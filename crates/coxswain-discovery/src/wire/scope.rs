@@ -38,7 +38,7 @@
 //! [`Snapshot`]: crate::proto::v1::Snapshot
 
 use coxswain_core::listener_status::{
-    ConflictReason, ListenerInfo, ListenerReadiness, RouteNamespaceSet,
+    ConflictReason, ListenerInfo, ListenerReadiness, ProxyProtocolListenerConfig, RouteNamespaceSet,
 };
 
 use crate::error::WireError;
@@ -136,6 +136,16 @@ pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerI
     } else {
         ConflictReason::None
     };
+    li.proxy_protocol = dto.proxy_protocol.as_ref().map(|pp| {
+        // Parse CIDR strings; drop malformed ones (fail-safe: fewer trusted peers
+        // → connection rejected, which is the correct safe direction).
+        let nets: Vec<ipnet::IpNet> = pp
+            .trusted_sources
+            .iter()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        ProxyProtocolListenerConfig::new(pp.enabled, nets)
+    });
     Ok(li)
 }
 

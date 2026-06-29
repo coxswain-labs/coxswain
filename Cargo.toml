@@ -80,6 +80,7 @@ matchit            = { version = "0.9" }
 nix                = { version = "0.31", features = ["signal", "process"] }
 parking_lot        = { version = "0.12" }
 percent-encoding   = { version = "2.3" }
+ppp                = { version = "2.3" }
 pingora            = { version = "0.8", default-features = false }
 pingora-core       = { version = "0.8", default-features = false }
 pingora-http       = { version = "0.8" }

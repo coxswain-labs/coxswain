@@ -305,30 +305,39 @@ pub(crate) struct ProxyArgs {
     )]
     pub proxy_tls_passthrough_dial_timeout: Duration,
 
-    /// Enable HAProxy PROXY protocol v1/v2 on the proxy listeners.
+    /// Enable HAProxy PROXY protocol v1/v2 on **Ingress** listeners.
     ///
-    /// When set, every accepted connection MUST carry a valid PROXY header.
-    /// Connections from sources not listed in `--proxy-trusted-sources` are
-    /// dropped immediately. Connections that omit or malform the header are
-    /// also dropped (strict mode).
+    /// When set, every connection accepted on the Ingress HTTP/HTTPS ports
+    /// (from `--ingress-http-port` / `--ingress-https-port`) MUST carry a valid
+    /// PROXY v1 or v2 header. Connections from sources not listed in
+    /// `--ingress-proxy-trusted-sources` are dropped immediately. Connections
+    /// that omit or malform the header are also dropped (strict mode).
     ///
-    /// The real client address is propagated upstream via the RFC 7239
-    /// `Forwarded` header.
+    /// This flag applies **only** to Ingress-origin listeners. For Gateway API
+    /// listeners, use a `ClientTrafficPolicy` CRD targeting the desired
+    /// listener (or Gateway) instead.
+    ///
+    /// The real client address extracted from the PROXY header is propagated
+    /// upstream via the RFC 7239 `Forwarded` header.
     #[arg(
         long,
-        env = "COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL",
+        env = "COXSWAIN_INGRESS_ACCEPT_PROXY_PROTOCOL",
         default_value_t = false
     )]
-    pub proxy_accept_proxy_protocol: bool,
+    pub ingress_accept_proxy_protocol: bool,
 
-    /// Comma-separated list of CIDR ranges that are permitted to send PROXY headers.
+    /// Comma-separated CIDR ranges permitted to send PROXY headers on Ingress listeners.
     ///
-    /// Only meaningful when `--proxy-accept-proxy-protocol` is set. Connections
+    /// Only meaningful when `--ingress-accept-proxy-protocol` is set. Connections
     /// from addresses outside this list are rejected at the TCP level.
     ///
     /// Example: `10.0.0.0/8,172.16.0.0/12,127.0.0.1/32`
-    #[arg(long, env = "COXSWAIN_PROXY_TRUSTED_SOURCES", value_delimiter = ',')]
-    pub proxy_trusted_sources: Vec<IpNet>,
+    #[arg(
+        long,
+        env = "COXSWAIN_INGRESS_PROXY_TRUSTED_SOURCES",
+        value_delimiter = ','
+    )]
+    pub ingress_proxy_trusted_sources: Vec<IpNet>,
 
     /// Global default for the total request timeout (client → proxy → upstream → client).
     ///

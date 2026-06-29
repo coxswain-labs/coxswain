@@ -6,6 +6,12 @@
 //! ## Regenerate manifests after touching a CRD type
 //!
 //! ```bash
+//! # ClientTrafficPolicy
+//! cargo run -p coxswain-core --example crdgen -- ClientTrafficPolicy \
+//!     > deploy/manifests/crds/clienttrafficpolicies.yaml
+//! cp deploy/manifests/crds/clienttrafficpolicies.yaml \
+//!     charts/coxswain/crds/clienttrafficpolicies.yaml
+//!
 //! # CoxswainGatewayParameters
 //! cargo run -p coxswain-core --example crdgen \
 //!     > deploy/manifests/crds/coxswaingatewayparameters.yaml
@@ -29,13 +35,17 @@
 //! and the committed YAML.
 
 use coxswain_core::crd::{
-    CoxswainGatewayParameters, CoxswainIngressClassParameters, PathRewriteRegex, RateLimit,
+    ClientTrafficPolicy, CoxswainGatewayParameters, CoxswainIngressClassParameters,
+    PathRewriteRegex, RateLimit,
 };
 use kube::CustomResourceExt;
 
 fn main() -> Result<(), serde_yaml::Error> {
     let kind = std::env::args().nth(1).unwrap_or_default();
     match kind.as_str() {
+        "ClientTrafficPolicy" => {
+            serde_yaml::to_writer(std::io::stdout(), &ClientTrafficPolicy::crd())
+        }
         "IngressClassParameters" => {
             serde_yaml::to_writer(std::io::stdout(), &CoxswainIngressClassParameters::crd())
         }

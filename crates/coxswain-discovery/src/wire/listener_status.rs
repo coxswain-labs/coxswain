@@ -120,6 +120,13 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
         internal_port: u32::from(info.internal_port),
         conflicted: info.conflict.is_conflicted(),
         protocol_conflict: matches!(info.conflict, ConflictReason::ProtocolConflict),
+        proxy_protocol: info
+            .proxy_protocol
+            .as_ref()
+            .map(|pp| p::ProxyProtocolListenerConfig {
+                enabled: pp.enabled,
+                trusted_sources: pp.trusted_sources.iter().map(|n| n.to_string()).collect(),
+            }),
     }
 }
 

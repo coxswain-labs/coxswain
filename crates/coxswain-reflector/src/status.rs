@@ -186,3 +186,80 @@ impl SharedBackendTlsPolicyStatus {
         self.0.tx.subscribe()
     }
 }
+
+/// Status record for one `ClientTrafficPolicy`.
+///
+/// Produced during each reconciler rebuild and consumed by the controller's
+/// leader-gated status writer to patch `status.ancestors[]`.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct ClientTrafficPolicyStatus {
+    /// `true` when the policy is accepted (no conflict on any targeted listener).
+    pub accepted: bool,
+    /// Reason string for the `Accepted` condition.
+    pub accepted_reason: &'static str,
+    /// `true` when the policy lost conflict resolution on at least one listener.
+    pub conflicted: bool,
+    /// Human-readable reason for the `Conflicted` condition when `conflicted` is `true`.
+    pub conflicted_reason: &'static str,
+}
+
+impl Default for ClientTrafficPolicyStatus {
+    fn default() -> Self {
+        Self {
+            accepted: true,
+            accepted_reason: "Accepted",
+            conflicted: false,
+            conflicted_reason: "NoConflicts",
+        }
+    }
+}
+
+/// Map from `(policy_namespace, policy_name)` to its status.
+pub type ClientTrafficPolicyStatusMap = HashMap<ObjectKey, ClientTrafficPolicyStatus>;
+
+struct SharedClientTrafficPolicyStatusInner {
+    map: ArcSwap<ClientTrafficPolicyStatusMap>,
+    tx: watch::Sender<u64>,
+}
+
+/// Shared handle to per-`ClientTrafficPolicy` status, produced after each reconciler rebuild.
+///
+/// The controller reads this to write `status.ancestors[]` when leader.
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct SharedClientTrafficPolicyStatus(Arc<SharedClientTrafficPolicyStatusInner>);
+
+impl Default for SharedClientTrafficPolicyStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedClientTrafficPolicyStatus {
+    /// Construct a new shared policy status map (initially empty, generation 0).
+    #[must_use]
+    pub fn new() -> Self {
+        let (tx, _) = watch::channel(0u64);
+        Self(Arc::new(SharedClientTrafficPolicyStatusInner {
+            map: ArcSwap::from_pointee(HashMap::new()),
+            tx,
+        }))
+    }
+
+    /// Load the current policy status map snapshot.
+    pub fn load(&self) -> arc_swap::Guard<Arc<ClientTrafficPolicyStatusMap>> {
+        self.0.map.load()
+    }
+
+    /// Store a new status map and notify subscribers via the generation counter.
+    pub fn store_and_notify(&self, map: ClientTrafficPolicyStatusMap) {
+        self.0.map.store(Arc::new(map));
+        self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    /// Returns a `watch::Receiver` for subscribing to change notifications.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.tx.subscribe()
+    }
+}

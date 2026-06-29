@@ -5,11 +5,16 @@
 //! the `kube::CustomResource` derive. The on-disk CRD YAML is generated from
 //! these types by `examples/crdgen.rs` and pinned by snapshot tests.
 
+pub mod client_traffic_policy;
 pub mod gateway_parameters;
 pub mod ingress_parameters;
 pub mod path_rewrite_regex;
 pub mod rate_limit;
 
+pub use client_traffic_policy::{
+    ClientTrafficPolicy, ClientTrafficPolicySpec, ClientTrafficPolicyStatus, LocalPolicyTargetRef,
+    PolicyAncestorRef, PolicyAncestorStatus, ProxyProtocolSpec,
+};
 pub use gateway_parameters::{
     CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType,
 };

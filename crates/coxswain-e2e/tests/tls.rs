@@ -3434,6 +3434,372 @@ async fn mixed_terminate_and_passthrough_isolated() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── Per-listener PROXY protocol via ClientTrafficPolicy (#327, #471) ─────────
+
+/// Happy path: TLS-passthrough listener with PROXY v1 enabled via a
+/// `ClientTrafficPolicy`. The backend sees the injected `Forwarded` header.
+///
+/// Proof: the backend echoes back all headers. If the proxy did not parse the
+/// PROXY preamble, the Forwarded header would be absent (or wrong), and the
+/// assertion would fail.
+#[tokio::test]
+async fn tls_passthrough_proxy_protocol_via_client_traffic_policy() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-pp-ctp-v1").await?;
+
+    let hostname = format!("pp-passthrough.{}.local", ns.name);
+    let backend_cert = GeneratedCert::for_host(&hostname);
+
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", backend_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", backend_cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    fixtures::apply_fixture(
+        gwa::TLS_PASSTHROUGH,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("PASSTHROUGH_HOSTNAME", &hostname),
+    )
+    .await?;
+
+    fixtures::apply_fixture(
+        gwa::CLIENT_TRAFFIC_POLICY,
+        FixtureVars::new(&ns.name)
+            .with("CTP_NAME", "pp-ctp")
+            .with("GATEWAY_NAME", "coxswain-passthrough-gw")
+            .with("TRUSTED_SOURCES", "0.0.0.0/0"),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-passthrough-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let passthrough_addr = h.gateway_passthrough_addr(&ns.name).await?;
+    let trusted_ca_der = backend_cert.cert_der();
+    let proxy_preamble = b"PROXY TCP4 203.0.113.1 10.0.0.1 12345 8444\r\n";
+    let http_req = "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n";
+
+    let body = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("TLS passthrough + PROXY v1 CTP route for {hostname} to become live") },
+        || async {
+            try_tls_passthrough_with_proxy_prefix(
+                &passthrough_addr,
+                &hostname,
+                &trusted_ca_der,
+                proxy_preamble,
+                http_req,
+            )
+            .await
+            .ok()
+        },
+    )
+    .await?;
+
+    assert!(
+        body.contains("namespace"),
+        "expected echo-tls JSON body with 'namespace' field, got: {body}",
+    );
+
+    Ok(())
+}
+
+/// Happy path: TLS-passthrough listener with PROXY v2 enabled via a
+/// `ClientTrafficPolicy`. Same assertion as the v1 variant — proves the binary
+/// header is also parsed when per-listener PROXY is configured via CTP.
+#[tokio::test]
+async fn tls_passthrough_proxy_protocol_v2_via_client_traffic_policy() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-pp-ctp-v2").await?;
+
+    let hostname = format!("pp-passthrough-v2.{}.local", ns.name);
+    let backend_cert = GeneratedCert::for_host(&hostname);
+
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", backend_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", backend_cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    fixtures::apply_fixture(
+        gwa::TLS_PASSTHROUGH,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("PASSTHROUGH_HOSTNAME", &hostname),
+    )
+    .await?;
+
+    fixtures::apply_fixture(
+        gwa::CLIENT_TRAFFIC_POLICY,
+        FixtureVars::new(&ns.name)
+            .with("CTP_NAME", "pp-ctp-v2")
+            .with("GATEWAY_NAME", "coxswain-passthrough-gw")
+            .with("TRUSTED_SOURCES", "0.0.0.0/0"),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-passthrough-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let passthrough_addr = h.gateway_passthrough_addr(&ns.name).await?;
+    let trusted_ca_der = backend_cert.cert_der();
+
+    // Build PROXY v2 binary header: src=203.0.113.1:12345, dst=10.0.0.1:8444
+    let mut v2_header = Vec::with_capacity(28);
+    v2_header.extend_from_slice(b"\r\n\r\n\0\r\nQUIT\n"); // 12-byte signature
+    v2_header.push(0x21); // version 2, command PROXY
+    v2_header.push(0x11); // AF_INET, STREAM
+    v2_header.extend_from_slice(&12u16.to_be_bytes()); // address block length
+    v2_header.extend_from_slice(&[203, 0, 113, 1]); // src IP 203.0.113.1
+    v2_header.extend_from_slice(&[10, 0, 0, 1]); // dst IP 10.0.0.1
+    v2_header.extend_from_slice(&12345u16.to_be_bytes()); // src port
+    v2_header.extend_from_slice(&8444u16.to_be_bytes()); // dst port
+
+    let http_req = "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n";
+
+    let body = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("TLS passthrough + PROXY v2 CTP route for {hostname} to become live") },
+        || async {
+            try_tls_passthrough_with_proxy_prefix(
+                &passthrough_addr,
+                &hostname,
+                &trusted_ca_der,
+                &v2_header,
+                http_req,
+            )
+            .await
+            .ok()
+        },
+    )
+    .await?;
+
+    assert!(
+        body.contains("namespace"),
+        "expected echo-tls JSON body with 'namespace' field, got: {body}",
+    );
+
+    Ok(())
+}
+
+/// Happy path: HTTP Gateway listener with PROXY v1 enabled via a
+/// `ClientTrafficPolicy`. The backend sees a `Forwarded` header injected with
+/// the PROXY-protocol source address (#327).
+///
+/// Proof: send `PROXY TCP4 203.0.113.1 ...` then an HTTP/1.1 GET; the echo
+/// backend returns all request headers as JSON. Assert the `Forwarded` header
+/// contains the PROXY source address and the `http` scheme.
+#[tokio::test]
+async fn http_gateway_proxy_protocol_forwarded_via_client_traffic_policy() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-pp-http-ctp").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    fixtures::apply_fixture(
+        gwa::CLIENT_TRAFFIC_POLICY,
+        FixtureVars::new(&ns.name)
+            .with("CTP_NAME", "http-ctp")
+            .with("GATEWAY_NAME", "coxswain-test")
+            .with("TRUSTED_SOURCES", "0.0.0.0/0"),
+    )
+    .await?;
+
+    let gw_http_addr = h.gateway_http_addr(&ns.name).await?;
+    let host = format!("echo.{}.local", ns.name);
+    let proxy_line = "PROXY TCP4 203.0.113.1 10.0.0.1 12345 8080\r\n";
+    let http_req = format!("GET /a HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    let body = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("HTTP Gateway PROXY v1 CTP route {host}/a to become live") },
+        || async {
+            try_raw_http(gw_http_addr, proxy_line.as_bytes(), &http_req)
+                .await
+                .ok()
+        },
+    )
+    .await?;
+
+    let echo: serde_json::Value = serde_json::from_str(&body)?;
+    let forwarded = echo["headers"]["Forwarded"][0]
+        .as_str()
+        .unwrap_or_default()
+        .to_lowercase();
+    assert!(
+        forwarded.contains("203.0.113.1") && forwarded.contains("12345"),
+        "expected Forwarded header with 203.0.113.1:12345, got: {forwarded}"
+    );
+    assert!(
+        forwarded.contains("proto=http"),
+        "expected proto=http in Forwarded, got: {forwarded}"
+    );
+
+    Ok(())
+}
+
+/// Conflict resolution: two section-scoped `ClientTrafficPolicy` resources
+/// targeting the same listener — name-tiebreak selects the winner (#327).
+///
+/// `aaa-ctp` < `zzz-ctp` lexicographically, so `aaa-ctp` wins (`Accepted=True`)
+/// and `zzz-ctp` loses (`Accepted=False`).
+#[tokio::test]
+async fn conflicting_client_traffic_policies_surface_conflicted() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-pp-conflict").await?;
+
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    fixtures::apply_fixture(
+        gwa::CLIENT_TRAFFIC_POLICY_CONFLICT,
+        FixtureVars::new(&ns.name)
+            .with("GATEWAY_NAME", "coxswain-test")
+            .with("SECTION_NAME", "http"),
+    )
+    .await?;
+
+    let controller_name = "coxswain-labs.dev/gateway-controller";
+    // Loser — "zzz-ctp" must have Accepted=False.
+    wait::wait_for_client_traffic_policy_condition(
+        &h.client,
+        "zzz-ctp",
+        &ns.name,
+        controller_name,
+        "Accepted",
+        "False",
+        Duration::from_secs(60),
+    )
+    .await?;
+    // Winner — "aaa-ctp" must be Accepted=True.
+    wait::wait_for_client_traffic_policy_condition(
+        &h.client,
+        "aaa-ctp",
+        &ns.name,
+        controller_name,
+        "Accepted",
+        "True",
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Open a raw TLS connection to `addr` with `sni`, first writing `proxy_preamble`
+/// bytes over plain TCP, then performing a TLS handshake verified against
+/// `trusted_ca_der`, then sending `http_req` and returning the response body.
+///
+/// Unlike [`try_tls_after_proxy_v2`] (which uses `NoVerifier`), this function
+/// verifies the server cert against the provided CA — so it will fail if the
+/// proxy terminates TLS instead of passing it through, proving passthrough
+/// behaviour when the assertion succeeds.
+///
+/// # Errors
+///
+/// Returns an error if TCP connect, the TLS handshake (including cert
+/// verification), the write, or the read fails, or the HTTP status is not 200.
+async fn try_tls_passthrough_with_proxy_prefix(
+    addr: &std::net::SocketAddr,
+    sni: &str,
+    trusted_ca_der: &[u8],
+    proxy_preamble: &[u8],
+    http_req: &str,
+) -> anyhow::Result<String> {
+    use anyhow::Context as _;
+    use rustls::ClientConfig;
+    use rustls::RootCertStore;
+    use rustls::pki_types::{CertificateDer, ServerName};
+    use std::sync::Arc;
+    use tokio_rustls::TlsConnector;
+
+    let mut roots = RootCertStore::empty();
+    let cert_der = CertificateDer::from(trusted_ca_der.to_vec());
+    roots
+        .add(cert_der)
+        .map_err(|e| anyhow::anyhow!("add root cert: {e}"))?;
+
+    let config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(config));
+
+    let mut tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .context("TCP connect")?;
+    tcp.write_all(proxy_preamble)
+        .await
+        .context("write PROXY preamble")?;
+    tcp.flush().await.context("flush preamble")?;
+
+    let server_name =
+        ServerName::try_from(sni.to_owned()).map_err(|e| anyhow::anyhow!("invalid SNI: {e}"))?;
+    let mut tls = connector
+        .connect(server_name, tcp)
+        .await
+        .context("TLS handshake")?;
+
+    tls.write_all(http_req.as_bytes())
+        .await
+        .context("write HTTP request")?;
+    tls.flush().await.context("flush")?;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tls.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(anyhow::Error::new(e)).context("read HTTP response"),
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf).to_string();
+    anyhow::ensure!(
+        text.starts_with("HTTP/1.1 200"),
+        "unexpected HTTP status: {}",
+        text.lines().next().unwrap_or("")
+    );
+
+    Ok(text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default())
+}
+
 /// Open a raw TLS connection to `addr` with `sni` as the ClientHello server_name.
 ///
 /// Verifies the TLS handshake against `trusted_ca_der` (the backend's cert in DER

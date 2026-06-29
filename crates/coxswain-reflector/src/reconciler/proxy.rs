@@ -20,6 +20,7 @@ use super::route_builder::{
 use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
 use crate::gateway_api::{
     BackendTlsIndex, GatewayApiReconciler, GrpcRouteReconciler, build_backend_tls_index,
+    effective_proxy_config, resolve_client_traffic_policies,
 };
 use crate::gw_types::BackendTlsPolicy;
 use crate::gw_types::GrpcRoute;
@@ -36,10 +37,11 @@ use crate::reference_grants::{
 };
 use crate::status::{
     GatewayListenerStatus, ListenerSource, SharedBackendTlsPolicyStatus,
-    SharedGatewayListenerStatus, SharedRouteStatus,
+    SharedClientTrafficPolicyStatus, SharedGatewayListenerStatus, SharedRouteStatus,
 };
 use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
+use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
 use coxswain_core::crd::{CoxswainIngressClassParameters, PathRewriteRegex, RateLimit};
 use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 use coxswain_core::fleet::{self, SharedFleet};
@@ -295,6 +297,7 @@ pub struct SharedProxyReconciler {
     /// for the same kind-neutrality reason.
     tls_route_status: SharedRouteStatus,
     policy_status: SharedBackendTlsPolicyStatus,
+    ctp_status: SharedClientTrafficPolicyStatus,
     fleet: SharedFleet,
     owned_gateways: OwnedGateways,
     leader: Arc<AtomicBool>,
@@ -377,6 +380,8 @@ pub struct StatusSubscriptions {
     pub tls_routes: ReflectHandle<TlsRoute>,
     /// Applied-`ListenerSet` stream + reader (GEP-1713).
     pub listener_sets: ReflectHandle<ListenerSet>,
+    /// Applied-`ClientTrafficPolicy` stream + reader (#327).
+    pub client_traffic_policies: ReflectHandle<ClientTrafficPolicy>,
 }
 
 /// Pre-created shared-store writers for the status-relevant types.
@@ -394,6 +399,7 @@ struct StatusStoreWriters {
     policies: reflector::store::Writer<BackendTlsPolicy>,
     tls_routes: reflector::store::Writer<TlsRoute>,
     listener_sets: reflector::store::Writer<ListenerSet>,
+    client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
 }
 
 /// `Option`-wrapped form of [`StatusStoreWriters`] produced by
@@ -410,6 +416,7 @@ struct StatusStoreOptionWriters {
     policies: Option<reflector::store::Writer<BackendTlsPolicy>>,
     tls_routes: Option<reflector::store::Writer<TlsRoute>>,
     listener_sets: Option<reflector::store::Writer<ListenerSet>>,
+    client_traffic_policies: Option<reflector::store::Writer<ClientTrafficPolicy>>,
 }
 
 impl StatusStoreWriters {
@@ -430,6 +437,7 @@ impl StatusStoreWriters {
                 policies: Some(w.policies),
                 tls_routes: Some(w.tls_routes),
                 listener_sets: Some(w.listener_sets),
+                client_traffic_policies: Some(w.client_traffic_policies),
             },
             None => StatusStoreOptionWriters {
                 routes: None,
@@ -441,6 +449,7 @@ impl StatusStoreWriters {
                 policies: None,
                 tls_routes: None,
                 listener_sets: None,
+                client_traffic_policies: None,
             },
         }
     }
@@ -493,6 +502,8 @@ impl SharedProxyReconciler {
             let (_, tls_routes) = reflector::store_shared::<TlsRoute>(STATUS_SUBSCRIBE_BUFFER);
             let (_, listener_sets) =
                 reflector::store_shared::<ListenerSet>(STATUS_SUBSCRIBE_BUFFER);
+            let (_, client_traffic_policies) =
+                reflector::store_shared::<ClientTrafficPolicy>(STATUS_SUBSCRIBE_BUFFER);
             let subs = StatusSubscriptions {
                 gateways: gateways.subscribe().unwrap_or_else(|| {
                     panic!("invariant: store_shared writer must yield a Gateway subscriber")
@@ -523,6 +534,11 @@ impl SharedProxyReconciler {
                 listener_sets: listener_sets.subscribe().unwrap_or_else(|| {
                     panic!("invariant: store_shared writer must yield a ListenerSet subscriber")
                 }),
+                client_traffic_policies: client_traffic_policies.subscribe().unwrap_or_else(|| {
+                    panic!(
+                        "invariant: store_shared writer must yield a ClientTrafficPolicy subscriber"
+                    )
+                }),
             };
             let writers = StatusStoreWriters {
                 gateways,
@@ -534,6 +550,7 @@ impl SharedProxyReconciler {
                 policies,
                 tls_routes,
                 listener_sets,
+                client_traffic_policies,
             };
             (Some(writers), Some(subs))
         } else {
@@ -554,6 +571,7 @@ impl SharedProxyReconciler {
             grpc_route_status: SharedRouteStatus::new(),
             tls_route_status: SharedRouteStatus::new(),
             policy_status: SharedBackendTlsPolicyStatus::new(),
+            ctp_status: SharedClientTrafficPolicyStatus::new(),
             fleet: SharedFleet::new(),
             owned_gateways,
             leader,
@@ -602,6 +620,12 @@ impl SharedProxyReconciler {
     /// write `status.ancestors[]` when leader.
     pub fn policy_status(&self) -> SharedBackendTlsPolicyStatus {
         self.policy_status.clone()
+    }
+
+    /// Returns the shared `ClientTrafficPolicy` status handle so the Controller can
+    /// write `status.ancestors[]` when leader (#327).
+    pub fn ctp_status(&self) -> SharedClientTrafficPolicyStatus {
+        self.ctp_status.clone()
     }
 
     /// Returns the SNI-keyed TLS passthrough routing table (GEP-2643, #70).
@@ -695,6 +719,9 @@ pub(super) struct ReflectorStores<'a> {
     /// `PathRewriteRegex` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters during Gateway API reconciliation.
     pub(super) path_rewrites: &'a reflector::Store<PathRewriteRegex>,
+    /// `ClientTrafficPolicy` CRs in scope — resolved per Gateway/listener to set
+    /// `ListenerInfo.proxy_protocol` during rebuild (#327).
+    pub(super) client_traffic_policies: &'a reflector::Store<ClientTrafficPolicy>,
 }
 
 pub(super) struct SharedOutputs<'a> {
@@ -710,6 +737,7 @@ pub(super) struct SharedOutputs<'a> {
     pub(super) grpc_route_status: &'a SharedRouteStatus,
     pub(super) tls_route_status: &'a SharedRouteStatus,
     pub(super) policy_status: &'a SharedBackendTlsPolicyStatus,
+    pub(super) ctp_status: &'a SharedClientTrafficPolicyStatus,
     pub(super) passthrough_routes: &'a SharedTlsPassthroughTable,
     pub(super) terminate_routes: &'a SharedTlsPassthroughTable,
     pub(super) ingress_event_tx: Option<&'a tokio::sync::mpsc::Sender<IngressEvent>>,
@@ -869,6 +897,7 @@ impl BackgroundService for SharedProxyReconciler {
             grpc_route_status: self.grpc_route_status.clone(),
             tls_route_status: self.tls_route_status.clone(),
             policy_status: self.policy_status.clone(),
+            ctp_status: self.ctp_status.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
             terminate_routes: self.terminate_routes.clone(),
             fleet: self.fleet.clone(),
@@ -912,6 +941,7 @@ struct SharedHandles {
     grpc_route_status: SharedRouteStatus,
     tls_route_status: SharedRouteStatus,
     policy_status: SharedBackendTlsPolicyStatus,
+    ctp_status: SharedClientTrafficPolicyStatus,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
     /// SNI-keyed TLS terminate routing table for TLSRouteModeTerminate (#481).
@@ -959,6 +989,7 @@ struct GatewayApiStoreWriters {
     path_rewrites: reflector::store::Writer<PathRewriteRegex>,
     listener_sets: reflector::store::Writer<ListenerSet>,
     namespaces: reflector::store::Writer<Namespace>,
+    client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
 }
 
 /// Spawn all Gateway API reflectors into `set`.
@@ -988,6 +1019,7 @@ fn add_gateway_api_reflectors(
         path_rewrites,
         listener_sets,
         namespaces,
+        client_traffic_policies,
     } = writers;
 
     spawn_reflector(
@@ -1095,6 +1127,16 @@ fn add_gateway_api_reflectors(
         ReflectorEffects::new(notify, health, "namespace", metrics),
         "Namespace",
     );
+    // `ClientTrafficPolicy` CRs — per-listener PROXY-protocol opt-in (#327).
+    // Namespaced and watched alongside other Gateway API policy resources.
+    spawn_reflector(
+        set,
+        client_traffic_policies,
+        scoped_api::<ClientTrafficPolicy>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "client_traffic_policy", metrics),
+        "ClientTrafficPolicy",
+    );
 }
 
 async fn spawn_tasks(
@@ -1116,6 +1158,7 @@ async fn spawn_tasks(
         grpc_route_status,
         tls_route_status,
         policy_status,
+        ctp_status,
         passthrough_routes,
         terminate_routes,
         fleet,
@@ -1164,6 +1207,10 @@ async fn spawn_tasks(
     // the data-plane reader observe the same synced store (GEP-1713).
     let (listener_set_reader, listener_set_writer) =
         reader_writer::<ListenerSet>(pre.listener_sets);
+    // ClientTrafficPolicy is a status-relevant store: the controller role subscribes
+    // to it via `StatusSubscriptions.client_traffic_policies` (#327).
+    let (ctp_reader, ctp_writer) =
+        reader_writer::<ClientTrafficPolicy>(pre.client_traffic_policies);
     let (namespace_reader, namespace_writer) = reflector::store::<Namespace>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
@@ -1285,6 +1332,7 @@ async fn spawn_tasks(
             path_rewrites: path_rewrite_writer,
             listener_sets: listener_set_writer,
             namespaces: namespace_writer,
+            client_traffic_policies: ctp_writer,
         };
         if crate::crds::gateway_api_crds_present(&client).await {
             add_gateway_api_reflectors(
@@ -1429,6 +1477,7 @@ async fn spawn_tasks(
                 configmaps: &configmap_reader,
                 rate_limits: &rate_limit_reader,
                 path_rewrites: &path_rewrite_reader,
+                client_traffic_policies: &ctp_reader,
             };
             let outputs = SharedOutputs {
                 ingress_routes: &ingress_routes,
@@ -1443,6 +1492,7 @@ async fn spawn_tasks(
                 grpc_route_status: &grpc_route_status,
                 tls_route_status: &tls_route_status,
                 policy_status: &policy_status,
+                ctp_status: &ctp_status,
                 passthrough_routes: &passthrough_routes,
                 terminate_routes: &terminate_routes,
                 ingress_event_tx: ingress_event_tx.as_ref(),
@@ -1514,6 +1564,11 @@ fn rebuild(
         owned_gateways = owned_gateways.len(),
         "Rebuilding routing table"
     );
+
+    // Resolve `ClientTrafficPolicy` configs per (gateway, optional listener) before
+    // the rebuild so `gateway_listener_status` can be annotated with proxy_protocol.
+    let (ctp_index, ctp_status_map) =
+        resolve_client_traffic_policies(stores.client_traffic_policies, &owned_gateways);
 
     // `policy_index` is built first because `Ownership` now carries a borrow of it.
     let (policy_index, mut policy_status_map) =
@@ -1616,6 +1671,16 @@ fn rebuild(
         &mut gateway_listener_status,
         true,
     );
+
+    // Wire CTP-resolved proxy_protocol config into each listener's `ListenerInfo`
+    // (#327). Section-scoped policies take precedence via `effective_proxy_config`.
+    for (gw_key, gw_status) in &mut gateway_listener_status {
+        for (listener_key, listener_info) in &mut gw_status.listeners {
+            if let Some(config) = effective_proxy_config(&ctp_index, gw_key, &listener_key.name) {
+                listener_info.proxy_protocol = Some(config.clone());
+            }
+        }
+    }
 
     let gateways = stores.gateways.state();
 
@@ -1720,6 +1785,7 @@ fn rebuild(
         entry.ancestors = ah.ancestors;
     }
     outputs.policy_status.store_and_notify(policy_status_map);
+    outputs.ctp_status.store_and_notify(ctp_status_map);
 
     // Build per-cut-over-Gateway snapshots for the dedicated registry (#426).
     //

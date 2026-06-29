@@ -19,18 +19,20 @@
 //! - **HTTPS (SNI-TLS)**: h1 and h2 via ALPN negotiation.  The acceptor
 //!   advertises `h2` and `http/1.1`; TLS clients that don't offer `h2` fall
 //!   back to HTTP/1.1.
-//! - **HAProxy PROXY protocol** (opt-in via `--proxy-accept-proxy-protocol`):
-//!   header is parsed before TLS and upstream dispatch; HTTP/1.1 only on this
-//!   path (h2c detection and h2 ALPN are disabled for PROXY-wrapped
-//!   connections; see issue #32 for the follow-up).
+//! - **HAProxy PROXY protocol** (opt-in per-listener via `ClientTrafficPolicy`
+//!   CRD, or via `--ingress-accept-proxy-protocol` for Ingress-origin listeners):
+//!   header is parsed and stripped before TLS/SNI dispatch; HTTP/1.1 only on
+//!   this path (h2c detection and h2 ALPN are disabled for PROXY-wrapped
+//!   connections; see issue #32 for the follow-up). TLS passthrough and
+//!   terminate listeners strip the PROXY header before the SNI peek so the
+//!   raw TLS stream reaches the backend unchanged.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use ipnet::IpNet;
 use pingora_core::apps::{HttpServerApp, ServerApp};
 use pingora_core::protocols::http::ServerSession;
 use pingora_core::protocols::l4::stream::Stream as L4Stream;
@@ -47,7 +49,9 @@ use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use coxswain_core::listener_status::ProxyProtocolListenerConfig;
 use coxswain_core::routing::SharedTlsPassthroughTable;
+use ppp::PartialResult as _;
 
 use crate::SniCertSelector;
 use crate::ctx::{CONN_INFO, ConnectionInfo};
@@ -71,24 +75,23 @@ pub enum AcceptorBuildError {
 }
 
 /// Typed errors from reading a PROXY protocol v1 or v2 header.
+#[non_exhaustive]
 #[derive(Debug, Error)]
 pub(crate) enum ProxyHeaderError {
+    /// No complete header arrived within the 5 s deadline.
     #[error("proxy header read timed out")]
     Timeout,
+    /// Connection closed or I/O error while peeking or draining.
     #[error("proxy header i/o error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("proxy v2 address block too large ({0} bytes)")]
+    /// Peek buffer reached [`MAX_PROXY_PEEK`] without a parseable header.
+    ///
+    /// The inner value is the cap (`MAX_PROXY_PEEK`), not the byte count seen.
+    #[error("PROXY header exceeds maximum peek size ({0} bytes)")]
     TooLarge(usize),
-    #[error("no proxy protocol header (strict mode)")]
+    /// Bytes present do not form a valid PROXY v1 or v2 header (strict mode).
+    #[error("no valid PROXY protocol header (strict mode)")]
     BadPreamble,
-    #[error("proxy v1 header exceeds 108 bytes")]
-    V1TooLarge,
-    #[error("proxy v1 header is not valid utf-8: {0}")]
-    Utf8(#[from] std::str::Utf8Error),
-    #[error("proxy v1 malformed: {0}")]
-    MalformedV1(&'static str),
-    #[error("proxy v1 unknown protocol: {0}")]
-    UnknownProtocol(String),
 }
 
 /// Groups the TLS L4 parameters for [`ProxyAcceptor::new`].
@@ -110,23 +113,13 @@ pub struct PassthroughConfig {
     pub dial_timeout: Duration,
 }
 
-/// CIDR allow-list for peers permitted to send PROXY protocol headers.
-#[non_exhaustive]
-pub struct TrustedSources {
-    nets: Vec<IpNet>,
-}
-
-impl TrustedSources {
-    /// Build a new allow-list from a set of CIDR ranges.
-    pub fn new(nets: Vec<IpNet>) -> Self {
-        Self { nets }
-    }
-
-    /// Returns `true` if `ip` is covered by at least one of the trusted CIDR ranges.
-    pub fn contains(&self, ip: &IpAddr) -> bool {
-        self.nets.iter().any(|n| n.contains(ip))
-    }
-}
+/// Maximum number of bytes peeked while searching for a complete PROXY header.
+///
+/// v1 max is 108 bytes. v2 fixed header is 16 bytes + address block: up to 12 bytes
+/// (IPv4), 36 bytes (IPv6), or 216 bytes (Unix). We cap at 552 to leave headroom for
+/// small TLVs. Headers with TLV payloads that push the total beyond this cap are
+/// rejected as `TooLarge`; TLV content is not inspected.
+const MAX_PROXY_PEEK: usize = 552;
 
 /// Whether a listener speaks plain HTTP, HTTPS, or TLS L4 (passthrough and/or terminate).
 #[non_exhaustive]
@@ -149,7 +142,7 @@ pub enum ListenerProtocol {
     TlsHybrid,
 }
 
-/// One listen address with its associated protocol.
+/// One listen address with its associated protocol and per-listener PROXY config.
 // intentionally open: field-literal constructed in crates/coxswain-bin/src/main.rs while assembling the desired listener set.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ListenerSpec {
@@ -157,22 +150,35 @@ pub struct ListenerSpec {
     pub addr: SocketAddr,
     /// Whether this listener speaks HTTP, HTTPS, or TLS passthrough.
     pub protocol: ListenerProtocol,
+    /// Per-listener PROXY protocol configuration.
+    ///
+    /// `None` means PROXY protocol is disabled for this listener. `Some` carries
+    /// both the `enabled` flag and the trusted-peer CIDR list.  When `enabled` is
+    /// `true`, every accepted connection must present a valid PROXY header from a
+    /// trusted source; connections without it are dropped.
+    ///
+    /// Gateway-origin listeners are seeded from the resolved `ClientTrafficPolicy`
+    /// CRD. Ingress-origin listeners are seeded from `--ingress-accept-proxy-protocol`
+    /// / `--ingress-proxy-trusted-sources` flags. The two mechanisms are disjoint.
+    pub proxy_protocol: Option<ProxyProtocolListenerConfig>,
 }
 
 impl ListenerSpec {
-    /// Create an HTTP listener spec for the given address.
+    /// Create an HTTP listener spec for the given address with no PROXY protocol.
     pub fn http(addr: SocketAddr) -> Self {
         Self {
             addr,
             protocol: ListenerProtocol::Http,
+            proxy_protocol: None,
         }
     }
 
-    /// Create an HTTPS listener spec for the given address.
+    /// Create an HTTPS listener spec for the given address with no PROXY protocol.
     pub fn https(addr: SocketAddr) -> Self {
         Self {
             addr,
             protocol: ListenerProtocol::Https,
+            proxy_protocol: None,
         }
     }
 
@@ -184,6 +190,7 @@ impl ListenerSpec {
         Self {
             addr,
             protocol: ListenerProtocol::TlsL4,
+            proxy_protocol: None,
         }
     }
 
@@ -195,6 +202,7 @@ impl ListenerSpec {
         Self {
             addr,
             protocol: ListenerProtocol::TlsHybrid,
+            proxy_protocol: None,
         }
     }
 }
@@ -206,14 +214,19 @@ impl ListenerSpec {
 /// computes the delta, binds newly-desired listeners, and begins draining
 /// removed ones — all in-process, with no process restart.
 ///
-/// When `trusted_sources` is `Some`, every accepted connection must carry a
-/// valid HAProxy PROXY-protocol header from the allow-listed CIDR set.  When
-/// it is `None` (the common case), standard Pingora connection handling is
-/// used, supporting both HTTP/1.1 and HTTP/2 via ALPN.
+/// PROXY protocol acceptance is per-listener, governed by
+/// [`ListenerSpec::proxy_protocol`] (derived from `ClientTrafficPolicy` CRD
+/// for Gateway listeners, or `--ingress-*` flags for Ingress listeners).
+/// When a listener has PROXY config with `enabled: true`, every accepted
+/// connection must present a valid HAProxy PROXY header from a trusted CIDR;
+/// connections without it or from untrusted peers are dropped. When the
+/// listener has no PROXY config, standard Pingora handling (h1+h2, ALPN)
+/// is used.
 ///
-/// TLS passthrough listeners (`ListenerProtocol::TlsPassthrough`) bypass the
+/// TLS passthrough listeners (`ListenerProtocol::TlsL4`) bypass the
 /// HTTP proxy entirely and forward raw encrypted streams by SNI, using the
-/// [`SharedTlsPassthroughTable`] snapshot.
+/// [`SharedTlsPassthroughTable`] snapshot. If PROXY config is enabled on a
+/// TLS L4 listener, the PROXY header is stripped before SNI peeking.
 #[non_exhaustive]
 pub struct ProxyAcceptor<P>
 where
@@ -225,8 +238,6 @@ where
     specs_rx: Option<watch::Receiver<HashSet<ListenerSpec>>>,
     /// Initial desired set (used as the permanent set when `specs_rx` is `None`).
     initial_specs: HashSet<ListenerSpec>,
-    /// When `Some`, require PROXY-protocol headers and only from these sources.
-    trusted: Option<Arc<TrustedSources>>,
     tls_selector: SniCertSelector,
     drain_timeout: Duration,
     /// SNI-keyed passthrough routing table for TLSRoute passthrough listeners.
@@ -245,7 +256,8 @@ where
     /// Build an acceptor.
     ///
     /// * `initial_specs` — listeners to bind immediately when the service
-    ///   starts; used as the permanent set when `specs_rx` is `None`.
+    ///   starts; used as the permanent set when `specs_rx` is `None`. Each
+    ///   spec carries its own per-listener [`ProxyProtocolListenerConfig`].
     /// * `specs_rx` — if `Some`, the acceptor watches this receiver for
     ///   desired-set changes and reconciles dynamically.  Pass `None` for a
     ///   static listener set.
@@ -262,28 +274,26 @@ where
         proxy: Arc<HttpProxy<P>>,
         initial_specs: HashSet<ListenerSpec>,
         specs_rx: Option<watch::Receiver<HashSet<ListenerSpec>>>,
-        trusted: Option<Arc<TrustedSources>>,
         tls_selector: SniCertSelector,
         drain_timeout: Duration,
         passthrough: PassthroughConfig,
     ) -> Result<Self, AcceptorBuildError> {
         // Validate the TLS acceptor eagerly so bind failures surface before runtime.
-        // ALPN h2 advertisement only applies to the standard path (`handle_standard`);
-        // the PROXY-protocol path (`handle_proxy_protocol`) runs an h1-only keepalive
-        // loop so we must not advertise h2 there.
-        let advertise_h2 = trusted.is_none();
+        // PROXY-protocol listeners run h1-only (`handle_proxy_protocol` does not
+        // advertise h2), but since PROXY config is per-listener we validate with
+        // `advertise_h2 = true` (the most restrictive build path, i.e. the same
+        // context the non-PROXY listeners will use).
         if initial_specs
             .iter()
             .any(|s| s.protocol == ListenerProtocol::Https)
         {
-            build_tls_context(&tls_selector, advertise_h2)?;
+            build_tls_context(&tls_selector, true)?;
         }
 
         Ok(Self {
             proxy,
             specs_rx,
             initial_specs,
-            trusted,
             tls_selector,
             drain_timeout,
             passthrough_table: passthrough.table,
@@ -311,7 +321,6 @@ where
 
         let cfg = ListenerConfig {
             proxy: Arc::clone(&self.proxy),
-            trusted: self.trusted.clone(),
             tls_selector: self.tls_selector.clone(),
             drain_timeout: self.drain_timeout,
             passthrough_table: self.passthrough_table.clone(),
@@ -400,18 +409,35 @@ struct ListenerHandle {
     /// old listener for the address). The current value also records the
     /// listener's protocol for the next reconcile's delta.
     proto_tx: watch::Sender<ListenerProtocol>,
+    /// Per-listener PROXY protocol config, pushed in place when the
+    /// `ClientTrafficPolicy` changes (or the `--ingress-*` flag is toggled) so
+    /// the running accept loop picks up the new config for subsequent connections
+    /// without rebinding the socket.
+    proxy_config_tx: watch::Sender<Option<ProxyProtocolListenerConfig>>,
 }
 
-/// Shared proxy + trust + TLS configuration used when spawning a new listener
-/// or handling connections.  Groups the fields that would otherwise exceed the
+/// Per-listener runtime signals for [`run_listener`]: drain + protocol +
+/// PROXY-config receivers, all updatable in place without rebinding the socket.
+struct ListenerSignals {
+    drain_token: CancellationToken,
+    proto_rx: watch::Receiver<ListenerProtocol>,
+    proxy_config_rx: watch::Receiver<Option<ProxyProtocolListenerConfig>>,
+    conn_shutdown_rx: watch::Receiver<bool>,
+}
+
+/// Shared proxy + TLS configuration used when spawning a new listener or
+/// handling connections.  Groups the fields that would otherwise exceed the
 /// `clippy::too_many_arguments` limit on the inner helper functions.
+///
+/// Per-listener PROXY config is NOT stored here; it flows via the
+/// `proxy_config_tx`/`proxy_config_rx` watch channel pair on `ListenerHandle`
+/// and `run_listener` so it can be updated in place without rebinding.
 struct ListenerConfig<P>
 where
     P: ProxyHttp + Send + Sync + 'static,
     <P as ProxyHttp>::CTX: Send + Sync,
 {
     proxy: Arc<HttpProxy<P>>,
-    trusted: Option<Arc<TrustedSources>>,
     tls_selector: SniCertSelector,
     drain_timeout: Duration,
     passthrough_table: SharedTlsPassthroughTable,
@@ -419,16 +445,19 @@ where
     l4_dial_timeout: Duration,
 }
 
-/// Per-connection handler state: the proxy, trust policy, and TLS selector
-/// together with the listener address metadata needed to seed [`CONN_INFO`] on
-/// the PROXY-protocol path.
+/// Per-connection handler state: the proxy, per-listener PROXY config, and TLS
+/// selector together with the listener address metadata needed to seed
+/// [`CONN_INFO`] on the PROXY-protocol path.
 struct ConnHandler<P>
 where
     P: ProxyHttp + Send + Sync + 'static,
     <P as ProxyHttp>::CTX: Send + Sync,
 {
     proxy: Arc<HttpProxy<P>>,
-    trusted: Option<Arc<TrustedSources>>,
+    /// Snapshot of the listener's PROXY protocol configuration at the moment
+    /// this connection was accepted.  `None` → no PROXY protocol; `Some` with
+    /// `enabled: true` → strict PROXY mode.
+    proxy_protocol: Option<ProxyProtocolListenerConfig>,
     tls_selector: SniCertSelector,
     local_addr: SocketAddr,
     protocol: ListenerProtocol,
@@ -439,7 +468,7 @@ where
 
 // ── Reconcile helpers ─────────────────────────────────────────────────────────
 
-/// The three disjoint actions a reconcile pass must take to converge the active
+/// The four disjoint actions a reconcile pass must take to converge the active
 /// listener set to the desired set. Pure output of [`plan_listener_changes`] so
 /// the delta logic is unit-testable without binding sockets.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -448,11 +477,21 @@ struct ListenerPlan {
     remove: Vec<SocketAddr>,
     /// Addresses already bound whose protocol changed — switch in place, no rebind.
     reprotocol: Vec<ListenerSpec>,
+    /// Addresses already bound whose PROXY config changed but whose protocol did
+    /// not — update config in place via `proxy_config_tx`, no rebind.
+    reproxy: Vec<ListenerSpec>,
     /// Newly-desired addresses to bind and spawn.
     add: Vec<ListenerSpec>,
 }
 
-/// Partition `desired` against the currently-bound `active` protocols into a
+/// Snapshot of the active state for one listener, used by [`plan_listener_changes`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActiveListenerState {
+    pub(crate) protocol: ListenerProtocol,
+    pub(crate) proxy_protocol: Option<ProxyProtocolListenerConfig>,
+}
+
+/// Partition `desired` against the currently-bound `active` state into a
 /// [`ListenerPlan`].
 ///
 /// An address present in both with a *different* protocol lands in `reprotocol`,
@@ -462,8 +501,11 @@ struct ListenerPlan {
 /// `SO_REUSEPORT` is set), dropping the port entirely — the exact failure that
 /// left `protocol: TLS` passthrough listeners stuck terminating on a port first
 /// bound as `Https` (GEP-2643 / #70).
+///
+/// An address with matching protocol but changed PROXY config lands in `reproxy`:
+/// the config is pushed over the `proxy_config_tx` watch channel without rebinding.
 fn plan_listener_changes(
-    active: &HashMap<SocketAddr, ListenerProtocol>,
+    active: &HashMap<SocketAddr, ActiveListenerState>,
     desired: &HashSet<ListenerSpec>,
 ) -> ListenerPlan {
     let desired_addrs: HashSet<SocketAddr> = desired.iter().map(|s| s.addr).collect();
@@ -476,7 +518,10 @@ fn plan_listener_changes(
     for spec in desired {
         match active.get(&spec.addr) {
             None => plan.add.push(spec.clone()),
-            Some(&proto) if proto != spec.protocol => plan.reprotocol.push(spec.clone()),
+            Some(state) if state.protocol != spec.protocol => plan.reprotocol.push(spec.clone()),
+            Some(state) if state.proxy_protocol != spec.proxy_protocol => {
+                plan.reproxy.push(spec.clone());
+            }
             Some(_) => {}
         }
     }
@@ -486,6 +531,7 @@ fn plan_listener_changes(
 /// Compute the delta between `active` and `desired` and apply it:
 /// - Spawn a listener task for each added spec.
 /// - Switch protocol in place for each spec whose port is already bound.
+/// - Push updated PROXY config for specs whose port is bound but PROXY config changed.
 /// - Signal drain for each removed spec.
 async fn reconcile_listeners<P>(
     active: &mut HashMap<SocketAddr, ListenerHandle>,
@@ -497,11 +543,19 @@ async fn reconcile_listeners<P>(
     P: ProxyHttp + Send + Sync + 'static,
     <P as ProxyHttp>::CTX: Send + Sync,
 {
-    let active_protos: HashMap<SocketAddr, ListenerProtocol> = active
+    let active_state: HashMap<SocketAddr, ActiveListenerState> = active
         .iter()
-        .map(|(addr, h)| (*addr, *h.proto_tx.borrow()))
+        .map(|(addr, h)| {
+            (
+                *addr,
+                ActiveListenerState {
+                    protocol: *h.proto_tx.borrow(),
+                    proxy_protocol: h.proxy_config_tx.borrow().clone(),
+                },
+            )
+        })
         .collect();
-    let plan = plan_listener_changes(&active_protos, &desired);
+    let plan = plan_listener_changes(&active_state, &desired);
 
     // Signal drain for removed listeners.
     for addr in &plan.remove {
@@ -534,6 +588,20 @@ async fn reconcile_listeners<P>(
             // `watch::Sender::send` only errors when every receiver is gone; the
             // listener task holds one, so a live listener always applies this.
             let _ = handle.proto_tx.send(spec.protocol);
+            // Also push the new PROXY config (protocol change may coincide).
+            let _ = handle.proxy_config_tx.send(spec.proxy_protocol.clone());
+        }
+    }
+
+    // Push updated PROXY config for ports whose protocol is unchanged.
+    for spec in &plan.reproxy {
+        if let Some(handle) = active.get(&spec.addr) {
+            tracing::debug!(
+                addr = %spec.addr,
+                enabled = spec.proxy_protocol.as_ref().is_some_and(|pp| pp.enabled),
+                "Updating PROXY protocol config in place"
+            );
+            let _ = handle.proxy_config_tx.send(spec.proxy_protocol.clone());
         }
     }
 
@@ -553,10 +621,10 @@ async fn reconcile_listeners<P>(
         let drain_token = CancellationToken::new();
         let (conn_shutdown_tx, conn_shutdown_rx) = watch::channel(false);
         let (proto_tx, proto_rx) = watch::channel(spec.protocol);
+        let (proxy_config_tx, proxy_config_rx) = watch::channel(spec.proxy_protocol.clone());
 
         let listener_cfg = ListenerConfig {
             proxy: Arc::clone(&cfg.proxy),
-            trusted: cfg.trusted.clone(),
             tls_selector: cfg.tls_selector.clone(),
             drain_timeout: cfg.drain_timeout,
             passthrough_table: cfg.passthrough_table.clone(),
@@ -574,10 +642,13 @@ async fn reconcile_listeners<P>(
         all_tasks.spawn(run_listener(
             tcp,
             addr,
-            proto_rx,
+            ListenerSignals {
+                drain_token: drain_token.clone(),
+                proto_rx,
+                proxy_config_rx,
+                conn_shutdown_rx,
+            },
             listener_cfg,
-            drain_token.clone(),
-            conn_shutdown_rx,
             global_shutdown.clone(),
         ));
 
@@ -587,6 +658,7 @@ async fn reconcile_listeners<P>(
                 drain_token,
                 conn_shutdown_tx,
                 proto_tx,
+                proxy_config_tx,
             },
         );
     }
@@ -609,15 +681,19 @@ fn signal_all_drain(active: &HashMap<SocketAddr, ListenerHandle>) {
 async fn run_listener<P>(
     tcp: tokio::net::TcpListener,
     addr: SocketAddr,
-    proto_rx: watch::Receiver<ListenerProtocol>,
+    signals: ListenerSignals,
     cfg: ListenerConfig<P>,
-    drain_token: CancellationToken,
-    conn_shutdown_rx: watch::Receiver<bool>,
     mut global_shutdown: ShutdownWatch,
 ) where
     P: ProxyHttp + Send + Sync + 'static,
     <P as ProxyHttp>::CTX: Send + Sync,
 {
+    let ListenerSignals {
+        drain_token,
+        proto_rx,
+        proxy_config_rx,
+        conn_shutdown_rx,
+    } = signals;
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
     let mut conn_set: JoinSet<()> = JoinSet::new();
 
@@ -639,13 +715,15 @@ async fn run_listener<P>(
                     Ok((stream, peer)) => {
                         match Arc::clone(&sem).try_acquire_owned() {
                             Ok(permit) => {
-                                // Read the live protocol: a reconcile may have
-                                // switched this port (e.g. Https → TlsHybrid) since
-                                // the listener was bound, without rebinding it.
+                                // Snapshot the live protocol and PROXY config.  A
+                                // reconcile may have switched either (e.g. Https →
+                                // TlsHybrid, or new ClientTrafficPolicy) since the
+                                // listener was bound, without rebinding the socket.
                                 let protocol = *proto_rx.borrow();
+                                let proxy_protocol = proxy_config_rx.borrow().clone();
                                 let handler = ConnHandler {
                                     proxy: Arc::clone(&cfg.proxy),
-                                    trusted: cfg.trusted.as_ref().map(Arc::clone),
+                                    proxy_protocol,
                                     tls_selector: cfg.tls_selector.clone(),
                                     local_addr: addr,
                                     protocol,
@@ -721,7 +799,13 @@ async fn run_listener<P>(
 
 /// Dispatch one connection on a TLS L4 port (passthrough or terminate, no HTTP layer).
 ///
-/// Peeks the ClientHello SNI via MSG_PEEK (bytes stay in the kernel queue).
+/// When the listener has PROXY protocol enabled and the peer is trusted, the
+/// PROXY header is stripped first via `peek_and_drain_proxy_header` so the
+/// remaining stream starts at the raw TLS ClientHello. The ClientHello bytes are
+/// still in the kernel queue after the drain (MSG_PEEK leaves them intact;
+/// `read_exact` drains only the header).
+///
+/// After any PROXY stripping, peeks the ClientHello SNI via MSG_PEEK.
 /// Checks the passthrough table first, then the terminate table. When
 /// `allow_https_fallthrough` is `true` (hybrid port) and neither table
 /// matches, falls through to HTTPS only if the port has a certificate for
@@ -731,7 +815,7 @@ async fn run_listener<P>(
 /// or `Some(tcp)` when the caller should fall through to the HTTPS path
 /// (only possible when `allow_https_fallthrough` is `true`).
 async fn dispatch_tls_l4<P>(
-    tcp: TcpStream,
+    mut tcp: TcpStream,
     peer_addr: SocketAddr,
     handler: &ConnHandler<P>,
     allow_https_fallthrough: bool,
@@ -740,6 +824,35 @@ where
     P: ProxyHttp + Send + Sync + 'static,
     <P as ProxyHttp>::CTX: Send + Sync,
 {
+    // Strip PROXY header before SNI peeking (#471).  Must come first so the
+    // SNI-peek sees the raw TLS ClientHello bytes, not the PROXY preamble.
+    if let Some(pp) = handler.proxy_protocol.as_ref().filter(|pp| pp.enabled) {
+        if !pp.is_trusted(&peer_addr.ip()) {
+            tracing::debug!(peer = %peer_addr, "TLS L4: rejecting connection from untrusted source (PROXY enabled)");
+            return None;
+        }
+        match peek_and_drain_proxy_header(&mut tcp, peer_addr).await {
+            Ok(real_addr) => {
+                // The L4 splice path has no HTTP layer and no CONN_INFO task-local,
+                // so `real_addr` appears only in the debug log below (sufficient for
+                // diagnosing PROXY-header issues on passthrough listeners).
+                tracing::debug!(
+                    peer = %peer_addr,
+                    real = %real_addr,
+                    "TLS L4: stripped PROXY header"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    peer = %peer_addr,
+                    error = %e,
+                    "TLS L4: PROXY header read failed, dropping connection"
+                );
+                return None;
+            }
+        }
+    }
+
     let port = handler.local_addr.port();
     let sni = match peek_sni(&tcp).await {
         Ok(s) => s,
@@ -815,11 +928,12 @@ where
 
 /// Handle one accepted TCP connection.
 ///
-/// Dispatches based on protocol and trust configuration:
-/// - `TlsL4`: peek SNI, match passthrough or terminate routing table, splice — no HTTP.
+/// Dispatches based on protocol and PROXY-protocol configuration:
+/// - `TlsL4`: strip PROXY header (if enabled), peek SNI, splice passthrough or terminate.
 /// - `TlsHybrid`: same as `TlsL4` but falls through to HTTPS if no L4 route matches.
-/// - PROXY-protocol path (when `trusted` is `Some`): read PROXY header, run HTTP/1.1 loop.
-/// - Standard Pingora path (when `trusted` is `None`): ALPN, HTTP/1.1 and HTTP/2.
+/// - PROXY-protocol path (when `proxy_protocol` is `Some` and `enabled`): strip PROXY header,
+///   inject real client address, then run the Pingora HTTP loop.
+/// - Standard Pingora path: ALPN, HTTP/1.1 and HTTP/2 without PROXY handling.
 async fn handle_connection<P>(
     tcp: TcpStream,
     peer_addr: SocketAddr,
@@ -856,7 +970,7 @@ async fn handle_connection<P>(
     // Scope the cert selector to the bind port this connection arrived on (#472)
     // so TLS-terminate only consults that port's certs.
     let scoped_selector = handler.tls_selector.for_port(handler.local_addr.port());
-    if let Some(trusted) = handler.trusted {
+    if let Some(pp) = handler.proxy_protocol.filter(|pp| pp.enabled) {
         handle_proxy_protocol(
             tcp,
             peer_addr,
@@ -864,7 +978,7 @@ async fn handle_connection<P>(
             effective_protocol,
             ProxyProtocolConn {
                 proxy: handler.proxy,
-                trusted,
+                proxy_protocol: pp,
                 tls_selector: scoped_selector,
             },
             conn_shutdown,
@@ -1036,15 +1150,15 @@ async fn handle_standard<P>(
 }
 
 /// Aggregated inputs for the PROXY-protocol connection handler, grouping the
-/// proxy, trust policy, and TLS selector so the function stays under the
-/// argument-count limit.
+/// proxy, per-listener PROXY config, and TLS selector so the function stays
+/// under the argument-count limit.
 struct ProxyProtocolConn<P>
 where
     P: ProxyHttp + Send + Sync + 'static,
     <P as ProxyHttp>::CTX: Send + Sync,
 {
     proxy: Arc<HttpProxy<P>>,
-    trusted: Arc<TrustedSources>,
+    proxy_protocol: ProxyProtocolListenerConfig,
     tls_selector: SniCertSelector,
 }
 
@@ -1064,7 +1178,7 @@ async fn handle_proxy_protocol<P>(
     P: ProxyHttp + Send + Sync + 'static,
     <P as ProxyHttp>::CTX: Send + Sync,
 {
-    if !conn.trusted.contains(&peer_addr.ip()) {
+    if !conn.proxy_protocol.is_trusted(&peer_addr.ip()) {
         tracing::debug!(peer = %peer_addr, "rejecting connection from untrusted source");
         return;
     }
@@ -1073,7 +1187,7 @@ async fn handle_proxy_protocol<P>(
     // block graceful drain.
     let real_addr = tokio::select! {
         _ = conn_shutdown.changed() => return,
-        result = read_proxy_header(&mut tcp, peer_addr) => match result {
+        result = peek_and_drain_proxy_header(&mut tcp, peer_addr) => match result {
             Ok(addr) => addr,
             Err(e) => {
                 tracing::debug!(peer = %peer_addr, error = %e, "PROXY header read failed, dropping connection");
@@ -1185,133 +1299,140 @@ pub(crate) fn build_tls_context(
 
 // ── PROXY protocol parsing ────────────────────────────────────────────────────
 
-/// Read a PROXY protocol v1 or v2 header from the stream.
+/// Peek-then-drain a PROXY protocol v1 or v2 header from `tcp`.
 ///
-/// Returns the real source [`SocketAddr`] from the header, or the TCP peer
-/// address when the header carries `UNKNOWN` / `LOCAL` (no address info).
+/// Uses `MSG_PEEK` to detect and measure the header, then `read_exact` to
+/// consume exactly those bytes so the payload (TLS ClientHello or HTTP data)
+/// remains in the kernel queue for the caller's subsequent `read` / `peek_sni`.
+///
+/// Returns the real source [`SocketAddr`] carried by the header, or `fallback`
+/// for `LOCAL` commands and `UNKNOWN` / unspecified address families.
 ///
 /// # Errors
 ///
-/// Returns [`ProxyHeaderError`] if no valid PROXY header is found (strict
-/// mode: drop connection).
-async fn read_proxy_header(
+/// - [`ProxyHeaderError::Timeout`] — no complete header within 5 s.
+/// - [`ProxyHeaderError::Io`] — connection closed or I/O error.
+/// - [`ProxyHeaderError::TooLarge`] — peek buffer grew to [`MAX_PROXY_PEEK`]
+///   without completing a parse.
+/// - [`ProxyHeaderError::BadPreamble`] — the bytes present do not form a valid
+///   PROXY v1 or v2 header (strict mode: drop the connection).
+async fn peek_and_drain_proxy_header(
     tcp: &mut TcpStream,
     fallback: SocketAddr,
 ) -> Result<SocketAddr, ProxyHeaderError> {
-    const V2_SIG: &[u8; 12] = b"\r\n\r\n\0\r\nQUIT\n";
     const TIMEOUT: Duration = Duration::from_secs(5);
 
-    let mut preamble = [0u8; 12];
-    tokio::time::timeout(TIMEOUT, tcp.read_exact(&mut preamble))
-        .await
-        .map_err(|_| ProxyHeaderError::Timeout)??;
+    tokio::time::timeout(TIMEOUT, async move {
+        let mut buf = vec![0u8; 32]; // start small, double when buffer fills
 
-    if &preamble == V2_SIG {
-        parse_proxy_v2(tcp, fallback).await
-    } else if preamble.starts_with(b"PROXY ") {
-        parse_proxy_v1(tcp, &preamble, fallback).await
-    } else {
-        Err(ProxyHeaderError::BadPreamble)
-    }
-}
-
-async fn parse_proxy_v2(
-    tcp: &mut TcpStream,
-    fallback: SocketAddr,
-) -> Result<SocketAddr, ProxyHeaderError> {
-    let mut hdr = [0u8; 4];
-    tcp.read_exact(&mut hdr).await?;
-
-    let cmd = hdr[0] & 0x0f;
-    let family = (hdr[1] >> 4) & 0x0f;
-    let proto = hdr[1] & 0x0f;
-    let addr_len = u16::from_be_bytes([hdr[2], hdr[3]]) as usize;
-
-    if addr_len > 536 {
-        return Err(ProxyHeaderError::TooLarge(addr_len));
-    }
-
-    let mut addr_block = vec![0u8; addr_len];
-    tcp.read_exact(&mut addr_block).await?;
-
-    if cmd == 0 {
-        return Ok(fallback);
-    }
-
-    match (family, proto) {
-        (1, 1) if addr_len >= 12 => {
-            let src_ip = std::net::Ipv4Addr::from([
-                addr_block[0],
-                addr_block[1],
-                addr_block[2],
-                addr_block[3],
-            ]);
-            let src_port = u16::from_be_bytes([addr_block[8], addr_block[9]]);
-            Ok(SocketAddr::new(src_ip.into(), src_port))
-        }
-        (2, 1) if addr_len >= 36 => {
-            let src_ip_bytes: [u8; 16] = addr_block[0..16]
-                .try_into()
-                .unwrap_or_else(|_| panic!("guarded by addr_len >= 36 check above"));
-            let src_ip = std::net::Ipv6Addr::from(src_ip_bytes);
-            let src_port = u16::from_be_bytes([addr_block[32], addr_block[33]]);
-            Ok(SocketAddr::new(src_ip.into(), src_port))
-        }
-        _ => Ok(fallback),
-    }
-}
-
-async fn parse_proxy_v1(
-    tcp: &mut TcpStream,
-    preamble: &[u8; 12],
-    fallback: SocketAddr,
-) -> Result<SocketAddr, ProxyHeaderError> {
-    let mut line: Vec<u8> = preamble.to_vec();
-    loop {
-        let mut byte = [0u8; 1];
-        tcp.read_exact(&mut byte).await?;
-        line.push(byte[0]);
-        if line.len() > 108 {
-            return Err(ProxyHeaderError::V1TooLarge);
-        }
-        if line.ends_with(b"\r\n") {
-            break;
-        }
-    }
-
-    let header = line
-        .strip_suffix(b"\r\n")
-        .unwrap_or_else(|| panic!("loop exits only when ends_with(\\r\\n)"));
-    let s = std::str::from_utf8(header)?;
-    let parts: Vec<&str> = s.split(' ').collect();
-
-    if parts.len() < 2 {
-        return Err(ProxyHeaderError::MalformedV1("too few fields"));
-    }
-
-    match parts[1] {
-        "TCP4" | "TCP6" => {
-            if parts.len() != 6 {
-                return Err(ProxyHeaderError::MalformedV1("expected 6 fields for TCP"));
+        // Grow-and-peek loop: expand `buf` until ppp can parse a complete header.
+        //
+        // When `ppp` says incomplete we must wait for new data before re-peeking.
+        // Without `tcp.readable().await`, re-peeking immediately returns the same
+        // partial bytes already in the kernel buffer — the buffer would grow to
+        // `MAX_PROXY_PEEK` in microseconds and spuriously report `TooLarge` on a
+        // legitimately fragmented PROXY header.
+        let (real_addr, header_len) = loop {
+            let n = tcp.peek(&mut buf).await.map_err(ProxyHeaderError::Io)?;
+            if n == 0 {
+                return Err(ProxyHeaderError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "connection closed before PROXY header",
+                )));
             }
-            let src_ip: IpAddr = parts[2]
-                .parse()
-                .map_err(|_| ProxyHeaderError::MalformedV1("invalid source IP"))?;
-            let src_port: u16 = parts[4]
-                .parse()
-                .map_err(|_| ProxyHeaderError::MalformedV1("invalid source port"))?;
-            Ok(SocketAddr::new(src_ip, src_port))
-        }
-        "UNKNOWN" => Ok(fallback),
-        other => Err(ProxyHeaderError::UnknownProtocol(other.to_owned())),
-    }
+
+            let result = ppp::HeaderResult::parse(&buf[..n]);
+
+            if result.is_incomplete() {
+                // Only grow when the buffer was full; if n < buf.len() the current
+                // capacity is already sufficient, just waiting for more bytes.
+                if n == buf.len() {
+                    if buf.len() >= MAX_PROXY_PEEK {
+                        return Err(ProxyHeaderError::TooLarge(MAX_PROXY_PEEK));
+                    }
+                    buf.resize((buf.len() * 2).min(MAX_PROXY_PEEK), 0);
+                }
+                // Wait for the kernel to deliver more bytes before re-peeking.
+                // After `tcp.peek` consumes the readiness event, `readable()` blocks
+                // until a new EPOLLIN fires (i.e., fresh bytes have arrived).
+                tcp.readable().await.map_err(ProxyHeaderError::Io)?;
+                continue;
+            }
+
+            // Parse completed.  Extract the source address and header byte length
+            // before the borrow on `buf` ends.
+            let pair = match result {
+                ppp::HeaderResult::V1(Ok(ref hdr)) => {
+                    use ppp::v1::Addresses;
+                    let addr = match &hdr.addresses {
+                        Addresses::Tcp4(a) => {
+                            SocketAddr::new(std::net::IpAddr::V4(a.source_address), a.source_port)
+                        }
+                        Addresses::Tcp6(a) => {
+                            SocketAddr::new(std::net::IpAddr::V6(a.source_address), a.source_port)
+                        }
+                        Addresses::Unknown => fallback,
+                    };
+                    (addr, hdr.header.len())
+                }
+                ppp::HeaderResult::V2(Ok(ref hdr)) => {
+                    use ppp::v2::{Addresses, Command};
+                    let addr = if matches!(hdr.command, Command::Local) {
+                        fallback
+                    } else {
+                        match &hdr.addresses {
+                            Addresses::IPv4(a) => SocketAddr::new(
+                                std::net::IpAddr::V4(a.source_address),
+                                a.source_port,
+                            ),
+                            Addresses::IPv6(a) => SocketAddr::new(
+                                std::net::IpAddr::V6(a.source_address),
+                                a.source_port,
+                            ),
+                            // Unix sockets and unspecified → no client address info.
+                            _ => fallback,
+                        }
+                    };
+                    (addr, hdr.header.len())
+                }
+                // Parse failed: not a PROXY v1 or v2 header.
+                ppp::HeaderResult::V1(Err(_)) | ppp::HeaderResult::V2(Err(_)) => {
+                    return Err(ProxyHeaderError::BadPreamble);
+                }
+            };
+            break pair;
+        };
+
+        // Drain exactly the header bytes from the kernel queue.
+        // The payload (TLS ClientHello or HTTP) stays for the next read/peek.
+        let mut drain = vec![0u8; header_len];
+        tcp.read_exact(&mut drain)
+            .await
+            .map_err(ProxyHeaderError::Io)?;
+
+        Ok(real_addr)
+    })
+    .await
+    .map_err(|_| ProxyHeaderError::Timeout)?
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
     use super::*;
+
+    fn active_state(
+        protocol: ListenerProtocol,
+        proxy_protocol: Option<ProxyProtocolListenerConfig>,
+    ) -> ActiveListenerState {
+        ActiveListenerState {
+            protocol,
+            proxy_protocol,
+        }
+    }
 
     #[test]
     fn listener_spec_equality_and_hash() {
@@ -1344,14 +1465,17 @@ mod tests {
         let addr_a: SocketAddr = "127.0.0.1:8080".parse().unwrap();
         let addr_b: SocketAddr = "127.0.0.1:8081".parse().unwrap();
 
-        let active: HashMap<SocketAddr, ListenerProtocol> =
-            [(addr_a, ListenerProtocol::Http)].into_iter().collect();
+        let active: HashMap<SocketAddr, ActiveListenerState> =
+            [(addr_a, active_state(ListenerProtocol::Http, None))]
+                .into_iter()
+                .collect();
         let desired: HashSet<ListenerSpec> = [ListenerSpec::http(addr_b)].into_iter().collect();
 
         let plan = plan_listener_changes(&active, &desired);
 
         assert_eq!(plan.remove, vec![addr_a]);
         assert!(plan.reprotocol.is_empty());
+        assert!(plan.reproxy.is_empty());
         assert_eq!(plan.add, vec![ListenerSpec::http(addr_b)]);
     }
 
@@ -1363,22 +1487,27 @@ mod tests {
         // never a no-op (which left passthrough stuck terminating) nor a
         // remove+add (which races the draining old listener for the socket).
         let addr: SocketAddr = "0.0.0.0:443".parse().unwrap();
-        let active: HashMap<SocketAddr, ListenerProtocol> =
-            [(addr, ListenerProtocol::Https)].into_iter().collect();
+        let active: HashMap<SocketAddr, ActiveListenerState> =
+            [(addr, active_state(ListenerProtocol::Https, None))]
+                .into_iter()
+                .collect();
         let desired: HashSet<ListenerSpec> = [ListenerSpec::tls_hybrid(addr)].into_iter().collect();
 
         let plan = plan_listener_changes(&active, &desired);
 
         assert!(plan.remove.is_empty(), "socket must stay bound");
         assert!(plan.add.is_empty(), "no rebind");
+        assert!(plan.reproxy.is_empty());
         assert_eq!(plan.reprotocol, vec![ListenerSpec::tls_hybrid(addr)]);
     }
 
     #[test]
     fn plan_listener_changes_noop_when_protocol_unchanged() {
         let addr: SocketAddr = "0.0.0.0:443".parse().unwrap();
-        let active: HashMap<SocketAddr, ListenerProtocol> =
-            [(addr, ListenerProtocol::TlsHybrid)].into_iter().collect();
+        let active: HashMap<SocketAddr, ActiveListenerState> =
+            [(addr, active_state(ListenerProtocol::TlsHybrid, None))]
+                .into_iter()
+                .collect();
         let desired: HashSet<ListenerSpec> = [ListenerSpec::tls_hybrid(addr)].into_iter().collect();
 
         let plan = plan_listener_changes(&active, &desired);
@@ -1386,27 +1515,58 @@ mod tests {
         assert_eq!(plan, ListenerPlan::default(), "stable set: no churn");
     }
 
-    use std::net::{IpAddr, Ipv4Addr};
+    #[test]
+    fn plan_listener_changes_detects_reproxy_without_rebind() {
+        // When the protocol is unchanged but the PROXY config changes (e.g. a new
+        // ClientTrafficPolicy enables PROXY on a port), the plan must produce a
+        // `reproxy` entry — not `reprotocol` or `add` — so the socket stays bound
+        // and only the in-process config is updated.
+        let addr: SocketAddr = "0.0.0.0:443".parse().unwrap();
+        let active: HashMap<SocketAddr, ActiveListenerState> =
+            [(addr, active_state(ListenerProtocol::Https, None))]
+                .into_iter()
+                .collect();
+
+        let net: ipnet::IpNet = "10.0.0.0/8".parse().unwrap();
+        let pp = ProxyProtocolListenerConfig::new(true, vec![net]);
+        let desired: HashSet<ListenerSpec> = [ListenerSpec {
+            addr,
+            protocol: ListenerProtocol::Https,
+            proxy_protocol: Some(pp),
+        }]
+        .into_iter()
+        .collect();
+
+        let plan = plan_listener_changes(&active, &desired);
+
+        assert!(plan.remove.is_empty(), "socket must stay bound");
+        assert!(plan.add.is_empty(), "no rebind");
+        assert!(plan.reprotocol.is_empty(), "protocol unchanged");
+        assert_eq!(plan.reproxy.len(), 1, "proxy config changed in place");
+        assert_eq!(plan.reproxy[0].addr, addr);
+    }
+
+    // ── ProxyProtocolListenerConfig tests ────────────────────────────────────
 
     #[test]
-    fn trusted_sources_contains_ip_in_range() {
+    fn proxy_protocol_config_is_trusted_checks_cidrs() {
         let net: ipnet::IpNet = "192.168.1.0/24".parse().unwrap();
-        let ts = TrustedSources::new(vec![net]);
-        assert!(ts.contains(&"192.168.1.100".parse::<IpAddr>().unwrap()));
-        assert!(!ts.contains(&"10.0.0.1".parse::<IpAddr>().unwrap()));
+        let pp = ProxyProtocolListenerConfig::new(true, vec![net]);
+        assert!(pp.is_trusted(&"192.168.1.100".parse::<IpAddr>().unwrap()));
+        assert!(!pp.is_trusted(&"10.0.0.1".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
-    fn trusted_sources_loopback() {
+    fn proxy_protocol_config_loopback() {
         let net: ipnet::IpNet = "127.0.0.1/32".parse().unwrap();
-        let ts = TrustedSources::new(vec![net]);
-        assert!(ts.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
-        assert!(!ts.contains(&"192.168.0.1".parse::<IpAddr>().unwrap()));
+        let pp = ProxyProtocolListenerConfig::new(true, vec![net]);
+        assert!(pp.is_trusted(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(!pp.is_trusted(&"192.168.0.1".parse::<IpAddr>().unwrap()));
     }
 
     #[test]
-    fn trusted_sources_empty_rejects_all() {
-        let ts = TrustedSources::new(vec![]);
-        assert!(!ts.contains(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
+    fn proxy_protocol_config_empty_rejects_all() {
+        let pp = ProxyProtocolListenerConfig::new(true, vec![]);
+        assert!(!pp.is_trusted(&IpAddr::V4(Ipv4Addr::LOCALHOST)));
     }
 }

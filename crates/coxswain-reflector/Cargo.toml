@@ -35,4 +35,5 @@ tracing = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
+serde_yaml = { workspace = true }
 tracing-test = { workspace = true }

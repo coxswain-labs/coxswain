@@ -11,7 +11,9 @@
 
 use crate::ownership::ObjectKey;
 use arc_swap::ArcSwap;
+use ipnet::IpNet;
 use std::collections::{BTreeMap, HashMap};
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::sync::watch;
 
@@ -399,6 +401,44 @@ impl RouteNamespaceSet {
     }
 }
 
+/// Resolved PROXY protocol configuration for one listener.
+///
+/// Produced by the reflector from a `ClientTrafficPolicy` (Gateway listeners)
+/// or from the `--ingress-accept-proxy-protocol` flag (Ingress-origin listeners).
+/// Consumed by the acceptor in `coxswain-proxy` to decide whether to parse and
+/// strip a PROXY v1/v2 header before dispatching each connection.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ProxyProtocolListenerConfig {
+    /// When `true`, every accepted connection must carry a valid PROXY v1/v2 header.
+    /// Connections without a valid header (or from untrusted peers) are dropped.
+    pub enabled: bool,
+    /// CIDR allow-list of peers permitted to send PROXY headers. Connections from
+    /// peers outside this list are dropped immediately, before the header is read.
+    /// Should be non-empty when `enabled` is `true`; an empty list rejects all
+    /// connections.
+    pub trusted_sources: Vec<IpNet>,
+}
+
+impl ProxyProtocolListenerConfig {
+    /// Construct a resolved per-listener PROXY protocol config.
+    ///
+    /// `enabled` gates whether the proxy expects a PROXY header; `trusted_sources`
+    /// is the CIDR allow-list of peers permitted to send one.
+    pub fn new(enabled: bool, trusted_sources: Vec<IpNet>) -> Self {
+        Self {
+            enabled,
+            trusted_sources,
+        }
+    }
+
+    /// Returns `true` if `ip` falls within at least one of the trusted CIDR ranges.
+    #[must_use]
+    pub fn is_trusted(&self, ip: &IpAddr) -> bool {
+        self.trusted_sources.iter().any(|n| n.contains(ip))
+    }
+}
+
 /// Consolidated per-listener metadata for one Gateway listener.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default)]
@@ -449,6 +489,11 @@ pub struct ListenerInfo {
     /// resource (Gateway or `ListenerSet`). Always `None` for Gateways without attached
     /// ListenerSets.
     pub conflict: ConflictReason,
+    /// PROXY protocol configuration resolved for this listener from a `ClientTrafficPolicy`.
+    ///
+    /// `None` means no policy targets this listener; the acceptor defaults to off.
+    /// Transported over the discovery wire so the data-plane proxy can enforce it.
+    pub proxy_protocol: Option<ProxyProtocolListenerConfig>,
 }
 
 impl ListenerInfo {

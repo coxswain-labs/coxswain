@@ -1,0 +1,183 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: clienttrafficpolicies.gateway.coxswain-labs.dev
+spec:
+  group: gateway.coxswain-labs.dev
+  names:
+    categories: []
+    kind: ClientTrafficPolicy
+    plural: clienttrafficpolicies
+    shortNames: []
+    singular: clienttrafficpolicy
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for ClientTrafficPolicySpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Policy that enables PROXY protocol v1/v2 acceptance on one or more Gateway
+              listeners without restarting the proxy.
+
+              A `ClientTrafficPolicy` in namespace `ns` targets the `Gateway` objects in
+              `targetRefs`. When `sectionName` is set it applies to a single named
+              listener; when omitted it applies to every listener on that Gateway.
+
+              Section-scoped policies take precedence over Gateway-scoped ones. If two
+              section-scoped policies target the same listener, the later-created one is
+              accepted and the earlier one receives `Conflicted=True`.
+            properties:
+              proxyProtocol:
+                description: |-
+                  PROXY protocol v1/v2 acceptance settings.
+
+                  When `None` the policy has no effect (a no-op policy is valid but
+                  immediately accepted with zero impact).
+                nullable: true
+                properties:
+                  enabled:
+                    description: |-
+                      When `true`, every accepted connection must carry a valid PROXY v1 or
+                      v2 header. Connections without a valid header, or from peers outside
+                      `trustedSources`, are dropped immediately.
+                    type: boolean
+                  trustedSources:
+                    description: |-
+                      CIDR allow-list of peers permitted to send PROXY headers (e.g.
+                      `["10.0.0.0/8", "192.168.1.0/24"]`). Should be non-empty when
+                      `enabled` is `true`; an empty list causes all connections to be
+                      rejected, which is logged as a warning.
+                    items:
+                      type: string
+                    type: array
+                required:
+                - enabled
+                type: object
+              targetRefs:
+                description: |-
+                  Gateways (and optionally specific listeners) this policy targets.
+
+                  Each entry must reference a `gateway.networking.k8s.io/Gateway` in the
+                  same namespace. The `sectionName` field narrows the target to a single
+                  named listener on that Gateway.
+                items:
+                  description: |-
+                    A reference to a specific Gateway or one of its named listeners.
+
+                    Mirrors the Gateway API `LocalPolicyTargetReferenceWithSectionName` shape
+                    without importing the generated types, so we control the schema.
+                  properties:
+                    group:
+                      description: API group of the target resource. Must be `gateway.networking.k8s.io`.
+                      type: string
+                    kind:
+                      description: Kind of the target resource. Must be `Gateway`.
+                      type: string
+                    name:
+                      description: Name of the target Gateway in the same namespace as this policy.
+                      type: string
+                    sectionName:
+                      description: |-
+                        Optional name of a specific listener on the Gateway. When omitted the
+                        policy applies to all listeners.
+                      nullable: true
+                      type: string
+                  required:
+                  - group
+                  - kind
+                  - name
+                  type: object
+                type: array
+            required:
+            - targetRefs
+            type: object
+          status:
+            description: Status written back to the `ClientTrafficPolicy` by the controller.
+            nullable: true
+            properties:
+              ancestors:
+                description: Per-ancestor policy conditions.
+                items:
+                  description: Status of this policy with respect to one ancestor (Gateway or listener).
+                  properties:
+                    ancestorRef:
+                      description: |-
+                        Reference to the Gateway (and optionally listener) this ancestor entry
+                        describes.
+                      properties:
+                        group:
+                          description: API group of the ancestor.
+                          nullable: true
+                          type: string
+                        kind:
+                          description: Kind of the ancestor.
+                          nullable: true
+                          type: string
+                        name:
+                          description: Name of the ancestor Gateway.
+                          type: string
+                        namespace:
+                          description: Namespace of the ancestor (omit for cluster-scoped resources).
+                          nullable: true
+                          type: string
+                        sectionName:
+                          description: Listener name, if this entry is specific to one listener.
+                          nullable: true
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    conditions:
+                      description: Conditions for this ancestor.
+                      items:
+                        description: Condition contains details for one aspect of the current state of this API Resource.
+                        properties:
+                          lastTransitionTime:
+                            description: lastTransitionTime is the last time the condition transitioned from one status to another. This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                            format: date-time
+                            type: string
+                          message:
+                            description: message is a human readable message indicating details about the transition. This may be an empty string.
+                            type: string
+                          observedGeneration:
+                            description: observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date with respect to the current state of the instance.
+                            format: int64
+                            type: integer
+                          reason:
+                            description: reason contains a programmatic identifier indicating the reason for the condition's last transition. Producers of specific condition types may define expected values and meanings for this field, and whether the values are considered a guaranteed API. The value should be a CamelCase string. This field may not be empty.
+                            type: string
+                          status:
+                            description: status of the condition, one of True, False, Unknown.
+                            type: string
+                          type:
+                            description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                            type: string
+                        required:
+                        - lastTransitionTime
+                        - message
+                        - reason
+                        - status
+                        - type
+                        type: object
+                      type: array
+                    controllerName:
+                      description: The controller that wrote this entry.
+                      type: string
+                  required:
+                  - ancestorRef
+                  - controllerName
+                  type: object
+                type: array
+            type: object
+        required:
+        - spec
+        title: ClientTrafficPolicy
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

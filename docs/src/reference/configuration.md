@@ -69,7 +69,7 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_LOG` | `--log` | `info` | Log level; supports `RUST_LOG` directive syntax (e.g. `info,coxswain=debug`) |
 | `COXSWAIN_LOG_FORMAT` | `--log-format` | `json` | `json` (production) or `console` (human-readable) |
 | `COXSWAIN_MANAGEMENT_BIND_ADDRESS` | `--management-bind-address` | `0.0.0.0` | IP the health (`/healthz`, `/readyz`) and admin (`/metrics`, `/api/v1/routes`) servers bind to |
-| `COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL` | `--proxy-accept-proxy-protocol` | `false` | Require HAProxy PROXY v1/v2 on inbound connections; must be combined with `--proxy-trusted-sources`. Note: h2c prior-knowledge and h2 ALPN are not available on PROXY-wrapped connections (h1-only on that path). |
+| `COXSWAIN_INGRESS_ACCEPT_PROXY_PROTOCOL` | `--ingress-accept-proxy-protocol` | `false` | Require HAProxy PROXY v1/v2 on **Ingress** inbound connections; must be combined with `--ingress-proxy-trusted-sources`. Note: h2c prior-knowledge and h2 ALPN are not available on PROXY-wrapped connections (h1-only on that path). Gateway listeners use `ClientTrafficPolicy` instead (see below). |
 | `COXSWAIN_PROXY_BIND_ADDRESS` | `--proxy-bind-address` | `0.0.0.0` | IP the data-plane HTTP/HTTPS proxy listeners bind to; health and admin bind separately via `--management-bind-address` |
 | `COXSWAIN_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT` | `--proxy-default-backend-request-timeout` | _(none)_ | Default upstream-only timeout when `HTTPRouteRule.timeouts.backendRequest` is not set |
 | `COXSWAIN_PROXY_DEFAULT_REQUEST_TIMEOUT` | `--proxy-default-request-timeout` | _(none)_ | Default total request timeout (client → proxy → upstream → client) when `HTTPRouteRule.timeouts.request` is not set |
@@ -78,7 +78,7 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_PROXY_SHUTDOWN_TIMEOUT` | `--proxy-shutdown-timeout` | `5s` | Hard deadline after the grace period; remaining connections are forcibly closed |
 | `COXSWAIN_PROXY_THREADS` | `--proxy-threads` | `2` | Worker threads per proxy service; set to CPU core count for maximum throughput |
 | `COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE` | `--proxy-upstream-keepalive-pool-size` | `128` | Maximum idle upstream connections in Pingora's keepalive pool; connections beyond the limit are evicted LRU |
-| `COXSWAIN_PROXY_TRUSTED_SOURCES` | `--proxy-trusted-sources` | _(none)_ | Comma-separated CIDRs allowed to send PROXY-protocol headers; only meaningful with `--proxy-accept-proxy-protocol` |
+| `COXSWAIN_INGRESS_PROXY_TRUSTED_SOURCES` | `--ingress-proxy-trusted-sources` | _(none)_ | Comma-separated CIDRs allowed to send PROXY-protocol headers on Ingress listeners; only meaningful with `--ingress-accept-proxy-protocol` |
 | `COXSWAIN_STATUS_ADDRESS` | `--status-address` | _(none)_ | IP or hostname written to `Ingress.status` and `Gateway.status.addresses`; required for cert-manager HTTP-01 and external-dns |
 | `COXSWAIN_WATCH_NAMESPACE` | `--watch-namespace` | _(cluster-wide)_ | Restrict the controller and proxy watch to a single namespace; both pods must be set to the same value |
 | `POD_NAME` | `--pod-name` | `coxswain-local` | Pod name used as the leader-election holder identity |
@@ -118,7 +118,50 @@ Coxswain supports HTTP/2 on both the downstream (client → proxy) and upstream 
 - **h2c (cleartext HTTP/2, prior-knowledge)** — automatic on plain-TCP listeners. The h2c preface is detected non-destructively; HTTP/1.1 clients on the same port are unaffected.
 - **Upstream h2c** — enabled per-route via `appProtocol: kubernetes.io/h2c` on the backend `Service` port (Gateway API GEP-1911 `HTTPRouteBackendProtocolH2C`).
 
-**PROXY-protocol restriction:** when `--proxy-accept-proxy-protocol` is set, inbound connections are h1-only. h2c prior-knowledge and h2 ALPN are disabled on PROXY-wrapped connections.
+**PROXY-protocol restriction:** when `--ingress-accept-proxy-protocol` is set, Ingress inbound connections are h1-only. h2c prior-knowledge and h2 ALPN are disabled on PROXY-wrapped connections.
+
+## PROXY protocol
+
+Coxswain supports HAProxy PROXY protocol v1 and v2 for real client-IP propagation behind L4 load balancers. The mechanism differs by listener origin:
+
+### Gateway listeners — `ClientTrafficPolicy`
+
+Gateway listeners (including TLS passthrough/hybrid) are configured per-listener through the `ClientTrafficPolicy` CRD. This is dynamic: the controller reconciles policies at runtime with no proxy restart.
+
+```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: my-ctp
+  namespace: default
+spec:
+  targetRefs:
+  - group: gateway.networking.k8s.io
+    kind: Gateway
+    name: my-gateway
+    # Optional: scope to one listener. Omit to apply to all listeners on the Gateway.
+    sectionName: https
+  proxyProtocol:
+    enabled: true
+    trustedSources:
+    - 10.0.0.0/8
+    - 192.168.0.0/16
+```
+
+**Precedence (GEP-713):** a section-scoped policy (with `sectionName`) beats a gateway-scoped one for the targeted listener. When two policies at the same scope target the same listener, the older `creationTimestamp` wins; the loser receives `Accepted=False / Conflicted=True` in `status.ancestors[]`.
+
+**TLS passthrough:** PROXY headers are stripped before SNI detection, so passthrough routes work correctly whether or not PROXY headers are present. Without a `ClientTrafficPolicy`, PROXY headers on passthrough listeners are treated as raw connection bytes and cause the SNI lookup to fail.
+
+### Ingress listeners — flags
+
+Ingress listeners are configured globally via two flags (or the equivalent Helm values). This applies to the entire Ingress plane; per-listener granularity is not available for Ingress because both `:80` and `:443` share a single L4 front load balancer.
+
+| Flag | Helm value | Default | Description |
+|------|-----------|---------|-------------|
+| `--ingress-accept-proxy-protocol` | `proxy.shared.acceptProxyProtocol` | `false` | Enable PROXY v1/v2 on Ingress listeners |
+| `--ingress-proxy-trusted-sources` | `proxy.shared.trustedSources` | _(none)_ | CIDRs whose connections carry PROXY headers |
+
+These flags do not affect Gateway listeners. Gateway listeners are always governed by `ClientTrafficPolicy`.
 
 ## Discovery control plane
 
