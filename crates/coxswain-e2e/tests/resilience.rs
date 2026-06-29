@@ -441,12 +441,14 @@ async fn dedicated_crash_loop_keeps_serving_via_shared() -> anyhow::Result<()> {
 
     fixtures::apply_fixture(gwa::CUTOVER_CRASH_LOOP, FixtureVars::new(&ns.name)).await?;
 
-    // White-box: address the SHARED pool's fixed Gateway-HTTP port directly, NOT
-    // this Gateway's own VIP (#472). The Gateway is dedicated-mode, so its
-    // advertised address points at the NotReady (crash-looping) dedicated
-    // Service; the invariant under test is that the SHARED pool keeps serving
-    // the route until cut-over, which is only observable on the shared listener.
-    let addr = h.controller.gateway_http_addr;
+    // White-box: port-forward directly to the shared-proxy pod's Gateway HTTP
+    // port, NOT the Gateway's own VIP (#472). The Gateway is dedicated-mode, so
+    // no per-Gateway VIP exists; the dedicated Service selects the crash-looping
+    // (ImagePullBackOff) pods. The invariant under test is that the SHARED pool
+    // keeps serving the route until cut-over — only observable on the shared
+    // pod's listener, hence the direct pod port-forward.
+    let pf = h.controller.gateway_http_forward().await?;
+    let addr = pf.addr;
     let host = format!("crash.{}.local", ns.name);
 
     wait_for_listener(addr, &host, Duration::from_secs(30)).await?;
