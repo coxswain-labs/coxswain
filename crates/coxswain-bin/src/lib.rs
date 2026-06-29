@@ -112,6 +112,8 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
                 args.common.ingress_http_port,
                 args.common.ingress_https_port,
             ),
+            enable_gateway_api: !args.common.disable_gateway_api,
+            enable_ingress: !args.common.disable_ingress,
         },
         health.clone(),
     )?;
@@ -248,6 +250,10 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             .with_aggregator(aggregator)
             .with_events(events)
             .with_ui()
+            .with_api_surfaces(
+                !args.common.disable_gateway_api,
+                !args.common.disable_ingress,
+            )
             .into_service(admin_addr),
     );
 
@@ -1262,7 +1268,14 @@ fn build_controller_config(
 }
 
 /// Construct the static Ingress listener specs from CLI args.
+///
+/// Returns an empty list when `--disable-ingress` is set — no listener ports
+/// are bound even if `--ingress-http-port` / `--ingress-https-port` were
+/// also passed.
 fn build_ingress_listeners(common: &CommonArgs, proxy: &ProxyArgs) -> Vec<ListenerSpec> {
+    if common.disable_ingress {
+        return Vec::new();
+    }
     let mut listeners: Vec<ListenerSpec> = Vec::new();
     if let Some(port) = common.ingress_http_port {
         listeners.push(ListenerSpec::http(SocketAddr::new(
@@ -1309,7 +1322,8 @@ fn wire_management_servers(
 
     let admin_addr = SocketAddr::new(common.management_bind_address, common.admin_port);
     let admin = AdminServer::new(config.health, config.leader)
-        .with_routes(config.ingress_routes, config.gateway_routes);
+        .with_routes(config.ingress_routes, config.gateway_routes)
+        .with_api_surfaces(!common.disable_gateway_api, !common.disable_ingress);
     server.add_service(admin.into_service(admin_addr));
 }
 

@@ -204,7 +204,7 @@ function emitControllers() {
     });
     write(`/api/v1/fleet/controllers/${c.name}/health`, {
       pod_name: c.name, reachable: true,
-      health: { version: '0.1.0', subsystems: { controller: controllerSubsystem(c.degraded) } },
+      health: { version: '0.1.0', subsystems: { controller: controllerSubsystem(c.degraded) }, api_surfaces: { gateway_api: true, ingress: true } },
     });
   });
 }
@@ -691,6 +691,7 @@ function emitHealth() {
     kubernetes_version: 'v1.31.2',
     leader: true,
     subsystems: { controller: controllerSubsystem(), proxy: proxySubsystem(['routing_table_loaded']) },
+    api_surfaces: { gateway_api: true, ingress: true },
   });
 }
 

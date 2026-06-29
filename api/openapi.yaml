@@ -13,7 +13,7 @@ info:
       - `fleet/*`   — all coxswain pods (controllers + proxies)
       - `routing/*` — config resources (Gateways, HTTPRoutes, Ingresses)
 
-    The `/api/v1/*` surface is served only by the controller and `dev` roles;
+    The `/api/v1/*` surface is served only by the controller role;
     proxy pods return 404 for everything except `/api/v1/health`, `/metrics`,
     and the proxy-local `/routes`.
 
@@ -31,7 +31,7 @@ paths:
   /:
     get:
       tags: [role-local]
-      summary: Embedded operator UI (controller/dev only)
+      summary: Embedded operator UI (controller only)
       responses:
         '200': { description: HTML, content: { text/html: {} } }
         '404': { description: UI not enabled (proxy roles) }
@@ -46,7 +46,7 @@ paths:
   /api/v1/routes:
     get:
       tags: [role-local]
-      summary: Proxy-local compiled routing table (proxy/dev only; 404 on controller)
+      summary: Proxy-local compiled routing table (proxy only; 404 on controller)
       description: >-
         Accepts the shared list filter/pagination params; with none, returns the
         legacy `{ingress, gateway}` full dump. With params, each spec block is
@@ -72,7 +72,7 @@ paths:
   /api/v1/facets:
     get:
       tags: [role-local]
-      summary: Distinct hosts + route namespaces this proxy serves (proxy/dev only; 404 on controller)
+      summary: Distinct hosts + route namespaces this proxy serves (proxy only; 404 on controller)
       description: >-
         Filter-dropdown options for the proxy route table — far smaller than the
         route set, so shipped whole. The controller relays this via
@@ -114,8 +114,8 @@ paths:
                     type: boolean
                     description: >-
                       Whether every connected proxy has Ack'd the controller's
-                      current snapshot. `true` vacuously when discovery is
-                      inactive (dev/proxy roles). Backs the topology lag banner (#393).
+                      current snapshot. `true` vacuously when no proxies are
+                      connected. Backs the topology lag banner (#393).
 
   /api/v1/fleet/controllers:
     get:
@@ -442,7 +442,7 @@ paths:
       responses:
         '200':
           description: >-
-            Convergence snapshot. `discovery_active` is `false` on dev/proxy
+            Convergence snapshot. `discovery_active` is `false` on proxy
             roles (no registry); both states yield `nodes: []` when empty.
           content:
             application/json:
@@ -451,7 +451,7 @@ paths:
                 properties:
                   discovery_active:
                     type: boolean
-                    description: False in dev mode (no discovery server / registry).
+                    description: False on proxy roles (no discovery server / registry).
                   controller_version:
                     type: [string, 'null']
                     description: Current SharedPool snapshot version (content hash).
@@ -598,6 +598,12 @@ components:
         kubernetes_version: { type: string, description: Apiserver GitVersion; omitted when unavailable. }
         leader: { type: boolean, description: Whether this pod holds the leader-election lease. }
         subsystems: { type: object, additionalProperties: true }
+        api_surfaces:
+          type: object
+          description: Which API surfaces are active on this pod role.
+          properties:
+            gateway_api: { type: boolean, description: Gateway API surface enabled (HTTPRoute, GatewayClass, etc.). }
+            ingress: { type: boolean, description: Ingress surface enabled. }
 
     PodEntry:
       type: object

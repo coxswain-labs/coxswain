@@ -197,12 +197,16 @@ controller:
   # Gateway status. Required for cert-manager HTTP-01 + external-dns.
   statusAddress: ""
 
-  # Enable the Ingress API surface. When false, no Ingress reflectors are
-  # started, COXSWAIN_INGRESS_HTTP_PORT / COXSWAIN_INGRESS_HTTPS_PORT are
-  # not set, and the shared-proxy Service exposes no Ingress ports.
-  # Corresponds to the --enable-ingress / --no-enable-ingress binary flag
-  # added in #492; this Helm value pre-wires the default so #492 can wire
-  # the flag without a values change.
+  # Enable the Gateway API surface (GatewayClass, HTTPRoute, etc.). When
+  # false, --disable-gateway-api is passed to both the controller and the
+  # shared proxy; no Gateway API reflectors are started and gateway_api_crds
+  # is not registered as a health check.
+  gatewayApi:
+    enabled: true
+
+  # Enable the Ingress surface. When false, --disable-ingress is passed to
+  # both pods; no Ingress reflectors are started, ingress listener ports are
+  # not bound, and the shared-proxy Service exposes no Ingress ports.
   ingress:
     enabled: true
 

@@ -197,6 +197,20 @@ pub struct ReconcilerOptions {
     /// proxy role leaves this `None` so no `events` RBAC is needed on the
     /// proxy `ServiceAccount`.
     pub ingress_event_tx: Option<tokio::sync::mpsc::Sender<IngressEvent>>,
+    /// When `true` (default), spawn Gateway API reflectors (`Gateway`,
+    /// `GatewayClass`, `HTTPRoute`, `GRPCRoute`, `TLSRoute`, `ListenerSet`,
+    /// `ReferenceGrant`, `BackendTLSPolicy`, `ConfigMap`) and register the
+    /// `gateway_api_crds` readiness check. When `false`, all Gateway API
+    /// watches are skipped entirely.
+    ///
+    /// If `true` but the CRDs are absent at startup, readiness fails under
+    /// the `gateway_api_crds` check and a background re-probe loop
+    /// self-heals once the CRDs appear (no pod restart required).
+    pub enable_gateway_api: bool,
+    /// When `true` (default), spawn Ingress reflectors (`Ingress`,
+    /// `IngressClass`, `CoxswainIngressClassParameters`) and register their
+    /// readiness checks. When `false`, all Ingress watches are skipped.
+    pub enable_ingress: bool,
 }
 
 impl Default for ReconcilerOptions {
@@ -209,6 +223,8 @@ impl Default for ReconcilerOptions {
             watch_fleet: false,
             status_subscriptions: false,
             ingress_event_tx: None,
+            enable_gateway_api: true,
+            enable_ingress: true,
         }
     }
 }
@@ -622,6 +638,10 @@ struct ReconcilerConfig {
     watch_fleet: bool,
     /// See [`ReconcilerOptions::ingress_event_tx`].
     ingress_event_tx: Option<tokio::sync::mpsc::Sender<IngressEvent>>,
+    /// See [`ReconcilerOptions::enable_gateway_api`].
+    enable_gateway_api: bool,
+    /// See [`ReconcilerOptions::enable_ingress`].
+    enable_ingress: bool,
 }
 
 pub(super) struct ReflectorStores<'a> {
@@ -833,6 +853,8 @@ impl BackgroundService for SharedProxyReconciler {
             metrics: crate::ReflectorMetrics::new(self.opts.metrics_prefix),
             watch_fleet: self.opts.watch_fleet,
             ingress_event_tx: self.opts.ingress_event_tx.clone(),
+            enable_gateway_api: self.opts.enable_gateway_api,
+            enable_ingress: self.opts.enable_ingress,
         };
         let handles = SharedHandles {
             ingress_routes: self.ingress_routes.clone(),
@@ -921,6 +943,160 @@ where
     }
 }
 
+/// Writer bundle for all Gateway API stores, passed as a unit to
+/// [`add_gateway_api_reflectors`]. Gathered here so the callers
+/// don't exceed the 7-argument function threshold.
+struct GatewayApiStoreWriters {
+    routes: reflector::store::Writer<HttpRoute>,
+    grpc_routes: reflector::store::Writer<GrpcRoute>,
+    tls_routes: reflector::store::Writer<TlsRoute>,
+    gateways: reflector::store::Writer<Gateway>,
+    gateway_classes: reflector::store::Writer<GatewayClass>,
+    grants: reflector::store::Writer<ReferenceGrant>,
+    policies: reflector::store::Writer<BackendTlsPolicy>,
+    configmaps: reflector::store::Writer<ConfigMap>,
+    rate_limits: reflector::store::Writer<RateLimit>,
+    path_rewrites: reflector::store::Writer<PathRewriteRegex>,
+    listener_sets: reflector::store::Writer<ListenerSet>,
+    namespaces: reflector::store::Writer<Namespace>,
+}
+
+/// Spawn all Gateway API reflectors into `set`.
+///
+/// Called either immediately at startup (CRDs present) or from the self-heal
+/// probe task once the CRDs appear. Consumes the writer bundle so each
+/// underlying `reflector::store::Writer` is owned by exactly one task.
+fn add_gateway_api_reflectors(
+    set: &mut JoinSet<()>,
+    client: &Client,
+    ns: Option<&str>,
+    writers: GatewayApiStoreWriters,
+    notify: &Arc<Notify>,
+    health: &SubsystemHandle,
+    metrics: crate::ReflectorMetrics,
+) {
+    let GatewayApiStoreWriters {
+        routes,
+        grpc_routes,
+        tls_routes,
+        gateways,
+        gateway_classes,
+        grants,
+        policies,
+        configmaps,
+        rate_limits,
+        path_rewrites,
+        listener_sets,
+        namespaces,
+    } = writers;
+
+    spawn_reflector(
+        set,
+        routes,
+        scoped_api::<HttpRoute>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "httproute", metrics),
+        "HttpRoute",
+    );
+    spawn_reflector(
+        set,
+        grpc_routes,
+        scoped_api::<GrpcRoute>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "grpcroute", metrics),
+        "GrpcRoute",
+    );
+    spawn_reflector(
+        set,
+        tls_routes,
+        scoped_api::<TlsRoute>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "tls_route", metrics),
+        "TlsRoute",
+    );
+    spawn_reflector(
+        set,
+        gateways,
+        scoped_api::<Gateway>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "gateway", metrics),
+        "Gateway",
+    );
+    spawn_reflector(
+        set,
+        gateway_classes,
+        Api::<GatewayClass>::all(client.clone()),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "gateway_class", metrics),
+        "GatewayClass",
+    );
+    spawn_reflector(
+        set,
+        grants,
+        scoped_api::<ReferenceGrant>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "reference_grant", metrics),
+        "ReferenceGrant",
+    );
+    spawn_reflector(
+        set,
+        policies,
+        scoped_api::<BackendTlsPolicy>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "backend_tls_policy", metrics),
+        "BackendTlsPolicy",
+    );
+    // ConfigMaps have no type= field selector equivalent; all CMs in scope are
+    // watched so BackendTLSPolicy caCertificateRefs can be resolved.
+    spawn_reflector(
+        set,
+        configmaps,
+        scoped_api::<ConfigMap>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "config_map", metrics),
+        "ConfigMap",
+    );
+    spawn_reflector(
+        set,
+        rate_limits,
+        scoped_api::<RateLimit>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "rate_limit", metrics),
+        "RateLimit",
+    );
+    spawn_reflector(
+        set,
+        path_rewrites,
+        scoped_api::<PathRewriteRegex>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "path_rewrite_regex", metrics),
+        "PathRewriteRegex",
+    );
+    // GEP-1713: ListenerSets are namespaced and merged into their parent Gateway's
+    // effective listener set during rebuild.
+    spawn_reflector(
+        set,
+        listener_sets,
+        scoped_api::<ListenerSet>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "listener_set", metrics),
+        "ListenerSet",
+    );
+    // Namespaces are cluster-scoped and watched only so a Gateway's
+    // `allowedListeners.namespaces.from: Selector` can be matched against the
+    // ListenerSet's namespace labels (GEP-1713). Must be cluster-wide — a
+    // `--watch-namespace` scope can't observe label changes on a ListenerSet's
+    // namespace object. Read-only; the proxy SA holds no write verb.
+    spawn_reflector(
+        set,
+        namespaces,
+        Api::<Namespace>::all(client.clone()),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "namespace", metrics),
+        "Namespace",
+    );
+}
+
 async fn spawn_tasks(
     client: Client,
     handles: SharedHandles,
@@ -956,6 +1132,8 @@ async fn spawn_tasks(
         metrics,
         watch_fleet,
         ingress_event_tx,
+        enable_gateway_api,
+        enable_ingress,
     } = config;
     // Status-relevant stores reuse the shared writers pre-created in `new` (so
     // the status-writer's subscriptions observe the same synced stores); the
@@ -991,71 +1169,12 @@ async fn spawn_tasks(
     let mut set = JoinSet::new();
     let ns = watch_namespace.as_deref();
 
-    spawn_reflector(
-        &mut set,
-        route_writer,
-        scoped_api::<HttpRoute>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "httproute", metrics),
-        "HttpRoute",
-    );
-    spawn_reflector(
-        &mut set,
-        grpc_route_writer,
-        scoped_api::<GrpcRoute>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "grpcroute", metrics),
-        "GrpcRoute",
-    );
-    spawn_reflector(
-        &mut set,
-        ingress_writer,
-        scoped_api::<Ingress>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "ingress", metrics),
-        "Ingress",
-    );
-    spawn_reflector(
-        &mut set,
-        class_writer,
-        Api::<IngressClass>::all(client.clone()),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "ingress_class", metrics),
-        "IngressClass",
-    );
-    // Watched cluster-wide (like IngressClass): an IngressClass is cluster-scoped
-    // and its `spec.parameters.namespace` is unconstrained, so a `--watch-namespace`
-    // scope would miss a params CR stored in another namespace. RBAC is a ClusterRole
-    // read; the proxy SA holds no write verb on this resource.
-    spawn_reflector(
-        &mut set,
-        class_params_writer,
-        Api::<CoxswainIngressClassParameters>::all(client.clone()),
-        watcher::Config::default(),
-        ReflectorEffects::new(
-            &notify,
-            &controller_health,
-            "ingress_class_parameters",
-            metrics,
-        ),
-        "CoxswainIngressClassParameters",
-    );
-    spawn_reflector(
-        &mut set,
-        gateway_writer,
-        scoped_api::<Gateway>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "gateway", metrics),
-        "Gateway",
-    );
-    spawn_reflector(
-        &mut set,
-        gateway_class_writer,
-        Api::<GatewayClass>::all(client.clone()),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "gateway_class", metrics),
-        "GatewayClass",
-    );
+    // --- Always-on reflectors (both surfaces) ---
+    //
+    // EndpointSlice, Secret (TLS), and Service are needed whether Gateway API,
+    // Ingress, or both are enabled: backends require port resolution (Service +
+    // EndpointSlice) and TLS certs are shared across surfaces.
+
     spawn_reflector(
         &mut set,
         slice_writer,
@@ -1063,14 +1182,6 @@ async fn spawn_tasks(
         watcher::Config::default(),
         ReflectorEffects::new(&notify, &controller_health, "endpoint_slice", metrics),
         "EndpointSlice",
-    );
-    spawn_reflector(
-        &mut set,
-        grant_writer,
-        scoped_api::<ReferenceGrant>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "reference_grant", metrics),
-        "ReferenceGrant",
     );
     // Field-selector scoped to `type=kubernetes.io/tls` to avoid pulling every Secret into memory.
     spawn_reflector(
@@ -1081,29 +1192,6 @@ async fn spawn_tasks(
         ReflectorEffects::new(&notify, &controller_health, "secret", metrics),
         "Secret",
     );
-    // Label-scoped to `ingress.coxswain-labs.dev/auth-basic=true` — only opt-in
-    // htpasswd Secrets are cached.  Keeps the data-plane proxy's memory footprint
-    // bounded: Opaque Secrets without this label are never loaded (#24).
-    spawn_reflector(
-        &mut set,
-        auth_secret_writer,
-        scoped_api::<Secret>(client.clone(), ns),
-        watcher::Config::default().labels("ingress.coxswain-labs.dev/auth-basic=true"),
-        ReflectorEffects::new(&notify, &controller_health, "auth_secret", metrics),
-        "AuthSecret",
-    );
-    // Label-scoped to `ingress.coxswain-labs.dev/auth-tls=true` — only opt-in CA
-    // Secrets for per-Ingress client-certificate mTLS are cached (#267).  Separate
-    // watch from `secrets` (server-TLS) and `auth_secrets` (htpasswd) to bound
-    // memory: only operator-tagged CA Secrets are loaded.
-    spawn_reflector(
-        &mut set,
-        auth_tls_secret_writer,
-        scoped_api::<Secret>(client.clone(), ns),
-        watcher::Config::default().labels("ingress.coxswain-labs.dev/auth-tls=true"),
-        ReflectorEffects::new(&notify, &controller_health, "auth_tls_secret", metrics),
-        "AuthTlsSecret",
-    );
     // Used to resolve targetPort for backends where servicePort ≠ targetPort.
     spawn_reflector(
         &mut set,
@@ -1113,73 +1201,165 @@ async fn spawn_tasks(
         ReflectorEffects::new(&notify, &controller_health, "service", metrics),
         "Service",
     );
-    spawn_reflector(
-        &mut set,
-        policy_writer,
-        scoped_api::<BackendTlsPolicy>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "backend_tls_policy", metrics),
-        "BackendTlsPolicy",
-    );
-    // ConfigMaps have no type= field selector equivalent; all CMs in scope are
-    // watched so BackendTLSPolicy caCertificateRefs can be resolved. A follow-up
-    // will switch to per-policy informers to bound memory use in large clusters.
-    spawn_reflector(
-        &mut set,
-        configmap_writer,
-        scoped_api::<ConfigMap>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "config_map", metrics),
-        "ConfigMap",
-    );
-    spawn_reflector(
-        &mut set,
-        rate_limit_writer,
-        scoped_api::<RateLimit>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "rate_limit", metrics),
-        "RateLimit",
-    );
-    spawn_reflector(
-        &mut set,
-        path_rewrite_writer,
-        scoped_api::<PathRewriteRegex>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "path_rewrite_regex", metrics),
-        "PathRewriteRegex",
-    );
-    spawn_reflector(
-        &mut set,
-        tls_route_writer,
-        scoped_api::<TlsRoute>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "tls_route", metrics),
-        "TlsRoute",
-    );
-    // GEP-1713: ListenerSets are namespaced and merged into their parent Gateway's
-    // effective listener set during rebuild; scoped to `--watch-namespace` like the
-    // other Gateway-API resources.
-    spawn_reflector(
-        &mut set,
-        listener_set_writer,
-        scoped_api::<ListenerSet>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "listener_set", metrics),
-        "ListenerSet",
-    );
-    // Namespaces are cluster-scoped and watched only so a Gateway's
-    // `allowedListeners.namespaces.from: Selector` can be matched against the
-    // ListenerSet's namespace labels (GEP-1713). Like IngressClass it must be
-    // cluster-wide — a `--watch-namespace` scope can't observe label changes on a
-    // ListenerSet's namespace object. Read-only; the proxy SA holds no write verb.
-    spawn_reflector(
-        &mut set,
-        namespace_writer,
-        Api::<Namespace>::all(client.clone()),
-        watcher::Config::default(),
-        ReflectorEffects::new(&notify, &controller_health, "namespace", metrics),
-        "Namespace",
-    );
+
+    // --- Ingress reflectors (gated by --disable-ingress) ---
+    //
+    // Auth Secrets are Ingress-specific (basic-auth + mTLS annotations); they
+    // live here rather than in the always-on block.
+    if enable_ingress {
+        spawn_reflector(
+            &mut set,
+            ingress_writer,
+            scoped_api::<Ingress>(client.clone(), ns),
+            watcher::Config::default(),
+            ReflectorEffects::new(&notify, &controller_health, "ingress", metrics),
+            "Ingress",
+        );
+        spawn_reflector(
+            &mut set,
+            class_writer,
+            Api::<IngressClass>::all(client.clone()),
+            watcher::Config::default(),
+            ReflectorEffects::new(&notify, &controller_health, "ingress_class", metrics),
+            "IngressClass",
+        );
+        // Watched cluster-wide (like IngressClass): an IngressClass is cluster-scoped
+        // and its `spec.parameters.namespace` is unconstrained, so a `--watch-namespace`
+        // scope would miss a params CR stored in another namespace. RBAC is a ClusterRole
+        // read; the proxy SA holds no write verb on this resource.
+        spawn_reflector(
+            &mut set,
+            class_params_writer,
+            Api::<CoxswainIngressClassParameters>::all(client.clone()),
+            watcher::Config::default(),
+            ReflectorEffects::new(
+                &notify,
+                &controller_health,
+                "ingress_class_parameters",
+                metrics,
+            ),
+            "CoxswainIngressClassParameters",
+        );
+        // Label-scoped to `ingress.coxswain-labs.dev/auth-basic=true` — only opt-in
+        // htpasswd Secrets are cached.  Keeps the data-plane proxy's memory footprint
+        // bounded: Opaque Secrets without this label are never loaded (#24).
+        spawn_reflector(
+            &mut set,
+            auth_secret_writer,
+            scoped_api::<Secret>(client.clone(), ns),
+            watcher::Config::default().labels("ingress.coxswain-labs.dev/auth-basic=true"),
+            ReflectorEffects::new(&notify, &controller_health, "auth_secret", metrics),
+            "AuthSecret",
+        );
+        // Label-scoped to `ingress.coxswain-labs.dev/auth-tls=true` — only opt-in CA
+        // Secrets for per-Ingress client-certificate mTLS are cached (#267).  Separate
+        // watch from `secrets` (server-TLS) and `auth_secrets` (htpasswd) to bound
+        // memory: only operator-tagged CA Secrets are loaded.
+        spawn_reflector(
+            &mut set,
+            auth_tls_secret_writer,
+            scoped_api::<Secret>(client.clone(), ns),
+            watcher::Config::default().labels("ingress.coxswain-labs.dev/auth-tls=true"),
+            ReflectorEffects::new(&notify, &controller_health, "auth_tls_secret", metrics),
+            "AuthTlsSecret",
+        );
+    }
+
+    // --- Gateway API reflectors (gated by --disable-gateway-api + CRD probe) ---
+    //
+    // When the surface is enabled (default), probe for Gateway API CRDs. If
+    // present, spawn all reflectors immediately. If absent, readiness fails
+    // under the `gateway_api_crds` check and a background re-probe loop starts
+    // the reflectors once the CRDs appear (self-healing — no pod restart needed).
+    if enable_gateway_api {
+        let gw_writers = GatewayApiStoreWriters {
+            routes: route_writer,
+            grpc_routes: grpc_route_writer,
+            tls_routes: tls_route_writer,
+            gateways: gateway_writer,
+            gateway_classes: gateway_class_writer,
+            grants: grant_writer,
+            policies: policy_writer,
+            configmaps: configmap_writer,
+            rate_limits: rate_limit_writer,
+            path_rewrites: path_rewrite_writer,
+            listener_sets: listener_set_writer,
+            namespaces: namespace_writer,
+        };
+        if crate::crds::gateway_api_crds_present(&client).await {
+            add_gateway_api_reflectors(
+                &mut set,
+                &client,
+                ns,
+                gw_writers,
+                &notify,
+                &controller_health,
+                metrics,
+            );
+            controller_health.ready("gateway_api_crds");
+        } else {
+            tracing::warn!(
+                "Gateway API CRDs not found; readiness will wait until they appear \
+                 (self-healing re-probe every 30 s — no pod restart required)"
+            );
+            // Self-heal probe task: polls until CRDs appear, then spawns the
+            // Gateway API reflectors and clears the `gateway_api_crds` check.
+            //
+            // The writers slot is consumed exactly once (on first CRD detection)
+            // and then the inner supervise-loop runs forever, so the outer loop
+            // body never reaches the take() a second time.
+            let probe_client = client.clone();
+            let probe_notify = Arc::clone(&notify);
+            let probe_health = controller_health.clone();
+            let probe_watch_namespace = watch_namespace.clone();
+            let mut writers_slot = Some(gw_writers);
+            set.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    if crate::crds::gateway_api_crds_present(&probe_client).await {
+                        let Some(writers) = writers_slot.take() else {
+                            // The inner supervise loop exited — this is a bug
+                            // since join_next() should run forever. Return to
+                            // let the JoinSet clean up.
+                            return;
+                        };
+                        let mut gw_set = JoinSet::new();
+                        let probe_ns = probe_watch_namespace.as_deref();
+                        add_gateway_api_reflectors(
+                            &mut gw_set,
+                            &probe_client,
+                            probe_ns,
+                            writers,
+                            &probe_notify,
+                            &probe_health,
+                            metrics,
+                        );
+                        probe_health.ready("gateway_api_crds");
+                        probe_notify.notify_waiters();
+                        tracing::info!(
+                            "Gateway API CRDs detected; reflectors started and readiness cleared"
+                        );
+                        // Supervise the dynamically spawned reflectors for the
+                        // lifetime of the probe task.
+                        loop {
+                            match gw_set.join_next().await {
+                                Some(Ok(())) => {
+                                    tracing::warn!("gateway-api reflector exited unexpectedly");
+                                }
+                                Some(Err(e)) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        "gateway-api reflector panicked"
+                                    );
+                                }
+                                None => return,
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
 
     // --- Fleet pod watch (controller role only) ---
     //

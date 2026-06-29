@@ -16,8 +16,8 @@
 //! `/api/v1/` (Prometheus scrape path and the web root).
 //!
 //! The full surface (paths + response schemas) is described in
-//! `crates/coxswain-admin/openapi.yaml` — an internal dev aid; keep it in sync
-//! with the dispatch below and the [`aggregator`] handlers.
+//! `api/openapi.yaml` — an internal aid; keep it in sync with the dispatch
+//! below and the [`aggregator`] handlers.
 
 mod aggregator;
 mod events;
@@ -111,13 +111,15 @@ pub struct AdminServer {
     /// on proxy roles (the endpoint returns 404 there).
     pub events: Option<EventSources>,
     /// Whether to serve the embedded operator UI at `GET /`. Enabled only on
-    /// the controller and dev roles — proxy roles leave this `false` so `GET /`
+    /// the controller role — proxy roles leave this `false` so `GET /`
     /// returns 404 structurally, the same gate as the aggregator surface.
     serve_ui: bool,
     /// HTTP module pipeline (response compression) applied to every buffered
     /// endpoint. The SSE stream deliberately bypasses it — compression buffers,
     /// which would defeat streaming.
     modules: HttpModules,
+    /// Active API surfaces included in every `/api/v1/health` response.
+    api_surfaces: ApiSurfaces,
 }
 
 impl AdminServer {
@@ -137,7 +139,21 @@ impl AdminServer {
             events: None,
             serve_ui: false,
             modules,
+            api_surfaces: ApiSurfaces::default(),
         }
+    }
+
+    /// Override the active API surfaces reported in `/api/v1/health`.
+    ///
+    /// Call this when the role was started with `--disable-gateway-api` or
+    /// `--disable-ingress`; the default is both surfaces enabled.
+    #[must_use]
+    pub fn with_api_surfaces(mut self, gateway_api: bool, ingress: bool) -> Self {
+        self.api_surfaces = ApiSurfaces {
+            gateway_api,
+            ingress,
+        };
+        self
     }
 
     /// Enable `GET /api/v1/routes` by supplying the proxy's local routing tables.
@@ -318,7 +334,12 @@ impl AdminServer {
                     Some(agg) => agg.kubernetes_version().await,
                     None => None,
                 };
-                return health_response(&self.health, version, self.leader.load(Ordering::Acquire));
+                return health_response(
+                    &self.health,
+                    version,
+                    self.leader.load(Ordering::Acquire),
+                    self.api_surfaces,
+                );
             }
             _ => {}
         }
@@ -596,6 +617,31 @@ impl AdminServer {
 
 // ── /api/v1/health ────────────────────────────────────────────────────────────
 
+/// Which API surfaces this pod role has enabled.
+///
+/// Serialised into every `/api/v1/health` response so the operator UI and
+/// automated tooling can detect Ingress-only or Gateway-API-only deployments
+/// without inspecting flags or Helm values.
+#[derive(Clone, Copy, Serialize)]
+#[non_exhaustive]
+pub struct ApiSurfaces {
+    /// `true` when the Gateway API surface (HTTPRoute, GatewayClass, etc.) is
+    /// active on this pod. `false` when `--disable-gateway-api` was set.
+    pub gateway_api: bool,
+    /// `true` when the Ingress surface is active. `false` when
+    /// `--disable-ingress` was set.
+    pub ingress: bool,
+}
+
+impl Default for ApiSurfaces {
+    fn default() -> Self {
+        Self {
+            gateway_api: true,
+            ingress: true,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct HealthResponse<'a> {
     version: &'static str,
@@ -611,12 +657,15 @@ struct HealthResponse<'a> {
     /// `/api/v1/cluster` leader probe).
     leader: bool,
     subsystems: BTreeMap<Arc<str>, SubsystemSnapshot>,
+    /// Which API surfaces are enabled on this pod role.
+    api_surfaces: ApiSurfaces,
 }
 
 fn health_response(
     health: &HealthRegistry,
     kubernetes_version: Option<&str>,
     leader: bool,
+    api_surfaces: ApiSurfaces,
 ) -> Response<Vec<u8>> {
     let snapshot = health.snapshot();
     let resp = HealthResponse {
@@ -624,6 +673,7 @@ fn health_response(
         kubernetes_version,
         leader,
         subsystems: snapshot.subsystems,
+        api_surfaces,
     };
     match serde_json::to_string(&resp) {
         Ok(body) => json_response(body),
@@ -649,7 +699,7 @@ mod tests {
     #[test]
     fn health_response_carries_version_kubernetes_version_leader_and_subsystems() {
         let registry = HealthRegistry::new();
-        let resp = health_response(&registry, Some("v1.31.2"), true);
+        let resp = health_response(&registry, Some("v1.31.2"), true, ApiSurfaces::default());
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -671,7 +721,7 @@ mod tests {
     #[test]
     fn health_response_omits_kubernetes_version_when_unavailable() {
         let registry = HealthRegistry::new();
-        let resp = health_response(&registry, None, false);
+        let resp = health_response(&registry, None, false, ApiSurfaces::default());
         let body = std::str::from_utf8(resp.body()).expect("utf8 body");
         let v: serde_json::Value = serde_json::from_str(body.trim()).expect("json");
         assert!(

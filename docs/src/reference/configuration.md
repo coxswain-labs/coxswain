@@ -61,6 +61,8 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_DISCOVERY_SVID_TTL` | `--discovery-svid-ttl` | `24h` | _(controller)_ Lifetime of SVIDs issued to proxies; proxies refresh at ~50 % |
 | `COXSWAIN_DISCOVERY_TRUST_DOMAIN` | `--discovery-trust-domain` | `cluster.local` | SPIFFE trust domain; must match across the controller and all proxies |
 | `COXSWAIN_HEALTH_PORT` | `--health-port` | `8081` | Port for liveness and readiness health endpoints |
+| `COXSWAIN_DISABLE_GATEWAY_API` | `--disable-gateway-api` | `false` | Disable the Gateway API surface entirely; no `HTTPRoute`/`GatewayClass` reflectors are started and the `gateway_api_crds` health check is not registered |
+| `COXSWAIN_DISABLE_INGRESS` | `--disable-ingress` | `false` | Disable the Ingress surface entirely; no Ingress reflectors are started and no Ingress listener ports are bound |
 | `COXSWAIN_INGRESS_DEFAULT_BACKEND` | `--ingress-default-backend` | _(none)_ | Cluster-wide fallback backend for `Ingress` requests that match no rule, expressed as `<namespace>/<service>:<port>` |
 | `COXSWAIN_INGRESS_HTTP_PORT` | `--ingress-http-port` | _(none)_ | Port for inbound HTTP traffic; unset to bind no static Ingress HTTP listener |
 | `COXSWAIN_INGRESS_HTTPS_PORT` | `--ingress-https-port` | _(none)_ | Port for inbound HTTPS traffic (SNI TLS); unset to bind no static Ingress HTTPS listener |
@@ -96,7 +98,17 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | Discovery (Stream) | `50051` | `COXSWAIN_DISCOVERY_PORT` | _(controller)_ mTLS gRPC routing-snapshot stream |
 | Bootstrap | `50052` | `COXSWAIN_DISCOVERY_BOOTSTRAP_PORT` | _(controller)_ server-auth gRPC SVID issuance |
 
-The Ingress proxy listeners are enabled by default (`controller.ingress.enabled=true`). Disable them with `controller.ingress.enabled=false` for Gateway-API-only installs. Port numbers are configured via `proxy.ingress.http.port` (default `80`) and `proxy.ingress.https.port` (default `443`).
+Both API surfaces are enabled by default. Use `controller.gatewayApi.enabled=false` for Ingress-only installs and `controller.ingress.enabled=false` for Gateway-API-only installs. Port numbers are configured via `proxy.ingress.http.port` (default `80`) and `proxy.ingress.https.port` (default `443`).
+
+### Self-healing Gateway API CRD detection
+
+When the Gateway API surface is enabled (`--disable-gateway-api` absent) but the Gateway API CRDs are not installed yet, Coxswain does not crash. Instead:
+
+1. A `gateway_api_crds` health check is registered but stays `Pending`, blocking `/readyz` until resolved.
+2. A background re-probe task polls every 30 seconds.
+3. Once the CRDs appear, the Gateway API reflectors are started in-process and `gateway_api_crds` becomes `Ready` — no pod restart required.
+
+The active API surfaces are visible in every pod's `/api/v1/health` response under `api_surfaces.gateway_api` and `api_surfaces.ingress`.
 
 ## HTTP/2 support
 

@@ -7,7 +7,7 @@
 //! turns a producer-side field rename into a compile error instead of a silently broken
 //! aggregation — the previous code re-parsed the JSON stringly via `as_str().unwrap_or("")`.
 //!
-//! Shapes mirror the schemas in `crates/coxswain-admin/openapi.yaml` (`RouteBlock`,
+//! Shapes mirror the schemas in `api/openapi.yaml` (`RouteBlock`,
 //! `Problems`/`Problem`, and the route-check response); keep both in sync. Object-key
 //! ordering is not part of the contract — serde emits fields in declaration order, the
 //! previous `serde_json::json!` path emitted them key-sorted; every consumer parses JSON,

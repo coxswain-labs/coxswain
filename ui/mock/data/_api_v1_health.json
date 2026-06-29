@@ -56,5 +56,9 @@
         }
       }
     }
+  },
+  "api_surfaces": {
+    "gateway_api": true,
+    "ingress": true
   }
 }

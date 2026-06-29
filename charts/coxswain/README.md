@@ -49,6 +49,7 @@ All values can be overridden with `--set key=value` or a custom `values.yaml`.
 | `controller.watchNamespace` | `""` (cluster-wide) | Restrict to a single namespace |
 | `controller.statusAddress` | `""` | External IP/hostname written to Ingress/Gateway status |
 | `controller.ingressDefaultBackend` | `""` | Fallback backend (`<ns>/<svc>:<port>`) |
+| `controller.gatewayApi.enabled` | `true` | Enable Gateway API surface (HTTPRoute, GatewayClass, etc.) |
 | `controller.ingress.enabled` | `true` | Enable Ingress API surface and listener ports |
 | `controller.leaseTtl` | `15s` | Leader lease validity duration |
 | `controller.leaseRenewInterval` | `5s` | Leader lease renewal interval |

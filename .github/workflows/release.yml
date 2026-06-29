@@ -135,6 +135,33 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      # Build cloud-provider-kind once on the amd64 runner — the conformance
+      # job runs on ubuntu-latest (amd64) and downloads this binary so
+      # setup-kind-cluster doesn't fall back to `go install` (which pulls the
+      # full module graph every run, ~30-60 s, and is flaky under network
+      # pressure). Mirrors the pattern in e2e.yml.
+      - name: Cache cloud-provider-kind binary
+        if: matrix.platform == 'linux/amd64'
+        id: cpk-cache
+        uses: actions/cache@v5
+        with:
+          path: cloud-provider-kind
+          key: cloud-provider-kind-${{ runner.os }}-v1
+
+      - name: Install cloud-provider-kind
+        if: matrix.platform == 'linux/amd64' && steps.cpk-cache.outputs.cache-hit != 'true'
+        run: |
+          go install sigs.k8s.io/cloud-provider-kind@latest
+          cp "$(go env GOPATH)/bin/cloud-provider-kind" ./cloud-provider-kind
+
+      - name: Upload cloud-provider-kind
+        if: matrix.platform == 'linux/amd64'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cloud-provider-kind
+          path: cloud-provider-kind
+          retention-days: 1
+
   trivy-scan:
     name: trivy-scan
     # Cheap CVE gate, run before the expensive conformance suite. Scans the
@@ -231,6 +258,19 @@ jobs:
           IMAGE="ghcr.io/${{ github.repository_owner }}/coxswain@sha256:${DIGEST}"
           docker pull "$IMAGE"
           docker tag "$IMAGE" coxswain:e2e
+
+      # Pre-built by the `build` job (linux/amd64 entry); place on PATH so
+      # setup-kind-cluster skips its `go install` fallback. Mirrors e2e.yml.
+      - name: Download cloud-provider-kind
+        uses: actions/download-artifact@v8
+        with:
+          name: cloud-provider-kind
+          path: /tmp/cpk
+
+      - name: Install cloud-provider-kind on PATH
+        run: |
+          chmod +x /tmp/cpk/cloud-provider-kind
+          sudo mv /tmp/cpk/cloud-provider-kind /usr/local/bin/cloud-provider-kind
 
       - uses: ./.github/actions/run-conformance
         id: conformance

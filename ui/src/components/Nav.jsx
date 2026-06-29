@@ -30,6 +30,7 @@ export function Nav({ activeScreen }) {
   const health     = useApi(getHealth).data;
   const version    = stripV(health?.version);
   const k8sVersion = stripV(health?.kubernetes_version);
+  const apiSurfaces = health?.api_surfaces;
   const versionRows = [
     { label: 'Coxswain', value: version },
     { label: 'Kubernetes', value: k8sVersion },
@@ -105,7 +106,7 @@ export function Nav({ activeScreen }) {
 
       {/* Version info popover + stream status — inline on wide screens, the info
           icon sits just left of the live indicator. */}
-      <VersionInfo rows={versionRows} class="version-info-inline" />
+      <VersionInfo rows={versionRows} surfaces={apiSurfaces} class="version-info-inline" />
       <SSEStatus connected={connected} class="nav-status-inline" />
 
       {/* Hamburger — visible on narrow screens */}
