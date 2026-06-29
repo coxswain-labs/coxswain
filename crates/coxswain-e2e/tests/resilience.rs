@@ -91,6 +91,42 @@ async fn wait_for_listener(addr: SocketAddr, host: &str, timeout: Duration) -> a
     .await
 }
 
+/// Establish a `kubectl port-forward` to the shared pool's Gateway HTTP listener
+/// that is proven live, re-creating the forward until it serves a 2xx for `host`.
+///
+/// A forward to a port nothing is listening on yet dies *permanently* on its
+/// first refused connection (`kubectl`: "lost connection to pod") — it never
+/// recovers once the port later binds. So a forward set up before the shared
+/// proxy has bound the dedicated-pre-cutover Gateway's listener (#210) is dead on
+/// arrival, and every later probe through it fails. Recreate the forward each
+/// poll; once the listener is bound the forward stays alive for the load run.
+async fn wait_for_shared_gateway_forward(
+    h: &Harness,
+    host: &str,
+    timeout: Duration,
+) -> anyhow::Result<coxswain_e2e::harness::controller::GatewayPortForward> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("build reqwest client")?;
+    wait::poll_until(
+        timeout,
+        wait::POLL,
+        || async { format!("shared pool to bind and serve {host} on its Gateway HTTP listener") },
+        || async {
+            // A fresh forward each attempt: a forward that raced ahead of the
+            // listener bind is already dead and cannot be reused.
+            let pf = h.controller.gateway_http_forward().await.ok()?;
+            let url = format!("http://{}/", pf.addr);
+            match client.get(&url).header("Host", host).send().await {
+                Ok(r) if r.status().is_success() => Some(pf),
+                _ => None,
+            }
+        },
+    )
+    .await
+}
+
 // ── Sustained load harness ────────────────────────────────────────────────────
 
 /// Stop driver for [`run_load`]. The inner concurrent-client loop is the same
@@ -447,11 +483,15 @@ async fn dedicated_crash_loop_keeps_serving_via_shared() -> anyhow::Result<()> {
     // (ImagePullBackOff) pods. The invariant under test is that the SHARED pool
     // keeps serving the route until cut-over — only observable on the shared
     // pod's listener, hence the direct pod port-forward.
-    let pf = h.controller.gateway_http_forward().await?;
-    let addr = pf.addr;
+    //
+    // The forward must be established *after* the shared proxy binds the
+    // listener: a forward that races ahead of the bind dies permanently on the
+    // first refused connection. `wait_for_shared_gateway_forward` recreates it
+    // until a probe succeeds, then hands back a live forward for the load run.
     let host = format!("crash.{}.local", ns.name);
+    let pf = wait_for_shared_gateway_forward(&h, &host, Duration::from_secs(60)).await?;
+    let addr = pf.addr;
 
-    wait_for_listener(addr, &host, Duration::from_secs(30)).await?;
     let result = run_load(
         addr,
         host,
