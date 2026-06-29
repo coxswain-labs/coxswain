@@ -151,7 +151,7 @@ In rootless mode the container binds 8080 instead of the service port (default 8
 The gateway Service references this by name so the mapping is automatic.
 */}}
 {{- define "coxswain.httpContainerPort" -}}
-{{- if .Values.security.rootless -}}8080{{- else -}}{{ .Values.proxy.http.port }}{{- end -}}
+{{- if .Values.security.rootless -}}8080{{- else -}}{{ .Values.proxy.ingress.http.port }}{{- end -}}
 {{- end }}
 
 {{/*
@@ -159,5 +159,5 @@ Actual container port for HTTPS.
 In rootless mode the container binds 8443 instead of the service port (default 443).
 */}}
 {{- define "coxswain.httpsContainerPort" -}}
-{{- if .Values.security.rootless -}}8443{{- else -}}{{ .Values.proxy.https.port }}{{- end -}}
+{{- if .Values.security.rootless -}}8443{{- else -}}{{ .Values.proxy.ingress.https.port }}{{- end -}}
 {{- end }}

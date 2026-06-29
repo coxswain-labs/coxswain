@@ -1,4 +1,4 @@
-{{- if and .Values.proxy.shared.enabled (or .Values.proxy.http.enabled .Values.proxy.https.enabled .Values.service.gateway.additionalPorts) -}}
+{{- if and .Values.proxy.shared.enabled .Values.controller.ingress.enabled -}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -25,19 +25,12 @@ spec:
     {{- toYaml .Values.service.gateway.loadBalancerSourceRanges | nindent 4 }}
   {{- end }}
   ports:
-    {{- if .Values.proxy.http.enabled }}
     - name: http
-      port: {{ .Values.proxy.http.port }}
+      port: {{ .Values.proxy.ingress.http.port }}
       targetPort: http
       protocol: TCP
-    {{- end }}
-    {{- if .Values.proxy.https.enabled }}
     - name: https
-      port: {{ .Values.proxy.https.port }}
+      port: {{ .Values.proxy.ingress.https.port }}
       targetPort: https
       protocol: TCP
-    {{- end }}
-    {{- with .Values.service.gateway.additionalPorts }}
-    {{- toYaml . | nindent 4 }}
-    {{- end }}
 {{- end }}
