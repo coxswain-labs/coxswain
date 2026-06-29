@@ -327,10 +327,11 @@ proxy:
     # (process-wide) — tune based on your longest expected upstream latency.
     listenerDrainTimeout: 30s
 
-    # COXSWAIN_PROXY_ACCEPT_PROXY_PROTOCOL — enable HAProxy PROXY protocol v1/v2.
+    # COXSWAIN_INGRESS_ACCEPT_PROXY_PROTOCOL — enable HAProxy PROXY protocol v1/v2
+    # on the Ingress listeners only. Gateway listeners use ClientTrafficPolicy CRD.
     acceptProxyProtocol: false
-    # COXSWAIN_PROXY_TRUSTED_SOURCES — CIDRs allowed to send PROXY headers
-    # (comma-joined when rendered).
+    # COXSWAIN_INGRESS_PROXY_TRUSTED_SOURCES — CIDRs allowed to send PROXY headers
+    # on Ingress listeners (comma-joined when rendered).
     trustedSources: []
 
     # COXSWAIN_PROXY_DEFAULT_REQUEST_TIMEOUT — global default total request timeout.

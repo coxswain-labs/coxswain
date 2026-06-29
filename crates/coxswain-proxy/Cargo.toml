@@ -37,6 +37,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 dashmap = { workspace = true }
+ppp = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

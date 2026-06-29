@@ -62,7 +62,9 @@ pub use reconciler::{
     StatusSubscriptions,
 };
 pub use status::{
-    BackendTlsPolicyStatus, BackendTlsPolicyStatusMap, GatewayListenerStatus, ListenerInfo,
-    ListenerReadiness, ListenerSource, ListenerStatusKey, RouteParentStatus, RouteStatusMap,
-    SharedBackendTlsPolicyStatus, SharedGatewayListenerStatus, SharedRouteStatus,
+    BackendTlsPolicyStatus, BackendTlsPolicyStatusMap, ClientTrafficPolicyStatus,
+    ClientTrafficPolicyStatusMap, GatewayListenerStatus, ListenerInfo, ListenerReadiness,
+    ListenerSource, ListenerStatusKey, RouteParentStatus, RouteStatusMap,
+    SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus, SharedGatewayListenerStatus,
+    SharedRouteStatus,
 };

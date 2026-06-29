@@ -1511,6 +1511,117 @@ pub async fn wait_for_ingress_warning_event(
     .await
 }
 
+/// Poll until a `ClientTrafficPolicy`'s `status.ancestors[]` contains a condition
+/// with the given type and status from the named controller.
+///
+/// Uses [`kube::api::DynamicObject`] because `ClientTrafficPolicy` is a coxswain-owned
+/// CRD with no generated typed Rust struct.
+///
+/// # Errors
+///
+/// Returns an error if no matching condition is found before `timeout` elapses.
+pub async fn wait_for_client_traffic_policy_condition(
+    client: &kube::Client,
+    name: &str,
+    namespace: &str,
+    controller_name: &str,
+    type_: &str,
+    status: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    use kube::api::{ApiResource, DynamicObject};
+
+    let ar = ApiResource {
+        group: "gateway.coxswain-labs.dev".into(),
+        version: "v1alpha1".into(),
+        api_version: "gateway.coxswain-labs.dev/v1alpha1".into(),
+        kind: "ClientTrafficPolicy".into(),
+        plural: "clienttrafficpolicies".into(),
+    };
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
+    let name = name.to_owned();
+    let controller_name = controller_name.to_owned();
+    let type_ = type_.to_owned();
+    let status = status.to_owned();
+    poll_until(
+        timeout,
+        POLL,
+        || {
+            let api = api.clone();
+            let name = name.clone();
+            let controller_name = controller_name.clone();
+            let type_ = type_.clone();
+            let status = status.clone();
+            async move {
+                match api.get(&name).await {
+                    Ok(obj) => {
+                        let ancestors = obj.data["status"]["ancestors"]
+                            .as_array()
+                            .map(|v| {
+                                v.iter()
+                                    .map(|a| {
+                                        format!(
+                                            "{}:{}",
+                                            a["controllerName"].as_str().unwrap_or(""),
+                                            a["conditions"]
+                                                .as_array()
+                                                .map(|conds| {
+                                                    conds
+                                                        .iter()
+                                                        .map(|c| {
+                                                            format!(
+                                                                "{}={}({})",
+                                                                c["type"].as_str().unwrap_or(""),
+                                                                c["status"].as_str().unwrap_or(""),
+                                                                c["reason"].as_str().unwrap_or("")
+                                                            )
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                        .join(",")
+                                                })
+                                                .unwrap_or_default()
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            })
+                            .unwrap_or_else(|| "<no ancestors>".into());
+                        format!(
+                            "ClientTrafficPolicy {namespace}/{name} to have ancestor condition \
+                             {type_}={status} from {controller_name}; observed ancestors=[{ancestors}]"
+                        )
+                    }
+                    Err(e) => format!(
+                        "ClientTrafficPolicy {namespace}/{name} to exist; fetch error: {e}"
+                    ),
+                }
+            }
+        },
+        || {
+            let api = api.clone();
+            let name = name.clone();
+            let controller_name = controller_name.clone();
+            let type_ = type_.clone();
+            let status = status.clone();
+            async move {
+                let obj = api.get(&name).await.ok()?;
+                let ancestors = obj.data["status"]["ancestors"].as_array()?;
+                let matched = ancestors.iter().any(|a| {
+                    a["controllerName"].as_str() == Some(&controller_name)
+                        && a["conditions"].as_array().is_some_and(|conds| {
+                            conds.iter().any(|c| {
+                                c["type"].as_str() == Some(&type_)
+                                    && c["status"].as_str() == Some(&status)
+                            })
+                        })
+                });
+                if matched { Some(()) } else { None }
+            }
+        },
+    )
+    .await
+}
+
 /// Fetch and summarize a `BackendTLSPolicy`'s ancestor conditions for a timeout dump.
 async fn backend_tls_policy_state(api: &Api<BackendTlsPolicy>, name: &str) -> String {
     match api.get(name).await {

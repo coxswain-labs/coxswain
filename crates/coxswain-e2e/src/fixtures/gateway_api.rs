@@ -275,3 +275,11 @@ pub const TLS_TERMINATE: &str = fixture!("tls_terminate.yaml");
 /// Placeholders: `GATEWAY_TLS_PASSTHROUGH_PORT`, `TERMINATE_HOSTNAME`, `PASSTHROUGH_HOSTNAME`,
 ///               `GW_TLS_CRT_B64`, `GW_TLS_KEY_B64`.
 pub const TLS_MIXED: &str = fixture!("tls_mixed.yaml");
+
+/// Gateway-scoped `ClientTrafficPolicy` enabling PROXY protocol.
+/// Substitutions: `CTP_NAME`, `GATEWAY_NAME`, `TRUSTED_SOURCES` (CIDR).
+pub const CLIENT_TRAFFIC_POLICY: &str = fixture!("client_traffic_policy.yaml");
+
+/// Two section-scoped `ClientTrafficPolicy` resources on the same listener (conflict test).
+/// Substitutions: `GATEWAY_NAME`, `SECTION_NAME`.
+pub const CLIENT_TRAFFIC_POLICY_CONFLICT: &str = fixture!("client_traffic_policy_conflict.yaml");

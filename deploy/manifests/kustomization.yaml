@@ -21,6 +21,7 @@ resources:
   - controller-rbac.yaml
   - shared-proxy-rbac.yaml
   - crds/coxswaingatewayparameters.yaml
+  - crds/clienttrafficpolicies.yaml
   - crds/ratelimits.yaml
   - gateway-class.yaml
   - ingress-class.yaml

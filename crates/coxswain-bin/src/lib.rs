@@ -13,6 +13,7 @@ use coxswain_controller::{
 };
 use coxswain_core::health::{HealthRegistry, SubsystemHandle};
 use coxswain_core::identity::{SpiffeId, SvidIssuer};
+use coxswain_core::listener_status::ProxyProtocolListenerConfig;
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{RouteTimeouts, SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use coxswain_core::shared::Shared;
@@ -24,7 +25,7 @@ use coxswain_discovery::{
 use coxswain_proxy::{
     GatewayProxy, IngressProxy, ListenerProtocol, ListenerSpec, PassthroughConfig, ProxyAcceptor,
     RateLimiterRegistry, RoutingEngine, RoutingSource, SharedProxyConfig, SniCertSelector,
-    TrustedSources, UpstreamCaCache,
+    UpstreamCaCache,
 };
 use coxswain_reflector::{GatewayListenerStatus, ListenerReadiness};
 use pingora_core::apps::HttpServerOptions;
@@ -493,50 +494,25 @@ fn wire_gateway_only_proxy_services(
 
     let (gw_tx, gw_rx) = watch::channel(initial_gw_specs.clone());
 
-    if proxy.proxy_accept_proxy_protocol {
-        if proxy.proxy_trusted_sources.is_empty() {
-            tracing::warn!(
-                "--proxy-accept-proxy-protocol is set but --proxy-trusted-sources is empty; \
-                 all connections will be rejected"
-            );
-        }
-        let trusted = Arc::new(TrustedSources::new(proxy.proxy_trusted_sources.clone()));
-        let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
-        server.add_service(
-            ProxyAcceptor::new(
-                gateway_proxy,
-                initial_gw_specs,
-                Some(gw_rx),
-                Some(trusted),
-                selector,
-                proxy.proxy_listener_drain_timeout,
-                PassthroughConfig {
-                    table: source.passthrough_routes(),
-                    terminate_table: source.terminate_routes(),
-                    dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
-                },
-            )
-            .context("build dedicated GatewayProxy acceptor (PROXY protocol)")?,
-        );
-    } else {
-        let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
-        server.add_service(
-            ProxyAcceptor::new(
-                gateway_proxy,
-                initial_gw_specs,
-                Some(gw_rx),
-                None,
-                selector,
-                proxy.proxy_listener_drain_timeout,
-                PassthroughConfig {
-                    table: source.passthrough_routes(),
-                    terminate_table: source.terminate_routes(),
-                    dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
-                },
-            )
-            .context("build dedicated GatewayProxy acceptor")?,
-        );
-    }
+    // Gateway listeners carry their PROXY config via ClientTrafficPolicy →
+    // ListenerInfo.proxy_protocol → ListenerSpec.proxy_protocol.
+    // No global flag: --ingress-* flags only cover Ingress-origin listeners.
+    let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
+    server.add_service(
+        ProxyAcceptor::new(
+            gateway_proxy,
+            initial_gw_specs,
+            Some(gw_rx),
+            selector,
+            proxy.proxy_listener_drain_timeout,
+            PassthroughConfig {
+                table: source.passthrough_routes(),
+                terminate_table: source.terminate_routes(),
+                dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+            },
+        )
+        .context("build dedicated GatewayProxy acceptor")?,
+    );
 
     server.add_service(background_service(
         "gateway-listener-specs",
@@ -636,46 +612,41 @@ fn wire_proxy_services(
     let advertised_ports = shared_cfg.advertised_ports.clone();
     advertised_ports.store(Arc::new(derive_advertised_ports(&listener_status.load())));
 
-    if proxy.proxy_accept_proxy_protocol {
-        if proxy.proxy_trusted_sources.is_empty() {
-            tracing::warn!(
-                "--proxy-accept-proxy-protocol is set but --proxy-trusted-sources is empty; \
-                 all connections will be rejected"
-            );
-        }
-        let trusted = Arc::new(TrustedSources::new(proxy.proxy_trusted_sources.clone()));
+    // Build the per-Ingress PROXY config from the --ingress-* flags.
+    // Ingress-origin listeners carry this on their ListenerSpec.proxy_protocol.
+    // Gateway-origin listeners get their PROXY config from ClientTrafficPolicy →
+    // ListenerInfo.proxy_protocol → ListenerSpec.proxy_protocol in derive_gateway_specs.
+    // The two mechanisms are disjoint: no flag bleed into Gateway listeners.
+    let ingress_proxy_config: Option<ProxyProtocolListenerConfig> =
+        if proxy.ingress_accept_proxy_protocol {
+            if proxy.ingress_proxy_trusted_sources.is_empty() {
+                tracing::warn!(
+                    "--ingress-accept-proxy-protocol is set but --ingress-proxy-trusted-sources \
+                     is empty; all Ingress connections will be rejected"
+                );
+            }
+            Some(ProxyProtocolListenerConfig::new(
+                true,
+                proxy.ingress_proxy_trusted_sources.clone(),
+            ))
+        } else {
+            None
+        };
 
-        if !ingress_specs.is_empty() {
-            let p = Arc::new(make_http_proxy(
-                &server.configuration,
-                IngressProxy::new(
-                    Arc::new(RoutingEngine::new(source.ingress_routes())),
-                    shared_cfg.clone(),
-                ),
-            ));
-            let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
-            server.add_service(
-                ProxyAcceptor::new(
-                    p,
-                    ingress_specs,
-                    None, // static: ingress ports never change
-                    Some(Arc::clone(&trusted)),
-                    selector,
-                    proxy.proxy_listener_drain_timeout,
-                    PassthroughConfig {
-                        table: source.passthrough_routes(),
-                        terminate_table: source.terminate_routes(),
-                        dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
-                    },
-                )
-                .context("build IngressProxy acceptor (PROXY protocol)")?,
-            );
-        }
+    // Seed PROXY config onto each Ingress ListenerSpec.
+    let ingress_specs_with_pp: HashSet<ListenerSpec> = ingress_specs
+        .into_iter()
+        .map(|mut s| {
+            s.proxy_protocol = ingress_proxy_config.clone();
+            s
+        })
+        .collect();
 
+    if !ingress_specs_with_pp.is_empty() {
         let p = Arc::new(make_http_proxy(
             &server.configuration,
-            GatewayProxy::new(
-                Arc::new(RoutingEngine::new(source.gateway_routes())),
+            IngressProxy::new(
+                Arc::new(RoutingEngine::new(source.ingress_routes())),
                 shared_cfg.clone(),
             ),
         ));
@@ -683,9 +654,8 @@ fn wire_proxy_services(
         server.add_service(
             ProxyAcceptor::new(
                 p,
-                initial_gw_specs,
-                Some(gw_rx),
-                Some(trusted),
+                ingress_specs_with_pp,
+                None, // static: ingress ports never change
                 selector,
                 proxy.proxy_listener_drain_timeout,
                 PassthroughConfig {
@@ -694,61 +664,33 @@ fn wire_proxy_services(
                     dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
                 },
             )
-            .context("build GatewayProxy acceptor (PROXY protocol)")?,
-        );
-    } else {
-        if !ingress_specs.is_empty() {
-            let p = Arc::new(make_http_proxy(
-                &server.configuration,
-                IngressProxy::new(
-                    Arc::new(RoutingEngine::new(source.ingress_routes())),
-                    shared_cfg.clone(),
-                ),
-            ));
-            let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
-            server.add_service(
-                ProxyAcceptor::new(
-                    p,
-                    ingress_specs,
-                    None, // static: ingress ports never change
-                    None,
-                    selector,
-                    proxy.proxy_listener_drain_timeout,
-                    PassthroughConfig {
-                        table: source.passthrough_routes(),
-                        terminate_table: source.terminate_routes(),
-                        dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
-                    },
-                )
-                .context("build IngressProxy acceptor")?,
-            );
-        }
-
-        let p = Arc::new(make_http_proxy(
-            &server.configuration,
-            GatewayProxy::new(
-                Arc::new(RoutingEngine::new(source.gateway_routes())),
-                shared_cfg,
-            ),
-        ));
-        let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
-        server.add_service(
-            ProxyAcceptor::new(
-                p,
-                initial_gw_specs,
-                Some(gw_rx),
-                None,
-                selector,
-                proxy.proxy_listener_drain_timeout,
-                PassthroughConfig {
-                    table: source.passthrough_routes(),
-                    terminate_table: source.terminate_routes(),
-                    dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
-                },
-            )
-            .context("build GatewayProxy acceptor")?,
+            .context("build IngressProxy acceptor")?,
         );
     }
+
+    let p = Arc::new(make_http_proxy(
+        &server.configuration,
+        GatewayProxy::new(
+            Arc::new(RoutingEngine::new(source.gateway_routes())),
+            shared_cfg,
+        ),
+    ));
+    let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
+    server.add_service(
+        ProxyAcceptor::new(
+            p,
+            initial_gw_specs,
+            Some(gw_rx),
+            selector,
+            proxy.proxy_listener_drain_timeout,
+            PassthroughConfig {
+                table: source.passthrough_routes(),
+                terminate_table: source.terminate_routes(),
+                dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+            },
+        )
+        .context("build GatewayProxy acceptor")?,
+    );
 
     server.add_service(background_service(
         "gateway-listener-specs",
@@ -1171,16 +1113,23 @@ impl pingora_core::services::background::BackgroundService for RateLimiterGcServ
 /// Per-port protocol upgrade rules:
 /// - TLSRoute passthrough or terminate-only → `TlsL4`
 /// - TLSRoute (any) + HTTPS terminate on the same port → `TlsHybrid`
+///
+/// `ListenerInfo.proxy_protocol` (resolved from `ClientTrafficPolicy`) is
+/// forwarded to the `ListenerSpec.proxy_protocol` field for the acceptor to
+/// enforce per-listener PROXY protocol (#327). When multiple listeners share a
+/// port (TlsHybrid), the first non-`None` PROXY config wins.
 fn derive_gateway_specs(
     health: &std::collections::HashMap<ObjectKey, GatewayListenerStatus>,
     bind_addr: IpAddr,
     excluded_ports: &HashSet<u16>,
 ) -> HashSet<ListenerSpec> {
-    // Accumulate the effective protocol per port. Rules (commutative):
+    // Accumulate the effective protocol and PROXY config per port.
+    // Protocol rules (commutative):
     //   TlsL4 + TlsL4   → TlsL4    (passthrough+terminate on same port = Mixed #481)
     //   TlsL4 + Https   → TlsHybrid
     //   Https + Https   → Https
-    let mut port_proto: HashMap<u16, ListenerProtocol> = HashMap::new();
+    let mut port_state: HashMap<u16, (ListenerProtocol, Option<ProxyProtocolListenerConfig>)> =
+        HashMap::new();
     for gw_health in health.values() {
         for info in gw_health.listeners.values() {
             // Bind the allocated internal port for shared-mode Gateways (#472):
@@ -1197,27 +1146,33 @@ fn derive_gateway_specs(
                 }
                 _ => ListenerProtocol::Https,
             };
-            port_proto
+            let new_pp = info.proxy_protocol.clone();
+            port_state
                 .entry(port)
-                .and_modify(|existing| {
+                .and_modify(|(existing_proto, existing_pp)| {
                     // Upgrade to TlsHybrid when TLS L4 and HTTPS terminate share a port.
-                    if (*existing == ListenerProtocol::TlsL4
+                    if (*existing_proto == ListenerProtocol::TlsL4
                         && new_proto == ListenerProtocol::Https)
-                        || (*existing == ListenerProtocol::Https
+                        || (*existing_proto == ListenerProtocol::Https
                             && new_proto == ListenerProtocol::TlsL4)
                     {
-                        *existing = ListenerProtocol::TlsHybrid;
+                        *existing_proto = ListenerProtocol::TlsHybrid;
                     }
                     // TlsL4+TlsL4 (Mixed) or Https+Https stay as-is.
+                    // Merge PROXY config: first non-None wins (same port, same CTP).
+                    if existing_pp.is_none() {
+                        *existing_pp = new_pp.clone();
+                    }
                 })
-                .or_insert(new_proto);
+                .or_insert((new_proto, new_pp));
         }
     }
-    port_proto
+    port_state
         .into_iter()
-        .map(|(port, protocol)| ListenerSpec {
+        .map(|(port, (protocol, proxy_protocol))| ListenerSpec {
             addr: SocketAddr::new(bind_addr, port),
             protocol,
+            proxy_protocol,
         })
         .collect()
 }

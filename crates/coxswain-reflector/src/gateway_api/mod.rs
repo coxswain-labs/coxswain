@@ -4,6 +4,7 @@
 pub(crate) mod backend_client_cert;
 mod backend_tls;
 mod bindings;
+mod client_traffic_policy;
 mod filters;
 pub(crate) mod frontend_tls;
 mod grpc_reconcile;
@@ -18,6 +19,9 @@ mod tls_status;
 pub use backend_tls::{BackendTlsIndex, build_backend_tls_index};
 pub use bindings::ListenerBinding;
 pub(crate) use bindings::parent_listener_source;
+pub use client_traffic_policy::{
+    ClientTrafficPolicyIndex, effective_proxy_config, resolve_client_traffic_policies,
+};
 pub use grpc_reconcile::GrpcRouteResolution;
 pub(crate) use hostnames::hostnames_intersect;
 pub use reconcile::RouteResolution;

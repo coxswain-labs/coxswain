@@ -714,6 +714,20 @@ message ListenerInfo {
   // Additive field; pre-1713 decoders read it as false (HostnameConflict), which
   // is the common case. Wire version stays 1.
   bool protocol_conflict = 9;
+  // PROXY protocol acceptance config resolved from a ClientTrafficPolicy.
+  // Absent = no policy; proxy defaults to off for this listener.
+  // Additive field; pre-CTP proxies decode it as absent (off). Wire version stays 1.
+  optional ProxyProtocolListenerConfig proxy_protocol = 10;
+}
+
+// PROXY protocol config for one listener, resolved by the controller from a
+// ClientTrafficPolicy. Transported to the proxy so it knows which listeners
+// require PROXY headers and which peer CIDRs to trust.
+message ProxyProtocolListenerConfig {
+  // true = expect and require a PROXY v1/v2 header on every connection.
+  bool enabled = 1;
+  // CIDR allow-list (string representation, e.g. "10.0.0.0/8").
+  repeated string trusted_sources = 2;
 }
 
 // Mirrors ListenerReadiness (a listener's readiness outcome; failure causes are TLS-specific).

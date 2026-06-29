@@ -64,8 +64,8 @@ All values can be overridden with `--set key=value` or a custom `values.yaml`.
 | `proxy.ingress.https.port` | `443` | Ingress HTTPS listener service port |
 | `proxy.shutdownGracePeriod` | `30s` | Drain window before final shutdown |
 | `proxy.shutdownTimeout` | `5s` | Hard deadline after grace period |
-| `proxy.acceptProxyProtocol` | `false` | Accept HAProxy PROXY protocol v1/v2 |
-| `proxy.trustedSources` | `[]` | CIDRs allowed to send PROXY headers |
+| `proxy.acceptProxyProtocol` | `false` | Accept HAProxy PROXY protocol v1/v2 on **Ingress listeners** only. Gateway listeners configure per-listener PROXY via `ClientTrafficPolicy` CRD. |
+| `proxy.trustedSources` | `[]` | CIDRs allowed to send PROXY headers on Ingress listeners |
 | `proxy.defaultRequestTimeout` | `""` | Global default total request timeout |
 | `proxy.defaultBackendRequestTimeout` | `""` | Global default backend request timeout |
 

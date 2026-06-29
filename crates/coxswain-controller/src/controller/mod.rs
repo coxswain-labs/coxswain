@@ -16,6 +16,7 @@
 //! truth-source the dedicated-mode operator also reads.
 
 use async_trait::async_trait;
+use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_reflector::gw_types::ListenerSet;
@@ -23,8 +24,8 @@ use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::gw_types::{BackendTlsPolicy, GrpcRoute, HttpRoute, TlsRoute};
 use coxswain_reflector::status::{
-    GatewayListenerStatus, SharedBackendTlsPolicyStatus, SharedGatewayListenerStatus,
-    SharedRouteStatus,
+    GatewayListenerStatus, SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus,
+    SharedGatewayListenerStatus, SharedRouteStatus,
 };
 use coxswain_reflector::{IngressEvent, StatusSubscriptions};
 use futures::StreamExt;
@@ -48,6 +49,7 @@ use std::time::Duration;
 use tokio::task::JoinSet;
 
 mod backend_tls_events;
+mod client_traffic_policy_events;
 mod conditions;
 mod config;
 mod gateway_class_events;
@@ -111,6 +113,8 @@ pub struct StatusChannels {
     pub tls_route: SharedRouteStatus,
     /// Per-`BackendTLSPolicy` ancestor health.
     pub policy: SharedBackendTlsPolicyStatus,
+    /// Per-`ClientTrafficPolicy` ancestor health (#327).
+    pub ctp: SharedClientTrafficPolicyStatus,
 }
 
 /// Leader-elected status writer. Registered as a Pingora `BackgroundService`
@@ -196,6 +200,7 @@ impl Controller {
             policies,
             tls_routes,
             listener_sets,
+            client_traffic_policies,
             ..
         } = subs;
 
@@ -212,6 +217,7 @@ impl Controller {
         let ingress_classes_reader = ingress_classes.reader();
         let policies_reader = policies.reader();
         let listener_sets_reader = listener_sets.reader();
+        let ctps_reader = client_traffic_policies.reader();
         let gateway_classes_for_gateways = gateway_classes.clone();
         let gateways_for_listener_sets = gateways.clone();
 
@@ -230,6 +236,7 @@ impl Controller {
             grpc_route_status: self.channels.grpc_route.clone(),
             tls_route_status: self.channels.tls_route.clone(),
             policy_status: self.channels.policy.clone(),
+            ctp_status: self.channels.ctp.clone(),
             gateway_classes: gateway_classes_reader,
             ingress_classes: ingress_classes_reader,
             gateways: gateways_reader.clone(),
@@ -248,6 +255,7 @@ impl Controller {
         let (ing_tx, ing_rx) = mpsc::unbounded::<()>();
         let (pol_tx, pol_rx) = mpsc::unbounded::<()>();
         let (ls_tx, ls_rx) = mpsc::unbounded::<()>();
+        let (ctp_tx, ctp_rx) = mpsc::unbounded::<()>();
         let leadership_txs = vec![
             gw_tx.clone(),
             gc_tx.clone(),
@@ -257,6 +265,7 @@ impl Controller {
             ing_tx.clone(),
             pol_tx.clone(),
             ls_tx.clone(),
+            ctp_tx.clone(),
         ];
 
         let mut tasks = JoinSet::new();
@@ -293,6 +302,7 @@ impl Controller {
             tls_route_tx,
         );
         spawn_health_forwarder(&mut tasks, self.channels.policy.subscribe(), pol_tx);
+        spawn_health_forwarder(&mut tasks, self.channels.ctp.subscribe(), ctp_tx);
         // GEP-1713: a TLS-health flip changes which listeners (incl. ListenerSet
         // ones) are programmed, so re-drive ListenerSet status off the same channel.
         spawn_health_forwarder(&mut tasks, self.channels.tls.subscribe(), ls_tx);
@@ -398,6 +408,13 @@ impl Controller {
             .reconcile_all_on(pol_rx)
             .run(reconcile_policy, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, policy_ctrl, "BackendTLSPolicy");
+
+        // --- ClientTrafficPolicy: primary only; re-driven on ctp-health flips +
+        // promotion (#327). ---
+        let ctp_ctrl = KubeController::for_shared_stream(client_traffic_policies, ctps_reader)
+            .reconcile_all_on(ctp_rx)
+            .run(reconcile_ctp, error_policy, ctx.clone());
+        spawn_controller_stream(&mut tasks, ctp_ctrl, "ClientTrafficPolicy");
 
         tracing::info!(pod = %self.config.pod_name, is_leader, "Status-writer work-queues active");
 
@@ -539,6 +556,7 @@ struct ReconcileContext {
     grpc_route_status: SharedRouteStatus,
     tls_route_status: SharedRouteStatus,
     policy_status: SharedBackendTlsPolicyStatus,
+    ctp_status: SharedClientTrafficPolicyStatus,
     /// Synced GatewayClass store, read for Gateway ownership at reconcile time.
     gateway_classes: kube::runtime::reflector::Store<GatewayClass>,
     /// Synced IngressClass store, read for Ingress ownership at reconcile time.
@@ -1031,6 +1049,31 @@ async fn reconcile_policy_inner(policy: &BackendTlsPolicy, ctx: &ReconcileContex
         policy,
         &ctx.controller_name,
         &ph,
+    )
+    .await;
+    Action::await_change()
+}
+
+async fn reconcile_ctp(
+    policy: Arc<ClientTrafficPolicy>,
+    ctx: Arc<ReconcileContext>,
+) -> Result<Action, Infallible> {
+    let started = std::time::Instant::now();
+    let res: Result<Action, Infallible> = Ok(reconcile_ctp_inner(&policy, &ctx).await);
+    crate::metrics::observe_reconcile("status_writer", started, &res);
+    res
+}
+
+async fn reconcile_ctp_inner(policy: &ClientTrafficPolicy, ctx: &ReconcileContext) -> Action {
+    if !ctx.leader.load(Ordering::Acquire) {
+        return Action::requeue(NON_LEADER_REQUEUE);
+    }
+    let ch = ctx.ctp_status.load();
+    client_traffic_policy_events::patch_client_traffic_policy_status(
+        &ctx.client,
+        policy,
+        &ctx.controller_name,
+        &ch,
     )
     .await;
     Action::await_change()

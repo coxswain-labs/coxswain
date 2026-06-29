@@ -152,7 +152,7 @@ On Kubernetes ≥ 1.30, the Helm chart installs a `ValidatingAdmissionPolicy` th
 
 ## Security
 
-Coxswain unconditionally strips `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Real-IP` from every upstream request before any route filter runs. The proxy owns these headers; client-supplied values are never forwarded. When `--proxy-accept-proxy-protocol` is active, Coxswain injects a proxy-generated `Forwarded` header derived from the real PROXY-protocol client address.
+Coxswain unconditionally strips `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Real-IP` from every upstream request before any route filter runs. The proxy owns these headers; client-supplied values are never forwarded. When PROXY protocol is enabled (via `--ingress-accept-proxy-protocol` for Ingress or a `ClientTrafficPolicy` for Gateway listeners), Coxswain injects a proxy-generated `Forwarded` header derived from the real PROXY-protocol client address.
 
 ## RBAC
 
