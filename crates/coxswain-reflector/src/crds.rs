@@ -1,14 +1,14 @@
 //! Gateway API CRD-presence probe.
 //!
-//! Run once at startup to decide whether to spawn Gateway API reflectors. If
-//! the CRDs are absent (`404` from the API server), the caller logs the
-//! Ingress-only warning and skips `Gateway`, `GatewayClass`, `HTTPRoute`,
-//! `ReferenceGrant`, and `BackendTLSPolicy` watches. Any other error (network
-//! blip, transient API server failure) is treated as "assume present" so a
-//! single bad reply cannot silently disable Gateway API.
+//! Called at startup and from the self-heal re-probe loop to decide whether to
+//! spawn Gateway API reflectors. If the CRDs are absent (`404` from the API
+//! server), the caller registers a `gateway_api_crds` health check that stays
+//! not-ready until the probe loop detects the CRDs and spawns the reflectors
+//! — no pod restart required.
 //!
-//! Detection is one-shot: installing the CRDs after a Coxswain pod is already
-//! running requires a pod restart to pick them up.
+//! Any error other than a `404` (network blip, transient API server failure)
+//! is treated as "assume present" so a single bad reply cannot silently
+//! disable Gateway API.
 
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use kube::{Api, Client};

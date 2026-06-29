@@ -99,7 +99,14 @@ spec:
             - name: COXSWAIN_WATCH_NAMESPACE
               value: {{ .Values.watchNamespace | quote }}
             {{- end }}
-            {{- if .Values.controller.ingress.enabled }}
+            {{- if not .Values.controller.gatewayApi.enabled }}
+            - name: COXSWAIN_DISABLE_GATEWAY_API
+              value: "true"
+            {{- end }}
+            {{- if not .Values.controller.ingress.enabled }}
+            - name: COXSWAIN_DISABLE_INGRESS
+              value: "true"
+            {{- else }}
             - name: COXSWAIN_INGRESS_HTTP_PORT
               value: {{ include "coxswain.httpContainerPort" . | quote }}
             - name: COXSWAIN_INGRESS_HTTPS_PORT

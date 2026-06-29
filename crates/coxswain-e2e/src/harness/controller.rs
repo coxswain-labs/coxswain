@@ -46,6 +46,12 @@ pub struct ControllerOptions {
     /// Sets `discovery.svidTtl` (#423). Short values (e.g. `"10s"`) drive rapid
     /// SVID rotation for resilience tests. `None` leaves the chart default (24h).
     pub discovery_svid_ttl: Option<String>,
+    /// Sets `controller.gatewayApi.enabled`. `None` leaves the chart default
+    /// (`true`). Use `Some(false)` to test Ingress-only installs.
+    pub gateway_api_enabled: Option<bool>,
+    /// Sets `controller.ingress.enabled`. `None` leaves the chart default
+    /// (`true`). Use `Some(false)` to test Gateway-API-only installs.
+    pub ingress_enabled: Option<bool>,
 }
 
 /// Handle to the in-cluster coxswain installation for one test.
@@ -105,6 +111,8 @@ impl ControllerProcess {
             access_log: opts.access_log,
             access_log_path_mode: opts.access_log_path_mode,
             discovery_svid_ttl: opts.discovery_svid_ttl,
+            gateway_api_enabled: opts.gateway_api_enabled,
+            ingress_enabled: opts.ingress_enabled,
         };
         if overrides != HelmOverrides::default() {
             let root = workspace_root().context("workspace root")?;
@@ -113,9 +121,18 @@ impl ControllerProcess {
                 .context("helm upgrade with overrides")?;
         }
 
-        let lb_ip = wait_for_lb_ip(SHARED_PROXY_SVC, COXSWAIN_NAMESPACE)
-            .await
-            .context("shared-proxy LB IP")?;
+        // When ingress is disabled the chart omits the external LoadBalancer Service
+        // (shared-proxy-service.yaml is gated on `controller.ingress.enabled`). The
+        // internal ClusterIP service used for health/admin port-forwards is always
+        // present. Use the unspecified address as a sentinel; tests that disable ingress
+        // must not send traffic through proxy_addr / tls_addr.
+        let lb_ip = if overrides.ingress_enabled == Some(false) {
+            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        } else {
+            wait_for_lb_ip(SHARED_PROXY_SVC, COXSWAIN_NAMESPACE)
+                .await
+                .context("shared-proxy LB IP")?
+        };
 
         let health_port = free_port()?;
         let admin_port = free_port()?;

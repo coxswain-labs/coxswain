@@ -107,7 +107,7 @@ curl -s http://localhost:8082/metrics        # Prometheus text
 kubectl get gatewayclass                   # should show "coxswain" accepted
 ```
 
-The full controller admin API (the `/api/v1/{fleet,routing}/*` surface, summaries, problems, health) is described in `crates/coxswain-admin/openapi.yaml` — an internal dev aid kept in sync with the dispatch.
+The full controller admin API (the `/api/v1/{fleet,routing}/*` surface, summaries, problems, health) is described in `api/openapi.yaml` — an internal aid kept in sync with the dispatch.
 
 `/readyz` returns 200 iff every registered subsystem check is `Ready` or `Degraded` (`Pending` and `Failed` flip it to 503). `/api/v1/health`'s `subsystems` exposes the full per-subsystem detail. If the Gateway API CRDs (or RBAC for any watched resource) are missing, the corresponding reflector errors out instead of emitting `InitDone`, its check stays `Pending`, and `/readyz` stays 503 — the pod is not actually ready until its dependencies are installed.
 

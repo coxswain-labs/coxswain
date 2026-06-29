@@ -54,6 +54,13 @@ pub struct StatusWriterConfig {
     /// Ingress listener ports (used for the `PortUnavailable` Gateway listener
     /// condition).
     pub ingress_ports: coxswain_reflector::IngressPorts,
+    /// Enable the Gateway API surface (HTTPRoute, GatewayClass, etc.).
+    /// When `false`, Gateway API reflectors and health checks are not
+    /// registered, and the surface is silently ignored.
+    pub enable_gateway_api: bool,
+    /// Enable the Ingress surface. When `false`, Ingress reflectors and health
+    /// checks are not registered.
+    pub enable_ingress: bool,
 }
 
 /// Error returned from [`spawn_status_writer`] when the wiring fails before
@@ -106,6 +113,8 @@ pub fn spawn_status_writer(
         controller_name,
         ingress_default_backend,
         ingress_ports,
+        enable_gateway_api,
+        enable_ingress,
     } = config;
 
     let ingress_routes = coxswain_core::routing::SharedIngressRoutingTable::new();
@@ -119,33 +128,50 @@ pub fn spawn_status_writer(
     let owned_gateways = OwnedGateways::new();
     let dedicated_registry = DedicatedRoutingRegistry::new();
 
-    let controller_handle = health.register(
-        "controller",
-        &[
-            "httproute",
-            "grpcroute",
-            "tls_route",
-            "ingress",
-            "ingress_class",
-            "ingress_class_parameters",
-            "gateway",
-            "gateway_class",
-            "listener_set",
-            "namespace",
-            "endpoint_slice",
-            "reference_grant",
-            "secret",
-            "auth_secret",
-            "auth_tls_secret",
-            "service",
-            "backend_tls_policy",
-            "config_map",
-            "rate_limit",
-            "path_rewrite_regex",
-            "pod",
-            "routing_table_built",
-        ],
-    );
+    // Always-on checks: shared by both surfaces and by the fleet watch +
+    // rebuild pipeline.
+    const ALWAYS_ON_CHECKS: &[&str] = &[
+        "endpoint_slice",
+        "secret",
+        "service",
+        "pod",
+        "routing_table_built",
+    ];
+    // Per-surface checks registered only when the surface is enabled;
+    // disabled surfaces never mark a check ready so registering them would
+    // block /readyz forever.
+    const INGRESS_CHECKS: &[&str] = &[
+        "ingress",
+        "ingress_class",
+        "ingress_class_parameters",
+        "auth_secret",
+        "auth_tls_secret",
+    ];
+    const GATEWAY_API_CHECKS: &[&str] = &[
+        "gateway_api_crds",
+        "httproute",
+        "grpcroute",
+        "tls_route",
+        "gateway",
+        "gateway_class",
+        "listener_set",
+        "namespace",
+        "reference_grant",
+        "backend_tls_policy",
+        "config_map",
+        "rate_limit",
+        "path_rewrite_regex",
+    ];
+
+    let mut controller_checks: Vec<&str> = ALWAYS_ON_CHECKS.to_vec();
+    if enable_ingress {
+        controller_checks.extend_from_slice(INGRESS_CHECKS);
+    }
+    if enable_gateway_api {
+        controller_checks.extend_from_slice(GATEWAY_API_CHECKS);
+    }
+
+    let controller_handle = health.register("controller", &controller_checks);
     let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
 
     let passthrough_routes = coxswain_core::routing::SharedTlsPassthroughTable::new();
@@ -198,6 +224,8 @@ pub fn spawn_status_writer(
             // watches (#347).
             opts.status_subscriptions = true;
             opts.ingress_event_tx = Some(ingress_event_tx);
+            opts.enable_gateway_api = enable_gateway_api;
+            opts.enable_ingress = enable_ingress;
             opts
         },
     );

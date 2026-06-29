@@ -185,6 +185,28 @@ pub(crate) struct CommonArgs {
     /// block. When omitted, no static Ingress HTTPS listener is bound.
     #[arg(long, env = "COXSWAIN_INGRESS_HTTPS_PORT")]
     pub ingress_https_port: Option<u16>,
+
+    /// Disable the Gateway API surface entirely.
+    ///
+    /// When set, no Gateway API reflectors (`Gateway`, `GatewayClass`,
+    /// `HTTPRoute`, `GRPCRoute`, `TLSRoute`, `ListenerSet`, `ReferenceGrant`,
+    /// `BackendTLSPolicy`) are started, no CRD-presence probe runs, and the
+    /// `gateway_api_crds` readiness check is not registered. Useful for
+    /// Ingress-only installs. Default (unset): the surface is enabled and, if
+    /// the CRDs are absent at startup, readiness fails until they appear
+    /// (self-healing re-probe — no restart required).
+    #[arg(long, env = "COXSWAIN_DISABLE_GATEWAY_API")]
+    pub disable_gateway_api: bool,
+
+    /// Disable the Ingress surface entirely.
+    ///
+    /// When set, no Ingress reflectors (`Ingress`, `IngressClass`,
+    /// `CoxswainIngressClassParameters`) are started and the proxy binds no
+    /// static Ingress listeners. Useful for Gateway-API-only installs, or
+    /// clusters where Ingress is handled by a separate controller. Default
+    /// (unset): the surface is enabled.
+    #[arg(long, env = "COXSWAIN_DISABLE_INGRESS")]
+    pub disable_ingress: bool,
 }
 
 /// Flags specific to roles that bind Pingora proxy listeners (`proxy`, `dev`).
@@ -1124,5 +1146,49 @@ mod tests {
         ])
         .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// Both disable flags default to `false` (surfaces enabled) when absent.
+    #[test]
+    fn disable_surface_flags_default_false() {
+        let cli =
+            Cli::try_parse_from(["coxswain", "serve", "controller"]).expect("controller parses");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Controller(args)) = serve.role else {
+            panic!("expected controller role");
+        };
+        assert!(
+            !args.common.disable_gateway_api,
+            "--disable-gateway-api defaults to false (gateway-api enabled)"
+        );
+        assert!(
+            !args.common.disable_ingress,
+            "--disable-ingress defaults to false (ingress enabled)"
+        );
+    }
+
+    /// `--disable-gateway-api` and `--disable-ingress` set their bools to `true`.
+    #[test]
+    fn disable_surface_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "controller",
+            "--disable-gateway-api",
+            "--disable-ingress",
+        ])
+        .expect("parses with disable flags");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Controller(args)) = serve.role else {
+            panic!("expected controller role");
+        };
+        assert!(
+            args.common.disable_gateway_api,
+            "--disable-gateway-api must be true when flag is set"
+        );
+        assert!(
+            args.common.disable_ingress,
+            "--disable-ingress must be true when flag is set"
+        );
     }
 }

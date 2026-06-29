@@ -22,13 +22,14 @@
 //! helpers live in `common::dedicated`.
 
 use coxswain_e2e::{
-    FixtureVars, Harness, NamespaceGuard,
-    fixtures::{self, backends, dedicated_proxy as dedicated},
+    ControllerOptions, FixtureVars, Harness, NamespaceGuard,
+    fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress as ing},
     harness::{HttpClient, wait},
 };
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
+use k8s_openapi::api::networking::v1::Ingress;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use std::time::Duration;
 
@@ -719,6 +720,183 @@ async fn lifecycle_gateway_deletion_cascades_resources() -> anyhow::Result<()> {
             gone.then_some(())
         },
     )
+    .await?;
+
+    Ok(())
+}
+
+// ── API-surface flag-gating (#492) ───────────────────────────────────────────
+//
+// Serial tests: both reconfigure the shared Helm release and must restore the
+// default config before returning. The nextest `serial` group in
+// `.config/nextest.toml` ensures these do not overlap other global-config tests.
+//
+// Pattern: apply a positive-control resource (from the STILL-ENABLED surface) +
+// the resource under test (from the DISABLED surface). Wait for the positive
+// control to confirm the controller ran. Then assert the disabled-surface
+// resource was left untouched.
+
+/// (#492 sad) Gateway API disabled: a Gateway applied while the surface is off
+/// receives no status conditions, proving coxswain does not reconcile Gateway
+/// API resources when `--disable-gateway-api` is set.
+///
+/// Positive control: an Ingress from the still-enabled surface gets its
+/// `loadBalancer` IP, confirming the controller processed the namespace and had
+/// every opportunity to (wrongly) reconcile the Gateway.
+///
+/// At the end the chart default (`controller.gatewayApi.enabled=true`) is
+/// restored so later serial tests run with stock config.
+#[tokio::test]
+async fn gateway_api_disabled_skips_gateway_reconcile() -> anyhow::Result<()> {
+    const STATUS_IP: &str = "203.0.113.81";
+    let h = Harness::start_with_options(ControllerOptions {
+        gateway_api_enabled: Some(false),
+        status_address: Some(STATUS_IP.to_string()),
+        ..Default::default()
+    })
+    .await?;
+
+    // Assert the health endpoint reports the surface as disabled.
+    let health: serde_json::Value = reqwest::get(h.controller_admin_url("/api/v1/health"))
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        health["api_surfaces"]["gateway_api"].as_bool(),
+        Some(false),
+        "api_surfaces.gateway_api must be false when --disable-gateway-api is set; got: {health}"
+    );
+    assert_eq!(
+        health["api_surfaces"]["ingress"].as_bool(),
+        Some(true),
+        "api_surfaces.ingress must remain true; got: {health}"
+    );
+
+    let ns = NamespaceGuard::create(&h.client, "prov-gw-disabled").await?;
+
+    // Apply an Ingress (positive control: proves the controller processed the ns).
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ing::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    // Apply a Gateway that would normally be reconciled.
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    // Wait for the Ingress to get an LB IP — proves the controller ran and had
+    // time to reconcile the Gateway if it were going to.
+    wait::wait_for_ingress_lb_ip(
+        &h.client,
+        "echo-ingress",
+        &ns.name,
+        STATUS_IP,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Negative assertion: the Gateway must NOT be reconciled by coxswain.
+    // The Gateway API admission webhook injects Accepted=Unknown / Programmed=Unknown
+    // conditions with observedGeneration=None at object creation time ("Waiting for
+    // controller"). Coxswain always sets observedGeneration when it writes conditions,
+    // so the absence of any condition with observedGeneration.is_some() proves it
+    // never touched the Gateway.
+    let gateways_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let gw = gateways_api.get("coxswain-test").await?;
+    let conditions = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or(&[]);
+    let coxswain_reconciled = conditions.iter().any(|c| c.observed_generation.is_some());
+    assert!(
+        !coxswain_reconciled,
+        "Gateway must not be reconciled by coxswain when gateway-api surface is disabled; \
+         initial 'Unknown' conditions from the Gateway API admission webhook are expected, \
+         but none with observedGeneration set should appear. Got: {conditions:?}"
+    );
+
+    // Restore the chart-default so later serial tests run with stock config.
+    Harness::start_with_options(ControllerOptions {
+        gateway_api_enabled: Some(true),
+        ..Default::default()
+    })
+    .await?;
+
+    Ok(())
+}
+
+/// (#492 sad) Ingress disabled: an Ingress applied while the surface is off
+/// receives no `loadBalancer` status, proving coxswain does not reconcile
+/// Ingress resources when `--disable-ingress` is set.
+///
+/// Positive control: a Gateway from the still-enabled surface reaches
+/// `Accepted=True`, confirming the controller processed the namespace.
+///
+/// At the end the chart default (`controller.ingress.enabled=true`) is
+/// restored so later serial tests run with stock config.
+#[tokio::test]
+async fn ingress_disabled_skips_ingress_reconcile() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        ingress_enabled: Some(false),
+        ..Default::default()
+    })
+    .await?;
+
+    // Assert the health endpoint reports the surface as disabled.
+    let health: serde_json::Value = reqwest::get(h.controller_admin_url("/api/v1/health"))
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        health["api_surfaces"]["ingress"].as_bool(),
+        Some(false),
+        "api_surfaces.ingress must be false when --disable-ingress is set; got: {health}"
+    );
+    assert_eq!(
+        health["api_surfaces"]["gateway_api"].as_bool(),
+        Some(true),
+        "api_surfaces.gateway_api must remain true; got: {health}"
+    );
+
+    let ns = NamespaceGuard::create(&h.client, "prov-ing-disabled").await?;
+
+    // Apply a Gateway (positive control: proves the controller processed the ns).
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    // Apply an Ingress that would normally be reconciled.
+    fixtures::apply_fixture(ing::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    // Wait for the Gateway to reach Accepted=True — proves the controller ran.
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-test",
+        &ns.name,
+        "Accepted",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Negative assertion: the Ingress must carry no loadBalancer status.
+    let ingresses: Api<Ingress> = Api::namespaced(h.client.clone(), &ns.name);
+    let ingress = ingresses.get("echo-ingress").await?;
+    let lb_entries = ingress
+        .status
+        .as_ref()
+        .and_then(|s| s.load_balancer.as_ref())
+        .and_then(|lb| lb.ingress.as_deref())
+        .unwrap_or(&[]);
+    assert!(
+        lb_entries.is_empty(),
+        "Ingress must have no loadBalancer status when ingress surface is disabled, got: {lb_entries:?}"
+    );
+
+    // Restore the chart-default so later serial tests run with stock config.
+    Harness::start_with_options(ControllerOptions {
+        ingress_enabled: Some(true),
+        ..Default::default()
+    })
     .await?;
 
     Ok(())

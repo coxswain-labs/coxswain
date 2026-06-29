@@ -264,6 +264,11 @@ img { max-width: 100%; }
 .version-row { display: flex; align-items: baseline; justify-content: space-between; gap: 24px; font-size: 13px; }
 .version-row dt { color: var(--muted); }
 .version-row dd { color: var(--text); font-family: ui-monospace, monospace; }
+.version-surfaces { margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; }
+.version-surface-chips { display: flex; gap: 6px; margin-top: 4px; }
+.version-surface-chip { font-size: 11px; padding: 2px 7px; border-radius: 10px; font-weight: 500; }
+.version-surface-chip.active   { background: #1a3a2d; color: #4ade80; }
+.version-surface-chip.inactive { background: #2d1e1e; color: #f87171; text-decoration: line-through; }
 @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:.4; } }
 
 /* ── Screen layout ───────────────────────────────────────────────────────── */

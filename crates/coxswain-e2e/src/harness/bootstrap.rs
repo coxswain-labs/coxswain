@@ -238,6 +238,12 @@ pub(crate) struct HelmOverrides {
     /// rotation cycle without waiting the 24 h default. `None` leaves the chart
     /// default.
     pub discovery_svid_ttl: Option<String>,
+    /// Passed as `controller.gatewayApi.enabled`. `None` leaves the chart
+    /// default (`true`). Use `Some(false)` to test Ingress-only installs.
+    pub gateway_api_enabled: Option<bool>,
+    /// Passed as `controller.ingress.enabled`. `None` leaves the chart
+    /// default (`true`). Use `Some(false)` to test Gateway-API-only installs.
+    pub ingress_enabled: Option<bool>,
 }
 
 /// Install or upgrade the coxswain Helm release with e2e-specific overrides.
@@ -320,6 +326,14 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
     if let Some(ttl) = &overrides.discovery_svid_ttl {
         args.push("--set".into());
         args.push(format!("discovery.svidTtl={ttl}"));
+    }
+    if let Some(enabled) = overrides.gateway_api_enabled {
+        args.push("--set".into());
+        args.push(format!("controller.gatewayApi.enabled={enabled}"));
+    }
+    if let Some(enabled) = overrides.ingress_enabled {
+        args.push("--set".into());
+        args.push(format!("controller.ingress.enabled={enabled}"));
     }
 
     let status = Command::new("helm")

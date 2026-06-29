@@ -42,22 +42,36 @@ mod common;
 
 /// Controller-subsystem checks asserted in `/status.subsystems.controller.checks`.
 ///
-/// Order is irrelevant but the set must match what `main.rs` registers — keep in
-/// lockstep with the `controller_handle` registration call.
+/// Order is irrelevant. Keep in lockstep with `ALWAYS_ON_CHECKS`, `INGRESS_CHECKS`,
+/// and `GATEWAY_API_CHECKS` in `status_writer.rs` — the default install enables
+/// both surfaces so all three sets are registered.
 const CONTROLLER_CHECKS: &[&str] = &[
-    "httproute",
+    // always-on
+    "endpoint_slice",
+    "secret",
+    "service",
+    "pod",
+    "routing_table_built",
+    // ingress surface
     "ingress",
     "ingress_class",
     "ingress_class_parameters",
+    "auth_secret",
+    "auth_tls_secret",
+    // gateway-api surface
+    "gateway_api_crds",
+    "httproute",
+    "grpcroute",
+    "tls_route",
     "gateway",
     "gateway_class",
-    "endpoint_slice",
+    "listener_set",
+    "namespace",
     "reference_grant",
-    "secret",
-    "service",
     "backend_tls_policy",
     "config_map",
-    "routing_table_built",
+    "rate_limit",
+    "path_rewrite_regex",
 ];
 
 // Note: the original `readyz_starts_not_ready_then_transitions_to_ready` test
