@@ -638,7 +638,6 @@ fn wildcard_kind_to_wire(k: WildcardKind) -> p::WildcardKind {
 
 fn normalize_level_to_wire(n: NormalizeLevel) -> p::NormalizeLevel {
     match n {
-        NormalizeLevel::None => p::NormalizeLevel::None,
         NormalizeLevel::Base => p::NormalizeLevel::Base,
         NormalizeLevel::MergeSlashes => p::NormalizeLevel::MergeSlashes,
         NormalizeLevel::DecodeAndMergeSlashes => p::NormalizeLevel::DecodeAndMergeSlashes,
@@ -1435,7 +1434,6 @@ fn wildcard_kind_from_wire(v: i32) -> Result<WildcardKind, WireError> {
 fn normalize_level_from_wire(v: i32) -> Result<NormalizeLevel, WireError> {
     match p::NormalizeLevel::try_from(v).unwrap_or(p::NormalizeLevel::Unspecified) {
         p::NormalizeLevel::Unspecified | p::NormalizeLevel::Base => Ok(NormalizeLevel::Base),
-        p::NormalizeLevel::None => Ok(NormalizeLevel::None),
         p::NormalizeLevel::MergeSlashes => Ok(NormalizeLevel::MergeSlashes),
         p::NormalizeLevel::DecodeAndMergeSlashes => Ok(NormalizeLevel::DecodeAndMergeSlashes),
     }

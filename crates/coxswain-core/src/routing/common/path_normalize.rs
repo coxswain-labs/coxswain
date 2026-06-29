@@ -1,7 +1,9 @@
 //! Envoy/Istio-style path normalization levels for routing and forwarding.
 //!
 //! Each level is a strict superset of the previous — `base` ⊂ `merge-slashes` ⊂
-//! `decode-and-merge-slashes`.  The `none` level is the identity (no-op).
+//! `decode-and-merge-slashes`.  `base` is the secure floor: there is no
+//! identity/passthrough level, because disabling normalization re-opens
+//! route-match bypass and path-traversal attacks.
 //!
 //! The model mirrors Istio's `MeshConfig.pathNormalization` (Envoy's
 //! `normalize_path` + `merge_slashes` + `path_with_escaped_slashes_action`),
@@ -23,20 +25,19 @@ use std::borrow::Cow;
 /// Defaults to [`NormalizeLevel::Base`], which decodes unreserved
 /// percent-encoded characters, converts backslashes to forward slashes, and
 /// applies RFC 3986 §5.2.4 dot-segment removal — matching Istio's mesh-wide
-/// baseline.  Operators may widen the level per Ingress via the
-/// `ingress.coxswain-labs.dev/path-normalize` annotation, or narrow to `None`
-/// to opt out entirely.  Gateway API routes always use the default (`Base`) —
-/// the shared `HostRouter` default materialises this without any annotation.
+/// baseline.  Operators may only *widen* the level per Ingress via the
+/// `ingress.coxswain-labs.dev/path-normalize` annotation; there is no
+/// passthrough/identity level, so normalization can never be disabled (a
+/// disabled level re-opens route-match bypass / path-traversal attacks).
+/// Gateway API routes always use the default (`Base`) — the shared
+/// `HostRouter` default materialises this without any annotation.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NormalizeLevel {
-    /// No normalization; the raw request path is used verbatim for routing and
-    /// forwarding.  Equivalent to Istio `DISABLE`.
-    None,
     /// Percent-decode unreserved characters (RFC 3986 §2.3), convert `\` to
     /// `/`, and apply RFC 3986 §5.2.4 dot-segment removal.  Does **not** merge
     /// consecutive slashes.  Equivalent to Istio `BASE`.  This is the default
-    /// for all routes (Ingress and Gateway API).
+    /// for all routes (Ingress and Gateway API) and the secure floor.
     #[default]
     Base,
     /// All of `Base`, plus collapse runs of `/` into a single `/`.  Equivalent
@@ -56,7 +57,7 @@ impl NormalizeLevel {
     /// Returns [`Cow::Owned`] only when normalization actually changed the path
     /// (one `String` allocation, then one `Arc::from` at the call site).
     pub(crate) fn apply(self, path: &str) -> Cow<'_, str> {
-        if self == NormalizeLevel::None || !needs_slow_path(path, self) {
+        if !needs_slow_path(path, self) {
             return Cow::Borrowed(path);
         }
         let normalized = run_normalization(path, self);
@@ -324,17 +325,6 @@ mod tests {
     }
     fn decode_merge(path: &str) -> Cow<'_, str> {
         NormalizeLevel::DecodeAndMergeSlashes.apply(path)
-    }
-
-    // ── None ─────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn none_is_always_borrowed() {
-        let path = "/api/../v1";
-        assert!(matches!(
-            NormalizeLevel::None.apply(path),
-            Cow::Borrowed(p) if p == path
-        ));
     }
 
     // ── Base: dot-segment removal ─────────────────────────────────────────────

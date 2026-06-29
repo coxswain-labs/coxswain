@@ -318,11 +318,13 @@ pub const ANNOTATION_PATH_NORMALIZE_DEFAULT: &str =
 pub const ANNOTATION_PATH_NORMALIZE_MERGE_SLASHES: &str =
     fixture!("annotation_path_normalize_merge_slashes.yaml");
 
-/// `ingress.coxswain-labs.dev/path-normalize: none` (#280): route `/v1` on
-/// `pn-none.<namespace>.local`. Used to verify that normalization is fully
-/// disabled: a request with `%2E%2E` in the path does not reach `/v1` (sad
-/// path — raw path miss).
-pub const ANNOTATION_PATH_NORMALIZE_NONE: &str = fixture!("annotation_path_normalize_none.yaml");
+/// `ingress.coxswain-labs.dev/path-normalize: none` (#280, hardened #483):
+/// route `/v1` on `pn-none.<namespace>.local`. The insecure `none` value was
+/// dropped in #483; this fixture verifies it now falls back to the secure
+/// `base` floor — a `%7E`-encoded tilde is decoded upstream rather than passed
+/// through verbatim.
+pub const ANNOTATION_PATH_NORMALIZE_NONE_FALLS_BACK: &str =
+    fixture!("annotation_path_normalize_none.yaml");
 
 // ── endpoint drain (#281) ────────────────────────────────────────────────────
 
