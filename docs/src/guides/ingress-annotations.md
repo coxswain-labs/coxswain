@@ -57,7 +57,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/auth-tls-verify-depth` | integer | `1` | `"2"` |
 | `ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/load-balance` | `round_robin`, `least_conn`, `ewma`, `ip_hash`, `hash:uri`, `hash:source-ip`, `hash:header=<name>`, `hash:cookie=<name>` | `round_robin` | `"hash:uri"` |
-| `ingress.coxswain-labs.dev/path-normalize` | `none`, `base`, `merge-slashes`, `decode-and-merge-slashes` | `base` | `"merge-slashes"` |
+| `ingress.coxswain-labs.dev/path-normalize` | `base`, `merge-slashes`, `decode-and-merge-slashes` | `base` | `"merge-slashes"` |
 | `ingress.coxswain-labs.dev/circuit-breaker-threshold` | integer 1–100 | _none_ (disabled) | `"50"` |
 | `ingress.coxswain-labs.dev/circuit-breaker-window` | duration | `10s` | `"30s"` |
 | `ingress.coxswain-labs.dev/circuit-breaker-open-duration` | duration | `5s` | `"10s"` |
@@ -196,7 +196,7 @@ spec:
 
 ## `path-normalize`
 
-Controls how request paths are normalised before routing and before being forwarded upstream. Coxswain mirrors [Envoy/Istio's `pathNormalization`](https://istio.io/latest/docs/reference/config/istio.mesh.v1alpha1/#MeshConfig-ProxyPathNormalization) — the same four-level enum with `base` as the cluster-wide default.
+Controls how request paths are normalised before routing and before being forwarded upstream. Coxswain mirrors [Envoy/Istio's `pathNormalization`](https://istio.io/latest/docs/reference/config/istio.mesh.v1alpha1/#MeshConfig-ProxyPathNormalization) — with `base` as the secure default. Normalisation cannot be disabled: `base` is the floor.
 
 Normalisation runs **before** the routing lookup; the canonical path is used for the path match _and_ is sent to the upstream unchanged by a `rewrite-target` (if one is configured, it is applied on top of the normalised path).
 
@@ -204,12 +204,14 @@ Normalisation runs **before** the routing lookup; the canonical path is used for
 
 | Level | Transformations applied |
 |-------|------------------------|
-| `none` | No-op — raw request path is routed and forwarded as-is. |
 | `base` _(default)_ | Percent-decode unreserved characters (`%2e`→`.`, `%2d`→`-`, etc.); convert `\` to `/`; remove dot segments (`.` and `..`, RFC 3986 §5.2.4). `%2f` and `%5c` are **not** decoded — they remain encoded to prevent path-traversal bypasses. |
 | `merge-slashes` | Everything in `base`, plus collapse consecutive slashes (`//` → `/`). |
 | `decode-and-merge-slashes` | Everything in `merge-slashes`, plus decode `%2f`→`/` and `%5c`→`\` before the rest of the pipeline. Use only when your backend expects literal `/` from encoded segments and you understand the security trade-off. |
 
 Each level includes all transformations of the levels before it.
+
+!!! warning "Migration: `none` was removed"
+    The `none` value (which disabled normalization entirely) was dropped because it re-opened route-match bypass and path-traversal attacks — a request could dodge a path-based route or `allow-source-range` rule with `..`, `%2e%2e`, or duplicate slashes. An Ingress that still sets `path-normalize: none` is **not rejected**: the controller logs a `WARN`, emits a `Warning` Event, and silently upgrades the level to `base`. If you previously relied on raw-path passthrough, expect normalized paths upstream now and remove any dependency on the un-normalized form.
 
 ```yaml
 metadata:

@@ -178,8 +178,8 @@ pub(super) struct IngressAnnotations {
     /// Envoy/Istio-style path normalization level from `path-normalize` (#280).
     ///
     /// `None` when the annotation is absent (the host builder uses its default,
-    /// `NormalizeLevel::Base`).  An explicit `"none"` disables normalization.
-    /// Unrecognized values emit `WARN` and fall back to `Base`.
+    /// `NormalizeLevel::Base`).  Unrecognized values — and the dropped `"none"`
+    /// value (#483) — emit `WARN` and fall back to `Base`.
     pub path_normalize: Option<NormalizeLevel>,
     /// Per-route circuit-breaker config from `circuit-breaker-*` annotations (#282).
     ///
@@ -474,8 +474,26 @@ impl IngressAnnotations {
             .map(|s| traffic_policy::parse_load_balance(s, route_id, &mut diag))
             .unwrap_or_default();
 
-        // ── Path normalization level (#280) ───────────────────────────────────
+        // ── Path normalization level (#280, hardened #483) ────────────────────
         let path_normalize = get(ann, PATH_NORMALIZE).map(|v| {
+            // `none` was dropped in #483: it disabled normalization and re-opened
+            // route-match bypass / path-traversal. Reject it with a dedicated
+            // migration warning (distinct from a typo) and fall back to `base`.
+            if v.trim().eq_ignore_ascii_case("none") {
+                tracing::warn!(
+                    ingress = %route_id,
+                    annotation = PATH_NORMALIZE,
+                    value = v,
+                    "path-normalize 'none' is no longer supported — it disabled \
+                     normalization, enabling path-traversal bypass; falling back to base"
+                );
+                issue!(
+                    PATH_NORMALIZE,
+                    "'none' is no longer supported (it disabled normalization, \
+                     enabling path-traversal bypass); falling back to base"
+                );
+                return NormalizeLevel::Base;
+            }
             parse_normalize_level(v).unwrap_or_else(|| {
                 tracing::warn!(
                     ingress = %route_id,
@@ -532,13 +550,15 @@ impl IngressAnnotations {
 
 /// Parse a `path-normalize` annotation value to a [`NormalizeLevel`].
 ///
-/// Accepts `none`, `base`, `merge-slashes`, `decode-and-merge-slashes`
+/// Accepts `base`, `merge-slashes`, `decode-and-merge-slashes`
 /// (ASCII-case-insensitive).  Returns `None` for unrecognized values; the
-/// caller emits a `WARN` and falls back to `Base`.
+/// caller emits a `WARN` and falls back to `Base`.  `none` is intentionally
+/// *not* accepted here — it was dropped in #483 (it disabled normalization);
+/// the caller detects it before delegating and emits a dedicated migration
+/// warning.
 #[must_use]
 pub fn parse_normalize_level(s: &str) -> Option<NormalizeLevel> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "none" => Some(NormalizeLevel::None),
         "base" => Some(NormalizeLevel::Base),
         "merge-slashes" => Some(NormalizeLevel::MergeSlashes),
         "decode-and-merge-slashes" => Some(NormalizeLevel::DecodeAndMergeSlashes),
@@ -1017,7 +1037,6 @@ mod tests {
 
     #[test]
     fn parse_normalize_level_all_variants() {
-        assert_eq!(parse_normalize_level("none"), Some(NormalizeLevel::None));
         assert_eq!(parse_normalize_level("base"), Some(NormalizeLevel::Base));
         assert_eq!(
             parse_normalize_level("merge-slashes"),
@@ -1031,7 +1050,6 @@ mod tests {
 
     #[test]
     fn parse_normalize_level_case_insensitive() {
-        assert_eq!(parse_normalize_level("NONE"), Some(NormalizeLevel::None));
         assert_eq!(parse_normalize_level("Base"), Some(NormalizeLevel::Base));
         assert_eq!(
             parse_normalize_level("Merge-Slashes"),
@@ -1043,6 +1061,9 @@ mod tests {
     fn parse_normalize_level_unknown_returns_none() {
         assert!(parse_normalize_level("aggressive").is_none());
         assert!(parse_normalize_level("").is_none());
+        // `none` was dropped in #483 — the parser no longer recognises it; the
+        // call site detects it separately and falls back to `base`.
+        assert!(parse_normalize_level("none").is_none());
     }
 
     #[test]
@@ -1059,10 +1080,14 @@ mod tests {
     }
 
     #[test]
-    fn parse_annotation_path_normalize_none_disables() {
+    #[tracing_test::traced_test]
+    fn parse_annotation_path_normalize_none_warns_and_falls_back_to_base() {
+        // #483: `none` is dropped — it warns and resolves to the secure `base`
+        // floor, never disabling normalization.
         let m = ann(&[(PATH_NORMALIZE, "none")]);
         let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert_eq!(a.path_normalize, Some(NormalizeLevel::None));
+        assert_eq!(a.path_normalize, Some(NormalizeLevel::Base));
+        assert!(logs_contain("no longer supported"));
     }
 
     #[test]

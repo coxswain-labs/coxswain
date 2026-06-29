@@ -1,6 +1,7 @@
-# path-normalize: none fixture.
-# Normalization is fully disabled: the raw request path is matched and
-# forwarded without any decoding or dot-segment removal.
+# path-normalize: none fixture (hardened #483).
+# `none` was dropped: it no longer disables normalization but falls back to the
+# secure `base` floor, so the request path is still decoded / dot-segment
+# removed before routing and forwarding.
 #
 # Route on pn-none.<namespace>.local:
 #   /v1 → echo-a

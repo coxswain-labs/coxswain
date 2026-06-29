@@ -1657,21 +1657,21 @@ async fn double_slash_not_collapsed_at_base() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `path-normalize: none` disables normalization entirely: the raw request path
-/// is matched AND forwarded verbatim.  Send `/v1/%7E` (tilde percent-encoded);
-/// both `none` and `base` match the `/v1` prefix (via the `{*rest}` wildcard),
-/// but `base` decodes `%7E` → `~` before forwarding while `none` forwards the
-/// raw `%7E`.  Asserting `resp.path == "/v1/%7E"` proves end-to-end that no
-/// decoding occurred on the forwarded path.
+/// `path-normalize: none` is dropped in #483: it no longer disables
+/// normalization but falls back to the secure `base` floor.  Send `/v1/%7E`
+/// (tilde percent-encoded); under `base` the proxy decodes `%7E` → `~` before
+/// forwarding.  Asserting `resp.path == "/v1/~"` proves end-to-end that the
+/// insecure passthrough is gone and `base` normalization is applied instead —
+/// had `none` still disabled normalization, the upstream would see `/v1/%7E`.
 #[tokio::test]
-async fn normalization_disabled_when_none() -> anyhow::Result<()> {
+async fn path_normalize_none_falls_back_to_base() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "pn-none-sad").await?;
+    let ns = NamespaceGuard::create(&h.client, "pn-none-fallback").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
     fixtures::apply_fixture(
-        ingress::ANNOTATION_PATH_NORMALIZE_NONE,
+        ingress::ANNOTATION_PATH_NORMALIZE_NONE_FALLS_BACK,
         FixtureVars::new(&ns.name),
     )
     .await?;
@@ -1680,13 +1680,14 @@ async fn normalization_disabled_when_none() -> anyhow::Result<()> {
     // Prime the route table with the clean path.
     wait::wait_for_route(&h.http, &host, "/v1", Duration::from_secs(60)).await?;
 
-    // /v1/%7E matches the /v1 prefix (rest = %7E); with none the upstream sees
-    // the encoded form — no decoding, no rewriting.
+    // /v1/%7E matches the /v1 prefix (rest = %7E); `none` falls back to `base`,
+    // which decodes the unreserved %7E → ~ before forwarding upstream.
     let resp = h.http.get(&host, "/v1/%7E").await?;
     assert_eq!(
         resp.path.as_deref(),
-        Some("/v1/%7E"),
-        "with path-normalize: none, %7E must reach the upstream undecoded"
+        Some("/v1/~"),
+        "path-normalize: none must fall back to base — %7E is decoded to ~, \
+         not forwarded verbatim"
     );
 
     Ok(())

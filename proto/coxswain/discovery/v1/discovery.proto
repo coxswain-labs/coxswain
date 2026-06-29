@@ -181,10 +181,9 @@ enum WildcardKind {
 // Mirrors coxswain_core::routing::NormalizeLevel.
 enum NormalizeLevel {
   NORMALIZE_LEVEL_UNSPECIFIED = 0;
-  NORMALIZE_LEVEL_NONE = 1; // passthrough
-  NORMALIZE_LEVEL_BASE = 2; // percent-normalise only (default)
-  NORMALIZE_LEVEL_MERGE_SLASHES = 3; // collapse repeated /
-  NORMALIZE_LEVEL_DECODE_AND_MERGE_SLASHES = 4; // decode + collapse
+  NORMALIZE_LEVEL_BASE = 1; // percent-normalise only (default, secure floor)
+  NORMALIZE_LEVEL_MERGE_SLASHES = 2; // collapse repeated /
+  NORMALIZE_LEVEL_DECODE_AND_MERGE_SLASHES = 3; // decode + collapse
 }
 
 // Mirrors coxswain_core::routing::RouteKind.
