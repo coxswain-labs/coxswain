@@ -1,0 +1,28 @@
+# mirror-target annotation fixture WITHOUT max-body-size (apply backends::ECHO first).
+#
+# Verifies stream-concurrent mirroring (#360): the proxy mirrors the full request body
+# to echo-b WITHOUT requiring max-body-size.  The primary traffic reaches echo-a.
+# The proxy must:
+#   * forward the primary request to echo-a (200, primary response visible to client), and
+#   * asynchronously stream each request body to echo-b (access-log mirror=true row appears).
+#
+# Host: mirrornombs.TESTNS.local -> echo-a:3000 (primary); mirror -> echo-b.TESTNS.svc:3000.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mirror-target-no-max-body-ingress
+  annotations:
+    ingress.coxswain-labs.dev/mirror-target: "echo-b.${TESTNS}.svc:3000"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: mirrornombs.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

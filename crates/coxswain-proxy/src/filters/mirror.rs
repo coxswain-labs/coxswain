@@ -1,21 +1,28 @@
 //! `RequestMirror` dispatch (GEP-3171): the fire-and-forget mirror sub-request.
 //!
-//! The mirror *setup* (sampling each `FilterAction::Mirror`, building one
-//! [`MirrorDispatch`] per backend, and buffering the request body when a
-//! max-body-size is configured) stays inline in [`crate::hooks`] because it is
-//! interleaved with the `request_filter` / `request_body_filter` lifecycle. This
-//! module owns only the terminal step: spawning the detached task that actually
-//! sends the mirror and discards its response.
+//! Mirror setup (sampling `FilterAction::Mirror` filters, opening per-backend mpsc
+//! channels, and spawning mirror tasks) happens in [`crate::hooks::request_filter`].
+//! `request_body_filter` tees arriving chunks to the channel senders; this module
+//! owns only the terminal step: the spawned task that streams the body to the mirror
+//! backend and discards its response.
 
 use crate::ctx::MirrorDispatch;
-use bytes::Bytes;
+
+/// Bounded capacity for the per-mirror mpsc channel (#360).
+///
+/// A full channel causes the current chunk to be dropped rather than stalling
+/// the primary request path (`try_send` is used, never `send`). 64 chunks provides
+/// enough headroom for any realistic mirror consumer lag while keeping per-request
+/// memory cost negligible (mirror is best-effort fire-and-forget).
+pub(crate) const MIRROR_CHANNEL_CAP: usize = 64;
 
 /// Dispatch a fire-and-forget mirror request, discarding the response.
 ///
 /// Spawns a Tokio task that:
 /// 1. Selects one endpoint from `dispatch.backend` via weighted round-robin.
 /// 2. Builds a `reqwest` request with the original method, forwarded headers, and
-///    the assembled body (empty for header-only mirrors).
+///    the streaming body (chunked transfer-encoded; the sender side is fed
+///    chunk-by-chunk by `request_body_filter`, concurrent with primary forwarding).
 /// 3. Sends with a bounded 5-second timeout (mirror latency must not stall the caller).
 /// 4. Discards the response entirely.
 /// 5. Emits a `coxswain_proxy::access` log row tagged `mirror = true` carrying
@@ -27,7 +34,7 @@ use bytes::Bytes;
 pub(crate) fn spawn_mirror_dispatch(
     dispatch: MirrorDispatch,
     client: reqwest::Client,
-    body: Bytes,
+    body: reqwest::Body,
     tracker: &tokio_util::task::TaskTracker,
 ) {
     // Bump synchronously before spawning so the counter is updated by the time

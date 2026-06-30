@@ -9,7 +9,7 @@
 //! effect tests — compression, response buffering, upstream keepalive,
 //! circuit-breaker, load-balance algorithm, upstream-hash, max-body-size,
 //! limit-connections, mirror-target, drain-timeout
-//! (#263/#266/#270/#274/#275/#276/#277/#281/#282/#283) — each landing with its
+//! (#263/#266/#270/#274/#275/#276/#277/#281/#282/#283/#360) — each landing with its
 //! feature. Seeded here today: the connect-retry annotation (`max-retries`,
 //! `retry-on`). Routing-shape behavior lives in `routing.rs`; TLS in `tls.rs`.
 
@@ -628,6 +628,63 @@ async fn primary_succeeds_when_mirror_backend_unreachable() -> anyhow::Result<()
         "mirror was disabled at reconcile time (no ready endpoints on port 9999); \
          no mirror=true access-log row must appear for host={host}"
     );
+
+    Ok(())
+}
+
+/// Verifies stream-concurrent mirroring works without `max-body-size` (#360).
+///
+/// The fixture has `mirror-target` set but no `max-body-size`.  The proxy must
+/// stream the request body to the mirror backend as chunks arrive (no buffering),
+/// producing an access-log `mirror = true` row for the host.  This confirms that
+/// body mirroring no longer requires a body-size cap annotation.
+#[tokio::test]
+async fn mirror_body_forwarded_without_max_body_size() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-mirror-nombs").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_MIRROR_TARGET_NO_MAX_BODY,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("mirrornombs.{}.local", ns.name);
+    let route = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+    route.assert_backend("echo-a");
+
+    // POST with a body to exercise the streaming mirror path.  No max-body-size
+    // is set, so the proxy must forward body chunks directly to the mirror channel.
+    let (status, body) = h
+        .http
+        .request_with_body(Method::POST, &host, "/", b"hello stream mirror".to_vec())
+        .await?;
+    assert_eq!(status, 200, "primary POST must succeed; host={host}");
+    body.expect("primary response must carry echo JSON")
+        .assert_backend("echo-a");
+
+    // Re-drive the POST on every poll iteration (mirror is fire-and-forget; a
+    // single copy can be lost during endpoint propagation) until a mirror=true
+    // access-log row appears for this host.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async { format!("a mirror=true access-log row to appear for host={host}") },
+        || async {
+            let _ = h
+                .http
+                .request_with_body(Method::POST, &host, "/", b"hello stream mirror".to_vec())
+                .await;
+            let logs = h.controller.shared_proxy_access_logs().await.ok()?;
+            logs.into_iter().find(|row| {
+                row.get("mirror").and_then(|v| v.as_bool()) == Some(true)
+                    && row.get("host").and_then(|v| v.as_str()) == Some(host.as_str())
+            })
+        },
+    )
+    .await?;
 
     Ok(())
 }

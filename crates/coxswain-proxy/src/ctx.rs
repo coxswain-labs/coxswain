@@ -9,6 +9,7 @@ use pingora_core::protocols::http::compression::Encode;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::mpsc;
 
 /// Per-connection info seeded by the PROXY protocol accept loop.
 #[derive(Clone)]
@@ -184,23 +185,19 @@ pub struct ProxyCtx {
     /// at the auth-response parsing step so `upstream_request_filter` can use a
     /// case-insensitive comparison without per-request allocation.
     pub auth_response_headers: Option<Vec<(Box<str>, Box<str>)>>,
-    /// Pending fire-and-forget mirror dispatches (#283, #261).
+    /// Bounded mpsc senders feeding in-flight mirror tasks (#360).
     ///
     /// Populated in `request_filter` when the route carries one or more
-    /// `FilterAction::Mirror` filters that survive the GEP-3171 sampling gate
-    /// and `max-body-size` is configured (body-mirroring mode).
-    /// `request_body_filter` accumulates body chunks in [`Self::mirror_body`]
-    /// and drains this Vec on end-of-stream to dispatch all mirrors.
-    /// When `max-body-size` is absent (header-only mode), dispatches fire
-    /// immediately in `request_filter` and this Vec is never populated.
-    pub(crate) mirrors: Vec<MirrorDispatch>,
-    /// Body chunks collected for fire-and-forget body mirroring.
-    ///
-    /// Only populated when [`Self::mirrors`] is non-empty and the route has
-    /// `max-body-size` set.  Each chunk is a [`Bytes`] refcount clone of the
-    /// original request chunk — zero data copies.  Consumed (and cleared) by
-    /// `request_body_filter` on end-of-stream.
-    pub mirror_body: Vec<Bytes>,
+    /// `FilterAction::Mirror` filters that survive the GEP-3171 sampling gate.
+    /// One sender per surviving mirror backend; each receiver side is wrapped as
+    /// a streaming `reqwest::Body` so the mirror task runs concurrently with
+    /// primary body forwarding — no intermediate buffering.
+    /// `request_body_filter` tees each arriving chunk to all senders via
+    /// [`mpsc::Sender::try_send`] (drop on backpressure, never stall primary).
+    /// Clearing this Vec on end-of-stream drops all senders, signalling EOF to
+    /// each mirror's body stream.  Works regardless of whether `max-body-size`
+    /// is set.
+    pub(crate) mirror_txs: Vec<mpsc::Sender<Bytes>>,
     /// Live streaming compressor for the current response, set by
     /// `upstream_response_filter` when the route has compression enabled and
     /// the response qualifies. `None` for every Gateway-API route, for Ingress
@@ -300,4 +297,7 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 192);
 //   Vec is smaller because Option<T> with a niche can't be smaller than T itself; the Vec
 //   pointer/len/cap triple (24B) is much smaller than a full MirrorDispatch struct (88B)
 //   (GEP-3171 multiple mirrors, #261) (624→560).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 560);
+// ProxyCtx: -24 stream-concurrent mirroring (#360): mirrors: Vec<MirrorDispatch> (24B) +
+//   mirror_body: Vec<Bytes> (24B) replaced by mirror_txs: Vec<mpsc::Sender<Bytes>> (24B);
+//   the two staging fields collapse into one sender vec (560→536).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 536);

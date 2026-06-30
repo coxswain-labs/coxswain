@@ -221,6 +221,13 @@ pub const ANNOTATION_MIRROR_TARGET: &str = fixture!("annotation_mirror_target.ya
 /// appears in the access log.
 pub const ANNOTATION_MIRROR_TARGET_UNREACHABLE: &str =
     fixture!("annotation_mirror_target_unreachable.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/mirror-target: "echo-b.TESTNS.svc:3000"` but
+/// **without** `max-body-size` (#360). Verifies stream-concurrent mirroring: the proxy
+/// streams the request body to echo-b as it arrives, without buffering and without
+/// requiring a body cap annotation. Used to confirm the access-log `mirror = true` row
+/// appears even when `max-body-size` is absent.
+pub const ANNOTATION_MIRROR_TARGET_NO_MAX_BODY: &str =
+    fixture!("annotation_mirror_target_no_max_body.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/compression-gzip: "true"`,
 /// `compression-level: "6"`, `compression-types: "application/json,..."` and
 /// `compression-min-size: "1"` (#270). Used to verify the proxy compresses

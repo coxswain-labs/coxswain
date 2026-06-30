@@ -23,7 +23,8 @@ itoa = { workspace = true }
 parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
 rand = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+tokio-stream = { workspace = true }
 sha1 = { workspace = true }
 zeroize = { workspace = true }
 coxswain-core = { workspace = true }

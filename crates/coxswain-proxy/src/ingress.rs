@@ -71,7 +71,7 @@ impl ProxyHttp for IngressProxy {
     where
         Self::CTX: Send + Sync,
     {
-        hooks::request_body_filter(body.as_ref(), end_of_stream, &self.cfg, ctx)
+        hooks::request_body_filter(body.as_ref(), end_of_stream, ctx)
     }
 
     async fn upstream_peer(
