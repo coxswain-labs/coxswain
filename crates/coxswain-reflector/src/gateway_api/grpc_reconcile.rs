@@ -4,6 +4,7 @@
 //! shared abstraction — the two reconcilers evolve independently. See the
 //! module-level `//!` in `gateway_api/mod.rs` for the design rationale.
 
+use super::backend_policy::{BackendPolicyIndex, ResolvedBackendPolicy};
 use super::backend_tls::{BackendTlsIndex, ResolvedPolicy};
 use super::bindings::{ListenerBinding, compute_grpc_listener_bindings};
 use crate::endpoints;
@@ -44,6 +45,8 @@ pub struct GrpcRouteResolution<'a> {
     pub listener_info: &'a HashMap<ListenerKey, ListenerBinding>,
     /// Per-(Service, port) `BackendTLSPolicy` lookup table.
     pub policy_index: &'a BackendTlsIndex,
+    /// Per-`Service` connect/idle timeout index from `CoxswainBackendPolicy` (#354).
+    pub backend_policy_index: &'a BackendPolicyIndex,
 }
 
 /// Result of looking up a `BackendTLSPolicy` for a rule's backend refs.
@@ -70,6 +73,7 @@ pub(super) fn reconcile(
     let GrpcRouteResolution {
         listener_info,
         policy_index,
+        backend_policy_index,
     } = resolution;
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
@@ -182,6 +186,15 @@ pub(super) fn reconcile(
             .with_per_backend_filters(per_backend_filters);
         if let Some(tls) = policy_tls {
             group = group.with_tls(tls);
+        }
+        // CoxswainBackendPolicy (#354): per-backend connect/idle timeouts.
+        if let Some(bp) = pick_backend_policy(backend_refs, route_ns, backend_policy_index) {
+            if bp.connect.is_some() {
+                group = group.with_connect_timeout(bp.connect);
+            }
+            if bp.idle.is_some() {
+                group = group.with_keepalive_timeout(bp.idle);
+            }
         }
         let group = Arc::new(group);
 
@@ -772,6 +785,33 @@ fn pick_backend_tls(
         None => PolicyMatch::None,
         Some((tls, _)) => PolicyMatch::Valid(tls),
     }
+}
+
+/// Select the `CoxswainBackendPolicy` timeouts to attach to a GRPCRoute rule's
+/// `BackendGroup` (#354). Highest-weight backendRef's Service policy wins.
+fn pick_backend_policy<'a>(
+    backend_refs: &[GrpcRouteRulesBackendRefs],
+    route_ns: &str,
+    backend_policy_index: &'a BackendPolicyIndex,
+) -> Option<&'a ResolvedBackendPolicy> {
+    let mut best: Option<(&ResolvedBackendPolicy, u16)> = None;
+    for b in backend_refs {
+        let b_ns = b.namespace.as_deref().unwrap_or(route_ns);
+        let Some(resolved) = backend_policy_index.get(&ObjectKey::new(b_ns, &b.name)) else {
+            continue;
+        };
+        let w = match b.weight {
+            None => 1u16,
+            Some(w) if w <= 0 => 0u16,
+            Some(w) => w.min(u16::MAX as i32) as u16,
+        };
+        match &best {
+            None => best = Some((resolved, w)),
+            Some((_, best_w)) if w > *best_w => best = Some((resolved, w)),
+            _ => {}
+        }
+    }
+    best.map(|(r, _)| r)
 }
 
 #[cfg(test)]

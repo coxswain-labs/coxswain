@@ -129,6 +129,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -157,6 +158,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),

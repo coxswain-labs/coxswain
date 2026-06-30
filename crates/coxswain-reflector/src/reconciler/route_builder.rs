@@ -223,6 +223,7 @@ pub(super) fn build_gateway_routes(
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: ownership.policy_index,
+                backend_policy_index: ownership.backend_policy_index,
                 rate_limits: stores.rate_limits,
                 path_rewrites: stores.path_rewrites,
                 backend_client_certs: ownership.backend_client_certs,
@@ -243,6 +244,7 @@ pub(super) fn build_gateway_routes(
             GrpcRouteResolution {
                 listener_info: &listener_info,
                 policy_index: ownership.policy_index,
+                backend_policy_index: ownership.backend_policy_index,
             },
             &mut builder,
         );

@@ -263,3 +263,82 @@ impl SharedClientTrafficPolicyStatus {
         self.0.tx.subscribe()
     }
 }
+
+/// Status record for one `CoxswainBackendPolicy` (#354).
+///
+/// Produced during each reconciler rebuild and consumed by the controller's
+/// leader-gated status writer to patch `status.ancestors[]` (one ancestor per
+/// targeted `Service`). Mirrors [`ClientTrafficPolicyStatus`] — the controller
+/// turns these flags into per-ancestor `Accepted`/`Conflicted` conditions.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct CoxswainBackendPolicyStatus {
+    /// `true` when the policy is accepted (no conflict on any targeted Service).
+    pub accepted: bool,
+    /// Reason string for the `Accepted` condition.
+    pub accepted_reason: &'static str,
+    /// `true` when the policy lost conflict resolution on at least one Service.
+    pub conflicted: bool,
+    /// Human-readable reason for the `Conflicted` condition when `conflicted` is `true`.
+    pub conflicted_reason: &'static str,
+}
+
+impl Default for CoxswainBackendPolicyStatus {
+    fn default() -> Self {
+        Self {
+            accepted: true,
+            accepted_reason: "Accepted",
+            conflicted: false,
+            conflicted_reason: "NoConflicts",
+        }
+    }
+}
+
+/// Map from `(policy_namespace, policy_name)` to its status.
+pub type CoxswainBackendPolicyStatusMap = HashMap<ObjectKey, CoxswainBackendPolicyStatus>;
+
+struct SharedCoxswainBackendPolicyStatusInner {
+    map: ArcSwap<CoxswainBackendPolicyStatusMap>,
+    tx: watch::Sender<u64>,
+}
+
+/// Shared handle to per-`CoxswainBackendPolicy` status, produced after each
+/// reconciler rebuild. The controller reads this to write `status.ancestors[]`
+/// when leader.
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct SharedCoxswainBackendPolicyStatus(Arc<SharedCoxswainBackendPolicyStatusInner>);
+
+impl Default for SharedCoxswainBackendPolicyStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedCoxswainBackendPolicyStatus {
+    /// Construct a new shared policy status map (initially empty, generation 0).
+    #[must_use]
+    pub fn new() -> Self {
+        let (tx, _) = watch::channel(0u64);
+        Self(Arc::new(SharedCoxswainBackendPolicyStatusInner {
+            map: ArcSwap::from_pointee(HashMap::new()),
+            tx,
+        }))
+    }
+
+    /// Load the current policy status map snapshot.
+    pub fn load(&self) -> arc_swap::Guard<Arc<CoxswainBackendPolicyStatusMap>> {
+        self.0.map.load()
+    }
+
+    /// Store a new status map and notify subscribers via the generation counter.
+    pub fn store_and_notify(&self, map: CoxswainBackendPolicyStatusMap) {
+        self.0.map.store(Arc::new(map));
+        self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    /// Returns a `watch::Receiver` for subscribing to change notifications.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.tx.subscribe()
+    }
+}
