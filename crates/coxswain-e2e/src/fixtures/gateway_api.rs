@@ -105,6 +105,16 @@ pub const BACKEND_TLS_POLICY_CONFLICT: &str = fixture!("backend_tls_policy_confl
 /// Shared by the happy (matching URI) and sad (wrong URI) paths.
 pub const BACKEND_TLS_POLICY_SAN: &str = fixture!("backend_tls_policy_san.yaml");
 
+/// CoxswainBackendPolicy with `spec.timeouts.connect: 500ms` attached to a
+/// black-holed Service (192.0.2.1) behind a Gateway-API HTTPRoute (#354). Proves
+/// the per-backend connect timeout reaches a Gateway-API upstream → prompt 502.
+pub const BACKEND_POLICY_CONNECT_TIMEOUT: &str = fixture!("backend_policy_connect_timeout.yaml");
+
+/// CoxswainBackendPolicy with an unparseable `spec.timeouts.connect` attached to
+/// the reachable echo-a Service (#354). Proves the bad value WARNs and falls back
+/// to default behaviour → route still returns 200. Depends on `backends::ECHO`.
+pub const BACKEND_POLICY_INVALID_TIMEOUT: &str = fixture!("backend_policy_invalid_timeout.yaml");
+
 /// Minimal single-listener Gateway used by the listener-drain traffic tests (#231).
 /// Declares one HTTP listener on `GATEWAY_HTTP_PORT`.
 pub const LISTENER_DRAIN: &str = fixture!("listener_drain.yaml");
