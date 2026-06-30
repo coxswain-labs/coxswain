@@ -4,13 +4,13 @@
 #   2. Provisions a PDB (minReplicas >= 2 satisfies the effective-floor rule).
 #   3. Renders the Deployment with no static `spec.replicas` (HPA owns it).
 #
-# TESTNS is substituted at runtime.
+# Applied with `kubectl apply -n <test-namespace>`, so objects omit an explicit
+# namespace (matching the sibling dedicated_gateway.yaml fixture).
 ---
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
 kind: CoxswainGatewayParameters
 metadata:
   name: autoscaling-params
-  namespace: TESTNS
 spec:
   autoscaling:
     enabled: true
@@ -22,7 +22,6 @@ apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway
 metadata:
   name: dedicated-gw
-  namespace: TESTNS
 spec:
   gatewayClassName: coxswain
   infrastructure:
