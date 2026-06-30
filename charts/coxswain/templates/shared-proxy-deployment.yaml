@@ -8,7 +8,9 @@ metadata:
     {{- include "coxswain.labels" . | nindent 4 }}
     app.kubernetes.io/component: shared-proxy
 spec:
+  {{- if not .Values.proxy.shared.autoscaling.enabled }}
   replicas: {{ .Values.proxy.shared.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "coxswain.sharedProxy.selectorLabels" . | nindent 6 }}

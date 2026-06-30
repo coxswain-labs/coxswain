@@ -137,9 +137,10 @@ controller:
   enabled: true
 
   # Number of controller replicas. The controller is leader-elected via Lease;
-  # extra replicas are HA failover, not throughput. Set to 0 to keep the
-  # Deployment around (faster to bring back) but run no pods.
-  replicas: 1
+  # extra replicas are HA failover, not throughput. Default 2 so the loss of a
+  # single pod (eviction, node drain, crash) leaves a standby to take the lease.
+  # Set to 0 to keep the Deployment around (faster to bring back) but run no pods.
+  replicas: 2
 
   # CPU / memory resource requests and limits.
   resources:
@@ -163,12 +164,13 @@ controller:
     create: true
 
   # PodDisruptionBudget to protect rolling upgrades.
+  # The PDB is only rendered when replicas >= 2; with a single replica a PDB
+  # either blocks drain permanently (maxUnavailable: 0) or allows full outage
+  # (maxUnavailable: 1) — both wrong. With 2+ replicas, maxUnavailable: 1 lets
+  # node drain evict one pod while leader election picks up on the survivor.
   podDisruptionBudget:
     enabled: true
-    # maxUnavailable: 0 keeps at least one leader-eligible replica during a
-    # node drain; harmless when replicas == 1 because there is nothing else to
-    # disrupt.
-    maxUnavailable: 0
+    maxUnavailable: 1
 
   # Extra pod metadata.
   podAnnotations: {}
@@ -288,7 +290,21 @@ proxy:
       name: ""
       annotations: {}
 
+    # HorizontalPodAutoscaler for the shared-proxy Deployment.
+    # When enabled, the Deployment's static `replicas` field is omitted so
+    # the HPA manages the replica count; set `replicas` only when disabled.
+    # The PDB is gated on the effective replica floor (minReplicas when
+    # autoscaling is enabled, replicas otherwise) being >= 2.
+    autoscaling:
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 10
+      targetCPUUtilizationPercentage: 80
+
     # PodDisruptionBudget.
+    # Only rendered when the effective replica floor >= 2 (minReplicas when
+    # autoscaling is enabled, replicas otherwise). A PDB with a single replica
+    # either blocks node drain permanently or allows full outage — both wrong.
     podDisruptionBudget:
       enabled: true
       maxUnavailable: 1

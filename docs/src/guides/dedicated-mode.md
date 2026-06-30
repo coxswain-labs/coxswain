@@ -46,11 +46,26 @@ Tunable fields on `CoxswainGatewayParameters`:
 
 | Field | Effect | Default |
 |-------|--------|---------|
-| `replicas` | Replica count for the provisioned proxy Deployment | `1` |
+| `replicas` | Static replica count (ignored when `autoscaling.enabled`) | `1` |
 | `resources` | Resource requests/limits on the proxy container | controller default |
 | `image` | Override the proxy image | controller's own image |
 | `serviceType` | `LoadBalancer`, `NodePort`, or `ClusterIP` for the proxy Service | `LoadBalancer` |
 | `podTemplate` | Partial `PodTemplateSpec` merged over the rendered template (nodeSelector, tolerations, env, sidecars, …) | — |
+| `autoscaling.enabled` | Provision an HPA for the dedicated proxy Deployment | `false` |
+| `autoscaling.minReplicas` | HPA lower bound; must be `≥ 2` for the PDB to be provisioned | — |
+| `autoscaling.maxReplicas` | HPA upper bound | — |
+| `autoscaling.targetCPUUtilizationPercentage` | HPA CPU utilization target | — |
+
+When `autoscaling.enabled: true`, the controller provisions an `HorizontalPodAutoscaler` and, when `minReplicas ≥ 2`, a `PodDisruptionBudget` alongside the Deployment. The Deployment's `spec.replicas` is left unset so the HPA is the sole replica authority. All three objects carry the same GEP-1762 name (`<gateway-name>-<gateway-class-name>`), the same owner reference, and the `coxswain-controller` field manager.
+
+```yaml
+spec:
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 80
+```
 
 ## Automatic provisioning by the controller
 

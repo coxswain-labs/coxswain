@@ -45,6 +45,9 @@ All values can be overridden with `--set key=value` or a custom `values.yaml`.
 
 | Key | Default | Description |
 |-----|---------|-------------|
+| `controller.replicas` | `2` | Controller replica count; PDB is only provisioned when `≥ 2` |
+| `controller.podDisruptionBudget.enabled` | `true` | Provision a PDB for the controller (effective when `replicas ≥ 2`) |
+| `controller.podDisruptionBudget.maxUnavailable` | `1` | Maximum disrupted controller pods during voluntary disruptions |
 | `controller.name` | `coxswain-labs.dev/gateway-controller` | GatewayClass controllerName to claim |
 | `controller.watchNamespace` | `""` (cluster-wide) | Restrict to a single namespace |
 | `controller.statusAddress` | `""` | External IP/hostname written to Ingress/Gateway status |
@@ -53,6 +56,17 @@ All values can be overridden with `--set key=value` or a custom `values.yaml`.
 | `controller.ingress.enabled` | `true` | Enable Ingress API surface and listener ports |
 | `controller.leaseTtl` | `15s` | Leader lease validity duration |
 | `controller.leaseRenewInterval` | `5s` | Leader lease renewal interval |
+
+### Shared proxy settings
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `proxy.shared.replicas` | `1` | Static replica count (ignored when `autoscaling.enabled`) |
+| `proxy.shared.podDisruptionBudget.enabled` | `true` | Provision a PDB (effective when floor `≥ 2`) |
+| `proxy.shared.autoscaling.enabled` | `false` | Enable HPA for the shared proxy |
+| `proxy.shared.autoscaling.minReplicas` | `2` | HPA lower bound; must be `≥ 2` for the PDB to be active |
+| `proxy.shared.autoscaling.maxReplicas` | `10` | HPA upper bound |
+| `proxy.shared.autoscaling.targetCPUUtilizationPercentage` | `80` | HPA CPU utilization target |
 
 ### Proxy settings
 

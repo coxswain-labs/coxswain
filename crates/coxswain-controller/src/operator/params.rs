@@ -17,7 +17,9 @@
 //! status writer in `crate::operator::status` (Gateway API spec).
 
 use super::merge::strategic_merge_pod_template;
-use coxswain_core::crd::{CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType};
+use coxswain_core::crd::{
+    AutoscalingParams, CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType,
+};
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use k8s_openapi::api::core::v1::ResourceRequirements;
@@ -58,6 +60,9 @@ pub(super) struct EffectiveParams {
     pub(super) image: Option<String>,
     pub(super) service_type: Option<ServiceType>,
     pub(super) pod_template: Option<serde_json::Value>,
+    /// Horizontal autoscaling configuration for the provisioned Deployment.
+    /// `None` means the `replicas` field governs (no HPA provisioned).
+    pub(super) autoscaling: Option<AutoscalingParams>,
 }
 
 /// Extract the [`ParamsRef`] the given GatewayClass's `parametersRef` points
@@ -176,6 +181,12 @@ fn overlay(
             class.and_then(|s| s.pod_template.as_ref()),
             gateway.and_then(|s| s.pod_template.as_ref()),
         ),
+        // `autoscaling` is a whole-block override: Gateway wins if set, else
+        // fall through to GatewayClass. No field-level merge between layers —
+        // the block is either from one source or the other.
+        autoscaling: gateway
+            .and_then(|s| s.autoscaling.clone())
+            .or_else(|| class.and_then(|s| s.autoscaling.clone())),
     }
 }
 
@@ -454,5 +465,79 @@ mod tests {
             result.is_none(),
             "non-matching parametersRef is not dedicated mode"
         );
+    }
+
+    /// Gateway autoscaling block wins over GatewayClass block (whole-block
+    /// override, not field-level merge).
+    #[test]
+    fn autoscaling_gateway_wins_over_class() {
+        let class = gateway_class("coxswain", Some("coxswain-system"), Some("class-defaults"));
+        let gw = gateway("default", "my-gw", Some("gw-params"));
+        let class_spec = spec_from_json(serde_json::json!({
+            "autoscaling": {"enabled": true, "minReplicas": 3, "maxReplicas": 5}
+        }));
+        let gw_spec = spec_from_json(serde_json::json!({
+            "autoscaling": {"enabled": true, "minReplicas": 2, "maxReplicas": 10}
+        }));
+        let lookup = lookup_from_pairs(vec![
+            (
+                ParamsRef {
+                    namespace: "coxswain-system".into(),
+                    name: "class-defaults".into(),
+                },
+                class_spec,
+            ),
+            (
+                ParamsRef {
+                    namespace: "default".into(),
+                    name: "gw-params".into(),
+                },
+                gw_spec,
+            ),
+        ]);
+        let result = resolve(&gw, &class, lookup).expect("ok").expect("some");
+        let autoscaling = result.autoscaling.expect("autoscaling present");
+        assert!(autoscaling.enabled, "enabled");
+        assert_eq!(
+            autoscaling.min_replicas,
+            Some(2),
+            "Gateway minReplicas wins"
+        );
+        assert_eq!(
+            autoscaling.max_replicas,
+            Some(10),
+            "Gateway maxReplicas wins"
+        );
+    }
+
+    /// GatewayClass autoscaling fills when Gateway doesn't set it.
+    #[test]
+    fn autoscaling_class_fills_when_gateway_unset() {
+        let class = gateway_class("coxswain", Some("coxswain-system"), Some("class-defaults"));
+        let gw = gateway("default", "my-gw", Some("gw-params"));
+        let class_spec = spec_from_json(serde_json::json!({
+            "autoscaling": {"enabled": true, "minReplicas": 2, "maxReplicas": 8}
+        }));
+        let gw_spec = spec_from_json(serde_json::json!({"replicas": 1}));
+        let lookup = lookup_from_pairs(vec![
+            (
+                ParamsRef {
+                    namespace: "coxswain-system".into(),
+                    name: "class-defaults".into(),
+                },
+                class_spec,
+            ),
+            (
+                ParamsRef {
+                    namespace: "default".into(),
+                    name: "gw-params".into(),
+                },
+                gw_spec,
+            ),
+        ]);
+        let result = resolve(&gw, &class, lookup).expect("ok").expect("some");
+        let autoscaling = result.autoscaling.expect("autoscaling filled from class");
+        assert!(autoscaling.enabled, "class enabled fills through");
+        assert_eq!(autoscaling.min_replicas, Some(2));
     }
 }

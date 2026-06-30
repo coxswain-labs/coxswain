@@ -8,24 +8,32 @@
 //! - `Gateway.spec.infrastructure.{labels,annotations}` (GEP-1867)
 //! - `CoxswainGatewayParameters.spec.podTemplate` (strategic-merge overlay)
 //!
-//! Direct edits on the generated `Deployment` / `Service` / `ServiceAccount`
-//! are **not** a supported layering mechanism. Every reconcile re-asserts
-//! ownership via `force=true`, so any direct edit will be overwritten on the
-//! next reconcile cycle. The two CR-level escape hatches above are
-//! intentionally the only way to customise the generated resources — this
-//! keeps the desired-state graph closed under the controller's view.
+//! Direct edits on the generated `Deployment` / `Service` / `ServiceAccount` /
+//! `HorizontalPodAutoscaler` / `PodDisruptionBudget` are **not** a supported
+//! layering mechanism. Every reconcile re-asserts ownership via `force=true`,
+//! so any direct edit will be overwritten on the next reconcile cycle.
 //!
 //! ## Field manager
 //!
 //! [`FIELD_MANAGER`] is `"coxswain-controller"`. The e2e suite asserts this
 //! literal on `metadata.managedFields[].manager`; renaming it requires a
 //! coordinated change to `provisioning.rs`.
+//!
+//! ## HPA / PDB lifecycle
+//!
+//! The HPA and PDB are **conditionally** provisioned: `RenderedSpecs.hpa` and
+//! `.pdb` are `Some` only when the effective parameters call for them. When
+//! `None`, `apply_rendered` deletes the named resource (via
+//! `ignore_not_found`) so transitions between autoscaling-on and
+//! autoscaling-off are handled on every reconcile without extra bookkeeping.
 
 use super::render::RenderedSpecs;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
-use kube::api::{Patch, PatchParams};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use kube::api::{DeleteParams, Patch, PatchParams};
 use kube::{Api, Client};
 use thiserror::Error;
 
@@ -52,6 +60,12 @@ pub(super) enum ApplyError {
     /// SSA of the `Deployment` failed.
     #[error("apply Deployment: {0}")]
     Deployment(#[source] kube::Error),
+    /// SSA or deletion of the `HorizontalPodAutoscaler` failed.
+    #[error("apply/delete HorizontalPodAutoscaler: {0}")]
+    Hpa(#[source] kube::Error),
+    /// SSA or deletion of the `PodDisruptionBudget` failed.
+    #[error("apply/delete PodDisruptionBudget: {0}")]
+    Pdb(#[source] kube::Error),
 }
 
 /// Server-side-apply the three rendered resources to the cluster.
@@ -124,7 +138,64 @@ pub(super) async fn apply_rendered(
         .await
         .map_err(ApplyError::Deployment)?;
 
+    // HPA: apply when enabled, delete (idempotently) when disabled. This
+    // handles the enabled→disabled transition without separate bookkeeping:
+    // every reconcile either asserts the desired HPA or removes the stale one.
+    let hpa_api: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
+    match rendered.hpa.as_ref() {
+        Some(hpa) => {
+            let hpa_name = hpa
+                .metadata
+                .name
+                .as_deref()
+                .unwrap_or_else(|| panic!("invariant: rendered HPA has no name"));
+            hpa_api
+                .patch(hpa_name, &params, &Patch::Apply(hpa))
+                .await
+                .map_err(ApplyError::Hpa)?;
+        }
+        None => {
+            // When autoscaling is disabled, remove any previously-provisioned
+            // HPA. The name follows the GEP-1762 pattern shared with the
+            // Deployment, so we can derive it from the Deployment name.
+            ignore_not_found(hpa_api.delete(deploy_name, &DeleteParams::default()).await)
+                .map_err(ApplyError::Hpa)?;
+        }
+    }
+
+    // PDB: same apply-or-delete pattern as HPA.
+    let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
+    match rendered.pdb.as_ref() {
+        Some(pdb) => {
+            let pdb_name = pdb
+                .metadata
+                .name
+                .as_deref()
+                .unwrap_or_else(|| panic!("invariant: rendered PDB has no name"));
+            pdb_api
+                .patch(pdb_name, &params, &Patch::Apply(pdb))
+                .await
+                .map_err(ApplyError::Pdb)?;
+        }
+        None => {
+            ignore_not_found(pdb_api.delete(deploy_name, &DeleteParams::default()).await)
+                .map_err(ApplyError::Pdb)?;
+        }
+    }
+
     Ok(())
+}
+
+/// Collapse a 404 Not Found into `Ok(())`. All other errors propagate.
+///
+/// Used by delete-on-`None` branches in `apply_rendered` so that
+/// disabled-but-never-created resources don't surface as spurious errors.
+fn ignore_not_found<T>(result: Result<T, kube::Error>) -> Result<(), kube::Error> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Server-side-apply a single shared-mode per-Gateway VIP Service (#472).

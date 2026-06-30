@@ -26,6 +26,52 @@ spec:
               `GatewayClass.spec.parametersRef`. The presence of such a reference is the
               dedicated-mode opt-in; the fields below tune the resulting proxy.
             properties:
+              autoscaling:
+                description: |-
+                  Horizontal autoscaling for the provisioned proxy Deployment. When
+                  `enabled` is `true`, the controller provisions an HPA targeting the
+                  dedicated-proxy Deployment; the Deployment's `spec.replicas` is left
+                  unset so the HPA is the sole authority on replica count. When `enabled`
+                  is `false` (the default), the static `replicas` field governs.
+
+                  The controller also provisions a PDB whenever the effective replica
+                  floor is ≥ 2: `min_replicas` when autoscaling is enabled, otherwise
+                  `replicas`. A PDB with fewer than 2 replicas is counterproductive
+                  (either blocks drain permanently or allows a full outage).
+                nullable: true
+                properties:
+                  enabled:
+                    default: false
+                    description: |-
+                      When `true`, the controller provisions an HPA for the dedicated proxy
+                      Deployment. Must be set explicitly; the `Default` is `false`.
+                    type: boolean
+                  maxReplicas:
+                    description: |-
+                      Maximum number of replicas the HPA may scale up to. When omitted,
+                      no explicit cap is set (the HPA's own unlimited behaviour applies).
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  minReplicas:
+                    description: |-
+                      Minimum number of replicas the HPA may scale down to. When omitted,
+                      the HPA's own default (currently 1 in Kubernetes) applies. Set to ≥ 2
+                      for an HA configuration.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  targetCPUUtilizationPercentage:
+                    description: |-
+                      Target CPU utilization percentage the HPA aims to maintain.
+                      Canonical Kubernetes casing is preserved via the explicit rename.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
               image:
                 description: |-
                   Override the proxy image. When `None`, the controller's default image

@@ -4,18 +4,31 @@ Review each section below before directing production traffic to Coxswain.
 
 ## Replicas and availability
 
-The Helm chart defaults to `proxy.shared.replicas: 1`, which is fine for evaluation but inadequate for production: a single replica is a single point of failure, and the default `PodDisruptionBudget` (`maxUnavailable: 1`) combined with one replica means a voluntary disruption can take the entire data plane offline. Run at least two replicas. Leader election only coordinates status writes, so all replicas serve traffic independently.
+**Controller.** The chart defaults to `controller.replicas: 2` — two replicas with leader election. The `PodDisruptionBudget` (`maxUnavailable: 1`) is provisioned automatically when `replicas >= 2`, so a node drain never removes the last controller pod. The controller does not use an HPA (extra replicas are failover standby, not throughput).
+
+**Shared proxy.** The chart defaults to `proxy.shared.replicas: 1`, which is fine for evaluation but inadequate for production. Run at least two replicas — the PDB is only provisioned when the effective replica floor is ≥ 2:
 
 ```bash
+# Static replicas:
 helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
   --namespace coxswain-system \
   --set proxy.shared.replicas=2
+
+# Or enable the HPA (minReplicas must also be ≥ 2 for the PDB to be active):
+helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
+  --namespace coxswain-system \
+  --set proxy.shared.autoscaling.enabled=true \
+  --set proxy.shared.autoscaling.minReplicas=2 \
+  --set proxy.shared.autoscaling.maxReplicas=10 \
+  --set proxy.shared.autoscaling.targetCPUUtilizationPercentage=80
 ```
 
-Verify the `PodDisruptionBudget` is in place:
+When the HPA is enabled, remove the static `proxy.shared.replicas` from your values — it is ignored while the HPA is active, and Helm will not fight the HPA on upgrades.
+
+Verify both the `HorizontalPodAutoscaler` and `PodDisruptionBudget` are in place:
 
 ```bash
-kubectl -n coxswain-system get pdb
+kubectl -n coxswain-system get hpa,pdb
 ```
 
 Pod anti-affinity is not set by default. Add it via your `values.yaml` to spread shared proxy replicas across nodes:

@@ -52,9 +52,11 @@ use coxswain_reflector::status::{
 };
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{
     ConfigMap, Namespace, Node, ObjectReference, Pod, Service, ServiceAccount,
 };
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::{
     Api, Client, Resource as _,
     api::{DeleteParams, ObjectMeta, Patch, PatchParams},
@@ -1659,9 +1661,17 @@ async fn delete_dedicated_resources(
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
     let services: Api<Service> = Api::namespaced(client.clone(), namespace);
     let service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    // HPA and PDB carry the same GEP-1762 name as the Deployment/Service/SA.
+    // They survive a plain Gateway delete (owner-ref GC handles that), but the
+    // dedicated→shared migration path deletes the Gateway resources explicitly
+    // because the Gateway itself survives and owner-ref GC doesn't run.
+    let hpas: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
+    let pdbs: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
     ignore_not_found(deployments.delete(name, &dp).await)?;
     ignore_not_found(services.delete(name, &dp).await)?;
     ignore_not_found(service_accounts.delete(name, &dp).await)?;
+    ignore_not_found(hpas.delete(name, &dp).await)?;
+    ignore_not_found(pdbs.delete(name, &dp).await)?;
     Ok(())
 }
 
