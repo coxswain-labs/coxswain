@@ -22,6 +22,7 @@ resources:
   - shared-proxy-rbac.yaml
   - crds/coxswaingatewayparameters.yaml
   - crds/clienttrafficpolicies.yaml
+  - crds/coxswainbackendpolicies.yaml
   - crds/ratelimits.yaml
   - gateway-class.yaml
   - ingress-class.yaml

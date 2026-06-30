@@ -19,8 +19,9 @@ use super::route_builder::{
 };
 use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
 use crate::gateway_api::{
-    BackendTlsIndex, GatewayApiReconciler, GrpcRouteReconciler, build_backend_tls_index,
-    effective_proxy_config, resolve_client_traffic_policies,
+    BackendPolicyIndex, BackendTlsIndex, GatewayApiReconciler, GrpcRouteReconciler,
+    build_backend_policy_index, build_backend_tls_index, effective_proxy_config,
+    resolve_client_traffic_policies,
 };
 use crate::gw_types::BackendTlsPolicy;
 use crate::gw_types::GrpcRoute;
@@ -37,11 +38,13 @@ use crate::reference_grants::{
 };
 use crate::status::{
     GatewayListenerStatus, ListenerSource, SharedBackendTlsPolicyStatus,
-    SharedClientTrafficPolicyStatus, SharedGatewayListenerStatus, SharedRouteStatus,
+    SharedClientTrafficPolicyStatus, SharedCoxswainBackendPolicyStatus,
+    SharedGatewayListenerStatus, SharedRouteStatus,
 };
 use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
 use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
+use coxswain_core::crd::coxswain_backend_policy::CoxswainBackendPolicy;
 use coxswain_core::crd::{CoxswainIngressClassParameters, PathRewriteRegex, RateLimit};
 use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 use coxswain_core::fleet::{self, SharedFleet};
@@ -298,6 +301,8 @@ pub struct SharedProxyReconciler {
     tls_route_status: SharedRouteStatus,
     policy_status: SharedBackendTlsPolicyStatus,
     ctp_status: SharedClientTrafficPolicyStatus,
+    /// Per-`CoxswainBackendPolicy` ancestor health (#354).
+    cbp_status: SharedCoxswainBackendPolicyStatus,
     fleet: SharedFleet,
     owned_gateways: OwnedGateways,
     leader: Arc<AtomicBool>,
@@ -382,6 +387,8 @@ pub struct StatusSubscriptions {
     pub listener_sets: ReflectHandle<ListenerSet>,
     /// Applied-`ClientTrafficPolicy` stream + reader (#327).
     pub client_traffic_policies: ReflectHandle<ClientTrafficPolicy>,
+    /// Applied-`CoxswainBackendPolicy` stream + reader (#354).
+    pub coxswain_backend_policies: ReflectHandle<CoxswainBackendPolicy>,
 }
 
 /// Pre-created shared-store writers for the status-relevant types.
@@ -400,6 +407,7 @@ struct StatusStoreWriters {
     tls_routes: reflector::store::Writer<TlsRoute>,
     listener_sets: reflector::store::Writer<ListenerSet>,
     client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
+    coxswain_backend_policies: reflector::store::Writer<CoxswainBackendPolicy>,
 }
 
 /// `Option`-wrapped form of [`StatusStoreWriters`] produced by
@@ -417,6 +425,7 @@ struct StatusStoreOptionWriters {
     tls_routes: Option<reflector::store::Writer<TlsRoute>>,
     listener_sets: Option<reflector::store::Writer<ListenerSet>>,
     client_traffic_policies: Option<reflector::store::Writer<ClientTrafficPolicy>>,
+    coxswain_backend_policies: Option<reflector::store::Writer<CoxswainBackendPolicy>>,
 }
 
 impl StatusStoreWriters {
@@ -438,6 +447,7 @@ impl StatusStoreWriters {
                 tls_routes: Some(w.tls_routes),
                 listener_sets: Some(w.listener_sets),
                 client_traffic_policies: Some(w.client_traffic_policies),
+                coxswain_backend_policies: Some(w.coxswain_backend_policies),
             },
             None => StatusStoreOptionWriters {
                 routes: None,
@@ -450,6 +460,7 @@ impl StatusStoreWriters {
                 tls_routes: None,
                 listener_sets: None,
                 client_traffic_policies: None,
+                coxswain_backend_policies: None,
             },
         }
     }
@@ -504,6 +515,8 @@ impl SharedProxyReconciler {
                 reflector::store_shared::<ListenerSet>(STATUS_SUBSCRIBE_BUFFER);
             let (_, client_traffic_policies) =
                 reflector::store_shared::<ClientTrafficPolicy>(STATUS_SUBSCRIBE_BUFFER);
+            let (_, coxswain_backend_policies) =
+                reflector::store_shared::<CoxswainBackendPolicy>(STATUS_SUBSCRIBE_BUFFER);
             let subs = StatusSubscriptions {
                 gateways: gateways.subscribe().unwrap_or_else(|| {
                     panic!("invariant: store_shared writer must yield a Gateway subscriber")
@@ -539,6 +552,13 @@ impl SharedProxyReconciler {
                         "invariant: store_shared writer must yield a ClientTrafficPolicy subscriber"
                     )
                 }),
+                coxswain_backend_policies: coxswain_backend_policies.subscribe().unwrap_or_else(
+                    || {
+                        panic!(
+                            "invariant: store_shared writer must yield a CoxswainBackendPolicy subscriber"
+                        )
+                    },
+                ),
             };
             let writers = StatusStoreWriters {
                 gateways,
@@ -551,6 +571,7 @@ impl SharedProxyReconciler {
                 tls_routes,
                 listener_sets,
                 client_traffic_policies,
+                coxswain_backend_policies,
             };
             (Some(writers), Some(subs))
         } else {
@@ -572,6 +593,7 @@ impl SharedProxyReconciler {
             tls_route_status: SharedRouteStatus::new(),
             policy_status: SharedBackendTlsPolicyStatus::new(),
             ctp_status: SharedClientTrafficPolicyStatus::new(),
+            cbp_status: SharedCoxswainBackendPolicyStatus::new(),
             fleet: SharedFleet::new(),
             owned_gateways,
             leader,
@@ -626,6 +648,12 @@ impl SharedProxyReconciler {
     /// write `status.ancestors[]` when leader (#327).
     pub fn ctp_status(&self) -> SharedClientTrafficPolicyStatus {
         self.ctp_status.clone()
+    }
+
+    /// Returns the shared `CoxswainBackendPolicy` status handle so the Controller
+    /// can write `status.ancestors[]` when leader (#354).
+    pub fn cbp_status(&self) -> SharedCoxswainBackendPolicyStatus {
+        self.cbp_status.clone()
     }
 
     /// Returns the SNI-keyed TLS passthrough routing table (GEP-2643, #70).
@@ -722,6 +750,9 @@ pub(super) struct ReflectorStores<'a> {
     /// `ClientTrafficPolicy` CRs in scope — resolved per Gateway/listener to set
     /// `ListenerInfo.proxy_protocol` during rebuild (#327).
     pub(super) client_traffic_policies: &'a reflector::Store<ClientTrafficPolicy>,
+    /// `CoxswainBackendPolicy` CRs in scope — resolved per target Service to set
+    /// per-backend connect/idle timeouts during route building (#354).
+    pub(super) coxswain_backend_policies: &'a reflector::Store<CoxswainBackendPolicy>,
 }
 
 pub(super) struct SharedOutputs<'a> {
@@ -738,6 +769,7 @@ pub(super) struct SharedOutputs<'a> {
     pub(super) tls_route_status: &'a SharedRouteStatus,
     pub(super) policy_status: &'a SharedBackendTlsPolicyStatus,
     pub(super) ctp_status: &'a SharedClientTrafficPolicyStatus,
+    pub(super) cbp_status: &'a SharedCoxswainBackendPolicyStatus,
     pub(super) passthrough_routes: &'a SharedTlsPassthroughTable,
     pub(super) terminate_routes: &'a SharedTlsPassthroughTable,
     pub(super) ingress_event_tx: Option<&'a tokio::sync::mpsc::Sender<IngressEvent>>,
@@ -762,6 +794,10 @@ pub(super) struct Ownership<'a> {
     /// `build_routes` and the per-route `reconcile` both need it on the same
     /// borrow pass — folding it in here keeps the function arities clippy-clean.
     pub(super) policy_index: &'a BackendTlsIndex,
+    /// Per-`Service` connect/idle timeout index from `CoxswainBackendPolicy` (#354).
+    /// Consulted during Gateway API route building to set per-backend timeouts.
+    /// Folded into `Ownership` for the same arity reason as `policy_index`.
+    pub(super) backend_policy_index: &'a BackendPolicyIndex,
     /// Resolved GEP-3155 backend client certs, keyed by `ObjectKey(ns, gw_name)`.
     /// Populated from `resolve_backend_client_certs` before the route build. Folded
     /// into `Ownership` (same rationale as `policy_index`) to keep arities clean.
@@ -898,6 +934,7 @@ impl BackgroundService for SharedProxyReconciler {
             tls_route_status: self.tls_route_status.clone(),
             policy_status: self.policy_status.clone(),
             ctp_status: self.ctp_status.clone(),
+            cbp_status: self.cbp_status.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
             terminate_routes: self.terminate_routes.clone(),
             fleet: self.fleet.clone(),
@@ -942,6 +979,7 @@ struct SharedHandles {
     tls_route_status: SharedRouteStatus,
     policy_status: SharedBackendTlsPolicyStatus,
     ctp_status: SharedClientTrafficPolicyStatus,
+    cbp_status: SharedCoxswainBackendPolicyStatus,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
     /// SNI-keyed TLS terminate routing table for TLSRouteModeTerminate (#481).
@@ -990,6 +1028,7 @@ struct GatewayApiStoreWriters {
     listener_sets: reflector::store::Writer<ListenerSet>,
     namespaces: reflector::store::Writer<Namespace>,
     client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
+    coxswain_backend_policies: reflector::store::Writer<CoxswainBackendPolicy>,
 }
 
 /// Spawn all Gateway API reflectors into `set`.
@@ -1020,6 +1059,7 @@ fn add_gateway_api_reflectors(
         listener_sets,
         namespaces,
         client_traffic_policies,
+        coxswain_backend_policies,
     } = writers;
 
     spawn_reflector(
@@ -1137,6 +1177,15 @@ fn add_gateway_api_reflectors(
         ReflectorEffects::new(notify, health, "client_traffic_policy", metrics),
         "ClientTrafficPolicy",
     );
+    // `CoxswainBackendPolicy` CRs — per-backend connect/idle timeouts (#354).
+    spawn_reflector(
+        set,
+        coxswain_backend_policies,
+        scoped_api::<CoxswainBackendPolicy>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "coxswain_backend_policy", metrics),
+        "CoxswainBackendPolicy",
+    );
 }
 
 async fn spawn_tasks(
@@ -1159,6 +1208,7 @@ async fn spawn_tasks(
         tls_route_status,
         policy_status,
         ctp_status,
+        cbp_status,
         passthrough_routes,
         terminate_routes,
         fleet,
@@ -1211,6 +1261,10 @@ async fn spawn_tasks(
     // to it via `StatusSubscriptions.client_traffic_policies` (#327).
     let (ctp_reader, ctp_writer) =
         reader_writer::<ClientTrafficPolicy>(pre.client_traffic_policies);
+    // CoxswainBackendPolicy is a status-relevant store: the controller role
+    // subscribes to it via `StatusSubscriptions.coxswain_backend_policies` (#354).
+    let (cbp_reader, cbp_writer) =
+        reader_writer::<CoxswainBackendPolicy>(pre.coxswain_backend_policies);
     let (namespace_reader, namespace_writer) = reflector::store::<Namespace>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
@@ -1333,6 +1387,7 @@ async fn spawn_tasks(
             listener_sets: listener_set_writer,
             namespaces: namespace_writer,
             client_traffic_policies: ctp_writer,
+            coxswain_backend_policies: cbp_writer,
         };
         if crate::crds::gateway_api_crds_present(&client).await {
             add_gateway_api_reflectors(
@@ -1478,6 +1533,7 @@ async fn spawn_tasks(
                 rate_limits: &rate_limit_reader,
                 path_rewrites: &path_rewrite_reader,
                 client_traffic_policies: &ctp_reader,
+                coxswain_backend_policies: &cbp_reader,
             };
             let outputs = SharedOutputs {
                 ingress_routes: &ingress_routes,
@@ -1493,6 +1549,7 @@ async fn spawn_tasks(
                 tls_route_status: &tls_route_status,
                 policy_status: &policy_status,
                 ctp_status: &ctp_status,
+                cbp_status: &cbp_status,
                 passthrough_routes: &passthrough_routes,
                 terminate_routes: &terminate_routes,
                 ingress_event_tx: ingress_event_tx.as_ref(),
@@ -1574,6 +1631,12 @@ fn rebuild(
     let (policy_index, mut policy_status_map) =
         build_backend_tls_index(stores.policies, stores.configmaps, stores.services);
 
+    // Per-Service connect/idle timeout index from `CoxswainBackendPolicy` (#354).
+    // Carried in `Ownership` alongside `policy_index` and applied to each
+    // Gateway API `BackendGroup` during route building.
+    let (backend_policy_index, cbp_status_map) =
+        build_backend_policy_index(stores.coxswain_backend_policies);
+
     // GEP-3155: resolve each Gateway's backend client cert once. `certs` is attached
     // to UpstreamTls during the route build; `health` feeds the gateway-level
     // ResolvedRefs condition merged into `gateway_listener_status` below.
@@ -1601,6 +1664,7 @@ fn rebuild(
         ls_cert_grants: &ls_cert_grants,
         ca_grants: &ca_grants,
         policy_index: &policy_index,
+        backend_policy_index: &backend_policy_index,
         backend_client_certs: &backend_client_certs.certs,
         backend_client_cert_failures: &backend_client_certs.failures,
         effective_gateways: &effective,
@@ -1786,6 +1850,7 @@ fn rebuild(
     }
     outputs.policy_status.store_and_notify(policy_status_map);
     outputs.ctp_status.store_and_notify(ctp_status_map);
+    outputs.cbp_status.store_and_notify(cbp_status_map);
 
     // Build per-cut-over-Gateway snapshots for the dedicated registry (#426).
     //
@@ -1922,6 +1987,7 @@ fn build_dedicated_gateway_snapshot(
         ls_cert_grants: base.ls_cert_grants,
         ca_grants: base.ca_grants,
         policy_index: base.policy_index,
+        backend_policy_index: base.backend_policy_index,
         backend_client_certs: &inputs.dedicated_certs.certs,
         backend_client_cert_failures: &inputs.dedicated_certs.failures,
         // Same merged map: the dedicated proxy serves its Gateway's effective listeners

@@ -15,7 +15,7 @@
 
 use coxswain_e2e::{
     FixtureVars, Harness, IngressClassGuard, NamespaceGuard,
-    fixtures::{self, backends, ingress},
+    fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::wait,
 };
 use reqwest::Method;
@@ -176,6 +176,69 @@ async fn class_default_connect_timeout_returns_502() -> anyhow::Result<()> {
     // request black-holes on connect and returns 502 within the 500ms deadline
     // supplied by the class default.
     wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
+/// Verifies that a `CoxswainBackendPolicy` with `spec.timeouts.connect: 500ms`
+/// attached to a backend `Service` bounds the upstream TCP-connect for a
+/// Gateway-API route (#354).
+///
+/// The backend's only EndpointSlice address is `192.0.2.1` (RFC 5737 TEST-NET-1),
+/// so the SYN is black-holed and `connect()` hangs. With the policy the proxy
+/// abandons the connect after 500ms and returns 502 (ConnectTimedout). The proof
+/// is the prompt 502 within the 60s budget: without the policy the connect would
+/// hang past it and the route would never return a clean 502 — i.e. the 502 IS
+/// the proof the per-backend connect timeout reached the Gateway-API upstream.
+#[tokio::test]
+async fn backend_policy_connect_timeout_returns_502() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-cbp-connect").await?;
+
+    fixtures::apply_fixture(
+        gwa::BACKEND_POLICY_CONNECT_TIMEOUT,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("backend-policy-connect.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
+
+    // 502 doubles as the readiness signal: once the route + policy are installed
+    // every request black-holes on connect and returns 502 within the 500ms
+    // deadline supplied by the policy.
+    wait::wait_for_route_status(&gw, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
+/// Verifies that an unparseable `CoxswainBackendPolicy` `spec.timeouts.connect`
+/// value WARNs and falls back to the default connection behaviour rather than
+/// erroring the connection (#354).
+///
+/// The policy targets the reachable `echo-a` Service with a bad duration string.
+/// The route must still return 200 — proving the bad value degraded to the
+/// default (no connection-level error). Without fail-open the connection would
+/// break and the route would never serve a clean 200.
+#[tokio::test]
+async fn backend_policy_invalid_timeout_falls_back() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-cbp-fallback").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        gwa::BACKEND_POLICY_INVALID_TIMEOUT,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("backend-policy-fallback.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
+
+    // The bad value must not break the connection — the reachable echo backend
+    // serves a clean 200, proving fallback to default connect behaviour.
+    wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
 
     Ok(())
 }

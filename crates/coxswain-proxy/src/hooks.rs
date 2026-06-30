@@ -808,8 +808,12 @@ pub(crate) async fn upstream_peer(
     let explicit_read = resolved.timeouts.read;
     let explicit_send = resolved.timeouts.send;
 
-    // Connection timeout: annotation-specific connect wins; else backend_request legacy.
-    let conn_timeout = explicit_connect.or(backend_timeout);
+    // Connection timeout precedence: an explicit per-route Ingress `connect-timeout`
+    // wins; else the per-backend `CoxswainBackendPolicy` connect timeout (#354); else
+    // the legacy `backend_request` budget.
+    let conn_timeout = explicit_connect
+        .or_else(|| resolved.backend_group.connect_timeout())
+        .or(backend_timeout);
     if let Some(t) = conn_timeout {
         peer.options.connection_timeout = Some(t);
         ctx.backend_request_timeout_active = true;
@@ -852,8 +856,10 @@ pub(crate) async fn upstream_peer(
         peer.options.read_timeout = Some(t);
     }
 
-    // Apply per-route upstream keepalive idle timeout (Ingress-only; Gateway-API routes
-    // leave this None and Pingora uses its LRU-eviction default).
+    // Apply per-backend upstream keepalive idle timeout: the Ingress
+    // `upstream-keepalive-timeout` annotation, or for Gateway-API routes the
+    // `CoxswainBackendPolicy` `spec.timeouts.idle` field (#354). `None` leaves
+    // Pingora's LRU-eviction default unchanged.
     if let Some(t) = resolved.backend_group.keepalive_timeout() {
         peer.options.idle_timeout = Some(t);
     }

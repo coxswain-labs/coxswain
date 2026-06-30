@@ -933,11 +933,26 @@ async fn params_autoscaling_provisions_hpa_and_pdb() -> anyhow::Result<()> {
     let hpa = wait::wait_for_resource(&hpas, RESOURCE_NAME, Duration::from_secs(30)).await?;
     let pdb = wait::wait_for_resource(&pdbs, RESOURCE_NAME, Duration::from_secs(30)).await?;
 
-    // Deployment must have no static replicas — HPA manages the count.
-    assert_eq!(
-        deploy.spec.as_ref().and_then(|s| s.replicas),
-        None,
-        "Deployment.spec.replicas must be absent when autoscaling is enabled (HPA owns it)"
+    // The HPA — not the controller — owns the replica count. The operator omits
+    // `spec.replicas` from its server-side-apply, but the apiserver defaults the
+    // field to 1 on read, so it is always present; the real invariant is that the
+    // `coxswain-controller` field manager does NOT manage `spec.replicas` (which
+    // would make Helm/SSA fight the HPA). Assert via managedFields.
+    let controller_owns_replicas = deploy
+        .metadata
+        .managed_fields
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter(|f| f.manager.as_deref() == Some("coxswain-controller"))
+        .any(|f| {
+            serde_json::to_string(f)
+                .map(|s| s.contains("f:replicas"))
+                .unwrap_or(false)
+        });
+    assert!(
+        !controller_owns_replicas,
+        "coxswain-controller must NOT manage spec.replicas when autoscaling is enabled (HPA owns the count)"
     );
 
     // HPA scaleTargetRef must point at the dedicated Deployment by GEP-1762 name.
@@ -1010,9 +1025,15 @@ async fn params_autoscaling_disabled_provisions_no_hpa() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "prov-dedgw-nohpa").await?;
 
-    // The default DEDICATED_GATEWAY fixture has no autoscaling block → replicas
-    // defaults to 1 and neither HPA nor PDB should be provisioned.
-    fixtures::apply_fixture(dedicated::DEDICATED_GATEWAY, FixtureVars::new(&ns.name)).await?;
+    // A single-replica, no-autoscaling fixture (`replicas: 1`, no `autoscaling`
+    // block) → neither HPA nor PDB should be provisioned (floor < 2). The
+    // ClusterIP fixture fits exactly; the test only inspects the rendered
+    // Deployment, not Pod readiness, so its pause-image stub is irrelevant here.
+    fixtures::apply_fixture(
+        dedicated::DEDICATED_GATEWAY_CLUSTERIP,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
 
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
     let hpas: Api<HorizontalPodAutoscaler> = Api::namespaced(h.client.clone(), &ns.name);

@@ -304,10 +304,20 @@ pub struct BackendGroup {
     ///
     /// `None` (the default, or an invalid/absent annotation) defers to Pingora's
     /// built-in behaviour: connections remain in the pool until the pool's LRU
-    /// capacity is exhausted. Gateway API routes always carry `None` (annotation is
-    /// Ingress-only). Applied per-request in `upstream_peer` via
-    /// `HttpPeer.options.idle_timeout`.
+    /// capacity is exhausted. Populated from the Ingress
+    /// `upstream-keepalive-timeout` annotation or, for Gateway API routes, the
+    /// `CoxswainBackendPolicy` `spec.timeouts.idle` field (#354). Applied
+    /// per-request in `upstream_peer` via `HttpPeer.options.idle_timeout`.
     keepalive_timeout: Option<std::time::Duration>,
+    /// Upstream TCP-connect timeout for this backend, from a `CoxswainBackendPolicy`
+    /// `spec.timeouts.connect` field attached to the target `Service` (#354).
+    ///
+    /// `None` (the default) defers to the per-route connect timeout (Ingress
+    /// `connect-timeout` annotation) or, failing that, the Gateway API
+    /// `backendRequest` budget. When `Some`, the proxy applies it to
+    /// `HttpPeer.options.connection_timeout` in `upstream_peer`, after any
+    /// route-level connect override but before the `backendRequest` fallback.
+    connect_timeout: Option<std::time::Duration>,
     /// Per-route upstream load-balancing algorithm from the
     /// `ingress.coxswain-labs.dev/load-balance` annotation.
     ///
@@ -369,6 +379,7 @@ impl BackendGroup {
             session_affinity: None,
             affinity_endpoints: None,
             keepalive_timeout: None,
+            connect_timeout: None,
             load_balance: LoadBalance::default(),
             lb_endpoints: None,
         }
@@ -431,6 +442,7 @@ impl BackendGroup {
             session_affinity: None,
             affinity_endpoints: None,
             keepalive_timeout: None,
+            connect_timeout: None,
             load_balance: LoadBalance::default(),
             lb_endpoints: None,
         }
@@ -453,6 +465,7 @@ impl BackendGroup {
             session_affinity: None,
             affinity_endpoints: None,
             keepalive_timeout: None,
+            connect_timeout: None,
             load_balance: LoadBalance::default(),
             lb_endpoints: None,
         }
@@ -498,6 +511,18 @@ impl BackendGroup {
     #[must_use]
     pub fn with_keepalive_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
         self.keepalive_timeout = timeout;
+        self
+    }
+
+    /// Set the upstream TCP-connect timeout (builder-style).
+    ///
+    /// Populated from a `CoxswainBackendPolicy` `spec.timeouts.connect` field
+    /// attached to the target `Service` (#354). `None` (the default) leaves the
+    /// connect timeout to the per-route override or the `backendRequest` budget;
+    /// see [`Self::connect_timeout`] for the proxy-side precedence.
+    #[must_use]
+    pub fn with_connect_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.connect_timeout = timeout;
         self
     }
 
@@ -728,6 +753,19 @@ impl BackendGroup {
     /// `HttpPeer.options.idle_timeout` in `upstream_peer`.
     pub fn keepalive_timeout(&self) -> Option<std::time::Duration> {
         self.keepalive_timeout
+    }
+
+    /// Upstream TCP-connect timeout from an attached `CoxswainBackendPolicy`
+    /// `spec.timeouts.connect`, if any (#354).
+    ///
+    /// `None` means "no per-backend connect override" — the proxy falls back to
+    /// the per-route Ingress `connect-timeout` or the Gateway API `backendRequest`
+    /// budget. When `Some`, the proxy applies it to
+    /// `HttpPeer.options.connection_timeout` in `upstream_peer`, taking precedence
+    /// over the `backendRequest` fallback but not over an explicit route-level
+    /// connect override.
+    pub fn connect_timeout(&self) -> Option<std::time::Duration> {
+        self.connect_timeout
     }
 
     /// The original construction inputs to this group, for wire-DTO serialisation.
@@ -1327,6 +1365,37 @@ mod tests {
         assert!(
             group.keepalive_timeout().is_none(),
             "with_keepalive_timeout(None) must leave the field None"
+        );
+    }
+
+    // ── with_connect_timeout (#354) ───────────────────────────────────────────────
+
+    #[test]
+    fn connect_timeout_default_is_none() {
+        let group = BackendGroup::new("ns/svc".to_string(), vec![]);
+        assert!(
+            group.connect_timeout().is_none(),
+            "no CoxswainBackendPolicy → None (route/backendRequest fallback)"
+        );
+    }
+
+    #[test]
+    fn with_connect_timeout_round_trips() {
+        let t = std::time::Duration::from_millis(500);
+        let group = BackendGroup::new("ns/svc".to_string(), vec![]).with_connect_timeout(Some(t));
+        assert_eq!(
+            group.connect_timeout(),
+            Some(t),
+            "with_connect_timeout should store and return the duration"
+        );
+    }
+
+    #[test]
+    fn with_connect_timeout_none_leaves_none() {
+        let group = BackendGroup::new("ns/svc".to_string(), vec![]).with_connect_timeout(None);
+        assert!(
+            group.connect_timeout().is_none(),
+            "with_connect_timeout(None) must leave the field None"
         );
     }
 

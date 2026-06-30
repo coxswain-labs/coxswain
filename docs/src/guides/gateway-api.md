@@ -14,6 +14,7 @@ Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io
 | `TLSRoute` | `gateway.networking.k8s.io/v1alpha2` | SNI-keyed L4 passthrough; no TLS termination at proxy |
 | `ReferenceGrant` | `gateway.networking.k8s.io/v1beta1` | Cross-namespace backend and certificate access |
 | `BackendTLSPolicy` | `gateway.networking.k8s.io/v1` | Upstream TLS configuration referencing a CA `ConfigMap` or `Secret` |
+| `CoxswainBackendPolicy` | `gateway.coxswain-labs.dev/v1alpha1` | Coxswain-native per-`Service` connect/idle timeouts — see [below](#coxswainbackendpolicy) |
 
 !!! warning "Not supported"
     `TCPRoute` and `UDPRoute` are not implemented.
@@ -582,6 +583,52 @@ Header matching uses the same `Exact` and `RegularExpression` semantics as `HTTP
 
 ```bash
 kubectl describe grpcroute my-grpc-route
+```
+
+## CoxswainBackendPolicy
+
+`CoxswainBackendPolicy` is a Coxswain-native [direct policy attachment](https://gateway-api.sigs.k8s.io/geps/gep-713/) (`gateway.coxswain-labs.dev/v1alpha1`) that sets per-backend upstream connection timeouts. It attaches to a `Service`; its timeouts apply to every Gateway API route (`HTTPRoute` or `GRPCRoute`) whose backend resolves to that Service.
+
+It is the Gateway API counterpart to the Ingress `connect-timeout` and `upstream-keepalive-timeout` annotations — Gateway API has no per-backend connection-timeout field of its own.
+
+### Fields
+
+| Field | Description |
+|-------|-------------|
+| `targetRefs[]` | The `Service` objects this policy applies to (same namespace). `group: ""`, `kind: Service`. |
+| `timeouts.connect` | Upstream TCP-connect timeout ([GEP-2257](https://gateway-api.sigs.k8s.io/geps/gep-2257/) duration, e.g. `500ms`, `5s`). Bounds how long the proxy waits to establish a connection before failing the request with `502`. |
+| `timeouts.idle` | Upstream keepalive idle timeout — how long an idle pooled connection is retained before eviction. |
+
+### Example
+
+```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: api-backend-timeouts
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: api
+  timeouts:
+    connect: 500ms
+    idle: 60s
+```
+
+### Behaviour
+
+- A backend `Service` with no attached policy keeps the default connection behaviour.
+- The per-backend `connect` timeout takes precedence over the Gateway API `HTTPRoute.timeouts.backendRequest` fallback, but an Ingress route's explicit `connect-timeout` annotation still wins for that route.
+- **Invalid values fail open.** An unparseable `connect` or `idle` string is logged as a warning and ignored — the backend falls back to the default, never a connection-level error. The duration string is deliberately not schema-validated so the policy is accepted and the warning surfaces at reconcile time rather than being rejected by the API server.
+- **Conflicts.** If two policies target the same `Service`, the older one (by `creationTimestamp`, ties broken by name) wins; the loser receives `Accepted=False, reason=Conflicted` in its `status.ancestors[]`.
+
+### Status
+
+The controller writes one `status.ancestors[]` entry per targeted `Service` with an `Accepted` condition:
+
+```bash
+kubectl describe coxswainbackendpolicy api-backend-timeouts
 ```
 
 ## TLSRoute

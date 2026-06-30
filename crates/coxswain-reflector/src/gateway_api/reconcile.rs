@@ -2,6 +2,7 @@
 //! listener bindings and resolved backend groups.
 
 use super::GatewayApiReconciler;
+use super::backend_policy::{BackendPolicyIndex, ResolvedBackendPolicy};
 use super::backend_tls::{BackendTlsIndex, ResolvedPolicy};
 use super::bindings::{ListenerBinding, compute_listener_bindings};
 use crate::endpoints;
@@ -51,6 +52,10 @@ pub struct RouteResolution<'a> {
     /// Per-(Service, port) `BackendTLSPolicy` lookup table; lookups try
     /// `(svc, Some(port))` first and fall back to `(svc, None)`.
     pub policy_index: &'a BackendTlsIndex,
+    /// Per-`Service` connect/idle timeout index from `CoxswainBackendPolicy` (#354).
+    /// The highest-weight backendRef's Service policy is applied to the rule's
+    /// `BackendGroup`.
+    pub backend_policy_index: &'a BackendPolicyIndex,
     /// `RateLimit` CR store for resolving `ExtensionRef` filters on
     /// `HTTPRouteRule`s. Looked up by `(namespace, name)` from the filter;
     /// missing CRs produce a WARN and fail-open (route is not limited).
@@ -93,6 +98,7 @@ impl GatewayApiReconciler {
         let RouteResolution {
             listener_info,
             policy_index,
+            backend_policy_index,
             rate_limits,
             path_rewrites,
             backend_client_certs,
@@ -265,6 +271,17 @@ impl GatewayApiReconciler {
                         None => tls,
                     };
                     group = group.with_tls(tls);
+                }
+                // CoxswainBackendPolicy (#354): apply per-backend connect/idle
+                // timeouts from the highest-weight backendRef's Service policy.
+                if let Some(bp) = pick_backend_policy(backend_refs, route_ns, backend_policy_index)
+                {
+                    if bp.connect.is_some() {
+                        group = group.with_connect_timeout(bp.connect);
+                    }
+                    if bp.idle.is_some() {
+                        group = group.with_keepalive_timeout(bp.idle);
+                    }
                 }
                 let group = Arc::new(group);
                 if invalid_policy || client_cert_fail_closed {
@@ -718,6 +735,39 @@ fn pick_backend_tls(
         Some((tls, _)) => PolicyMatch::Valid(tls),
         None => PolicyMatch::None,
     }
+}
+
+/// Select the `CoxswainBackendPolicy` timeouts to attach to a rule's
+/// `BackendGroup` (#354).
+///
+/// Scans `backend_refs`, looking each backend's Service up in
+/// `backend_policy_index` (keyed by `ObjectKey(svc_ns, svc_name)`). The
+/// highest-weight ref's policy wins (ties break by array order), mirroring
+/// [`pick_backend_tls`]. Returns `None` when no targeted Service carries a
+/// policy with a parseable timeout.
+fn pick_backend_policy<'a>(
+    backend_refs: &[HttpRouteRulesBackendRefs],
+    route_ns: &str,
+    backend_policy_index: &'a BackendPolicyIndex,
+) -> Option<&'a ResolvedBackendPolicy> {
+    let mut best: Option<(&ResolvedBackendPolicy, u16)> = None;
+    for b in backend_refs {
+        let b_ns = b.namespace.as_deref().unwrap_or(route_ns);
+        let Some(resolved) = backend_policy_index.get(&ObjectKey::new(b_ns, &b.name)) else {
+            continue;
+        };
+        let w = match b.weight {
+            None => 1u16,
+            Some(w) if w <= 0 => 0u16,
+            Some(w) => w.min(u16::MAX as i32) as u16,
+        };
+        match &best {
+            None => best = Some((resolved, w)),
+            Some((_, best_w)) if w > *best_w => best = Some((resolved, w)),
+            _ => {}
+        }
+    }
+    best.map(|(r, _)| r)
 }
 
 // ── Gateway TLS listener reconciliation ──────────────────────────────────────
@@ -1283,6 +1333,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1321,6 +1372,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1359,6 +1411,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1389,6 +1442,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1418,6 +1472,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1487,6 +1542,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1531,6 +1587,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1601,6 +1658,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1682,6 +1740,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1737,6 +1796,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1826,6 +1886,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1871,6 +1932,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1908,6 +1970,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1947,6 +2010,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1978,6 +2042,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2015,6 +2080,7 @@ mod tests {
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 backend_client_certs: &HashMap::new(),

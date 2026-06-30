@@ -1,0 +1,56 @@
+# CoxswainBackendPolicy invalid-timeout fallback fixture (#354).
+#
+# A CoxswainBackendPolicy attached to the reachable echo-a Service sets
+# spec.timeouts.connect to an unparseable value. The reflector WARNs and falls
+# back to the default connection behaviour — it must NOT error the connection.
+#
+# Proof: traffic to the route still returns 200, i.e. the bad value degraded to
+# the default rather than breaking the upstream connection.
+#
+# Depends on the `echo` backend (backends::ECHO) applied separately.
+#
+# Route: backend-policy-fallback.TESTNS.local / -> echo-a:3000 (reachable)
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend-policy-fallback-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "backend-policy-fallback.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: echo-a-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-a
+  timeouts:
+    connect: "not-a-duration"
