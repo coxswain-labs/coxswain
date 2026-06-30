@@ -1,4 +1,5 @@
-//! Render the desired `Deployment`, `Service`, and `ServiceAccount` for a
+//! Render the desired `Deployment`, `Service`, `ServiceAccount`, optional
+//! `HorizontalPodAutoscaler`, and optional `PodDisruptionBudget` for a
 //! dedicated-mode Gateway from the merged [`EffectiveParams`].
 //!
 //! Pure, infallible, side-effect-free — given the same inputs, produces the
@@ -63,11 +64,16 @@ use coxswain_core::naming::gep1762_resource_name;
 use coxswain_reflector::EffectiveListenerPort;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+use k8s_openapi::api::autoscaling::v2::{
+    CrossVersionObjectReference, HorizontalPodAutoscaler, HorizontalPodAutoscalerSpec, MetricSpec,
+    MetricTarget, ResourceMetricSource,
+};
 use k8s_openapi::api::core::v1::{
     ConfigMapVolumeSource, Container, ContainerPort, PodSpec, PodTemplateSpec,
     ProjectedVolumeSource, Service, ServiceAccount, ServiceAccountTokenProjection, ServicePort,
     ServiceSpec, Volume, VolumeMount, VolumeProjection,
 };
+use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
@@ -153,7 +159,7 @@ const DISCOVERY_TRUST_VOLUME: &str = "trust-bundle";
 /// `<dir>/ca.crt`, matching [`RenderInputs::discovery_ca_bundle_path`].
 const DISCOVERY_TRUST_MOUNT_DIR: &str = "/var/run/secrets/coxswain/trust-bundle";
 
-/// The three rendered resources for one dedicated-mode Gateway.
+/// The rendered resources for one dedicated-mode Gateway.
 #[non_exhaustive]
 #[derive(Debug)]
 pub(super) struct RenderedSpecs {
@@ -163,6 +169,14 @@ pub(super) struct RenderedSpecs {
     pub(super) service: Service,
     /// `Deployment` of the proxy pod.
     pub(super) deployment: Deployment,
+    /// `HorizontalPodAutoscaler` targeting the proxy Deployment. `Some` only
+    /// when `params.autoscaling.enabled` is `true`; the applier deletes any
+    /// previously-provisioned HPA when this is `None`.
+    pub(super) hpa: Option<HorizontalPodAutoscaler>,
+    /// `PodDisruptionBudget` protecting the proxy Deployment during voluntary
+    /// disruptions. `Some` only when the effective replica floor (minReplicas
+    /// if autoscaling, else replicas) is ≥ 2.
+    pub(super) pdb: Option<PodDisruptionBudget>,
 }
 
 /// Built-in default for [`EffectiveParams::replicas`].
@@ -217,6 +231,8 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
             inputs.effective_ports,
         ),
         deployment: render_deployment(&common, inputs),
+        hpa: render_hpa(&common, inputs.params),
+        pdb: render_pdb(&common, inputs.params),
     }
 }
 
@@ -758,11 +774,25 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         .as_deref()
         .unwrap_or(inputs.controller_image)
         .to_string();
-    let replicas = inputs
+    // When an HPA is active it is the sole authority on replica count; setting
+    // `replicas` on the Deployment would cause Helm to fight the HPA on every
+    // reconcile, so we omit it (`None` leaves the field unmanaged by SSA).
+    let replicas = if inputs
         .params
-        .replicas
-        .and_then(|r| i32::try_from(r).ok())
-        .unwrap_or(DEFAULT_REPLICAS);
+        .autoscaling
+        .as_ref()
+        .is_some_and(|a| a.enabled)
+    {
+        None
+    } else {
+        Some(
+            inputs
+                .params
+                .replicas
+                .and_then(|r| i32::try_from(r).ok())
+                .unwrap_or(DEFAULT_REPLICAS),
+        )
+    };
 
     let mut args = vec![
         "serve".to_string(),
@@ -843,7 +873,7 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
     Deployment {
         metadata: metadata_for(common),
         spec: Some(DeploymentSpec {
-            replicas: Some(replicas),
+            replicas,
             selector: LabelSelector {
                 match_labels: Some(selector_labels),
                 ..Default::default()
@@ -959,6 +989,101 @@ fn merge_pod_template(base: &PodTemplateSpec, overlay: &serde_json::Value) -> Po
             "invariant: merged PodTemplateSpec must deserialize cleanly; \
              the operator's podTemplate overlay produced an invalid spec: {e}"
         )
+    })
+}
+
+/// Render a `HorizontalPodAutoscaler` targeting the dedicated-proxy Deployment.
+///
+/// Returns `Some` only when `params.autoscaling.enabled` is `true`. Carries the
+/// same GEP-1762 name, labels, and owner reference as the other rendered
+/// resources so it can be SSA-applied and GC'd under the same field-manager
+/// contract. The Deployment name used by `scaleTargetRef` is `common.name` —
+/// the same GEP-1762 name the Deployment was rendered with.
+///
+/// `minReplicas` and `maxReplicas` are populated only when set in the params;
+/// omitting them lets the HPA apply its own Kubernetes defaults.
+fn render_hpa(common: &Common<'_>, params: &EffectiveParams) -> Option<HorizontalPodAutoscaler> {
+    let autoscaling = params.autoscaling.as_ref().filter(|a| a.enabled)?;
+
+    let metrics = autoscaling.target_cpu_utilization_percentage.map(|pct| {
+        vec![MetricSpec {
+            type_: "Resource".to_string(),
+            resource: Some(ResourceMetricSource {
+                name: "cpu".to_string(),
+                target: MetricTarget {
+                    type_: "Utilization".to_string(),
+                    average_utilization: Some(i32::try_from(pct).unwrap_or(i32::MAX)),
+                    ..Default::default()
+                },
+            }),
+            ..Default::default()
+        }]
+    });
+
+    let min_replicas = autoscaling.min_replicas.and_then(|r| i32::try_from(r).ok());
+    let max_replicas = autoscaling
+        .max_replicas
+        .and_then(|r| i32::try_from(r).ok())
+        .unwrap_or(i32::MAX);
+
+    Some(HorizontalPodAutoscaler {
+        metadata: metadata_for(common),
+        spec: HorizontalPodAutoscalerSpec {
+            scale_target_ref: CrossVersionObjectReference {
+                api_version: Some("apps/v1".to_string()),
+                kind: "Deployment".to_string(),
+                name: common.name.to_string(),
+            },
+            min_replicas,
+            max_replicas,
+            metrics,
+            ..Default::default()
+        },
+        status: None,
+    })
+}
+
+/// Render a `PodDisruptionBudget` protecting the dedicated-proxy Deployment.
+///
+/// Returns `Some` (maxUnavailable: 1) only when the effective replica floor
+/// is ≥ 2. The floor is `min_replicas` when autoscaling is enabled, otherwise
+/// the static `replicas` field (default 1). A PDB with a single-replica
+/// Deployment either blocks drain permanently (maxUnavailable: 0) or provides
+/// no protection (maxUnavailable ≥ 1) — both wrong.
+///
+/// Carries the same GEP-1762 name, labels, and owner reference as the other
+/// rendered resources; its pod selector joins on the same two-key set the
+/// Deployment uses.
+fn render_pdb(common: &Common<'_>, params: &EffectiveParams) -> Option<PodDisruptionBudget> {
+    let floor: u32 = if let Some(a) = params.autoscaling.as_ref().filter(|a| a.enabled) {
+        a.min_replicas.unwrap_or(1)
+    } else {
+        params.replicas.unwrap_or(1)
+    };
+    if floor < 2 {
+        return None;
+    }
+
+    let mut selector_labels = BTreeMap::new();
+    selector_labels.insert("app.kubernetes.io/name".to_string(), "coxswain".to_string());
+    if let Some(instance) = common.labels.get("app.kubernetes.io/instance") {
+        selector_labels.insert(
+            "app.kubernetes.io/instance".to_string(),
+            instance.to_string(),
+        );
+    }
+
+    Some(PodDisruptionBudget {
+        metadata: metadata_for(common),
+        spec: Some(PodDisruptionBudgetSpec {
+            max_unavailable: Some(IntOrString::Int(1)),
+            selector: Some(LabelSelector {
+                match_labels: Some(selector_labels),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        status: None,
     })
 }
 

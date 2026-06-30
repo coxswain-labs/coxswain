@@ -16,7 +16,7 @@ pub use client_traffic_policy::{
     PolicyAncestorRef, PolicyAncestorStatus, ProxyProtocolSpec,
 };
 pub use gateway_parameters::{
-    CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType,
+    AutoscalingParams, CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType,
 };
 pub use ingress_parameters::{CoxswainIngressClassParameters, CoxswainIngressClassParametersSpec};
 pub use path_rewrite_regex::{PathRewriteRegex, PathRewriteRegexSpec};

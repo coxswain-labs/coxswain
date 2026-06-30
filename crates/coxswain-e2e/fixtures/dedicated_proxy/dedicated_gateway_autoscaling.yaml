@@ -1,0 +1,39 @@
+# Dedicated-mode Gateway with autoscaling enabled (#497).
+# Used by the provisioning-plane tests to verify that the controller:
+#   1. Provisions an HPA targeting the dedicated Deployment.
+#   2. Provisions a PDB (minReplicas >= 2 satisfies the effective-floor rule).
+#   3. Renders the Deployment with no static `spec.replicas` (HPA owns it).
+#
+# TESTNS is substituted at runtime.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: autoscaling-params
+  namespace: TESTNS
+spec:
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: dedicated-gw
+  namespace: TESTNS
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    parametersRef:
+      group: gateway.coxswain-labs.dev
+      kind: CoxswainGatewayParameters
+      name: autoscaling-params
+  listeners:
+    - name: http
+      port: 8100
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same

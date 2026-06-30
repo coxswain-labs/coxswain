@@ -1,4 +1,6 @@
-{{- if and .Values.proxy.shared.enabled .Values.proxy.shared.podDisruptionBudget.enabled -}}
+{{- $autoscalingEnabled := .Values.proxy.shared.autoscaling.enabled -}}
+{{- $floor := ternary (int .Values.proxy.shared.autoscaling.minReplicas) (int .Values.proxy.shared.replicas) $autoscalingEnabled -}}
+{{- if and .Values.proxy.shared.enabled .Values.proxy.shared.podDisruptionBudget.enabled (ge $floor 2) -}}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

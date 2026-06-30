@@ -28,8 +28,10 @@ use coxswain_e2e::{
 };
 use gateway_api::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use std::time::Duration;
 
@@ -898,6 +900,147 @@ async fn ingress_disabled_skips_ingress_reconcile() -> anyhow::Result<()> {
         ..Default::default()
     })
     .await?;
+
+    Ok(())
+}
+
+// ── #497 — Dedicated-proxy autoscaling (HPA + PDB) ───────────────────────────
+
+/// #497 — `autoscaling.enabled: true` provisions an HPA + PDB alongside the
+/// dedicated-proxy Deployment.
+///
+/// Asserts: HPA exists with the correct scaleTargetRef, minReplicas,
+/// maxReplicas, and CPU target; PDB exists (minReplicas=2 satisfies floor≥2);
+/// Deployment has `spec.replicas` unset (HPA is the sole replica authority).
+/// All three carry the GEP-1762 name and the `coxswain-controller` field manager.
+#[tokio::test]
+async fn params_autoscaling_provisions_hpa_and_pdb() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-hpa").await?;
+
+    fixtures::apply_fixture(
+        dedicated::DEDICATED_GATEWAY_AUTOSCALING,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let hpas: Api<HorizontalPodAutoscaler> = Api::namespaced(h.client.clone(), &ns.name);
+    let pdbs: Api<PodDisruptionBudget> = Api::namespaced(h.client.clone(), &ns.name);
+
+    let deploy =
+        wait::wait_for_resource(&deployments, RESOURCE_NAME, Duration::from_secs(30)).await?;
+    let hpa = wait::wait_for_resource(&hpas, RESOURCE_NAME, Duration::from_secs(30)).await?;
+    let pdb = wait::wait_for_resource(&pdbs, RESOURCE_NAME, Duration::from_secs(30)).await?;
+
+    // Deployment must have no static replicas — HPA manages the count.
+    assert_eq!(
+        deploy.spec.as_ref().and_then(|s| s.replicas),
+        None,
+        "Deployment.spec.replicas must be absent when autoscaling is enabled (HPA owns it)"
+    );
+
+    // HPA scaleTargetRef must point at the dedicated Deployment by GEP-1762 name.
+    let spec = &hpa.spec;
+    assert_eq!(
+        spec.scale_target_ref.api_version.as_deref(),
+        Some("apps/v1"),
+        "HPA scaleTargetRef.apiVersion"
+    );
+    assert_eq!(
+        spec.scale_target_ref.kind, "Deployment",
+        "HPA scaleTargetRef.kind"
+    );
+    assert_eq!(
+        spec.scale_target_ref.name, RESOURCE_NAME,
+        "HPA scaleTargetRef.name must be the GEP-1762 resource name"
+    );
+    assert_eq!(
+        spec.min_replicas,
+        Some(2),
+        "HPA minReplicas from autoscaling.minReplicas"
+    );
+    assert_eq!(
+        spec.max_replicas, 5,
+        "HPA maxReplicas from autoscaling.maxReplicas"
+    );
+    let cpu_target = spec
+        .metrics
+        .as_deref()
+        .and_then(|m| m.first())
+        .and_then(|m| m.resource.as_ref())
+        .map(|r| r.target.average_utilization);
+    assert_eq!(
+        cpu_target,
+        Some(Some(70)),
+        "HPA CPU averageUtilization from autoscaling.targetCPUUtilizationPercentage"
+    );
+
+    // HPA must carry the GEP-1762 name and coxswain-controller field manager.
+    let managers = hpa
+        .metadata
+        .managed_fields
+        .as_ref()
+        .expect("HPA managedFields present");
+    assert!(
+        managers
+            .iter()
+            .any(|f| f.manager.as_deref() == Some("coxswain-controller")),
+        "HPA must have a managedFields entry with manager = 'coxswain-controller'"
+    );
+
+    // PDB must exist and be configured for maxUnavailable: 1.
+    let pdb_spec = pdb.spec.as_ref().expect("PDB spec present");
+    assert_eq!(
+        pdb_spec.max_unavailable,
+        Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(1)),
+        "PDB maxUnavailable must be 1"
+    );
+
+    Ok(())
+}
+
+/// #497 (negative) — `autoscaling` absent provisions no HPA and no PDB when
+/// the static replica count is 1 (the default).
+///
+/// Asserts: after the Deployment is up, neither an HPA nor a PDB exists at the
+/// GEP-1762 name; Deployment has `spec.replicas: Some(1)`.
+#[tokio::test]
+async fn params_autoscaling_disabled_provisions_no_hpa() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-nohpa").await?;
+
+    // The default DEDICATED_GATEWAY fixture has no autoscaling block → replicas
+    // defaults to 1 and neither HPA nor PDB should be provisioned.
+    fixtures::apply_fixture(dedicated::DEDICATED_GATEWAY, FixtureVars::new(&ns.name)).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let hpas: Api<HorizontalPodAutoscaler> = Api::namespaced(h.client.clone(), &ns.name);
+    let pdbs: Api<PodDisruptionBudget> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // Wait for the Deployment (positive control: controller processed this Gateway).
+    let deploy =
+        wait::wait_for_resource(&deployments, RESOURCE_NAME, Duration::from_secs(30)).await?;
+
+    // Static replicas should be present (not None) because no HPA manages it.
+    assert_eq!(
+        deploy.spec.as_ref().and_then(|s| s.replicas),
+        Some(1),
+        "Deployment.spec.replicas must be Some(1) when autoscaling is disabled"
+    );
+
+    // HPA and PDB must NOT exist — the controller must not have provisioned them.
+    let hpa_result = hpas.get(RESOURCE_NAME).await;
+    assert!(
+        hpa_result.is_err(),
+        "HPA must not exist when autoscaling is disabled; got: {hpa_result:?}"
+    );
+
+    let pdb_result = pdbs.get(RESOURCE_NAME).await;
+    assert!(
+        pdb_result.is_err(),
+        "PDB must not exist when replica floor < 2; got: {pdb_result:?}"
+    );
 
     Ok(())
 }

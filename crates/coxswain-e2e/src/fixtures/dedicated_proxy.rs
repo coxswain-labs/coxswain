@@ -100,3 +100,11 @@ pub const SHARED_GATEWAY_INFRA: &str = fixture!("shared_gateway_infra.yaml");
 /// `{LoadBalancer, NodePort, ClusterIP}`).
 pub const REJECT_GATEWAY_PARAMS_INVALID_SERVICE_TYPE: &str =
     fixture!("reject_gateway_params_invalid_service_type.yaml");
+
+// ── Autoscaling (#497) ───────────────────────────────────────────────────────
+
+/// Dedicated-mode `Gateway` with `autoscaling.enabled: true`, `minReplicas: 2`,
+/// `maxReplicas: 5`, `targetCPUUtilizationPercentage: 70`. Used to verify the
+/// controller provisions an `HPA` and `PDB` alongside the Deployment, and that
+/// the Deployment has no static `spec.replicas` (HPA owns the count).
+pub const DEDICATED_GATEWAY_AUTOSCALING: &str = fixture!("dedicated_gateway_autoscaling.yaml");

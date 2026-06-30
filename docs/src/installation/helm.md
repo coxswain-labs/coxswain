@@ -38,12 +38,19 @@ helm show values oci://ghcr.io/coxswain-labs/charts/coxswain
 
 | Value | Default | Description |
 |-------|---------|-------------|
-| `controller.replicas` | `1` | Number of controller replicas (run `≥ 2` in production) |
+| `controller.replicas` | `2` | Controller replica count; PDB is only provisioned when `≥ 2` |
+| `controller.podDisruptionBudget.enabled` | `true` | Provision a PDB for the controller (effective when `replicas ≥ 2`) |
 | `image.tag` | _(chart appVersion)_ | Image tag to deploy |
 | `controllerName` | `coxswain-labs.dev/gateway-controller` | GatewayClass `controllerName` to claim |
 | `watchNamespace` | `""` | Restrict watch to a single namespace; empty = cluster-wide |
 | `proxy.ingress.http.port` | `80` | Ingress HTTP listener port |
 | `proxy.ingress.https.port` | `443` | Ingress HTTPS listener port |
+| `proxy.shared.replicas` | `1` | Static replica count (ignored when `autoscaling.enabled`) |
+| `proxy.shared.autoscaling.enabled` | `false` | Enable HPA for the shared proxy |
+| `proxy.shared.autoscaling.minReplicas` | `2` | HPA lower bound; must be `≥ 2` for the PDB to be active |
+| `proxy.shared.autoscaling.maxReplicas` | `10` | HPA upper bound |
+| `proxy.shared.autoscaling.targetCPUUtilizationPercentage` | `80` | HPA CPU utilization target |
+| `proxy.shared.podDisruptionBudget.enabled` | `true` | Provision a PDB for the shared proxy (effective when floor `≥ 2`) |
 | `proxy.shared.threads` | `2` | Worker threads per shared proxy service |
 | `proxy.shared.resources.requests.cpu` | `100m` | Shared proxy CPU request |
 | `proxy.shared.resources.requests.memory` | `128Mi` | Shared proxy memory request |

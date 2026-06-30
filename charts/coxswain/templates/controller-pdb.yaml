@@ -1,4 +1,4 @@
-{{- if and .Values.controller.enabled .Values.controller.podDisruptionBudget.enabled -}}
+{{- if and .Values.controller.enabled .Values.controller.podDisruptionBudget.enabled (ge (int .Values.controller.replicas) 2) -}}
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:

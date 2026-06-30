@@ -358,9 +358,15 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
 }
 
 /// Poll the `coxswain-leader-lock` Lease until its `holderIdentity` is one of
-/// the currently-running controller pods AND no extra (terminating) controller
-/// pods remain. This guarantees the new leader from a rolling update has fully
-/// taken over before tests proceed.
+/// the currently-running controller pods, the controller Deployment's rollout
+/// has fully settled (no extra terminating pods surviving a rolling update),
+/// and exactly one pod holds the lease. This guarantees the new leader from a
+/// rolling update has fully taken over before tests proceed.
+///
+/// The HA default runs the controller at `replicas: 2`, so the settle signal
+/// is the Deployment's own status (`status.replicas == status.readyReplicas ==
+/// spec.replicas`) rather than a hardcoded single-pod assumption — among those
+/// ready replicas, leader election elects exactly one lease holder.
 ///
 /// # Errors
 ///
@@ -369,8 +375,8 @@ async fn wait_for_leader_ready() -> anyhow::Result<()> {
     wait_for_leader_ready_in(COXSWAIN_NAMESPACE).await
 }
 
-/// Poll `coxswain-leader-lock` in `namespace` until the sole running
-/// controller pod holds the lease.
+/// Poll `coxswain-leader-lock` in `namespace` until the controller Deployment
+/// rollout has settled and one of its ready pods holds the lease.
 ///
 /// # Errors
 ///
@@ -378,6 +384,33 @@ async fn wait_for_leader_ready() -> anyhow::Result<()> {
 async fn wait_for_leader_ready_in(namespace: &str) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
+        // Deployment rollout status: desired replicas, total non-terminated
+        // replicas (old + new during a rolling update), and ready replicas.
+        // The rollout is settled only when all three agree — any terminating
+        // old pod from a rolling update keeps `status.replicas` above desired.
+        let deploy_out = Command::new("kubectl")
+            .args([
+                "get",
+                "deploy",
+                "-n",
+                namespace,
+                "-l",
+                "app.kubernetes.io/component=controller",
+                "-o",
+                "jsonpath={.items[0].spec.replicas}/{.items[0].status.replicas}/{.items[0].status.readyReplicas}",
+            ])
+            .output()
+            .await
+            .context("kubectl get deploy")?;
+        let deploy_status = String::from_utf8_lossy(&deploy_out.stdout);
+        let mut fields = deploy_status.split('/');
+        // Absent numeric status fields render empty; treat them as 0 so an
+        // un-rolled-out Deployment never spuriously satisfies the predicate.
+        let desired: u32 = fields.next().unwrap_or("").trim().parse().unwrap_or(0);
+        let total: u32 = fields.next().unwrap_or("").trim().parse().unwrap_or(0);
+        let ready: u32 = fields.next().unwrap_or("").trim().parse().unwrap_or(0);
+        let settled = desired > 0 && total == desired && ready == desired;
+
         let pods_out = Command::new("kubectl")
             .args([
                 "get",
@@ -415,12 +448,14 @@ async fn wait_for_leader_ready_in(namespace: &str) -> anyhow::Result<()> {
             .trim()
             .to_string();
 
-        if pods.len() == 1 && pods.contains(&holder) {
+        // Settled rollout (desired == total == ready pods, no terminating
+        // surplus) with the lease held by one of those ready pods.
+        if settled && pods.len() == desired as usize && pods.contains(&holder) {
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!(
-                "leader handover timeout: pods={pods:?}, holder={holder:?} (expected exactly one controller pod holding the lease)"
+                "leader handover timeout: desired={desired}, total={total}, ready={ready}, pods={pods:?}, holder={holder:?} (expected a settled controller rollout with exactly one pod holding the lease)"
             );
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

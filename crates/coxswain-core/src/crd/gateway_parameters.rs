@@ -69,6 +69,60 @@ pub struct CoxswainGatewayParametersSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "preserve_unknown_fields_schema")]
     pub pod_template: Option<serde_json::Value>,
+
+    /// Horizontal autoscaling for the provisioned proxy Deployment. When
+    /// `enabled` is `true`, the controller provisions an HPA targeting the
+    /// dedicated-proxy Deployment; the Deployment's `spec.replicas` is left
+    /// unset so the HPA is the sole authority on replica count. When `enabled`
+    /// is `false` (the default), the static `replicas` field governs.
+    ///
+    /// The controller also provisions a PDB whenever the effective replica
+    /// floor is ≥ 2: `min_replicas` when autoscaling is enabled, otherwise
+    /// `replicas`. A PDB with fewer than 2 replicas is counterproductive
+    /// (either blocks drain permanently or allows a full outage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoscaling: Option<AutoscalingParams>,
+}
+
+/// Horizontal autoscaling parameters for the controller-provisioned dedicated
+/// proxy Deployment.
+///
+/// When `enabled` is `true`, the controller provisions a `HorizontalPodAutoscaler`
+/// alongside the Deployment and leaves `Deployment.spec.replicas` unset so the
+/// HPA is the sole authority on replica count. The controller also provisions a
+/// `PodDisruptionBudget` (maxUnavailable: 1) when `min_replicas >= 2`.
+///
+/// When `enabled` is `false` (default), the static
+/// [`CoxswainGatewayParametersSpec::replicas`] governs and the HPA is not
+/// provisioned.
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+#[non_exhaustive]
+pub struct AutoscalingParams {
+    /// When `true`, the controller provisions an HPA for the dedicated proxy
+    /// Deployment. Must be set explicitly; the `Default` is `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Minimum number of replicas the HPA may scale down to. When omitted,
+    /// the HPA's own default (currently 1 in Kubernetes) applies. Set to ≥ 2
+    /// for an HA configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_replicas: Option<u32>,
+
+    /// Maximum number of replicas the HPA may scale up to. When omitted,
+    /// no explicit cap is set (the HPA's own unlimited behaviour applies).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_replicas: Option<u32>,
+
+    /// Target CPU utilization percentage the HPA aims to maintain.
+    /// Canonical Kubernetes casing is preserved via the explicit rename.
+    #[serde(
+        rename = "targetCPUUtilizationPercentage",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub target_cpu_utilization_percentage: Option<u32>,
 }
 
 /// Service type for the provisioned proxy Service.
@@ -97,7 +151,9 @@ fn preserve_unknown_fields_schema(_: &mut SchemaGenerator) -> Schema {
 mod tests {
     #![allow(missing_docs)]
 
-    use crate::crd::{CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType};
+    use crate::crd::{
+        AutoscalingParams, CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType,
+    };
     use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
     use kube::CustomResourceExt;
 
@@ -152,6 +208,7 @@ mod tests {
         assert!(cr.spec.image.is_none());
         assert!(cr.spec.resources.is_none());
         assert!(cr.spec.pod_template.is_none());
+        assert!(cr.spec.autoscaling.is_none());
     }
 
     #[test]
@@ -232,6 +289,66 @@ mod tests {
 
         let reserialized = serde_json::to_value(pt).expect("re-serialize");
         assert_eq!(&reserialized, pt, "re-serialization must be lossless");
+    }
+
+    #[test]
+    fn autoscaling_enabled_round_trips() {
+        let cr = parse_cr(
+            "autoscaling:\n  enabled: true\n  \
+             minReplicas: 2\n  maxReplicas: 10\n  \
+             targetCPUUtilizationPercentage: 75",
+        );
+        let a = cr
+            .spec
+            .autoscaling
+            .as_ref()
+            .expect("autoscaling must be present");
+        assert!(a.enabled, "enabled must be true");
+        assert_eq!(a.min_replicas, Some(2), "minReplicas");
+        assert_eq!(a.max_replicas, Some(10), "maxReplicas");
+        assert_eq!(
+            a.target_cpu_utilization_percentage,
+            Some(75),
+            "targetCPUUtilizationPercentage"
+        );
+    }
+
+    #[test]
+    fn autoscaling_disabled_default_omits_optional_fields() {
+        // Only `enabled: false` — optional subfields should default to None.
+        let cr = parse_cr("autoscaling:\n  enabled: false");
+        let a = cr
+            .spec
+            .autoscaling
+            .as_ref()
+            .expect("autoscaling block present");
+        assert!(!a.enabled, "enabled must be false");
+        assert!(a.min_replicas.is_none(), "minReplicas absent");
+        assert!(a.max_replicas.is_none(), "maxReplicas absent");
+        assert!(
+            a.target_cpu_utilization_percentage.is_none(),
+            "targetCPUUtilizationPercentage absent"
+        );
+    }
+
+    #[test]
+    fn autoscaling_serializes_target_cpu_with_canonical_casing() {
+        // Verify the explicit rename produces "targetCPUUtilizationPercentage"
+        // (uppercase CPU), not "targetCpuUtilizationPercentage" (camelCase default).
+        let params = AutoscalingParams {
+            enabled: true,
+            target_cpu_utilization_percentage: Some(80),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&params).expect("serialize");
+        assert!(
+            json.get("targetCPUUtilizationPercentage").is_some(),
+            "canonical casing 'targetCPUUtilizationPercentage' must be present; got: {json}"
+        );
+        assert!(
+            json.get("targetCpuUtilizationPercentage").is_none(),
+            "camelCase 'targetCpuUtilizationPercentage' must NOT be present"
+        );
     }
 
     #[test]
