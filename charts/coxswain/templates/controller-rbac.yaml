@@ -105,17 +105,29 @@ rules:
   # operators author these objects; the controller only renders from them.
   # Watch + status-write ClientTrafficPolicy (#327): the controller reconciles
   # per-listener PROXY protocol config and patches status.ancestors[].
+  # Watch + status-write CoxswainBackendPolicy (#354): per-backend connect/idle
+  # timeouts, status.ancestors[] patched per targeted Service.
   - apiGroups: ["gateway.coxswain-labs.dev"]
-    resources: ["coxswaingatewayparameters", "clienttrafficpolicies"]
+    resources: ["coxswaingatewayparameters", "clienttrafficpolicies", "coxswainbackendpolicies"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.coxswain-labs.dev"]
-    resources: ["clienttrafficpolicies/status"]
+    resources: ["clienttrafficpolicies/status", "coxswainbackendpolicies/status"]
     verbs: ["patch", "update"]
   # Server-side-apply provisioning of dedicated-mode proxy Deployments
   # (#208). The Deployments are owner-referenced to the Gateway so K8s
   # cascades their deletion automatically.
   - apiGroups: ["apps"]
     resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Dedicated-proxy autoscaling (#497): the operator server-side-applies an HPA +
+  # PDB when `autoscaling.enabled`, and DELETES them on every reconcile when
+  # disabled (so an autoscaling-off Gateway provisions neither). `delete` is
+  # therefore required even for Gateways that never enable autoscaling.
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Read-only Pod watch (#210, #211) so the operator can observe
   # dedicated-proxy Pod readiness — publishes the
