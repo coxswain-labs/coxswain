@@ -24,6 +24,7 @@ pub use client_traffic_policy::{
 };
 pub use grpc_reconcile::GrpcRouteResolution;
 pub(crate) use hostnames::hostnames_intersect;
+pub(crate) use reconcile::GatewayTlsTarget;
 pub use reconcile::RouteResolution;
 pub(crate) use route_status::RouteLike;
 

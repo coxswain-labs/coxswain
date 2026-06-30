@@ -58,6 +58,7 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::Session;
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_stream::StreamExt as _;
 
 /// Headers stripped from mirror sub-requests beyond the standard hop-by-hop set.
 ///
@@ -93,8 +94,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             affinity_pin: None,
             affinity_set_cookie: false,
             auth_response_headers: None,
-            mirrors: Vec::new(),
-            mirror_body: Vec::new(),
+            mirror_txs: Vec::new(),
             compression_encoder: None,
             client_cert_pem: None,
             client_ip: None,
@@ -474,6 +474,10 @@ pub(crate) async fn request_filter<K>(
                     .filter_map(|(name, value)| {
                         let lower = name.as_str().to_ascii_lowercase();
                         if lower == "host"
+                            // content-length is stripped because the streaming mirror body uses
+                            // Transfer-Encoding: chunked; forwarding the original CL alongside
+                            // chunked TE violates RFC 9112 §6.1 and confuses strict backends.
+                            || lower == "content-length"
                             || auth::HOP_BY_HOP.contains(&lower.as_str())
                             || MIRROR_CREDENTIAL_HEADERS.contains(&lower.as_str())
                         {
@@ -504,36 +508,59 @@ pub(crate) async fn request_filter<K>(
                 None => Arc::clone(&original_path),
             };
 
-            // Build one MirrorDispatch per surviving backend, sharing immutable
-            // captures via Arc clone (no data copy).
-            let dispatches: Vec<MirrorDispatch> = surviving
-                .into_iter()
-                .map(|backend| MirrorDispatch {
+            // Dispatch mirror tasks per surviving backend.
+            //
+            // Methods that cannot carry a request body (GET, HEAD, OPTIONS, CONNECT,
+            // TRACE) are dispatched immediately with an empty body — no channel needed.
+            // This also avoids the H2 bodyless edge case where Pingora never calls
+            // `request_body_filter` for methods with no DATA frames.
+            //
+            // All other methods (POST, PUT, PATCH, DELETE, …) open a bounded mpsc
+            // channel per backend and wrap its receiver as a streaming reqwest::Body so
+            // the body is forwarded chunk-by-chunk in `request_body_filter`, concurrent
+            // with primary forwarding — no buffering and no max-body-size dependency
+            // (#360).  H2 streaming bodies without Content-Length (RFC-legal for H2)
+            // are handled correctly: the channel stays open until request_body_filter
+            // delivers end_of_stream or ProxyCtx drops.
+            let method_has_body = !matches!(
+                method,
+                http::Method::GET
+                    | http::Method::HEAD
+                    | http::Method::OPTIONS
+                    | http::Method::CONNECT
+                    | http::Method::TRACE
+            );
+            let mut txs = Vec::with_capacity(surviving.len());
+            for backend in surviving {
+                let dispatch = MirrorDispatch {
                     backend,
                     method: method.clone(),
                     host: Arc::clone(&host),
                     path_and_query: Arc::clone(&path_and_query),
                     headers: headers.clone(),
                     metric_route_id: Arc::clone(&metric_route_id),
-                })
-                .collect();
-
-            if ctx.max_body_size.is_none() {
-                // Header-only mode: no body will be buffered; dispatch all now.
-                // Covers bodyless methods (GET, HEAD) and routes without max-body-size.
-                for dispatch in dispatches {
-                    crate::filters::mirror::spawn_mirror_dispatch(
-                        dispatch,
-                        cfg.auth_client.clone(),
-                        Bytes::new(),
-                        &cfg.mirror_tracker,
+                };
+                let body = if method_has_body {
+                    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(
+                        crate::filters::mirror::MIRROR_CHANNEL_CAP,
                     );
-                }
-            } else {
-                // Body-buffering mode: stash dispatches; request_body_filter accumulates
-                // chunks and dispatches all on end_of_stream.
-                ctx.mirrors = dispatches;
+                    let body = reqwest::Body::wrap_stream(
+                        tokio_stream::wrappers::ReceiverStream::new(rx)
+                            .map(Ok::<Bytes, std::io::Error>),
+                    );
+                    txs.push(tx);
+                    body
+                } else {
+                    reqwest::Body::default()
+                };
+                crate::filters::mirror::spawn_mirror_dispatch(
+                    dispatch,
+                    cfg.auth_client.clone(),
+                    body,
+                    &cfg.mirror_tracker,
+                );
             }
+            ctx.mirror_txs = txs;
         }
     }
 
@@ -592,7 +619,7 @@ fn content_length(session: &Session) -> Option<u64> {
 }
 
 /// Pingora `request_body_filter` body: enforce the per-route request-body size limit
-/// on streaming/chunked uploads and buffer body chunks for fire-and-forget mirroring.
+/// on streaming/chunked uploads, and tees body chunks to any active mirror tasks.
 ///
 /// Called for every chunk of the request body (including a final call with
 /// `end_of_stream = true` when the body is complete). Accumulates the running byte
@@ -603,67 +630,54 @@ fn content_length(session: &Session) -> Option<u64> {
 /// hot-path allocation budget. No-ops for size enforcement when the route carries no
 /// limit (every Gateway-API route, and Ingress routes without the annotation).
 ///
-/// When `mirror-target` is active and `max-body-size` is set, each chunk is also teed
-/// into [`ProxyCtx::mirror_body`] (a [`Bytes`] refcount clone — no data copy). On
-/// `end_of_stream` the mirror dispatch fires fire-and-forget via
-/// [`crate::filters::mirror::spawn_mirror_dispatch`].
-/// The `auth_client` is only cloned when a mirror dispatch is triggered (i.e., when
-/// `ctx.mirrors.is_empty()` is false and `end_of_stream` is true).
+/// When `mirror-target` is active, each chunk is also teed to all mirror tasks via
+/// bounded mpsc senders ([`ProxyCtx::mirror_txs`]). Chunks are sent with
+/// `try_send` (non-blocking): a slow mirror upstream causes the current chunk to be
+/// dropped rather than stalling the primary path. On `end_of_stream` the sender vec is
+/// cleared, dropping all senders and closing each mirror body stream. Mirroring is
+/// independent of `max-body-size` (#360).
 ///
 /// # Errors
 /// Returns `Error::explain(413, …)` once the cumulative body size exceeds the limit.
 pub(crate) fn request_body_filter(
     body: Option<&Bytes>,
     end_of_stream: bool,
-    cfg: &crate::config::SharedProxyConfig,
     ctx: &mut ProxyCtx,
 ) -> Result<()> {
-    // ── Body size enforcement (unchanged) ────────────────────────────────────
+    // ── Body size enforcement ────────────────────────────────────────────────
     if let Some(limit) = ctx.max_body_size {
         ctx.body_bytes_seen = ctx
             .body_bytes_seen
             .saturating_add(body.map_or(0, Bytes::len) as u64);
         if ctx.body_bytes_seen > limit {
+            // Close mirror channels immediately so their tasks don't wait for
+            // ProxyCtx to drop (which only happens after fail_to_proxy + logging).
+            ctx.mirror_txs.clear();
             return Err(pingora_core::Error::explain(
                 HTTPStatus(413),
                 "request body exceeds max-body-size",
             ));
         }
+    }
 
-        // ── Mirror body tee ──────────────────────────────────────────────────
-        // Only active when mirror dispatches are pending and body buffering is configured
-        // (max-body-size implies a bounded buffer; #263 rejects over-cap bodies above,
-        // so the mirror buffer is inherently bounded at the same cap).
-        if !ctx.mirrors.is_empty() {
-            if let Some(chunk) = body
-                && !chunk.is_empty()
-            {
-                ctx.mirror_body.push(chunk.clone()); // refcount bump, no data copy
-            }
-            if end_of_stream {
-                let body_bytes: Bytes = if ctx.mirror_body.is_empty() {
-                    Bytes::new()
-                } else {
-                    let total: usize = ctx.mirror_body.iter().map(Bytes::len).sum();
-                    let mut buf = bytes::BytesMut::with_capacity(total);
-                    for chunk in ctx.mirror_body.drain(..) {
-                        buf.extend_from_slice(&chunk);
-                    }
-                    buf.freeze()
-                };
-                // Dispatch all pending mirrors, sharing the assembled body via
-                // Bytes refcount clone (no extra data copy per mirror).
-                for dispatch in ctx.mirrors.drain(..) {
-                    crate::filters::mirror::spawn_mirror_dispatch(
-                        dispatch,
-                        cfg.auth_client.clone(),
-                        body_bytes.clone(),
-                        &cfg.mirror_tracker,
-                    );
-                }
+    // ── Mirror body tee (independent of max-body-size, #360) ────────────────
+    if !ctx.mirror_txs.is_empty() {
+        if let Some(chunk) = body
+            && !chunk.is_empty()
+        {
+            for tx in &ctx.mirror_txs {
+                // Bounded channel: drop the current chunk on backpressure rather
+                // than stalling the primary path. Mirror is best-effort.
+                let _ = tx.try_send(chunk.clone()); // Bytes clone = refcount bump, no data copy
             }
         }
+        if end_of_stream {
+            // Drop all senders → closes each receiver stream → signals EOF to
+            // the reqwest body wrapping that stream.
+            ctx.mirror_txs.clear();
+        }
     }
+
     Ok(())
 }
 

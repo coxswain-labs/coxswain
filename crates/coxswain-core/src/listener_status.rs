@@ -112,8 +112,6 @@ pub enum ListenerReadiness {
     /// Listener uses an unsupported protocol/mode combination.
     ///
     /// Surfaces `Accepted=False, reason=UnsupportedValue` on the Gateway listener.
-    /// Currently emitted for `protocol: TLS, tls.mode: Terminate` listeners — only
-    /// `tls.mode: Passthrough` is supported for TLS listeners (GEP-2643).
     Unsupported {
         /// Human-readable description of what is not supported.
         message: String,
@@ -144,6 +142,14 @@ pub enum ListenerReadiness {
     /// no HTTP parsing. The certificate is resolved into the per-port TLS store
     /// exactly as for HTTPS; routing is by SNI hostname, not HTTP headers.
     TlsTerminate,
+    /// TLS or HTTPS listener in shared-proxy mode whose VIP Service has not yet
+    /// been allocated an internal NodePort by the controller.
+    ///
+    /// Surfaces `Programmed=False, reason=Pending` so the controller does not
+    /// publish `status.addresses` prematurely. Once the VIP Service exists and
+    /// the internal port is known, the next rebuild replaces this with
+    /// `TlsPassthrough`, `TlsTerminate`, or `Resolved`.
+    VipPending,
 }
 
 impl ListenerReadiness {
@@ -164,7 +170,9 @@ impl ListenerReadiness {
     /// `NotApplicable` (non-HTTPS listener), `Resolved` (all refs resolved),
     /// `TlsPassthrough`, and `TlsTerminate` are healthy. `ResolvedPartial` is
     /// **not** healthy — it carries a degraded `ResolvedRefs=False` condition —
-    /// even though the listener is still serving.
+    /// even though the listener is still serving. `VipPending` is **not**
+    /// healthy — the VIP internal port is not yet known, so `Programmed=False`
+    /// is correct until the next rebuild.
     #[must_use]
     pub fn is_healthy(&self) -> bool {
         matches!(
@@ -183,6 +191,7 @@ impl ListenerReadiness {
             }
             Self::Invalid { .. } => "Invalid",
             Self::Unsupported { .. } => "UnsupportedValue",
+            Self::VipPending => "Pending",
             Self::NotApplicable | Self::Resolved | Self::TlsPassthrough | Self::TlsTerminate => {
                 "Resolved"
             }
@@ -199,6 +208,7 @@ impl ListenerReadiness {
             | Self::Invalid { message }
             | Self::Unsupported { message }
             | Self::ResolvedPartial { message } => message.as_str(),
+            Self::VipPending => "waiting for VIP port allocation",
             Self::NotApplicable | Self::Resolved | Self::TlsPassthrough | Self::TlsTerminate => "",
         }
     }

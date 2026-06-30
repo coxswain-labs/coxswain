@@ -425,19 +425,17 @@ The mirror target is resolved to pod endpoints at reconcile time (not per-reques
 
 ### Body mirroring
 
-By default (without `max-body-size`) the mirror receives the request headers and an empty body. To mirror the full request body, set `max-body-size` on the same Ingress — the proxy buffers each request body up to the cap and includes it verbatim in the mirror sub-request:
+The proxy streams the full request body to the mirror backend **as chunks arrive**, concurrent with primary forwarding — no intermediate buffering and no dependency on `max-body-size`. A minimal annotation is all that is needed:
 
 ```yaml
 metadata:
   annotations:
     ingress.coxswain-labs.dev/mirror-target: "shadow-svc.my-namespace.svc:8080"
-    ingress.coxswain-labs.dev/max-body-size: "1m"
 ```
 
-`max-body-size` already rejects requests exceeding the cap with 413, so the mirror buffer is inherently bounded — no additional memory risk is introduced.
+**Backpressure:** each mirror task receives body chunks via a bounded internal channel. If the mirror upstream falls behind, the current chunk is dropped rather than stalling the primary path. The mirror body may be truncated for slow mirror backends, which is expected and acceptable for a fire-and-forget shadow.
 
-!!! note "Body-mirroring for large payloads"
-    Stream-concurrent mirroring (mirror body as it arrives, no buffering) is planned. Until then, mirror with a body cap is the recommended pattern for production use.
+`max-body-size` can still be set independently to cap and reject oversized primary request bodies with 413 — but it is not required for body mirroring.
 
 ### Observability
 
