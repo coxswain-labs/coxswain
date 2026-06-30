@@ -6,6 +6,7 @@
 //! these types by `examples/crdgen.rs` and pinned by snapshot tests.
 
 pub mod client_traffic_policy;
+pub mod coxswain_backend_policy;
 pub mod gateway_parameters;
 pub mod ingress_parameters;
 pub mod path_rewrite_regex;
@@ -14,6 +15,10 @@ pub mod rate_limit;
 pub use client_traffic_policy::{
     ClientTrafficPolicy, ClientTrafficPolicySpec, ClientTrafficPolicyStatus, LocalPolicyTargetRef,
     PolicyAncestorRef, PolicyAncestorStatus, ProxyProtocolSpec,
+};
+pub use coxswain_backend_policy::{
+    BackendPolicyAncestorRef, BackendPolicyAncestorStatus, BackendPolicyTargetRef, BackendTimeouts,
+    CoxswainBackendPolicy, CoxswainBackendPolicySpec, CoxswainBackendPolicyStatus,
 };
 pub use gateway_parameters::{
     AutoscalingParams, CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType,

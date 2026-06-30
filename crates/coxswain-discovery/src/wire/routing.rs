@@ -231,6 +231,7 @@ fn backend_group_to_wire(bg: &BackendGroup, depth: usize) -> p::BackendGroup {
         .collect();
 
     let keepalive_millis = bg.keepalive_timeout().map(|d| d.as_millis() as u64);
+    let connect_millis = bg.connect_timeout().map(|d| d.as_millis() as u64);
 
     p::BackendGroup {
         name: bg.name().to_string(),
@@ -239,6 +240,7 @@ fn backend_group_to_wire(bg: &BackendGroup, depth: usize) -> p::BackendGroup {
         tls: bg.upstream_tls().map(|t| upstream_tls_to_wire(t)),
         retry: Some(retry_to_wire(&bg.retry_policy())),
         keepalive_millis,
+        connect_millis,
         per_backend_filters,
         load_balance: Some(load_balance_to_wire(bg.load_balance())),
         session_affinity: bg.session_affinity().map(session_affinity_to_wire),
@@ -904,6 +906,9 @@ pub(crate) fn bg_from_wire(dto: &p::BackendGroup, depth: usize) -> Result<Backen
     bg = bg.with_retries(retry);
     if let Some(ms) = dto.keepalive_millis {
         bg = bg.with_keepalive_timeout(Some(Duration::from_millis(ms)));
+    }
+    if let Some(ms) = dto.connect_millis {
+        bg = bg.with_connect_timeout(Some(Duration::from_millis(ms)));
     }
     if let Some(pbf) = per_backend_filters {
         bg = bg.with_per_backend_filters(pbf);
@@ -1921,6 +1926,35 @@ mod tests {
         assert_eq!(pbf.len(), 2, "two slots");
         assert!(pbf[0].is_some(), "backend 0 has filters");
         assert!(pbf[1].is_none(), "backend 1 has no filters");
+    }
+
+    #[test]
+    fn backend_timeouts_round_trip() {
+        let a = addr("10.0.0.1:80");
+        let bg = Arc::new(
+            BackendGroup::new("ns/svc".to_string(), vec![a])
+                .with_connect_timeout(Some(Duration::from_millis(500)))
+                .with_keepalive_timeout(Some(Duration::from_secs(60))),
+        );
+        let entry = Arc::new(simple_entry(bg));
+
+        let mut b = IngressRoutingTableBuilder::new();
+        b.for_port(80)
+            .exact_host("example.com")
+            .add_exact_route("/api", entry);
+
+        let rt = rt_ingress(b);
+        let bg2 = rt.route(80, "example.com", "/api", &ctx()).expect("hit");
+        assert_eq!(
+            bg2.connect_timeout(),
+            Some(Duration::from_millis(500)),
+            "connect timeout must survive the wire round-trip (#354)"
+        );
+        assert_eq!(
+            bg2.keepalive_timeout(),
+            Some(Duration::from_secs(60)),
+            "keepalive (idle) timeout must survive the wire round-trip"
+        );
     }
 
     // ── 11. Mirror: nested depth ok; over-deep → MirrorTooDeep ───────────────

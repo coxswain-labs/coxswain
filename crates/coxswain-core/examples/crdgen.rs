@@ -12,6 +12,12 @@
 //! cp deploy/manifests/crds/clienttrafficpolicies.yaml \
 //!     charts/coxswain/crds/clienttrafficpolicies.yaml
 //!
+//! # CoxswainBackendPolicy
+//! cargo run -p coxswain-core --example crdgen -- CoxswainBackendPolicy \
+//!     > deploy/manifests/crds/coxswainbackendpolicies.yaml
+//! cp deploy/manifests/crds/coxswainbackendpolicies.yaml \
+//!     charts/coxswain/crds/coxswainbackendpolicies.yaml
+//!
 //! # CoxswainGatewayParameters
 //! cargo run -p coxswain-core --example crdgen \
 //!     > deploy/manifests/crds/coxswaingatewayparameters.yaml
@@ -35,8 +41,8 @@
 //! and the committed YAML.
 
 use coxswain_core::crd::{
-    ClientTrafficPolicy, CoxswainGatewayParameters, CoxswainIngressClassParameters,
-    PathRewriteRegex, RateLimit,
+    ClientTrafficPolicy, CoxswainBackendPolicy, CoxswainGatewayParameters,
+    CoxswainIngressClassParameters, PathRewriteRegex, RateLimit,
 };
 use kube::CustomResourceExt;
 
@@ -45,6 +51,9 @@ fn main() -> Result<(), serde_yaml::Error> {
     match kind.as_str() {
         "ClientTrafficPolicy" => {
             serde_yaml::to_writer(std::io::stdout(), &ClientTrafficPolicy::crd())
+        }
+        "CoxswainBackendPolicy" => {
+            serde_yaml::to_writer(std::io::stdout(), &CoxswainBackendPolicy::crd())
         }
         "IngressClassParameters" => {
             serde_yaml::to_writer(std::io::stdout(), &CoxswainIngressClassParameters::crd())

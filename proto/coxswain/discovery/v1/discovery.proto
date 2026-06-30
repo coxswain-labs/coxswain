@@ -256,6 +256,7 @@ message BackendGroup {
   SessionAffinity session_affinity = 13;
   // optional scalars
   optional uint64 keepalive_millis = 30; // absent = Pingora default
+  optional uint64 connect_millis = 31; // CoxswainBackendPolicy spec.timeouts.connect (#354); absent = route/backendRequest fallback
   // repeated
   repeated WeightedBackend weighted = 40; // BackendGroupSpec; construction order
   repeated PerBackendFiltersEntry per_backend_filters = 41; // index-aligned with `weighted`; sorted by index
