@@ -228,9 +228,8 @@ pub(crate) fn listener_condition_triplet(
     } else {
         ("False", outcome.reason(), outcome.message())
     };
-    // Accepted is False when the listener uses an unsupported protocol/mode combination
-    // (e.g. TLS/Terminate — only TLS/Passthrough is supported), when the frontend CA
-    // failed to resolve, or True/Accepted otherwise.
+    // Accepted is False when the listener uses an unsupported protocol/mode combination,
+    // when the frontend CA failed to resolve, or True/Accepted otherwise.
     let (accepted_status, accepted_reason, accepted_msg) = if frontend_ca_failed {
         ("False", "NoValidCACertificate", frontend_msg)
     } else if let ListenerReadiness::Unsupported { message } = &outcome {

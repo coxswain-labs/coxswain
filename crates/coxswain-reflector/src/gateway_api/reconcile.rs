@@ -752,24 +752,34 @@ impl GatewayApiReconciler {
     ///
     /// Only `protocol: HTTPS` with `tls.mode: Terminate` (the default) installs a
     /// cert here. `protocol: TLS, tls.mode: Passthrough` listeners are handled by
-    /// `build_passthrough_routes`; `TLS/Terminate` is `Unsupported`. Non-HTTPS
-    /// listeners are `NotApplicable`. Cross-namespace `certificateRefs` require a
-    /// matching entry in `cert_grants`. `internal_ports` maps `listenerPort →
-    /// internalPort` (#472) for shared-mode VIP isolation.
+    /// `build_passthrough_routes`. Non-HTTPS listeners are `NotApplicable`.
+    /// Cross-namespace `certificateRefs` require a matching entry in `cert_grants`.
     pub(crate) fn reconcile_tls(
-        gw_name: &str,
-        listeners: &[EffectiveListener],
+        target: &GatewayTlsTarget<'_>,
         secrets: &reflector::Store<Secret>,
         cert_grants: &HashSet<ReferenceGrantKey>,
         ls_cert_grants: &HashSet<ReferenceGrantKey>,
         builder: &mut PortTlsStoreBuilder,
-        internal_ports: &HashMap<u16, u16>,
     ) -> GatewayListenerStatus {
         let mut map = BTreeMap::new();
 
-        for listener in listeners {
+        for listener in target.listeners {
             let listener_port = listener.port as u16;
-            let internal_port = internal_ports.get(&listener_port).copied().unwrap_or(0);
+            let internal_port = target
+                .internal_ports
+                .get(&listener_port)
+                .copied()
+                .unwrap_or(0);
+            // A VIP Service is created asynchronously after the Gateway first appears.
+            // Until it exists, internal_port is 0 and kube-proxy has not yet been
+            // programmed to route VIP traffic to the proxy's NodePort. Emitting
+            // TlsPassthrough / TlsTerminate (both healthy) while internal_port is 0
+            // would cause the controller to publish Programmed=True + status.addresses
+            // prematurely — the proxy binds the spec port, but kube-proxy routes to a
+            // different internal port, causing ECONNREFUSED until the second rebuild.
+            // Callers must ensure internal_port is non-zero when readiness is expected
+            // (shared reconciler: VIP-based; dedicated reconciler: identity mapping).
+            let vip_pending = internal_port == 0;
             // Bind port the proxy accepts this listener on (= internal port when
             // allocated, else the spec port); the cert store keys on it.
             let bind_port = if internal_port != 0 {
@@ -784,26 +794,54 @@ impl GatewayApiReconciler {
             } else if listener.protocol == "TLS"
                 && listener.tls.as_ref().is_some_and(|t| t.passthrough)
             {
-                // TLS passthrough: proxy peeks SNI and forwards raw stream; no cert needed.
-                ListenerReadiness::TlsPassthrough
+                if vip_pending {
+                    ListenerReadiness::VipPending
+                } else {
+                    // TLS passthrough: proxy peeks SNI and forwards raw stream; no cert needed.
+                    ListenerReadiness::TlsPassthrough
+                }
             } else if listener.protocol == "TLS" {
-                // TLS/Terminate (TLSRouteModeTerminate, #481): resolve the cert exactly as for
-                // HTTPS and install it into the per-port TLS store so the proxy's SniCertSelector
-                // finds it. Remap Resolved → TlsTerminate so the bin layer creates a TlsL4
-                // proxy port (L4 splice) rather than an HTTPS (L7 HTTP) listener.
-                let grants = grants_for_source(&listener.source, cert_grants, ls_cert_grants);
-                match resolve_listener_tls(gw_name, listener, secrets, grants, builder, bind_port) {
-                    ListenerReadiness::Resolved => ListenerReadiness::TlsTerminate,
-                    other => other,
+                if vip_pending {
+                    ListenerReadiness::VipPending
+                } else {
+                    // TLS/Terminate (TLSRouteModeTerminate, #481): resolve the cert exactly as for
+                    // HTTPS and install it into the per-port TLS store so the proxy's SniCertSelector
+                    // finds it. Remap Resolved → TlsTerminate so the bin layer creates a TlsL4
+                    // proxy port (L4 splice) rather than an HTTPS (L7 HTTP) listener.
+                    let grants = grants_for_source(&listener.source, cert_grants, ls_cert_grants);
+                    match resolve_listener_tls(
+                        target.gw_name,
+                        listener,
+                        secrets,
+                        grants,
+                        builder,
+                        bind_port,
+                    ) {
+                        ListenerReadiness::Resolved => ListenerReadiness::TlsTerminate,
+                        other => other,
+                    }
                 }
             } else if listener.protocol != "HTTPS" {
                 ListenerReadiness::NotApplicable
+            } else if vip_pending {
+                // Same VIP race as TLS listeners: defer until the internal port is
+                // known so Programmed=True is not published before kube-proxy NAT
+                // is programmed. Cert resolution is skipped; the next rebuild
+                // (after the VIP Service appears) installs it at the right port.
+                ListenerReadiness::VipPending
             } else {
                 // A ListenerSet listener's cross-namespace cert is permitted by a
                 // `from.kind: ListenerSet` grant; a Gateway listener's by
                 // `from.kind: Gateway` (GEP-1713). Pick the matching grant set.
                 let grants = grants_for_source(&listener.source, cert_grants, ls_cert_grants);
-                resolve_listener_tls(gw_name, listener, secrets, grants, builder, bind_port)
+                resolve_listener_tls(
+                    target.gw_name,
+                    listener,
+                    secrets,
+                    grants,
+                    builder,
+                    bind_port,
+                )
             };
             let mut li = ListenerInfo::default();
             li.readiness = readiness;
@@ -826,6 +864,29 @@ impl GatewayApiReconciler {
         glh.listeners = map;
         glh
     }
+}
+
+/// Per-Gateway context passed to [`GatewayApiReconciler::reconcile_tls`].
+///
+/// Groups the 7+ parameters into a single struct to satisfy the workspace
+/// `clippy::too_many_arguments` policy.
+pub(crate) struct GatewayTlsTarget<'a> {
+    /// Gateway `metadata.name` — used in diagnostic log messages.
+    pub(crate) gw_name: &'a str,
+    /// Effective listeners for this Gateway (its own plus any merged ListenerSet
+    /// listeners, GEP-1713).
+    pub(crate) listeners: &'a [EffectiveListener],
+    /// `listenerPort → internalPort` mapping.
+    ///
+    /// For the **shared reconciler**: built from VIP Services (#472). An absent
+    /// entry (maps to 0 via `unwrap_or`) means the VIP Service has not yet been
+    /// created — readiness is deferred (`VipPending`) until the next rebuild.
+    ///
+    /// For the **dedicated reconciler**: pre-populated with identity mappings
+    /// (`spec_port → spec_port`) so `internal_port` is never 0. The dedicated
+    /// proxy binds the spec port directly; treating 0 as "pending" would prevent
+    /// the listener from ever reaching `TlsPassthrough` / `TlsTerminate`.
+    pub(crate) internal_ports: &'a HashMap<u16, u16>,
 }
 
 /// Select the applicable ReferenceGrant set for a listener based on its source kind.
@@ -1037,15 +1098,19 @@ mod tests {
         let grant: HashSet<ReferenceGrantKey> =
             std::iter::once(ReferenceGrantKey::specific("team-a", "certs", "cert")).collect();
         let empty = HashSet::new();
+        // Provide a real internal_port so VipPending doesn't short-circuit cert validation.
+        let ports = HashMap::from([(8443u16, 30001u16)]);
         let mut builder = PortTlsStoreBuilder::new();
         let health = GatewayApiReconciler::reconcile_tls(
-            "gw",
-            std::slice::from_ref(&listener),
+            &GatewayTlsTarget {
+                gw_name: "gw",
+                listeners: std::slice::from_ref(&listener),
+                internal_ports: &ports,
+            },
             &secrets,
             &grant, // cert_grants (Gateway-from) — must NOT permit an LS listener
             &empty, // ls_cert_grants empty
             &mut builder,
-            &HashMap::new(),
         );
         let outcome =
             &health.listeners[&ListenerStatusKey::listener_set(ls_key.clone(), "https")].readiness;
@@ -1059,13 +1124,15 @@ mod tests {
         // proving the grant was accepted (no longer RefNotPermitted).
         let mut builder2 = PortTlsStoreBuilder::new();
         let health2 = GatewayApiReconciler::reconcile_tls(
-            "gw",
-            std::slice::from_ref(&listener),
+            &GatewayTlsTarget {
+                gw_name: "gw",
+                listeners: std::slice::from_ref(&listener),
+                internal_ports: &ports,
+            },
             &secrets,
             &empty, // cert_grants empty
             &grant, // ls_cert_grants (ListenerSet-from) — permits the LS listener
             &mut builder2,
-            &HashMap::new(),
         );
         let outcome2 =
             &health2.listeners[&ListenerStatusKey::listener_set(ls_key, "https")].readiness;
@@ -1073,6 +1140,122 @@ mod tests {
             !matches!(outcome2, ListenerReadiness::RefNotPermitted { .. }),
             "a ListenerSet-from grant must permit the cross-ns cert ref, got {outcome2:?}"
         );
+    }
+
+    // ── VipPending: deferred readiness when internal_port is not yet allocated ──
+
+    fn tls_listener(protocol: &str, passthrough: bool) -> EffectiveListener {
+        use crate::reconciler::listener_merge::{
+            EffectiveCertRef, EffectiveListener, EffectiveTls,
+        };
+        use crate::status::ConflictReason;
+        EffectiveListener {
+            source: ListenerSource::Gateway,
+            owning_namespace: "default".to_string(),
+            name: "tls".to_string(),
+            port: 8443,
+            protocol: protocol.to_string(),
+            hostname: Some("tls.example.com".to_string()),
+            tls: Some(EffectiveTls {
+                passthrough,
+                certificate_refs: if passthrough {
+                    vec![]
+                } else {
+                    vec![EffectiveCertRef {
+                        group: None,
+                        kind: None,
+                        name: "cert".to_string(),
+                        namespace: None,
+                    }]
+                },
+            }),
+            route_namespaces: coxswain_core::listener_status::RouteNamespaceSet::All,
+            allowed_route_kinds: vec![],
+            conflict: ConflictReason::None,
+        }
+    }
+
+    fn empty_secrets() -> kube::runtime::reflector::Store<Secret> {
+        let mut w = reflector::store::Writer::<Secret>::default();
+        w.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
+        w.as_reader()
+    }
+
+    /// TLS/Passthrough with no VIP Service yet → VipPending (not TlsPassthrough).
+    #[test]
+    fn tls_passthrough_without_vip_is_pending() {
+        let listener = tls_listener("TLS", true);
+        let secrets = empty_secrets();
+        let empty = HashSet::new();
+        let mut builder = PortTlsStoreBuilder::new();
+        let health = GatewayApiReconciler::reconcile_tls(
+            &GatewayTlsTarget {
+                gw_name: "gw",
+                listeners: std::slice::from_ref(&listener),
+                internal_ports: &HashMap::new(), // no VIP yet
+            },
+            &secrets,
+            &empty,
+            &empty,
+            &mut builder,
+        );
+        let outcome = &health.listeners[&ListenerStatusKey::gateway("tls")].readiness;
+        assert!(
+            matches!(outcome, ListenerReadiness::VipPending),
+            "TLS/Passthrough with internal_port=0 must be VipPending, got {outcome:?}"
+        );
+    }
+
+    /// TLS/Passthrough once VIP is allocated → TlsPassthrough (healthy).
+    #[test]
+    fn tls_passthrough_with_vip_is_healthy() {
+        let listener = tls_listener("TLS", true);
+        let secrets = empty_secrets();
+        let empty = HashSet::new();
+        let mut builder = PortTlsStoreBuilder::new();
+        let health = GatewayApiReconciler::reconcile_tls(
+            &GatewayTlsTarget {
+                gw_name: "gw",
+                listeners: std::slice::from_ref(&listener),
+                internal_ports: &std::collections::HashMap::from([(8443u16, 30001u16)]),
+            },
+            &secrets,
+            &empty,
+            &empty,
+            &mut builder,
+        );
+        let outcome = &health.listeners[&ListenerStatusKey::gateway("tls")].readiness;
+        assert!(
+            matches!(outcome, ListenerReadiness::TlsPassthrough),
+            "TLS/Passthrough with VIP allocated must be TlsPassthrough, got {outcome:?}"
+        );
+    }
+
+    /// TLS/Terminate with no VIP Service yet → VipPending (cert resolution skipped).
+    #[test]
+    fn tls_terminate_without_vip_is_pending() {
+        let listener = tls_listener("TLS", false);
+        let secrets = empty_secrets();
+        let empty = HashSet::new();
+        let mut builder = PortTlsStoreBuilder::new();
+        let health = GatewayApiReconciler::reconcile_tls(
+            &GatewayTlsTarget {
+                gw_name: "gw",
+                listeners: std::slice::from_ref(&listener),
+                internal_ports: &HashMap::new(), // no VIP yet
+            },
+            &secrets,
+            &empty,
+            &empty,
+            &mut builder,
+        );
+        let outcome = &health.listeners[&ListenerStatusKey::gateway("tls")].readiness;
+        assert!(
+            matches!(outcome, ListenerReadiness::VipPending),
+            "TLS/Terminate with internal_port=0 must be VipPending, got {outcome:?}"
+        );
+        // No cert was installed in the TLS store (build is empty).
+        assert_eq!(builder.build().port_count(), 0);
     }
 
     // ── Original path-matching tests (unchanged behaviour) ────────────────────

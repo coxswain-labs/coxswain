@@ -502,12 +502,6 @@ pub(super) fn build_tls(
         let ns = gw.metadata.namespace.clone().unwrap_or_default();
         let name = gw.metadata.name.clone().unwrap_or_default();
         let gw_key = ObjectKey::new(ns.clone(), name.clone());
-        // This Gateway's listenerPort → internalPort slice of the global map.
-        let gw_internal: std::collections::HashMap<u16, u16> = vip_internal
-            .iter()
-            .filter(|((k, _), _)| k == &gw_key)
-            .map(|((_, lp), ip)| (*lp, *ip))
-            .collect();
         // GEP-1713: reconcile the Gateway's EFFECTIVE listeners (its own plus those
         // merged from attached ListenerSets), each resolving its certs in its own
         // namespace. Falls back to an empty slice for a Gateway not in the map.
@@ -516,14 +510,42 @@ pub(super) fn build_tls(
             .get(&gw_key)
             .map(|e| e.listeners.as_slice())
             .unwrap_or(&[]);
+        // This Gateway's listenerPort → internalPort map.
+        //
+        // Shared reconciler (`skip_cut_over = true`): built from VIP Services (#472).
+        // An absent entry means the VIP Service has not yet been created; `reconcile_tls`
+        // treats internal_port == 0 as `VipPending` (Programmed=False) to avoid
+        // publishing status.addresses before kube-proxy has been programmed.
+        //
+        // Dedicated reconciler (`skip_cut_over = false`): the dedicated proxy binds
+        // spec ports directly (no kube-proxy VIP NAT). Use an identity mapping so
+        // internal_port is never 0 — the same `internal_port == 0 → pending` logic
+        // in `reconcile_tls` correctly skips these listeners.
+        let gw_internal: std::collections::HashMap<u16, u16> = if skip_cut_over {
+            vip_internal
+                .iter()
+                .filter(|((k, _), _)| k == &gw_key)
+                .map(|((_, lp), ip)| (*lp, *ip))
+                .collect()
+        } else {
+            listeners
+                .iter()
+                .map(|l| {
+                    let p = l.port as u16;
+                    (p, p)
+                })
+                .collect()
+        };
         let health = GatewayApiReconciler::reconcile_tls(
-            &name,
-            listeners,
+            &crate::gateway_api::GatewayTlsTarget {
+                gw_name: &name,
+                listeners,
+                internal_ports: &gw_internal,
+            },
             stores.secrets,
             ownership.cert_grants,
             ownership.ls_cert_grants,
             &mut tls_builder,
-            &gw_internal,
         );
         // Populate the per-port listener-hostname snapshot for
         // misdirected-request detection (GEP-3567, #96). Keyed by BIND port so
@@ -667,6 +689,8 @@ pub(super) fn count_attached_routes<R: RouteLike>(
 ) {
     // TLSRoutes (passthrough_kind=true) attach to any TLS-L4 listener (Passthrough
     // or Terminate). HTTP/GRPC routes attach only to non-TLS-L4 listeners.
+    // VipPending is intentionally absent: a listener whose VIP port is not yet
+    // allocated is not programmed (Programmed=False) and must not accept routes.
     let listener_accepts = |info: &ListenerInfo| {
         let is_tls_l4 = matches!(
             info.readiness,
