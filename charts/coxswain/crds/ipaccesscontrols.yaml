@@ -1,0 +1,74 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: ipaccesscontrols.gateway.coxswain-labs.dev
+spec:
+  group: gateway.coxswain-labs.dev
+  names:
+    categories: []
+    kind: IpAccessControl
+    plural: ipaccesscontrols
+    shortNames: []
+    singular: ipaccesscontrol
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for IpAccessControlSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Source-IP access-control policy for an `HTTPRoute` rule.
+
+              Reference this CR from an `HTTPRouteRule.filters` entry with
+              `type: ExtensionRef` pointing at `group: gateway.coxswain-labs.dev`,
+              `kind: IpAccessControl`. The proxy resolves the request's effective client
+              IP (PROXY-protocol peer / trusted forwarded header if configured, else the
+              L4 downstream peer — the same resolution the rate-limit and Ingress
+              source-range filters use) and:
+
+              - rejects it with `403 Forbidden` when it falls inside any `deny` CIDR
+                (evaluated **first**, so a denied IP is blocked even if `allow` would
+                admit it), then
+              - when `allow` is non-empty, rejects it with `403` unless it falls inside at
+                least one `allow` CIDR.
+
+              An empty `allow` list imposes no allow-list restriction (only `deny`
+              applies); empty `allow` **and** empty `deny` performs no filtering. Invalid
+              CIDR tokens are logged and skipped at reconcile time rather than rejecting
+              the whole policy — a single typo never locks out (or fails to protect) a
+              route by accident.
+            properties:
+              allow:
+                description: |-
+                  CIDR blocks (IPv4 or IPv6) whose client IPs are **admitted**; every other
+                  IP is rejected with `403`.
+
+                  A bare address without a prefix is treated as a host route
+                  (`/32` / `/128`). When empty (the default) no allow-list restriction is
+                  imposed — only [`deny`](Self::deny) applies. A client IP that cannot be
+                  determined is rejected against a non-empty allow-list (fail-closed).
+                items:
+                  type: string
+                type: array
+              deny:
+                description: |-
+                  CIDR blocks (IPv4 or IPv6) whose client IPs are **blocked** with `403`.
+
+                  Evaluated before [`allow`](Self::allow): an IP inside any `deny` range is
+                  rejected even when `allow` would admit it. A bare address without a
+                  prefix (`10.0.0.1`, `2001:db8::1`) is treated as a host route
+                  (`/32` / `/128`). When empty (the default) nothing is denied.
+                items:
+                  type: string
+                type: array
+            type: object
+        required:
+        - spec
+        title: IpAccessControl
+        type: object
+    served: true
+    storage: true
+    subresources: {}

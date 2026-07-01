@@ -164,6 +164,7 @@ pub fn spawn_status_writer(
         "config_map",
         "rate_limit",
         "path_rewrite_regex",
+        "ip_access_control",
     ];
 
     let mut controller_checks: Vec<&str> = ALWAYS_ON_CHECKS.to_vec();

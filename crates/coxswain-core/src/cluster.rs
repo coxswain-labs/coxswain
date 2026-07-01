@@ -97,7 +97,7 @@ pub struct RoutingSummary {
 ///
 /// Used by the cluster-summary builder to classify a Gateway as
 /// [`ProxyPool::Dedicated`] when its `spec.infrastructure.parametersRef` targets
-/// a `coxswain-labs.dev` `CoxswainGatewayParameters` resource.
+/// a `gateway.coxswain-labs.dev` `CoxswainGatewayParameters` resource.
 pub const PARAMETERS_REF_GROUP: &str = "gateway.coxswain-labs.dev";
 
 /// CRD kind that identifies a `parametersRef` pointing at `CoxswainGatewayParameters`.

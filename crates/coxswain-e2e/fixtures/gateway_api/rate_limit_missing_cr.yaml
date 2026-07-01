@@ -37,7 +37,7 @@ spec:
       filters:
         - type: ExtensionRef
           extensionRef:
-            group: coxswain-labs.dev
+            group: gateway.coxswain-labs.dev
             kind: RateLimit
             name: does-not-exist
       backendRefs:

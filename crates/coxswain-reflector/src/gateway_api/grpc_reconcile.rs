@@ -19,6 +19,7 @@ use crate::gw_types::{
 };
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
+use coxswain_core::crd::{IpAccessControl, RateLimit};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
@@ -37,8 +38,11 @@ use std::time::SystemTime;
 
 /// Precomputed context for GRPCRoute reconciliation.
 ///
-/// Intentionally slim compared to [`super::reconcile::RouteResolution`]: GRPCRoute has no
-/// RateLimit or PathRewriteRegex ExtensionRef support.
+/// Slimmer than [`super::reconcile::RouteResolution`]: GRPCRoute supports the
+/// protocol-agnostic ExtensionRef filters — `RateLimit` (#25) and `IpAccessControl`
+/// (#479) — but not `PathRewriteRegex`, which rewrites the request path (for gRPC
+/// the path *is* the `/{service}/{method}` RPC address, so rewriting it is
+/// meaningless).
 #[non_exhaustive]
 pub struct GrpcRouteResolution<'a> {
     /// `(gw_ns, gw_name, listener_name) → (hostname, port)` for every listener on owned Gateways.
@@ -47,6 +51,12 @@ pub struct GrpcRouteResolution<'a> {
     pub policy_index: &'a BackendTlsIndex,
     /// Per-`Service` connect/idle timeout index from `CoxswainBackendPolicy` (#354).
     pub backend_policy_index: &'a BackendPolicyIndex,
+    /// `RateLimit` CR store for resolving `ExtensionRef` filters into per-route
+    /// rate-limiting config (#25). A missing CR fails open (route not limited).
+    pub rate_limits: &'a reflector::Store<RateLimit>,
+    /// `IpAccessControl` CR store for resolving `ExtensionRef` filters into per-route
+    /// source-IP allow/deny CIDR sets (#479). A missing CR fails open (no filtering).
+    pub ip_access: &'a reflector::Store<IpAccessControl>,
 }
 
 /// Result of looking up a `BackendTLSPolicy` for a rule's backend refs.
@@ -74,6 +84,8 @@ pub(super) fn reconcile(
         listener_info,
         policy_index,
         backend_policy_index,
+        rate_limits,
+        ip_access,
     } = resolution;
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
@@ -224,6 +236,9 @@ pub(super) fn reconcile(
             (Some(group), None)
         };
 
+        let (allow_source_range, deny_source_range) =
+            resolve_grpc_ip_access(rule_filters, route_ns, ip_access);
+        let rate_limit = resolve_grpc_rate_limit(rule_filters, route_ns, rate_limits);
         let ctx = GrpcRuleContext {
             filters: rule_filters,
             error_status,
@@ -231,6 +246,9 @@ pub(super) fn reconcile(
             metric_route_id: &metric_route_id,
             created_at,
             circuit_breaker,
+            rate_limit,
+            allow_source_range,
+            deny_source_range,
         };
         for (hostname_opt, port) in &bindings {
             let pb = builder.for_port(*port);
@@ -244,6 +262,62 @@ pub(super) fn reconcile(
     }
 }
 
+/// GRPCRoute counterpart to [`super::filters::resolve_ip_access`]: scans a rule's
+/// filters for an `IpAccessControl` `ExtensionRef` and resolves it into the
+/// `(allow, deny)` source-IP CIDR sets (#479). Source-IP filtering is
+/// protocol-agnostic, so gRPC reuses the same per-ref resolver as HTTP; only the
+/// filter-list iteration differs (the two route types have distinct filter structs).
+fn resolve_grpc_ip_access(
+    filters: &[GrpcRouteRulesFilters],
+    route_ns: &str,
+    ip_access: &reflector::Store<IpAccessControl>,
+) -> (super::filters::CidrSet, super::filters::CidrSet) {
+    for f in filters {
+        if !matches!(f.r#type, GrpcRouteRulesFiltersType::ExtensionRef) {
+            continue;
+        }
+        let Some(ext) = &f.extension_ref else {
+            continue;
+        };
+        if let Some(res) = super::filters::resolve_ip_access_ref(
+            &ext.group, &ext.kind, &ext.name, route_ns, ip_access,
+        ) {
+            return res;
+        }
+    }
+    (None, None)
+}
+
+/// GRPCRoute counterpart to [`super::filters::resolve_rate_limit`]: scans a rule's
+/// filters for a `RateLimit` `ExtensionRef` and resolves it into a
+/// [`RateLimitConfig`] (#25). Rate limiting is protocol-agnostic (gRPC is HTTP/2;
+/// IP- and header-keyed limiting both apply), so gRPC reuses the same per-ref
+/// resolver as HTTP; only the filter-list iteration differs.
+fn resolve_grpc_rate_limit(
+    filters: &[GrpcRouteRulesFilters],
+    route_ns: &str,
+    rate_limits: &reflector::Store<RateLimit>,
+) -> Option<Arc<coxswain_core::routing::RateLimitConfig>> {
+    for f in filters {
+        if !matches!(f.r#type, GrpcRouteRulesFiltersType::ExtensionRef) {
+            continue;
+        }
+        let Some(ext) = &f.extension_ref else {
+            continue;
+        };
+        if let Some(cfg) = super::filters::resolve_rate_limit_ref(
+            &ext.group,
+            &ext.kind,
+            &ext.name,
+            route_ns,
+            rate_limits,
+        ) {
+            return cfg;
+        }
+    }
+    None
+}
+
 struct GrpcRuleContext<'a> {
     filters: &'a [GrpcRouteRulesFilters],
     error_status: Option<u16>,
@@ -253,6 +327,15 @@ struct GrpcRuleContext<'a> {
     /// Per-backend circuit breaker from the rule's winning `CoxswainBackendPolicy`
     /// (#478). Shared across every entry the rule installs.
     circuit_breaker: Option<Arc<coxswain_core::routing::CircuitBreakerConfig>>,
+    /// Rate-limiting config resolved from the rule's `RateLimit` `ExtensionRef`
+    /// (#25). Shared across every entry the rule installs.
+    rate_limit: Option<Arc<coxswain_core::routing::RateLimitConfig>>,
+    /// Source-IP allow-list resolved from the rule's `IpAccessControl` `ExtensionRef`
+    /// (#479). Shared across every entry the rule installs.
+    allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    /// Source-IP deny-list resolved from the same `IpAccessControl`. Enforced before
+    /// `allow_source_range` in the proxy.
+    deny_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
 }
 
 /// Installs one GRPCRoute rule (all its matches) into a `HostRouterBuilder`.
@@ -286,7 +369,9 @@ fn apply_grpc_rule(
         };
         entry
             .with_metric_route_id(Arc::clone(ctx.metric_route_id))
-            .with_rate_limit(None)
+            .with_rate_limit(ctx.rate_limit.clone())
+            .with_allow_source_range(ctx.allow_source_range.clone())
+            .with_deny_source_range(ctx.deny_source_range.clone())
             .with_circuit_breaker(ctx.circuit_breaker.clone())
     };
 
@@ -503,7 +588,23 @@ fn build_filters(filters: &[GrpcRouteRulesFilters]) -> Vec<FilterAction> {
                     }
                 }
             }
-            GrpcRouteRulesFiltersType::RequestMirror | GrpcRouteRulesFiltersType::ExtensionRef => {
+            GrpcRouteRulesFiltersType::ExtensionRef => {
+                // RateLimit (#25) and IpAccessControl (#479) ExtensionRefs are
+                // resolved separately (into the route's rate-limit config and
+                // source-IP allow/deny sets); any other ExtensionRef is
+                // unsupported on GRPCRoute.
+                let supported = f.extension_ref.as_ref().is_some_and(|ext| {
+                    ext.group == "gateway.coxswain-labs.dev"
+                        && (ext.kind == "RateLimit" || ext.kind == "IpAccessControl")
+                });
+                if !supported {
+                    tracing::warn!(
+                        filter_type = ?f.r#type,
+                        "Skipping unsupported GRPCRouteFilter ExtensionRef"
+                    );
+                }
+            }
+            GrpcRouteRulesFiltersType::RequestMirror => {
                 tracing::warn!(
                     filter_type = ?f.r#type,
                     "Skipping unsupported GRPCRouteFilter type"
@@ -981,6 +1082,130 @@ mod tests {
         assert!(
             preds.method.is_none(),
             "gRPC method predicate must always be None"
+        );
+    }
+
+    // ── resolve_grpc_ip_access (#479) ─────────────────────────────────────────
+
+    fn grpc_ip_access_filter(name: &str) -> GrpcRouteRulesFilters {
+        use crate::gw_types::v::grpcroutes::GrpcRouteRulesFiltersExtensionRef;
+        GrpcRouteRulesFilters {
+            r#type: GrpcRouteRulesFiltersType::ExtensionRef,
+            extension_ref: Some(GrpcRouteRulesFiltersExtensionRef {
+                group: "gateway.coxswain-labs.dev".to_string(),
+                kind: "IpAccessControl".to_string(),
+                name: name.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    // `IpAccessControlSpec` is `#[non_exhaustive]` — deserialize a CR instead.
+    fn ip_access_cr(ns: &str, name: &str, allow: &[&str], deny: &[&str]) -> IpAccessControl {
+        let list = |items: &[&str]| -> String {
+            if items.is_empty() {
+                " []".to_string()
+            } else {
+                items.iter().map(|s| format!("\n    - {s}")).collect()
+            }
+        };
+        let yaml = format!(
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: IpAccessControl\n\
+             metadata:\n  name: {name}\n  namespace: {ns}\n\
+             spec:\n  allow:{}\n  deny:{}\n",
+            list(allow),
+            list(deny),
+        );
+        serde_yaml::from_str(&yaml).expect("valid IpAccessControl")
+    }
+
+    #[test]
+    fn grpc_ip_access_resolves_allow_and_deny() {
+        let store = crate::tests::fixtures::make_ip_access_store(vec![ip_access_cr(
+            "default",
+            "policy",
+            &["203.0.113.0/24"],
+            &["10.0.0.0/8"],
+        )]);
+        let (allow, deny) =
+            resolve_grpc_ip_access(&[grpc_ip_access_filter("policy")], "default", &store);
+        assert_eq!(
+            *allow.expect("allow set"),
+            vec!["203.0.113.0/24".parse::<ipnet::IpNet>().expect("valid")]
+        );
+        assert_eq!(
+            *deny.expect("deny set"),
+            vec!["10.0.0.0/8".parse::<ipnet::IpNet>().expect("valid")]
+        );
+    }
+
+    #[test]
+    fn grpc_ip_access_no_ext_ref_is_none() {
+        let store = crate::tests::fixtures::empty_ip_access_store();
+        let (allow, deny) = resolve_grpc_ip_access(&[], "default", &store);
+        assert!(allow.is_none() && deny.is_none());
+    }
+
+    #[test]
+    fn grpc_ip_access_missing_cr_fails_open() {
+        let store = crate::tests::fixtures::empty_ip_access_store();
+        let (allow, deny) =
+            resolve_grpc_ip_access(&[grpc_ip_access_filter("absent")], "default", &store);
+        assert!(
+            allow.is_none() && deny.is_none(),
+            "missing CR must not filter"
+        );
+    }
+
+    // ── resolve_grpc_rate_limit (#25) ─────────────────────────────────────────
+
+    fn grpc_rate_limit_filter(name: &str) -> GrpcRouteRulesFilters {
+        use crate::gw_types::v::grpcroutes::GrpcRouteRulesFiltersExtensionRef;
+        GrpcRouteRulesFilters {
+            r#type: GrpcRouteRulesFiltersType::ExtensionRef,
+            extension_ref: Some(GrpcRouteRulesFiltersExtensionRef {
+                group: "gateway.coxswain-labs.dev".to_string(),
+                kind: "RateLimit".to_string(),
+                name: name.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    // `RateLimitSpec` is `#[non_exhaustive]` — deserialize a CR instead.
+    fn rate_limit_cr(ns: &str, name: &str, rps: u32) -> RateLimit {
+        let yaml = format!(
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: RateLimit\n\
+             metadata:\n  name: {name}\n  namespace: {ns}\n\
+             spec:\n  requestsPerSecond: {rps}\n",
+        );
+        serde_yaml::from_str(&yaml).expect("valid RateLimit")
+    }
+
+    #[test]
+    fn grpc_rate_limit_resolves_config() {
+        let store =
+            crate::tests::fixtures::make_rate_limit_store(vec![rate_limit_cr("default", "rl", 10)]);
+        let cfg = resolve_grpc_rate_limit(&[grpc_rate_limit_filter("rl")], "default", &store)
+            .expect("rate limit resolved");
+        assert_eq!(cfg.requests_per_second.get(), 10);
+    }
+
+    #[test]
+    fn grpc_rate_limit_no_ext_ref_is_none() {
+        let store = crate::tests::fixtures::empty_rate_limit_store();
+        assert!(resolve_grpc_rate_limit(&[], "default", &store).is_none());
+    }
+
+    #[test]
+    fn grpc_rate_limit_missing_cr_fails_open() {
+        let store = crate::tests::fixtures::empty_rate_limit_store();
+        assert!(
+            resolve_grpc_rate_limit(&[grpc_rate_limit_filter("absent")], "default", &store)
+                .is_none(),
+            "missing CR must fail open (no rate limiting)"
         );
     }
 }

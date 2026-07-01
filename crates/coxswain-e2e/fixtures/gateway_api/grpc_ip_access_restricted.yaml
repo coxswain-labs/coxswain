@@ -1,0 +1,54 @@
+# GRPCRoute + IpAccessControl (restrictive allow-list) — apply backends::GRPC_ECHO first.
+#
+# The IpAccessControl allow-list contains only 203.0.113.0/24 (TEST-NET-3, which
+# the test's real client IP is never part of), so the gRPC call is rejected before
+# reaching the backend. Proves IP gating fires on GRPCRoute (#479 gRPC sad path).
+# The route still becomes Programmed (the filter is accepted); the call fails at
+# request time on the source-IP check.
+#
+# Gateway: coxswain-grpc-ipac on GATEWAY_HTTP_PORT.
+# Route host: grpc-ipac.TESTNS.local, GrpcEcho/Echo -> grpc-echo:50051.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-ipac
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: IpAccessControl
+metadata:
+  name: ipac
+spec:
+  allow:
+    - 203.0.113.0/24
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-ipac-route
+spec:
+  hostnames:
+    - "grpc-ipac.${TESTNS}.local"
+  parentRefs:
+    - name: coxswain-grpc-ipac
+  rules:
+    - matches:
+        - method:
+            type: Exact
+            service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+            method: Echo
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: IpAccessControl
+            name: ipac
+      backendRefs:
+        - name: grpc-echo
+          port: 50051

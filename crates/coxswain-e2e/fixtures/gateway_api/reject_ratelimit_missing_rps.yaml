@@ -4,7 +4,7 @@
 #
 # The generated CRD marks `requestsPerSecond` as `required`.
 ---
-apiVersion: coxswain-labs.dev/v1alpha1
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
 kind: RateLimit
 metadata:
   name: reject-test

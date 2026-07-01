@@ -22,7 +22,7 @@ spec:
         namespaces:
           from: Same
 ---
-apiVersion: coxswain-labs.dev/v1alpha1
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
 kind: RateLimit
 metadata:
   name: one-rps
@@ -47,7 +47,7 @@ spec:
       filters:
         - type: ExtensionRef
           extensionRef:
-            group: coxswain-labs.dev
+            group: gateway.coxswain-labs.dev
             kind: RateLimit
             name: one-rps
       backendRefs:

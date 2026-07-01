@@ -67,12 +67,6 @@ rules:
   - apiGroups: ["ingress.coxswain-labs.dev"]
     resources: ["coxswainingressclassparameters"]
     verbs: ["get", "list", "watch"]
-  # Read RateLimit and PathRewriteRegex CRs so HTTPRouteRule ExtensionRef filters can be resolved
-  # into per-route rate-limiting config (#25) and path rewrites (#77). No write verbs: operators author
-  # these objects; coxswain only reads them.
-  - apiGroups: ["coxswain-labs.dev"]
-    resources: ["ratelimits", "pathrewriteregexes"]
-    verbs: ["get", "list", "watch"]
   # `listenersets` (GEP-1713, #93): the reflector reads them to merge their
   # listeners into the parent Gateway's effective set; the leader writes
   # `listenersets/status` (below) with Accepted/Programmed/Conflicted. Standard
@@ -101,8 +95,12 @@ rules:
   # per-listener PROXY protocol config and patches status.ancestors[].
   # Watch + status-write CoxswainBackendPolicy (#354): the controller reconciles
   # per-backend connect/idle timeouts and patches status.ancestors[].
+  # Read the route-scoped ExtensionRef filter CRs — RateLimit (#25),
+  # PathRewriteRegex (#77), IpAccessControl (#479) — so HTTPRouteRule
+  # ExtensionRef filters resolve into per-route config. Read-only.
   - apiGroups: ["gateway.coxswain-labs.dev"]
-    resources: ["coxswaingatewayparameters", "clienttrafficpolicies", "coxswainbackendpolicies"]
+    resources:
+      ["coxswaingatewayparameters", "clienttrafficpolicies", "coxswainbackendpolicies", "ratelimits", "pathrewriteregexes", "ipaccesscontrols"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.coxswain-labs.dev"]
     resources: ["clienttrafficpolicies/status", "coxswainbackendpolicies/status"]

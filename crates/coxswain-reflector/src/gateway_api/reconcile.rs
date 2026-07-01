@@ -20,7 +20,7 @@ use crate::status::{
     GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerSource, ListenerStatusKey,
 };
 use crate::tls::load_tls_cert;
-use coxswain_core::crd::{PathRewriteRegex, RateLimit};
+use coxswain_core::crd::{IpAccessControl, PathRewriteRegex, RateLimit};
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
@@ -63,6 +63,10 @@ pub struct RouteResolution<'a> {
     /// `PathRewriteRegex` CR store for resolving `ExtensionRef` filters on
     /// `HTTPRouteRule`s.
     pub path_rewrites: &'a reflector::Store<PathRewriteRegex>,
+    /// `IpAccessControl` CR store for resolving `ExtensionRef` filters on
+    /// `HTTPRouteRule`s into per-route `allow`/`deny` source-IP CIDR sets (#479).
+    /// Looked up by `(namespace, name)`; a missing CR fails open (no filtering).
+    pub ip_access: &'a reflector::Store<IpAccessControl>,
     /// `ObjectKey(gw_ns, gw_name) → BackendClientCert` for Gateways that resolved a
     /// `spec.tls.backend.clientCertificateRef` (GEP-3155). A route's effective client
     /// cert comes from its owned parent Gateway; it is attached to any `UpstreamTls`
@@ -101,6 +105,7 @@ impl GatewayApiReconciler {
             backend_policy_index,
             rate_limits,
             path_rewrites,
+            ip_access,
             backend_client_certs,
             backend_client_cert_failures,
         } = resolution;
@@ -323,6 +328,8 @@ impl GatewayApiReconciler {
 
             let rate_limit =
                 super::filters::resolve_rate_limit(rule_filters, route_ns, rate_limits);
+            let (allow_source_range, deny_source_range) =
+                super::filters::resolve_ip_access(rule_filters, route_ns, ip_access);
             let ctx = RuleContext {
                 filters: rule_filters,
                 timeouts: &rule_timeouts,
@@ -331,6 +338,8 @@ impl GatewayApiReconciler {
                 metric_route_id: &metric_route_id,
                 created_at,
                 rate_limit,
+                allow_source_range,
+                deny_source_range,
                 circuit_breaker,
                 route_ns,
                 path_rewrites,
@@ -470,6 +479,12 @@ struct RuleContext<'a> {
     metric_route_id: &'a Arc<str>,
     created_at: Option<SystemTime>,
     rate_limit: Option<Arc<RateLimitConfig>>,
+    /// Source-IP allow-list resolved from the rule's `IpAccessControl`
+    /// `ExtensionRef` (#479). Shared across every entry the rule installs.
+    allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    /// Source-IP deny-list resolved from the same `IpAccessControl`. Enforced
+    /// before `allow_source_range` in the proxy.
+    deny_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
     /// Per-backend circuit breaker from the rule's winning `CoxswainBackendPolicy`
     /// (#478). Shared across every entry the rule installs (one refcount bump each).
     circuit_breaker: Option<Arc<coxswain_core::routing::CircuitBreakerConfig>>,
@@ -515,6 +530,8 @@ fn apply_rule(
         entry
             .with_metric_route_id(Arc::clone(ctx.metric_route_id))
             .with_rate_limit(ctx.rate_limit.clone())
+            .with_allow_source_range(ctx.allow_source_range.clone())
+            .with_deny_source_range(ctx.deny_source_range.clone())
             .with_circuit_breaker(ctx.circuit_breaker.clone())
     };
 
@@ -1351,6 +1368,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1390,6 +1408,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1429,6 +1448,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1460,6 +1480,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1490,6 +1511,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1560,6 +1582,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1605,6 +1628,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1676,6 +1700,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1758,6 +1783,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1814,6 +1840,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1904,6 +1931,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1950,6 +1978,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1988,6 +2017,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -2028,6 +2058,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -2060,6 +2091,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -2098,6 +2130,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },

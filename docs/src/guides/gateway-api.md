@@ -272,7 +272,7 @@ spec:
 | `URLRewrite` | Supported (hostname and path rewrite) |
 | `RequestRedirect` | Supported (scheme, hostname, port, path, status code) |
 | `RequestMirror` | Supported — GEP-3171 fire-and-forget shadow traffic with optional `percent` or `fraction` sampling; multiple filters per rule for multiple mirrors |
-| `ExtensionRef` | Supported (for `RateLimit` and `PathRewriteRegex` Coxswain extensions) |
+| `ExtensionRef` | Supported (for `RateLimit`, `PathRewriteRegex`, and `IpAccessControl` Coxswain extensions) |
 | `CORS` | Supported — GEP-1767 preflight short-circuit and response-header injection |
 
 ### Attaching to a Gateway
@@ -487,6 +487,42 @@ requestMirror:
 
 Mirror traffic is visible in the proxy access log (`mirror: true` field) and counted by the `coxswain_proxy_mirror_requests_total{route, upstream}` Prometheus counter.
 
+### IP access control
+
+`IpAccessControl` (`gateway.coxswain-labs.dev/v1alpha1`) restricts a route to a set of source-IP CIDR ranges. Attach it to an `HTTPRouteRule` with an `ExtensionRef` filter — the Gateway API surface for the Ingress `allow-source-range` / `deny-source-range` annotations. It has no Gateway API standard equivalent; its merit anchor is Envoy's `rbac` CIDR-principal filter / Istio `AuthorizationPolicy` `ipBlocks`/`notIpBlocks`.
+
+```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: IpAccessControl
+metadata:
+  name: office-only
+spec:
+  deny:                       # evaluated FIRST
+    - 203.0.113.5/32
+  allow:                      # then the allow-list
+    - 203.0.113.0/24
+    - 2001:db8::/32
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+# ...
+    filters:
+      - type: ExtensionRef
+        extensionRef:
+          group: gateway.coxswain-labs.dev
+          kind: IpAccessControl
+          name: office-only
+```
+
+Semantics:
+
+- **`deny` is evaluated before `allow`.** A client inside any `deny` range gets `403` even when `allow` would admit it.
+- **`allow` restricts to the listed ranges** — a client outside every `allow` range gets `403`. An empty `allow` list imposes no allow-list restriction (only `deny` applies); empty `allow` **and** empty `deny` performs no filtering.
+- **IPv4 and IPv6** CIDRs are both accepted; a bare address (`203.0.113.5`) is treated as a host route (`/32` / `/128`). Invalid CIDR tokens are logged and skipped rather than rejecting the whole policy.
+- A **missing** `IpAccessControl` CR fails open (a WARN is logged; the route is not filtered).
+
+The client IP is resolved through the same path as the rest of the data plane: the PROXY-protocol peer when a `ClientTrafficPolicy` enables PROXY protocol on the listener, otherwise the L4 downstream peer. There is no Gateway-side trusted-forwarded-header surface yet, so behind an L7 load balancer that terminates the connection, enable PROXY protocol so the real client IP reaches the filter.
+
 ### Status conditions
 
 | Condition | True when |
@@ -567,11 +603,11 @@ Header matching uses the same `Exact` and `RegularExpression` semantics as `HTTP
 | `spec.hostnames` | Full (including wildcards) |
 | `spec.rules[].matches[].method` | `Exact` and `RegularExpression` |
 | `spec.rules[].matches[].headers` | Full |
-| `spec.rules[].filters` | `RequestHeaderModifier`, `ResponseHeaderModifier` |
+| `spec.rules[].filters` | `RequestHeaderModifier`, `ResponseHeaderModifier`, `ExtensionRef` (`RateLimit`, `IpAccessControl`) |
 | `spec.rules[].backendRefs` | Service backends only |
 | `spec.rules[].backendRefs[].weight` | Full |
 
-`ExtensionRef` filters not matching the `RateLimit` or `PathRewriteRegex` Coxswain resources are skipped with a WARN log line.
+GRPCRoute supports the protocol-agnostic `ExtensionRef` filters — [`RateLimit`](rate-limiting.md) and [`IpAccessControl`](#ip-access-control) — which apply identically to gRPC (HTTP/2) traffic. `PathRewriteRegex` is not supported: for gRPC the request path *is* the `/{service}/{method}` RPC address, so rewriting it is meaningless. Any other `ExtensionRef` (and `RequestMirror`) is skipped with a WARN log line.
 
 ### Status conditions
 

@@ -6,7 +6,7 @@ use crate::gw_types::v::httproutes::{
     HttpRouteRulesFiltersCors, HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType,
     HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesQueryParamsType,
 };
-use coxswain_core::crd::RateLimit;
+use coxswain_core::crd::{IpAccessControl, RateLimit};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, CorsConfig, CorsOrigin, FilterAction, HeaderMod, HeaderPredicate,
@@ -21,6 +21,11 @@ use regex::Regex;
 use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+
+/// A resolved source-IP CIDR set attached to a route (allow or deny list), or
+/// `None` when the set is absent (no filtering on that side). Matches the shape
+/// of `RouteEntry::{allow,deny}_source_range`.
+pub(super) type CidrSet = Option<Arc<Vec<ipnet::IpNet>>>;
 
 /// Store references needed to resolve `backendRef` targets in filters (e.g.
 /// `RequestMirror`).
@@ -157,7 +162,7 @@ pub(super) fn build_filters(
                     tracing::warn!("Skipping ExtensionRef filter — payload is missing");
                     continue;
                 };
-                if ext.group == "coxswain-labs.dev" && ext.kind == "PathRewriteRegex" {
+                if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "PathRewriteRegex" {
                     let obj_ref =
                         reflector::ObjectRef::<coxswain_core::crd::PathRewriteRegex>::new(
                             &ext.name,
@@ -188,8 +193,11 @@ pub(super) fn build_filters(
                             "PathRewriteRegex CR not found — filter skipped"
                         );
                     }
-                } else if ext.group == "coxswain-labs.dev" && ext.kind == "RateLimit" {
+                } else if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "RateLimit" {
                     // Handled separately by `resolve_rate_limit`.
+                } else if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "IpAccessControl"
+                {
+                    // Handled separately by `resolve_ip_access`.
                 } else {
                     tracing::warn!(
                         group = %ext.group,
@@ -597,14 +605,15 @@ pub(super) fn build_backend_ref_filters(
 }
 
 /// Scans `filters` for an `ExtensionRef` pointing at a `RateLimit` CR
-/// (`group: coxswain-labs.dev`, `kind: RateLimit`) and, if found, resolves
+/// (`group: gateway.coxswain-labs.dev`, `kind: RateLimit`) and, if found, resolves
 /// the named CR from `rate_limits` and converts its spec to a
 /// [`RateLimitConfig`].
 ///
-/// Only the first matching `ExtensionRef` is used; subsequent ones are
-/// ignored. Non-`RateLimit` extension refs continue to log a warning and are
-/// skipped. Missing CRs or a zero `requestsPerSecond` value log a warning and
-/// return `None` (fail-open: the route is not limited).
+/// Only the first matching `ExtensionRef` is used; other extension refs (and
+/// non-`RateLimit` kinds) are ignored here — `build_filters` owns the
+/// "unsupported ExtensionRef" WARN, so this scan stays silent on them. Missing
+/// CRs or a zero `requestsPerSecond` value log a warning and return `None`
+/// (fail-open: the route is not limited).
 pub(super) fn resolve_rate_limit(
     filters: &[HttpRouteRulesFilters],
     route_ns: &str,
@@ -615,42 +624,168 @@ pub(super) fn resolve_rate_limit(
             continue;
         }
         let Some(ext) = &f.extension_ref else {
-            tracing::warn!("Skipping ExtensionRef filter — payload is missing");
             continue;
         };
-        if ext.group != "coxswain-labs.dev" || ext.kind != "RateLimit" {
-            tracing::warn!(
-                group = %ext.group,
-                kind  = %ext.kind,
-                name  = %ext.name,
-                "Skipping unsupported ExtensionRef (expected group=coxswain-labs.dev kind=RateLimit)"
-            );
-            continue;
+        if let Some(cfg) =
+            resolve_rate_limit_ref(&ext.group, &ext.kind, &ext.name, route_ns, rate_limits)
+        {
+            return cfg;
         }
-        let obj_ref = reflector::ObjectRef::<RateLimit>::new(&ext.name).within(route_ns);
-        let Some(cr) = rate_limits.get(&obj_ref) else {
-            tracing::warn!(
-                ns   = route_ns,
-                name = %ext.name,
-                "RateLimit CR not found — rate limiting skipped (fail-open)"
-            );
-            return None;
-        };
-        let Some(rps) = NonZeroU32::new(cr.spec.requests_per_second) else {
-            tracing::warn!(
-                ns   = route_ns,
-                name = %ext.name,
-                "RateLimit CR has requestsPerSecond=0 — rate limiting skipped (fail-open)"
-            );
-            return None;
-        };
-        let key = match &cr.spec.by_header {
-            Some(h) => RateLimitKey::Header(Arc::from(h.to_ascii_lowercase().as_str())),
-            None => RateLimitKey::ClientIp,
-        };
-        return Some(Arc::new(RateLimitConfig::new(rps, cr.spec.burst, key)));
     }
     None
+}
+
+/// Resolve a single `ExtensionRef` (by `group`/`kind`/`name`) into a
+/// [`RateLimitConfig`], if it targets a `RateLimit` CR.
+///
+/// Returns `None` when the ref is **not** a `RateLimit` (`group ==
+/// gateway.coxswain-labs.dev`, `kind == RateLimit`) so the caller keeps scanning.
+/// When it *is*, returns `Some(cfg_opt)`: `Some(None)` on a missing CR or
+/// `requestsPerSecond=0` (WARN + fail-open), `Some(Some(cfg))` otherwise. Shared
+/// by the HTTPRoute and GRPCRoute reconcilers (rate limiting is protocol-agnostic;
+/// only the differently-typed filter-list iteration differs).
+pub(super) fn resolve_rate_limit_ref(
+    ext_group: &str,
+    ext_kind: &str,
+    ext_name: &str,
+    route_ns: &str,
+    rate_limits: &reflector::Store<RateLimit>,
+) -> Option<Option<Arc<RateLimitConfig>>> {
+    if ext_group != "gateway.coxswain-labs.dev" || ext_kind != "RateLimit" {
+        return None;
+    }
+    let obj_ref = reflector::ObjectRef::<RateLimit>::new(ext_name).within(route_ns);
+    let Some(cr) = rate_limits.get(&obj_ref) else {
+        tracing::warn!(
+            ns = route_ns,
+            name = ext_name,
+            "RateLimit CR not found — rate limiting skipped (fail-open)"
+        );
+        return Some(None);
+    };
+    let Some(rps) = NonZeroU32::new(cr.spec.requests_per_second) else {
+        tracing::warn!(
+            ns = route_ns,
+            name = ext_name,
+            "RateLimit CR has requestsPerSecond=0 — rate limiting skipped (fail-open)"
+        );
+        return Some(None);
+    };
+    let key = match &cr.spec.by_header {
+        Some(h) => RateLimitKey::Header(Arc::from(h.to_ascii_lowercase().as_str())),
+        None => RateLimitKey::ClientIp,
+    };
+    Some(Some(Arc::new(RateLimitConfig::new(
+        rps,
+        cr.spec.burst,
+        key,
+    ))))
+}
+
+/// Scans `filters` for an `ExtensionRef` pointing at an `IpAccessControl` CR
+/// (`group: gateway.coxswain-labs.dev`, `kind: IpAccessControl`) and, if found, resolves
+/// the named CR from `ip_access` and parses its `allow` / `deny` CIDR sets into
+/// the `(allow_source_range, deny_source_range)` lists the proxy enforces (deny
+/// evaluated first — the same fields the Ingress `allow-source-range` /
+/// `deny-source-range` annotations feed).
+///
+/// Only the first matching `ExtensionRef` is used; other extension refs (and
+/// non-`IpAccessControl` kinds) are ignored here — `build_filters` owns the
+/// "unsupported ExtensionRef" WARN, so this scan stays silent on them. A missing
+/// CR logs a WARN and returns `(None, None)` (fail-open: the route is not
+/// filtered). Each CIDR set is `None` when empty or entirely unparseable, so an
+/// empty/typo'd list never silently changes the route's admit behaviour.
+pub(super) fn resolve_ip_access(
+    filters: &[HttpRouteRulesFilters],
+    route_ns: &str,
+    ip_access: &reflector::Store<IpAccessControl>,
+) -> (CidrSet, CidrSet) {
+    for f in filters {
+        if !matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
+            continue;
+        }
+        let Some(ext) = &f.extension_ref else {
+            continue;
+        };
+        if let Some(res) =
+            resolve_ip_access_ref(&ext.group, &ext.kind, &ext.name, route_ns, ip_access)
+        {
+            return res;
+        }
+    }
+    (None, None)
+}
+
+/// Resolve a single `ExtensionRef` (identified by its `group`/`kind`/`name`) into
+/// the `(allow, deny)` source-IP CIDR sets, if it targets an `IpAccessControl` CR.
+///
+/// Returns `None` when the ref is **not** an `IpAccessControl` (`group ==
+/// gateway.coxswain-labs.dev`, `kind == IpAccessControl`) so the caller keeps
+/// scanning. When it *is*, returns `Some((allow, deny))`: a missing CR logs a WARN
+/// and yields `Some((None, None))` (fail-open). Shared by the HTTPRoute and
+/// GRPCRoute reconcilers, which iterate their own (differently-typed) filter lists.
+pub(super) fn resolve_ip_access_ref(
+    ext_group: &str,
+    ext_kind: &str,
+    ext_name: &str,
+    route_ns: &str,
+    ip_access: &reflector::Store<IpAccessControl>,
+) -> Option<(CidrSet, CidrSet)> {
+    if ext_group != "gateway.coxswain-labs.dev" || ext_kind != "IpAccessControl" {
+        return None;
+    }
+    let obj_ref = reflector::ObjectRef::<IpAccessControl>::new(ext_name).within(route_ns);
+    let Some(cr) = ip_access.get(&obj_ref) else {
+        tracing::warn!(
+            ns = route_ns,
+            name = ext_name,
+            "IpAccessControl CR not found — IP access control skipped (fail-open)"
+        );
+        return Some((None, None));
+    };
+    let deny = parse_cidr_set(&cr.spec.deny, route_ns, ext_name, "deny");
+    let allow = parse_cidr_set(&cr.spec.allow, route_ns, ext_name, "allow");
+    Some((allow, deny))
+}
+
+/// Parse an `IpAccessControl` CIDR list into an `Arc<Vec<IpNet>>`, promoting bare
+/// IPs to host routes and skipping invalid tokens with a WARN.
+///
+/// Returns `None` when the list is empty or every token is unparseable, so the
+/// caller treats the set as absent rather than as an empty (all-blocking /
+/// nothing-matching) list. `field` names the offending set (`"allow"` / `"deny"`)
+/// in skipped-token WARNs.
+fn parse_cidr_set(
+    tokens: &[String],
+    route_ns: &str,
+    cr_name: &str,
+    field: &'static str,
+) -> CidrSet {
+    let nets: Vec<ipnet::IpNet> = tokens
+        .iter()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .filter_map(|token| {
+            match crate::ingress::annotations::edge_access::parse_cidr_or_host(token) {
+                Some(net) => Some(net),
+                None => {
+                    tracing::warn!(
+                        ns = route_ns,
+                        name = cr_name,
+                        field,
+                        token,
+                        "IpAccessControl has an invalid CIDR — skipping token"
+                    );
+                    None
+                }
+            }
+        })
+        .collect();
+    if nets.is_empty() {
+        None
+    } else {
+        Some(Arc::new(nets))
+    }
 }
 
 #[cfg(test)]
@@ -750,6 +885,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -802,6 +938,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -852,6 +989,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -908,6 +1046,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -971,6 +1110,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1010,5 +1150,110 @@ mod tests {
             }
             _ => panic!("expected FilterAction::Cors"),
         }
+    }
+
+    // ── resolve_ip_access ─────────────────────────────────────────────────────
+
+    use crate::gw_types::v::httproutes::HttpRouteRulesFiltersExtensionRef;
+    use coxswain_core::crd::IpAccessControl;
+
+    fn ip_access_ext_ref(name: &str) -> HttpRouteRulesFilters {
+        HttpRouteRulesFilters {
+            r#type: HttpRouteRulesFiltersType::ExtensionRef,
+            extension_ref: Some(HttpRouteRulesFiltersExtensionRef {
+                group: "gateway.coxswain-labs.dev".to_string(),
+                kind: "IpAccessControl".to_string(),
+                name: name.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    // `IpAccessControlSpec` is `#[non_exhaustive]`, so it cannot be built with a
+    // struct literal from this crate — deserialize a CR instead.
+    fn ip_access_cr(ns: &str, name: &str, allow: &[&str], deny: &[&str]) -> IpAccessControl {
+        let list = |items: &[&str]| -> String {
+            if items.is_empty() {
+                " []".to_string()
+            } else {
+                items.iter().map(|s| format!("\n    - {s}")).collect()
+            }
+        };
+        let yaml = format!(
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: IpAccessControl\n\
+             metadata:\n  name: {name}\n  namespace: {ns}\n\
+             spec:\n  allow:{}\n  deny:{}\n",
+            list(allow),
+            list(deny),
+        );
+        serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("valid IpAccessControl: {e}\n{yaml}"))
+    }
+
+    #[test]
+    fn resolve_ip_access_no_ext_ref_is_none() {
+        let store = empty_ip_access_store();
+        let (allow, deny) = resolve_ip_access(&[], "default", &store);
+        assert!(allow.is_none());
+        assert!(deny.is_none());
+    }
+
+    #[test]
+    fn resolve_ip_access_present_cr_parses_allow_and_deny() {
+        let store = make_ip_access_store(vec![ip_access_cr(
+            "default",
+            "policy",
+            &["203.0.113.0/24"],
+            &["10.0.0.0/8"],
+        )]);
+        let (allow, deny) = resolve_ip_access(&[ip_access_ext_ref("policy")], "default", &store);
+        assert_eq!(
+            *allow.expect("allow set"),
+            vec!["203.0.113.0/24".parse::<ipnet::IpNet>().expect("valid")]
+        );
+        assert_eq!(
+            *deny.expect("deny set"),
+            vec!["10.0.0.0/8".parse::<ipnet::IpNet>().expect("valid")]
+        );
+    }
+
+    #[test]
+    fn resolve_ip_access_bare_ip_becomes_host_route() {
+        let store = make_ip_access_store(vec![ip_access_cr(
+            "default",
+            "policy",
+            &["203.0.113.10"],
+            &[],
+        )]);
+        let (allow, _) = resolve_ip_access(&[ip_access_ext_ref("policy")], "default", &store);
+        assert_eq!(
+            *allow.expect("allow set"),
+            vec!["203.0.113.10/32".parse::<ipnet::IpNet>().expect("valid")]
+        );
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_ip_access_missing_cr_fails_open() {
+        let store = empty_ip_access_store();
+        let (allow, deny) = resolve_ip_access(&[ip_access_ext_ref("absent")], "default", &store);
+        assert!(allow.is_none(), "missing CR must not filter");
+        assert!(deny.is_none(), "missing CR must not filter");
+        assert!(logs_contain("IpAccessControl CR not found"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_ip_access_skips_invalid_cidr_tokens() {
+        let store = make_ip_access_store(vec![ip_access_cr(
+            "default",
+            "policy",
+            &["not-a-cidr", "203.0.113.0/24"],
+            &["also-bad"],
+        )]);
+        let (allow, deny) = resolve_ip_access(&[ip_access_ext_ref("policy")], "default", &store);
+        assert_eq!(allow.expect("one valid allow").len(), 1);
+        assert!(deny.is_none(), "all-invalid deny list collapses to None");
+        assert!(logs_contain("invalid CIDR"));
     }
 }

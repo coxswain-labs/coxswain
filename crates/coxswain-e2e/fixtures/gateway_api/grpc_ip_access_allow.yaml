@@ -1,0 +1,54 @@
+# GRPCRoute + IpAccessControl (allow-all) — apply backends::GRPC_ECHO first.
+#
+# The IpAccessControl allow-list covers all IPv4 and IPv6 sources, so the test's
+# real client IP is admitted and the gRPC Echo call reaches the backend. Proves
+# the IpAccessControl ExtensionRef is accepted on GRPCRoute (route Programmed) and
+# that admitted traffic flows (#479 gRPC happy path).
+#
+# Gateway: coxswain-grpc-ipac on GATEWAY_HTTP_PORT.
+# Route host: grpc-ipac.TESTNS.local, GrpcEcho/Echo -> grpc-echo:50051.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-ipac
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: IpAccessControl
+metadata:
+  name: ipac
+spec:
+  allow:
+    - 0.0.0.0/0
+    - "::/0"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-ipac-route
+spec:
+  hostnames:
+    - "grpc-ipac.${TESTNS}.local"
+  parentRefs:
+    - name: coxswain-grpc-ipac
+  rules:
+    - matches:
+        - method:
+            type: Exact
+            service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+            method: Echo
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: IpAccessControl
+            name: ipac
+      backendRefs:
+        - name: grpc-echo
+          port: 50051

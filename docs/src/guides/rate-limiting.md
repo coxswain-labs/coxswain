@@ -90,7 +90,7 @@ metadata:
 Attach a rate limit to a single `HTTPRoute` rule by referencing a `RateLimit` custom resource from an `ExtensionRef` filter:
 
 ```yaml
-apiVersion: coxswain-labs.dev/v1alpha1
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
 kind: RateLimit
 metadata:
   name: api-limit
@@ -115,7 +115,7 @@ spec:
       filters:
         - type: ExtensionRef
           extensionRef:
-            group: coxswain-labs.dev
+            group: gateway.coxswain-labs.dev
             kind: RateLimit
             name: api-limit
       backendRefs:
@@ -131,7 +131,7 @@ spec:
 | `burst` | integer ≥ 0 | `0` | Extra burst capacity above sustained rate |
 | `byHeader` | string | _absent_ (IP-keyed) | Header name to use as the client key |
 
-The `RateLimit` CR must be in the same namespace as the `HTTPRoute`. A rule can reference at most one `RateLimit` (the first `ExtensionRef` with `group: coxswain-labs.dev` and `kind: RateLimit` wins).
+The `RateLimit` CR must be in the same namespace as the `HTTPRoute`. A rule can reference at most one `RateLimit` (the first `ExtensionRef` with `group: gateway.coxswain-labs.dev` and `kind: RateLimit` wins).
 
 **Fail-open**: a dangling reference to a non-existent `RateLimit` CR emits a controller warning and installs the route with no rate limiting — traffic is never blocked by a missing CR.
 

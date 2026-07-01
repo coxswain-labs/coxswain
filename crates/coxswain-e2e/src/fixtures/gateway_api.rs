@@ -152,6 +152,30 @@ pub const RATE_LIMIT_EXTENSIONREF: &str = fixture!("rate_limit_extensionref.yaml
 /// `RateLimit` CR that does not exist (#25). Used to verify fail-open:
 /// the missing CR is ignored (warn) and all traffic is served.
 pub const RATE_LIMIT_MISSING_CR: &str = fixture!("rate_limit_missing_cr.yaml");
+/// Gateway + `IpAccessControl` CR (allow-list only) + HTTPRoute with an
+/// `ExtensionRef`, plus a `ClientTrafficPolicy` enabling PROXY protocol so the
+/// synthetic client IP can be injected (#479). Clients in `203.0.113.0/24` pass;
+/// all others get 403.
+pub const IP_ACCESS_ALLOW: &str = fixture!("ip_access_allow.yaml");
+/// Gateway + `IpAccessControl` CR (deny-list only) + HTTPRoute + PROXY-protocol
+/// `ClientTrafficPolicy` (#479). Clients in `203.0.113.0/24` get 403; with no
+/// allow-list, every other source IP is admitted.
+pub const IP_ACCESS_DENY: &str = fixture!("ip_access_deny.yaml");
+/// Gateway + `IpAccessControl` CR listing `203.0.113.0/24` in BOTH allow and
+/// deny + HTTPRoute + PROXY-protocol `ClientTrafficPolicy` (#479). Verifies deny
+/// is evaluated before allow: a client in that range is rejected 403.
+pub const IP_ACCESS_DENY_PRECEDENCE: &str = fixture!("ip_access_deny_precedence.yaml");
+/// Gateway + GRPCRoute (`GrpcEcho/Echo`) + `IpAccessControl` allow-list covering
+/// all sources (`0.0.0.0/0`, `::/0`) via `ExtensionRef` (#479 gRPC happy path).
+/// The real client IP is admitted, so the gRPC call reaches `grpc-echo`.
+pub const GRPC_IP_ACCESS_ALLOW: &str = fixture!("grpc_ip_access_allow.yaml");
+/// Gateway + GRPCRoute + `IpAccessControl` allow-list of only `203.0.113.0/24`
+/// (TEST-NET-3) via `ExtensionRef` (#479 gRPC sad path). The real client IP is
+/// outside the range, so the gRPC call is rejected before the backend.
+pub const GRPC_IP_ACCESS_RESTRICTED: &str = fixture!("grpc_ip_access_restricted.yaml");
+/// Gateway + GRPCRoute + `RateLimit` (rps=1) via `ExtensionRef` (#25 gRPC
+/// parity). The first call is served; rapid follow-ups are rejected.
+pub const GRPC_RATE_LIMIT: &str = fixture!("grpc_rate_limit.yaml");
 /// Dedicated-mode Gateway whose `CoxswainGatewayParameters` references an
 /// image that cannot be pulled (#210). The dedicated proxy Pod never becomes
 /// Ready, so the operator never publishes `DedicatedProxyReady=True` and the

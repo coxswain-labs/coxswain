@@ -9,6 +9,7 @@ pub mod client_traffic_policy;
 pub mod coxswain_backend_policy;
 pub mod gateway_parameters;
 pub mod ingress_parameters;
+pub mod ip_access_control;
 pub mod path_rewrite_regex;
 pub mod rate_limit;
 
@@ -24,5 +25,6 @@ pub use gateway_parameters::{
     AutoscalingParams, CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType,
 };
 pub use ingress_parameters::{CoxswainIngressClassParameters, CoxswainIngressClassParametersSpec};
+pub use ip_access_control::{IpAccessControl, IpAccessControlSpec};
 pub use path_rewrite_regex::{PathRewriteRegex, PathRewriteRegexSpec};
 pub use rate_limit::{RateLimit, RateLimitSpec};

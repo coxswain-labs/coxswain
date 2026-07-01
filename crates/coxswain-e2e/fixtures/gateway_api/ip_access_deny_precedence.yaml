@@ -1,0 +1,72 @@
+# IpAccessControl ExtensionRef fixture — deny-before-allow precedence
+# (apply backends::ECHO first).
+#
+# An IpAccessControl CR lists 203.0.113.0/24 in BOTH allow and deny. A client in
+# that range would be admitted by the allow-list but is rejected 403 because deny
+# is evaluated first. A ClientTrafficPolicy enables PROXY protocol so the test can
+# inject a synthetic client IP.
+#
+# Gateway: coxswain-ipac on GATEWAY_HTTP_PORT.
+# Route host: gwipac.TESTNS.local, path / -> echo-a:3000.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-ipac
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: IpAccessControl
+metadata:
+  name: ipac
+spec:
+  deny:
+    - 203.0.113.0/24
+  allow:
+    - 203.0.113.0/24
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: ClientTrafficPolicy
+metadata:
+  name: ipac-ctp
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: coxswain-ipac
+  proxyProtocol:
+    enabled: true
+    trustedSources:
+      - 0.0.0.0/0
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: ipac-route
+spec:
+  parentRefs:
+    - name: coxswain-ipac
+  hostnames:
+    - "gwipac.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: IpAccessControl
+            name: ipac
+      backendRefs:
+        - name: echo-a
+          port: 3000

@@ -45,11 +45,18 @@ impl RouteLike for GrpcRoute {
     fn has_unsupported_filter(&self) -> bool {
         self.spec.rules.as_deref().unwrap_or(&[]).iter().any(|r| {
             r.filters.as_deref().unwrap_or(&[]).iter().any(|f| {
-                matches!(
-                    f.r#type,
-                    GrpcRouteRulesFiltersType::RequestMirror
-                        | GrpcRouteRulesFiltersType::ExtensionRef
-                )
+                if matches!(f.r#type, GrpcRouteRulesFiltersType::RequestMirror) {
+                    return true;
+                }
+                // RateLimit (#25) and IpAccessControl (#479) ExtensionRefs are
+                // supported on GRPCRoute; any other ExtensionRef is not.
+                if matches!(f.r#type, GrpcRouteRulesFiltersType::ExtensionRef)
+                    && let Some(ext) = &f.extension_ref
+                {
+                    return ext.group != "gateway.coxswain-labs.dev"
+                        || (ext.kind != "RateLimit" && ext.kind != "IpAccessControl");
+                }
+                false
             })
         })
     }
