@@ -1,0 +1,55 @@
+# CoxswainBackendPolicy invalid load-balancer fallback fixture (#389).
+#
+# A CoxswainBackendPolicy attached to the reachable echo-a Service sets
+# spec.loadBalancer.algorithm to an unrecognised value. The reflector WARNs and
+# falls back to the default weighted round-robin — it must NOT break routing.
+#
+# Proof: traffic to the route still returns 200, i.e. the bad value degraded to
+# the default rather than dropping the route.
+#
+# Depends on the `echo` backend (backends::ECHO) applied separately.
+# Route: backend-policy-lb-fallback.TESTNS.local / -> echo-a:3000 (reachable)
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend-policy-lb-fallback-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "backend-policy-lb-fallback.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: echo-a-lb-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-a
+  loadBalancer:
+    algorithm: "not-a-real-algorithm"

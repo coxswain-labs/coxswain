@@ -115,6 +115,31 @@ pub const BACKEND_POLICY_CONNECT_TIMEOUT: &str = fixture!("backend_policy_connec
 /// to default behaviour → route still returns 200. Depends on `backends::ECHO`.
 pub const BACKEND_POLICY_INVALID_TIMEOUT: &str = fixture!("backend_policy_invalid_timeout.yaml");
 
+/// CoxswainBackendPolicy with `spec.loadBalancer.algorithm: least_conn` attached
+/// to the shared `lb-pool` Service behind a Gateway-API HTTPRoute (#389). Proves
+/// the LB algorithm reaches a Gateway-API upstream → traffic skews to the idle
+/// endpoint. Depends on `backends::LB_MIXED`.
+pub const BACKEND_POLICY_LEAST_CONN: &str = fixture!("backend_policy_least_conn.yaml");
+
+/// CoxswainBackendPolicy with an unrecognised `spec.loadBalancer.algorithm`
+/// attached to the reachable echo-a Service (#389). Proves the bad value WARNs and
+/// falls back to round-robin → route still returns 200. Depends on `backends::ECHO`.
+pub const BACKEND_POLICY_INVALID_LOAD_BALANCE: &str =
+    fixture!("backend_policy_invalid_load_balance.yaml");
+
+/// CoxswainBackendPolicy with `spec.circuitBreaker` (threshold 50%, window 500ms,
+/// open 2s, min-requests 4) attached to the go-httpbin Service behind a
+/// Gateway-API HTTPRoute (#478). Drives the breaker open/recover tests. Depends on
+/// `backends::GO_HTTPBIN`.
+pub const BACKEND_POLICY_CIRCUIT_BREAKER: &str = fixture!("backend_policy_circuit_breaker.yaml");
+
+/// CoxswainBackendPolicy with an out-of-range `spec.circuitBreaker.threshold: 0`
+/// attached to the go-httpbin Service (#478). Proves the disabled gate WARNs and
+/// installs no breaker → upstream 500s pass through (never a fail-fast 503).
+/// Depends on `backends::GO_HTTPBIN`.
+pub const BACKEND_POLICY_INVALID_CIRCUIT_BREAKER: &str =
+    fixture!("backend_policy_invalid_circuit_breaker.yaml");
+
 /// Minimal single-listener Gateway used by the listener-drain traffic tests (#231).
 /// Declares one HTTP listener on `GATEWAY_HTTP_PORT`.
 pub const LISTENER_DRAIN: &str = fixture!("listener_drain.yaml");

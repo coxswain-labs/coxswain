@@ -1,0 +1,56 @@
+# CoxswainBackendPolicy invalid circuit-breaker fallback fixture (#478).
+#
+# A CoxswainBackendPolicy attached to the go-httpbin Service sets
+# spec.circuitBreaker.threshold to 0 — outside the valid 1..=100 range, the
+# disabled gate. The reflector WARNs and installs NO breaker.
+#
+# Proof: even under a stream of upstream 500s the route keeps returning the real
+# upstream 500 (never a breaker fail-fast 503), i.e. the out-of-range threshold
+# disabled the breaker rather than rejecting the resource.
+#
+# Depends on the `go-httpbin` backend (backends::GO_HTTPBIN) applied separately.
+# Route: backend-policy-breaker-disabled.TESTNS.local / -> go-httpbin:3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend-policy-breaker-disabled-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "backend-policy-breaker-disabled.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: go-httpbin
+          port: 3000
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: go-httpbin-disabled-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: go-httpbin
+  circuitBreaker:
+    threshold: 0
