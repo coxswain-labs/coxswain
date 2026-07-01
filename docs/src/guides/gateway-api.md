@@ -14,7 +14,7 @@ Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io
 | `TLSRoute` | `gateway.networking.k8s.io/v1alpha2` | SNI-keyed L4 passthrough; no TLS termination at proxy |
 | `ReferenceGrant` | `gateway.networking.k8s.io/v1beta1` | Cross-namespace backend and certificate access |
 | `BackendTLSPolicy` | `gateway.networking.k8s.io/v1` | Upstream TLS configuration referencing a CA `ConfigMap` or `Secret` |
-| `CoxswainBackendPolicy` | `gateway.coxswain-labs.dev/v1alpha1` | Coxswain-native per-`Service` connect/idle timeouts — see [below](#coxswainbackendpolicy) |
+| `CoxswainBackendPolicy` | `gateway.coxswain-labs.dev/v1alpha1` | Coxswain-native per-`Service` connection policy: connect/idle timeouts, load-balancing algorithm, circuit breaker — see [below](#coxswainbackendpolicy) |
 
 !!! warning "Not supported"
     `TCPRoute` and `UDPRoute` are not implemented.
@@ -587,9 +587,9 @@ kubectl describe grpcroute my-grpc-route
 
 ## CoxswainBackendPolicy
 
-`CoxswainBackendPolicy` is a Coxswain-native [direct policy attachment](https://gateway-api.sigs.k8s.io/geps/gep-713/) (`gateway.coxswain-labs.dev/v1alpha1`) that sets per-backend upstream connection timeouts. It attaches to a `Service`; its timeouts apply to every Gateway API route (`HTTPRoute` or `GRPCRoute`) whose backend resolves to that Service.
+`CoxswainBackendPolicy` is a Coxswain-native [direct policy attachment](https://gateway-api.sigs.k8s.io/geps/gep-713/) (`gateway.coxswain-labs.dev/v1alpha1`) that sets per-backend upstream connection policy: connect/idle timeouts, the load-balancing algorithm, and a circuit breaker. It attaches to a `Service`; its settings apply to every Gateway API route (`HTTPRoute` or `GRPCRoute`) whose backend resolves to that Service.
 
-It is the Gateway API counterpart to the Ingress `connect-timeout` and `upstream-keepalive-timeout` annotations — Gateway API has no per-backend connection-timeout field of its own.
+It is the Gateway API counterpart to a family of Ingress annotations — `connect-timeout` / `upstream-keepalive-timeout`, `load-balance`, and `circuit-breaker-*` — none of which has a Gateway API standard equivalent. Each field group is **deliberately proprietary**: it is anchored to a first-class Envoy/Istio concept (LB policies, outlier detection), not an nginx-ism, and there is no upstream Gateway API convergence to await.
 
 ### Fields
 
@@ -598,6 +598,12 @@ It is the Gateway API counterpart to the Ingress `connect-timeout` and `upstream
 | `targetRefs[]` | The `Service` objects this policy applies to (same namespace). `group: ""`, `kind: Service`. |
 | `timeouts.connect` | Upstream TCP-connect timeout ([GEP-2257](https://gateway-api.sigs.k8s.io/geps/gep-2257/) duration, e.g. `500ms`, `5s`). Bounds how long the proxy waits to establish a connection before failing the request with `502`. |
 | `timeouts.idle` | Upstream keepalive idle timeout — how long an idle pooled connection is retained before eviction. |
+| `loadBalancer.algorithm` | Upstream load-balancing algorithm. One of `round_robin` (default), `least_conn`, `ewma`, `ip_hash`, `hash:uri`, `hash:source-ip`, `hash:header=<name>`, `hash:cookie=<name>`. Mirrors the Ingress `load-balance` annotation. |
+| `circuitBreaker.threshold` | Error rate (%) that trips the breaker (`1`–`100`). The gate: absent or out of range disables the breaker. |
+| `circuitBreaker.window` | Rolling window over which the EWMA error rate is computed (GEP-2257 duration). Default `10s`. |
+| `circuitBreaker.openDuration` | How long the breaker stays open before allowing a probe. Default `5s`. Starting duration when `maxOpenDuration` enables exponential backoff. |
+| `circuitBreaker.minRequests` | Minimum requests in the window before the breaker can trip. Default `10`. |
+| `circuitBreaker.maxOpenDuration` | Optional cap that enables exponential backoff from `openDuration` up to this value. Unset → constant open duration. |
 
 ### Example
 
@@ -605,7 +611,7 @@ It is the Gateway API counterpart to the Ingress `connect-timeout` and `upstream
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
 kind: CoxswainBackendPolicy
 metadata:
-  name: api-backend-timeouts
+  name: api-backend-policy
 spec:
   targetRefs:
     - group: ""
@@ -614,13 +620,22 @@ spec:
   timeouts:
     connect: 500ms
     idle: 60s
+  loadBalancer:
+    algorithm: least_conn
+  circuitBreaker:
+    threshold: 50
+    window: 10s
+    openDuration: 5s
+    minRequests: 10
 ```
 
 ### Behaviour
 
-- A backend `Service` with no attached policy keeps the default connection behaviour.
+- A backend `Service` with no attached policy keeps the default connection behaviour (weighted round-robin, breaker disabled).
 - The per-backend `connect` timeout takes precedence over the Gateway API `HTTPRoute.timeouts.backendRequest` fallback, but an Ingress route's explicit `connect-timeout` annotation still wins for that route.
-- **Invalid values fail open.** An unparseable `connect` or `idle` string is logged as a warning and ignored — the backend falls back to the default, never a connection-level error. The duration string is deliberately not schema-validated so the policy is accepted and the warning surfaces at reconcile time rather than being rejected by the API server.
+- **`loadBalancer.algorithm`** applies the same upstream selection the Ingress `load-balance` annotation drives; `round_robin` is a no-op (the default). The `hash:*` forms select an endpoint by a consistent hash of the named request attribute.
+- **`circuitBreaker`** drives the same per-endpoint outlier detection as the Ingress `circuit-breaker-*` annotations: once the EWMA error rate over `window` meets `threshold` (after at least `minRequests`), the breaker opens and requests fail fast with `503` until a probe after `openDuration` succeeds.
+- **Invalid values fail open.** An unparseable duration, an unrecognised `loadBalancer.algorithm`, or an out-of-range `circuitBreaker.threshold` is logged as a warning and ignored — the backend falls back to the default (round-robin / breaker disabled), never a connection-level error or a rejected resource. These fields are deliberately not schema-validated so the policy is accepted and the warning surfaces at reconcile time.
 - **Conflicts.** If two policies target the same `Service`, the older one (by `creationTimestamp`, ties broken by name) wins; the loser receives `Accepted=False, reason=Conflicted` in its `status.ancestors[]`.
 
 ### Status

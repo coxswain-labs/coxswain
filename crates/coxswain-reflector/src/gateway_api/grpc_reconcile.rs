@@ -187,15 +187,22 @@ pub(super) fn reconcile(
         if let Some(tls) = policy_tls {
             group = group.with_tls(tls);
         }
-        // CoxswainBackendPolicy (#354): per-backend connect/idle timeouts.
-        if let Some(bp) = pick_backend_policy(backend_refs, route_ns, backend_policy_index) {
+        // CoxswainBackendPolicy: per-backend connect/idle timeouts (#354) and LB
+        // algorithm (#389) on the BackendGroup; the circuit breaker (#478) is
+        // RouteEntry-level and carried out to the GrpcRuleContext below.
+        let bp = pick_backend_policy(backend_refs, route_ns, backend_policy_index);
+        if let Some(bp) = bp {
             if bp.connect.is_some() {
                 group = group.with_connect_timeout(bp.connect);
             }
             if bp.idle.is_some() {
                 group = group.with_keepalive_timeout(bp.idle);
             }
+            if let Some(lb) = &bp.load_balance {
+                group = group.with_load_balance(lb.clone());
+            }
         }
+        let circuit_breaker = bp.and_then(|bp| bp.circuit_breaker.clone());
         let group = Arc::new(group);
 
         let (group_opt, error_status): (Option<Arc<BackendGroup>>, Option<u16>) = if invalid_policy
@@ -223,6 +230,7 @@ pub(super) fn reconcile(
             route_id: &route_id,
             metric_route_id: &metric_route_id,
             created_at,
+            circuit_breaker,
         };
         for (hostname_opt, port) in &bindings {
             let pb = builder.for_port(*port);
@@ -242,6 +250,9 @@ struct GrpcRuleContext<'a> {
     route_id: &'a str,
     metric_route_id: &'a Arc<str>,
     created_at: Option<SystemTime>,
+    /// Per-backend circuit breaker from the rule's winning `CoxswainBackendPolicy`
+    /// (#478). Shared across every entry the rule installs.
+    circuit_breaker: Option<Arc<coxswain_core::routing::CircuitBreakerConfig>>,
 }
 
 /// Installs one GRPCRoute rule (all its matches) into a `HostRouterBuilder`.
@@ -276,6 +287,7 @@ fn apply_grpc_rule(
         entry
             .with_metric_route_id(Arc::clone(ctx.metric_route_id))
             .with_rate_limit(None)
+            .with_circuit_breaker(ctx.circuit_breaker.clone())
     };
 
     match rule.matches.as_deref() {

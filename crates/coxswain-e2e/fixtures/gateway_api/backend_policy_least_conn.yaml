@@ -1,0 +1,56 @@
+# CoxswainBackendPolicy load-balancer fixture (#389) — Gateway-API parity for the
+# Ingress `load-balance: least_conn` annotation.
+#
+# Routes a Gateway-API HTTPRoute to the shared lb-pool Service (two pods: lb-fast,
+# echo-basic, instant; lb-slow, go-httpbin, holds /delay/<N>). A CoxswainBackendPolicy
+# attached to lb-pool sets spec.loadBalancer.algorithm: least_conn, so the proxy
+# accumulates more active in-flight counts on lb-slow and favours lb-fast for new
+# selections — the same behaviour the Ingress annotation drives, proving the policy
+# reached the Gateway-API upstream.
+#
+# Apply backends::LB_MIXED before this fixture.
+# Route: backend-policy-lb.TESTNS.local / -> lb-pool:3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend-policy-lb-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "backend-policy-lb.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: lb-pool
+          port: 3000
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: lb-pool-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: lb-pool
+  loadBalancer:
+    algorithm: "least_conn"

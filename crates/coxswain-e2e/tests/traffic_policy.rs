@@ -243,6 +243,327 @@ async fn backend_policy_invalid_timeout_falls_back() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── CoxswainBackendPolicy: load-balancer algorithm (#389) ─────────────────────
+//
+// Gateway-API parity for the Ingress `load-balance` annotation. The policy's
+// `spec.loadBalancer.algorithm` mirrors the annotation vocabulary 1:1; a bad value
+// WARNs and falls back to round-robin (no apiserver rejection).
+
+/// Happy path (#389): a `CoxswainBackendPolicy` with
+/// `spec.loadBalancer.algorithm: least_conn` on the backend `Service` makes the
+/// proxy route a Gateway-API HTTPRoute's traffic by fewest-active-connections.
+///
+/// The `lb-pool` Service is backed by `lb-fast` (echo-basic, instant) and
+/// `lb-slow` (go-httpbin, holds `/delay/1` for 1s). Under least_conn the slow
+/// endpoint accumulates active connections and new selections prefer the fast
+/// one. Asserts `fast_count > slow_count` and `slow_count >= 1` — the same proof
+/// as the Ingress annotation test, here via the policy on the Gateway-API surface.
+#[tokio::test]
+async fn backend_policy_least_conn_routes_more_to_fast_upstream() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-cbp-leastconn").await?;
+
+    fixtures::apply_fixture(backends::LB_MIXED, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["lb-fast", "lb-slow"]).await?;
+    fixtures::apply_fixture(gwa::BACKEND_POLICY_LEAST_CONN, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("backend-policy-lb.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
+
+    // Readiness: both backends return 200 for /delay/1 (echo instantly, httpbin after 1s).
+    wait::wait_for_route_status(&gw, &host, "/delay/1", 200, Duration::from_secs(90)).await?;
+    // BOTH lb-pool endpoints must be compiled before the burst, else the
+    // distribution assertions are decided by whichever endpoint landed first.
+    wait::wait_for_route_endpoints(
+        &h.admin_url("/api/v1/routes"),
+        &host,
+        2,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Pipelined burst: 20 requests, up to 4 in-flight. lb-slow holds each for 1s,
+    // so new selections see its active count ≥ 1 and route to lb-fast.
+    let client = Arc::new(
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()?,
+    );
+    let sem = Arc::new(tokio::sync::Semaphore::new(4));
+    let proxy_addr = gw.proxy_addr;
+
+    let handles: Vec<_> = (0..20u32)
+        .map(|_| {
+            let client = Arc::clone(&client);
+            let sem = Arc::clone(&sem);
+            let url = format!("http://{proxy_addr}/delay/1");
+            let host = host.clone();
+            tokio::spawn(async move {
+                let _permit = sem
+                    .acquire_owned()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
+                let resp =
+                    coxswain_e2e::harness::http::get_with_transient_retry(&client, &url, &host, 3)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("send: {e}"))?;
+                let status = resp.status().as_u16();
+                anyhow::ensure!(status == 200, "expected 200, got {status}");
+                let body = resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("parse body: {e}"))?;
+                Ok::<Option<String>, anyhow::Error>(body["pod"].as_str().map(String::from))
+            })
+        })
+        .collect();
+
+    let mut fast_count = 0usize;
+    let mut slow_count = 0usize;
+    for handle in handles {
+        let pod_opt = handle.await.map_err(|e| anyhow::anyhow!("task: {e}"))??;
+        if pod_opt
+            .as_deref()
+            .is_some_and(|p| p.starts_with("lb-fast-"))
+        {
+            fast_count += 1;
+        } else {
+            slow_count += 1;
+        }
+    }
+
+    assert!(
+        fast_count > slow_count,
+        "policy least_conn must route more requests to the fast upstream; \
+         fast_count={fast_count}, slow_count={slow_count}"
+    );
+    assert!(
+        slow_count >= 1,
+        "policy least_conn must route at least one request to the slow upstream \
+         (both endpoints reachable); fast_count={fast_count}, slow_count={slow_count}"
+    );
+
+    Ok(())
+}
+
+/// Sad path (#389): a `CoxswainBackendPolicy` with an unrecognised
+/// `spec.loadBalancer.algorithm` WARNs and falls back to round-robin rather than
+/// dropping the route.
+///
+/// The policy targets the reachable `echo-a` Service with a bogus algorithm. The
+/// route must still return 200 — proving the bad value degraded to the default
+/// (no routing break). Without fail-open the route would never serve a clean 200.
+#[tokio::test]
+async fn backend_policy_invalid_load_balance_falls_back_to_round_robin() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-cbp-lbfallback").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        gwa::BACKEND_POLICY_INVALID_LOAD_BALANCE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("backend-policy-lb-fallback.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
+
+    // The bad algorithm must not drop the route — the reachable echo backend
+    // serves a clean 200, proving fallback to default round-robin.
+    wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
+// ── CoxswainBackendPolicy: circuit breaker (#478) ─────────────────────────────
+//
+// Gateway-API parity for the Ingress `circuit-breaker-*` annotation family. The
+// policy's `spec.circuitBreaker` carries the same knobs; an out-of-range threshold
+// disables the breaker. The fixture uses threshold=50%, min-requests=4,
+// window=500ms (sub-second, so failsafe's EWMA time gate is always satisfied),
+// open-duration=2s. go-httpbin's /status/:code drives upstream codes.
+
+/// Happy path (#478): once enough upstream 500s drop the EWMA success rate below
+/// `threshold`, the policy-driven breaker opens and subsequent requests fail fast
+/// with 503 without reaching the upstream.
+///
+/// Asserts the negative first: a baseline error is a real upstream 500 (breaker
+/// still closed). After the trip batch, requests are fail-fast 503.
+#[tokio::test]
+async fn backend_policy_breaker_opens_when_upstream_errors() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-cbp-cb-open").await?;
+
+    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
+    fixtures::apply_fixture(
+        gwa::BACKEND_POLICY_CIRCUIT_BREAKER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("backend-policy-breaker.{}.local", ns.name);
+    let proxy = h.gateway_http_addr(&ns.name).await?;
+
+    // Route readiness: poll /status/200 until the proxy forwards it to go-httpbin.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("{host} / route to return 200 from go-httpbin") },
+        || async {
+            if raw_status(proxy, &host, "/status/200").await == 200 {
+                Some(())
+            } else {
+                None
+            }
+        },
+    )
+    .await?;
+
+    // Negative baseline: the breaker is still closed — the first error must reach
+    // the upstream (500), not be rejected by the breaker (503).
+    let pre = raw_status(proxy, &host, "/status/500").await;
+    assert_eq!(
+        pre, 500,
+        "before the trip sequence the upstream 500 must reach the client (not a breaker 503)"
+    );
+
+    // Trip sequence: over-shoot min-requests to guarantee the breaker opens
+    // regardless of how many readiness requests remain in the 500ms window.
+    for _ in 0..8u32 {
+        raw_status(proxy, &host, "/status/500").await;
+    }
+
+    let open_status = raw_status(proxy, &host, "/status/500").await;
+    assert_eq!(
+        open_status, 503,
+        "after the trip sequence the policy circuit breaker must fail-fast with 503 \
+         (circuitBreaker.threshold=50, minRequests=4)"
+    );
+
+    Ok(())
+}
+
+/// Recovery path (#478): after the breaker opens and `openDuration` elapses, the
+/// breaker half-opens; a successful probe (upstream 200) closes it and traffic is
+/// served normally again.
+#[tokio::test]
+async fn backend_policy_breaker_closes_after_open_duration_when_upstream_recovers()
+-> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-cbp-cb-recover").await?;
+
+    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
+    fixtures::apply_fixture(
+        gwa::BACKEND_POLICY_CIRCUIT_BREAKER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("backend-policy-breaker.{}.local", ns.name);
+    let proxy = h.gateway_http_addr(&ns.name).await?;
+
+    // Route readiness.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("{host} / route to return 200 from go-httpbin") },
+        || async {
+            if raw_status(proxy, &host, "/status/200").await == 200 {
+                Some(())
+            } else {
+                None
+            }
+        },
+    )
+    .await?;
+
+    // Trip the breaker.
+    for _ in 0..8u32 {
+        raw_status(proxy, &host, "/status/500").await;
+    }
+    let open_status = raw_status(proxy, &host, "/status/500").await;
+    assert_eq!(
+        open_status, 503,
+        "breaker must be open (503) before the recovery window; \
+         if 500, the trip sequence did not open the policy breaker"
+    );
+
+    // Recovery: after openDuration (2s) the breaker half-opens; a /status/200 probe
+    // closes it. No bare sleep — poll the real observable (200 response).
+    wait::poll_until(
+        Duration::from_secs(15),
+        wait::POLL_FAST,
+        || async { "policy circuit breaker to close (expecting 200 from /status/200)".to_string() },
+        || async {
+            if raw_status(proxy, &host, "/status/200").await == 200 {
+                Some(())
+            } else {
+                None
+            }
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Sad path (#478): a `CoxswainBackendPolicy` with an out-of-range
+/// `spec.circuitBreaker.threshold: 0` (the disabled gate) WARNs and installs no
+/// breaker — upstream 500s pass through and never become a fail-fast 503.
+///
+/// Drives the same error stream as the open test against a policy that should be
+/// disabled; the breaker never trips, so the route keeps returning the real
+/// upstream 500. Proves the bad value disabled the breaker rather than rejecting
+/// the resource.
+#[tokio::test]
+async fn backend_policy_invalid_circuit_breaker_threshold_stays_disabled() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-cbp-cb-disabled").await?;
+
+    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
+    fixtures::apply_fixture(
+        gwa::BACKEND_POLICY_INVALID_CIRCUIT_BREAKER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("backend-policy-breaker-disabled.{}.local", ns.name);
+    let proxy = h.gateway_http_addr(&ns.name).await?;
+
+    // Readiness.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("{host} / route to return 200 from go-httpbin") },
+        || async {
+            if raw_status(proxy, &host, "/status/200").await == 200 {
+                Some(())
+            } else {
+                None
+            }
+        },
+    )
+    .await?;
+
+    // Drive a stream of errors that WOULD trip a 50%-threshold breaker, then assert
+    // the upstream 500 still passes through — the disabled gate installed no breaker.
+    for _ in 0..8u32 {
+        raw_status(proxy, &host, "/status/500").await;
+    }
+    let status = raw_status(proxy, &host, "/status/500").await;
+    assert_eq!(
+        status, 500,
+        "with threshold=0 (disabled) the breaker must never trip — upstream 500 must pass \
+         through, never a fail-fast 503; got {status}"
+    );
+
+    Ok(())
+}
+
 /// Verifies that `ingress.coxswain-labs.dev/max-body-size: "1k"` (#263) caps the
 /// request body. One route, the full happy/sad matrix:
 /// - under-limit POST (200 B, Content-Length) → 200, served by `echo-a`;

@@ -5,9 +5,7 @@
 //! empty default) so the affected annotation is treated as absent — the Ingress
 //! keeps serving.
 
-use coxswain_core::routing::{CompressionConfig, HashSource, LoadBalance, RetryOn};
-use http::HeaderName;
-use std::sync::Arc;
+use coxswain_core::routing::{CompressionConfig, LoadBalance, LoadBalanceParseError, RetryOn};
 
 // ── Timeout annotation keys ───────────────────────────────────────────────────
 
@@ -375,98 +373,74 @@ pub(crate) fn parse_load_balance(
     route_id: &str,
     diag: &mut Vec<AnnotationIssue>,
 ) -> LoadBalance {
-    match s {
-        "round_robin" => LoadBalance::RoundRobin,
-        "least_conn" => LoadBalance::LeastConn,
-        "ewma" => LoadBalance::Ewma,
-        // Backward-compatible alias: ip_hash → hash:source-ip
-        "ip_hash" => LoadBalance::Hash(HashSource::SourceIp),
-        _ if s.starts_with("hash:") => parse_hash_attribute(&s["hash:".len()..], s, route_id, diag),
-        _ => {
-            tracing::warn!(
-                ingress = %route_id,
-                value = s,
-                "unknown load-balance value — valid values: round_robin, least_conn, ewma, \
-                 hash:uri, hash:source-ip, hash:header=<name>, hash:cookie=<name>, ip_hash; \
-                 falling back to round_robin"
-            );
-            diag.push(AnnotationIssue {
-                annotation: LOAD_BALANCE,
-                message: format!("unknown load-balance value '{s}' — falling back to round_robin"),
-            });
-            LoadBalance::RoundRobin
-        }
-    }
-}
-
-/// Parse the attribute portion of a `hash:<attr>` load-balance value.
-fn parse_hash_attribute(
-    attr: &str,
-    full: &str,
-    route_id: &str,
-    diag: &mut Vec<AnnotationIssue>,
-) -> LoadBalance {
-    match attr {
-        "uri" => LoadBalance::Hash(HashSource::Uri),
-        "source-ip" => LoadBalance::Hash(HashSource::SourceIp),
-        _ if attr.starts_with("header=") => {
-            let name = &attr["header=".len()..];
-            if name.is_empty() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    value = full,
-                    "empty header name in load-balance hash expression; falling back to round_robin"
-                );
-                diag.push(AnnotationIssue {
-                    annotation: LOAD_BALANCE,
-                    message: "empty header name in load-balance hash expression — falling back to round_robin".into(),
-                });
-                return LoadBalance::RoundRobin;
-            }
-            match HeaderName::from_bytes(name.as_bytes()) {
-                Ok(h) => LoadBalance::Hash(HashSource::Header(h)),
-                Err(_) => {
+    // The value→algorithm vocabulary is owned by coxswain-core so the Ingress
+    // annotation and the CoxswainBackendPolicy (#389) can never drift. This
+    // surface maps each parse error to its annotation-specific WARN + diagnostic
+    // and falls back to round-robin.
+    match LoadBalance::parse_lenient(s) {
+        Ok(lb) => lb,
+        Err(e) => {
+            let message = match e {
+                LoadBalanceParseError::UnknownValue => {
                     tracing::warn!(
                         ingress = %route_id,
-                        value = full,
+                        value = s,
+                        "unknown load-balance value — valid values: round_robin, least_conn, ewma, \
+                         hash:uri, hash:source-ip, hash:header=<name>, hash:cookie=<name>, ip_hash; \
+                         falling back to round_robin"
+                    );
+                    format!("unknown load-balance value '{s}' — falling back to round_robin")
+                }
+                LoadBalanceParseError::EmptyHeaderName => {
+                    tracing::warn!(
+                        ingress = %route_id,
+                        value = s,
+                        "empty header name in load-balance hash expression; falling back to round_robin"
+                    );
+                    "empty header name in load-balance hash expression — falling back to round_robin"
+                        .to_string()
+                }
+                LoadBalanceParseError::InvalidHeaderName => {
+                    tracing::warn!(
+                        ingress = %route_id,
+                        value = s,
                         "invalid header name in load-balance hash expression; falling back to round_robin"
                     );
-                    diag.push(AnnotationIssue {
-                        annotation: LOAD_BALANCE,
-                        message: format!(
-                            "invalid header name in load-balance hash expression: {full}"
-                        ),
-                    });
-                    LoadBalance::RoundRobin
+                    format!("invalid header name in load-balance hash expression: {s}")
                 }
-            }
-        }
-        _ if attr.starts_with("cookie=") => {
-            let name = &attr["cookie=".len()..];
-            if name.is_empty() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    value = full,
-                    "empty cookie name in load-balance hash expression; falling back to round_robin"
-                );
-                diag.push(AnnotationIssue {
-                    annotation: LOAD_BALANCE,
-                    message: "empty cookie name in load-balance hash expression — falling back to round_robin".into(),
-                });
-                return LoadBalance::RoundRobin;
-            }
-            LoadBalance::Hash(HashSource::Cookie(Arc::from(name)))
-        }
-        _ => {
-            tracing::warn!(
-                ingress = %route_id,
-                value = full,
-                "unknown hash attribute in load-balance; valid forms: hash:uri, hash:source-ip, \
-                 hash:header=<name>, hash:cookie=<name>; falling back to round_robin"
-            );
+                LoadBalanceParseError::EmptyCookieName => {
+                    tracing::warn!(
+                        ingress = %route_id,
+                        value = s,
+                        "empty cookie name in load-balance hash expression; falling back to round_robin"
+                    );
+                    "empty cookie name in load-balance hash expression — falling back to round_robin"
+                        .to_string()
+                }
+                LoadBalanceParseError::UnknownHashAttr => {
+                    tracing::warn!(
+                        ingress = %route_id,
+                        value = s,
+                        "unknown hash attribute in load-balance; valid forms: hash:uri, hash:source-ip, \
+                         hash:header=<name>, hash:cookie=<name>; falling back to round_robin"
+                    );
+                    format!("unknown hash attribute in load-balance: {s}")
+                }
+                // `LoadBalanceParseError` is `#[non_exhaustive]`: any future
+                // variant degrades to a generic WARN + round-robin fallback.
+                other => {
+                    tracing::warn!(
+                        ingress = %route_id,
+                        value = s,
+                        error = %other,
+                        "invalid load-balance value; falling back to round_robin"
+                    );
+                    format!("invalid load-balance value '{s}' — falling back to round_robin")
+                }
+            };
             diag.push(AnnotationIssue {
                 annotation: LOAD_BALANCE,
-                message: format!("unknown hash attribute in load-balance: {full}"),
+                message,
             });
             LoadBalance::RoundRobin
         }
@@ -702,6 +676,9 @@ pub(crate) fn parse_mirror_target(s: &str) -> Option<MirrorTargetRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use coxswain_core::routing::HashSource;
+    use http::HeaderName;
+    use std::sync::Arc;
 
     #[test]
     fn parse_u32_valid() {
