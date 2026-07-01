@@ -1,0 +1,52 @@
+# GRPCRoute + RateLimit (rps=1) — apply backends::GRPC_ECHO first.
+#
+# The RateLimit caps the route to 1 req/s with no burst. Proves the RateLimit
+# ExtensionRef is accepted on GRPCRoute and enforced on gRPC (HTTP/2) traffic:
+# the first call is served, rapid follow-ups are rejected (#25 gRPC parity).
+#
+# Gateway: coxswain-grpc-rl on GATEWAY_HTTP_PORT.
+# Route host: grpc-rl.TESTNS.local, GrpcEcho/Echo -> grpc-echo:50051.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-rl
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RateLimit
+metadata:
+  name: one-rps
+spec:
+  requestsPerSecond: 1
+  burst: 0
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-rl-route
+spec:
+  hostnames:
+    - "grpc-rl.${TESTNS}.local"
+  parentRefs:
+    - name: coxswain-grpc-rl
+  rules:
+    - matches:
+        - method:
+            type: Exact
+            service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+            method: Echo
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: RateLimit
+            name: one-rps
+      backendRefs:
+        - name: grpc-echo
+          port: 50051

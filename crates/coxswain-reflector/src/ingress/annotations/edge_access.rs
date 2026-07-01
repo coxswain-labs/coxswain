@@ -181,8 +181,13 @@ fn parse_cidr_list(
     if nets.is_empty() { None } else { Some(nets) }
 }
 
-/// Parse a single token as a CIDR block, falling back to a bare host address.
-fn parse_cidr_or_host(token: &str) -> Option<ipnet::IpNet> {
+/// Parse a single token as a CIDR block, falling back to a bare host address
+/// (`10.0.0.1` → `10.0.0.1/32`, `2001:db8::1` → `2001:db8::1/128`).
+///
+/// Shared with the Gateway-API `IpAccessControl` filter resolver so both the
+/// Ingress annotation and the Gateway CRD promote bare IPs to host routes
+/// identically.
+pub(crate) fn parse_cidr_or_host(token: &str) -> Option<ipnet::IpNet> {
     token.parse::<ipnet::IpNet>().ok().or_else(|| {
         token
             .parse::<std::net::IpAddr>()

@@ -940,6 +940,7 @@ mod tests {
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &crate::tests::fixtures::empty_rate_limit_store(),
                 path_rewrites: &crate::tests::fixtures::empty_path_rewrite_store(),
+                ip_access: &crate::tests::fixtures::empty_ip_access_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },

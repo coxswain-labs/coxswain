@@ -26,6 +26,32 @@ use coxswain_e2e::{
 use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+// Minimal `grpcecho` proto (hand-derived from grpcecho.proto to avoid a
+// prost-build dependency) for the GRPCRoute ExtensionRef parity tests (#479, #25).
+// Service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+mod grpcecho {
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct EchoRequest {}
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct GrpcContext {
+        #[prost(string, tag = "4")]
+        pub pod: String,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct EchoAssertions {
+        #[prost(message, optional, tag = "4")]
+        pub context: Option<GrpcContext>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct EchoResponse {
+        #[prost(message, optional, tag = "1")]
+        pub assertions: Option<EchoAssertions>,
+    }
+}
+
 /// `allow-source-range`: a request whose **real client IP** (carried in the PROXY
 /// header) is inside the allow-listed CIDR is served normally (#264 happy path).
 #[tokio::test]
@@ -686,6 +712,315 @@ async fn gateway_route_unthrottled_when_ratelimit_cr_missing() -> anyhow::Result
     anyhow::ensure!(
         statuses.iter().all(|&s| s == 200),
         "missing RateLimit CR must be fail-open (all 200), got: {statuses:?}"
+    );
+    Ok(())
+}
+
+// ── IP access control (Gateway API ExtensionRef) ──────────────────────────────
+//
+// Gateway-side parity for the Ingress allow/deny-source-range annotations (#479).
+// PROXY protocol is enabled per-Gateway via a ClientTrafficPolicy (bundled in the
+// fixture) so a synthetic client IP can be injected — the same client-IP path the
+// filter evaluates. The dest port in the PROXY line (8000) matches GATEWAY_HTTP_PORT.
+
+/// `IpAccessControl` allow-list: a client whose real IP is inside the allow-listed
+/// CIDR reaches the backend (200) (#479 happy path).
+#[tokio::test]
+async fn gateway_ip_allow_in_range_admitted() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ipac-allow-in").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::IP_ACCESS_ALLOW, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-ipac",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let addr = h.gateway_http_addr(&ns.name).await?;
+
+    let host = format!("gwipac.{}.local", ns.name);
+    // 203.0.113.10 ∈ 203.0.113.0/24 — admitted. Poll to 200 (404 before install).
+    let proxy_line = "PROXY TCP4 203.0.113.10 10.0.0.1 12345 8000\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    let body =
+        wait_for_proxy_v1_status(addr, proxy_line, &http_req, 200, Duration::from_secs(60)).await?;
+    let echo: EchoResponse = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+    echo.assert_backend("echo-a");
+    Ok(())
+}
+
+/// `IpAccessControl` allow-list: a client outside every allow-listed CIDR is
+/// rejected with 403 before reaching any backend (#479 sad path).
+#[tokio::test]
+async fn gateway_ip_allow_out_of_range_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ipac-allow-out").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::IP_ACCESS_ALLOW, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-ipac",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let addr = h.gateway_http_addr(&ns.name).await?;
+
+    let host = format!("gwipac.{}.local", ns.name);
+    // 192.0.2.1 ∉ 203.0.113.0/24 — rejected. Polling to 403 disambiguates the
+    // pre-install 404 from the allow-list denial.
+    let proxy_line = "PROXY TCP4 192.0.2.1 10.0.0.1 12345 8000\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    wait_for_proxy_v1_status(addr, proxy_line, &http_req, 403, Duration::from_secs(60)).await?;
+    Ok(())
+}
+
+/// `IpAccessControl` deny-list: a client whose real IP is inside the deny-listed
+/// CIDR is rejected with 403 (#479 happy path — block in effect).
+#[tokio::test]
+async fn gateway_ip_deny_blocks_listed_client() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ipac-deny-in").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::IP_ACCESS_DENY, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-ipac",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let addr = h.gateway_http_addr(&ns.name).await?;
+
+    let host = format!("gwipac.{}.local", ns.name);
+    // 203.0.113.10 ∈ 203.0.113.0/24 — blocked. Poll to 403 (404 before install).
+    let proxy_line = "PROXY TCP4 203.0.113.10 10.0.0.1 12345 8000\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    wait_for_proxy_v1_status(addr, proxy_line, &http_req, 403, Duration::from_secs(60)).await?;
+    Ok(())
+}
+
+/// `IpAccessControl` deny-list with no allow-list: a client outside the deny CIDR
+/// is admitted — an empty allow-list imposes no restriction (#479 sad path).
+#[tokio::test]
+async fn gateway_ip_deny_allows_unlisted_client() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ipac-deny-out").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::IP_ACCESS_DENY, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-ipac",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let addr = h.gateway_http_addr(&ns.name).await?;
+
+    let host = format!("gwipac.{}.local", ns.name);
+    // 192.0.2.1 ∉ 203.0.113.0/24 deny — admitted (no allow-list restriction).
+    let proxy_line = "PROXY TCP4 192.0.2.1 10.0.0.1 12345 8000\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    let body =
+        wait_for_proxy_v1_status(addr, proxy_line, &http_req, 200, Duration::from_secs(60)).await?;
+    let echo: EchoResponse = serde_json::from_str(&body)
+        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+    echo.assert_backend("echo-a");
+    Ok(())
+}
+
+/// `IpAccessControl` with a CIDR in BOTH allow and deny: deny is evaluated first,
+/// so a client in that range is rejected 403 (#479 precedence test).
+#[tokio::test]
+async fn gateway_ip_deny_precedes_allow_when_both_match() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ipac-precedence").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::IP_ACCESS_DENY_PRECEDENCE, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-ipac",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let addr = h.gateway_http_addr(&ns.name).await?;
+
+    let host = format!("gwipac.{}.local", ns.name);
+    // 203.0.113.10 ∈ both lists — deny wins, so 403 confirms deny-before-allow.
+    let proxy_line = "PROXY TCP4 203.0.113.10 10.0.0.1 12345 8000\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+    wait_for_proxy_v1_status(addr, proxy_line, &http_req, 403, Duration::from_secs(60)).await?;
+    Ok(())
+}
+
+// ── IP access control + rate limiting on GRPCRoute (#479, #25 gRPC parity) ─────
+//
+// The protocol-agnostic ExtensionRef filters apply to gRPC (HTTP/2) identically.
+// gRPC maps proxy HTTP errors to gRPC status codes, so the filter outcome is
+// observable without PROXY protocol: 403 → PermissionDenied, 429 → Unavailable,
+// 404 (route not yet live) → Unimplemented. The last mapping lets a sad-path test
+// distinguish "blocked" from "not yet installed" while polling.
+
+/// Issue one `GrpcEcho/Echo` unary call through the Gateway VIP for `host`.
+/// Connect/transport failures are folded into `Status::unavailable` so callers
+/// can match on `tonic::Code` uniformly.
+async fn grpc_echo_call(
+    gw_addr: std::net::SocketAddr,
+    host: &str,
+) -> Result<grpcecho::EchoResponse, tonic::Status> {
+    let origin: tonic::transport::Uri = format!("http://{host}:{}", gw_addr.port())
+        .parse()
+        .map_err(|e| tonic::Status::unavailable(format!("uri: {e}")))?;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))
+        .map_err(|e| tonic::Status::unavailable(format!("endpoint: {e}")))?
+        .origin(origin);
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|e| tonic::Status::unavailable(format!("connect: {e}")))?;
+    let mut client = tonic::client::Grpc::new(channel);
+    client
+        .ready()
+        .await
+        .map_err(|e| tonic::Status::unavailable(format!("ready: {e}")))?;
+    let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo"
+        .parse::<tonic::codegen::http::uri::PathAndQuery>()
+        .map_err(|e| tonic::Status::unavailable(format!("path: {e}")))?;
+    let codec = tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+    client
+        .unary(tonic::Request::new(grpcecho::EchoRequest {}), path, codec)
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+/// `IpAccessControl` on a GRPCRoute: an allow-list covering all sources admits the
+/// client and the gRPC call reaches the backend (#479 gRPC happy path — also proves
+/// the ExtensionRef is accepted on GRPCRoute).
+#[tokio::test]
+async fn grpc_route_ip_access_admits_when_client_allowed() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "grpc-ipac-ok").await?;
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_IP_ACCESS_ALLOW, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("grpc-ipac.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+
+    // Poll until the data plane serves the call — an admitted client reaches grpc-echo.
+    let resp = wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("allowed gRPC Echo via {host} to succeed") },
+        || async { grpc_echo_call(gw_addr, &host).await.ok() },
+    )
+    .await?;
+
+    let pod = resp
+        .assertions
+        .and_then(|a| a.context)
+        .map(|c| c.pod)
+        .unwrap_or_default();
+    assert!(
+        pod.starts_with("grpc-echo-"),
+        "response must come from grpc-echo-* pod, got {pod:?}"
+    );
+    Ok(())
+}
+
+/// `IpAccessControl` on a GRPCRoute: an allow-list the client is not part of
+/// rejects the call before the backend. The proxy's 403 surfaces as gRPC
+/// `PermissionDenied`, distinct from the `Unimplemented` (404) seen before the
+/// route is live — so polling for `PermissionDenied` confirms the block is in
+/// effect (#479 gRPC sad path).
+#[tokio::test]
+async fn grpc_route_ip_access_blocks_when_client_not_allowed() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "grpc-ipac-deny").await?;
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_IP_ACCESS_RESTRICTED, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("grpc-ipac.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+
+    // Poll until the call is rejected with PermissionDenied (403). Unimplemented
+    // (404, route not yet live) does not match, so this waits for the route to be
+    // live AND the source-IP allow-list to fire.
+    wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("restricted gRPC Echo via {host} to be denied (PermissionDenied)") },
+        || async {
+            match grpc_echo_call(gw_addr, &host).await {
+                Err(s) if s.code() == tonic::Code::PermissionDenied => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// `RateLimit` on a GRPCRoute (rps=1): the first call is served (proving the route
+/// is live and the ExtensionRef accepted), then rapid follow-ups are rejected —
+/// the proxy's 429 surfaces as gRPC `Unavailable` (#25 gRPC parity).
+#[tokio::test]
+async fn grpc_route_rate_limited_via_extensionref() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "grpc-rl").await?;
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_RATE_LIMIT, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("grpc-rl.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+
+    // First, wait until a call succeeds — confirms the route is live and admits
+    // within the 1-cell budget (also drains the token).
+    wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("gRPC Echo via {host} to succeed once (within quota)") },
+        || async { grpc_echo_call(gw_addr, &host).await.ok() },
+    )
+    .await?;
+
+    // Rapid-fire: the bucket is drained, so at least one call must be rejected.
+    // The route is confirmed live, so a rejection is the rate limit — the proxy's
+    // 429 maps to gRPC `Unavailable`. Match that code specifically rather than any
+    // error, so a stray transport hiccup can't masquerade as enforcement.
+    let mut rate_limited = false;
+    for _ in 0..20 {
+        if let Err(s) = grpc_echo_call(gw_addr, &host).await
+            && s.code() == tonic::Code::Unavailable
+        {
+            rate_limited = true;
+            break;
+        }
+    }
+    anyhow::ensure!(
+        rate_limited,
+        "expected at least one gRPC call to be rate-limited (RateLimit rps=1, 429 → Unavailable) on rapid-fire"
     );
     Ok(())
 }

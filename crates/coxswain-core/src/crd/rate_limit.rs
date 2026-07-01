@@ -1,7 +1,7 @@
 //! `RateLimit` CRD — per-route rate-limiting policy for Gateway-API routes.
 //!
 //! Attached to an `HTTPRouteRule` via an `ExtensionRef` filter (group
-//! `coxswain-labs.dev`, kind `RateLimit`). The reflector resolves the named CR
+//! `gateway.coxswain-labs.dev`, kind `RateLimit`). The reflector resolves the named CR
 //! from this CRD and translates it into the governor-free [`RateLimitConfig`]
 //! type in `coxswain-core::routing` that the proxy uses for enforcement.
 //!
@@ -19,14 +19,14 @@ use serde::{Deserialize, Serialize};
 /// Rate-limiting policy for an `HTTPRoute` rule.
 ///
 /// Reference this CR from an `HTTPRouteRule.filters` entry with
-/// `type: ExtensionRef` pointing at `group: coxswain-labs.dev`,
+/// `type: ExtensionRef` pointing at `group: gateway.coxswain-labs.dev`,
 /// `kind: RateLimit`.  The proxy enforces one governor GCRA token bucket per
 /// distinct `by_header` value (or per client IP when `by_header` is absent) on
 /// the matching route; over-limit requests receive a `429 Too Many Requests`
 /// response with a `Retry-After` header.
 #[derive(CustomResource, Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[kube(
-    group = "coxswain-labs.dev",
+    group = "gateway.coxswain-labs.dev",
     version = "v1alpha1",
     kind = "RateLimit",
     plural = "ratelimits",
@@ -79,7 +79,7 @@ mod tests {
     fn parse_cr(spec_fragment: &str) -> RateLimit {
         let indented = spec_fragment.replace('\n', "\n  ");
         let yaml = format!(
-            "apiVersion: coxswain-labs.dev/v1alpha1\n\
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
              kind: RateLimit\n\
              metadata:\n  name: t\n\
              spec:\n  {indented}\n",
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn missing_rps_is_rejected() {
-        let yaml = "apiVersion: coxswain-labs.dev/v1alpha1\n\
+        let yaml = "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
                     kind: RateLimit\n\
                     metadata:\n  name: bad\n\
                     spec:\n  burst: 5\n";

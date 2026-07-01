@@ -35,6 +35,12 @@
 //!     > deploy/manifests/crds/ratelimits.yaml
 //! cp deploy/manifests/crds/ratelimits.yaml \
 //!     charts/coxswain/crds/ratelimits.yaml
+//!
+//! # IpAccessControl
+//! cargo run -p coxswain-core --example crdgen -- IpAccessControl \
+//!     > deploy/manifests/crds/ipaccesscontrols.yaml
+//! cp deploy/manifests/crds/ipaccesscontrols.yaml \
+//!     charts/coxswain/crds/ipaccesscontrols.yaml
 //! ```
 //!
 //! The snapshot tests in `coxswain-core` fail on drift between this generator
@@ -42,7 +48,7 @@
 
 use coxswain_core::crd::{
     ClientTrafficPolicy, CoxswainBackendPolicy, CoxswainGatewayParameters,
-    CoxswainIngressClassParameters, PathRewriteRegex, RateLimit,
+    CoxswainIngressClassParameters, IpAccessControl, PathRewriteRegex, RateLimit,
 };
 use kube::CustomResourceExt;
 
@@ -60,6 +66,7 @@ fn main() -> Result<(), serde_yaml::Error> {
         }
         "RateLimit" => serde_yaml::to_writer(std::io::stdout(), &RateLimit::crd()),
         "PathRewriteRegex" => serde_yaml::to_writer(std::io::stdout(), &PathRewriteRegex::crd()),
+        "IpAccessControl" => serde_yaml::to_writer(std::io::stdout(), &IpAccessControl::crd()),
         // No arg or "GatewayParameters" → gateway (backward-compatible default).
         _ => serde_yaml::to_writer(std::io::stdout(), &CoxswainGatewayParameters::crd()),
     }

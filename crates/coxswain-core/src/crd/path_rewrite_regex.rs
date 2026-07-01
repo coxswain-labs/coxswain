@@ -1,7 +1,7 @@
 //! `PathRewriteRegex` CRD — per-route path rewrite policy for Gateway-API routes.
 //!
 //! Attached to an `HTTPRouteRule` via an `ExtensionRef` filter (group
-//! `coxswain-labs.dev`, kind `PathRewriteRegex`). The reflector resolves the named CR
+//! `gateway.coxswain-labs.dev`, kind `PathRewriteRegex`). The reflector resolves the named CR
 //! from this CRD and translates it into a `RegexReplace` path modifier.
 //!
 //! Source of truth is the Rust type below; the on-disk CRD YAML
@@ -16,11 +16,11 @@ use serde::{Deserialize, Serialize};
 /// Path rewrite policy using regular expressions.
 ///
 /// Reference this CR from an `HTTPRouteRule.filters` entry with
-/// `type: ExtensionRef` pointing at `group: coxswain-labs.dev`,
+/// `type: ExtensionRef` pointing at `group: gateway.coxswain-labs.dev`,
 /// `kind: PathRewriteRegex`.
 #[derive(CustomResource, Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[kube(
-    group = "coxswain-labs.dev",
+    group = "gateway.coxswain-labs.dev",
     version = "v1alpha1",
     kind = "PathRewriteRegex",
     plural = "pathrewriteregexes",

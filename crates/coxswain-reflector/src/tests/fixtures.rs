@@ -1,4 +1,4 @@
-use coxswain_core::crd::{PathRewriteRegex, RateLimit};
+use coxswain_core::crd::{IpAccessControl, PathRewriteRegex, RateLimit};
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use kube::api::ObjectMeta;
@@ -70,6 +70,26 @@ pub(crate) fn empty_rate_limit_store() -> reflector::Store<RateLimit> {
 
 pub(crate) fn empty_path_rewrite_store() -> reflector::Store<PathRewriteRegex> {
     reflector::store::Writer::<PathRewriteRegex>::default().as_reader()
+}
+
+pub(crate) fn empty_ip_access_store() -> reflector::Store<IpAccessControl> {
+    reflector::store::Writer::<IpAccessControl>::default().as_reader()
+}
+
+pub(crate) fn make_rate_limit_store(crs: Vec<RateLimit>) -> reflector::Store<RateLimit> {
+    let mut writer = reflector::store::Writer::<RateLimit>::default();
+    for cr in crs {
+        writer.apply_watcher_event(&watcher::Event::Apply(cr));
+    }
+    writer.as_reader()
+}
+
+pub(crate) fn make_ip_access_store(crs: Vec<IpAccessControl>) -> reflector::Store<IpAccessControl> {
+    let mut writer = reflector::store::Writer::<IpAccessControl>::default();
+    for cr in crs {
+        writer.apply_watcher_event(&watcher::Event::Apply(cr));
+    }
+    writer.as_reader()
 }
 
 pub(crate) fn empty_secret_store() -> reflector::Store<Secret> {

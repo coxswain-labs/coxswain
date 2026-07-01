@@ -45,7 +45,9 @@ use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
 use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
 use coxswain_core::crd::coxswain_backend_policy::CoxswainBackendPolicy;
-use coxswain_core::crd::{CoxswainIngressClassParameters, PathRewriteRegex, RateLimit};
+use coxswain_core::crd::{
+    CoxswainIngressClassParameters, IpAccessControl, PathRewriteRegex, RateLimit,
+};
 use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 use coxswain_core::fleet::{self, SharedFleet};
 use coxswain_core::health::SubsystemHandle;
@@ -747,6 +749,9 @@ pub(super) struct ReflectorStores<'a> {
     /// `PathRewriteRegex` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters during Gateway API reconciliation.
     pub(super) path_rewrites: &'a reflector::Store<PathRewriteRegex>,
+    /// `IpAccessControl` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
+    /// filters into per-route source-IP allow/deny CIDR sets (#479).
+    pub(super) ip_access: &'a reflector::Store<IpAccessControl>,
     /// `ClientTrafficPolicy` CRs in scope — resolved per Gateway/listener to set
     /// `ListenerInfo.proxy_protocol` during rebuild (#327).
     pub(super) client_traffic_policies: &'a reflector::Store<ClientTrafficPolicy>,
@@ -1025,6 +1030,7 @@ struct GatewayApiStoreWriters {
     configmaps: reflector::store::Writer<ConfigMap>,
     rate_limits: reflector::store::Writer<RateLimit>,
     path_rewrites: reflector::store::Writer<PathRewriteRegex>,
+    ip_access: reflector::store::Writer<IpAccessControl>,
     listener_sets: reflector::store::Writer<ListenerSet>,
     namespaces: reflector::store::Writer<Namespace>,
     client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
@@ -1056,6 +1062,7 @@ fn add_gateway_api_reflectors(
         configmaps,
         rate_limits,
         path_rewrites,
+        ip_access,
         listener_sets,
         namespaces,
         client_traffic_policies,
@@ -1143,6 +1150,14 @@ fn add_gateway_api_reflectors(
         watcher::Config::default(),
         ReflectorEffects::new(notify, health, "path_rewrite_regex", metrics),
         "PathRewriteRegex",
+    );
+    spawn_reflector(
+        set,
+        ip_access,
+        scoped_api::<IpAccessControl>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "ip_access_control", metrics),
+        "IpAccessControl",
     );
     // GEP-1713: ListenerSets are namespaced and merged into their parent Gateway's
     // effective listener set during rebuild.
@@ -1251,6 +1266,7 @@ async fn spawn_tasks(
     let (configmap_reader, configmap_writer) = reflector::store::<ConfigMap>();
     let (rate_limit_reader, rate_limit_writer) = reflector::store::<RateLimit>();
     let (path_rewrite_reader, path_rewrite_writer) = reflector::store::<PathRewriteRegex>();
+    let (ip_access_reader, ip_access_writer) = reflector::store::<IpAccessControl>();
     let (tls_route_reader, tls_route_writer) = reader_writer::<TlsRoute>(pre.tls_routes);
     // ListenerSet is a status-relevant store: in the controller role its writer is
     // the shared one pre-created in `new`, so the status-writer's subscription and
@@ -1384,6 +1400,7 @@ async fn spawn_tasks(
             configmaps: configmap_writer,
             rate_limits: rate_limit_writer,
             path_rewrites: path_rewrite_writer,
+            ip_access: ip_access_writer,
             listener_sets: listener_set_writer,
             namespaces: namespace_writer,
             client_traffic_policies: ctp_writer,
@@ -1532,6 +1549,7 @@ async fn spawn_tasks(
                 configmaps: &configmap_reader,
                 rate_limits: &rate_limit_reader,
                 path_rewrites: &path_rewrite_reader,
+                ip_access: &ip_access_reader,
                 client_traffic_policies: &ctp_reader,
                 coxswain_backend_policies: &cbp_reader,
             };
