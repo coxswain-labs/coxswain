@@ -11,10 +11,11 @@
 //! same route keep accepting traffic.
 //!
 //! # Hot-path allocation budget
-//! Routes without the `circuit-breaker-threshold` annotation (all Gateway-API routes
-//! and most Ingress routes) short-circuit on the `Option<Arc<CircuitBreakerConfig>>`
-//! check in `upstream_peer`/`logging` — zero overhead.  Routes that carry the
-//! annotation hit the `DashMap` lookup per request: one hash probe, no allocation.
+//! Routes with no circuit breaker (Gateway-API routes without a `CoxswainBackendPolicy`
+//! `circuitBreaker`, and most Ingress routes) short-circuit on the
+//! `Option<Arc<CircuitBreakerConfig>>` check in `upstream_peer`/`logging` — zero
+//! overhead.  Routes that carry one hit the `DashMap` lookup per request: one hash
+//! probe, no allocation.
 //! The per-endpoint `BreakerEntry` is built once on first use.
 //!
 //! # State transitions and metrics
@@ -182,8 +183,9 @@ impl failsafe::Instrument for MetricsInstrument {
 ///
 /// Cloning is cheap (the inner `Arc<BreakerMap>` is reference-counted).
 /// Both `IngressProxy` and `GatewayProxy` hold a clone so they share a single
-/// breaker pool; Gateway-API routes never carry a `CircuitBreakerConfig` so their
-/// paths never touch the registry.
+/// breaker pool. A Gateway-API route carries a `CircuitBreakerConfig` only when a
+/// `CoxswainBackendPolicy` with `spec.circuitBreaker` targets its backend Service
+/// (#478); routes without one never touch the registry.
 #[non_exhaustive]
 #[derive(Clone, Default)]
 pub struct CircuitBreakerRegistry {
@@ -285,7 +287,32 @@ fn build_entry(route_id: &str, addr: SocketAddr, cfg: &CircuitBreakerConfig) -> 
         upstream: Box::clone(&upstream_str),
     };
 
-    let sm: Box<dyn BreakerOps + Send + Sync> = match cfg.max_open_duration {
+    // `failsafe::backoff::exponential` asserts `start ≥ 1s`, `max ≥ 1s`, and
+    // `max ≥ start`. These bounds are reachable from operator config — an Ingress
+    // annotation OR a CoxswainBackendPolicy `circuitBreaker` with a sub-second
+    // `open_duration`, a sub-second `max_open_duration`, or `max < open`. A panic
+    // here drops live traffic, so this data-plane choke point fails safe: when the
+    // exponential preconditions don't hold, fall back to constant backoff and WARN
+    // rather than letting the assert fire. Reflector-side parsing is best-effort;
+    // this is the structural guarantee.
+    let exp_max_open = cfg.max_open_duration.filter(|max_open| {
+        let ok = cfg.open_duration.as_secs() > 0
+            && max_open.as_secs() > 0
+            && *max_open >= cfg.open_duration;
+        if !ok {
+            tracing::warn!(
+                route = route_id,
+                open_duration_ms = cfg.open_duration.as_millis(),
+                max_open_duration_ms = max_open.as_millis(),
+                "circuit-breaker exponential backoff requires open_duration ≥ 1s, \
+                 max_open_duration ≥ 1s, and max_open_duration ≥ open_duration — \
+                 falling back to constant backoff"
+            );
+        }
+        ok
+    });
+
+    let sm: Box<dyn BreakerOps + Send + Sync> = match exp_max_open {
         Some(max_open) => {
             let policy = failure_policy::success_rate_over_time_window(
                 required_success_rate,
@@ -407,6 +434,29 @@ mod tests {
             entry.sm.is_call_permitted(),
             "fresh exponential breaker must permit first call"
         );
+    }
+
+    #[test]
+    fn build_entry_falls_back_to_constant_when_exponential_bounds_violated() {
+        // Each of these would trip a `failsafe::backoff::exponential` assert if it
+        // reached the call; build_entry must instead degrade to constant backoff
+        // and never panic on the data plane.
+        let bad = [
+            // open_duration < 1s (start.as_secs() == 0)
+            (Duration::from_millis(500), Some(Duration::from_secs(30))),
+            // max_open_duration < 1s (max.as_secs() == 0)
+            (Duration::from_secs(5), Some(Duration::from_millis(500))),
+            // max_open_duration < open_duration
+            (Duration::from_secs(5), Some(Duration::from_secs(2))),
+        ];
+        for (open, max) in bad {
+            let cfg = CircuitBreakerConfig::new(50, 5, Duration::from_secs(10), open, max);
+            let entry = build_entry("gateway/default/test:0.0", addr(), &cfg);
+            assert!(
+                entry.sm.is_call_permitted(),
+                "breaker with open={open:?}, max={max:?} must build (constant fallback) and permit"
+            );
+        }
     }
 
     #[test]

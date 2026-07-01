@@ -201,8 +201,12 @@ impl GatewayApiReconciler {
                 .iter()
                 .any(|f| matches!(f.r#type, HttpRouteRulesFiltersType::RequestRedirect));
 
-            let (group, error_status): (Option<Arc<BackendGroup>>, Option<u16>) = if has_redirect {
-                (None, None)
+            let (group, error_status, circuit_breaker): (
+                Option<Arc<BackendGroup>>,
+                Option<u16>,
+                Option<Arc<coxswain_core::routing::CircuitBreakerConfig>>,
+            ) = if has_redirect {
+                (None, None, None)
             } else {
                 let backend_refs = match rule.backend_refs.as_deref() {
                     Some(b) if !b.is_empty() => b,
@@ -272,17 +276,23 @@ impl GatewayApiReconciler {
                     };
                     group = group.with_tls(tls);
                 }
-                // CoxswainBackendPolicy (#354): apply per-backend connect/idle
-                // timeouts from the highest-weight backendRef's Service policy.
-                if let Some(bp) = pick_backend_policy(backend_refs, route_ns, backend_policy_index)
-                {
+                // CoxswainBackendPolicy: apply per-backend connect/idle timeouts
+                // (#354) and the LB algorithm (#389) to the BackendGroup from the
+                // highest-weight backendRef's Service policy. The circuit breaker
+                // (#478) is RouteEntry-level, carried out to the RuleContext below.
+                let bp = pick_backend_policy(backend_refs, route_ns, backend_policy_index);
+                if let Some(bp) = bp {
                     if bp.connect.is_some() {
                         group = group.with_connect_timeout(bp.connect);
                     }
                     if bp.idle.is_some() {
                         group = group.with_keepalive_timeout(bp.idle);
                     }
+                    if let Some(lb) = &bp.load_balance {
+                        group = group.with_load_balance(lb.clone());
+                    }
                 }
+                let circuit_breaker = bp.and_then(|bp| bp.circuit_breaker.clone());
                 let group = Arc::new(group);
                 if invalid_policy || client_cert_fail_closed {
                     // GEP-1897: a backend covered by an invalid BackendTLSPolicy MUST
@@ -290,7 +300,7 @@ impl GatewayApiReconciler {
                     // "upstream not reachable" which matches the spec intent. GEP-3155
                     // applies the same fail-closed 502 when the gateway client cert ref
                     // is configured but unresolvable.
-                    (Some(group), Some(502u16))
+                    (Some(group), Some(502u16), circuit_breaker)
                 } else if group.endpoints().is_empty() {
                     // HTTPRoute spec: a valid Service with zero ready endpoints
                     // SHOULD return 503; an invalid/missing backend or all-zero-
@@ -305,9 +315,9 @@ impl GatewayApiReconciler {
                         status,
                         "No ready endpoints for rule — installing error route"
                     );
-                    (Some(group), Some(status))
+                    (Some(group), Some(status), circuit_breaker)
                 } else {
-                    (Some(group), None)
+                    (Some(group), None, circuit_breaker)
                 }
             };
 
@@ -321,6 +331,7 @@ impl GatewayApiReconciler {
                 metric_route_id: &metric_route_id,
                 created_at,
                 rate_limit,
+                circuit_breaker,
                 route_ns,
                 path_rewrites,
                 slices,
@@ -459,6 +470,9 @@ struct RuleContext<'a> {
     metric_route_id: &'a Arc<str>,
     created_at: Option<SystemTime>,
     rate_limit: Option<Arc<RateLimitConfig>>,
+    /// Per-backend circuit breaker from the rule's winning `CoxswainBackendPolicy`
+    /// (#478). Shared across every entry the rule installs (one refcount bump each).
+    circuit_breaker: Option<Arc<coxswain_core::routing::CircuitBreakerConfig>>,
     route_ns: &'a str,
     path_rewrites: &'a reflector::Store<PathRewriteRegex>,
     slices: &'a reflector::Store<EndpointSlice>,
@@ -501,6 +515,7 @@ fn apply_rule(
         entry
             .with_metric_route_id(Arc::clone(ctx.metric_route_id))
             .with_rate_limit(ctx.rate_limit.clone())
+            .with_circuit_breaker(ctx.circuit_breaker.clone())
     };
 
     let backend_stores = super::filters::BackendStores {
