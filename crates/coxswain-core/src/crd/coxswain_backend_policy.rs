@@ -3,10 +3,12 @@
 //! Attaches to a Kubernetes `Service` (GEP-713 direct-policy attachment, the same
 //! pattern as [`ClientTrafficPolicy`](super::client_traffic_policy)) and applies
 //! per-upstream-connection settings to every Gateway API route whose backend
-//! resolves to that Service. This issue (#354) ships `spec.timeouts.connect` and
-//! `spec.timeouts.idle`; the CRD is the canonical future home for the rest of the
-//! per-backend connection policy surface (LB algorithm #389, circuit breaking
-//! #478, upstream-keepalive parity #365).
+//! resolves to that Service. It is the canonical home for the per-backend
+//! connection policy surface that has no Gateway API standard: `spec.timeouts`
+//! (connect/idle, #354), `spec.loadBalancer` (LB algorithm, #389), and
+//! `spec.circuitBreaker` (#478) — each a deliberately-proprietary parallel to the
+//! matching `ingress.coxswain-labs.dev/*` annotation. Upstream-keepalive parity
+//! (#365) is the remaining slot.
 //!
 //! Source of truth is the Rust type below; the on-disk CRD YAML
 //! (`deploy/manifests/crds/coxswainbackendpolicies.yaml` and
@@ -51,6 +53,20 @@ pub struct CoxswainBackendPolicySpec {
     /// effect on connection behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<BackendTimeouts>,
+
+    /// Upstream load-balancing algorithm for routes backed by the targeted
+    /// Service (#389). Gateway-API parity for the Ingress
+    /// `ingress.coxswain-labs.dev/load-balance` annotation. When `None` the
+    /// route keeps the default weighted round-robin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_balancer: Option<BackendLoadBalancer>,
+
+    /// Upstream circuit-breaker for routes backed by the targeted Service
+    /// (#478). Gateway-API parity for the Ingress
+    /// `ingress.coxswain-labs.dev/circuit-breaker-*` annotation family. When
+    /// `None` the breaker is disabled (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breaker: Option<BackendCircuitBreaker>,
 }
 
 /// A reference to a `Service` this policy targets.
@@ -98,6 +114,64 @@ pub struct BackendTimeouts {
     /// (connections stay until LRU capacity forces eviction).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle: Option<String>,
+}
+
+/// Upstream load-balancing algorithm selector (#389).
+///
+/// `algorithm` is a free-form string mirroring the Ingress
+/// `ingress.coxswain-labs.dev/load-balance` annotation vocabulary 1:1, so the two
+/// surfaces resolve identical values via the same shared parser
+/// ([`LoadBalance::parse_lenient`](coxswain_core_routing_load_balance)). It is
+/// intentionally **not** schema-enum-validated: an unrecognised value reaches the
+/// reflector, which WARNs and falls back to weighted round-robin rather than the
+/// apiserver rejecting the resource (matching [`BackendTimeouts`]).
+///
+/// Accepted values: `round_robin` (default), `least_conn`, `ewma`, `ip_hash`,
+/// `hash:uri`, `hash:source-ip`, `hash:header=<name>`, `hash:cookie=<name>`.
+///
+/// [coxswain_core_routing_load_balance]: https://docs.rs/coxswain-core/latest/coxswain_core/routing/enum.LoadBalance.html
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendLoadBalancer {
+    /// Algorithm selector string. See the type-level docs for the vocabulary.
+    pub algorithm: String,
+}
+
+/// Upstream circuit-breaker settings (#478).
+///
+/// Mirrors the `ingress.coxswain-labs.dev/circuit-breaker-*` annotation family.
+/// `threshold` is the gate: absent or out of the `1..=100` range disables the
+/// breaker (WARN + default). Durations are free-form GEP-2257 strings, **not**
+/// schema-pattern-validated — an unparseable value WARNs and falls back to the
+/// per-field default at the reflector (matching [`BackendTimeouts`]).
+#[non_exhaustive]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendCircuitBreaker {
+    /// Error rate (%) that trips the breaker (`1..=100`). The gate: absent or out
+    /// of range → breaker disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<u8>,
+
+    /// Rolling window over which the EWMA error rate is computed. Default `10s`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
+
+    /// How long the breaker stays open before allowing a probe. Default `5s`.
+    /// Starting duration when `maxOpenDuration` enables exponential backoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_duration: Option<String>,
+
+    /// Minimum requests in the window before the breaker can trip. Default `10`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_requests: Option<u32>,
+
+    /// Maximum open-duration cap. When set, the breaker uses exponential backoff
+    /// from `openDuration` up to this cap; when unset, the open duration is
+    /// constant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_open_duration: Option<String>,
 }
 
 /// Status written back to the `CoxswainBackendPolicy` by the controller.
@@ -219,6 +293,49 @@ mod tests {
         let t = cr.spec.timeouts.as_ref().expect("timeouts present");
         assert_eq!(t.connect.as_deref(), Some("500ms"));
         assert_eq!(t.idle.as_deref(), Some("60s"));
+    }
+
+    #[test]
+    fn load_balancer_algorithm_round_trips() {
+        let cr = parse_cr(concat!(
+            "targetRefs:\n",
+            "- kind: Service\n",
+            "  name: my-svc\n",
+            "loadBalancer:\n",
+            "  algorithm: least_conn",
+        ));
+        let lb = cr
+            .spec
+            .load_balancer
+            .as_ref()
+            .expect("loadBalancer present");
+        assert_eq!(lb.algorithm, "least_conn");
+        assert!(cr.spec.circuit_breaker.is_none());
+    }
+
+    #[test]
+    fn circuit_breaker_round_trips() {
+        let cr = parse_cr(concat!(
+            "targetRefs:\n",
+            "- kind: Service\n",
+            "  name: my-svc\n",
+            "circuitBreaker:\n",
+            "  threshold: 50\n",
+            "  window: 10s\n",
+            "  openDuration: 5s\n",
+            "  minRequests: 20\n",
+            "  maxOpenDuration: 1m",
+        ));
+        let cb = cr
+            .spec
+            .circuit_breaker
+            .as_ref()
+            .expect("circuitBreaker present");
+        assert_eq!(cb.threshold, Some(50));
+        assert_eq!(cb.window.as_deref(), Some("10s"));
+        assert_eq!(cb.open_duration.as_deref(), Some("5s"));
+        assert_eq!(cb.min_requests, Some(20));
+        assert_eq!(cb.max_open_duration.as_deref(), Some("1m"));
     }
 
     #[test]

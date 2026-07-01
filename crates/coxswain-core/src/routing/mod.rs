@@ -19,8 +19,8 @@ pub use common::auth::{
     PasswordHash,
 };
 pub use common::backend::{
-    BackendGroup, BackendGroupSpec, HashSource, LoadBalance, Selected, SessionAffinity,
-    affinity_hash, affinity_hash_parts, affinity_token,
+    BackendGroup, BackendGroupSpec, HashSource, LoadBalance, LoadBalanceParseError, Selected,
+    SessionAffinity, affinity_hash, affinity_hash_parts, affinity_token,
 };
 pub use common::circuit_breaker::CircuitBreakerConfig;
 pub use common::compression::CompressionConfig;

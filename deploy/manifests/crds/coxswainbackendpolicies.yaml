@@ -30,6 +30,61 @@ spec:
               `creationTimestamp`, ties broken by name) wins and the loser receives
               `Accepted=False, reason=Conflicted` in its status.
             properties:
+              circuitBreaker:
+                description: |-
+                  Upstream circuit-breaker for routes backed by the targeted Service
+                  (#478). Gateway-API parity for the Ingress
+                  `ingress.coxswain-labs.dev/circuit-breaker-*` annotation family. When
+                  `None` the breaker is disabled (the default).
+                nullable: true
+                properties:
+                  maxOpenDuration:
+                    description: |-
+                      Maximum open-duration cap. When set, the breaker uses exponential backoff
+                      from `openDuration` up to this cap; when unset, the open duration is
+                      constant.
+                    nullable: true
+                    type: string
+                  minRequests:
+                    description: Minimum requests in the window before the breaker can trip. Default `10`.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  openDuration:
+                    description: |-
+                      How long the breaker stays open before allowing a probe. Default `5s`.
+                      Starting duration when `maxOpenDuration` enables exponential backoff.
+                    nullable: true
+                    type: string
+                  threshold:
+                    description: |-
+                      Error rate (%) that trips the breaker (`1..=100`). The gate: absent or out
+                      of range → breaker disabled.
+                    format: uint8
+                    maximum: 255.0
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  window:
+                    description: Rolling window over which the EWMA error rate is computed. Default `10s`.
+                    nullable: true
+                    type: string
+                type: object
+              loadBalancer:
+                description: |-
+                  Upstream load-balancing algorithm for routes backed by the targeted
+                  Service (#389). Gateway-API parity for the Ingress
+                  `ingress.coxswain-labs.dev/load-balance` annotation. When `None` the
+                  route keeps the default weighted round-robin.
+                nullable: true
+                properties:
+                  algorithm:
+                    description: Algorithm selector string. See the type-level docs for the vocabulary.
+                    type: string
+                required:
+                - algorithm
+                type: object
               targetRefs:
                 description: |-
                   Services this policy targets.

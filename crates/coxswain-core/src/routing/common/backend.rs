@@ -105,6 +105,86 @@ pub enum LoadBalance {
     Hash(HashSource),
 }
 
+impl LoadBalance {
+    /// Parse a load-balance algorithm selector shared by the Ingress
+    /// `ingress.coxswain-labs.dev/load-balance` annotation and the
+    /// `CoxswainBackendPolicy` `loadBalancer.algorithm` field (#389), so the two
+    /// surfaces resolve identical vocabulary and can never drift.
+    ///
+    /// Accepts `round_robin`, `least_conn`, `ewma`, `ip_hash` (alias for
+    /// `hash:source-ip`), and the `hash:{uri,source-ip,header=<name>,cookie=<name>}`
+    /// forms. The proxy extracts and hashes the [`HashSource`] at request time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LoadBalanceParseError`] for an unknown selector, an unknown
+    /// `hash:` attribute, or an empty/invalid header or cookie name. Callers decide
+    /// how to surface it: the annotation path WARNs + falls back to `RoundRobin`;
+    /// the policy path WARNs + leaves the default behaviour untouched.
+    #[must_use = "the parsed LoadBalance (or the parse error) must be handled"]
+    pub fn parse_lenient(s: &str) -> Result<Self, LoadBalanceParseError> {
+        match s {
+            "round_robin" => Ok(Self::RoundRobin),
+            "least_conn" => Ok(Self::LeastConn),
+            "ewma" => Ok(Self::Ewma),
+            // Backward-compatible alias: ip_hash → hash:source-ip.
+            "ip_hash" => Ok(Self::Hash(HashSource::SourceIp)),
+            _ if s.starts_with("hash:") => Self::parse_hash_attribute(&s["hash:".len()..]),
+            _ => Err(LoadBalanceParseError::UnknownValue),
+        }
+    }
+
+    /// Parse the attribute portion of a `hash:<attr>` selector.
+    fn parse_hash_attribute(attr: &str) -> Result<Self, LoadBalanceParseError> {
+        match attr {
+            "uri" => Ok(Self::Hash(HashSource::Uri)),
+            "source-ip" => Ok(Self::Hash(HashSource::SourceIp)),
+            _ if attr.starts_with("header=") => {
+                let name = &attr["header=".len()..];
+                if name.is_empty() {
+                    return Err(LoadBalanceParseError::EmptyHeaderName);
+                }
+                HeaderName::from_bytes(name.as_bytes())
+                    .map(|h| Self::Hash(HashSource::Header(h)))
+                    .map_err(|_| LoadBalanceParseError::InvalidHeaderName)
+            }
+            _ if attr.starts_with("cookie=") => {
+                let name = &attr["cookie=".len()..];
+                if name.is_empty() {
+                    return Err(LoadBalanceParseError::EmptyCookieName);
+                }
+                Ok(Self::Hash(HashSource::Cookie(Arc::from(name))))
+            }
+            _ => Err(LoadBalanceParseError::UnknownHashAttr),
+        }
+    }
+}
+
+/// Failure modes of [`LoadBalance::parse_lenient`].
+///
+/// Each variant maps to a distinct operator-facing diagnostic at the call site;
+/// the offending input string is held by the caller, so the variants are
+/// fieldless.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum LoadBalanceParseError {
+    /// The selector matched no known algorithm or `hash:` form.
+    #[error("unknown load-balance value")]
+    UnknownValue,
+    /// A `hash:header=` form carried an empty header name.
+    #[error("empty header name in load-balance hash expression")]
+    EmptyHeaderName,
+    /// A `hash:header=` form carried a syntactically invalid header name.
+    #[error("invalid header name in load-balance hash expression")]
+    InvalidHeaderName,
+    /// A `hash:cookie=` form carried an empty cookie name.
+    #[error("empty cookie name in load-balance hash expression")]
+    EmptyCookieName,
+    /// The `hash:` form carried an unrecognised attribute.
+    #[error("unknown hash attribute in load-balance")]
+    UnknownHashAttr,
+}
+
 /// Deterministic FNV-1a hash of a byte slice.
 ///
 /// Used for both the per-endpoint affinity token ([`affinity_token`]) and the
@@ -1615,6 +1695,73 @@ mod tests {
             eps[0].ewma_ns.load(Ordering::Relaxed),
             expected,
             "EWMA folds via alpha=1/8"
+        );
+    }
+
+    // ── LoadBalance::parse_lenient (shared annotation/policy vocabulary) ───────
+
+    #[test]
+    fn parse_lenient_accepts_known_algorithms() {
+        assert_eq!(
+            LoadBalance::parse_lenient("round_robin"),
+            Ok(LoadBalance::RoundRobin)
+        );
+        assert_eq!(
+            LoadBalance::parse_lenient("least_conn"),
+            Ok(LoadBalance::LeastConn)
+        );
+        assert_eq!(LoadBalance::parse_lenient("ewma"), Ok(LoadBalance::Ewma));
+    }
+
+    #[test]
+    fn parse_lenient_ip_hash_aliases_source_ip() {
+        assert_eq!(
+            LoadBalance::parse_lenient("ip_hash"),
+            Ok(LoadBalance::Hash(HashSource::SourceIp))
+        );
+        assert_eq!(
+            LoadBalance::parse_lenient("hash:source-ip"),
+            Ok(LoadBalance::Hash(HashSource::SourceIp))
+        );
+        assert_eq!(
+            LoadBalance::parse_lenient("hash:uri"),
+            Ok(LoadBalance::Hash(HashSource::Uri))
+        );
+    }
+
+    #[test]
+    fn parse_lenient_hash_header_and_cookie_carry_their_source() {
+        match LoadBalance::parse_lenient("hash:header=x-user-id") {
+            Ok(LoadBalance::Hash(HashSource::Header(h))) => assert_eq!(h.as_str(), "x-user-id"),
+            other => panic!("expected header hash, got {other:?}"),
+        }
+        match LoadBalance::parse_lenient("hash:cookie=sid") {
+            Ok(LoadBalance::Hash(HashSource::Cookie(c))) => assert_eq!(&*c, "sid"),
+            other => panic!("expected cookie hash, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_lenient_surfaces_each_error_variant() {
+        assert_eq!(
+            LoadBalance::parse_lenient("bogus"),
+            Err(LoadBalanceParseError::UnknownValue)
+        );
+        assert_eq!(
+            LoadBalance::parse_lenient("hash:header="),
+            Err(LoadBalanceParseError::EmptyHeaderName)
+        );
+        assert_eq!(
+            LoadBalance::parse_lenient("hash:header=bad header"),
+            Err(LoadBalanceParseError::InvalidHeaderName)
+        );
+        assert_eq!(
+            LoadBalance::parse_lenient("hash:cookie="),
+            Err(LoadBalanceParseError::EmptyCookieName)
+        );
+        assert_eq!(
+            LoadBalance::parse_lenient("hash:nope"),
+            Err(LoadBalanceParseError::UnknownHashAttr)
         );
     }
 }
