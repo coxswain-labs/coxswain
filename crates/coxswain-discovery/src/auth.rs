@@ -760,8 +760,7 @@ pub(crate) mod tests {
         let got_snapshot =
             tokio::time::timeout(std::time::Duration::from_secs(3), inbound.message())
                 .await
-                .map_err(|_| tonic::Status::deadline_exceeded("timed out"))?
-                .map_err(|e| e)?
+                .map_err(|_| tonic::Status::deadline_exceeded("timed out"))??
                 .is_some();
 
         Ok(got_snapshot)

@@ -96,7 +96,7 @@ jobs:
         with:
           cache-key-prefix: ci-clippy
           components: clippy
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
 
   test:
     name: test

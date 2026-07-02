@@ -895,14 +895,9 @@ mod tests {
 
             // Drain the remaining inbound messages (Acks/Nacks) into `client_tx`.
             tokio::spawn(async move {
-                loop {
-                    match inbound.message().await {
-                        Ok(Some(msg)) => {
-                            if client_tx.send(msg).await.is_err() {
-                                break;
-                            }
-                        }
-                        _ => break,
+                while let Ok(Some(msg)) = inbound.message().await {
+                    if client_tx.send(msg).await.is_err() {
+                        break;
                     }
                 }
             });

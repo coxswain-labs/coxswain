@@ -1629,7 +1629,6 @@ mod tests {
                         ..Default::default()
                     },
                 ]),
-                ..Default::default()
             },
             ..Default::default()
         };
@@ -1755,7 +1754,6 @@ mod tests {
                         ..Default::default()
                     },
                 ]),
-                ..Default::default()
             },
             ..Default::default()
         };
@@ -1842,7 +1840,6 @@ mod tests {
                         ..Default::default()
                     },
                 ]),
-                ..Default::default()
             },
             ..Default::default()
         };
@@ -1989,7 +1986,6 @@ mod tests {
                     ),
                     ..Default::default()
                 }]),
-                ..Default::default()
             },
             ..Default::default()
         }

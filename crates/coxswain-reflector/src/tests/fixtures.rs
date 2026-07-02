@@ -46,7 +46,6 @@ pub(crate) fn make_slice_with_all_conditions(
                 serving,
                 ready,
                 terminating,
-                ..Default::default()
             }),
             ..Default::default()
         }]),
