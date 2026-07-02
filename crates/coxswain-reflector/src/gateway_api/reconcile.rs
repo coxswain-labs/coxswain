@@ -77,7 +77,10 @@ pub struct RouteResolution<'a> {
     /// the Ingress `auth-basic-secret` annotation reads — no duplicate watcher.
     pub auth_secrets: &'a reflector::Store<Secret>,
     /// `RequestSizeLimit` CR store for resolving `ExtensionRef` filters on
-    /// `HTTPRouteRule`s (#443). Protocol-agnostic — also resolved on GRPCRoute.
+    /// `HTTPRouteRule`s (#443). HTTPRoute-only — NOT enforced on GRPCRoute (#509): a
+    /// mid-stream body cap on HTTP/2 deadlocks the client under pingora, and gRPC
+    /// sends no `Content-Length` for the up-front check; gRPC relies on the backend's
+    /// own `max_recv_msg_size` until pingora ships request-body buffering (#816/#780).
     pub request_size_limits: &'a reflector::Store<RequestSizeLimit>,
     /// `Compression` CR store for resolving `ExtensionRef` filters on
     /// `HTTPRouteRule`s (#446). HTTPRoute-only — not supported on GRPCRoute.

@@ -91,6 +91,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             last_retry_condition: None,
             max_body_size: None,
             body_bytes_seen: 0,
+            is_h2: false,
             affinity_pin: None,
             affinity_set_cookie: false,
             auth_response_headers: None,
@@ -129,6 +130,10 @@ pub(crate) async fn request_filter<K>(
     let host: Arc<str> = Arc::from(extract_host(req));
     let path: Arc<str> = Arc::from(req.uri.path());
     let query = req.uri.query().map(str::to_string);
+    // Capture the downstream protocol once: the mid-stream `max_body_size` cap in
+    // `request_body_filter` must not fire on HTTP/2 (pingora deadlocks the client on a
+    // body-filter error, #509). h2 size limits are enforced up-front via Content-Length.
+    ctx.is_h2 = req.version == http::Version::HTTP_2;
     // Capture Origin early, before the session is mutably borrowed for response writing
     // (CORS preflight and response-header injection both need the value).
     ctx.cors_origin = req
@@ -632,16 +637,20 @@ fn content_length(session: &Session) -> Option<u64> {
 }
 
 /// Pingora `request_body_filter` body: enforce the per-route request-body size limit
-/// on streaming/chunked uploads, and tees body chunks to any active mirror tasks.
+/// on streaming/chunked **HTTP/1.x** uploads, and tees body chunks to any active mirror
+/// tasks.
 ///
 /// Called for every chunk of the request body (including a final call with
-/// `end_of_stream = true` when the body is complete). Accumulates the running byte
-/// count on the [`ProxyCtx`] and, once it exceeds the route's `max-body-size`, returns
-/// `Err(Error::explain(413, …))`. Pingora propagates that through `fail_to_proxy`,
-/// which writes a clean `413 Payload Too Large` to the client. The body is not buffered
-/// for size enforcement — the `u64` counter is the only state — so this stays within the
-/// hot-path allocation budget. No-ops for size enforcement when the route carries no
-/// limit (every Gateway-API route, and Ingress routes without the annotation).
+/// `end_of_stream = true` when the body is complete). On HTTP/1.x it accumulates the
+/// running byte count on the [`ProxyCtx`] and, once it exceeds the route's
+/// `max-body-size`, returns `Err(Error::explain(413, …))`. Pingora propagates that
+/// through `fail_to_proxy`, which writes a clean `413 Payload Too Large` to the client.
+/// The body is not buffered for size enforcement — the `u64` counter is the only state —
+/// so this stays within the hot-path allocation budget. No-ops for size enforcement when
+/// the route carries no limit (Ingress routes without the annotation) or the downstream
+/// is **HTTP/2** ([`ProxyCtx::is_h2`]): returning `Err` here on an h2 session deadlocks
+/// the client (#509), so h2/gRPC size limits are enforced only up-front via the
+/// `Content-Length` check in `request_filter`.
 ///
 /// When `mirror-target` is active, each chunk is also teed to all mirror tasks via
 /// bounded mpsc senders ([`ProxyCtx::mirror_txs`]). Chunks are sent with
@@ -651,14 +660,22 @@ fn content_length(session: &Session) -> Option<u64> {
 /// independent of `max-body-size` (#360).
 ///
 /// # Errors
-/// Returns `Error::explain(413, …)` once the cumulative body size exceeds the limit.
+/// On HTTP/1.x, returns `Error::explain(413, …)` once the cumulative body size exceeds
+/// the limit. Never errors on HTTP/2 (see above).
 pub(crate) fn request_body_filter(
     body: Option<&Bytes>,
     end_of_stream: bool,
     ctx: &mut ProxyCtx,
 ) -> Result<()> {
     // ── Body size enforcement ────────────────────────────────────────────────
-    if let Some(limit) = ctx.max_body_size {
+    // HTTP/2 is deliberately excluded: returning `Err` from this hook on an h2
+    // session deadlocks the client, because pingora's h2 proxy loop swallows the
+    // error and never surfaces a response (#509). h2 requests that *declare* an
+    // oversized body are already rejected up-front by the `Content-Length` check in
+    // `request_filter`; a streaming h2 upload without `Content-Length` (notably gRPC)
+    // is left to the backend's own limits until pingora supports request-body
+    // buffering (pingora #816/#780). HTTP/1.x keeps full mid-stream enforcement.
+    if let Some(limit) = ctx.max_body_size.filter(|_| !ctx.is_h2) {
         ctx.body_bytes_seen = ctx
             .body_bytes_seen
             .saturating_add(body.map_or(0, Bytes::len) as u64);
@@ -1280,4 +1297,42 @@ pub(crate) async fn logging(
         error = err_msg.as_deref(),
         "access",
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ctx_with_limit(limit: u64, is_h2: bool) -> ProxyCtx {
+        let mut ctx = ProxyCtx::default();
+        ctx.max_body_size = Some(limit);
+        ctx.is_h2 = is_h2;
+        ctx
+    }
+
+    #[test]
+    fn body_filter_rejects_oversized_on_h1() {
+        let mut ctx = ctx_with_limit(10, false);
+        let chunk = Bytes::from(vec![0u8; 20]);
+        // Over the 10-byte cap on an HTTP/1.x session → 413.
+        assert!(request_body_filter(Some(&chunk), true, &mut ctx).is_err());
+    }
+
+    #[test]
+    fn body_filter_allows_underlimit_on_h1() {
+        let mut ctx = ctx_with_limit(100, false);
+        let chunk = Bytes::from(vec![0u8; 20]);
+        assert!(request_body_filter(Some(&chunk), true, &mut ctx).is_ok());
+    }
+
+    #[test]
+    fn body_filter_never_rejects_on_h2() {
+        // #509: returning Err here on an h2 session deadlocks the client, so the
+        // mid-stream cap must be skipped entirely regardless of body size.
+        let mut ctx = ctx_with_limit(10, true);
+        let chunk = Bytes::from(vec![0u8; 1_000]);
+        assert!(request_body_filter(Some(&chunk), true, &mut ctx).is_ok());
+        // Counter is not even advanced on h2 (enforcement is fully disabled).
+        assert_eq!(ctx.body_bytes_seen, 0);
+    }
 }

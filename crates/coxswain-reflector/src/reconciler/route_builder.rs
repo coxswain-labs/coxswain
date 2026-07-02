@@ -252,7 +252,6 @@ pub(super) fn build_gateway_routes(
                 backend_policy_index: ownership.backend_policy_index,
                 rate_limits: stores.rate_limits,
                 ip_access: stores.ip_access,
-                request_size_limits: stores.request_size_limits,
             },
             &mut builder,
         );

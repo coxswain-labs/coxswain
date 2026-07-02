@@ -557,7 +557,7 @@ Semantics:
 
 ### Request size limit
 
-`RequestSizeLimit` (`gateway.coxswain-labs.dev/v1alpha1`) caps the request body size for a route. Attach it to an `HTTPRouteRule` or `GRPCRouteRule` with an `ExtensionRef` filter — the Gateway API surface for the Ingress `max-body-size` annotation. Unlike `BasicAuth`/`Compression`, this filter **is** supported on `GRPCRoute`: a proxy-side byte cap protects backends from oversized HTTP/2 gRPC messages too (orthogonal to gRPC's own max-message-size).
+`RequestSizeLimit` (`gateway.coxswain-labs.dev/v1alpha1`) caps the request body size for a route. Attach it to an `HTTPRouteRule` with an `ExtensionRef` filter — the Gateway API surface for the Ingress `max-body-size` annotation. Like `BasicAuth`/`Compression`, this filter is **HTTPRoute-only** and is not enforced on `GRPCRoute` (see [below](#request-size-limit-is-not-enforced-on-grpcroute)).
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -581,9 +581,15 @@ kind: HTTPRoute
 Semantics:
 
 - `maxSize` accepts a bare byte count or a `k`/`m`/`g`-suffixed size (binary multipliers, case-insensitive) — the same parser as the Ingress `max-body-size` annotation.
-- Requests exceeding the limit are rejected with `413 Payload Too Large`, checked up front against `Content-Length` when present and mid-stream for chunked/streaming bodies.
+- On HTTP/1.x, requests exceeding the limit are rejected with `413 Payload Too Large`, checked up front against `Content-Length` when present and mid-stream for chunked/streaming bodies.
+- On **HTTP/2**, only the up-front `Content-Length` check applies. A streaming HTTP/2 upload that omits `Content-Length` is **not** capped — it fails open (see the note below on why mid-stream HTTP/2 enforcement is deferred).
 - A missing `RequestSizeLimit` CR or an unparseable `maxSize` fails open (no limit enforced).
-- **Known limitation on GRPCRoute (HTTP/2):** the security guarantee holds — an oversized gRPC message is never forwarded to the backend — but a `pingora-proxy` 0.8.1 limitation means the client does not currently receive a clean rejection status over HTTP/2 the way an HTTP/1.1 client gets a `413`; the connection instead hangs until it is otherwise closed. Tracked in [#509](https://github.com/coxswain-labs/coxswain/issues/509).
+
+#### Request size limit is not enforced on GRPCRoute
+
+`RequestSizeLimit` attached to a `GRPCRoute` is accepted but **not enforced** — the reconciler skips it and logs a WARN line (as it does for `BasicAuth`/`Compression`). gRPC message sizes are instead governed by the backend's own `max_recv_msg_size` (gRPC servers reject oversized messages with `RESOURCE_EXHAUSTED`; the default receive cap is ~4 MB).
+
+The reason is a `pingora-proxy` limitation: a `request_body_filter` rejection over HTTP/2 is swallowed by pingora's h2 proxy loop and never delivered to the client, deadlocking the request ([#509](https://github.com/coxswain-labs/coxswain/issues/509)). gRPC never sends `Content-Length`, so the up-front check that guards HTTP/2 elsewhere cannot apply. Faithful edge enforcement for gRPC/HTTP/2 needs buffer-first rejection (as Envoy's `buffer` filter does) and is deferred until pingora ships request-body buffering (pingora [#816](https://github.com/cloudflare/pingora/issues/816)/[#780](https://github.com/cloudflare/pingora/issues/780)).
 
 ### Response compression
 
@@ -704,11 +710,11 @@ Header matching uses the same `Exact` and `RegularExpression` semantics as `HTTP
 | `spec.hostnames` | Full (including wildcards) |
 | `spec.rules[].matches[].method` | `Exact` and `RegularExpression` |
 | `spec.rules[].matches[].headers` | Full |
-| `spec.rules[].filters` | `RequestHeaderModifier`, `ResponseHeaderModifier`, `ExtensionRef` (`RateLimit`, `IpAccessControl`, `RequestSizeLimit`) |
+| `spec.rules[].filters` | `RequestHeaderModifier`, `ResponseHeaderModifier`, `ExtensionRef` (`RateLimit`, `IpAccessControl`) |
 | `spec.rules[].backendRefs` | Service backends only |
 | `spec.rules[].backendRefs[].weight` | Full |
 
-GRPCRoute supports the protocol-agnostic `ExtensionRef` filters — [`RateLimit`](rate-limiting.md), [`IpAccessControl`](#ip-access-control), and [`RequestSizeLimit`](#request-size-limit) — which apply identically to gRPC (HTTP/2) traffic. `PathRewriteRegex` is not supported: for gRPC the request path *is* the `/{service}/{method}` RPC address, so rewriting it is meaningless. `BasicAuth` and `Compression` are HTTP-only idioms and are not supported either — gRPC clients authenticate with bearer tokens or mTLS, and gRPC compresses per-message at the framing layer rather than via HTTP `Content-Encoding`. Any other `ExtensionRef` (and `RequestMirror`) is skipped with a WARN log line.
+GRPCRoute supports the protocol-agnostic `ExtensionRef` filters — [`RateLimit`](rate-limiting.md) and [`IpAccessControl`](#ip-access-control) — which apply identically to gRPC (HTTP/2) traffic. `PathRewriteRegex` is not supported: for gRPC the request path *is* the `/{service}/{method}` RPC address, so rewriting it is meaningless. `BasicAuth` and `Compression` are HTTP-only idioms and are not supported either — gRPC clients authenticate with bearer tokens or mTLS, and gRPC compresses per-message at the framing layer rather than via HTTP `Content-Encoding`. `RequestSizeLimit` is also not enforced on gRPC — a mid-stream body cap over HTTP/2 deadlocks the client under pingora ([#509](https://github.com/coxswain-labs/coxswain/issues/509)), so gRPC message sizes are left to the backend's `max_recv_msg_size` ([details](#request-size-limit-is-not-enforced-on-grpcroute)). Any other `ExtensionRef` (and `RequestMirror`) is skipped with a WARN log line.
 
 ### Status conditions
 

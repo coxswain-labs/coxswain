@@ -760,10 +760,8 @@ mod grpcecho {
 /// Issue one `GrpcEcho/Echo` unary call through the Gateway VIP for `host`,
 /// with an arbitrary request message type. Connect/transport failures are
 /// folded into `Status::unavailable` so callers can match on `tonic::Code`
-/// uniformly. Bounded to 20s total (`Status::deadline_exceeded` on expiry) so
-/// a server that accepts the connection but never responds — which is
-/// exactly what a broken byte-cap-over-HTTP/2 rejection would look like —
-/// fails the test instead of hanging the whole suite indefinitely.
+/// uniformly. Bounded to 20s total (`Status::deadline_exceeded` on expiry) as a
+/// general safety net so a stuck call fails the test instead of hanging the suite.
 async fn grpc_echo_call<Req: prost::Message + Default + 'static>(
     gw_addr: SocketAddr,
     host: &str,
@@ -812,16 +810,21 @@ async fn grpc_echo_call_inner<Req: prost::Message + Default + 'static>(
         .map(tonic::Response::into_inner)
 }
 
-/// `RequestSizeLimit` CR via `ExtensionRef` on a GRPCRoute (maxSize: 1k): a
-/// normal (small) call succeeds — proving the route is live and the
-/// ExtensionRef accepted — then an oversized message never succeeds (#443
-/// GRPCRoute parity). Asserts the security invariant (oversized body never
-/// reaches the backend), not a specific client-visible status: pingora-proxy
-/// 0.8.1's HTTP/2 proxy loop doesn't deliver a clean rejection response for a
-/// mid-stream `request_body_filter` error the way it does over HTTP/1.1 — see
-/// coxswain-labs/coxswain#509.
+/// `RequestSizeLimit` is deliberately **not enforced** on GRPCRoute (#443 scope
+/// decision, coxswain-labs/coxswain#509). A mid-stream body cap over HTTP/2 deadlocks
+/// the client under pingora (its h2 proxy loop swallows a `request_body_filter`
+/// rejection instead of responding), and gRPC never sends `Content-Length` for the
+/// up-front check to use — so coxswain leaves gRPC message sizing to the backend's own
+/// `max_recv_msg_size` until pingora ships request-body buffering (pingora #816/#780).
+/// The reconciler skips the `RequestSizeLimit` ExtensionRef on GRPCRoute (logged as
+/// unsupported, like `BasicAuth`/`Compression`), so an over-cap message routes through
+/// untouched.
+///
+/// Asserts non-enforcement: with a 1 KiB `RequestSizeLimit` attached, both a small call
+/// and a 2 KiB over-cap call succeed promptly — the backend echoes them, no rejection
+/// and (critically) no hang.
 #[tokio::test]
-async fn gateway_request_size_limit_enforces_cap_on_grpcroute() -> anyhow::Result<()> {
+async fn gateway_request_size_limit_not_enforced_on_grpcroute() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "gw-grpc-maxbody").await?;
     fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
@@ -835,12 +838,11 @@ async fn gateway_request_size_limit_enforces_cap_on_grpcroute() -> anyhow::Resul
     let host = format!("grpc-maxbody.{}.local", ns.name);
     let gw_addr = h.gateway_http_addr(&ns.name).await?;
 
-    // First, wait until a small call succeeds — confirms the route is live and
-    // under-limit messages pass.
+    // Wait until a small call succeeds — confirms the route is live.
     wait::poll_until(
         Duration::from_secs(60),
         Duration::from_millis(500),
-        || async { format!("gRPC Echo via {host} to succeed (under limit)") },
+        || async { format!("gRPC Echo via {host} to succeed") },
         || async {
             grpc_echo_call(gw_addr, &host, grpcecho::EchoRequest {})
                 .await
@@ -849,31 +851,18 @@ async fn gateway_request_size_limit_enforces_cap_on_grpcroute() -> anyhow::Resul
     )
     .await?;
 
-    // An oversized message (2 KiB padding > 1 KiB cap) must never succeed. The
-    // route is confirmed live, so any error here other than Unimplemented (404,
-    // route not yet live — a stale-route false positive) demonstrates the byte
-    // cap held: the security invariant is that the oversized body is never
-    // forwarded to grpc-echo, which `request_body_filter` guarantees regardless
-    // of what the client observes.
-    //
-    // The client-visible outcome is, unfortunately, not a clean gRPC rejection
-    // status today: pingora-proxy 0.8.1's HTTP/2 proxy loop does not deliver a
-    // response to the client when `request_body_filter` rejects a body
-    // mid-stream (it only happens on the HTTP/1.1 path) — see
-    // coxswain-labs/coxswain#509. `grpc_echo_call`'s 20s bound turns that hang
-    // into a `DeadlineExceeded` status here, which this assertion accepts as
-    // the documented current behavior rather than a test bug.
+    // A 2 KiB message far exceeds the CR's 1 KiB cap. Because RequestSizeLimit is not
+    // enforced on GRPCRoute, it must route through to grpc-echo and succeed — proving
+    // the edge does not cap gRPC bodies, and that a rejected body no longer hangs the
+    // client (#509). The route is confirmed live above, so this is a single atomic call.
     let oversized = grpcecho::PaddedEchoRequest {
         padding: vec![0u8; 2048],
     };
-    let result = grpc_echo_call(gw_addr, &host, oversized).await;
-    match result {
-        Ok(_) => anyhow::bail!("oversized gRPC message must be rejected, got Ok"),
-        Err(s) if s.code() == tonic::Code::Unimplemented => {
-            anyhow::bail!("route not live (Unimplemented) — not a size-limit rejection")
-        }
-        Err(_) => {}
-    }
+    grpc_echo_call(gw_addr, &host, oversized).await.map_err(|s| {
+        anyhow::anyhow!(
+            "over-cap gRPC call must succeed (RequestSizeLimit is not enforced on gRPC), got {s:?}"
+        )
+    })?;
 
     Ok(())
 }

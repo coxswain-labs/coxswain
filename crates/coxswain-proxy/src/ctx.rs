@@ -165,6 +165,15 @@ pub struct ProxyCtx {
     /// Compared against [`Self::max_body_size`] to abort over-limit streaming/chunked
     /// uploads with 413 without buffering the whole body.
     pub body_bytes_seen: u64,
+    /// `true` when the downstream request is HTTP/2 (h2, h2c, or gRPC). Captured
+    /// once at `request_filter` entry from the request version.
+    ///
+    /// Gates the mid-stream `max_body_size` cap in `request_body_filter`: on HTTP/2
+    /// we must NOT reject from the body-filter hook because pingora's h2 proxy loop
+    /// swallows the error and deadlocks the client (#509). h2 size limits are enforced
+    /// only up-front via the `Content-Length` pre-check; correct mid-stream h2/gRPC
+    /// enforcement awaits pingora request-body buffering (pingora #816/#780).
+    pub is_h2: bool,
     /// Session-affinity endpoint resolved in `request_filter` from the request's
     /// cookie/header against the matched `BackendGroup`'s affinity index. When `Some`,
     /// `upstream_peer` pins to it instead of taking a round-robin tick. `None` (the
@@ -300,4 +309,5 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 192);
 // ProxyCtx: -24 stream-concurrent mirroring (#360): mirrors: Vec<MirrorDispatch> (24B) +
 //   mirror_body: Vec<Bytes> (24B) replaced by mirror_txs: Vec<mpsc::Sender<Bytes>> (24B);
 //   the two staging fields collapse into one sender vec (560→536).
+// ProxyCtx: +0 for is_h2: bool absorbed into existing alignment padding (#509).
 const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 536);

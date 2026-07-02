@@ -19,7 +19,7 @@ use crate::gw_types::{
 };
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
-use coxswain_core::crd::{IpAccessControl, RateLimit, RequestSizeLimit};
+use coxswain_core::crd::{IpAccessControl, RateLimit};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
@@ -39,10 +39,14 @@ use std::time::SystemTime;
 /// Precomputed context for GRPCRoute reconciliation.
 ///
 /// Slimmer than [`super::reconcile::RouteResolution`]: GRPCRoute supports the
-/// protocol-agnostic ExtensionRef filters — `RateLimit` (#25), `IpAccessControl`
-/// (#479), and `RequestSizeLimit` (#443) — but not `PathRewriteRegex` (for gRPC
-/// the path *is* the `/{service}/{method}` RPC address, so rewriting it is
-/// meaningless), nor `BasicAuth`/`Compression` (HTTP-only idioms, #442/#446).
+/// protocol-agnostic ExtensionRef filters — `RateLimit` (#25) and `IpAccessControl`
+/// (#479) — but not `PathRewriteRegex` (for gRPC the path *is* the
+/// `/{service}/{method}` RPC address, so rewriting it is meaningless), nor
+/// `BasicAuth`/`Compression` (HTTP-only idioms, #442/#446), nor `RequestSizeLimit`
+/// (#443): a mid-stream body-size cap on HTTP/2 deadlocks the client under pingora
+/// (#509), and gRPC never sends `Content-Length` for the up-front check to use — so
+/// gRPC messages are size-limited by the backend's own `max_recv_msg_size` until
+/// pingora supports request-body buffering (pingora #816/#780).
 #[non_exhaustive]
 pub struct GrpcRouteResolution<'a> {
     /// `(gw_ns, gw_name, listener_name) → (hostname, port)` for every listener on owned Gateways.
@@ -57,10 +61,6 @@ pub struct GrpcRouteResolution<'a> {
     /// `IpAccessControl` CR store for resolving `ExtensionRef` filters into per-route
     /// source-IP allow/deny CIDR sets (#479). A missing CR fails open (no filtering).
     pub ip_access: &'a reflector::Store<IpAccessControl>,
-    /// `RequestSizeLimit` CR store for resolving `ExtensionRef` filters into a
-    /// per-route body-size cap (#443). Protocol-agnostic — a byte cap protects
-    /// backends from oversized HTTP/2 gRPC messages too.
-    pub request_size_limits: &'a reflector::Store<RequestSizeLimit>,
 }
 
 /// Result of looking up a `BackendTLSPolicy` for a rule's backend refs.
@@ -90,7 +90,6 @@ pub(super) fn reconcile(
         backend_policy_index,
         rate_limits,
         ip_access,
-        request_size_limits,
     } = resolution;
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
@@ -244,8 +243,6 @@ pub(super) fn reconcile(
         let (allow_source_range, deny_source_range) =
             resolve_grpc_ip_access(rule_filters, route_ns, ip_access);
         let rate_limit = resolve_grpc_rate_limit(rule_filters, route_ns, rate_limits);
-        let max_body_size =
-            resolve_grpc_request_size_limit(rule_filters, route_ns, request_size_limits);
         let ctx = GrpcRuleContext {
             filters: rule_filters,
             error_status,
@@ -256,7 +253,6 @@ pub(super) fn reconcile(
             rate_limit,
             allow_source_range,
             deny_source_range,
-            max_body_size,
         };
         for (hostname_opt, port) in &bindings {
             let pb = builder.for_port(*port);
@@ -326,35 +322,6 @@ fn resolve_grpc_rate_limit(
     None
 }
 
-/// GRPCRoute counterpart to [`super::filters::resolve_request_size_limit`]:
-/// scans a rule's filters for a `RequestSizeLimit` `ExtensionRef` and resolves
-/// it into a byte-count limit (#443). Protocol-agnostic — gRPC reuses the same
-/// per-ref resolver as HTTP; only the filter-list iteration differs.
-fn resolve_grpc_request_size_limit(
-    filters: &[GrpcRouteRulesFilters],
-    route_ns: &str,
-    request_size_limits: &reflector::Store<RequestSizeLimit>,
-) -> Option<u64> {
-    for f in filters {
-        if !matches!(f.r#type, GrpcRouteRulesFiltersType::ExtensionRef) {
-            continue;
-        }
-        let Some(ext) = &f.extension_ref else {
-            continue;
-        };
-        if let Some(limit) = super::filters::resolve_request_size_limit_ref(
-            &ext.group,
-            &ext.kind,
-            &ext.name,
-            route_ns,
-            request_size_limits,
-        ) {
-            return limit;
-        }
-    }
-    None
-}
-
 struct GrpcRuleContext<'a> {
     filters: &'a [GrpcRouteRulesFilters],
     error_status: Option<u16>,
@@ -373,9 +340,6 @@ struct GrpcRuleContext<'a> {
     /// Source-IP deny-list resolved from the same `IpAccessControl`. Enforced before
     /// `allow_source_range` in the proxy.
     deny_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
-    /// Request-body byte cap resolved from the rule's `RequestSizeLimit`
-    /// `ExtensionRef` (#443). Shared across every entry the rule installs.
-    max_body_size: Option<u64>,
 }
 
 /// Installs one GRPCRoute rule (all its matches) into a `HostRouterBuilder`.
@@ -413,7 +377,6 @@ fn apply_grpc_rule(
             .with_allow_source_range(ctx.allow_source_range.clone())
             .with_deny_source_range(ctx.deny_source_range.clone())
             .with_circuit_breaker(ctx.circuit_breaker.clone())
-            .with_max_body_size(ctx.max_body_size)
     };
 
     match rule.matches.as_deref() {
@@ -630,17 +593,15 @@ fn build_filters(filters: &[GrpcRouteRulesFilters]) -> Vec<FilterAction> {
                 }
             }
             GrpcRouteRulesFiltersType::ExtensionRef => {
-                // RateLimit (#25), IpAccessControl (#479), and RequestSizeLimit
-                // (#443) ExtensionRefs are resolved separately (into the route's
-                // rate-limit config, source-IP allow/deny sets, and body-size cap
-                // respectively); any other ExtensionRef is unsupported on
-                // GRPCRoute — notably BasicAuth (#442) and Compression (#446),
-                // both HTTP-only idioms.
+                // RateLimit (#25) and IpAccessControl (#479) ExtensionRefs are
+                // resolved separately (into the route's rate-limit config and
+                // source-IP allow/deny sets); any other ExtensionRef is unsupported
+                // on GRPCRoute — notably BasicAuth (#442), Compression (#446), and
+                // RequestSizeLimit (#443, see #509: a mid-stream h2 body cap deadlocks
+                // the client under pingora; gRPC is limited by the backend instead).
                 let supported = f.extension_ref.as_ref().is_some_and(|ext| {
                     ext.group == "gateway.coxswain-labs.dev"
-                        && (ext.kind == "RateLimit"
-                            || ext.kind == "IpAccessControl"
-                            || ext.kind == "RequestSizeLimit")
+                        && (ext.kind == "RateLimit" || ext.kind == "IpAccessControl")
                 });
                 if !supported {
                     tracing::warn!(
