@@ -41,14 +41,32 @@
 //!     > deploy/manifests/crds/ipaccesscontrols.yaml
 //! cp deploy/manifests/crds/ipaccesscontrols.yaml \
 //!     charts/coxswain/crds/ipaccesscontrols.yaml
+//!
+//! # BasicAuth
+//! cargo run -p coxswain-core --example crdgen -- BasicAuth \
+//!     > deploy/manifests/crds/basicauths.yaml
+//! cp deploy/manifests/crds/basicauths.yaml \
+//!     charts/coxswain/crds/basicauths.yaml
+//!
+//! # RequestSizeLimit
+//! cargo run -p coxswain-core --example crdgen -- RequestSizeLimit \
+//!     > deploy/manifests/crds/requestsizelimits.yaml
+//! cp deploy/manifests/crds/requestsizelimits.yaml \
+//!     charts/coxswain/crds/requestsizelimits.yaml
+//!
+//! # Compression
+//! cargo run -p coxswain-core --example crdgen -- Compression \
+//!     > deploy/manifests/crds/compressions.yaml
+//! cp deploy/manifests/crds/compressions.yaml \
+//!     charts/coxswain/crds/compressions.yaml
 //! ```
 //!
 //! The snapshot tests in `coxswain-core` fail on drift between this generator
 //! and the committed YAML.
 
 use coxswain_core::crd::{
-    ClientTrafficPolicy, CoxswainBackendPolicy, CoxswainGatewayParameters,
-    CoxswainIngressClassParameters, IpAccessControl, PathRewriteRegex, RateLimit,
+    BasicAuth, ClientTrafficPolicy, Compression, CoxswainBackendPolicy, CoxswainGatewayParameters,
+    CoxswainIngressClassParameters, IpAccessControl, PathRewriteRegex, RateLimit, RequestSizeLimit,
 };
 use kube::CustomResourceExt;
 
@@ -67,6 +85,9 @@ fn main() -> Result<(), serde_yaml::Error> {
         "RateLimit" => serde_yaml::to_writer(std::io::stdout(), &RateLimit::crd()),
         "PathRewriteRegex" => serde_yaml::to_writer(std::io::stdout(), &PathRewriteRegex::crd()),
         "IpAccessControl" => serde_yaml::to_writer(std::io::stdout(), &IpAccessControl::crd()),
+        "BasicAuth" => serde_yaml::to_writer(std::io::stdout(), &BasicAuth::crd()),
+        "RequestSizeLimit" => serde_yaml::to_writer(std::io::stdout(), &RequestSizeLimit::crd()),
+        "Compression" => serde_yaml::to_writer(std::io::stdout(), &Compression::crd()),
         // No arg or "GatewayParameters" → gateway (backward-compatible default).
         _ => serde_yaml::to_writer(std::io::stdout(), &CoxswainGatewayParameters::crd()),
     }

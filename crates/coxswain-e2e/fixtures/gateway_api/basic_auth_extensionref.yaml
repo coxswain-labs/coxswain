@@ -1,0 +1,68 @@
+# BasicAuth ExtensionRef fixture (apply backends::ECHO first).
+#
+# A BasicAuth CR references an htpasswd Secret (alice:secret, bcrypt); an
+# HTTPRoute references the CR via an ExtensionRef filter. The proxy must:
+#   * admit a request carrying valid Authorization: Basic credentials, and
+#   * reject a request with missing/invalid credentials with 401.
+#
+# Credentials: alice:secret (bcrypt).
+#
+# Gateway: coxswain-basicauth on GATEWAY_HTTP_PORT.
+# Route host: gwbasicauth.TESTNS.local, path / -> echo-a:3000.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-basicauth
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gw-auth-htpasswd
+  labels:
+    ingress.coxswain-labs.dev/auth-basic: "true"
+type: Opaque
+data:
+  auth: YWxpY2U6JDJ5JDA0JHdyUkZRU0NCZXpZTFR5V1hKS1dldXVPaHRGdWtyQWo3UHpQWXRRc09ORWg4ck9PampJTGFLCg==
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: BasicAuth
+metadata:
+  name: basicauth
+spec:
+  secretRef:
+    name: gw-auth-htpasswd
+    namespace: ${TESTNS}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: basicauth-route
+spec:
+  parentRefs:
+    - name: coxswain-basicauth
+  hostnames:
+    - "gwbasicauth.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: BasicAuth
+            name: basicauth
+      backendRefs:
+        - name: echo-a
+          port: 3000

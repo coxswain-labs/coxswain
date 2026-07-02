@@ -1,0 +1,46 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: requestsizelimits.gateway.coxswain-labs.dev
+spec:
+  group: gateway.coxswain-labs.dev
+  names:
+    categories: []
+    kind: RequestSizeLimit
+    plural: requestsizelimits
+    shortNames: []
+    singular: requestsizelimit
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for RequestSizeLimitSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Request-body size limit for an `HTTPRoute` or `GRPCRoute` rule.
+
+              Reference this CR from a rule's `filters` entry with `type: ExtensionRef`
+              pointing at `group: gateway.coxswain-labs.dev`, `kind: RequestSizeLimit`.
+              The proxy rejects a request whose body exceeds `maxSize` with `413 Payload
+              Too Large`, checked up front against `Content-Length` when present and
+              mid-stream for chunked/streaming bodies.
+            properties:
+              maxSize:
+                description: |-
+                  Maximum request body size — a byte count or `k`/`m`/`g`-suffixed size
+                  (case-insensitive, binary multipliers), e.g. `"8m"`. Matches the
+                  Ingress `max-body-size` annotation's `parse_byte_size` semantics.
+                type: string
+            required:
+            - maxSize
+            type: object
+        required:
+        - spec
+        title: RequestSizeLimit
+        type: object
+    served: true
+    storage: true
+    subresources: {}

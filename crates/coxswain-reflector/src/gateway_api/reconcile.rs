@@ -20,13 +20,15 @@ use crate::status::{
     GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerSource, ListenerStatusKey,
 };
 use crate::tls::load_tls_cert;
-use coxswain_core::crd::{IpAccessControl, PathRewriteRegex, RateLimit};
+use coxswain_core::crd::{
+    BasicAuth, Compression, IpAccessControl, PathRewriteRegex, RateLimit, RequestSizeLimit,
+};
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
-    BackendClientCert, BackendGroup, BackendProtocol, FilterAction, GatewayRoutingTableBuilder,
-    HostRouterBuilder, MatchPredicates, RateLimitConfig, RouteEntry, RouteTimeouts, UpstreamTls,
-    WildcardKind,
+    BackendClientCert, BackendGroup, BackendProtocol, CompressionConfig, FilterAction,
+    GatewayRoutingTableBuilder, HostRouterBuilder, IngressAuthConfig, MatchPredicates,
+    RateLimitConfig, RouteEntry, RouteTimeouts, UpstreamTls, WildcardKind,
 };
 use coxswain_core::tls::PortTlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -67,6 +69,19 @@ pub struct RouteResolution<'a> {
     /// `HTTPRouteRule`s into per-route `allow`/`deny` source-IP CIDR sets (#479).
     /// Looked up by `(namespace, name)`; a missing CR fails open (no filtering).
     pub ip_access: &'a reflector::Store<IpAccessControl>,
+    /// `BasicAuth` CR store for resolving `ExtensionRef` filters on `HTTPRouteRule`s
+    /// (#442). HTTPRoute-only — not supported on GRPCRoute.
+    pub basic_auths: &'a reflector::Store<BasicAuth>,
+    /// Label-scoped htpasswd Secrets (`ingress.coxswain-labs.dev/auth-basic=true`)
+    /// consumed by a resolved `BasicAuth` CR's `secretRef` (#442). The same store
+    /// the Ingress `auth-basic-secret` annotation reads — no duplicate watcher.
+    pub auth_secrets: &'a reflector::Store<Secret>,
+    /// `RequestSizeLimit` CR store for resolving `ExtensionRef` filters on
+    /// `HTTPRouteRule`s (#443). Protocol-agnostic — also resolved on GRPCRoute.
+    pub request_size_limits: &'a reflector::Store<RequestSizeLimit>,
+    /// `Compression` CR store for resolving `ExtensionRef` filters on
+    /// `HTTPRouteRule`s (#446). HTTPRoute-only — not supported on GRPCRoute.
+    pub compressions: &'a reflector::Store<Compression>,
     /// `ObjectKey(gw_ns, gw_name) → BackendClientCert` for Gateways that resolved a
     /// `spec.tls.backend.clientCertificateRef` (GEP-3155). A route's effective client
     /// cert comes from its owned parent Gateway; it is attached to any `UpstreamTls`
@@ -106,6 +121,10 @@ impl GatewayApiReconciler {
             rate_limits,
             path_rewrites,
             ip_access,
+            basic_auths,
+            auth_secrets,
+            request_size_limits,
+            compressions,
             backend_client_certs,
             backend_client_cert_failures,
         } = resolution;
@@ -330,6 +349,19 @@ impl GatewayApiReconciler {
                 super::filters::resolve_rate_limit(rule_filters, route_ns, rate_limits);
             let (allow_source_range, deny_source_range) =
                 super::filters::resolve_ip_access(rule_filters, route_ns, ip_access);
+            let auth = super::filters::resolve_basic_auth(
+                rule_filters,
+                route_ns,
+                basic_auths,
+                auth_secrets,
+            );
+            let max_body_size = super::filters::resolve_request_size_limit(
+                rule_filters,
+                route_ns,
+                request_size_limits,
+            );
+            let compression =
+                super::filters::resolve_compression(rule_filters, route_ns, compressions);
             let ctx = RuleContext {
                 filters: rule_filters,
                 timeouts: &rule_timeouts,
@@ -341,6 +373,9 @@ impl GatewayApiReconciler {
                 allow_source_range,
                 deny_source_range,
                 circuit_breaker,
+                auth,
+                max_body_size,
+                compression,
                 route_ns,
                 path_rewrites,
                 slices,
@@ -488,6 +523,14 @@ struct RuleContext<'a> {
     /// Per-backend circuit breaker from the rule's winning `CoxswainBackendPolicy`
     /// (#478). Shared across every entry the rule installs (one refcount bump each).
     circuit_breaker: Option<Arc<coxswain_core::routing::CircuitBreakerConfig>>,
+    /// Auth config resolved from the rule's `BasicAuth` `ExtensionRef` (#442).
+    auth: Option<Arc<IngressAuthConfig>>,
+    /// Request-body byte cap resolved from the rule's `RequestSizeLimit`
+    /// `ExtensionRef` (#443).
+    max_body_size: Option<u64>,
+    /// Response-compression config resolved from the rule's `Compression`
+    /// `ExtensionRef` (#446).
+    compression: Option<Arc<CompressionConfig>>,
     route_ns: &'a str,
     path_rewrites: &'a reflector::Store<PathRewriteRegex>,
     slices: &'a reflector::Store<EndpointSlice>,
@@ -533,6 +576,9 @@ fn apply_rule(
             .with_allow_source_range(ctx.allow_source_range.clone())
             .with_deny_source_range(ctx.deny_source_range.clone())
             .with_circuit_breaker(ctx.circuit_breaker.clone())
+            .with_auth(ctx.auth.clone())
+            .with_max_body_size(ctx.max_body_size)
+            .with_compression(ctx.compression.clone())
     };
 
     let backend_stores = super::filters::BackendStores {
@@ -1369,6 +1415,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1409,6 +1459,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1449,6 +1503,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1481,6 +1539,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1512,6 +1574,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1583,6 +1649,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1629,6 +1699,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1701,6 +1775,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1784,6 +1862,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1841,6 +1923,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1932,6 +2018,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1979,6 +2069,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -2018,6 +2112,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -2059,6 +2157,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -2092,6 +2194,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -2131,6 +2237,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },

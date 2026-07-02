@@ -1,4 +1,6 @@
-use coxswain_core::crd::{IpAccessControl, PathRewriteRegex, RateLimit};
+use coxswain_core::crd::{
+    BasicAuth, Compression, IpAccessControl, PathRewriteRegex, RateLimit, RequestSizeLimit,
+};
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use kube::api::ObjectMeta;
@@ -94,6 +96,52 @@ pub(crate) fn make_ip_access_store(crs: Vec<IpAccessControl>) -> reflector::Stor
 
 pub(crate) fn empty_secret_store() -> reflector::Store<Secret> {
     reflector::store::Writer::<Secret>::default().as_reader()
+}
+
+pub(crate) fn make_secret_store(secrets: Vec<Secret>) -> reflector::Store<Secret> {
+    let mut writer = reflector::store::Writer::<Secret>::default();
+    for secret in secrets {
+        writer.apply_watcher_event(&watcher::Event::Apply(secret));
+    }
+    writer.as_reader()
+}
+
+pub(crate) fn empty_basic_auth_store() -> reflector::Store<BasicAuth> {
+    reflector::store::Writer::<BasicAuth>::default().as_reader()
+}
+
+pub(crate) fn make_basic_auth_store(crs: Vec<BasicAuth>) -> reflector::Store<BasicAuth> {
+    let mut writer = reflector::store::Writer::<BasicAuth>::default();
+    for cr in crs {
+        writer.apply_watcher_event(&watcher::Event::Apply(cr));
+    }
+    writer.as_reader()
+}
+
+pub(crate) fn empty_request_size_limit_store() -> reflector::Store<RequestSizeLimit> {
+    reflector::store::Writer::<RequestSizeLimit>::default().as_reader()
+}
+
+pub(crate) fn make_request_size_limit_store(
+    crs: Vec<RequestSizeLimit>,
+) -> reflector::Store<RequestSizeLimit> {
+    let mut writer = reflector::store::Writer::<RequestSizeLimit>::default();
+    for cr in crs {
+        writer.apply_watcher_event(&watcher::Event::Apply(cr));
+    }
+    writer.as_reader()
+}
+
+pub(crate) fn empty_compression_store() -> reflector::Store<Compression> {
+    reflector::store::Writer::<Compression>::default().as_reader()
+}
+
+pub(crate) fn make_compression_store(crs: Vec<Compression>) -> reflector::Store<Compression> {
+    let mut writer = reflector::store::Writer::<Compression>::default();
+    for cr in crs {
+        writer.apply_watcher_event(&watcher::Event::Apply(cr));
+    }
+    writer.as_reader()
 }
 
 pub(crate) fn make_svc_store(services: Vec<Service>) -> reflector::Store<Service> {

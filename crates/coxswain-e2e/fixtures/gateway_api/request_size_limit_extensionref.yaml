@@ -1,0 +1,56 @@
+# RequestSizeLimit ExtensionRef fixture (apply backends::ECHO first).
+#
+# A RequestSizeLimit CR caps request bodies at 1 KiB. An HTTPRoute references
+# it via an ExtensionRef filter. The proxy must:
+#   * serve an under-limit POST (echo backend identity, 2xx), and
+#   * reject an over-limit POST with 413 — both when Content-Length declares the
+#     size up front and when a chunked/streaming body (no Content-Length) crosses
+#     the cap mid-stream.
+#
+# Gateway: coxswain-maxbody on GATEWAY_HTTP_PORT.
+# Route host: gwmaxbody.TESTNS.local, path / -> echo-a:3000.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-maxbody
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RequestSizeLimit
+metadata:
+  name: one-kib
+spec:
+  maxSize: "1k"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: maxbody-route
+spec:
+  parentRefs:
+    - name: coxswain-maxbody
+  hostnames:
+    - "gwmaxbody.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: RequestSizeLimit
+            name: one-kib
+      backendRefs:
+        - name: echo-a
+          port: 3000
