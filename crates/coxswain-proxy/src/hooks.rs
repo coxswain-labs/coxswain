@@ -268,13 +268,22 @@ pub(crate) async fn request_filter<K>(
     // Evaluated BEFORE the allow-list: a denied IP is blocked even when the allow-list
     // would admit it. A None client IP is fail-open (not denied) — a block list only
     // acts on IPs it can positively attribute to a listed range.
+    //
+    // Written explicitly via `session.write_response_header` (like the rate-limit
+    // block below) rather than returned as `Err(Error::explain(...))`: Pingora's
+    // generic `fail_to_proxy` error path does not reliably deliver a client-visible
+    // response over HTTP/2 (confirmed via a gRPC client hanging instead of observing
+    // 403 → PermissionDenied), while the explicit low-level write works on both
+    // HTTP/1.1 and HTTP/2.
     if let Some(nets) = m.deny_source_range.as_deref() {
         let client_ip = ctx.client_ip;
         if ip_denied(client_ip, nets) {
-            return Err(pingora_core::Error::explain(
-                HTTPStatus(403),
-                "client IP in deny-list",
-            ));
+            let resp = ResponseHeader::build(403, Some(0))?;
+            session
+                .write_response_header(Box::new(resp), true)
+                .await
+                .unwrap_or_else(|e| tracing::error!("failed to write deny-list response: {e}"));
+            return Ok(true);
         }
     }
 
@@ -283,13 +292,17 @@ pub(crate) async fn request_filter<K>(
     // never receives a redirect (which would leak the canonical host/URL) nor has
     // its body read. The real client IP is resolved once by resolve_client_ip (above)
     // and cached on ctx — no per-request allocation for the CIDR scan.
+    //
+    // Written explicitly for the same HTTP/2 reason as the deny-list block above.
     if let Some(nets) = m.allow_source_range.as_deref()
         && !ip_allowed(ctx.client_ip, nets)
     {
-        return Err(pingora_core::Error::explain(
-            HTTPStatus(403),
-            "client IP not in allow-list",
-        ));
+        let resp = ResponseHeader::build(403, Some(0))?;
+        session
+            .write_response_header(Box::new(resp), true)
+            .await
+            .unwrap_or_else(|e| tracing::error!("failed to write allow-list response: {e}"));
+        return Ok(true);
     }
 
     // Per-route rate limiting. Enforcement runs after allow-list (denied clients
