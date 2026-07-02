@@ -272,7 +272,7 @@ spec:
 | `URLRewrite` | Supported (hostname and path rewrite) |
 | `RequestRedirect` | Supported (scheme, hostname, port, path, status code) |
 | `RequestMirror` | Supported — GEP-3171 fire-and-forget shadow traffic with optional `percent` or `fraction` sampling; multiple filters per rule for multiple mirrors |
-| `ExtensionRef` | Supported (for `RateLimit`, `PathRewriteRegex`, and `IpAccessControl` Coxswain extensions) |
+| `ExtensionRef` | Supported (for `RateLimit`, `PathRewriteRegex`, `IpAccessControl`, `BasicAuth`, `RequestSizeLimit`, and `Compression` Coxswain extensions) |
 | `CORS` | Supported — GEP-1767 preflight short-circuit and response-header injection |
 
 ### Attaching to a Gateway
@@ -523,6 +523,106 @@ Semantics:
 
 The client IP is resolved through the same path as the rest of the data plane: the PROXY-protocol peer when a `ClientTrafficPolicy` enables PROXY protocol on the listener, otherwise the L4 downstream peer. There is no Gateway-side trusted-forwarded-header surface yet, so behind an L7 load balancer that terminates the connection, enable PROXY protocol so the real client IP reaches the filter.
 
+### Basic authentication
+
+`BasicAuth` (`gateway.coxswain-labs.dev/v1alpha1`) validates `Authorization: Basic` credentials against an htpasswd `Secret`. Attach it to an `HTTPRouteRule` with an `ExtensionRef` filter — the Gateway API surface for the Ingress `auth-basic-secret` annotation. HTTP Basic auth is a browser/HTTP idiom, so this filter is **not** supported on `GRPCRoute` (gRPC clients authenticate with bearer tokens or mTLS instead).
+
+```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: BasicAuth
+metadata:
+  name: office-only
+spec:
+  secretRef:
+    name: office-htpasswd
+    namespace: default
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+# ...
+    filters:
+      - type: ExtensionRef
+        extensionRef:
+          group: gateway.coxswain-labs.dev
+          kind: BasicAuth
+          name: office-only
+```
+
+Semantics:
+
+- The referenced `Secret` **must** carry the label `ingress.coxswain-labs.dev/auth-basic: "true"` and store the htpasswd file under the key `auth` (nginx convention) — the same requirements as the Ingress annotation, so one Secret can back both surfaces.
+- Supported hash formats: bcrypt (`$2a$`/`$2b$`/`$2y$`) and Apache SHA1 (`{SHA}`, accepted but logged as weak).
+- Valid credentials are forwarded; missing/invalid credentials get `401` with `WWW-Authenticate`.
+- A missing, unlabeled, or unparseable Secret — or a missing `BasicAuth` CR's `secretRef` — fails **closed** with `503`, distinct from a missing `BasicAuth` CR itself (which fails open: no auth enforced).
+
+### Request size limit
+
+`RequestSizeLimit` (`gateway.coxswain-labs.dev/v1alpha1`) caps the request body size for a route. Attach it to an `HTTPRouteRule` or `GRPCRouteRule` with an `ExtensionRef` filter — the Gateway API surface for the Ingress `max-body-size` annotation. Unlike `BasicAuth`/`Compression`, this filter **is** supported on `GRPCRoute`: a proxy-side byte cap protects backends from oversized HTTP/2 gRPC messages too (orthogonal to gRPC's own max-message-size).
+
+```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RequestSizeLimit
+metadata:
+  name: small-uploads
+spec:
+  maxSize: "8m"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+# ...
+    filters:
+      - type: ExtensionRef
+        extensionRef:
+          group: gateway.coxswain-labs.dev
+          kind: RequestSizeLimit
+          name: small-uploads
+```
+
+Semantics:
+
+- `maxSize` accepts a bare byte count or a `k`/`m`/`g`-suffixed size (binary multipliers, case-insensitive) — the same parser as the Ingress `max-body-size` annotation.
+- Requests exceeding the limit are rejected with `413 Payload Too Large`, checked up front against `Content-Length` when present and mid-stream for chunked/streaming bodies.
+- A missing `RequestSizeLimit` CR or an unparseable `maxSize` fails open (no limit enforced).
+
+### Response compression
+
+`Compression` (`gateway.coxswain-labs.dev/v1alpha1`) enables gzip/brotli response compression for a route. Attach it to an `HTTPRouteRule` with an `ExtensionRef` filter — the Gateway API surface for the Ingress `compression-*` annotations. gRPC compresses per-message at the gRPC framing layer (`grpc-encoding`), not via HTTP `Content-Encoding`, so this filter is **not** supported on `GRPCRoute`; the proxy also refuses to compress any response whose `Content-Type` starts with `application/grpc`, even on an HTTPRoute (a gRPC-over-HTTPRoute edge case), regardless of the CR's `types` allow-list.
+
+```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: Compression
+metadata:
+  name: default-compression
+spec:
+  gzip: true
+  brotli: true
+  level: 6
+  minSize: 1024
+  types:
+    - text/html
+    - text/plain
+    - text/css
+    - application/json
+    - application/javascript
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+# ...
+    filters:
+      - type: ExtensionRef
+        extensionRef:
+          group: gateway.coxswain-labs.dev
+          kind: Compression
+          name: default-compression
+```
+
+Semantics:
+
+- At least one of `gzip` / `brotli` must be `true` for the CR to have any effect; when both are `false` (the default) it is a no-op.
+- Brotli is preferred over gzip when both are enabled and the client advertises `br` in `Accept-Encoding`.
+- `level` (1–9, default `6`), `minSize` (bytes, default `1024`), and `types` (default: `text/html`, `text/plain`, `text/css`, `application/json`, `application/javascript`) mirror the Ingress `compression-*` annotation defaults.
+- A missing `Compression` CR fails open (no compression).
+
 ### Status conditions
 
 | Condition | True when |
@@ -603,11 +703,11 @@ Header matching uses the same `Exact` and `RegularExpression` semantics as `HTTP
 | `spec.hostnames` | Full (including wildcards) |
 | `spec.rules[].matches[].method` | `Exact` and `RegularExpression` |
 | `spec.rules[].matches[].headers` | Full |
-| `spec.rules[].filters` | `RequestHeaderModifier`, `ResponseHeaderModifier`, `ExtensionRef` (`RateLimit`, `IpAccessControl`) |
+| `spec.rules[].filters` | `RequestHeaderModifier`, `ResponseHeaderModifier`, `ExtensionRef` (`RateLimit`, `IpAccessControl`, `RequestSizeLimit`) |
 | `spec.rules[].backendRefs` | Service backends only |
 | `spec.rules[].backendRefs[].weight` | Full |
 
-GRPCRoute supports the protocol-agnostic `ExtensionRef` filters — [`RateLimit`](rate-limiting.md) and [`IpAccessControl`](#ip-access-control) — which apply identically to gRPC (HTTP/2) traffic. `PathRewriteRegex` is not supported: for gRPC the request path *is* the `/{service}/{method}` RPC address, so rewriting it is meaningless. Any other `ExtensionRef` (and `RequestMirror`) is skipped with a WARN log line.
+GRPCRoute supports the protocol-agnostic `ExtensionRef` filters — [`RateLimit`](rate-limiting.md), [`IpAccessControl`](#ip-access-control), and [`RequestSizeLimit`](#request-size-limit) — which apply identically to gRPC (HTTP/2) traffic. `PathRewriteRegex` is not supported: for gRPC the request path *is* the `/{service}/{method}` RPC address, so rewriting it is meaningless. `BasicAuth` and `Compression` are HTTP-only idioms and are not supported either — gRPC clients authenticate with bearer tokens or mTLS, and gRPC compresses per-message at the framing layer rather than via HTTP `Content-Encoding`. Any other `ExtensionRef` (and `RequestMirror`) is skipped with a WARN log line.
 
 ### Status conditions
 

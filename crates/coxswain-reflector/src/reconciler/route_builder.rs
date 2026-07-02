@@ -227,6 +227,10 @@ pub(super) fn build_gateway_routes(
                 rate_limits: stores.rate_limits,
                 path_rewrites: stores.path_rewrites,
                 ip_access: stores.ip_access,
+                basic_auths: stores.basic_auths,
+                auth_secrets: stores.auth_secrets,
+                request_size_limits: stores.request_size_limits,
+                compressions: stores.compressions,
                 backend_client_certs: ownership.backend_client_certs,
                 backend_client_cert_failures: ownership.backend_client_cert_failures,
             },
@@ -248,6 +252,7 @@ pub(super) fn build_gateway_routes(
                 backend_policy_index: ownership.backend_policy_index,
                 rate_limits: stores.rate_limits,
                 ip_access: stores.ip_access,
+                request_size_limits: stores.request_size_limits,
             },
             &mut builder,
         );

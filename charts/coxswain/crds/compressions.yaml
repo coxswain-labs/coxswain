@@ -1,0 +1,77 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: compressions.gateway.coxswain-labs.dev
+spec:
+  group: gateway.coxswain-labs.dev
+  names:
+    categories: []
+    kind: Compression
+    plural: compressions
+    shortNames: []
+    singular: compression
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for CompressionSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Response-compression policy for an `HTTPRoute` rule.
+
+              Reference this CR from an `HTTPRouteRule.filters` entry with
+              `type: ExtensionRef` pointing at `group: gateway.coxswain-labs.dev`,
+              `kind: Compression`. At least one of [`gzip`](Self::gzip) /
+              [`brotli`](Self::brotli) must be `true` for the filter to have any effect;
+              when both are `false` (the default) the CR is a no-op.
+            properties:
+              brotli:
+                default: false
+                description: |-
+                  Compress responses with brotli when the client advertises `br` in
+                  `Accept-Encoding`. Brotli is preferred over gzip when both are enabled.
+                  Defaults to `false`.
+                type: boolean
+              gzip:
+                default: false
+                description: |-
+                  Compress responses with gzip when the client advertises `gzip` in
+                  `Accept-Encoding`. Defaults to `false`.
+                type: boolean
+              level:
+                description: |-
+                  Compression level, `1`–`9` (default `6` when absent). Applies to both
+                  gzip and brotli.
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              minSize:
+                description: |-
+                  Minimum response body size in bytes below which compression is
+                  skipped (default `1024`). Compared against `Content-Length` when
+                  present; chunked responses are always compressed regardless.
+                format: uint64
+                minimum: 0.0
+                nullable: true
+                type: integer
+              types:
+                description: |-
+                  Allow-list of media types (the part of `Content-Type` before `;`)
+                  eligible for compression. Defaults to `["text/html", "text/plain",
+                  "text/css", "application/json", "application/javascript"]` when
+                  absent or empty.
+                items:
+                  type: string
+                type: array
+            type: object
+        required:
+        - spec
+        title: Compression
+        type: object
+    served: true
+    storage: true
+    subresources: {}

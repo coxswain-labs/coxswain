@@ -26,6 +26,9 @@ resources:
   - crds/ratelimits.yaml
   - crds/pathrewriteregexes.yaml
   - crds/ipaccesscontrols.yaml
+  - crds/basicauths.yaml
+  - crds/requestsizelimits.yaml
+  - crds/compressions.yaml
   - gateway-class.yaml
   - ingress-class.yaml
   - vap-ingress-annotations.yaml

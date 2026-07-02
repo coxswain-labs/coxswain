@@ -14,13 +14,16 @@ use pingora_http::{RequestHeader, ResponseHeader};
 /// encoder on `ctx.compression_encoder`.
 ///
 /// Called from [`crate::hooks::upstream_response_filter`] when the matched route
-/// carries a [`CompressionConfig`].  The decision is a conjunction of five guards:
+/// carries a [`CompressionConfig`].  The decision is a conjunction of six guards:
 ///
 /// 1. The response status is a normal body-bearing code (not 1xx/204/304).
 /// 2. The response does not already have a `Content-Encoding` header.
-/// 3. The response `Content-Type` (media type before `;`) is in the allow-list.
-/// 4. The response `Content-Length` is either absent or ≥ `min_size`.
-/// 5. The client's `Accept-Encoding` advertises an enabled algorithm.
+/// 3. The response `Content-Type` is not `application/grpc*` (#446) — checked
+///    unconditionally, independent of `cfg.types`, since gRPC framing (not HTTP
+///    `Content-Encoding`) owns response compression and corrupting it is never safe.
+/// 4. The response `Content-Type` (media type before `;`) is in the allow-list.
+/// 5. The response `Content-Length` is either absent or ≥ `min_size`.
+/// 6. The client's `Accept-Encoding` advertises an enabled algorithm.
 ///
 /// On a positive decision, the encoder is stored in `ctx.compression_encoder`;
 /// the response headers are adjusted (add `Content-Encoding`, add/extend `Vary`,
@@ -48,17 +51,28 @@ pub(crate) fn maybe_setup_compression(
         return;
     }
 
-    // Guard 3: Content-Type must be in the allow-list.
     let ct = resp
         .headers
         .get(CONTENT_TYPE)
         .and_then(|v| std::str::from_utf8(v.as_bytes()).ok())
         .unwrap_or("");
+
+    // Guard 3: never compress a gRPC response — gRPC compresses per-message at
+    // the framing layer (`grpc-encoding`), not via HTTP `Content-Encoding`; doing
+    // so here would corrupt the framing on a gRPC-over-HTTPRoute response. This
+    // check ignores `cfg.types` on purpose — a misconfigured allow-list must not
+    // be able to defeat it.
+    let media_type = ct.split(';').next().unwrap_or("").trim().as_bytes();
+    if media_type.len() >= 16 && media_type[..16].eq_ignore_ascii_case(b"application/grpc") {
+        return;
+    }
+
+    // Guard 4: Content-Type must be in the allow-list.
     if !cfg.allows_type(ct) {
         return;
     }
 
-    // Guard 4: Content-Length, when present, must be >= min_size.
+    // Guard 5: Content-Length, when present, must be >= min_size.
     // Absent Content-Length (chunked upstream) is allowed — we cannot know the
     // size in advance, so we compress optimistically.
     if let Some(cl_val) = resp.headers.get(CONTENT_LENGTH) {
@@ -71,7 +85,7 @@ pub(crate) fn maybe_setup_compression(
         }
     }
 
-    // Guard 5: client Accept-Encoding — pick algorithm (brotli preferred).
+    // Guard 6: client Accept-Encoding — pick algorithm (brotli preferred).
     let ae = req
         .headers
         .get(header::ACCEPT_ENCODING)
@@ -328,6 +342,40 @@ mod tests {
         let mut ctx = ProxyCtx::default();
         maybe_setup_compression(&req, &mut resp, &mut ctx, &cfg);
         assert!(ctx.compression_encoder.is_none(), "204 must be skipped");
+    }
+
+    #[test]
+    fn setup_compression_skips_grpc_content_type_even_when_allow_listed() {
+        // Misconfigured allow-list explicitly includes "application/grpc" — the
+        // gRPC guard must still win regardless of `cfg.types` (#446).
+        let cfg = CompressionConfig::new(
+            true,
+            false,
+            6,
+            0,
+            vec!["application/grpc".into()].into_boxed_slice(),
+        );
+        let req = req_with_ae("gzip");
+        let mut resp = resp_200("application/grpc", None);
+        let mut ctx = ProxyCtx::default();
+        maybe_setup_compression(&req, &mut resp, &mut ctx, &cfg);
+        assert!(
+            ctx.compression_encoder.is_none(),
+            "application/grpc must never be compressed"
+        );
+    }
+
+    #[test]
+    fn setup_compression_skips_grpc_content_type_with_proto_suffix() {
+        let cfg = gzip_cfg();
+        let req = req_with_ae("gzip");
+        let mut resp = resp_200("application/grpc+proto", Some(4096));
+        let mut ctx = ProxyCtx::default();
+        maybe_setup_compression(&req, &mut resp, &mut ctx, &cfg);
+        assert!(
+            ctx.compression_encoder.is_none(),
+            "application/grpc+proto must never be compressed"
+        );
     }
 
     #[test]

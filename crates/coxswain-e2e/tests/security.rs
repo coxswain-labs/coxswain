@@ -1303,6 +1303,99 @@ async fn request_rejected_when_basic_auth_secret_unlabeled() -> anyhow::Result<(
     Ok(())
 }
 
+// ── BasicAuth ExtensionRef (Gateway API, #442) ────────────────────────────────
+
+/// `BasicAuth` CR via `ExtensionRef`: a request carrying valid `Authorization:
+/// Basic` credentials is admitted (200) (#442 happy path — also proves the
+/// ExtensionRef is accepted on HTTPRoute).
+#[tokio::test]
+async fn gateway_basic_auth_valid_credential_admitted() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-basicauth-ok").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::BASIC_AUTH_EXTENSIONREF, FixtureVars::new(&ns.name)).await?;
+    let host = format!("gwbasicauth.{}.local", ns.name);
+
+    // alice:secret (bcrypt) → Authorization: Basic YWxpY2U6c2VjcmV0.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("gateway BasicAuth route to admit alice:secret at {host}") },
+        || async {
+            let result = h
+                .http
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+                .await;
+            match result {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+    Ok(())
+}
+
+/// `BasicAuth` CR via `ExtensionRef`: a request with wrong credentials is
+/// rejected with 401 + `WWW-Authenticate` (#442 sad path — invalid credentials).
+#[tokio::test]
+async fn gateway_basic_auth_invalid_credential_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-basicauth-bad").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::BASIC_AUTH_EXTENSIONREF, FixtureVars::new(&ns.name)).await?;
+    let host = format!("gwbasicauth.{}.local", ns.name);
+
+    // Wait until the route is live and enforcing: no credentials → 401 (not 404).
+    wait::wait_for_route_status(&h.http, &host, "/", 401, Duration::from_secs(90)).await?;
+
+    // wrong:password → Authorization: Basic d3Jvbmc6cGFzc3dvcmQ=
+    let (status, resp_hdrs, _) = h
+        .http
+        .get_full_with_headers(
+            &host,
+            "/",
+            &[("authorization", "Basic d3Jvbmc6cGFzc3dvcmQ=")],
+        )
+        .await?;
+    anyhow::ensure!(
+        status == 401,
+        "expected 401 for wrong credentials, got {status}"
+    );
+    anyhow::ensure!(
+        resp_hdrs.contains_key(reqwest::header::WWW_AUTHENTICATE),
+        "expected WWW-Authenticate header in 401 response; got: {resp_hdrs:?}"
+    );
+    Ok(())
+}
+
+/// `BasicAuth` CR referencing an UNLABELED Secret: the reflector never loads
+/// it, so the proxy fails closed with 503 — even valid credentials are refused
+/// (#442 sad path — fail-closed label requirement).
+#[tokio::test]
+async fn gateway_basic_auth_unlabeled_secret_fails_closed() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-basicauth-nolabel").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        gwa::BASIC_AUTH_EXTENSIONREF_UNLABELED,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let host = format!("gwbasicauthnolabel.{}.local", ns.name);
+
+    wait::wait_for_route_status(&h.http, &host, "/", 503, Duration::from_secs(90)).await?;
+
+    // Confirm even valid credentials return 503 (proxy never consults the Secret).
+    let status = h.http.get_status(&host, "/").await?;
+    anyhow::ensure!(
+        status == 503,
+        "expected 503 (fail-closed: unlabeled secret), got {status}"
+    );
+    Ok(())
+}
+
 // ── Per-Ingress client-certificate mTLS (#267) ───────────────────────────────
 
 /// `auth-tls-secret` + `auth-tls-pass-certificate-to-upstream`: a TLS connection

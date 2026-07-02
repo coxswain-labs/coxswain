@@ -48,13 +48,18 @@ impl RouteLike for GrpcRoute {
                 if matches!(f.r#type, GrpcRouteRulesFiltersType::RequestMirror) {
                     return true;
                 }
-                // RateLimit (#25) and IpAccessControl (#479) ExtensionRefs are
-                // supported on GRPCRoute; any other ExtensionRef is not.
+                // RateLimit (#25), IpAccessControl (#479), and RequestSizeLimit
+                // (#443) ExtensionRefs are supported on GRPCRoute; any other
+                // ExtensionRef is not — notably BasicAuth (#442) and Compression
+                // (#446), both HTTP-only idioms.
                 if matches!(f.r#type, GrpcRouteRulesFiltersType::ExtensionRef)
                     && let Some(ext) = &f.extension_ref
                 {
                     return ext.group != "gateway.coxswain-labs.dev"
-                        || (ext.kind != "RateLimit" && ext.kind != "IpAccessControl");
+                        || !matches!(
+                            ext.kind.as_str(),
+                            "RateLimit" | "IpAccessControl" | "RequestSizeLimit"
+                        );
                 }
                 false
             })
