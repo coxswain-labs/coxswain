@@ -1314,6 +1314,7 @@ async fn gateway_basic_auth_valid_credential_admitted() -> anyhow::Result<()> {
     let ns = NamespaceGuard::create(&h.client, "gw-basicauth-ok").await?;
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     fixtures::apply_fixture(gwa::BASIC_AUTH_EXTENSIONREF, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
     let host = format!("gwbasicauth.{}.local", ns.name);
 
     // alice:secret (bcrypt) → Authorization: Basic YWxpY2U6c2VjcmV0.
@@ -1322,8 +1323,7 @@ async fn gateway_basic_auth_valid_credential_admitted() -> anyhow::Result<()> {
         wait::POLL,
         || async { format!("gateway BasicAuth route to admit alice:secret at {host}") },
         || async {
-            let result = h
-                .http
+            let result = gw
                 .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
                 .await;
             match result {
@@ -1345,14 +1345,14 @@ async fn gateway_basic_auth_invalid_credential_rejected() -> anyhow::Result<()> 
     let ns = NamespaceGuard::create(&h.client, "gw-basicauth-bad").await?;
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     fixtures::apply_fixture(gwa::BASIC_AUTH_EXTENSIONREF, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
     let host = format!("gwbasicauth.{}.local", ns.name);
 
     // Wait until the route is live and enforcing: no credentials → 401 (not 404).
-    wait::wait_for_route_status(&h.http, &host, "/", 401, Duration::from_secs(90)).await?;
+    wait::wait_for_route_status(&gw, &host, "/", 401, Duration::from_secs(90)).await?;
 
     // wrong:password → Authorization: Basic d3Jvbmc6cGFzc3dvcmQ=
-    let (status, resp_hdrs, _) = h
-        .http
+    let (status, resp_hdrs, _) = gw
         .get_full_with_headers(
             &host,
             "/",
@@ -1383,12 +1383,13 @@ async fn gateway_basic_auth_unlabeled_secret_fails_closed() -> anyhow::Result<()
         FixtureVars::new(&ns.name),
     )
     .await?;
+    let gw = h.gateway_http(&ns.name).await?;
     let host = format!("gwbasicauthnolabel.{}.local", ns.name);
 
-    wait::wait_for_route_status(&h.http, &host, "/", 503, Duration::from_secs(90)).await?;
+    wait::wait_for_route_status(&gw, &host, "/", 503, Duration::from_secs(90)).await?;
 
     // Confirm even valid credentials return 503 (proxy never consults the Secret).
-    let status = h.http.get_status(&host, "/").await?;
+    let status = gw.get_status(&host, "/").await?;
     anyhow::ensure!(
         status == 503,
         "expected 503 (fail-closed: unlabeled secret), got {status}"

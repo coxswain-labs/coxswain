@@ -583,6 +583,7 @@ Semantics:
 - `maxSize` accepts a bare byte count or a `k`/`m`/`g`-suffixed size (binary multipliers, case-insensitive) — the same parser as the Ingress `max-body-size` annotation.
 - Requests exceeding the limit are rejected with `413 Payload Too Large`, checked up front against `Content-Length` when present and mid-stream for chunked/streaming bodies.
 - A missing `RequestSizeLimit` CR or an unparseable `maxSize` fails open (no limit enforced).
+- **Known limitation on GRPCRoute (HTTP/2):** the security guarantee holds — an oversized gRPC message is never forwarded to the backend — but a `pingora-proxy` 0.8.1 limitation means the client does not currently receive a clean rejection status over HTTP/2 the way an HTTP/1.1 client gets a `413`; the connection instead hangs until it is otherwise closed. Tracked in [#509](https://github.com/coxswain-labs/coxswain/issues/509).
 
 ### Response compression
 
