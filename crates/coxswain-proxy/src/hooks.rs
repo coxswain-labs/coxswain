@@ -1304,10 +1304,11 @@ mod tests {
     use super::*;
 
     fn ctx_with_limit(limit: u64, is_h2: bool) -> ProxyCtx {
-        let mut ctx = ProxyCtx::default();
-        ctx.max_body_size = Some(limit);
-        ctx.is_h2 = is_h2;
-        ctx
+        ProxyCtx {
+            max_body_size: Some(limit),
+            is_h2,
+            ..Default::default()
+        }
     }
 
     #[test]
