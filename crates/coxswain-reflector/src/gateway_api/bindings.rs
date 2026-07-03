@@ -685,7 +685,6 @@ mod tests {
                     }]),
                     hostnames: Some(vec!["h.example.com".to_string()]),
                     rules: Some(vec![make_simple_rule("svc")]),
-                    ..Default::default()
                 },
                 status: None,
             }

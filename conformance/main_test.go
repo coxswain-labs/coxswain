@@ -4,7 +4,6 @@ import (
 	"os"
 	"testing"
 
-	"k8s.io/apimachinery/pkg/util/sets"
 	v1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 	"sigs.k8s.io/gateway-api/conformance"
 	"sigs.k8s.io/gateway-api/conformance/utils/suite"
@@ -28,18 +27,18 @@ import (
 func TestConformance(t *testing.T) {
 	opts := conformance.DefaultOptions(t)
 	opts.GatewayClassName = "coxswain"
-	opts.ConformanceProfiles = sets.New[suite.ConformanceProfileName](
+	opts.ConformanceProfiles = []suite.ConformanceProfileName{
 		suite.GatewayHTTPConformanceProfileName,
 		suite.GatewayGRPCConformanceProfileName,
 		suite.GatewayTLSConformanceProfileName,
-	)
+	}
 
 	// Declare only features that are currently implemented.
 	// Add entries here as each feature issue closes.
-	opts.SupportedFeatures = sets.New[features.FeatureName](
+	opts.SupportedFeatures = []features.FeatureName{
 		// Core (required for HTTP profile conformance claim)
 		features.SupportGateway,   // #34
- 		features.SupportHTTPRoute, // #34
+		features.SupportHTTPRoute, // #34
 		// Extended: matching (#7)
 		features.SupportHTTPRouteQueryParamMatching,
 		features.SupportHTTPRouteMethodMatching,
@@ -117,7 +116,7 @@ func TestConformance(t *testing.T) {
 		// resources; in shared mode the carrier is a per-Gateway identity
 		// ServiceAccount in the Gateway's namespace.
 		features.SupportGatewayInfrastructurePropagation,
-	)
+	}
 
 	// GatewayStaticAddresses (#260): the suite overlays these onto the test's
 	// `PLACEHOLDER_USABLE_ADDRS`/`PLACEHOLDER_UNUSABLE_ADDRS` manifest values.
