@@ -338,7 +338,7 @@ pub(crate) fn parse_compression(
     Some(CompressionConfig::new(gzip, brotli, level, min_size, types))
 }
 
-fn default_compression_types() -> Box<[Box<str>]> {
+pub(crate) fn default_compression_types() -> Box<[Box<str>]> {
     DEFAULT_COMPRESSION_TYPES
         .iter()
         .map(|s| (*s).into())

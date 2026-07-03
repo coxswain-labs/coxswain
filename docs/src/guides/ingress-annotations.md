@@ -394,8 +394,8 @@ Units are **binary** (`k` = 1024, `m` = 1024², `g` = 1024³), matching nginx-in
 
 Enforcement is two-layered and never buffers the whole body:
 
-- When the request declares a `Content-Length` larger than the limit, it is rejected up front — before any upstream connection is opened.
-- For chunked or streaming uploads (no `Content-Length`), the proxy counts bytes as they arrive and aborts with 413 the moment the running total crosses the limit.
+- When the request declares a `Content-Length` larger than the limit, it is rejected up front — before any upstream connection is opened. This applies to both HTTP/1.x and HTTP/2.
+- For chunked or streaming uploads with no `Content-Length`, the proxy counts bytes as they arrive and aborts with 413 the moment the running total crosses the limit **on HTTP/1.x only**. A streaming **HTTP/2** upload without `Content-Length` is not capped mid-stream (it fails open) — returning a rejection mid-body over HTTP/2 deadlocks the client under `pingora-proxy` ([#509](https://github.com/coxswain-labs/coxswain/issues/509)); faithful HTTP/2 enforcement awaits pingora request-body buffering.
 
 Omitting the annotation imposes no limit. An unparseable value (e.g. `"8mb"`, `"lots"`) emits a controller warning and is treated as absent — the route serves with no body cap rather than being rejected (**fail-open**).
 

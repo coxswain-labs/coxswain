@@ -1,0 +1,57 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: basicauths.gateway.coxswain-labs.dev
+spec:
+  group: gateway.coxswain-labs.dev
+  names:
+    categories: []
+    kind: BasicAuth
+    plural: basicauths
+    shortNames: []
+    singular: basicauth
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for BasicAuthSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              HTTP Basic authentication policy for an `HTTPRoute` rule.
+
+              Reference this CR from an `HTTPRouteRule.filters` entry with
+              `type: ExtensionRef` pointing at `group: gateway.coxswain-labs.dev`,
+              `kind: BasicAuth`. The proxy validates `Authorization: Basic` against the
+              credentials in the referenced htpasswd `Secret`; a missing/invalid
+              credential responds `401` with `WWW-Authenticate`, and a missing,
+              unlabeled, or unparseable Secret fails closed with `503`.
+            properties:
+              secretRef:
+                description: Reference to the htpasswd `Secret` carrying credentials.
+                properties:
+                  name:
+                    description: Secret name.
+                    type: string
+                  namespace:
+                    description: |-
+                      Secret namespace. Required — mirrors the explicit `namespace/name`
+                      form of the Ingress `auth-basic-secret` annotation; no `ReferenceGrant`
+                      is required for cross-namespace refs, matching that precedent.
+                    type: string
+                required:
+                - name
+                - namespace
+                type: object
+            required:
+            - secretRef
+            type: object
+        required:
+        - spec
+        title: BasicAuth
+        type: object
+    served: true
+    storage: true
+    subresources: {}

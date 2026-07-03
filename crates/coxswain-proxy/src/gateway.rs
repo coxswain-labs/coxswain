@@ -14,6 +14,7 @@ use crate::hooks;
 use crate::retry;
 use crate::routing::engine::RoutingEngine;
 use async_trait::async_trait;
+use bytes::Bytes;
 use coxswain_core::routing::Gateway;
 use pingora_core::Result;
 use pingora_core::upstreams::peer::HttpPeer;
@@ -122,6 +123,20 @@ impl ProxyHttp for GatewayProxy {
         Self::CTX: Send + Sync,
     {
         hooks::upstream_response_filter(session, upstream_response, ctx).await
+    }
+
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<Bytes>,
+        end_of_stream: bool,
+        ctx: &mut ProxyCtx,
+    ) -> Result<Option<std::time::Duration>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        hooks::response_body_filter(body, end_of_stream, ctx)?;
+        Ok(None)
     }
 
     fn fail_to_connect(

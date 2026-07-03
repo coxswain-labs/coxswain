@@ -655,6 +655,218 @@ async fn max_body_size_invalid_value_rejected_by_vap() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── RequestSizeLimit ExtensionRef (Gateway API, #443) ─────────────────────────
+
+/// `RequestSizeLimit` CR via `ExtensionRef` on an HTTPRoute: under-limit bodies
+/// are served (backend identity, 2xx); over-limit bodies are rejected with 413
+/// — both up-front (`Content-Length`) and mid-stream (chunked, no
+/// `Content-Length`) (#443 happy + sad path — also proves the ExtensionRef is
+/// accepted on HTTPRoute).
+#[tokio::test]
+async fn gateway_request_size_limit_enforces_cap() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-maxbody").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        gwa::REQUEST_SIZE_LIMIT_EXTENSIONREF,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwmaxbody.{}.local", ns.name);
+
+    // Readiness: a bodyless GET is always under the limit, so a 200 proves the
+    // route is installed before we exercise the body-size cases.
+    wait::wait_for_route_status(&gw, &host, "/", 200, Duration::from_secs(60)).await?;
+
+    // Happy path: 200 B < 1 KiB → served, and specifically by echo-a.
+    let (status, body) = gw
+        .request_with_body(Method::POST, &host, "/", vec![b'x'; 200])
+        .await?;
+    assert_eq!(status, 200, "under-limit POST must be served");
+    body.expect("under-limit POST must return an echo body")
+        .assert_backend("echo-a");
+
+    // Sad path (up-front): 4 KiB with Content-Length > 1 KiB → 413.
+    let (status, body) = gw
+        .request_with_body(Method::POST, &host, "/", vec![b'x'; 4096])
+        .await?;
+    assert_eq!(
+        status, 413,
+        "over-limit POST (Content-Length) must be rejected with 413"
+    );
+    assert!(
+        body.is_none(),
+        "rejected POST must not reach the echo backend"
+    );
+
+    // Sad path (mid-stream): chunked body (no Content-Length) totalling 4 KiB
+    // across 8x512 B chunks crosses the 1 KiB cap → 413.
+    let chunks = vec![vec![b'x'; 512]; 8];
+    let (status, body) = gw
+        .request_with_streamed_body(Method::POST, &host, "/", chunks)
+        .await?;
+    assert_eq!(
+        status, 413,
+        "over-limit chunked POST must be rejected with 413"
+    );
+    assert!(
+        body.is_none(),
+        "rejected chunked POST must not reach the echo backend"
+    );
+
+    Ok(())
+}
+
+// Minimal `grpcecho` proto (hand-derived from grpcecho.proto to avoid a
+// prost-build dependency) for the GRPCRoute RequestSizeLimit parity test (#443).
+// Service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+mod grpcecho {
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct EchoRequest {}
+
+    /// A padded request used only to exceed the RequestSizeLimit byte cap.
+    /// The proxy's byte-size guard fires on raw body bytes before the backend
+    /// ever deserializes the message, so a real grpcecho.proto field is not
+    /// needed — proto3's wire format tolerates the extra unknown tag.
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct PaddedEchoRequest {
+        #[prost(bytes = "vec", tag = "99")]
+        pub padding: Vec<u8>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct GrpcContext {
+        #[prost(string, tag = "4")]
+        pub pod: String,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct EchoAssertions {
+        #[prost(message, optional, tag = "4")]
+        pub context: Option<GrpcContext>,
+    }
+
+    #[derive(Clone, PartialEq, prost::Message)]
+    pub struct EchoResponse {
+        #[prost(message, optional, tag = "1")]
+        pub assertions: Option<EchoAssertions>,
+    }
+}
+
+/// Issue one `GrpcEcho/Echo` unary call through the Gateway VIP for `host`,
+/// with an arbitrary request message type. Connect/transport failures are
+/// folded into `Status::unavailable` so callers can match on `tonic::Code`
+/// uniformly. Bounded to 20s total (`Status::deadline_exceeded` on expiry) as a
+/// general safety net so a stuck call fails the test instead of hanging the suite.
+async fn grpc_echo_call<Req: prost::Message + Default + 'static>(
+    gw_addr: SocketAddr,
+    host: &str,
+    req: Req,
+) -> Result<grpcecho::EchoResponse, tonic::Status> {
+    match tokio::time::timeout(
+        Duration::from_secs(20),
+        grpc_echo_call_inner(gw_addr, host, req),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(tonic::Status::deadline_exceeded(
+            "grpc_echo_call did not complete within 20s",
+        )),
+    }
+}
+
+async fn grpc_echo_call_inner<Req: prost::Message + Default + 'static>(
+    gw_addr: SocketAddr,
+    host: &str,
+    req: Req,
+) -> Result<grpcecho::EchoResponse, tonic::Status> {
+    let origin: tonic::transport::Uri = format!("http://{host}:{}", gw_addr.port())
+        .parse()
+        .map_err(|e| tonic::Status::unavailable(format!("uri: {e}")))?;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))
+        .map_err(|e| tonic::Status::unavailable(format!("endpoint: {e}")))?
+        .origin(origin);
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|e| tonic::Status::unavailable(format!("connect: {e}")))?;
+    let mut client = tonic::client::Grpc::new(channel);
+    client
+        .ready()
+        .await
+        .map_err(|e| tonic::Status::unavailable(format!("ready: {e}")))?;
+    let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo"
+        .parse::<tonic::codegen::http::uri::PathAndQuery>()
+        .map_err(|e| tonic::Status::unavailable(format!("path: {e}")))?;
+    let codec = tonic_prost::ProstCodec::<Req, grpcecho::EchoResponse>::default();
+    client
+        .unary(tonic::Request::new(req), path, codec)
+        .await
+        .map(tonic::Response::into_inner)
+}
+
+/// `RequestSizeLimit` is deliberately **not enforced** on GRPCRoute (#443 scope
+/// decision, coxswain-labs/coxswain#509). A mid-stream body cap over HTTP/2 deadlocks
+/// the client under pingora (its h2 proxy loop swallows a `request_body_filter`
+/// rejection instead of responding), and gRPC never sends `Content-Length` for the
+/// up-front check to use — so coxswain leaves gRPC message sizing to the backend's own
+/// `max_recv_msg_size` until pingora ships request-body buffering (pingora #816/#780).
+/// The reconciler skips the `RequestSizeLimit` ExtensionRef on GRPCRoute (logged as
+/// unsupported, like `BasicAuth`/`Compression`), so an over-cap message routes through
+/// untouched.
+///
+/// Asserts non-enforcement: with a 1 KiB `RequestSizeLimit` attached, both a small call
+/// and a 2 KiB over-cap call succeed promptly — the backend echoes them, no rejection
+/// and (critically) no hang.
+#[tokio::test]
+async fn gateway_request_size_limit_not_enforced_on_grpcroute() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-grpc-maxbody").await?;
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(
+        gwa::REQUEST_SIZE_LIMIT_GRPCROUTE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("grpc-maxbody.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+
+    // Wait until a small call succeeds — confirms the route is live.
+    wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("gRPC Echo via {host} to succeed") },
+        || async {
+            grpc_echo_call(gw_addr, &host, grpcecho::EchoRequest {})
+                .await
+                .ok()
+        },
+    )
+    .await?;
+
+    // A 2 KiB message far exceeds the CR's 1 KiB cap. Because RequestSizeLimit is not
+    // enforced on GRPCRoute, it must route through to grpc-echo and succeed — proving
+    // the edge does not cap gRPC bodies, and that a rejected body no longer hangs the
+    // client (#509). The route is confirmed live above, so this is a single atomic call.
+    let oversized = grpcecho::PaddedEchoRequest {
+        padding: vec![0u8; 2048],
+    };
+    grpc_echo_call(gw_addr, &host, oversized).await.map_err(|s| {
+        anyhow::anyhow!(
+            "over-cap gRPC call must succeed (RequestSizeLimit is not enforced on gRPC), got {s:?}"
+        )
+    })?;
+
+    Ok(())
+}
+
 // ── Session affinity (#15) ─────────────────────────────────────────────────────
 //
 // One `echo-aff` Service with three pods backs each test, so a backend group holds
@@ -1363,6 +1575,125 @@ async fn compression_skips_disallowed_content_type() -> anyhow::Result<()> {
     assert!(
         resp_headers.get("content-encoding").is_none(),
         "proxy must NOT compress application/json when only text/plain is in compression-types"
+    );
+
+    Ok(())
+}
+
+// ── Compression ExtensionRef (Gateway API, #446) ──────────────────────────────
+//
+// The `application/grpc*` passthrough guard (never compress a gRPC-over-HTTPRoute
+// response, regardless of `types` config) is covered by the proxy unit tests in
+// `crates/coxswain-proxy/src/policy/compression.rs` — constructing a real
+// gRPC-content-type HTTPRoute response end-to-end adds no additional coverage
+// over the deterministic unit tests and isn't exercised here.
+
+/// `Compression` CR via `ExtensionRef`: with gzip enabled and `minSize: 1`, a
+/// request advertising `Accept-Encoding: gzip` gets a gzip-compressed response
+/// (#446 happy path — also proves the ExtensionRef is accepted on HTTPRoute).
+#[tokio::test]
+async fn gateway_compression_gzip_compresses_eligible_response() -> anyhow::Result<()> {
+    use flate2::read::GzDecoder;
+    use std::io::Read as _;
+
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-comp-gzip").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::COMPRESSION_EXTENSIONREF, FixtureVars::new(&ns.name)).await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwcompression.{}.local", ns.name);
+    wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
+
+    let (status, resp_headers, body) = gw
+        .get_full_raw(&host, "/", &[("Accept-Encoding", "gzip")])
+        .await?;
+
+    assert_eq!(status, 200, "gateway compression route must return 200");
+    assert_eq!(
+        resp_headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "proxy must set Content-Encoding: gzip on the response"
+    );
+    let vary = resp_headers
+        .get("vary")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        vary.to_ascii_lowercase().contains("accept-encoding"),
+        "Vary must include Accept-Encoding (got: {vary:?})"
+    );
+
+    let mut decoder = GzDecoder::new(body.as_ref());
+    let mut decompressed = String::new();
+    decoder
+        .read_to_string(&mut decompressed)
+        .map_err(|e| anyhow::anyhow!("failed to gzip-decompress response: {e}"))?;
+    serde_json::from_str::<serde_json::Value>(&decompressed).map_err(|e| {
+        anyhow::anyhow!("decompressed body is not valid JSON: {e}; body: {decompressed}")
+    })?;
+
+    Ok(())
+}
+
+/// `Compression` CR via `ExtensionRef`: with both gzip and brotli enabled,
+/// brotli is preferred when the client advertises `br` in `Accept-Encoding`
+/// (#446 behaviour).
+#[tokio::test]
+async fn gateway_compression_prefers_brotli_when_client_supports_br() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-comp-brotli").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::COMPRESSION_EXTENSIONREF, FixtureVars::new(&ns.name)).await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwcompression.{}.local", ns.name);
+    wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
+
+    let (status, resp_headers, _) = gw
+        .get_full_raw(&host, "/", &[("Accept-Encoding", "br, gzip")])
+        .await?;
+
+    assert_eq!(status, 200, "gateway compression route must return 200");
+    assert_eq!(
+        resp_headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("br"),
+        "brotli must be preferred over gzip when both enabled and br offered"
+    );
+
+    Ok(())
+}
+
+/// `Compression` CR via `ExtensionRef`: a client that sends no `Accept-Encoding`
+/// gets the response uncompressed — the proxy never forces an encoding the
+/// client didn't advertise (#446 sad path).
+#[tokio::test]
+async fn gateway_compression_passthrough_without_accept_encoding() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-comp-passthrough").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::COMPRESSION_EXTENSIONREF, FixtureVars::new(&ns.name)).await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwcompression.{}.local", ns.name);
+    wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
+
+    let (status, resp_headers, _) = gw.get_full_raw(&host, "/", &[]).await?;
+
+    assert_eq!(status, 200, "gateway compression route must return 200");
+    assert!(
+        resp_headers.get("content-encoding").is_none(),
+        "proxy must NOT compress when the client sends no Accept-Encoding"
     );
 
     Ok(())

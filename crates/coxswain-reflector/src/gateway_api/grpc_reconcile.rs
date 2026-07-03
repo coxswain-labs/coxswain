@@ -40,9 +40,13 @@ use std::time::SystemTime;
 ///
 /// Slimmer than [`super::reconcile::RouteResolution`]: GRPCRoute supports the
 /// protocol-agnostic ExtensionRef filters — `RateLimit` (#25) and `IpAccessControl`
-/// (#479) — but not `PathRewriteRegex`, which rewrites the request path (for gRPC
-/// the path *is* the `/{service}/{method}` RPC address, so rewriting it is
-/// meaningless).
+/// (#479) — but not `PathRewriteRegex` (for gRPC the path *is* the
+/// `/{service}/{method}` RPC address, so rewriting it is meaningless), nor
+/// `BasicAuth`/`Compression` (HTTP-only idioms, #442/#446), nor `RequestSizeLimit`
+/// (#443): a mid-stream body-size cap on HTTP/2 deadlocks the client under pingora
+/// (#509), and gRPC never sends `Content-Length` for the up-front check to use — so
+/// gRPC messages are size-limited by the backend's own `max_recv_msg_size` until
+/// pingora supports request-body buffering (pingora #816/#780).
 #[non_exhaustive]
 pub struct GrpcRouteResolution<'a> {
     /// `(gw_ns, gw_name, listener_name) → (hostname, port)` for every listener on owned Gateways.
@@ -591,8 +595,10 @@ fn build_filters(filters: &[GrpcRouteRulesFilters]) -> Vec<FilterAction> {
             GrpcRouteRulesFiltersType::ExtensionRef => {
                 // RateLimit (#25) and IpAccessControl (#479) ExtensionRefs are
                 // resolved separately (into the route's rate-limit config and
-                // source-IP allow/deny sets); any other ExtensionRef is
-                // unsupported on GRPCRoute.
+                // source-IP allow/deny sets); any other ExtensionRef is unsupported
+                // on GRPCRoute — notably BasicAuth (#442), Compression (#446), and
+                // RequestSizeLimit (#443, see #509: a mid-stream h2 body cap deadlocks
+                // the client under pingora; gRPC is limited by the backend instead).
                 let supported = f.extension_ref.as_ref().is_some_and(|ext| {
                     ext.group == "gateway.coxswain-labs.dev"
                         && (ext.kind == "RateLimit" || ext.kind == "IpAccessControl")

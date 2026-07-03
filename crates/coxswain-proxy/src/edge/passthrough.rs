@@ -352,7 +352,7 @@ mod tests {
         let sni_ext_body: Vec<u8> = {
             let mut v = Vec::new();
             // ServerNameList length = 1 + 2 + sni_host_len
-            let list_len = (3 + sni_host_len) as u16;
+            let list_len = 3 + sni_host_len;
             v.extend_from_slice(&list_len.to_be_bytes());
             v.push(0x00); // name_type = host_name
             v.extend_from_slice(&sni_host_len.to_be_bytes());
@@ -383,11 +383,12 @@ mod tests {
         let ch_len = ch_body.len() as u32;
 
         // Handshake record
-        let mut hs: Vec<u8> = Vec::new();
-        hs.push(0x01); // type = ClientHello
-        hs.push(((ch_len >> 16) & 0xff) as u8);
-        hs.push(((ch_len >> 8) & 0xff) as u8);
-        hs.push((ch_len & 0xff) as u8);
+        let mut hs: Vec<u8> = vec![
+            0x01, // type = ClientHello
+            ((ch_len >> 16) & 0xff) as u8,
+            ((ch_len >> 8) & 0xff) as u8,
+            (ch_len & 0xff) as u8,
+        ];
         hs.extend_from_slice(&ch_body);
 
         let hs_len = hs.len() as u16;

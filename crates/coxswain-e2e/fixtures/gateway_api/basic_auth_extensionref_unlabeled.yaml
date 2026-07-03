@@ -1,0 +1,65 @@
+# BasicAuth ExtensionRef fixture — UNLABELED Secret (apply backends::ECHO first).
+#
+# The Secret intentionally omits the ingress.coxswain-labs.dev/auth-basic:
+# "true" label, so the reflector's label-scoped watcher never includes it in
+# the auth_secrets store. The BasicAuth CR's secretRef resolves to
+# IngressAuthConfig::Unavailable and the proxy fails closed with 503 — even
+# valid credentials are refused before the Secret is consulted.
+#
+# Gateway: coxswain-basicauth-nolabel on GATEWAY_HTTP_PORT.
+# Route host: gwbasicauthnolabel.TESTNS.local, path / -> echo-a:3000.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-basicauth-nolabel
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gw-auth-htpasswd-unlabeled
+type: Opaque
+data:
+  auth: YWxpY2U6JDJ5JDA0JHdyUkZRU0NCZXpZTFR5V1hKS1dldXVPaHRGdWtyQWo3UHpQWXRRc09ORWg4ck9PampJTGFLCg==
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: BasicAuth
+metadata:
+  name: basicauth-nolabel
+spec:
+  secretRef:
+    name: gw-auth-htpasswd-unlabeled
+    namespace: ${TESTNS}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: basicauth-nolabel-route
+spec:
+  parentRefs:
+    - name: coxswain-basicauth-nolabel
+  hostnames:
+    - "gwbasicauthnolabel.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: BasicAuth
+            name: basicauth-nolabel
+      backendRefs:
+        - name: echo-a
+          port: 3000

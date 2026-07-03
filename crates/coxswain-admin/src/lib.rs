@@ -384,6 +384,11 @@ impl AdminServer {
             ["manifests", kind, namespace, name] => agg.get_manifest(kind, namespace, name).await,
             ["problems"] => agg.list_problems().await,
             ["topology"] => agg.topology().await,
+            // Internal-only: fetched by peer controller replicas to build the
+            // merged topology view (#500 HA — each replica's registry only
+            // holds the proxies that connected to IT). Harmless to call
+            // directly; not surfaced in the UI.
+            ["topology", "local"] => agg.topology_local().await,
 
             _ => aggregator::not_found(),
         }

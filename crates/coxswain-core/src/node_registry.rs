@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 /// the conversion from its own `Scope` into this core-local mirror at the
 /// crate boundary.
 #[non_exhaustive]
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind")]
 pub enum NodeScope {
     /// The shared proxy pool, serving all Ingress + Gateway routing that is not
@@ -43,7 +43,7 @@ pub enum NodeScope {
 
 /// Snapshot of a single connected proxy node.
 #[non_exhaustive]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NodeEntry {
     /// Opaque identifier supplied by the proxy in its `Subscribe` message.
     pub node_id: String,
@@ -82,10 +82,41 @@ impl NodeEntry {
 /// [`SharedNodeRegistry::load`] and hold it briefly; do not cache it across
 /// reconcile cycles.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct NodeRegistry {
     /// Map of `node_id` → per-node entry.
     pub nodes: HashMap<String, NodeEntry>,
+}
+
+impl NodeRegistry {
+    /// Content hash of the controller's current SharedPool snapshot, derived
+    /// from the connected SharedPool node with the lexicographically smallest
+    /// `node_id` (deterministic across callers). Returns `None` when no
+    /// SharedPool node is present.
+    ///
+    /// Free-standing on the plain snapshot type (not just
+    /// [`SharedNodeRegistry`]) so a registry merged from multiple controller
+    /// replicas — e.g. a topology fan-out union — can compute the same value
+    /// a single replica's live registry would.
+    #[must_use]
+    pub fn controller_version(&self) -> Option<String> {
+        self.nodes
+            .values()
+            .filter(|e| e.scope == NodeScope::SharedPool)
+            .min_by(|a, b| a.node_id.cmp(&b.node_id))
+            .and_then(|e| e.target_version.clone())
+    }
+
+    /// Merge `other`'s nodes into `self`, keyed by `node_id`.
+    ///
+    /// A `node_id` present in both is overwritten by `other`'s entry — the
+    /// only legitimate source of a collision is the same node represented in
+    /// two fan-out responses (e.g. a controller's own local registry fetched
+    /// both directly and via its own peer endpoint), where the entries are
+    /// equivalent modulo a benign race, not a real conflict.
+    pub fn merge(&mut self, other: NodeRegistry) {
+        self.nodes.extend(other.nodes);
+    }
 }
 
 // ── SharedNodeRegistry ────────────────────────────────────────────────────────
@@ -174,12 +205,7 @@ impl SharedNodeRegistry {
     /// deterministic pick avoids returning a different value on each call.
     #[must_use]
     pub fn controller_version(&self) -> Option<String> {
-        self.load()
-            .nodes
-            .into_values()
-            .filter(|e| e.scope == NodeScope::SharedPool)
-            .min_by(|a, b| a.node_id.cmp(&b.node_id))
-            .and_then(|e| e.target_version)
+        self.load().controller_version()
     }
 
     /// Remove a node's row on stream exit.
@@ -375,5 +401,67 @@ mod tests {
         reg.connect("node-a", shared(), now());
         // reg2 sees the same underlying map
         assert!(reg2.load().nodes.contains_key("node-a"));
+    }
+
+    // ── NodeRegistry::merge / controller_version (topology fan-out) ─────────────
+
+    #[test]
+    fn merge_unions_disjoint_node_ids() {
+        let a = SharedNodeRegistry::new();
+        a.connect("node-a", shared(), now());
+        let b = SharedNodeRegistry::new();
+        b.connect("node-b", shared(), now());
+        let mut merged = a.load();
+        merged.merge(b.load());
+        assert_eq!(merged.nodes.len(), 2);
+        assert!(merged.nodes.contains_key("node-a"));
+        assert!(merged.nodes.contains_key("node-b"));
+    }
+
+    #[test]
+    fn merge_overwrites_on_shared_node_id() {
+        let a = SharedNodeRegistry::new();
+        a.connect("node-a", shared(), now());
+        a.record_target("node-a", "v1".to_owned());
+        let b = SharedNodeRegistry::new();
+        b.connect("node-a", shared(), now());
+        b.record_target("node-a", "v2".to_owned());
+        let mut merged = a.load();
+        merged.merge(b.load());
+        assert_eq!(merged.nodes.len(), 1, "same node_id collapses to one entry");
+        assert_eq!(
+            merged.nodes["node-a"].target_version.as_deref(),
+            Some("v2"),
+            "the merged-in registry wins on collision"
+        );
+    }
+
+    #[test]
+    fn controller_version_on_plain_registry_matches_shared_handle() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect("node-a", shared(), now());
+        reg.record_target("node-a", "v42".to_owned());
+        let snap = reg.load();
+        assert_eq!(snap.controller_version().as_deref(), Some("v42"));
+        assert_eq!(snap.controller_version(), reg.controller_version());
+    }
+
+    #[test]
+    fn node_entry_and_registry_round_trip_json() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect("node-a", gw("default", "my-gw"), now());
+        reg.record_target("node-a", "v1".to_owned());
+        reg.record_ack("node-a", "v1".to_owned(), now());
+        let snap = reg.load();
+
+        let json = serde_json::to_string(&snap).expect("serialize");
+        let round_tripped: NodeRegistry = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(round_tripped.nodes.len(), 1);
+        let entry = &round_tripped.nodes["node-a"];
+        assert_eq!(entry.scope, gw("default", "my-gw"));
+        assert_eq!(entry.target_version.as_deref(), Some("v1"));
+        assert_eq!(entry.last_acked_version.as_deref(), Some("v1"));
+        assert!(entry.in_sync());
     }
 }

@@ -368,7 +368,7 @@ mod tests {
         )]);
         let (index, status) = build_backend_policy_index(&store);
         // No parseable timeout → no index entry (default behaviour retained).
-        assert!(index.get(&ObjectKey::new("ns", "svc")).is_none());
+        assert!(!index.contains_key(&ObjectKey::new("ns", "svc")));
         // Policy is still accepted — a bad value is a WARN, not a rejection.
         let s = status.get(&ObjectKey::new("ns", "p1")).expect("status");
         assert!(s.accepted);
@@ -412,7 +412,7 @@ mod tests {
         let spec = format!("{SVC_TARGET}  loadBalancer:\n    algorithm: bogus\n");
         let store = store_from(vec![policy_from_spec("ns", "p1", &spec)]);
         let (index, status) = build_backend_policy_index(&store);
-        assert!(index.get(&ObjectKey::new("ns", "svc")).is_none());
+        assert!(!index.contains_key(&ObjectKey::new("ns", "svc")));
         // Bad value is a WARN, not a rejection.
         assert!(
             status
@@ -427,7 +427,7 @@ mod tests {
         let spec = format!("{SVC_TARGET}  loadBalancer:\n    algorithm: round_robin\n");
         let store = store_from(vec![policy_from_spec("ns", "p1", &spec)]);
         let (index, _) = build_backend_policy_index(&store);
-        assert!(index.get(&ObjectKey::new("ns", "svc")).is_none());
+        assert!(!index.contains_key(&ObjectKey::new("ns", "svc")));
     }
 
     #[test]
@@ -450,7 +450,7 @@ mod tests {
         let spec = format!("{SVC_TARGET}  circuitBreaker:\n    threshold: 0\n");
         let store = store_from(vec![policy_from_spec("ns", "p1", &spec)]);
         let (index, status) = build_backend_policy_index(&store);
-        assert!(index.get(&ObjectKey::new("ns", "svc")).is_none());
+        assert!(!index.contains_key(&ObjectKey::new("ns", "svc")));
         assert!(
             status
                 .get(&ObjectKey::new("ns", "p1"))

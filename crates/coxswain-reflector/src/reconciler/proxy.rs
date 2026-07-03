@@ -46,7 +46,8 @@ use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedCl
 use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
 use coxswain_core::crd::coxswain_backend_policy::CoxswainBackendPolicy;
 use coxswain_core::crd::{
-    CoxswainIngressClassParameters, IpAccessControl, PathRewriteRegex, RateLimit,
+    BasicAuth, Compression, CoxswainIngressClassParameters, IpAccessControl, PathRewriteRegex,
+    RateLimit, RequestSizeLimit,
 };
 use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 use coxswain_core::fleet::{self, SharedFleet};
@@ -752,6 +753,15 @@ pub(super) struct ReflectorStores<'a> {
     /// `IpAccessControl` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters into per-route source-IP allow/deny CIDR sets (#479).
     pub(super) ip_access: &'a reflector::Store<IpAccessControl>,
+    /// `BasicAuth` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
+    /// filters, HTTPRoute-only (#442).
+    pub(super) basic_auths: &'a reflector::Store<BasicAuth>,
+    /// `RequestSizeLimit` CRs in scope — resolved from `HTTPRouteRule`/`GRPCRouteRule`
+    /// `ExtensionRef` filters into a per-route body-size cap (#443).
+    pub(super) request_size_limits: &'a reflector::Store<RequestSizeLimit>,
+    /// `Compression` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
+    /// filters, HTTPRoute-only (#446).
+    pub(super) compressions: &'a reflector::Store<Compression>,
     /// `ClientTrafficPolicy` CRs in scope — resolved per Gateway/listener to set
     /// `ListenerInfo.proxy_protocol` during rebuild (#327).
     pub(super) client_traffic_policies: &'a reflector::Store<ClientTrafficPolicy>,
@@ -1031,6 +1041,9 @@ struct GatewayApiStoreWriters {
     rate_limits: reflector::store::Writer<RateLimit>,
     path_rewrites: reflector::store::Writer<PathRewriteRegex>,
     ip_access: reflector::store::Writer<IpAccessControl>,
+    basic_auths: reflector::store::Writer<BasicAuth>,
+    request_size_limits: reflector::store::Writer<RequestSizeLimit>,
+    compressions: reflector::store::Writer<Compression>,
     listener_sets: reflector::store::Writer<ListenerSet>,
     namespaces: reflector::store::Writer<Namespace>,
     client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
@@ -1063,6 +1076,9 @@ fn add_gateway_api_reflectors(
         rate_limits,
         path_rewrites,
         ip_access,
+        basic_auths,
+        request_size_limits,
+        compressions,
         listener_sets,
         namespaces,
         client_traffic_policies,
@@ -1158,6 +1174,30 @@ fn add_gateway_api_reflectors(
         watcher::Config::default(),
         ReflectorEffects::new(notify, health, "ip_access_control", metrics),
         "IpAccessControl",
+    );
+    spawn_reflector(
+        set,
+        basic_auths,
+        scoped_api::<BasicAuth>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "basic_auth", metrics),
+        "BasicAuth",
+    );
+    spawn_reflector(
+        set,
+        request_size_limits,
+        scoped_api::<RequestSizeLimit>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "request_size_limit", metrics),
+        "RequestSizeLimit",
+    );
+    spawn_reflector(
+        set,
+        compressions,
+        scoped_api::<Compression>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "compression", metrics),
+        "Compression",
     );
     // GEP-1713: ListenerSets are namespaced and merged into their parent Gateway's
     // effective listener set during rebuild.
@@ -1267,6 +1307,10 @@ async fn spawn_tasks(
     let (rate_limit_reader, rate_limit_writer) = reflector::store::<RateLimit>();
     let (path_rewrite_reader, path_rewrite_writer) = reflector::store::<PathRewriteRegex>();
     let (ip_access_reader, ip_access_writer) = reflector::store::<IpAccessControl>();
+    let (basic_auth_reader, basic_auth_writer) = reflector::store::<BasicAuth>();
+    let (request_size_limit_reader, request_size_limit_writer) =
+        reflector::store::<RequestSizeLimit>();
+    let (compression_reader, compression_writer) = reflector::store::<Compression>();
     let (tls_route_reader, tls_route_writer) = reader_writer::<TlsRoute>(pre.tls_routes);
     // ListenerSet is a status-relevant store: in the controller role its writer is
     // the shared one pre-created in `new`, so the status-writer's subscription and
@@ -1318,11 +1362,25 @@ async fn spawn_tasks(
         ReflectorEffects::new(&notify, &controller_health, "service", metrics),
         "Service",
     );
+    // Label-scoped to `ingress.coxswain-labs.dev/auth-basic=true` — only opt-in
+    // htpasswd Secrets are cached.  Keeps the data-plane proxy's memory footprint
+    // bounded: Opaque Secrets without this label are never loaded (#24). Always-on
+    // (not gated by `enable_ingress`): the Gateway-API `BasicAuth` ExtensionRef
+    // (#442) consumes the same label-scoped store — no duplicate watcher.
+    spawn_reflector(
+        &mut set,
+        auth_secret_writer,
+        scoped_api::<Secret>(client.clone(), ns),
+        watcher::Config::default().labels("ingress.coxswain-labs.dev/auth-basic=true"),
+        ReflectorEffects::new(&notify, &controller_health, "auth_secret", metrics),
+        "AuthSecret",
+    );
 
     // --- Ingress reflectors (gated by --disable-ingress) ---
     //
-    // Auth Secrets are Ingress-specific (basic-auth + mTLS annotations); they
-    // live here rather than in the always-on block.
+    // The mTLS auth-tls Secret watch is Ingress-specific; the basic-auth Secret
+    // watch moved to the always-on block above since Gateway API's `BasicAuth`
+    // ExtensionRef (#442) consumes it too.
     if enable_ingress {
         spawn_reflector(
             &mut set,
@@ -1357,17 +1415,6 @@ async fn spawn_tasks(
             ),
             "CoxswainIngressClassParameters",
         );
-        // Label-scoped to `ingress.coxswain-labs.dev/auth-basic=true` — only opt-in
-        // htpasswd Secrets are cached.  Keeps the data-plane proxy's memory footprint
-        // bounded: Opaque Secrets without this label are never loaded (#24).
-        spawn_reflector(
-            &mut set,
-            auth_secret_writer,
-            scoped_api::<Secret>(client.clone(), ns),
-            watcher::Config::default().labels("ingress.coxswain-labs.dev/auth-basic=true"),
-            ReflectorEffects::new(&notify, &controller_health, "auth_secret", metrics),
-            "AuthSecret",
-        );
         // Label-scoped to `ingress.coxswain-labs.dev/auth-tls=true` — only opt-in CA
         // Secrets for per-Ingress client-certificate mTLS are cached (#267).  Separate
         // watch from `secrets` (server-TLS) and `auth_secrets` (htpasswd) to bound
@@ -1401,6 +1448,9 @@ async fn spawn_tasks(
             rate_limits: rate_limit_writer,
             path_rewrites: path_rewrite_writer,
             ip_access: ip_access_writer,
+            basic_auths: basic_auth_writer,
+            request_size_limits: request_size_limit_writer,
+            compressions: compression_writer,
             listener_sets: listener_set_writer,
             namespaces: namespace_writer,
             client_traffic_policies: ctp_writer,
@@ -1550,6 +1600,9 @@ async fn spawn_tasks(
                 rate_limits: &rate_limit_reader,
                 path_rewrites: &path_rewrite_reader,
                 ip_access: &ip_access_reader,
+                basic_auths: &basic_auth_reader,
+                request_size_limits: &request_size_limit_reader,
+                compressions: &compression_reader,
                 client_traffic_policies: &ctp_reader,
                 coxswain_backend_policies: &cbp_reader,
             };

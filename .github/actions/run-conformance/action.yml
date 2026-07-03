@@ -100,21 +100,22 @@ runs:
     - name: Wait for controller leader handover
       shell: bash
       run: |
-        # `helm --wait` returns once the controller pod is Ready (readyz), but
-        # readiness does not imply the pod has won leader election yet. Until it
+        # `helm --wait` returns once the controller pods are Ready (readyz), but
+        # readiness does not imply a pod has won leader election yet. Until it
         # holds the lease it sees objects via InitApply events with
         # is_leader=false and skips status patches; once it later becomes leader
         # nothing re-fires for already-known objects. The conformance suite hits
-        # this immediately by creating Gateways during setup. Block until exactly
-        # one controller pod exists and it holds the lease.
+        # this immediately by creating Gateways during setup. Block until leader
+        # election completes and the lease holder is one of the running
+        # controller pods — any replica may win (HA default is 2, #500), so this
+        # does NOT require exactly one pod to exist.
         for i in $(seq 1 60); do
           PODS=$(kubectl get pods -n coxswain-system \
             -l app.kubernetes.io/component=controller \
             -o jsonpath='{.items[*].metadata.name}')
           HOLDER=$(kubectl get lease coxswain-leader-lock -n coxswain-system \
             -o jsonpath='{.spec.holderIdentity}' --ignore-not-found)
-          COUNT=$(echo "$PODS" | wc -w | tr -d ' ')
-          if [ "$COUNT" = "1" ] && [ -n "$HOLDER" ] && echo " $PODS " | grep -q " $HOLDER "; then
+          if [ -n "$PODS" ] && [ -n "$HOLDER" ] && echo " $PODS " | grep -q " $HOLDER "; then
             echo "Leader: $HOLDER"
             exit 0
           fi

@@ -1,0 +1,52 @@
+# GRPCRoute + RequestSizeLimit (maxSize: 1k) — apply backends::GRPC_ECHO first.
+#
+# The RequestSizeLimit caps request bodies at 1 KiB. Proves the RequestSizeLimit
+# ExtensionRef is accepted on GRPCRoute and enforced on gRPC (HTTP/2) message
+# bodies too (#443 GRPCRoute parity): an oversized message is rejected before
+# it reaches grpc-echo.
+#
+# Gateway: coxswain-grpc-maxbody on GATEWAY_HTTP_PORT.
+# Route host: grpc-maxbody.TESTNS.local, GrpcEcho/Echo -> grpc-echo:50051.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-maxbody
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RequestSizeLimit
+metadata:
+  name: one-kib
+spec:
+  maxSize: "1k"
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-maxbody-route
+spec:
+  hostnames:
+    - "grpc-maxbody.${TESTNS}.local"
+  parentRefs:
+    - name: coxswain-grpc-maxbody
+  rules:
+    - matches:
+        - method:
+            type: Exact
+            service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+            method: Echo
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: RequestSizeLimit
+            name: one-kib
+      backendRefs:
+        - name: grpc-echo
+          port: 50051

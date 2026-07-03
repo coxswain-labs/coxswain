@@ -6,15 +6,15 @@ use crate::gw_types::v::httproutes::{
     HttpRouteRulesFiltersCors, HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType,
     HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesQueryParamsType,
 };
-use coxswain_core::crd::{IpAccessControl, RateLimit};
+use coxswain_core::crd::{BasicAuth, Compression, IpAccessControl, RateLimit, RequestSizeLimit};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
-    BackendGroup, CorsConfig, CorsOrigin, FilterAction, HeaderMod, HeaderPredicate,
-    MatchPredicates, MirrorFraction, PathModifier, QueryPredicate, RateLimitConfig, RateLimitKey,
-    ValueMatch,
+    BackendGroup, CompressionConfig, CorsConfig, CorsOrigin, FilterAction, HeaderMod,
+    HeaderPredicate, IngressAuthConfig, MatchPredicates, MirrorFraction, PathModifier,
+    QueryPredicate, RateLimitConfig, RateLimitKey, ValueMatch,
 };
 use http::{HeaderName, Method};
-use k8s_openapi::api::core::v1::Service;
+use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use regex::Regex;
@@ -198,6 +198,13 @@ pub(super) fn build_filters(
                 } else if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "IpAccessControl"
                 {
                     // Handled separately by `resolve_ip_access`.
+                } else if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "BasicAuth" {
+                    // Handled separately by `resolve_basic_auth`.
+                } else if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "RequestSizeLimit"
+                {
+                    // Handled separately by `resolve_request_size_limit`.
+                } else if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "Compression" {
+                    // Handled separately by `resolve_compression`.
                 } else {
                     tracing::warn!(
                         group = %ext.group,
@@ -788,6 +795,276 @@ fn parse_cidr_set(
     }
 }
 
+/// Scans `filters` for an `ExtensionRef` pointing at a `BasicAuth` CR
+/// (`group: gateway.coxswain-labs.dev`, `kind: BasicAuth`) and, if found, resolves
+/// the named CR's `secretRef`, reads the label-scoped htpasswd Secret from
+/// `auth_secrets`, and produces the same [`IngressAuthConfig`] the Ingress
+/// `auth-basic-secret` annotation feeds (same fail-closed ladder: missing CR,
+/// missing/unlabeled Secret, missing `auth` data key, or zero parseable
+/// entries all resolve to `IngressAuthConfig::Unavailable` → `503`).
+///
+/// Only the first matching `ExtensionRef` is used; other extension refs (and
+/// non-`BasicAuth` kinds) are ignored here — `build_filters` owns the
+/// "unsupported ExtensionRef" WARN. Returns `None` when no `BasicAuth`
+/// `ExtensionRef` is present on this rule (no auth on the route) or the
+/// referenced CR itself is missing (fail-open — matches `resolve_rate_limit`).
+pub(super) fn resolve_basic_auth(
+    filters: &[HttpRouteRulesFilters],
+    route_ns: &str,
+    basic_auths: &reflector::Store<BasicAuth>,
+    auth_secrets: &reflector::Store<Secret>,
+) -> Option<Arc<IngressAuthConfig>> {
+    for f in filters {
+        if !matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
+            continue;
+        }
+        let Some(ext) = &f.extension_ref else {
+            continue;
+        };
+        if let Some(cfg) = resolve_basic_auth_ref(
+            &ext.group,
+            &ext.kind,
+            &ext.name,
+            route_ns,
+            basic_auths,
+            auth_secrets,
+        ) {
+            return Some(cfg);
+        }
+    }
+    None
+}
+
+/// Resolve a single `ExtensionRef` (by `group`/`kind`/`name`) into an
+/// [`IngressAuthConfig`], if it targets a `BasicAuth` CR.
+///
+/// Returns `None` when the ref is **not** a `BasicAuth` so the caller keeps
+/// scanning, or when the `BasicAuth` CR itself is missing (fail-open — no
+/// auth on the route, mirroring `resolve_rate_limit_ref`'s missing-CR
+/// handling). Once a CR is found, every subsequent failure (missing/unlabeled
+/// Secret, missing `auth` key, zero parseable credentials) fails **closed**
+/// (`Some(Unavailable)`) — an operator who attached this filter expects auth
+/// enforcement, so a broken Secret must not silently open the route.
+pub(super) fn resolve_basic_auth_ref(
+    ext_group: &str,
+    ext_kind: &str,
+    ext_name: &str,
+    route_ns: &str,
+    basic_auths: &reflector::Store<BasicAuth>,
+    auth_secrets: &reflector::Store<Secret>,
+) -> Option<Arc<IngressAuthConfig>> {
+    if ext_group != "gateway.coxswain-labs.dev" || ext_kind != "BasicAuth" {
+        return None;
+    }
+    let obj_ref = reflector::ObjectRef::<BasicAuth>::new(ext_name).within(route_ns);
+    let Some(cr) = basic_auths.get(&obj_ref) else {
+        tracing::warn!(
+            ns = route_ns,
+            name = ext_name,
+            "BasicAuth CR not found — auth skipped (fail-open)"
+        );
+        return None;
+    };
+    let route_id = format!("{route_ns}/{ext_name}");
+    let secret_ref = &cr.spec.secret_ref;
+    let secret_obj_ref =
+        reflector::ObjectRef::<Secret>::new(&secret_ref.name).within(&secret_ref.namespace);
+    let Some(secret) = auth_secrets.get(&secret_obj_ref) else {
+        tracing::warn!(
+            ns = route_ns,
+            name = ext_name,
+            secret_ns = %secret_ref.namespace,
+            secret_name = %secret_ref.name,
+            "BasicAuth secretRef not found in auth-secret reflector — \
+             is the Secret labeled ingress.coxswain-labs.dev/auth-basic=true? \
+             failing closed (503)"
+        );
+        return Some(Arc::new(IngressAuthConfig::Unavailable));
+    };
+    let Some(data) = secret
+        .data
+        .as_ref()
+        .and_then(|d| d.get("auth"))
+        .map(|b| &b.0)
+    else {
+        tracing::warn!(
+            ns = route_ns,
+            name = ext_name,
+            secret_ns = %secret_ref.namespace,
+            secret_name = %secret_ref.name,
+            "BasicAuth Secret has no 'auth' data key (expected htpasswd file) — \
+             failing closed (503)"
+        );
+        return Some(Arc::new(IngressAuthConfig::Unavailable));
+    };
+    let mut diag = Vec::new();
+    let creds = crate::ingress::annotations::auth::parse_htpasswd(data, &route_id, &mut diag);
+    if creds.is_empty() {
+        tracing::warn!(
+            ns = route_ns,
+            name = ext_name,
+            secret_ns = %secret_ref.namespace,
+            secret_name = %secret_ref.name,
+            "BasicAuth Secret has no parseable htpasswd entries \
+             (supported: bcrypt $2y/$2b/$2a, SHA1 {{SHA}}...) — failing closed (503)"
+        );
+        return Some(Arc::new(IngressAuthConfig::Unavailable));
+    }
+    Some(Arc::new(IngressAuthConfig::Basic(creds.into())))
+}
+
+/// Scans `filters` for an `ExtensionRef` pointing at a `RequestSizeLimit` CR
+/// (`group: gateway.coxswain-labs.dev`, `kind: RequestSizeLimit`) and, if found,
+/// resolves the named CR's `maxSize` into a byte count via
+/// [`parse_byte_size`][crate::ingress::annotations::parse_byte_size] — the
+/// same parser the Ingress `max-body-size` annotation uses.
+///
+/// Only the first matching `ExtensionRef` is used. Missing CRs and
+/// unparseable `maxSize` values log a WARN and return `None` (fail-open: no
+/// limit enforced). Protocol-agnostic — shared by the HTTPRoute and
+/// GRPCRoute reconcilers (#443); only the filter-list iteration differs.
+pub(super) fn resolve_request_size_limit(
+    filters: &[HttpRouteRulesFilters],
+    route_ns: &str,
+    request_size_limits: &reflector::Store<RequestSizeLimit>,
+) -> Option<u64> {
+    for f in filters {
+        if !matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
+            continue;
+        }
+        let Some(ext) = &f.extension_ref else {
+            continue;
+        };
+        if let Some(limit) = resolve_request_size_limit_ref(
+            &ext.group,
+            &ext.kind,
+            &ext.name,
+            route_ns,
+            request_size_limits,
+        ) {
+            return limit;
+        }
+    }
+    None
+}
+
+/// Resolve a single `ExtensionRef` into a byte-count limit, if it targets a
+/// `RequestSizeLimit` CR.
+///
+/// Returns `None` when the ref is **not** a `RequestSizeLimit` so the caller
+/// keeps scanning. When it *is*, returns `Some(limit_opt)`: `Some(None)` on a
+/// missing CR or unparseable `maxSize` (WARN + fail-open), `Some(Some(n))`
+/// otherwise.
+pub(super) fn resolve_request_size_limit_ref(
+    ext_group: &str,
+    ext_kind: &str,
+    ext_name: &str,
+    route_ns: &str,
+    request_size_limits: &reflector::Store<RequestSizeLimit>,
+) -> Option<Option<u64>> {
+    if ext_group != "gateway.coxswain-labs.dev" || ext_kind != "RequestSizeLimit" {
+        return None;
+    }
+    let obj_ref = reflector::ObjectRef::<RequestSizeLimit>::new(ext_name).within(route_ns);
+    let Some(cr) = request_size_limits.get(&obj_ref) else {
+        tracing::warn!(
+            ns = route_ns,
+            name = ext_name,
+            "RequestSizeLimit CR not found — limit skipped (fail-open)"
+        );
+        return Some(None);
+    };
+    let limit = crate::ingress::annotations::parse_byte_size(&cr.spec.max_size);
+    if limit.is_none() {
+        tracing::warn!(
+            ns = route_ns,
+            name = ext_name,
+            value = %cr.spec.max_size,
+            "RequestSizeLimit CR has invalid maxSize — limit skipped (fail-open)"
+        );
+    }
+    Some(limit)
+}
+
+/// Scans `filters` for an `ExtensionRef` pointing at a `Compression` CR
+/// (`group: gateway.coxswain-labs.dev`, `kind: Compression`) and, if found,
+/// resolves the named CR into a [`CompressionConfig`].
+///
+/// Only the first matching `ExtensionRef` is used. A missing CR logs a WARN
+/// and returns `None` (fail-open: no compression). When both `gzip` and
+/// `brotli` are `false` the CR is a no-op and `None` is returned, mirroring
+/// `parse_compression`'s Ingress-annotation behaviour — the proxy never
+/// constructs an encoder for a route with nothing to compress.
+pub(super) fn resolve_compression(
+    filters: &[HttpRouteRulesFilters],
+    route_ns: &str,
+    compressions: &reflector::Store<Compression>,
+) -> Option<Arc<CompressionConfig>> {
+    for f in filters {
+        if !matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
+            continue;
+        }
+        let Some(ext) = &f.extension_ref else {
+            continue;
+        };
+        if let Some(cfg) =
+            resolve_compression_ref(&ext.group, &ext.kind, &ext.name, route_ns, compressions)
+        {
+            return cfg;
+        }
+    }
+    None
+}
+
+/// Resolve a single `ExtensionRef` into a [`CompressionConfig`], if it
+/// targets a `Compression` CR.
+///
+/// Returns `None` when the ref is **not** a `Compression` so the caller keeps
+/// scanning. When it *is*, returns `Some(cfg_opt)`: `Some(None)` on a missing
+/// CR or a CR with both `gzip`/`brotli` disabled, `Some(Some(cfg))` otherwise.
+pub(super) fn resolve_compression_ref(
+    ext_group: &str,
+    ext_kind: &str,
+    ext_name: &str,
+    route_ns: &str,
+    compressions: &reflector::Store<Compression>,
+) -> Option<Option<Arc<CompressionConfig>>> {
+    if ext_group != "gateway.coxswain-labs.dev" || ext_kind != "Compression" {
+        return None;
+    }
+    let obj_ref = reflector::ObjectRef::<Compression>::new(ext_name).within(route_ns);
+    let Some(cr) = compressions.get(&obj_ref) else {
+        tracing::warn!(
+            ns = route_ns,
+            name = ext_name,
+            "Compression CR not found — compression skipped (fail-open)"
+        );
+        return Some(None);
+    };
+    if !cr.spec.gzip && !cr.spec.brotli {
+        return Some(None);
+    }
+    let level = cr.spec.level.filter(|l| (1..=9).contains(l)).unwrap_or(6);
+    let min_size = cr.spec.min_size.unwrap_or(1024);
+    let types: Box<[Box<str>]> = if cr.spec.types.is_empty() {
+        crate::ingress::annotations::default_compression_types()
+    } else {
+        cr.spec
+            .types
+            .iter()
+            .map(|t| t.to_lowercase().into_boxed_str())
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    };
+    Some(Some(Arc::new(CompressionConfig::new(
+        cr.spec.gzip,
+        cr.spec.brotli,
+        level,
+        min_size,
+        types,
+    ))))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -832,7 +1109,6 @@ mod tests {
                     filters: Some(filters),
                     ..Default::default()
                 }]),
-                ..Default::default()
             },
             ..Default::default()
         }
@@ -886,6 +1162,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -939,6 +1219,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -990,6 +1274,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1047,6 +1335,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1111,6 +1403,10 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
                 backend_client_cert_failures: &HashSet::new(),
             },
@@ -1255,5 +1551,258 @@ mod tests {
         assert_eq!(allow.expect("one valid allow").len(), 1);
         assert!(deny.is_none(), "all-invalid deny list collapses to None");
         assert!(logs_contain("invalid CIDR"));
+    }
+
+    // ── resolve_basic_auth ────────────────────────────────────────────────────
+
+    use coxswain_core::crd::BasicAuth;
+    use k8s_openapi::ByteString;
+    use std::collections::BTreeMap;
+
+    fn basic_auth_ext_ref(name: &str) -> HttpRouteRulesFilters {
+        HttpRouteRulesFilters {
+            r#type: HttpRouteRulesFiltersType::ExtensionRef,
+            extension_ref: Some(HttpRouteRulesFiltersExtensionRef {
+                group: "gateway.coxswain-labs.dev".to_string(),
+                kind: "BasicAuth".to_string(),
+                name: name.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    // `BasicAuthSpec` is `#[non_exhaustive]` — deserialize a CR instead.
+    fn basic_auth_cr(ns: &str, name: &str, secret_ns: &str, secret_name: &str) -> BasicAuth {
+        let yaml = format!(
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: BasicAuth\n\
+             metadata:\n  name: {name}\n  namespace: {ns}\n\
+             spec:\n  secretRef:\n    name: {secret_name}\n    namespace: {secret_ns}\n",
+        );
+        serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("valid BasicAuth: {e}\n{yaml}"))
+    }
+
+    fn htpasswd_secret(ns: &str, name: &str, auth_data: &str) -> Secret {
+        let mut data = BTreeMap::new();
+        data.insert(
+            "auth".to_string(),
+            ByteString(auth_data.as_bytes().to_vec()),
+        );
+        Secret {
+            metadata: kube::api::ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            data: Some(data),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_basic_auth_no_ext_ref_is_none() {
+        let basic_auths = empty_basic_auth_store();
+        let auth_secrets = empty_secret_store();
+        assert!(resolve_basic_auth(&[], "default", &basic_auths, &auth_secrets).is_none());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_basic_auth_missing_cr_fails_open() {
+        let basic_auths = empty_basic_auth_store();
+        let auth_secrets = empty_secret_store();
+        let cfg = resolve_basic_auth(
+            &[basic_auth_ext_ref("absent")],
+            "default",
+            &basic_auths,
+            &auth_secrets,
+        );
+        assert!(cfg.is_none(), "missing CR must not enforce auth");
+        assert!(logs_contain("BasicAuth CR not found"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_basic_auth_missing_secret_fails_closed() {
+        let basic_auths = make_basic_auth_store(vec![basic_auth_cr(
+            "default",
+            "policy",
+            "default",
+            "my-htpasswd",
+        )]);
+        let auth_secrets = empty_secret_store();
+        let cfg = resolve_basic_auth(
+            &[basic_auth_ext_ref("policy")],
+            "default",
+            &basic_auths,
+            &auth_secrets,
+        )
+        .expect("Some when CR present");
+        assert!(matches!(*cfg, IngressAuthConfig::Unavailable));
+        assert!(logs_contain("failing closed"));
+    }
+
+    #[test]
+    fn resolve_basic_auth_valid_secret_produces_basic_config() {
+        let basic_auths = make_basic_auth_store(vec![basic_auth_cr(
+            "default",
+            "policy",
+            "default",
+            "my-htpasswd",
+        )]);
+        let auth_secrets = make_secret_store(vec![htpasswd_secret(
+            "default",
+            "my-htpasswd",
+            "alice:$2y$12$abcdefghijklmnopqrstuuVGKkqzuSFPb0h.d.XRjRijkFvxONxfy\n",
+        )]);
+        let cfg = resolve_basic_auth(
+            &[basic_auth_ext_ref("policy")],
+            "default",
+            &basic_auths,
+            &auth_secrets,
+        )
+        .expect("Some when CR and Secret present");
+        assert!(matches!(*cfg, IngressAuthConfig::Basic(ref creds) if creds.len() == 1));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_basic_auth_empty_htpasswd_fails_closed() {
+        let basic_auths = make_basic_auth_store(vec![basic_auth_cr(
+            "default",
+            "policy",
+            "default",
+            "my-htpasswd",
+        )]);
+        let auth_secrets = make_secret_store(vec![htpasswd_secret("default", "my-htpasswd", "")]);
+        let cfg = resolve_basic_auth(
+            &[basic_auth_ext_ref("policy")],
+            "default",
+            &basic_auths,
+            &auth_secrets,
+        )
+        .expect("Some when CR present");
+        assert!(matches!(*cfg, IngressAuthConfig::Unavailable));
+    }
+
+    // ── resolve_request_size_limit ────────────────────────────────────────────
+
+    use coxswain_core::crd::RequestSizeLimit;
+
+    fn request_size_limit_ext_ref(name: &str) -> HttpRouteRulesFilters {
+        HttpRouteRulesFilters {
+            r#type: HttpRouteRulesFiltersType::ExtensionRef,
+            extension_ref: Some(HttpRouteRulesFiltersExtensionRef {
+                group: "gateway.coxswain-labs.dev".to_string(),
+                kind: "RequestSizeLimit".to_string(),
+                name: name.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn request_size_limit_cr(ns: &str, name: &str, max_size: &str) -> RequestSizeLimit {
+        let yaml = format!(
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: RequestSizeLimit\n\
+             metadata:\n  name: {name}\n  namespace: {ns}\n\
+             spec:\n  maxSize: {max_size}\n",
+        );
+        serde_yaml::from_str(&yaml)
+            .unwrap_or_else(|e| panic!("valid RequestSizeLimit: {e}\n{yaml}"))
+    }
+
+    #[test]
+    fn resolve_request_size_limit_no_ext_ref_is_none() {
+        let store = empty_request_size_limit_store();
+        assert!(resolve_request_size_limit(&[], "default", &store).is_none());
+    }
+
+    #[test]
+    fn resolve_request_size_limit_parses_byte_suffix() {
+        let store =
+            make_request_size_limit_store(vec![request_size_limit_cr("default", "rsl", "8m")]);
+        let limit =
+            resolve_request_size_limit(&[request_size_limit_ext_ref("rsl")], "default", &store);
+        assert_eq!(limit, Some(8 * 1024 * 1024));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_request_size_limit_missing_cr_fails_open() {
+        let store = empty_request_size_limit_store();
+        let limit =
+            resolve_request_size_limit(&[request_size_limit_ext_ref("absent")], "default", &store);
+        assert!(limit.is_none());
+        assert!(logs_contain("RequestSizeLimit CR not found"));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_request_size_limit_invalid_max_size_fails_open() {
+        let store =
+            make_request_size_limit_store(vec![request_size_limit_cr("default", "rsl", "bogus")]);
+        let limit =
+            resolve_request_size_limit(&[request_size_limit_ext_ref("rsl")], "default", &store);
+        assert!(limit.is_none());
+        assert!(logs_contain("invalid maxSize"));
+    }
+
+    // ── resolve_compression ───────────────────────────────────────────────────
+
+    use coxswain_core::crd::Compression;
+
+    fn compression_ext_ref(name: &str) -> HttpRouteRulesFilters {
+        HttpRouteRulesFilters {
+            r#type: HttpRouteRulesFiltersType::ExtensionRef,
+            extension_ref: Some(HttpRouteRulesFiltersExtensionRef {
+                group: "gateway.coxswain-labs.dev".to_string(),
+                kind: "Compression".to_string(),
+                name: name.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn compression_cr(ns: &str, name: &str, gzip: bool, brotli: bool) -> Compression {
+        let yaml = format!(
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: Compression\n\
+             metadata:\n  name: {name}\n  namespace: {ns}\n\
+             spec:\n  gzip: {gzip}\n  brotli: {brotli}\n",
+        );
+        serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("valid Compression: {e}\n{yaml}"))
+    }
+
+    #[test]
+    fn resolve_compression_no_ext_ref_is_none() {
+        let store = empty_compression_store();
+        assert!(resolve_compression(&[], "default", &store).is_none());
+    }
+
+    #[test]
+    fn resolve_compression_gzip_only_produces_config() {
+        let store = make_compression_store(vec![compression_cr("default", "gz", true, false)]);
+        let cfg = resolve_compression(&[compression_ext_ref("gz")], "default", &store)
+            .expect("Some when gzip enabled");
+        assert!(cfg.gzip);
+        assert!(!cfg.brotli);
+        assert_eq!(cfg.level, 6);
+        assert_eq!(cfg.min_size, 1024);
+    }
+
+    #[test]
+    fn resolve_compression_both_disabled_is_none() {
+        let store = make_compression_store(vec![compression_cr("default", "noop", false, false)]);
+        assert!(resolve_compression(&[compression_ext_ref("noop")], "default", &store).is_none());
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_compression_missing_cr_fails_open() {
+        let store = empty_compression_store();
+        let cfg = resolve_compression(&[compression_ext_ref("absent")], "default", &store);
+        assert!(cfg.is_none());
+        assert!(logs_contain("Compression CR not found"));
     }
 }

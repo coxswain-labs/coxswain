@@ -176,6 +176,26 @@ pub const GRPC_IP_ACCESS_RESTRICTED: &str = fixture!("grpc_ip_access_restricted.
 /// Gateway + GRPCRoute + `RateLimit` (rps=1) via `ExtensionRef` (#25 gRPC
 /// parity). The first call is served; rapid follow-ups are rejected.
 pub const GRPC_RATE_LIMIT: &str = fixture!("grpc_rate_limit.yaml");
+/// Gateway + `BasicAuth` CR (labeled htpasswd Secret, alice:secret bcrypt) +
+/// HTTPRoute with `ExtensionRef` (#442). Valid `Authorization: Basic`
+/// credentials are admitted; missing/invalid credentials get 401.
+pub const BASIC_AUTH_EXTENSIONREF: &str = fixture!("basic_auth_extensionref.yaml");
+/// Gateway + `BasicAuth` CR referencing an UNLABELED htpasswd Secret +
+/// HTTPRoute with `ExtensionRef` (#442 sad path). The reflector never loads
+/// the Secret, so the proxy fails closed with 503 even for valid credentials.
+pub const BASIC_AUTH_EXTENSIONREF_UNLABELED: &str =
+    fixture!("basic_auth_extensionref_unlabeled.yaml");
+/// Gateway + `RequestSizeLimit` CR (maxSize: 1k) + HTTPRoute with
+/// `ExtensionRef` (#443). Under-limit bodies pass; over-limit bodies get 413.
+pub const REQUEST_SIZE_LIMIT_EXTENSIONREF: &str = fixture!("request_size_limit_extensionref.yaml");
+/// Gateway + GRPCRoute + `RequestSizeLimit` (maxSize: 1k) via `ExtensionRef`
+/// (#443 GRPCRoute parity). Proves the byte cap applies to gRPC (HTTP/2)
+/// message bodies too.
+pub const REQUEST_SIZE_LIMIT_GRPCROUTE: &str = fixture!("request_size_limit_grpcroute.yaml");
+/// Gateway + `Compression` CR (gzip+brotli) + HTTPRoute with `ExtensionRef`
+/// (#446). Verifies `Content-Encoding`/`Vary` negotiation and the
+/// `application/grpc` passthrough guard.
+pub const COMPRESSION_EXTENSIONREF: &str = fixture!("compression_extensionref.yaml");
 /// Dedicated-mode Gateway whose `CoxswainGatewayParameters` references an
 /// image that cannot be pulled (#210). The dedicated proxy Pod never becomes
 /// Ready, so the operator never publishes `DedicatedProxyReady=True` and the
