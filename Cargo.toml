@@ -9,7 +9,9 @@ members = [
     "crates/coxswain-reflector",
     "crates/coxswain-health",
     "crates/coxswain-admin",
-    "crates/coxswain-e2e"
+    "crates/coxswain-e2e",
+    "crates/gateway-api-types",
+    "xtask"
 ]
 default-members = [
     "crates/coxswain-bin",
@@ -19,7 +21,8 @@ default-members = [
     "crates/coxswain-proxy",
     "crates/coxswain-reflector",
     "crates/coxswain-health",
-    "crates/coxswain-admin"
+    "crates/coxswain-admin",
+    "crates/gateway-api-types"
 ]
 
 [workspace.package]
@@ -57,9 +60,9 @@ flate2             = { version = "1" }
 form_urlencoded    = { version = "1.2" }
 governor           = { version = "0.10", default-features = false, features = ["std", "dashmap"] }
 futures            = { version = "0.3" }
-# Sourced from a coxswain-labs fork that rebuilds 0.21.0 against kube 4 (#350).
-# Pin to a specific commit for reproducible builds.
-gateway-api        = { version = "0.21", git = "https://github.com/coxswain-labs/gateway-api-rs", rev = "9c1238557eaff3060fb649a6426f9d04054fa022" }
+# First-party kopium-generated bindings (#510). Regenerate with
+# `cargo run -p xtask -- gateway-api-types`; see the repo-root xtask crate.
+gateway-api-types  = { path = "./crates/gateway-api-types" }
 http               = { version = "1" }
 humantime          = { version = "2" }
 ipnet              = { version = "2" }
@@ -118,6 +121,7 @@ tracing            = { version = "0.1" }
 x509-parser        = { version = "0.18" }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 tracing-test       = { version = "0.2" }
+ureq               = { version = "3" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
