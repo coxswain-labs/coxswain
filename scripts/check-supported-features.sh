@@ -8,9 +8,16 @@ set -euo pipefail
 RUST_FILE="crates/coxswain-controller/src/controller/gateway_class_status.rs"
 GO_FILE="conformance/main_test.go"
 
-# Extract quoted strings from SUPPORTED_FEATURES in the Rust file.
-# Matches lines like:    "Gateway",
-rust_features=$(grep -E '^\s+"[A-Za-z0-9]+",' "$RUST_FILE" \
+# Extract quoted strings from the SUPPORTED_FEATURES array only — scoped to
+# between its declaration and closing `];` so a quoted string anywhere else
+# in the file (e.g. a "True"/"False" condition-status literal) can't be
+# misread as a feature name.
+rust_features=$(awk '
+  /const SUPPORTED_FEATURES/ { in_array=1; next }
+  in_array && /\];/ { exit }
+  in_array
+' "$RUST_FILE" \
+  | grep -E '^\s+"[A-Za-z0-9]+",' \
   | sed 's/[^"]*"\([^"]*\)".*/\1/' \
   | sort)
 

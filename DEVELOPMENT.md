@@ -36,6 +36,21 @@ Run the binary directly on your machine. It discovers the cluster via `~/.kube/c
 kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$(cat .gateway-api-version)/standard-install.yaml"
 ```
 
+`.gateway-api-version` is the **single** version knob for the whole repo — the same file also pins the CRD version installed by `coxswain-e2e`'s bootstrap harness and drives regeneration of the `gateway-api-types` crate (see below). Bumping it does not require any other file to change in lockstep.
+
+#### Regenerating `gateway-api-types`
+
+`crates/gateway-api-types` (Gateway API Rust bindings) is generated wholesale — never hand-edited — by the `xtask` crate, a repo-root sibling of `crates/` (the classic `cargo xtask` layout; not part of the runtime dependency graph, same non-runtime category as `coxswain-e2e`). To bump the Gateway API version:
+
+1. Requires the [`kopium`](https://github.com/kube-rs/kopium) CLI (`cargo install kopium`) and an authenticated `gh` CLI (used for GitHub API tree listings that drive CRD-kind and condition-constant discovery).
+2. Edit `.gateway-api-version` at the repo root.
+3. Run the generator:
+   ```bash
+   cargo run -p xtask -- gateway-api-types
+   ```
+   (Pass an explicit tag as a trailing argument, e.g. `-- gateway-api-types v1.6.0`, to test an unreleased tag without touching `.gateway-api-version`.)
+4. Review the regenerated diff under `crates/gateway-api-types/src/` like any other committed-generated artifact (same trust model as `charts/coxswain/crds/*.yaml`), then `cargo test --workspace --exclude coxswain-e2e` to catch any CRD schema changes existing fixtures need to account for (new required fields show up as `E0063` compile errors at every affected struct literal).
+
 ### 2. Apply the cluster manifests
 
 Apply everything except the Deployments — the binary runs on your machine:
