@@ -26,7 +26,7 @@ use coxswain_e2e::{
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress as ing},
     harness::{HttpClient, wait},
 };
-use gateway_api::apis::standard::gateways::Gateway;
+use gateway_api_types::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
@@ -669,14 +669,14 @@ async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<
     // Baseline — the route resolves while the grant is in place.
     wait::wait_for_route(&http, &host, "/", Duration::from_secs(60)).await?;
 
-    use gateway_api::apis::standard::referencegrants::ReferenceGrant;
+    use gateway_api_types::apis::standard::referencegrants::ReferenceGrant;
     let grants: Api<ReferenceGrant> = Api::namespaced(h.client.clone(), &tenant.name);
     let grant_name = format!("allow-httproute-from-{}", ns.name);
     grants.delete(&grant_name, &DeleteParams::default()).await?;
 
     // Cross-namespace backend dropped from the routing table → reflector
     // installs an "error route" returning 500 ("No ready endpoints for rule —
-    // installing error route (500)"; see `gateway_api::reconcile`).
+    // installing error route (500)"; see `coxswain_reflector::gateway_api::reconcile`).
     wait::wait_for_route_status(&http, &host, "/", 500, Duration::from_secs(30)).await?;
 
     Ok(())

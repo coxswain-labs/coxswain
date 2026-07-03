@@ -2,6 +2,7 @@
 
 use super::conditions::{make_condition, route_parent_gets_status};
 use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::gw_types::constants::RouteConditionType;
 use coxswain_reflector::gw_types::{
     HttpRoute,
     v::httproutes::{HttpRouteStatusParents, HttpRouteStatusParentsParentRef},
@@ -82,13 +83,19 @@ pub(super) async fn mark_http_route_programmed(
             };
 
             let accepted_cond = make_condition(
-                "Accepted",
+                RouteConditionType::Accepted,
                 acc_status,
                 acc_reason,
                 "",
                 observed_gen,
                 now.clone(),
             );
+            // "Programmed" is not a Gateway API `RouteConditionType` (the spec
+            // only defines Accepted/ResolvedRefs/PartiallyInvalid for routes —
+            // Programmed is Gateway/Listener-only); it's a coxswain-specific
+            // addition, so it stays a plain literal rather than a forced,
+            // nonexistent enum variant. Condition semantics are out of scope
+            // for #510 — see that issue's "Out of scope" section.
             let programmed_cond = make_condition(
                 "Programmed",
                 prog_status,
@@ -98,7 +105,7 @@ pub(super) async fn mark_http_route_programmed(
                 now.clone(),
             );
             let resolved_refs_cond = make_condition(
-                "ResolvedRefs",
+                RouteConditionType::ResolvedRefs,
                 res_status,
                 res_reason,
                 "",

@@ -6,6 +6,7 @@
 use super::conditions::make_condition;
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::BackendTlsPolicy;
+use coxswain_reflector::gw_types::constants::PolicyConditionType;
 use coxswain_reflector::gw_types::v::backendtlspolicies::{
     BackendTlsPolicyStatusAncestors, BackendTlsPolicyStatusAncestorsAncestorRef,
 };
@@ -86,7 +87,7 @@ fn build_ancestors(
 
     let make_entry = |ancestor_ref: BackendTlsPolicyStatusAncestorsAncestorRef| {
         let accepted_cond = make_condition(
-            "Accepted",
+            PolicyConditionType::Accepted,
             acc_status,
             acc_reason,
             "",
@@ -94,7 +95,7 @@ fn build_ancestors(
             now.clone(),
         );
         let resolved_refs_cond = make_condition(
-            "ResolvedRefs",
+            PolicyConditionType::ResolvedRefs,
             res_status,
             res_reason,
             "",

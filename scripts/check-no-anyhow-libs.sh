@@ -15,6 +15,7 @@ LIB_CRATES=(
   coxswain-controller
   coxswain-admin
   coxswain-health
+  gateway-api-types
 )
 
 offenders=()

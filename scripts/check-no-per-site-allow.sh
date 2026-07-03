@@ -8,6 +8,11 @@
 # - '#![allow(missing_docs)]' at the top of bench files and
 #   'crates/coxswain-e2e/tests/*' — criterion/e2e macros expand to `pub fn`
 #   items the author can't annotate.
+# - 'crates/gateway-api-types/src/**' — generated wholesale by the repo-root
+#   'xtask' crate (#510); kopium itself emits a per-file
+#   '#[allow(unused_imports)]' on its internal `prelude` module (some kinds
+#   don't use every prelude import), which can't be removed without patching
+#   kopium's own output. Same trust model as the committed CRD manifests.
 #
 # Run from the repo root. Exits non-zero with a list of offending sites.
 
@@ -22,10 +27,11 @@ offenders=$(grep -rnE '^\s*#!?\[(allow|expect)\(' crates/*/src/ \
   | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#!\[allow\(missing_docs\)\]' \
   || true)
 
-# Trim entries inside bench / e2e tests paths.
+# Trim entries inside bench / e2e tests paths, and the generated crate.
 offenders=$(printf '%s\n' "$offenders" \
   | grep -vE 'crates/[^/]+/benches/' \
   | grep -vE 'crates/coxswain-e2e/tests/' \
+  | grep -vE 'crates/gateway-api-types/src/' \
   | grep -v '^$' \
   || true)
 

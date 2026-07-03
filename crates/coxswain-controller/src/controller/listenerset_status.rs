@@ -12,6 +12,10 @@
 use crate::status_common::{listener_condition_triplet, make_condition};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::ListenerSet;
+use coxswain_reflector::gw_types::constants::{
+    ListenerConditionReason, ListenerConditionType, ListenerSetConditionReason,
+    ListenerSetConditionType,
+};
 use coxswain_reflector::gw_types::v::listenersets::ListenerSetListeners;
 use coxswain_reflector::ingress::IngressPorts;
 use coxswain_reflector::status::{
@@ -175,7 +179,7 @@ fn listener_conditions(
             }
         }
         conds.push(make_condition(
-            "Conflicted",
+            ListenerConditionType::Conflicted,
             "True",
             reason,
             conflict_msg,
@@ -184,9 +188,9 @@ fn listener_conditions(
         ));
     } else {
         conds.push(make_condition(
-            "Conflicted",
+            ListenerConditionType::Conflicted,
             "False",
-            "NoConflicts",
+            ListenerConditionReason::NoConflicts,
             "",
             generation,
             now.clone(),
@@ -262,17 +266,17 @@ pub(super) fn build_listenerset_status_patch(
     let (accepted_status, accepted_reason, accepted_msg) = if !accepted {
         (
             "False",
-            "NotAllowed",
+            ListenerSetConditionReason::NotAllowed,
             "the parent Gateway's spec.allowedListeners does not permit this ListenerSet",
         )
     } else if all_listeners_invalid {
         (
             "False",
-            "ListenersNotValid",
+            ListenerSetConditionReason::ListenersNotValid,
             "all listeners are invalid or conflicted",
         )
     } else {
-        ("True", "Accepted", "")
+        ("True", ListenerSetConditionReason::Accepted, "")
     };
     let (prog_status, prog_reason, prog_msg) = if !accepted {
         // GEP-1713 conformance: a ListenerSet rejected by the parent's
@@ -280,13 +284,13 @@ pub(super) fn build_listenerset_status_patch(
         // mirroring its Accepted condition (NOT `Pending`).
         (
             "False",
-            "NotAllowed",
+            ListenerSetConditionReason::NotAllowed,
             "ListenerSet not accepted by the parent Gateway",
         )
     } else if all_listeners_invalid {
         (
             "False",
-            "ListenersNotValid",
+            ListenerSetConditionReason::ListenersNotValid,
             "all listeners are invalid or conflicted",
         )
     } else {
@@ -295,11 +299,11 @@ pub(super) fn build_listenerset_status_patch(
         // own `Programmed=False/Conflicted` condition records the loss) does NOT
         // drag the whole set to Programmed=False — mirrors the Gateway-level rule
         // and the protocol/hostname-conflict conformance expectations.
-        ("True", "Programmed", "")
+        ("True", ListenerSetConditionReason::Programmed, "")
     };
     let conditions = vec![
         make_condition(
-            "Accepted",
+            ListenerSetConditionType::Accepted,
             accepted_status,
             accepted_reason,
             accepted_msg,
@@ -307,7 +311,7 @@ pub(super) fn build_listenerset_status_patch(
             now.clone(),
         ),
         make_condition(
-            "Programmed",
+            ListenerSetConditionType::Programmed,
             prog_status,
             prog_reason,
             prog_msg,

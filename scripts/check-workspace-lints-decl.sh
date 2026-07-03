@@ -3,6 +3,13 @@
 # = true`" rule. Without this declaration, a crate silently escapes every
 # workspace lint, defeating the single-source-of-truth policy.
 #
+# Exemption: 'gateway-api-types' is generated wholesale by the repo-root
+# 'xtask' crate (#510) — reviewed by diff on regen, same trust
+# model as the committed 'charts/coxswain/crds/*.yaml' manifests. kopium's own
+# output needs lint latitude (missing_docs, doc formatting, tabs-in-doc-comments,
+# ...) the rest of the workspace doesn't, so it carries its own '[lints]'
+# table instead of inheriting the workspace one.
+#
 # Run from the repo root. Exits non-zero with a list of offending Cargo.toml
 # files.
 
@@ -10,6 +17,9 @@ set -euo pipefail
 
 offenders=()
 for cargo_toml in crates/*/Cargo.toml; do
+  if [[ "$cargo_toml" == "crates/gateway-api-types/Cargo.toml" ]]; then
+    continue
+  fi
   # Look for the '[lints]' section followed (eventually) by 'workspace = true'.
   if ! awk '
     /^\[lints\]/ { in_lints=1; next }
@@ -32,5 +42,5 @@ if [ "${#offenders[@]}" -gt 0 ]; then
   exit 1
 fi
 
-count=$(ls crates/*/Cargo.toml | wc -l | tr -d ' ')
-echo "OK: $count crate manifests declare '[lints] workspace = true'."
+count=$(ls crates/*/Cargo.toml | grep -vc 'crates/gateway-api-types/Cargo.toml')
+echo "OK: $count crate manifests declare '[lints] workspace = true' (gateway-api-types exempt, generated)."

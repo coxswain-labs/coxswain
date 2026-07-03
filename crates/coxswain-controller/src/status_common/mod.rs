@@ -16,6 +16,7 @@
 
 pub(crate) mod addresses;
 
+use coxswain_reflector::gw_types::constants::{ListenerConditionReason, ListenerConditionType};
 use coxswain_reflector::gw_types::v::gateways::{
     GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
@@ -38,11 +39,21 @@ pub(crate) const OPERATOR_OWNED_CONDITION_TYPE_PREFIX: &str = "gateway.coxswain-
 /// writers — avoid `Condition { ... }` struct literals elsewhere so any
 /// future field convention (e.g. `last_transition_time` clamping) lands in
 /// one place.
+///
+/// `type_` and `reason` accept `impl Display` rather than `&str` (#510) so
+/// call sites pass the Go-derived typed constants from
+/// `coxswain_reflector::gw_types::constants` (e.g.
+/// `GatewayConditionReason::ResolvedRefs`) instead of hand-typed string
+/// literals wherever the value is a fixed Gateway API condition/reason — a
+/// typo or a drifted-from-spec string is now a compile error, not a silent
+/// wire-format bug. Values with no upstream Go-source constant (a
+/// reflector-computed reason, or a Coxswain-owned condition like
+/// `gateway.coxswain-labs.dev/DedicatedProxyReady`) keep passing `&str`.
 #[must_use]
 pub(crate) fn make_condition(
-    type_: &str,
+    type_: impl std::fmt::Display,
     status: &str,
-    reason: &str,
+    reason: impl std::fmt::Display,
     message: &str,
     generation: i64,
     now: Time,
@@ -215,27 +226,46 @@ pub(crate) fn listener_condition_triplet(
     let frontend_msg = frontend_outcome
         .map(FrontendValidationOutcome::message)
         .unwrap_or("");
+    // `resolved_refs_reason` (and the other two reason bindings below) unify to
+    // `String`: most arms are fixed Gateway API reasons (typed via
+    // `ListenerConditionReason`, so a typo or spec drift is a compile error),
+    // but the fallback arm forwards `outcome.reason()` — a reflector-computed
+    // `&'static str` from `coxswain_core::ListenerReadiness`, already
+    // exhaustively matched there (#510 doesn't thread the Go-derived enum
+    // through `coxswain-core`, which stays Gateway-API-agnostic by design).
     let (resolved_refs_status, resolved_refs_reason, resolved_refs_msg) = if frontend_ca_failed {
-        ("False", frontend_reason, frontend_msg)
+        ("False", frontend_reason.to_string(), frontend_msg)
     } else if has_invalid_kinds {
         (
             "False",
-            "InvalidRouteKinds",
+            ListenerConditionReason::InvalidRouteKinds.to_string(),
             "One or more specified route kinds are not supported by this implementation",
         )
     } else if outcome.is_healthy() {
-        ("True", "ResolvedRefs", "")
+        (
+            "True",
+            ListenerConditionReason::ResolvedRefs.to_string(),
+            "",
+        )
     } else {
-        ("False", outcome.reason(), outcome.message())
+        ("False", outcome.reason().to_string(), outcome.message())
     };
     // Accepted is False when the listener uses an unsupported protocol/mode combination,
     // when the frontend CA failed to resolve, or True/Accepted otherwise.
     let (accepted_status, accepted_reason, accepted_msg) = if frontend_ca_failed {
-        ("False", "NoValidCACertificate", frontend_msg)
+        (
+            "False",
+            ListenerConditionReason::NoValidCACertificate.to_string(),
+            frontend_msg,
+        )
     } else if let ListenerReadiness::Unsupported { message } = &outcome {
-        ("False", "UnsupportedValue", message.as_str())
+        (
+            "False",
+            ListenerConditionReason::UnsupportedValue.to_string(),
+            message.as_str(),
+        )
     } else {
-        ("True", "Accepted", "")
+        ("True", ListenerConditionReason::Accepted.to_string(), "")
     };
     // Port-conflict detection (#201): a listener whose port is reserved by the
     // Ingress data plane (--proxy-http-port / --proxy-https-port) cannot be bound
@@ -248,13 +278,21 @@ pub(crate) fn listener_condition_triplet(
         "port {listener_port_u16} is reserved by the Ingress proxy (set via --proxy-http-port or --proxy-https-port)"
     );
     let (listener_prog_status, listener_prog_reason, listener_prog_msg) = if port_conflict {
-        ("False", "PortUnavailable", port_conflict_msg.as_str())
+        (
+            "False",
+            ListenerConditionReason::PortUnavailable.to_string(),
+            port_conflict_msg.as_str(),
+        )
     } else if frontend_ca_failed {
-        ("False", "NoValidCACertificate", frontend_msg)
+        (
+            "False",
+            ListenerConditionReason::NoValidCACertificate.to_string(),
+            frontend_msg,
+        )
     } else if outcome.is_healthy() {
-        ("True", "Programmed", "")
+        ("True", ListenerConditionReason::Programmed.to_string(), "")
     } else {
-        ("False", outcome.reason(), outcome.message())
+        ("False", outcome.reason().to_string(), outcome.message())
     };
     tracing::debug!(
         listener = %listener_name,
@@ -264,7 +302,7 @@ pub(crate) fn listener_condition_triplet(
     );
     vec![
         make_condition(
-            "Accepted",
+            ListenerConditionType::Accepted,
             accepted_status,
             accepted_reason,
             accepted_msg,
@@ -272,7 +310,7 @@ pub(crate) fn listener_condition_triplet(
             now.clone(),
         ),
         make_condition(
-            "ResolvedRefs",
+            ListenerConditionType::ResolvedRefs,
             resolved_refs_status,
             resolved_refs_reason,
             resolved_refs_msg,
@@ -280,7 +318,7 @@ pub(crate) fn listener_condition_triplet(
             now.clone(),
         ),
         make_condition(
-            "Programmed",
+            ListenerConditionType::Programmed,
             listener_prog_status,
             listener_prog_reason,
             listener_prog_msg,

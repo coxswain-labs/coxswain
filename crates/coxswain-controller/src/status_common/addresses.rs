@@ -17,19 +17,8 @@
 //! requested but not bound is `AddressNotUsable`; an unsupported `type` is
 //! `UnsupportedAddress` (rejected before provisioning).
 
+use coxswain_reflector::gw_types::constants::GatewayConditionReason;
 use coxswain_reflector::gw_types::v::gateways::GatewayAddresses;
-
-/// `Accepted=False` reason when a requested address carries a `type` coxswain
-/// cannot honor (anything other than `IPAddress`/`Hostname`). Gateway API
-/// canonical (`apis/v1/gateway_types.go`).
-pub(crate) const REASON_UNSUPPORTED_ADDRESS: &str = "UnsupportedAddress";
-/// `Programmed=False` reason when every requested `type` is supported but at
-/// least one requested address could not be bound to the data-plane Service.
-/// Gateway API canonical.
-pub(crate) const REASON_ADDRESS_NOT_USABLE: &str = "AddressNotUsable";
-/// `Programmed=False` reason emitted when `Accepted=False` (the spec is invalid,
-/// so it cannot be programmed). Gateway API canonical.
-pub(crate) const REASON_INVALID: &str = "Invalid";
 
 /// An address `type` coxswain can place in `status.addresses`. Per the Gateway
 /// API spec an absent `spec.addresses[*].type` defaults to `IPAddress`.
@@ -81,12 +70,12 @@ impl TypedAddress {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StaticAddressOutcome {
-    /// `Some(REASON_UNSUPPORTED_ADDRESS)` forces `Accepted=(False, reason)`.
-    pub(crate) accepted_override: Option<&'static str>,
+    /// `Some(GatewayConditionReason::UnsupportedAddress)` forces
+    /// `Accepted=(False, reason)`.
+    pub(crate) accepted_override: Option<GatewayConditionReason>,
     /// `Some(reason)` forces `Programmed=(False, reason)` —
-    /// `REASON_ADDRESS_NOT_USABLE`, or `REASON_INVALID` when
-    /// `accepted_override` is also set.
-    pub(crate) programmed_override: Option<&'static str>,
+    /// `AddressNotUsable`, or `Invalid` when `accepted_override` is also set.
+    pub(crate) programmed_override: Option<GatewayConditionReason>,
     /// The addresses to publish in `status.addresses`. Only the *usable* bound
     /// addresses — never the unusable or invalid requested values.
     pub(crate) status_addresses: Vec<TypedAddress>,
@@ -176,8 +165,8 @@ pub(crate) fn evaluate_static_addresses(
                 // provisioning. status.addresses is cleared (empty) and the
                 // feature is treated as engaged so the writer publishes `[]`.
                 return StaticAddressOutcome {
-                    accepted_override: Some(REASON_UNSUPPORTED_ADDRESS),
-                    programmed_override: Some(REASON_INVALID),
+                    accepted_override: Some(GatewayConditionReason::UnsupportedAddress),
+                    programmed_override: Some(GatewayConditionReason::Invalid),
                     status_addresses: Vec::new(),
                     feature_engaged: true,
                 };
@@ -215,7 +204,7 @@ pub(crate) fn evaluate_static_addresses(
 
     StaticAddressOutcome {
         accepted_override: None,
-        programmed_override: (!all_usable).then_some(REASON_ADDRESS_NOT_USABLE),
+        programmed_override: (!all_usable).then_some(GatewayConditionReason::AddressNotUsable),
         status_addresses,
         feature_engaged: true,
     }
@@ -223,10 +212,8 @@ pub(crate) fn evaluate_static_addresses(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        REASON_ADDRESS_NOT_USABLE, REASON_INVALID, REASON_UNSUPPORTED_ADDRESS,
-        SupportedAddressType, TypedAddress, evaluate_static_addresses,
-    };
+    use super::{SupportedAddressType, TypedAddress, evaluate_static_addresses};
+    use coxswain_reflector::gw_types::constants::GatewayConditionReason;
     use coxswain_reflector::gw_types::v::gateways::GatewayAddresses;
 
     fn req(type_: Option<&str>, value: Option<&str>) -> GatewayAddresses {
@@ -261,8 +248,14 @@ mod tests {
             &[req(Some("test/fake-invalid-type"), Some("nonsense"))],
             &[],
         );
-        assert_eq!(out.accepted_override, Some(REASON_UNSUPPORTED_ADDRESS));
-        assert_eq!(out.programmed_override, Some(REASON_INVALID));
+        assert_eq!(
+            out.accepted_override,
+            Some(GatewayConditionReason::UnsupportedAddress)
+        );
+        assert_eq!(
+            out.programmed_override,
+            Some(GatewayConditionReason::Invalid)
+        );
         assert!(out.status_addresses.is_empty());
         assert!(out.feature_engaged);
     }
@@ -276,7 +269,10 @@ mod tests {
             ],
             &[ip("10.96.0.10")],
         );
-        assert_eq!(out.accepted_override, Some(REASON_UNSUPPORTED_ADDRESS));
+        assert_eq!(
+            out.accepted_override,
+            Some(GatewayConditionReason::UnsupportedAddress)
+        );
         assert!(out.status_addresses.is_empty());
     }
 
@@ -314,7 +310,10 @@ mod tests {
             out.accepted_override.is_none(),
             "supported types stay Accepted"
         );
-        assert_eq!(out.programmed_override, Some(REASON_ADDRESS_NOT_USABLE));
+        assert_eq!(
+            out.programmed_override,
+            Some(GatewayConditionReason::AddressNotUsable)
+        );
         // Only the usable bound address is published; the unusable value never is.
         assert_eq!(out.status_addresses, vec![ip("10.96.0.10")]);
     }
@@ -324,7 +323,10 @@ mod tests {
         // VIP pending or apiserver rejected the requested clusterIP → resolved empty.
         let out = evaluate_static_addresses(&[req(Some("IPAddress"), Some("192.0.2.1"))], &[]);
         assert!(out.accepted_override.is_none());
-        assert_eq!(out.programmed_override, Some(REASON_ADDRESS_NOT_USABLE));
+        assert_eq!(
+            out.programmed_override,
+            Some(GatewayConditionReason::AddressNotUsable)
+        );
         assert!(out.status_addresses.is_empty());
     }
 

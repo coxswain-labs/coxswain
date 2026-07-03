@@ -5,6 +5,7 @@
 
 use super::conditions::make_condition;
 use coxswain_core::ownership::{self, ObjectKey};
+use coxswain_reflector::gw_types::constants::RouteConditionType;
 use coxswain_reflector::gw_types::{
     TlsRoute,
     v::tlsroutes::{TlsRouteParentRefs, TlsRouteStatusParents, TlsRouteStatusParentsParentRef},
@@ -82,13 +83,15 @@ pub(super) async fn mark_tls_route_programmed(
             };
 
             let accepted_cond = make_condition(
-                "Accepted",
+                RouteConditionType::Accepted,
                 acc_status,
                 acc_reason,
                 "",
                 observed_gen,
                 now.clone(),
             );
+            // "Programmed" is not a Gateway API `RouteConditionType` — see the
+            // identical note in `route_events.rs`.
             let programmed_cond = make_condition(
                 "Programmed",
                 prog_status,
@@ -98,7 +101,7 @@ pub(super) async fn mark_tls_route_programmed(
                 now.clone(),
             );
             let resolved_refs_cond = make_condition(
-                "ResolvedRefs",
+                RouteConditionType::ResolvedRefs,
                 res_status,
                 res_reason,
                 "",

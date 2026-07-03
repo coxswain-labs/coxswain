@@ -1,6 +1,9 @@
 //! `GatewayClass` status patch builder and staleness check.
 
 use super::conditions::{gateway_class_accepted, make_condition};
+use coxswain_reflector::gw_types::constants::{
+    GatewayClassConditionReason, GatewayClassConditionType,
+};
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 
@@ -76,7 +79,14 @@ pub(super) fn gateway_class_needs_status_patch(gc: &GatewayClass) -> bool {
 /// Builds a merge-patch body for `GatewayClass.status` with both the `Accepted`
 /// condition and the complete `supportedFeatures` list.
 pub(super) fn build_gateway_class_status_patch(generation: i64, now: &Time) -> serde_json::Value {
-    let condition = make_condition("Accepted", "True", "Accepted", "", generation, now.clone());
+    let condition = make_condition(
+        GatewayClassConditionType::Accepted,
+        "True",
+        GatewayClassConditionReason::Accepted,
+        "",
+        generation,
+        now.clone(),
+    );
     let supported_features: Vec<serde_json::Value> = SUPPORTED_FEATURES
         .iter()
         .map(|name| serde_json::json!({ "name": name }))

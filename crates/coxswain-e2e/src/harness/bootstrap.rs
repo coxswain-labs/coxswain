@@ -13,8 +13,11 @@ use tokio::sync::OnceCell;
 static CLUSTER_SETUP: OnceCell<()> = OnceCell::const_new();
 
 /// Single source of truth for the Gateway API CRD version installed in tests.
-/// To bump: change `.gateway-api-version` at the repo root and update
-/// `gateway-api` in workspace `Cargo.toml`. See `docs/gateway-api-support.md`.
+/// To bump: change `.gateway-api-version` at the repo root, then regenerate
+/// `gateway-api-types` with `cargo run -p xtask -- gateway-api-types`
+/// (#510) — that's the whole loop; there's no second version string to keep
+/// in sync (`gateway-api-types` is an in-workspace crate, not an external
+/// dependency pinned separately in `Cargo.toml`).
 const GATEWAY_API_VERSION: &str = include_str!("../../../../.gateway-api-version").trim_ascii();
 
 /// Local Docker image tag used for all e2e runs.

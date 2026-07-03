@@ -130,13 +130,20 @@ pub fn spawn_status_writer(
     let dedicated_registry = DedicatedRoutingRegistry::new();
 
     // Always-on checks: shared by both surfaces and by the fleet watch +
-    // rebuild pipeline.
+    // rebuild pipeline. `auth_secret` lives here (not in INGRESS_CHECKS)
+    // because its reflector is spawned unconditionally in
+    // `coxswain_reflector::reconciler::proxy` — Gateway API's `BasicAuth`
+    // ExtensionRef (#442) consumes the same label-scoped store, so the watch
+    // was made always-on regardless of `enable_ingress`. Registering it only
+    // when Ingress is enabled left it spawned-but-unregistered with Ingress
+    // disabled, panicking the first time the reflector reached `InitDone`.
     const ALWAYS_ON_CHECKS: &[&str] = &[
         "endpoint_slice",
         "secret",
         "service",
         "pod",
         "routing_table_built",
+        "auth_secret",
     ];
     // Per-surface checks registered only when the surface is enabled;
     // disabled surfaces never mark a check ready so registering them would
@@ -145,7 +152,6 @@ pub fn spawn_status_writer(
         "ingress",
         "ingress_class",
         "ingress_class_parameters",
-        "auth_secret",
         "auth_tls_secret",
     ];
     const GATEWAY_API_CHECKS: &[&str] = &[

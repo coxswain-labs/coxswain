@@ -159,6 +159,7 @@ runs:
           --project=coxswain \
           --url=https://github.com/coxswain-labs/coxswain \
           --version=$(git describe --tags --always --dirty) \
+          --contact=https://github.com/coxswain-labs/coxswain/issues \
           --report-output="${REPORT_FILE}" \
           --cleanup-base-resources=true
         echo "report-file=conformance/${REPORT_FILE}" >> "$GITHUB_OUTPUT"

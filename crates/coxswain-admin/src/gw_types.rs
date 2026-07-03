@@ -8,6 +8,6 @@
 //! the crate boundary — all internal code uses the alias, never the raw
 //! `HTTPRoute` name.
 
-pub use gateway_api::apis::standard as v;
+pub use gateway_api_types::apis::standard as v;
 
 pub use v::httproutes::HttpRoute;

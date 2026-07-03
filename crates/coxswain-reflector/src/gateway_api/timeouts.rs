@@ -1,21 +1,29 @@
 //! Parses GEP-2257 (Go `time.ParseDuration`) duration strings into `std::time::Duration`
 //! and translates `HTTPRouteRule.timeouts` into [`RouteTimeouts`].
 //!
-//! Duration parsing is delegated to [`crate::duration::parse_duration`], which is
-//! shared with the Ingress annotation parser.
+//! Duration parsing goes through [`gateway_api_types::Duration`] (#510), which
+//! validates *strictly* per GEP-2257 — units below a millisecond (`ns`, `us`)
+//! are rejected, unlike the permissive parser
+//! ([`crate::duration::parse_duration`]) the Ingress-annotation namespace uses.
+//! HTTPRoute's `timeouts` field is a Gateway API spec field, so strict
+//! validation here is a correctness tightening, not a behavior regression: an
+//! operator setting `timeouts.request: "500us"` was previously silently
+//! accepted despite GEP-2257 disallowing sub-millisecond precision.
 
 use crate::gw_types::v::httproutes::HttpRouteRulesTimeouts;
 use coxswain_core::routing::RouteTimeouts;
 
-/// Parse a Gateway API GEP-2257 duration string (Go `time.ParseDuration` format).
-///
-/// Supported units: `ns`, `us`/`µs`, `ms`, `s`, `m`, `h`. Values may be compounded
-/// without spaces (`"1h30m"`).
+/// Parses a Gateway API GEP-2257 duration string (Go `time.ParseDuration`
+/// format, restricted to `h`/`m`/`s`/`ms` units).
 ///
 /// Returns `None` for **both** invalid input and zero values (`"0s"`, `"0"`).
 /// Per GEP-2257, zero is treated as "unset" — the same as omitting the field entirely.
 pub(super) fn parse_gateway_duration(s: &str) -> Option<std::time::Duration> {
-    crate::duration::parse_duration(s)
+    let parsed: gateway_api_types::Duration = s.parse().ok()?;
+    if parsed.is_zero() {
+        return None;
+    }
+    Some(parsed.into())
 }
 
 pub(super) fn parse_rule_timeouts(t: &HttpRouteRulesTimeouts) -> RouteTimeouts {
@@ -86,6 +94,21 @@ mod tests {
     fn parse_gateway_duration_invalid_returns_none() {
         assert_eq!(super::super::timeouts::parse_gateway_duration("10x"), None);
         assert_eq!(super::super::timeouts::parse_gateway_duration("abc"), None);
+    }
+
+    #[test]
+    fn parse_gateway_duration_rejects_sub_millisecond_units() {
+        // GEP-2257 disallows units below a millisecond; unlike the permissive
+        // Ingress-annotation parser, HTTPRoute timeouts reject them outright
+        // rather than silently accepting Go-style `ns`/`us` units (#510).
+        assert_eq!(
+            super::super::timeouts::parse_gateway_duration("100ns"),
+            None
+        );
+        assert_eq!(
+            super::super::timeouts::parse_gateway_duration("500us"),
+            None
+        );
     }
 
     #[test]

@@ -47,13 +47,13 @@
 //! transition that nonetheless requires repatching.
 
 use crate::status_common::addresses::{
-    REASON_ADDRESS_NOT_USABLE, REASON_UNSUPPORTED_ADDRESS, StaticAddressOutcome,
-    SupportedAddressType, TypedAddress, evaluate_static_addresses,
+    StaticAddressOutcome, SupportedAddressType, TypedAddress, evaluate_static_addresses,
 };
 use crate::status_common::{
     OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_route_kind_info,
     make_condition,
 };
+use coxswain_reflector::gw_types::constants::{GatewayConditionReason, GatewayConditionType};
 use coxswain_reflector::gw_types::v::gateways::{
     Gateway, GatewayStatusAddresses, GatewayStatusListeners,
 };
@@ -74,26 +74,10 @@ use std::sync::Arc;
 pub(crate) const DEDICATED_PROXY_READY_CONDITION_TYPE: &str =
     "gateway.coxswain-labs.dev/DedicatedProxyReady";
 
-/// `Accepted` reason emitted when the Gateway's resolved
-/// `CoxswainGatewayParameters` target is missing. Gateway API canonical
-/// reason for an unresolvable `parametersRef`.
-const REASON_INVALID_PARAMETERS: &str = "InvalidParameters";
-/// `Accepted` reason emitted on the success path. Gateway API canonical.
-const REASON_ACCEPTED: &str = "Accepted";
-/// `Programmed` reason emitted when the Gateway is fully programmed (Ready
-/// pod + address assigned + Accepted).
-const REASON_PROGRAMMED: &str = "Programmed";
-/// `Programmed` reason emitted when `Accepted` is `False` (Gateway spec is
-/// invalid; cannot be programmed). Gateway API canonical.
-const REASON_INVALID: &str = "Invalid";
-/// `Programmed` reason emitted while waiting for the dedicated-proxy Pod
-/// to become Ready. Gateway API canonical.
-const REASON_PENDING: &str = "Pending";
-/// `Programmed` reason emitted when no Service-resolved address is yet
-/// available. Gateway API canonical.
-const REASON_ADDRESS_NOT_ASSIGNED: &str = "AddressNotAssigned";
-/// `DedicatedProxyReady` reason emitted when the cut-over has fired
-/// (Coxswain-internal).
+/// `DedicatedProxyReady` reason emitted when the cut-over has fired. Not a
+/// Gateway API constant — `DedicatedProxyReady` is a Coxswain-owned condition
+/// (see [`DEDICATED_PROXY_READY_CONDITION_TYPE`]), so this stays a plain
+/// string rather than a `gateway_api_types` enum variant.
 const REASON_READY: &str = "Ready";
 /// `DedicatedProxyReady` reason emitted before cut-over (Coxswain-internal).
 const REASON_PROVISIONING: &str = "Provisioning";
@@ -196,7 +180,7 @@ pub(crate) fn build_dedicated_gateway_status_patch(
 
     let mut conditions = vec![
         make_condition(
-            "Accepted",
+            GatewayConditionType::Accepted,
             accepted.status,
             accepted.reason,
             accepted.message,
@@ -204,7 +188,7 @@ pub(crate) fn build_dedicated_gateway_status_patch(
             now.clone(),
         ),
         make_condition(
-            "Programmed",
+            GatewayConditionType::Programmed,
             programmed.status,
             programmed.reason,
             programmed.message,
@@ -302,13 +286,21 @@ pub(crate) fn dedicated_gateway_needs_status_patch(
     );
     let cut_over = cut_over_outcome(inputs.accepted, inputs.ready_pod_count);
 
+    // Unify to `String`: `accepted`/`programmed` carry a typed
+    // `GatewayConditionReason`, `cut_over` a plain `&'static str`
+    // (`DedicatedProxyReady` has no Gateway API constant) — see
+    // `ConditionOutcome`/`CutOverOutcome` above.
     let owned_expected = [
-        ("Accepted", accepted.status, accepted.reason),
-        ("Programmed", programmed.status, programmed.reason),
+        ("Accepted", accepted.status, accepted.reason.to_string()),
+        (
+            "Programmed",
+            programmed.status,
+            programmed.reason.to_string(),
+        ),
         (
             DEDICATED_PROXY_READY_CONDITION_TYPE,
             cut_over.status,
-            cut_over.reason,
+            cut_over.reason.to_string(),
         ),
     ];
 
@@ -514,9 +506,21 @@ pub(crate) async fn clear_dedicated_gateway_status(
     Ok(())
 }
 
-/// One `(status, reason, message)` triple per Gateway-API condition.
+/// One `(status, reason, message)` triple for a Gateway-API-canonical
+/// condition (`Accepted`/`Programmed`) — `reason` is the typed Go-derived
+/// enum, not a hand-typed literal. `DedicatedProxyReady` (Coxswain-owned, no
+/// Go-source counterpart) uses [`CutOverOutcome`] instead.
 #[derive(Debug, Clone, Copy)]
 struct ConditionOutcome {
+    status: &'static str,
+    reason: GatewayConditionReason,
+    message: &'static str,
+}
+
+/// One `(status, reason, message)` triple for the Coxswain-owned
+/// `DedicatedProxyReady` condition — `reason` has no Gateway API constant.
+#[derive(Debug, Clone, Copy)]
+struct CutOverOutcome {
     status: &'static str,
     reason: &'static str,
     message: &'static str,
@@ -535,19 +539,19 @@ fn accepted_outcome(
             if static_outcome.accepted_override.is_some() {
                 return ConditionOutcome {
                     status: "False",
-                    reason: REASON_UNSUPPORTED_ADDRESS,
+                    reason: GatewayConditionReason::UnsupportedAddress,
                     message: "spec.addresses contains an address type this implementation does not support",
                 };
             }
             ConditionOutcome {
                 status: "True",
-                reason: REASON_ACCEPTED,
+                reason: GatewayConditionReason::Accepted,
                 message: "",
             }
         }
         AcceptedOutcome::InvalidParameters => ConditionOutcome {
             status: "False",
-            reason: REASON_INVALID_PARAMETERS,
+            reason: GatewayConditionReason::InvalidParameters,
             message: "parametersRef target CoxswainGatewayParameters object does not exist",
         },
     }
@@ -570,49 +574,49 @@ fn programmed_outcome(
     {
         return ConditionOutcome {
             status: "False",
-            reason: REASON_INVALID,
+            reason: GatewayConditionReason::Invalid,
             message: "Gateway spec is invalid; see the Accepted condition for details",
         };
     }
     if ready_pod_count == 0 {
         return ConditionOutcome {
             status: "False",
-            reason: REASON_PENDING,
+            reason: GatewayConditionReason::Pending,
             message: "Awaiting Ready dedicated-proxy Pod",
         };
     }
     // GatewayStaticAddresses (#260): a requested address of a supported type that
     // could not be bound to the Service ranks above the generic "no address" case.
-    if static_outcome.programmed_override == Some(REASON_ADDRESS_NOT_USABLE) {
+    if static_outcome.programmed_override == Some(GatewayConditionReason::AddressNotUsable) {
         return ConditionOutcome {
             status: "False",
-            reason: REASON_ADDRESS_NOT_USABLE,
+            reason: GatewayConditionReason::AddressNotUsable,
             message: "one or more requested spec.addresses could not be assigned to the Gateway",
         };
     }
     if addresses.is_empty() {
         return ConditionOutcome {
             status: "False",
-            reason: REASON_ADDRESS_NOT_ASSIGNED,
+            reason: GatewayConditionReason::AddressNotAssigned,
             message: "Service has no assigned addresses",
         };
     }
     ConditionOutcome {
         status: "True",
-        reason: REASON_PROGRAMMED,
+        reason: GatewayConditionReason::Programmed,
         message: "",
     }
 }
 
-fn cut_over_outcome(accepted: AcceptedOutcome, ready_pod_count: usize) -> ConditionOutcome {
+fn cut_over_outcome(accepted: AcceptedOutcome, ready_pod_count: usize) -> CutOverOutcome {
     if accepted == AcceptedOutcome::Accepted && ready_pod_count >= 1 {
-        ConditionOutcome {
+        CutOverOutcome {
             status: "True",
             reason: REASON_READY,
             message: "Dedicated proxy has at least one Ready pod",
         }
     } else {
-        ConditionOutcome {
+        CutOverOutcome {
             status: "False",
             reason: REASON_PROVISIONING,
             message: "Dedicated proxy has zero Ready pods",

@@ -11,6 +11,7 @@
 #     -args --organization=coxswain-labs --project=coxswain \
 #     --url=https://github.com/coxswain-labs/coxswain \
 #     --version="$(git describe --tags --always)" \
+#     --contact=https://github.com/coxswain-labs/coxswain/issues \
 #     --report-output=reports/local-report.yaml
 #
 # Usage:
@@ -123,4 +124,5 @@ echo "    cd conformance && ${STATIC_ADDR_ENV}go test -v -timeout 60m -run TestC
 echo "      -args --organization=coxswain-labs --project=coxswain \\"
 echo "      --url=https://github.com/coxswain-labs/coxswain \\"
 echo "      --version=\"\$(git describe --tags --always)\" \\"
+echo "      --contact=https://github.com/coxswain-labs/coxswain/issues \\"
 echo "      --report-output=reports/local-report.yaml"
