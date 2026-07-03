@@ -101,6 +101,7 @@ pub(super) fn make_route(
                 matches,
                 ..Default::default()
             }]),
+            ..Default::default()
         },
         ..Default::default()
     }
@@ -228,6 +229,7 @@ pub(super) fn make_route_with_hostnames_and_parent(
             }]),
             hostnames: Some(hostnames.iter().map(|h| h.to_string()).collect()),
             rules: Some(vec![make_simple_rule("svc")]),
+            ..Default::default()
         },
         status: None,
     }
@@ -255,6 +257,7 @@ pub(super) fn make_route_with_parent_port(
             }]),
             hostnames: Some(hostnames.iter().map(|h| h.to_string()).collect()),
             rules: Some(vec![make_simple_rule("svc")]),
+            ..Default::default()
         },
         status: None,
     }

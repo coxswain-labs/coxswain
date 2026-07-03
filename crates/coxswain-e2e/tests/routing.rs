@@ -24,7 +24,7 @@ use coxswain_e2e::{
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::{http, wait},
 };
-use gateway_api::apis::standard::httproutes::HttpRoute;
+use gateway_api_types::apis::standard::httproutes::HttpRoute;
 
 // Minimal prost message types for the GrpcEcho conformance service.
 // Service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho

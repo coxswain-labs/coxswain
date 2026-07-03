@@ -15,7 +15,7 @@ bytes         = { workspace = true }
 coxswain-core = { workspace = true }
 form_urlencoded = { workspace = true }
 futures       = { workspace = true }
-gateway-api   = { workspace = true }
+gateway-api-types = { workspace = true }
 http          = { workspace = true }
 humantime     = { workspace = true }
 k8s-openapi   = { workspace = true }

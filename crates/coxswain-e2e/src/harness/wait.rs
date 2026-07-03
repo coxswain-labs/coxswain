@@ -1,11 +1,11 @@
 //! Polling helpers that retry until Kubernetes resources reach the desired state.
 
 use anyhow::Context as _;
-use gateway_api::apis::standard::backendtlspolicies::BackendTlsPolicy;
-use gateway_api::apis::standard::gatewayclasses::GatewayClass;
-use gateway_api::apis::standard::gateways::Gateway;
-use gateway_api::apis::standard::grpcroutes::GrpcRoute;
-use gateway_api::apis::standard::httproutes::HttpRoute;
+use gateway_api_types::apis::standard::backendtlspolicies::BackendTlsPolicy;
+use gateway_api_types::apis::standard::gatewayclasses::GatewayClass;
+use gateway_api_types::apis::standard::gateways::Gateway;
+use gateway_api_types::apis::standard::grpcroutes::GrpcRoute;
+use gateway_api_types::apis::standard::httproutes::HttpRoute;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::Ingress;

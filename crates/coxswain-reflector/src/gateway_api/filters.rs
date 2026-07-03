@@ -1109,6 +1109,7 @@ mod tests {
                     filters: Some(filters),
                     ..Default::default()
                 }]),
+                ..Default::default()
             },
             ..Default::default()
         }

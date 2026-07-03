@@ -20,10 +20,10 @@ use coxswain_e2e::{
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress},
     harness::{GATEWAY_TLS_PASSTHROUGH_PORT, wait},
 };
-use gateway_api::apis::standard::gateways::Gateway;
-use gateway_api::apis::standard::grpcroutes::GrpcRoute;
-use gateway_api::apis::standard::httproutes::HttpRoute;
-use gateway_api::apis::standard::listenersets::ListenerSet;
+use gateway_api_types::apis::standard::gateways::Gateway;
+use gateway_api_types::apis::standard::grpcroutes::GrpcRoute;
+use gateway_api_types::apis::standard::httproutes::HttpRoute;
+use gateway_api_types::apis::standard::listenersets::ListenerSet;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount, ServicePort, ServiceSpec};
 use k8s_openapi::api::networking::v1::Ingress;
