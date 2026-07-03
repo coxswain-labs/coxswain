@@ -6,6 +6,7 @@
 use super::conditions::make_condition;
 use coxswain_core::crd::coxswain_backend_policy::CoxswainBackendPolicy;
 use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::gw_types::constants::PolicyConditionType;
 use coxswain_reflector::status::{CoxswainBackendPolicyStatus, CoxswainBackendPolicyStatusMap};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
 use kube::{
@@ -80,7 +81,7 @@ fn build_ancestors(
     let con_reason = health.conflicted_reason;
 
     let accepted_val = serde_json::to_value(make_condition(
-        "Accepted",
+        PolicyConditionType::Accepted,
         acc_status,
         acc_reason,
         "",
@@ -88,6 +89,9 @@ fn build_ancestors(
         now.clone(),
     ))
     .unwrap_or(serde_json::Value::Null);
+    // "Conflicted" is not a GEP-713 `PolicyConditionType` (see the identical
+    // note in `client_traffic_policy_events.rs`) — a pre-existing coxswain
+    // design choice, out of scope for #510.
     let conflicted_val = serde_json::to_value(make_condition(
         "Conflicted",
         con_status,

@@ -7,6 +7,7 @@ use crate::status_common::{
     OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_route_kind_info,
 };
 use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::gw_types::constants::{GatewayConditionReason, GatewayConditionType};
 use coxswain_reflector::gw_types::v::gateways::{Gateway, GatewayStatusListeners};
 use coxswain_reflector::status::{
     GatewayListenerStatus, ListenerReadiness, ListenerSource, ListenerStatusKey,
@@ -31,20 +32,20 @@ impl SharedAddressDecision {
     /// Desired `(status, reason)` for the top-level `Accepted` condition:
     /// `(False, UnsupportedAddress)` when a requested address type is
     /// unsupported, else the canonical `(True, Accepted)`.
-    fn desired_accepted(&self) -> (&'static str, &'static str) {
+    fn desired_accepted(&self) -> (&'static str, GatewayConditionReason) {
         match self.static_outcome.accepted_override {
             Some(reason) => ("False", reason),
-            None => ("True", "Accepted"),
+            None => ("True", GatewayConditionReason::Accepted),
         }
     }
 
     /// Desired `(status, reason)` for the top-level `Programmed` condition:
     /// `(False, AddressNotUsable | Invalid)` when a requested address could not
     /// be honored, else the canonical `(True, Programmed)`.
-    fn desired_programmed(&self) -> (&'static str, &'static str) {
+    fn desired_programmed(&self) -> (&'static str, GatewayConditionReason) {
         match self.static_outcome.programmed_override {
             Some(reason) => ("False", reason),
-            None => ("True", "Programmed"),
+            None => ("True", GatewayConditionReason::Programmed),
         }
     }
 }
@@ -230,7 +231,13 @@ fn any_status_writer_owned_condition_stale(conditions: &[Condition], expected_ge
 /// Returns true iff the Gateway's current top-level condition named `type_`
 /// matches the desired `(status, reason)` pair. Used for `Accepted`/`Programmed`,
 /// which the static-address feature (#260) can drive to `False`.
-fn condition_matches(gw: &Gateway, type_: &str, want_status: &str, want_reason: &str) -> bool {
+fn condition_matches(
+    gw: &Gateway,
+    type_: &str,
+    want_status: &str,
+    want_reason: impl std::fmt::Display,
+) -> bool {
+    let want_reason = want_reason.to_string();
     gw.status
         .as_ref()
         .and_then(|s| s.conditions.as_ref())
@@ -297,7 +304,7 @@ pub(super) fn build_gateway_status_patch(
     let (prog_status, prog_reason) = decision.desired_programmed();
     let mut conditions = vec![
         make_condition(
-            "Accepted",
+            GatewayConditionType::Accepted,
             acc_status,
             acc_reason,
             static_address_message(acc_reason),
@@ -305,7 +312,7 @@ pub(super) fn build_gateway_status_patch(
             now.clone(),
         ),
         make_condition(
-            "Programmed",
+            GatewayConditionType::Programmed,
             prog_status,
             prog_reason,
             static_address_message(prog_reason),
@@ -319,9 +326,9 @@ pub(super) fn build_gateway_status_patch(
         && fv.insecure_fallback
     {
         conditions.push(make_condition(
-            "InsecureFrontendValidationMode",
+            GatewayConditionType::InsecureFrontendValidationMode,
             "True",
-            "ConfigurationChanged",
+            GatewayConditionReason::ConfigurationChanged,
             "Gateway spec.tls.frontend.default.validation.mode is AllowInsecureFallback; \
              client certificates are requested but not enforced. \
              Authorization is delegated to backends.",
@@ -336,7 +343,7 @@ pub(super) fn build_gateway_status_patch(
     // conformance gateways keep Accepted=True while ResolvedRefs goes False.
     if let Some(outcome) = health.backend_client_cert.as_ref() {
         conditions.push(make_condition(
-            "ResolvedRefs",
+            GatewayConditionType::ResolvedRefs,
             outcome.resolved_refs_status(),
             outcome.resolved_refs_reason(),
             outcome.message(),
@@ -419,18 +426,18 @@ pub(super) fn build_gateway_status_patch(
 /// Human-readable `message` for a static-address condition reason (#260). The
 /// happy-path reasons (`Accepted`/`Programmed`) carry an empty message, matching
 /// the legacy behaviour.
-fn static_address_message(reason: &str) -> &'static str {
-    use crate::status_common::addresses::{
-        REASON_ADDRESS_NOT_USABLE, REASON_INVALID, REASON_UNSUPPORTED_ADDRESS,
-    };
-    if reason == REASON_UNSUPPORTED_ADDRESS {
-        "spec.addresses contains an address type this implementation does not support"
-    } else if reason == REASON_ADDRESS_NOT_USABLE {
-        "one or more requested spec.addresses could not be assigned to the Gateway"
-    } else if reason == REASON_INVALID {
-        "Gateway spec is invalid; see the Accepted condition for details"
-    } else {
-        ""
+fn static_address_message(reason: GatewayConditionReason) -> &'static str {
+    match reason {
+        GatewayConditionReason::UnsupportedAddress => {
+            "spec.addresses contains an address type this implementation does not support"
+        }
+        GatewayConditionReason::AddressNotUsable => {
+            "one or more requested spec.addresses could not be assigned to the Gateway"
+        }
+        GatewayConditionReason::Invalid => {
+            "Gateway spec is invalid; see the Accepted condition for details"
+        }
+        _ => "",
     }
 }
 
@@ -441,6 +448,7 @@ mod tests {
         SharedAddressDecision, build_gateway_status_patch, gateway_needs_status_patch,
     };
     use crate::status_common::addresses::StaticAddressOutcome;
+    use coxswain_reflector::gw_types::constants::GatewayConditionReason;
 
     /// A not-engaged decision with no legacy address — the common case for tests
     /// that pre-date GatewayStaticAddresses (#260).
@@ -806,8 +814,8 @@ mod tests {
     use crate::status_common::addresses::{SupportedAddressType, TypedAddress};
 
     fn engaged(
-        accepted_override: Option<&'static str>,
-        programmed_override: Option<&'static str>,
+        accepted_override: Option<GatewayConditionReason>,
+        programmed_override: Option<GatewayConditionReason>,
         status_addresses: Vec<TypedAddress>,
     ) -> SharedAddressDecision {
         SharedAddressDecision {
@@ -824,7 +832,11 @@ mod tests {
     #[test]
     fn patch_sets_accepted_false_on_unsupported_address() {
         let gw = gateway(1, None, None);
-        let decision = engaged(Some("UnsupportedAddress"), Some("Invalid"), vec![]);
+        let decision = engaged(
+            Some(GatewayConditionReason::UnsupportedAddress),
+            Some(GatewayConditionReason::Invalid),
+            vec![],
+        );
         let patch = build_gateway_status_patch(
             &gw,
             &default_status(),
@@ -855,7 +867,7 @@ mod tests {
     #[test]
     fn patch_sets_programmed_address_not_usable_keeping_accepted_true() {
         let gw = gateway(1, None, None);
-        let decision = engaged(None, Some("AddressNotUsable"), vec![]);
+        let decision = engaged(None, Some(GatewayConditionReason::AddressNotUsable), vec![]);
         let patch = build_gateway_status_patch(
             &gw,
             &default_status(),
@@ -922,7 +934,11 @@ mod tests {
             Some(vec![condition("Accepted", 1), condition("Programmed", 1)]),
             Some(vec![listener_status("http", 1)]),
         );
-        let decision = engaged(Some("UnsupportedAddress"), Some("Invalid"), vec![]);
+        let decision = engaged(
+            Some(GatewayConditionReason::UnsupportedAddress),
+            Some(GatewayConditionReason::Invalid),
+            vec![],
+        );
         assert!(gateway_needs_status_patch(
             &gw,
             &default_status(),
