@@ -8,6 +8,60 @@ use crate::status::ListenerSource;
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
 use std::collections::{HashMap, HashSet};
 
+/// The subset of a route `parentRef` the listener-binding logic reads, abstracted
+/// so [`compute_listener_bindings`] works for both `HTTPRoute` and `GRPCRoute`
+/// parentRefs (kopium emits a distinct type per route kind with identical fields).
+pub(super) trait ParentRefLike {
+    fn group(&self) -> Option<&str>;
+    fn kind(&self) -> Option<&str>;
+    fn namespace(&self) -> Option<&str>;
+    fn name(&self) -> &str;
+    fn port(&self) -> Option<u16>;
+    fn section_name(&self) -> Option<&str>;
+}
+
+impl ParentRefLike for HttpRouteParentRefs {
+    fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+    fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+    fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+    fn name(&self) -> &str {
+        self.name.as_str()
+    }
+    fn port(&self) -> Option<u16> {
+        self.port.map(|p| p as u16)
+    }
+    fn section_name(&self) -> Option<&str> {
+        self.section_name.as_deref()
+    }
+}
+
+impl ParentRefLike for GrpcRouteParentRefs {
+    fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+    fn kind(&self) -> Option<&str> {
+        self.kind.as_deref()
+    }
+    fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
+    }
+    fn name(&self) -> &str {
+        self.name.as_str()
+    }
+    fn port(&self) -> Option<u16> {
+        self.port.map(|p| p as u16)
+    }
+    fn section_name(&self) -> Option<&str> {
+        self.section_name.as_deref()
+    }
+}
+
 /// Whether a route `parentRef` attaches to a listener this controller serves
 /// (GEP-1713). A `kind: Gateway` (or unspecified) ref attaches when it names an
 /// owned Gateway; a `kind: ListenerSet` ref attaches when that ListenerSet
@@ -92,9 +146,9 @@ pub struct ListenerBinding {
 /// Returns one entry per (listener hostname, listener port) binding derived from the
 /// route's `parentRefs`. `None` hostname means insert under the port's catchall.
 /// When no listener info is available (tests/misconfigured), port 80 is used as a fallback.
-pub(super) fn compute_listener_bindings(
+pub(super) fn compute_listener_bindings<P: ParentRefLike>(
     route_hostnames: &[&str],
-    parent_refs: &[HttpRouteParentRefs],
+    parent_refs: &[P],
     route_ns: &str,
     listener_info: &HashMap<ListenerKey, ListenerBinding>,
 ) -> Vec<(Option<String>, u16)> {
@@ -118,18 +172,17 @@ pub(super) fn compute_listener_bindings(
         }
     } else {
         for pr in parent_refs {
-            let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
-            let gw_name = pr.name.as_str();
-            let pr_port_filter = pr.port.map(|p| p as u16);
+            let gw_ns = pr.namespace().unwrap_or(route_ns);
+            let gw_name = pr.name();
+            let pr_port_filter = pr.port();
             // GEP-1713: the parentRef may target a Gateway or a ListenerSet.
-            let source =
-                parent_listener_source(pr.group.as_deref(), pr.kind.as_deref(), gw_ns, gw_name);
+            let source = parent_listener_source(pr.group(), pr.kind(), gw_ns, gw_name);
 
             // Collect (port, listener_hostname) pairs for this parentRef. A listener
             // only binds when its `allowedRoutes.namespaces` admits the route's
             // namespace (GEP-1713) — without this, a route attaches (and serves
             // traffic) regardless of the listener's namespace scoping.
-            let l_bindings: Vec<(u16, &str)> = if let Some(sn) = pr.section_name.as_deref() {
+            let l_bindings: Vec<(u16, &str)> = if let Some(sn) = pr.section_name() {
                 let key = listener_key(&source, gw_ns, gw_name, sn);
                 match listener_info.get(&key) {
                     Some(info)
@@ -203,16 +256,15 @@ pub(super) fn compute_listener_bindings(
             };
             // Isolation only applies when the parentRef names a specific listener.
             !parent_refs.iter().any(|pr| {
-                let our_sn = match pr.section_name.as_deref() {
+                let our_sn = match pr.section_name() {
                     Some(sn) if !sn.is_empty() => sn,
                     _ => return false,
                 };
-                let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
-                let gw_name = pr.name.as_str();
+                let gw_ns = pr.namespace().unwrap_or(route_ns);
+                let gw_name = pr.name();
                 // Isolation is scoped to listeners declared by the SAME resource
                 // (the parentRef's Gateway or ListenerSet), GEP-1713.
-                let source =
-                    parent_listener_source(pr.group.as_deref(), pr.kind.as_deref(), gw_ns, gw_name);
+                let source = parent_listener_source(pr.group(), pr.kind(), gw_ns, gw_name);
                 let our_spec = listener_info
                     .get(&listener_key(&source, gw_ns, gw_name, our_sn))
                     .map(|info| hostnames::listener_specificity(&info.hostname))
@@ -244,12 +296,9 @@ pub(super) fn compute_listener_bindings(
     result
 }
 
-/// Identical to [`compute_listener_bindings`] but accepts `GRPCRoute.parentRefs`.
-///
-/// The body is a sibling copy — `GrpcRouteParentRefs` has the same relevant fields
-/// (`name`, `namespace`, `port`, `section_name`) as `HttpRouteParentRefs` but is a
-/// distinct Rust type from the kopium codegen. Kept as a concrete copy per the
-/// no-shared-abstraction constraint for this issue.
+/// Listener bindings for a `GRPCRoute`. Thin wrapper over the generic
+/// [`compute_listener_bindings`] — `GrpcRouteParentRefs` implements
+/// [`ParentRefLike`], so the binding/isolation logic is shared, not copied.
 #[must_use = "compute_grpc_listener_bindings always returns a Vec"]
 pub(super) fn compute_grpc_listener_bindings(
     route_hostnames: &[&str],
@@ -257,141 +306,7 @@ pub(super) fn compute_grpc_listener_bindings(
     route_ns: &str,
     listener_info: &HashMap<ListenerKey, ListenerBinding>,
 ) -> Vec<(Option<String>, u16)> {
-    let mut bindings: HashMap<Option<String>, HashSet<u16>> = HashMap::new();
-
-    macro_rules! add {
-        ($hostname:expr, $port:expr) => {
-            bindings.entry($hostname).or_default().insert($port);
-        };
-    }
-
-    if listener_info.is_empty() {
-        if route_hostnames.is_empty() {
-            add!(None, 80u16);
-        } else {
-            for h in route_hostnames {
-                add!(Some(h.to_string()), 80u16);
-            }
-        }
-    } else {
-        for pr in parent_refs {
-            let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
-            let gw_name = pr.name.as_str();
-            let pr_port_filter = pr.port.map(|p| p as u16);
-            // GEP-1713: the parentRef may target a Gateway or a ListenerSet.
-            let source =
-                parent_listener_source(pr.group.as_deref(), pr.kind.as_deref(), gw_ns, gw_name);
-
-            // Namespace scoping mirrors `compute_listener_bindings` (GEP-1713): a
-            // listener binds only when its `allowedRoutes.namespaces` admits the
-            // route's namespace.
-            let l_bindings: Vec<(u16, &str)> = if let Some(sn) = pr.section_name.as_deref() {
-                let key = listener_key(&source, gw_ns, gw_name, sn);
-                match listener_info.get(&key) {
-                    Some(info)
-                        if pr_port_filter.is_none_or(|pp| pp == info.port)
-                            && info.route_namespaces.allows(route_ns) =>
-                    {
-                        vec![(info.bind_port, info.hostname.as_str())]
-                    }
-                    _ => vec![],
-                }
-            } else {
-                listener_info
-                    .iter()
-                    .filter_map(|(k, info)| {
-                        if k.source != source || k.gw_ns != gw_ns || k.gw_name != gw_name {
-                            return None;
-                        }
-                        if pr_port_filter.is_none_or(|pp| pp == info.port)
-                            && info.route_namespaces.allows(route_ns)
-                        {
-                            Some((info.bind_port, info.hostname.as_str()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect()
-            };
-
-            for (port, lh) in l_bindings {
-                if lh.is_empty() {
-                    if route_hostnames.is_empty() {
-                        add!(None, port);
-                    } else {
-                        for h in route_hostnames {
-                            add!(Some(h.to_string()), port);
-                        }
-                    }
-                } else if route_hostnames.is_empty() {
-                    add!(Some(lh.to_string()), port);
-                } else {
-                    for rh in route_hostnames {
-                        if hostnames::hostname_matches(rh, lh) {
-                            let effective = if rh.starts_with("*.") && !lh.starts_with("*.") {
-                                lh.to_string()
-                            } else if rh.starts_with("*.")
-                                && lh.starts_with("*.")
-                                && lh.len() > rh.len()
-                            {
-                                // Both wildcards: the listener is more specific
-                                // (longer suffix) → use the listener hostname.
-                                lh.to_string()
-                            } else {
-                                rh.to_string()
-                            };
-                            add!(Some(effective), port);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if !listener_info.is_empty() {
-        bindings.retain(|hostname_opt, _| {
-            let e = match hostname_opt {
-                Some(h) => h.as_str(),
-                None => return true,
-            };
-            !parent_refs.iter().any(|pr| {
-                let our_sn = match pr.section_name.as_deref() {
-                    Some(sn) if !sn.is_empty() => sn,
-                    _ => return false,
-                };
-                let gw_ns = pr.namespace.as_deref().unwrap_or(route_ns);
-                let gw_name = pr.name.as_str();
-                let source =
-                    parent_listener_source(pr.group.as_deref(), pr.kind.as_deref(), gw_ns, gw_name);
-                let our_spec = listener_info
-                    .get(&listener_key(&source, gw_ns, gw_name, our_sn))
-                    .map(|info| hostnames::listener_specificity(&info.hostname))
-                    .unwrap_or(0);
-                let e_is_wildcard = e.starts_with("*.");
-                listener_info.iter().any(|(k, info)| {
-                    let h_other = &info.hostname;
-                    k.source == source
-                        && k.gw_ns == gw_ns
-                        && k.gw_name == gw_name
-                        && k.listener.as_str() != our_sn
-                        && hostnames::listener_specificity(h_other) > our_spec
-                        && if e_is_wildcard {
-                            h_other == e
-                        } else {
-                            hostnames::hostname_matches(e, h_other)
-                        }
-                })
-            })
-        });
-    }
-
-    let mut result = Vec::new();
-    for (hostname_opt, ports) in bindings {
-        for port in ports {
-            result.push((hostname_opt.clone(), port));
-        }
-    }
-    result
+    compute_listener_bindings(route_hostnames, parent_refs, route_ns, listener_info)
 }
 
 #[cfg(test)]
@@ -493,6 +408,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -540,6 +456,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -585,6 +502,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -630,6 +548,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -708,6 +627,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -739,6 +659,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),

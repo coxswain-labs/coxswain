@@ -554,6 +554,23 @@ Semantics:
 - Supported hash formats: bcrypt (`$2a$`/`$2b$`/`$2y$`) and Apache SHA1 (`{SHA}`, accepted but logged as weak).
 - Valid credentials are forwarded; missing/invalid credentials get `401` with `WWW-Authenticate`.
 - A missing, unlabeled, or unparseable Secret — or a missing `BasicAuth` CR's `secretRef` — fails **closed** with `503`, distinct from a missing `BasicAuth` CR itself (which fails open: no auth enforced).
+- A `secretRef` whose `namespace` differs from the `BasicAuth` CR's namespace requires a matching `ReferenceGrant` in the Secret's namespace — `from` a `BasicAuth` (`gateway.coxswain-labs.dev`) in the CR's namespace, `to` a core `Secret`. Without the grant the reference fails **closed** (`503`); a tenant cannot bind another namespace's auth Secret. Same-namespace refs need no grant.
+
+```yaml
+# In the Secret's namespace, to permit a BasicAuth in namespace `apps`:
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-basicauth-from-apps
+spec:
+  from:
+    - group: gateway.coxswain-labs.dev
+      kind: BasicAuth
+      namespace: apps
+  to:
+    - group: ""
+      kind: Secret
+```
 
 ### Request size limit
 

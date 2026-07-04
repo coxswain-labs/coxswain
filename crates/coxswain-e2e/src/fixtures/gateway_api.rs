@@ -185,6 +185,16 @@ pub const BASIC_AUTH_EXTENSIONREF: &str = fixture!("basic_auth_extensionref.yaml
 /// the Secret, so the proxy fails closed with 503 even for valid credentials.
 pub const BASIC_AUTH_EXTENSIONREF_UNLABELED: &str =
     fixture!("basic_auth_extensionref_unlabeled.yaml");
+/// Tenant-side of the cross-namespace `BasicAuth` secretRef pair (#520): the
+/// htpasswd Secret + a `BasicAuth → Secret` ReferenceGrant permitting a
+/// `BasicAuth` CR in `TESTNS`. Apply to the tenant namespace with
+/// `.with("TESTNS", <route-ns>)`. Pair with [`BASIC_AUTH_XNS_ROUTE`].
+pub const BASIC_AUTH_XNS_TENANT: &str = fixture!("basic_auth_xns_tenant.yaml");
+/// Route-side of the cross-namespace `BasicAuth` secretRef pair (#520): Gateway +
+/// `BasicAuth` CR whose `secretRef.namespace` is `TENANTNS` + HTTPRoute. Apply to
+/// the route namespace with `.with("TENANTNS", <tenant-ns>)`. Without the
+/// ReferenceGrant from [`BASIC_AUTH_XNS_TENANT`] the proxy fails closed (503).
+pub const BASIC_AUTH_XNS_ROUTE: &str = fixture!("basic_auth_xns_route.yaml");
 /// Gateway + `RequestSizeLimit` CR (maxSize: 1k) + HTTPRoute with
 /// `ExtensionRef` (#443). Under-limit bodies pass; over-limit bodies get 413.
 pub const REQUEST_SIZE_LIMIT_EXTENSIONREF: &str = fixture!("request_size_limit_extensionref.yaml");

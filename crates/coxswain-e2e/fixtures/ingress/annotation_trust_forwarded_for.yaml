@@ -1,8 +1,11 @@
-# trust-forwarded-for annotation fixture (apply backends::ECHO first).
+# trust-forwarded-for annotation fixture, WITHOUT forwarded-for-trusted-cidrs
+# (apply backends::ECHO first).
 #
-# The Ingress trusts X-Forwarded-For and restricts access to forwarded clients
-# in 203.0.113.0/24. With trust-forwarded-for enabled the proxy uses the first
-# non-private IP from the header as the effective client IP for allow-source-range.
+# trust-forwarded-for is enabled but no trusted proxy CIDRs are configured, so the
+# proxy is fail-closed: it trusts NO peer and ignores the forwarded header entirely,
+# using the L4 peer address as the effective client IP for allow-source-range. This
+# fixture exercises that fail-closed behaviour; the trusted-cidrs happy path lives in
+# annotation_trust_forwarded_for_cidrs.yaml.
 #
 # e2e drives the L4 peer via the PROXY protocol so tests control both the L4 addr
 # and the forwarded header independently.

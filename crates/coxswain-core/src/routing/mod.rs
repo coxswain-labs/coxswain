@@ -31,7 +31,8 @@ pub use common::filters::{
     CorsConfig, CorsOrigin, FilterAction, HeaderMod, HeaderModError, MirrorFraction, PathModifier,
 };
 pub use common::host_router::{
-    HostRouter, HostRouterBuilder, RouteMatch, WildcardKind, compile_path_regex,
+    HostRouter, HostRouterBuilder, REGEX_SIZE_LIMIT, RouteMatch, WildcardKind, compile_bounded,
+    compile_path_regex,
 };
 pub use common::path_normalize::NormalizeLevel;
 pub use common::port::{HostPattern, PortRoutingTable, PortTableBuilder};

@@ -138,9 +138,14 @@ pub(crate) fn maybe_setup_compression(
     resp.remove_header(&ACCEPT_RANGES);
     // Pingora's H1 handler decides whether to add Transfer-Encoding: chunked
     // *before* calling upstream_response_filter, based on the upstream's
-    // Content-Length.  Because we remove Content-Length here, we must set
-    // chunked ourselves so the downstream has a valid body framing.
-    let _ = resp.insert_header(TRANSFER_ENCODING, "chunked");
+    // Content-Length. Because we remove Content-Length here, we must set chunked
+    // ourselves so an HTTP/1.x downstream has valid body framing. On HTTP/2 the
+    // framing is carried by DATA frames and `Transfer-Encoding` is forbidden
+    // (RFC 9113 §8.2.2) — inserting it would corrupt or be rejected by the h2
+    // encoder, so gate on the downstream protocol.
+    if !ctx.is_h2 {
+        let _ = resp.insert_header(TRANSFER_ENCODING, "chunked");
+    }
 }
 
 /// Choose a compression algorithm from the client's `Accept-Encoding` string,
@@ -329,6 +334,40 @@ mod tests {
         assert!(
             ctx.compression_encoder.is_some(),
             "chunked response without Content-Length must be compressed"
+        );
+    }
+
+    #[test]
+    fn setup_compression_sets_chunked_te_on_h1_only() {
+        use http::header::TRANSFER_ENCODING;
+        let cfg = gzip_cfg();
+        let req = req_with_ae("gzip");
+
+        // HTTP/1.x downstream: chunked framing is required after Content-Length removal.
+        let mut resp_h1 = resp_200("application/json", Some(4096));
+        let mut ctx_h1 = ProxyCtx {
+            is_h2: false,
+            ..Default::default()
+        };
+        maybe_setup_compression(&req, &mut resp_h1, &mut ctx_h1, &cfg);
+        assert!(ctx_h1.compression_encoder.is_some());
+        assert_eq!(
+            resp_h1.headers.get(TRANSFER_ENCODING).map(|v| v.as_bytes()),
+            Some(&b"chunked"[..]),
+            "h1 downstream must get Transfer-Encoding: chunked"
+        );
+
+        // HTTP/2 downstream: Transfer-Encoding is forbidden (RFC 9113 §8.2.2).
+        let mut resp_h2 = resp_200("application/json", Some(4096));
+        let mut ctx_h2 = ProxyCtx {
+            is_h2: true,
+            ..Default::default()
+        };
+        maybe_setup_compression(&req, &mut resp_h2, &mut ctx_h2, &cfg);
+        assert!(ctx_h2.compression_encoder.is_some());
+        assert!(
+            resp_h2.headers.get(TRANSFER_ENCODING).is_none(),
+            "h2 downstream must NOT carry Transfer-Encoding"
         );
     }
 

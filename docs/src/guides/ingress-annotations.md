@@ -512,8 +512,10 @@ When `trust-forwarded-for: "true"` is set, the proxy resolves the effective clie
 
 1. **L4 base IP** — real client addr from PROXY protocol if present, otherwise the TCP peer addr.
 2. **No config** — if the Ingress has no `trust-forwarded-for`, use the L4 base IP (current behavior unchanged).
-3. **CIDR gate** — if `forwarded-for-trusted-cidrs` is non-empty AND the L4 base IP is **not** in any listed CIDR, the forwarded header is ignored (anti-spoofing) and the L4 base IP is used.
-4. **Header parse** — parse the configured header (default `X-Forwarded-For`), scan the comma-separated IP list left-to-right, and use the **first non-private IP** found. If no non-private IP is found, fall back to the L4 base IP.
+3. **CIDR gate (fail-closed)** — the forwarded header is honored **only** when the L4 base IP is inside one of the `forwarded-for-trusted-cidrs`. If the list is empty, or the L4 peer is not in it, the header is ignored (anti-spoofing) and the L4 base IP is used. An empty list trusts **no** peer — you must configure your load balancer's CIDR to enable header trust.
+4. **Rightmost-untrusted parse** — parse the configured header (default `X-Forwarded-For`) and scan the comma-separated list **right-to-left**, skipping addresses that are themselves trusted-proxy hops (in `forwarded-for-trusted-cidrs`) or private/reserved. The first address that is neither is the effective client IP. Everything to its left is client-controlled and ignored, so a forged leftmost token cannot spoof the client IP. If no untrusted address is found, fall back to the L4 base IP.
+
+All addresses are canonicalized before matching, so an IPv4-mapped IPv6 form (`::ffff:a.b.c.d`) is treated as its IPv4 address — it cannot slip past an IPv4 `allow-`/`deny-source-range`.
 
 "Private/reserved" means RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), loopback (`127/8`, `::1`), link-local (`169.254/16`, `fe80::/10`), ULA (`fc00::/7`), and unspecified.
 

@@ -294,14 +294,16 @@ async fn deny_takes_precedence_over_allow_when_both_match() -> anyhow::Result<()
 
 // ── Trusted proxy headers (trust-forwarded-for / forwarded-for-header / -trusted-cidrs) ──
 
-/// `trust-forwarded-for`: when the annotation is `"true"` and the forwarded header carries a
-/// public IP, the proxy uses that IP as the effective client IP for `allow-source-range` (#271
-/// happy path — header trusted, forwarded IP in range).
+/// `trust-forwarded-for` fail-closed: when the annotation is `"true"` but no
+/// `forwarded-for-trusted-cidrs` are configured, the forwarded header is **ignored**
+/// (trust no peer). A client cannot spoof an in-range IP via the header; the L4 peer
+/// address is used, so an out-of-range L4 peer is rejected even though the header
+/// carries an allow-listed IP (#271 / S2 — empty trusted-cidrs is fail-closed).
 #[tokio::test]
-async fn forwarded_header_ip_used_for_allow_source_range_when_trusted() -> anyhow::Result<()> {
+async fn forwarded_header_ignored_without_trusted_cidrs_fail_closed() -> anyhow::Result<()> {
     bootstrap().await?;
     let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "trust-fwd-ok").await?;
+    let ns = NamespaceGuard::create(&client, "trust-fwd-failclosed").await?;
 
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
@@ -311,9 +313,10 @@ async fn forwarded_header_ip_used_for_allow_source_range_when_trusted() -> anyho
     )
     .await?;
 
-    // Run with PROXY protocol: the L4 peer (10.0.0.1) is outside the allow-range, but the
-    // forwarded IP (203.0.113.10) is inside 203.0.113.0/24.  With trust-forwarded-for the
-    // proxy must use 203.0.113.10 and admit the request.
+    // L4 peer 10.0.0.1 is outside the allow-range; the header carries an in-range IP
+    // (203.0.113.10). With no trusted-cidrs the proxy is fail-closed and ignores the
+    // header, so the effective IP is 10.0.0.1 ∉ 203.0.113.0/24 → 403. Polling to 403 is
+    // an unambiguous signal that the route is live AND the header was NOT trusted.
     let controller = ControllerProcess::start_with_options(ControllerOptions {
         accept_proxy_protocol: true,
         trusted_sources: vec!["0.0.0.0/0".to_string()],
@@ -324,9 +327,57 @@ async fn forwarded_header_ip_used_for_allow_source_range_when_trusted() -> anyho
 
     let host = format!("trustfwd.{}.local", ns.name);
     let proxy_line = "PROXY TCP4 10.0.0.1 10.0.0.2 12345 80\r\n";
-    // 203.0.113.10 ∈ 203.0.113.0/24 — should be admitted via the forwarded header.
     let http_req = format!(
         "GET / HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-For: 203.0.113.10\r\nConnection: close\r\n\r\n"
+    );
+
+    wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        proxy_line,
+        &http_req,
+        403,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// `trust-forwarded-for` with trusted-cidrs: when the L4 peer IS a trusted proxy but
+/// the forwarded header carries only private/reserved hops, no untrusted address can be
+/// resolved, so the proxy falls back to the (trusted) L4 peer IP. Here that L4 IP is
+/// itself allow-listed, so the request is admitted — proving the private-hop skip +
+/// L4 fallback path (#271 — trusted peer, header all-private).
+#[tokio::test]
+async fn forwarded_header_all_private_under_trusted_peer_falls_back_to_l4() -> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+    let ns = NamespaceGuard::create(&client, "trust-fwd-priv").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_TRUST_FORWARDED_FOR_CIDRS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("trustfwdcidr.{}.local", ns.name);
+    // L4 peer 10.0.0.1 ∈ trusted-cidrs (10.0.0.1/32) → header trusted. Header carries
+    // only 10.0.0.5 (private) → no untrusted address → fall back to L4 10.0.0.1, which
+    // ∈ allow-source-range (10.0.0.1/32) → 200. Polling to 200 + backend identity
+    // confirms the fallback resolved to the trusted L4 peer.
+    let proxy_line = "PROXY TCP4 10.0.0.1 10.0.0.2 12345 80\r\n";
+    let http_req = format!(
+        "GET / HTTP/1.1\r\nHost: {host}\r\nX-Real-IP: 10.0.0.5\r\nConnection: close\r\n\r\n"
     );
 
     let body = wait_for_proxy_v1_status(
@@ -341,52 +392,6 @@ async fn forwarded_header_ip_used_for_allow_source_range_when_trusted() -> anyho
     let echo: EchoResponse = serde_json::from_str(&body)
         .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
     echo.assert_backend("echo-a");
-
-    Ok(())
-}
-
-/// `trust-forwarded-for`: when the forwarded header contains only private IPs the proxy
-/// falls back to the L4 peer IP; if that IP is also outside the allow-range, the request
-/// is rejected (#271 sad path — all forwarded IPs private, L4 peer not in range).
-#[tokio::test]
-async fn forwarded_header_all_private_ips_falls_back_to_l4_and_is_rejected() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "trust-fwd-priv").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_TRUST_FORWARDED_FOR,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("trustfwd.{}.local", ns.name);
-    let proxy_line = "PROXY TCP4 10.0.0.1 10.0.0.2 12345 80\r\n";
-    // 10.0.0.5 is RFC1918 (private) — no public IP in the header.  The proxy falls back
-    // to the L4 peer 10.0.0.1, which is also private and ∉ 203.0.113.0/24 → 403.
-    // Polling to 403 unambiguously signals the route is live AND the allow-list fired.
-    let http_req = format!(
-        "GET / HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-For: 10.0.0.5\r\nConnection: close\r\n\r\n"
-    );
-
-    wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        403,
-        Duration::from_secs(60),
-    )
-    .await?;
 
     Ok(())
 }
@@ -474,6 +479,102 @@ async fn spoofed_forwarded_header_from_untrusted_peer_is_rejected() -> anyhow::R
     let http_req = format!(
         "GET / HTTP/1.1\r\nHost: {host}\r\nX-Real-IP: 203.0.113.10\r\nConnection: close\r\n\r\n"
     );
+
+    wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        proxy_line,
+        &http_req,
+        403,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Rightmost-untrusted resolution: a client that forges a leftmost token in the
+/// trusted forwarded header cannot bypass `allow-source-range`. The trusted LB appends
+/// the client's real (out-of-range) IP to the right; the proxy resolves the rightmost
+/// untrusted address, ignoring the in-range value the client injected on the left, and
+/// rejects the request (S1 — leftmost-XFF spoofing defeated).
+#[tokio::test]
+async fn forwarded_header_forged_leftmost_cannot_bypass_allow_list() -> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+    let ns = NamespaceGuard::create(&client, "trust-fwd-forge").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_TRUST_FORWARDED_FOR_CIDRS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("trustfwdcidr.{}.local", ns.name);
+    // L4 peer 10.0.0.1 ∈ trusted-cidrs → header trusted. The client forges an in-range
+    // leftmost token (203.0.113.10 ∈ allow-range) hoping to be admitted; the trusted LB
+    // appends the real client 8.8.8.8 to the right. Rightmost-untrusted resolves 8.8.8.8
+    // ∉ allow-range → 403. The old leftmost-wins scan would have picked 203.0.113.10 and
+    // admitted (200) — polling to 403 proves the forgery is defeated.
+    let proxy_line = "PROXY TCP4 10.0.0.1 10.0.0.2 12345 80\r\n";
+    let http_req = format!(
+        "GET / HTTP/1.1\r\nHost: {host}\r\nX-Real-IP: 203.0.113.10, 8.8.8.8\r\nConnection: close\r\n\r\n"
+    );
+
+    wait_for_proxy_v1_status(
+        controller.proxy_addr,
+        proxy_line,
+        &http_req,
+        403,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// IPv4-mapped IPv6 deny-list canonicalization: a client whose real IP arrives in the
+/// `::ffff:a.b.c.d` mapped form is canonicalized before the CIDR check, so it cannot
+/// evade an IPv4 `deny-source-range` by presenting the mapped form (SEC-1 — no
+/// mapped-v6 deny evasion).
+#[tokio::test]
+async fn mapped_v6_client_matches_deny_v4_cidr() -> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+    let ns = NamespaceGuard::create(&client, "deny-mapped-v6").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_DENY_SOURCE_RANGE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let controller = ControllerProcess::start_with_options(ControllerOptions {
+        accept_proxy_protocol: true,
+        trusted_sources: vec!["0.0.0.0/0".to_string()],
+        ..Default::default()
+    })
+    .await?;
+    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+    let host = format!("denyrange.{}.local", ns.name);
+    // L4 peer arrives as the IPv4-mapped IPv6 form of 203.0.113.10, which ∈ the denied
+    // 203.0.113.0/24 after canonicalization → 403. Without canonicalization the mapped
+    // form would not match the v4 CIDR and slip through (200) — polling to 403 proves
+    // the mapped-v6 evasion is closed.
+    let proxy_line = "PROXY TCP6 ::ffff:203.0.113.10 ::ffff:10.0.0.1 12345 80\r\n";
+    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
 
     wait_for_proxy_v1_status(
         controller.proxy_addr,
@@ -1394,6 +1495,93 @@ async fn gateway_basic_auth_unlabeled_secret_fails_closed() -> anyhow::Result<()
         status == 503,
         "expected 503 (fail-closed: unlabeled secret), got {status}"
     );
+    Ok(())
+}
+
+/// Cross-namespace `BasicAuth` secretRef requires a ReferenceGrant (#520): with a
+/// matching `BasicAuth → Secret` grant the cross-ns htpasswd Secret resolves and
+/// valid credentials are admitted (200). Deleting the grant makes the ref fail
+/// closed (503) even for valid credentials — a tenant cannot bind another
+/// namespace's auth Secret without permission.
+#[tokio::test]
+async fn gateway_basic_auth_cross_namespace_requires_reference_grant() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-basicauth-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "gw-basicauth-xns-tenant").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    // Tenant ns: htpasswd Secret + a BasicAuth→Secret ReferenceGrant permitting ns.
+    fixtures::apply_fixture(
+        gwa::BASIC_AUTH_XNS_TENANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+
+    // Route ns: Gateway + BasicAuth CR (secretRef → tenant) + HTTPRoute.
+    fixtures::apply_fixture(
+        gwa::BASIC_AUTH_XNS_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwbasicauthxns.{}.local", ns.name);
+
+    // Happy: with the grant in place, valid creds (alice:secret) are admitted.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("cross-ns BasicAuth to admit alice:secret at {host}") },
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+
+    // Sad: delete the ReferenceGrant → the cross-ns secretRef fails closed (503),
+    // even for valid credentials. Proves the grant is load-bearing, not decorative.
+    let grant_name = format!("allow-basicauth-from-{}", ns.name);
+    let deleted = tokio::process::Command::new("kubectl")
+        .args([
+            "delete",
+            "referencegrant",
+            &grant_name,
+            "-n",
+            &tenant.name,
+            "--ignore-not-found",
+        ])
+        .status()
+        .await
+        .map_err(|e| anyhow::anyhow!("delete ReferenceGrant: {e}"))?;
+    anyhow::ensure!(deleted.success(), "kubectl delete referencegrant failed");
+
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!("cross-ns BasicAuth to fail closed (503) after grant deletion at {host}")
+        },
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+                .await
+            {
+                Ok((503, _, _)) => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
     Ok(())
 }
 

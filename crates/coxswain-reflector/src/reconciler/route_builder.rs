@@ -5,10 +5,10 @@
 //! ([`ReflectorStores`], [`Ownership`], [`SharedOutputs`], [`IngressBuildConfig`])
 //! defined alongside the loop.
 
+use super::dedicated::{IngressBuildConfig, gateway_is_cut_over};
 use super::listener_merge::{EffectiveGateway, EffectiveListener};
 use super::proxy::{
-    IngressBuildConfig, IngressDefaultBackend, IngressEvent, Ownership, ReflectorStores,
-    SharedOutputs, gateway_is_cut_over,
+    IngressDefaultBackend, IngressEvent, Ownership, ReflectorStores, SharedOutputs,
 };
 use crate::endpoints;
 use crate::gateway_api::hostnames_intersect;
@@ -229,6 +229,7 @@ pub(super) fn build_gateway_routes(
                 ip_access: stores.ip_access,
                 basic_auths: stores.basic_auths,
                 auth_secrets: stores.auth_secrets,
+                basic_auth_secret_grants: ownership.basic_auth_secret_grants,
                 request_size_limits: stores.request_size_limits,
                 compressions: stores.compressions,
                 backend_client_certs: ownership.backend_client_certs,

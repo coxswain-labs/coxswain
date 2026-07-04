@@ -55,6 +55,17 @@ pub(crate) async fn resolve_outcome(
             HTTPStatus(404),
             format!("no route for path {path} on host {host}"),
         )),
-        _ => unreachable!("invariant: RouteOutcome is non-exhaustive but only four variants exist"),
+        // `RouteOutcome` is cross-crate `#[non_exhaustive]`: a variant added in
+        // coxswain-core compiles clean here and would reach this arm at runtime on the
+        // data plane. Degrade to a 500 rather than panicking (zero-crash-site bar).
+        _ => {
+            tracing::error!("unhandled RouteOutcome variant — returning 500");
+            let resp = ResponseHeader::build(500, Some(0))?;
+            session
+                .write_response_header(Box::new(resp), true)
+                .await
+                .unwrap_or_else(|e| tracing::error!("failed to write error response: {e}"));
+            Ok(None)
+        }
     }
 }

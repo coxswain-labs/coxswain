@@ -11,13 +11,12 @@ use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, CompressionConfig, CorsConfig, CorsOrigin, FilterAction, HeaderMod,
     HeaderPredicate, IngressAuthConfig, MatchPredicates, MirrorFraction, PathModifier,
-    QueryPredicate, RateLimitConfig, RateLimitKey, ValueMatch,
+    QueryPredicate, RateLimitConfig, RateLimitKey, ValueMatch, compile_bounded,
 };
 use http::{HeaderName, Method};
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
-use regex::Regex;
 use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -162,14 +161,14 @@ pub(super) fn build_filters(
                     tracing::warn!("Skipping ExtensionRef filter — payload is missing");
                     continue;
                 };
-                if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "PathRewriteRegex" {
+                if ext.group == super::COXSWAIN_GROUP && ext.kind == "PathRewriteRegex" {
                     let obj_ref =
                         reflector::ObjectRef::<coxswain_core::crd::PathRewriteRegex>::new(
                             &ext.name,
                         )
                         .within(route_ns);
                     if let Some(cr) = path_rewrites.get(&obj_ref) {
-                        match regex::Regex::new(&cr.spec.pattern) {
+                        match compile_bounded(&cr.spec.pattern) {
                             Ok(regex) => {
                                 out.push(FilterAction::UrlRewrite {
                                     hostname: None,
@@ -193,17 +192,15 @@ pub(super) fn build_filters(
                             "PathRewriteRegex CR not found — filter skipped"
                         );
                     }
-                } else if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "RateLimit" {
+                } else if ext.group == super::COXSWAIN_GROUP && ext.kind == "RateLimit" {
                     // Handled separately by `resolve_rate_limit`.
-                } else if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "IpAccessControl"
-                {
+                } else if ext.group == super::COXSWAIN_GROUP && ext.kind == "IpAccessControl" {
                     // Handled separately by `resolve_ip_access`.
-                } else if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "BasicAuth" {
+                } else if ext.group == super::COXSWAIN_GROUP && ext.kind == "BasicAuth" {
                     // Handled separately by `resolve_basic_auth`.
-                } else if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "RequestSizeLimit"
-                {
+                } else if ext.group == super::COXSWAIN_GROUP && ext.kind == "RequestSizeLimit" {
                     // Handled separately by `resolve_request_size_limit`.
-                } else if ext.group == "gateway.coxswain-labs.dev" && ext.kind == "Compression" {
+                } else if ext.group == super::COXSWAIN_GROUP && ext.kind == "Compression" {
                     // Handled separately by `resolve_compression`.
                 } else {
                     tracing::warn!(
@@ -483,7 +480,7 @@ pub(super) fn build_predicates(
 
         let matcher = match h.r#type.as_ref() {
             Some(HttpRouteRulesMatchesHeadersType::RegularExpression) => {
-                let re = Regex::new(&h.value).ok()?;
+                let re = compile_bounded(&h.value).ok()?;
                 ValueMatch::Regex(re)
             }
             _ => ValueMatch::Exact(h.value.clone()),
@@ -496,7 +493,7 @@ pub(super) fn build_predicates(
     for q in m.query_params.as_deref().unwrap_or(&[]) {
         let matcher = match q.r#type.as_ref() {
             Some(HttpRouteRulesMatchesQueryParamsType::RegularExpression) => {
-                let re = Regex::new(&q.value).ok()?;
+                let re = compile_bounded(&q.value).ok()?;
                 ValueMatch::Regex(re)
             }
             _ => ValueMatch::Exact(q.value.clone()),
@@ -658,7 +655,7 @@ pub(super) fn resolve_rate_limit_ref(
     route_ns: &str,
     rate_limits: &reflector::Store<RateLimit>,
 ) -> Option<Option<Arc<RateLimitConfig>>> {
-    if ext_group != "gateway.coxswain-labs.dev" || ext_kind != "RateLimit" {
+    if ext_group != super::COXSWAIN_GROUP || ext_kind != "RateLimit" {
         return None;
     }
     let obj_ref = reflector::ObjectRef::<RateLimit>::new(ext_name).within(route_ns);
@@ -738,7 +735,7 @@ pub(super) fn resolve_ip_access_ref(
     route_ns: &str,
     ip_access: &reflector::Store<IpAccessControl>,
 ) -> Option<(CidrSet, CidrSet)> {
-    if ext_group != "gateway.coxswain-labs.dev" || ext_kind != "IpAccessControl" {
+    if ext_group != super::COXSWAIN_GROUP || ext_kind != "IpAccessControl" {
         return None;
     }
     let obj_ref = reflector::ObjectRef::<IpAccessControl>::new(ext_name).within(route_ns);
@@ -813,6 +810,7 @@ pub(super) fn resolve_basic_auth(
     route_ns: &str,
     basic_auths: &reflector::Store<BasicAuth>,
     auth_secrets: &reflector::Store<Secret>,
+    secret_grants: &HashSet<ReferenceGrantKey>,
 ) -> Option<Arc<IngressAuthConfig>> {
     for f in filters {
         if !matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
@@ -828,6 +826,7 @@ pub(super) fn resolve_basic_auth(
             route_ns,
             basic_auths,
             auth_secrets,
+            secret_grants,
         ) {
             return Some(cfg);
         }
@@ -852,8 +851,9 @@ pub(super) fn resolve_basic_auth_ref(
     route_ns: &str,
     basic_auths: &reflector::Store<BasicAuth>,
     auth_secrets: &reflector::Store<Secret>,
+    secret_grants: &HashSet<ReferenceGrantKey>,
 ) -> Option<Arc<IngressAuthConfig>> {
-    if ext_group != "gateway.coxswain-labs.dev" || ext_kind != "BasicAuth" {
+    if ext_group != super::COXSWAIN_GROUP || ext_kind != "BasicAuth" {
         return None;
     }
     let obj_ref = reflector::ObjectRef::<BasicAuth>::new(ext_name).within(route_ns);
@@ -867,6 +867,30 @@ pub(super) fn resolve_basic_auth_ref(
     };
     let route_id = format!("{route_ns}/{ext_name}");
     let secret_ref = &cr.spec.secret_ref;
+
+    // Cross-namespace secretRef requires a matching `BasicAuth → Secret`
+    // ReferenceGrant (#520). Without one, fail closed (503) rather than binding a
+    // Secret in another namespace — the Ingress single-namespace precedent does not
+    // carry over to the Gateway-API trust model. Same-namespace refs need no grant.
+    if secret_ref.namespace != route_ns
+        && !reference_grants::backend_ref_allowed(
+            route_ns,
+            &secret_ref.namespace,
+            &secret_ref.name,
+            secret_grants,
+        )
+    {
+        tracing::warn!(
+            ns = route_ns,
+            name = ext_name,
+            secret_ns = %secret_ref.namespace,
+            secret_name = %secret_ref.name,
+            "BasicAuth secretRef crosses namespaces with no matching ReferenceGrant — \
+             failing closed (503)"
+        );
+        return Some(Arc::new(IngressAuthConfig::Unavailable));
+    }
+
     let secret_obj_ref =
         reflector::ObjectRef::<Secret>::new(&secret_ref.name).within(&secret_ref.namespace);
     let Some(secret) = auth_secrets.get(&secret_obj_ref) else {
@@ -962,7 +986,7 @@ pub(super) fn resolve_request_size_limit_ref(
     route_ns: &str,
     request_size_limits: &reflector::Store<RequestSizeLimit>,
 ) -> Option<Option<u64>> {
-    if ext_group != "gateway.coxswain-labs.dev" || ext_kind != "RequestSizeLimit" {
+    if ext_group != super::COXSWAIN_GROUP || ext_kind != "RequestSizeLimit" {
         return None;
     }
     let obj_ref = reflector::ObjectRef::<RequestSizeLimit>::new(ext_name).within(route_ns);
@@ -1029,7 +1053,7 @@ pub(super) fn resolve_compression_ref(
     route_ns: &str,
     compressions: &reflector::Store<Compression>,
 ) -> Option<Option<Arc<CompressionConfig>>> {
-    if ext_group != "gateway.coxswain-labs.dev" || ext_kind != "Compression" {
+    if ext_group != super::COXSWAIN_GROUP || ext_kind != "Compression" {
         return None;
     }
     let obj_ref = reflector::ObjectRef::<Compression>::new(ext_name).within(route_ns);
@@ -1164,6 +1188,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1221,6 +1246,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1276,6 +1302,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1337,6 +1364,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1405,6 +1433,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1603,7 +1632,16 @@ mod tests {
     fn resolve_basic_auth_no_ext_ref_is_none() {
         let basic_auths = empty_basic_auth_store();
         let auth_secrets = empty_secret_store();
-        assert!(resolve_basic_auth(&[], "default", &basic_auths, &auth_secrets).is_none());
+        assert!(
+            resolve_basic_auth(
+                &[],
+                "default",
+                &basic_auths,
+                &auth_secrets,
+                &std::collections::HashSet::new()
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -1616,6 +1654,7 @@ mod tests {
             "default",
             &basic_auths,
             &auth_secrets,
+            &std::collections::HashSet::new(),
         );
         assert!(cfg.is_none(), "missing CR must not enforce auth");
         assert!(logs_contain("BasicAuth CR not found"));
@@ -1636,6 +1675,7 @@ mod tests {
             "default",
             &basic_auths,
             &auth_secrets,
+            &std::collections::HashSet::new(),
         )
         .expect("Some when CR present");
         assert!(matches!(*cfg, IngressAuthConfig::Unavailable));
@@ -1660,6 +1700,7 @@ mod tests {
             "default",
             &basic_auths,
             &auth_secrets,
+            &std::collections::HashSet::new(),
         )
         .expect("Some when CR and Secret present");
         assert!(matches!(*cfg, IngressAuthConfig::Basic(ref creds) if creds.len() == 1));
@@ -1680,9 +1721,69 @@ mod tests {
             "default",
             &basic_auths,
             &auth_secrets,
+            &std::collections::HashSet::new(),
         )
         .expect("Some when CR present");
         assert!(matches!(*cfg, IngressAuthConfig::Unavailable));
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_basic_auth_cross_namespace_without_grant_fails_closed() {
+        // BasicAuth CR in `default` references a Secret in `other` with no
+        // ReferenceGrant → must fail closed (503), never bind the cross-ns Secret.
+        let basic_auths = make_basic_auth_store(vec![basic_auth_cr(
+            "default",
+            "policy",
+            "other",
+            "my-htpasswd",
+        )]);
+        let auth_secrets = make_secret_store(vec![htpasswd_secret(
+            "other",
+            "my-htpasswd",
+            "alice:$2y$12$abcdefghijklmnopqrstuuVGKkqzuSFPb0h.d.XRjRijkFvxONxfy\n",
+        )]);
+        let cfg = resolve_basic_auth(
+            &[basic_auth_ext_ref("policy")],
+            "default",
+            &basic_auths,
+            &auth_secrets,
+            &std::collections::HashSet::new(),
+        )
+        .expect("Some when CR present");
+        assert!(matches!(*cfg, IngressAuthConfig::Unavailable));
+        assert!(logs_contain("no matching ReferenceGrant"));
+    }
+
+    #[test]
+    fn resolve_basic_auth_cross_namespace_with_grant_resolves() {
+        // A matching BasicAuth→Secret ReferenceGrant permits the cross-ns ref.
+        let basic_auths = make_basic_auth_store(vec![basic_auth_cr(
+            "default",
+            "policy",
+            "other",
+            "my-htpasswd",
+        )]);
+        let auth_secrets = make_secret_store(vec![htpasswd_secret(
+            "other",
+            "my-htpasswd",
+            "alice:$2y$12$abcdefghijklmnopqrstuuVGKkqzuSFPb0h.d.XRjRijkFvxONxfy\n",
+        )]);
+        let mut grants = std::collections::HashSet::new();
+        grants.insert(ReferenceGrantKey::specific(
+            "default",
+            "other",
+            "my-htpasswd",
+        ));
+        let cfg = resolve_basic_auth(
+            &[basic_auth_ext_ref("policy")],
+            "default",
+            &basic_auths,
+            &auth_secrets,
+            &grants,
+        )
+        .expect("Some when CR and Secret present");
+        assert!(matches!(*cfg, IngressAuthConfig::Basic(ref creds) if creds.len() == 1));
     }
 
     // ── resolve_request_size_limit ────────────────────────────────────────────

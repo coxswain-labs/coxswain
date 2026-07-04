@@ -943,6 +943,7 @@ mod tests {
                 ip_access: &crate::tests::fixtures::empty_ip_access_store(),
                 basic_auths: &crate::tests::fixtures::empty_basic_auth_store(),
                 auth_secrets: &crate::tests::fixtures::empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &crate::tests::fixtures::empty_request_size_limit_store(),
                 compressions: &crate::tests::fixtures::empty_compression_store(),
                 backend_client_certs: &HashMap::new(),

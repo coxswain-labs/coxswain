@@ -228,20 +228,24 @@ pub(crate) fn parse_htpasswd(
     };
 
     text.lines()
-        .filter_map(|line| {
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            // Log the 1-based line number, never the line content: an htpasswd line
+            // is `user:hash`, so emitting it would leak the password hash into logs.
+            let line_number = idx + 1;
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 return None;
             }
             let Some((username, hash)) = line.split_once(':') else {
-                tracing::warn!(line = line, "htpasswd line has no ':' separator — skipping");
+                tracing::warn!(line_number, "htpasswd line has no ':' separator — skipping");
                 return None;
             };
             let username = username.trim();
             let hash = hash.trim();
             if username.is_empty() || hash.is_empty() {
                 tracing::warn!(
-                    line = line,
+                    line_number,
                     "htpasswd line has empty username or hash — skipping"
                 );
                 return None;

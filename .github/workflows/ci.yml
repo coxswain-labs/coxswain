@@ -57,6 +57,7 @@ jobs:
               - 'scripts/check-no-per-site-allow.sh'
               - 'scripts/check-must-use-builders.sh'
               - 'scripts/check-must-use-results.sh'
+              - 'scripts/check-bounded-regex.sh'
               - 'scripts/check-no-e2e-sleeps.sh'
               - 'scripts/check-e2e-single-poller.sh'
               - 'scripts/check-annotation-coverage.sh'
@@ -189,6 +190,8 @@ jobs:
         run: bash scripts/check-must-use-builders.sh
       - name: Result-returning pub fns carry #[must_use]
         run: bash scripts/check-must-use-results.sh
+      - name: Tenant-supplied regexes compile via compile_bounded (bounded size)
+        run: bash scripts/check-bounded-regex.sh
       - name: No unused dependencies (cargo-machete)
         uses: taiki-e/install-action@v2
         with:
