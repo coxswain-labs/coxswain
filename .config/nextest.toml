@@ -36,6 +36,15 @@ setup-scripts = true
 command = ["bash", "-c", 'test -n "${COXSWAIN_E2E_BOOTSTRAPPED:-}" || cargo run --quiet -p coxswain-e2e --bin e2e_setup']
 slow-timeout = { period = "900s", terminate-after = 1 }
 
+# Marks the serial pass so the harness's mutation-site guard (helm_install in
+# bootstrap.rs) permits non-default HelmOverrides. Attached ONLY to the
+# e2e-serial profile below; in the parallel `e2e` profile the var is unset, so
+# any test that reconfigures the shared release panics loudly at the mutation
+# site instead of corrupting concurrent tests. Setup scripts export env to the
+# profile's tests via the file named by $NEXTEST_ENV.
+[scripts.setup.e2e-serial-marker]
+command = ["bash", "-c", 'echo "COXSWAIN_E2E_SERIAL=1" >> "$NEXTEST_ENV"']
+
 # ---------------------------------------------------------------------------
 # Global-config mutators
 # ---------------------------------------------------------------------------
@@ -132,4 +141,4 @@ fail-fast = false
 
 [[profile.e2e-serial.scripts]]
 filter = 'all()'
-setup = ['e2e-setup']
+setup = ['e2e-setup', 'e2e-serial-marker']

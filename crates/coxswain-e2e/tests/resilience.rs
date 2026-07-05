@@ -1125,12 +1125,85 @@ async fn svid_rotation_before_expiry_keeps_routing() -> anyhow::Result<()> {
         result.errors, result.total
     );
 
-    // Restore the chart-default TTL so later serial tests run with stock config.
-    Harness::start_with_options(ControllerOptions {
-        discovery_svid_ttl: Some("24h".to_string()),
-        ..Default::default()
-    })
+    // No manual restore: leaving `discovery.svidTtl` set (even to the chart
+    // default) would register as a leaked override forever after. The next
+    // default-options `Harness::start` self-heals via `ensure_default_release`,
+    // which clears ALL user-supplied values back to chart defaults.
+
+    Ok(())
+}
+
+// ── Scenario 5: shared-Gateway churn recycles internal ports cleanly ──────────
+
+/// Deleting a shared-mode Gateway frees its allocated internal accept port; a
+/// Gateway created afterwards recycles that first-free port. This exercises the
+/// two halves of the #529 hardening together: the proxy releases a removed VIP
+/// listener's socket the instant it stops accepting (so the recycled port is
+/// not left dark by a bind race), and the controller reads existing
+/// internal-port assignments authoritatively from the apiserver each pass (so a
+/// survivor Gateway's port is never remapped when the allocation landscape
+/// shifts under it).
+///
+/// Sad-path note: a genuine bind conflict (the `bind_failed` metric / dark
+/// port) requires a second process contending for the port, which the harness
+/// cannot stage in-cluster; it is covered by the metric + the reasoning in
+/// `edge/accept.rs`, not here.
+#[tokio::test]
+async fn shared_gateway_port_recycle_keeps_survivor_and_newcomer_routing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+
+    // Two independent shared Gateways, each with its own VIP + internal port.
+    let ns_a = NamespaceGuard::create(&h.client, "recycle-a").await?;
+    let ns_b = NamespaceGuard::create(&h.client, "recycle-b").await?;
+    for ns in [&ns_a.name, &ns_b.name] {
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(ns)).await?;
+        wait::wait_for_backends(ns).await?;
+        fixtures::apply_fixture(gwa::LISTENER_DRAIN, FixtureVars::new(ns)).await?;
+    }
+    let host_a = format!("drain.{}.local", ns_a.name);
+    let host_b = format!("drain.{}.local", ns_b.name);
+    let gw_a = h.gateway_http_addr(&ns_a.name).await?;
+    let gw_b = h.gateway_http_addr(&ns_b.name).await?;
+    wait_for_listener(gw_a, &host_a, Duration::from_secs(60)).await?;
+    wait_for_listener(gw_b, &host_b, Duration::from_secs(60)).await?;
+
+    // Delete Gateway A: its VIP is pruned and its internal port freed. Wait for
+    // the Gateway object to be gone so the free has been triggered.
+    let gw_api_a: Api<Gateway> = Api::namespaced(h.client.clone(), &ns_a.name);
+    gw_api_a
+        .delete("drain-gw", &DeleteParams::default())
+        .await
+        .context("delete Gateway A")?;
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL_FAST,
+        || async { "Gateway A to be deleted".to_string() },
+        || async {
+            match gw_api_a.get_opt("drain-gw").await {
+                Ok(None) => Some(()),
+                _ => None,
+            }
+        },
+    )
     .await?;
+
+    // A newcomer Gateway C recycles A's freed first-free internal port. If that
+    // port were left dark (bind race) or the survivor B were remapped onto it,
+    // one of these probes would fail.
+    let ns_c = NamespaceGuard::create(&h.client, "recycle-c").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns_c.name)).await?;
+    wait::wait_for_backends(&ns_c.name).await?;
+    fixtures::apply_fixture(gwa::LISTENER_DRAIN, FixtureVars::new(&ns_c.name)).await?;
+    let host_c = format!("drain.{}.local", ns_c.name);
+    let gw_c = h.gateway_http_addr(&ns_c.name).await?;
+    wait_for_listener(gw_c, &host_c, Duration::from_secs(60)).await?;
+
+    // Survivor B still routes on its own host after the churn — a remap would
+    // have sent B's VIP traffic into another Gateway's listener (404/503 on
+    // B's host) or darkened B's port.
+    wait_for_listener(gw_b, &host_b, Duration::from_secs(30))
+        .await
+        .context("survivor Gateway B still routes after peer churn")?;
 
     Ok(())
 }

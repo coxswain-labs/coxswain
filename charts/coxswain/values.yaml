@@ -321,7 +321,10 @@ proxy:
     priorityClassName: ""
 
     # COXSWAIN_PROXY_THREADS — worker threads per proxy service.
-    threads: 2
+    # 0 = auto: resolved at startup from the effective CPU parallelism
+    # (cgroup-quota-aware, so it tracks resources.limits.cpu below), floored at
+    # 2. Set an explicit value only to override. Tune to the CPU *limit*.
+    threads: 0
 
     # COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE — maximum idle upstream
     # connections held in Pingora's keepalive pool.  Connections beyond this

@@ -47,7 +47,10 @@ pub(crate) fn listeners_active() -> &'static IntGaugeVec {
 
 /// Counter: cumulative listener lifecycle events.
 ///
-/// Labels: `event ∈ {"added", "removed", "drain_completed", "drain_exceeded"}`.
+/// Labels: `event ∈ {"added", "removed", "drain_completed", "drain_exceeded",
+/// "bind_failed"}`. `bind_failed` counts a listener whose `bind()` failed (the
+/// port stays dark until a later reconcile retries) — a data-plane signal worth
+/// alerting on.
 ///
 /// # Panics
 ///

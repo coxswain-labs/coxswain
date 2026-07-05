@@ -1,28 +1,56 @@
 //! Serialized shared-mode per-Gateway VIP Service reconciler (#472).
 //!
 //! Owns every shared-mode Gateway's VIP `Service` from ONE serialized task so
-//! the global internal-port allocation stays single-writer: each pass reads a
-//! consistent snapshot, computes one collision-free port map, and applies it
-//! atomically. Per-Gateway reconciles in [`super::reconciler`] only *signal*
-//! this task via [`super::ReconcileContext::vip_trigger`]; the periodic tick is
-//! a store-lag backstop. Also honours GatewayStaticAddresses (#260) by pinning
-//! requested `IPAddress`es as the VIP Service `spec.clusterIP`, and orphan-prunes
-//! VIP Services whose owning Gateway is gone or has left shared mode.
+//! the global internal-port allocation stays single-writer: each pass computes
+//! one collision-free port map and applies it atomically. The allocation's
+//! `existing` (reuse) input is read AUTHORITATIVELY from the apiserver — a
+//! consistent LIST of the VIP Services, not the watch-lagged reflector store —
+//! so the pass has read-your-own-writes semantics with no in-memory ledger:
+//! `allocate_internal_ports` keeps every in-range existing assignment, so a
+//! pass racing its own previous apply (or a freshly-promoted leader) can never
+//! remap a live Gateway's internal port. Per-Gateway reconciles in
+//! [`super::reconciler`] only *signal* this task via
+//! [`super::ReconcileContext::vip_trigger`]; the periodic tick is a backstop.
+//! Also honours GatewayStaticAddresses (#260) by pinning requested
+//! `IPAddress`es as the VIP Service `spec.clusterIP`, and orphan-prunes VIP
+//! Services whose owning Gateway is gone or has left shared mode.
 
 use super::reconciler::{
     ReconcileContext, gateway_id, gateway_key, ignore_not_found, is_owned_shared_mode,
 };
 use super::{apply, render_shared};
 use coxswain_core::crd::ServiceType;
+use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
-use coxswain_reflector::port_alloc::{DEFAULT_INTERNAL_PORT_RANGE, allocate_internal_ports};
+use coxswain_reflector::port_alloc::{
+    DEFAULT_INTERNAL_PORT_RANGE, ListenerKey, SHARED_GATEWAY_VIP_COMPONENT,
+    allocate_internal_ports, read_vip_internal_ports,
+};
 use k8s_openapi::api::core::v1::{ObjectReference, Service};
-use kube::{Api, Client, Resource as _, api::DeleteParams};
+use kube::{Api, Client, Resource as _, api::DeleteParams, api::ListParams};
 use pingora_core::server::ShutdownWatch;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+
+/// A live Gateway's `listenerPort → internalPort` assignment changed between
+/// passes — the allocation stability invariant was violated. With the
+/// `existing` input read authoritatively from the apiserver (a consistent LIST,
+/// not the watch-lagged store) the allocator keeps every in-range existing
+/// assignment, so this is unreachable outside a genuine anomaly (an existing
+/// `targetPort` out of range, or a duplicate). It is surfaced (WARN +
+/// Kubernetes Event), never panicked — the operator must keep reconciling.
+struct RemapViolation {
+    /// Owning Gateway.
+    gateway: ObjectKey,
+    /// Advertised listener port whose internal mapping moved.
+    listener_port: u16,
+    /// Previously persisted internal port.
+    old_internal: u16,
+    /// Newly allocated internal port.
+    new_internal: u16,
+}
 
 /// Backstop resync interval for the serialized VIP reconciler (#472). Events
 /// make the common case prompt; this catches a Gateway missed on an
@@ -52,7 +80,11 @@ pub(super) async fn run_vip_reconciler(ctx: Arc<ReconcileContext>, mut shutdown:
             _ = ctx.vip_trigger.notified() => {}
             _ = interval.tick() => {}
         }
-        // Only the leader writes; followers idle until promotion.
+        // Only the leader writes; followers idle until promotion. The
+        // allocation is stateless across passes and leadership terms: each pass
+        // reads the current internal-port assignments authoritatively from the
+        // apiserver, so a fresh leader (or a leadership flap) needs no seeding
+        // or reset — there is no in-memory state that could go stale.
         if ctx.leader.load(Ordering::Acquire) {
             reconcile_all_vips(&ctx).await;
         }
@@ -64,7 +96,10 @@ pub(super) async fn run_vip_reconciler(ctx: Arc<ReconcileContext>, mut shutdown:
 /// Service, and prunes the VIP Service of any Gateway that has left shared mode.
 ///
 /// Best-effort: a single Service apply/delete failure is logged and the pass
-/// continues — the next tick retries from current cluster state.
+/// continues — the next tick retries from current cluster state. Because
+/// `existing` is read authoritatively from the apiserver each pass, a failed
+/// apply cannot shift the port landscape for anyone else: the retried pass sees
+/// exactly the assignments that actually persisted.
 async fn reconcile_all_vips(ctx: &ReconcileContext) {
     let gateways = ctx.gateways_store.state();
     let services = ctx.services_store.state();
@@ -92,8 +127,36 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
 
     let desired =
         super::shared_alloc::desired_listener_keys(&gateways, &effective_ports, is_shared);
-    let existing = super::shared_alloc::existing_internal_ports(&services);
+    // Read-your-own-writes without any in-memory state: read the current
+    // `(Gateway, listenerPort) → internalPort` assignments authoritatively from
+    // the apiserver (a consistent LIST of the VIP Services), NOT from the
+    // watch-lagged Services store. A pass racing its own previous apply — or a
+    // freshly-promoted leader racing a predecessor's writes — sees exactly what
+    // persisted, so `allocate_internal_ports` (which keeps every in-range
+    // existing assignment) can never force-SSA a new targetPort onto a live
+    // Gateway's VIP Service. On a LIST failure we fall back to the store view:
+    // a stale existing map degrades to the pre-existing behaviour (possible
+    // transient remap) rather than blocking provisioning entirely.
+    let existing = match list_persisted_internal_ports(ctx).await {
+        Ok(map) => map,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "operator: authoritative VIP-Service LIST failed; falling back to \
+                 the (possibly stale) Services store for this pass"
+            );
+            super::shared_alloc::existing_internal_ports(&services)
+        }
+    };
     let allocation = allocate_internal_ports(&desired, &existing, DEFAULT_INTERNAL_PORT_RANGE);
+    // Alarm on any live-Gateway remap. Structurally unreachable when `existing`
+    // is authoritative (the allocator keeps in-range existing ports), so a
+    // firing here means a genuine anomaly — a persisted targetPort outside the
+    // range, or a duplicate — worth an operator-visible Event, not a silent
+    // reallocation.
+    for violation in detect_remaps(&existing, &allocation) {
+        emit_remap_violation_event(ctx, &gateways, &violation).await;
+    }
 
     // Apply each owned shared Gateway's VIP Service into the CONTROLLER namespace
     // (alongside the shared proxy pod) so its selector resolves and the cloud LB
@@ -183,6 +246,56 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
             ),
         }
     }
+}
+
+/// The `(Gateway, listenerPort) → internalPort` assignments currently persisted
+/// in the VIP Services, read **authoritatively** from the apiserver (a
+/// consistent LIST, not the watch-lagged reflector store) so the allocation
+/// pass has read-your-own-writes semantics without any in-memory ledger.
+///
+/// Scoped by the [`SHARED_GATEWAY_VIP_COMPONENT`] label to the controller
+/// namespace, so the result set is exactly the VIP Services and stays small.
+///
+/// # Errors
+///
+/// Returns the underlying `kube` error if the LIST fails; the caller falls back
+/// to the store view for that pass.
+async fn list_persisted_internal_ports(
+    ctx: &ReconcileContext,
+) -> Result<HashMap<ListenerKey, u16>, kube::Error> {
+    let ctrl_ns = ctx.controller_namespace.as_str();
+    let api: Api<Service> = Api::namespaced(ctx.client.clone(), ctrl_ns);
+    let lp = ListParams::default().labels(&format!(
+        "app.kubernetes.io/component={SHARED_GATEWAY_VIP_COMPONENT}"
+    ));
+    let list = api.list(&lp).await?;
+    let services: Vec<Arc<Service>> = list.items.into_iter().map(Arc::new).collect();
+    Ok(read_vip_internal_ports(&services))
+}
+
+/// Detect live-Gateway allocation remaps: a `(Gateway, listenerPort)` whose
+/// authoritative `existing` internal port differs from the port just allocated.
+/// With an authoritative `existing` this is structurally unreachable
+/// (`allocate_internal_ports` keeps every in-range existing assignment), so any
+/// result is a genuine anomaly the caller surfaces as a Warning Event.
+fn detect_remaps(
+    existing: &HashMap<ListenerKey, u16>,
+    allocation: &coxswain_reflector::port_alloc::PortAllocation,
+) -> Vec<RemapViolation> {
+    let mut out = Vec::new();
+    for (gw, listener_port, new_internal) in allocation.iter() {
+        if let Some(&old_internal) = existing.get(&(gw.clone(), listener_port))
+            && old_internal != new_internal
+        {
+            out.push(RemapViolation {
+                gateway: gw.clone(),
+                listener_port,
+                old_internal,
+                new_internal,
+            });
+        }
+    }
+    out
 }
 
 /// Parameters for [`bind_static_vip_service`], grouped to keep the call within
@@ -403,6 +516,68 @@ fn vip_service_should_prune(
     }) {
         Some(gw) => !is_shared(gw), // exists but migrated out of shared mode → prune
         None => true,               // Gateway gone (no GC for an out-of-ns Service) → prune
+    }
+}
+
+/// Alarm on a violation of the allocation stability invariant (see
+/// `vip_ledger`): a live Gateway's `listenerPort → internalPort` mapping moved
+/// between passes. With the ledger feeding the allocator this must never fire;
+/// if it does, kube-proxy's NAT was remapped while the proxy may still be bound
+/// to the old port — connections die before the proxy, so make it loud (WARN +
+/// Warning Event) instead of letting it pass as a routine apply. Best-effort:
+/// a publish failure is logged, never propagated.
+async fn emit_remap_violation_event(
+    ctx: &ReconcileContext,
+    gateways: &[Arc<Gateway>],
+    violation: &RemapViolation,
+) {
+    use kube::runtime::events::{Event, EventType, Recorder, Reporter};
+
+    tracing::warn!(
+        gateway = %violation.gateway,
+        listener_port = violation.listener_port,
+        old_internal = violation.old_internal,
+        new_internal = violation.new_internal,
+        "operator: internal-port allocation REMAPPED a live Gateway's listener — \
+         stability invariant violated; traffic to the old targetPort will fail \
+         until the proxy rebinds"
+    );
+    let Some(gw) = gateways
+        .iter()
+        .find(|g| gateway_key(g) == violation.gateway)
+    else {
+        return;
+    };
+    let reference = ObjectReference {
+        api_version: Some("gateway.networking.k8s.io/v1".into()),
+        kind: Some("Gateway".into()),
+        name: gw.metadata.name.clone(),
+        namespace: gw.metadata.namespace.clone(),
+        uid: gw.metadata.uid.clone(),
+        ..Default::default()
+    };
+    let reporter = Reporter {
+        controller: ctx.controller_name.to_string(),
+        instance: None,
+    };
+    let recorder = Recorder::new(ctx.client.clone(), reporter);
+    if let Err(e) = recorder
+        .publish(
+            &Event {
+                action: "AllocateInternalPort".into(),
+                reason: "InternalPortRemapped".into(),
+                note: Some(format!(
+                    "listener {} internal port moved {} -> {} while the Gateway is live",
+                    violation.listener_port, violation.old_internal, violation.new_internal
+                )),
+                type_: EventType::Warning,
+                secondary: None,
+            },
+            &reference,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "Failed to publish InternalPortRemapped Event");
     }
 }
 

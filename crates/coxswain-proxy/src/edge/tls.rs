@@ -13,6 +13,19 @@ use pingora_core::tls::{
 use std::any::Any;
 use std::sync::Arc;
 
+// NOTE: server cert/key PEM and the mTLS CA bundle are parsed per handshake
+// (below, in `certificate_callback`). An earlier revision cached the parsed
+// handles process-wide keyed by the PEM bytes; that was reverted because it
+// (a) retained rotated-away private-key material in process memory until a
+// wholesale cap-clear a stable install never reaches, (b) allocated and
+// memcpy'd the full PEM on every cache probe, and (c) serialized every
+// handshake through one global mutex. The dominant per-connection CPU sink was
+// the BoringSSL `SslAcceptor` rebuild, which is now cached once per process
+// (see `edge/accept.rs::cached_acceptor`); the residual X509/PKey parse is
+// cheap relative to the handshake crypto itself. If profiling later justifies
+// caching the parsed handles, do it at snapshot-apply time in the cert store
+// (parse-at-construction) so rotation invalidates it — not on the hot path.
+
 /// Information about the verified client certificate, stored as a nested field
 /// inside [`ConnTlsInfo`] after a successful mTLS handshake.
 pub(crate) struct ClientCertInfo {

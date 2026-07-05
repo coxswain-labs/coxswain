@@ -220,8 +220,15 @@ pub(crate) struct CommonArgs {
 pub(crate) struct ProxyArgs {
     /// Worker threads per proxy service.
     ///
-    /// Threads are not shared across services. Set to the available CPU core count for maximum throughput.
-    #[arg(long, env = "COXSWAIN_PROXY_THREADS", default_value_t = 2)]
+    /// Threads are not shared across services. `0` (the default) means **auto**:
+    /// resolve to the effective CPU parallelism at startup via
+    /// [`std::thread::available_parallelism`], which is cgroup-quota-aware on
+    /// Linux (it reads `cpu.max` / `cfs_quota`), so the count tracks the pod's
+    /// `resources.limits.cpu` with no manual tuning — floored at 2. Set an
+    /// explicit non-zero value to override. Tune to the pod's CPU *limit*, not
+    /// the host core count: over-provisioning threads under a CFS quota only
+    /// adds context-switching.
+    #[arg(long, env = "COXSWAIN_PROXY_THREADS", default_value_t = 0)]
     pub proxy_threads: usize,
 
     /// Drain window before the final shutdown step.
