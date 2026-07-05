@@ -1,9 +1,14 @@
 name: Preload Gateway API images into kind
 description: >
-  Reads the Gateway API version from .gateway-api-version, pulls the
-  conformance echo-basic backend image, and loads it into the named kind
-  cluster. Optionally also loads busybox:1.37, which is required by the
-  e2e (non-conformance) test suites.
+  Pulls the conformance echo-basic backend image (and optionally busybox) that
+  the e2e / conformance suites deploy, and loads it into the named kind cluster
+  for offline use. The image references are read verbatim from
+  crates/coxswain-e2e/src/fixtures/images.rs — the single source of truth the
+  test fixtures substitute — so the preloaded image can never drift from what the
+  tests actually request. This is DECOUPLED from .gateway-api-version: the
+  echo-basic backend is Gateway-API-version-agnostic and published on an
+  independent cadence (there is no per-API-version tag), so deriving its tag from
+  the API version silently breaks on every version bump.
 
 inputs:
   cluster-name:
@@ -11,35 +16,45 @@ inputs:
     required: true
   include-busybox:
     description: >
-      Set to 'true' to also pull and load busybox:1.37. Required by the
-      routing/tls data-plane suites; not needed for conformance.
+      Set to 'true' to also pull and load busybox. Required by the routing/tls
+      data-plane suites; not needed for conformance.
     required: false
     default: 'false'
 
 runs:
   using: composite
   steps:
-    - name: Read Gateway API version
-      id: gw-version
-      shell: bash
-      run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
-
     - name: Pull and load echo-basic into kind
       shell: bash
       run: |
-        GW_VER=${{ steps.gw-version.outputs.version }}
-        docker pull gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER}
-        kind load docker-image \
-          gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-${GW_VER} \
-          --name ${{ inputs.cluster-name }}
+        set -euo pipefail
+        images=crates/coxswain-e2e/src/fixtures/images.rs
+        ref=$(grep -oE 'gcr\.io/k8s-staging-gateway-api/echo-basic:[^"]+' "$images" | head -1)
+        if [ -z "$ref" ]; then
+          echo "could not read the echo-basic image reference from $images" >&2
+          exit 1
+        fi
+        # `kind load` matches the loaded image by its tag; kubelet then resolves
+        # the fixture's `tag@sha256:...` reference by digest (the same pattern the
+        # busybox preload below relies on). Pulling the digest-pinned ref stores
+        # the image untagged, so tag it explicitly before loading.
+        tag=${ref%@*}
+        for i in 1 2 3; do docker pull "$ref" && break; echo "pull $ref failed ($i/3), retrying in 15s"; sleep 15; done
+        docker tag "$ref" "$tag"
+        kind load docker-image "$tag" --name "${{ inputs.cluster-name }}"
 
     - name: Pull and load busybox into kind
       if: ${{ inputs.include-busybox == 'true' }}
       shell: bash
       run: |
-        for i in 1 2 3; do
-          docker pull busybox:1.37 && break
-          echo "docker pull busybox:1.37 failed (attempt $i/3), retrying in 15s..."
-          sleep 15
-        done
-        kind load docker-image busybox:1.37 --name ${{ inputs.cluster-name }}
+        set -euo pipefail
+        images=crates/coxswain-e2e/src/fixtures/images.rs
+        ref=$(grep -oE 'busybox:[^"]+' "$images" | head -1)
+        if [ -z "$ref" ]; then
+          echo "could not read the busybox image reference from $images" >&2
+          exit 1
+        fi
+        tag=${ref%@*}
+        for i in 1 2 3; do docker pull "$ref" && break; echo "pull $ref failed ($i/3), retrying in 15s"; sleep 15; done
+        docker tag "$ref" "$tag"
+        kind load docker-image "$tag" --name "${{ inputs.cluster-name }}"
