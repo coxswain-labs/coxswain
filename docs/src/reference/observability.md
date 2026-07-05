@@ -41,6 +41,8 @@ Route id formats:
 
 The following listener-lifecycle metrics are also exposed: `coxswain_proxy_listeners_active`, `coxswain_proxy_listener_lifecycle_total`, `coxswain_proxy_listener_drain_duration_seconds`, `coxswain_proxy_requests_force_closed_total`.
 
+`coxswain_proxy_listener_lifecycle_total` carries an `event` label ∈ `{added, removed, drain_completed, drain_exceeded, bind_failed}`. **`bind_failed`** counts a listener whose socket `bind()` failed — that local port serves no traffic until a later reconcile retries the bind. A sustained non-zero rate is a data-plane outage signal worth alerting on (a port conflict, or a stale process still holding the port); it should otherwise stay flat at zero.
+
 The `listener` label is the **local port the proxy accepted the connection on**. For Ingress and dedicated-mode Gateway traffic this is the advertised port (e.g. `80`/`443`). For shared-mode Gateway listeners it is the **internal accept port** the controller allocates per Gateway (in the `30000–32767` range), *not* the advertised port: a per-Gateway VIP Service maps the advertised port onto that internal port, and the proxy keys routing, TLS, and metrics on the port it accepts on so cross-Gateway hostname namespaces stay isolated (see [Architecture → per-Gateway addressing](../architecture.md)). To slice a shared-mode Gateway's series by its advertised port, join on the VIP Service rather than reading it from the `listener` label.
 
 ### Controller-pod metrics (`coxswain_controller_*`)
@@ -225,9 +227,11 @@ COXSWAIN_LOG=info,coxswain_proxy::access=off
 
 ## Kubernetes Events
 
-The controller emits Kubernetes `Warning` Events on affected `Ingress` objects for two
-diagnostic conditions. Events appear in `kubectl describe ingress <name>` and
-`kubectl get events` — no log-aggregation pipeline needed.
+The controller emits Kubernetes `Warning` Events for diagnostic conditions — on the
+affected `Ingress` object for the Ingress-routing conditions below, and on the affected
+`Gateway` object for the shared-mode addressing conditions. Events appear in
+`kubectl describe <kind> <name>` and `kubectl get events` — no log-aggregation pipeline
+needed.
 
 ### RouteConflict
 
@@ -255,6 +259,27 @@ Type     Reason             Age   From                 Message
 ----     ------             ---   ----                 -------
 Warning  InvalidAnnotation  5s    coxswain-controller  ingress.coxswain-labs.dev/connect-timeout: invalid duration — using default
 ```
+
+### InternalPortRemapped (shared-mode Gateway)
+
+Emitted on a shared-mode `Gateway` if the controller ever reallocates a **live** listener's
+internal accept port (the `30000–32767` port its VIP Service maps the advertised port onto).
+The controller reads existing allocations authoritatively from the apiserver each pass and
+keeps every in-range assignment, so this is expected to **never fire**; if it does, it means
+kube-proxy's NAT was remapped while the proxy may still be bound to the old port (a brief
+data-plane blip for that Gateway) and points at a genuine anomaly — a persisted `targetPort`
+outside the range, or a duplicate.
+
+```
+Type     Reason                Age   From                 Message
+----     ------                ---   ----                 -------
+Warning  InternalPortRemapped  3s    coxswain-controller  listener 443 internal port moved 30001 -> 30004 while the Gateway is live
+```
+
+### InternalPortRangeExhausted (shared-mode Gateway)
+
+Emitted on a shared-mode `Gateway` when the `30000–32767` internal-port band is exhausted;
+the un-allocated listeners get no VIP port and are not addressed until capacity frees up.
 
 ### Deduplication
 

@@ -40,7 +40,9 @@ use pingora_core::protocols::tls::server::handshake_with_callback;
 use pingora_core::protocols::{ALPN, GetSocketDigest, SocketDigest};
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::Service;
-use pingora_core::tls::ssl::{AlpnError, SslAcceptor, SslMethod, SslRef, select_next_proto};
+use pingora_core::tls::ssl::{
+    AlpnError, SslAcceptor, SslMethod, SslOptions, SslRef, SslSessionCacheMode, select_next_proto,
+};
 use pingora_proxy::{HttpProxy, ProxyHttp};
 use thiserror::Error;
 use tokio::io::AsyncReadExt;
@@ -605,16 +607,32 @@ async fn reconcile_listeners<P>(
         }
     }
 
-    // Spawn tasks for newly-desired listeners.
+    // Spawn tasks for newly-desired listeners. The stock tokio bind sets
+    // SO_REUSEADDR (so a re-add whose predecessor left TIME_WAIT remnants still
+    // succeeds) but NOT SO_REUSEPORT — a second process binding the same port
+    // must still fail loudly with EADDRINUSE rather than silently split traffic
+    // with a stale proxy. The dark-port race that an earlier SO_REUSEPORT
+    // experiment targeted is instead closed at the source: `run_listener`
+    // releases its listening socket the instant it stops accepting (before the
+    // drain window), so by the time a later reconcile re-adds the port the
+    // socket is already free.
     for spec in plan.add {
         let tcp = match tokio::net::TcpListener::bind(spec.addr).await {
             Ok(l) => l,
             Err(e) => {
-                tracing::warn!(
+                // A dark port is a routing outage for that Gateway until a
+                // later reconcile retries the bind (the addr stays in
+                // `desired` and out of `active`, so every pass re-attempts).
+                // Loud on purpose (error + metric): with drain-start socket
+                // release this should be a rare, transient collision.
+                tracing::error!(
                     addr = %spec.addr,
                     error = %e,
-                    "Cannot bind new listener; skipping"
+                    "Cannot bind new listener; port dark until a later reconcile succeeds"
                 );
+                metrics::lifecycle()
+                    .with_label_values(&["bind_failed"])
+                    .inc();
                 continue;
             }
         };
@@ -757,7 +775,17 @@ async fn run_listener<P>(
         }
     }
 
-    // Accept stopped. Begin drain window.
+    // Accept stopped. Release the listening socket IMMEDIATELY — in-flight
+    // connections are independent fds and drain below regardless. Holding the
+    // listener through the (up to 30 s) drain window would keep the port bound
+    // with nobody accepting: a re-added listener on the same port either hits
+    // EADDRINUSE (without SO_REUSEPORT) or, worse, the kernel keeps completing
+    // handshakes into this dead socket's backlog and those connections hang
+    // until the drop. Releasing here shrinks the reuse overlap to the
+    // microseconds between the drain signal and this poll.
+    drop(tcp);
+
+    // Begin drain window for in-flight connections.
     let drain_start = Instant::now();
 
     let force_closed = tokio::select! {
@@ -1269,18 +1297,49 @@ pub(crate) struct TlsContext {
     pub(crate) callbacks: Arc<pingora_core::listeners::TlsAcceptCallbacks>,
 }
 
-/// Build a TLS acceptor for an HTTPS listener.
+/// Process-wide cached `SslAcceptor`s, one per ALPN flavour (h2-advertising
+/// and h1-only). The acceptor holds NO certificate state — certs, keys, and
+/// mTLS CA stores are installed per handshake by [`SniCertSelector`]'s
+/// callback against the live cert store — so one immutable acceptor per
+/// flavour serves every connection for the process lifetime. Building one is
+/// pure cipher/protocol configuration (BoringSSL `mozilla_intermediate_v5`),
+/// which used to run PER CONNECTION and was a measurable CPU sink on the
+/// acceptor runtime under HTTPS load. `OnceLock` gives lock-free reads after
+/// the first build and collapses the cold-start build race to a single winner.
+static ACCEPTOR_H2: std::sync::OnceLock<Arc<SslAcceptor>> = std::sync::OnceLock::new();
+static ACCEPTOR_H1: std::sync::OnceLock<Arc<SslAcceptor>> = std::sync::OnceLock::new();
+
+/// Get (building on first use) the process-wide acceptor for the flavour.
+/// A build failure is returned uncached — the next connection retries.
 ///
-/// When `advertise_h2` is `true`, the acceptor registers an ALPN-select
-/// callback that prefers `h2` over `http/1.1`, enabling transparent HTTP/2
-/// negotiation with TLS clients.  Pass `false` for the PROXY-protocol path,
-/// which runs an h1-only keepalive loop and must not advertise h2.
-pub(crate) fn build_tls_context(
-    selector: &SniCertSelector,
-    advertise_h2: bool,
-) -> Result<TlsContext, AcceptorBuildError> {
+/// SECURITY: TLS session resumption (tickets + server session cache) is
+/// disabled on these acceptors. One `SSL_CTX` is now shared across every
+/// listener of a flavour, including a non-mTLS HTTPS Gateway and an
+/// mTLS-required one; with resumption enabled a client could full-handshake
+/// against the non-mTLS SNI, obtain a ticket, and resume against the mTLS SNI
+/// on an abbreviated handshake that skips BoringSSL's certificate callback —
+/// where [`SniCertSelector`] installs `SSL_VERIFY_PEER | FAIL_IF_NO_PEER_CERT`
+/// — yielding an mTLS bypass. The prior per-connection acceptor made
+/// resumption structurally impossible (a fresh `SSL_CTX`/ticket key per
+/// connection); disabling it here preserves that property while keeping the
+/// build-once CPU win. It also removes a process-lifetime shared ticket key
+/// (a forward-secrecy erosion). Coxswain does not rely on resumption.
+fn cached_acceptor(advertise_h2: bool) -> Result<Arc<SslAcceptor>, AcceptorBuildError> {
+    let slot = if advertise_h2 {
+        &ACCEPTOR_H2
+    } else {
+        &ACCEPTOR_H1
+    };
+    if let Some(acceptor) = slot.get() {
+        return Ok(Arc::clone(acceptor));
+    }
     let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
         .map_err(|e| AcceptorBuildError::TlsAcceptorBuild(e.to_string()))?;
+    // Disable resumption: no server session cache, no session tickets. See the
+    // SECURITY note above — cross-SNI resumption on a shared SSL_CTX would let a
+    // resumed handshake skip per-SNI mTLS enforcement.
+    builder.set_session_cache_mode(SslSessionCacheMode::OFF);
+    builder.set_options(SslOptions::NO_TICKET);
     if advertise_h2 {
         builder.set_alpn_select_callback(
             |_ssl: &mut SslRef, client: &[u8]| -> Result<&[u8], AlpnError> {
@@ -1290,9 +1349,30 @@ pub(crate) fn build_tls_context(
             },
         );
     }
+    let acceptor = Arc::new(builder.build());
+    // A racing builder is harmless: whichever `set` wins, both acceptors are
+    // valid and equivalent; `get_or_init`-style dedup via set().unwrap_or.
+    let _ = slot.set(Arc::clone(&acceptor));
+    Ok(slot.get().map_or(acceptor, Arc::clone))
+}
+
+/// Build a TLS context for an HTTPS listener: the process-wide cached
+/// acceptor for the flavour plus this connection's SNI-callback handle.
+///
+/// When `advertise_h2` is `true`, the acceptor registers an ALPN-select
+/// callback that prefers `h2` over `http/1.1`, enabling transparent HTTP/2
+/// negotiation with TLS clients.  Pass `false` for the PROXY-protocol path,
+/// which runs an h1-only keepalive loop and must not advertise h2.
+/// Per-connection cost is two `Arc` clones; the BoringSSL acceptor itself is
+/// built once per process per flavour (see [`cached_acceptor`]).
+pub(crate) fn build_tls_context(
+    selector: &SniCertSelector,
+    advertise_h2: bool,
+) -> Result<TlsContext, AcceptorBuildError> {
+    let acceptor = cached_acceptor(advertise_h2)?;
     let callbacks: pingora_core::listeners::TlsAcceptCallbacks = Box::new(selector.clone());
     Ok(TlsContext {
-        acceptor: Arc::new(builder.build()),
+        acceptor,
         callbacks: Arc::new(callbacks),
     })
 }

@@ -1282,9 +1282,30 @@ fn wire_management_servers(
     server.add_service(admin.into_service(admin_addr));
 }
 
+/// Resolve the per-service proxy worker-thread count. A non-zero `configured`
+/// value is honoured verbatim; `0` means **auto** — the effective CPU
+/// parallelism from [`std::thread::available_parallelism`] (cgroup-quota-aware
+/// on Linux, so it tracks the pod's `resources.limits.cpu`), floored at 2 and
+/// falling back to 2 if the cgroup/affinity info cannot be read.
+fn resolve_proxy_threads(configured: usize) -> usize {
+    if configured != 0 {
+        return configured;
+    }
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(2)
+        .max(2)
+}
+
 fn build_server(args: &ProxyArgs) -> Server {
+    let threads = resolve_proxy_threads(args.proxy_threads);
+    tracing::info!(
+        proxy_threads = threads,
+        configured = args.proxy_threads,
+        "Resolved per-service proxy worker threads (0 configured = auto from CPU quota)"
+    );
     let conf = ServerConf {
-        threads: args.proxy_threads,
+        threads,
         grace_period_seconds: Some(args.proxy_shutdown_grace_period.as_secs()),
         graceful_shutdown_timeout_seconds: Some(args.proxy_shutdown_timeout.as_secs()),
         upstream_keepalive_pool_size: args.proxy_upstream_keepalive_pool_size,
@@ -1328,6 +1349,16 @@ fn init_logger(format: LogFormat, log_filter: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_proxy_threads_honours_explicit_and_floors_auto() {
+        // Explicit non-zero values pass through verbatim.
+        assert_eq!(resolve_proxy_threads(1), 1);
+        assert_eq!(resolve_proxy_threads(8), 8);
+        // Auto (0) resolves to the effective parallelism, never below the
+        // floor of 2 (so a sub-2-core CPU quota still gets 2 threads).
+        assert!(resolve_proxy_threads(0) >= 2);
+    }
 
     #[test]
     fn controller_namespace_parsed_from_service_dns() {

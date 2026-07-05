@@ -36,6 +36,15 @@ setup-scripts = true
 command = ["bash", "-c", 'test -n "${COXSWAIN_E2E_BOOTSTRAPPED:-}" || cargo run --quiet -p coxswain-e2e --bin e2e_setup']
 slow-timeout = { period = "900s", terminate-after = 1 }
 
+# Marks the serial pass so the harness's mutation-site guard (helm_install in
+# bootstrap.rs) permits non-default HelmOverrides. Attached ONLY to the
+# e2e-serial profile below; in the parallel `e2e` profile the var is unset, so
+# any test that reconfigures the shared release panics loudly at the mutation
+# site instead of corrupting concurrent tests. Setup scripts export env to the
+# profile's tests via the file named by $NEXTEST_ENV.
+[scripts.setup.e2e-serial-marker]
+command = ["bash", "-c", 'echo "COXSWAIN_E2E_SERIAL=1" >> "$NEXTEST_ENV"']
+
 # ---------------------------------------------------------------------------
 # Global-config mutators
 # ---------------------------------------------------------------------------
@@ -74,11 +83,9 @@ default-filter = '''
     | test(=proxy_protocol_http_v1_forwarded) | test(=proxy_protocol_https_v2_forwarded)
     | test(=allow_source_range_in_range_allowed) | test(=allow_source_range_out_of_range_rejected)
     | test(=deny_source_range_blocks_listed_client) | test(=deny_source_range_allows_unlisted_client) | test(=deny_takes_precedence_over_allow_when_both_match)
-    | test(=forwarded_header_ip_used_for_allow_source_range_when_trusted) | test(=forwarded_header_all_private_ips_falls_back_to_l4_and_is_rejected)
+    | test(=forwarded_header_all_private_under_trusted_peer_falls_back_to_l4) | test(=mapped_v6_client_matches_deny_v4_cidr)
     | test(=custom_forwarded_header_from_trusted_peer_resolves_client_ip) | test(=spoofed_forwarded_header_from_untrusted_peer_is_rejected)
     | test(=forwarded_header_forged_leftmost_cannot_bypass_allow_list) | test(=forwarded_header_ignored_without_trusted_cidrs_fail_closed)
-    | test(=satisfy_any_admits_when_ip_in_range_even_if_auth_denies) | test(=satisfy_any_admits_when_auth_passes_even_if_ip_out_of_range) | test(=satisfy_any_denies_when_both_ip_and_auth_fail)
-    | test(=satisfy_all_denies_when_ip_passes_but_auth_denies) | test(=deny_source_range_blocks_under_satisfy_any_despite_ip_and_auth_passing)
     | test(=status_reports_load_balancer_ip)
     | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
     | test(=timeouts_request_returns_504) | test(=timeouts_backend_request_returns_504)
@@ -115,11 +122,9 @@ default-filter = '''
   | test(=proxy_protocol_http_v1_forwarded) | test(=proxy_protocol_https_v2_forwarded)
   | test(=allow_source_range_in_range_allowed) | test(=allow_source_range_out_of_range_rejected)
   | test(=deny_source_range_blocks_listed_client) | test(=deny_source_range_allows_unlisted_client) | test(=deny_takes_precedence_over_allow_when_both_match)
-  | test(=forwarded_header_ip_used_for_allow_source_range_when_trusted) | test(=forwarded_header_all_private_ips_falls_back_to_l4_and_is_rejected)
+  | test(=forwarded_header_all_private_under_trusted_peer_falls_back_to_l4) | test(=mapped_v6_client_matches_deny_v4_cidr)
   | test(=custom_forwarded_header_from_trusted_peer_resolves_client_ip) | test(=spoofed_forwarded_header_from_untrusted_peer_is_rejected)
   | test(=forwarded_header_forged_leftmost_cannot_bypass_allow_list) | test(=forwarded_header_ignored_without_trusted_cidrs_fail_closed)
-  | test(=satisfy_any_admits_when_ip_in_range_even_if_auth_denies) | test(=satisfy_any_admits_when_auth_passes_even_if_ip_out_of_range) | test(=satisfy_any_denies_when_both_ip_and_auth_fail)
-  | test(=satisfy_all_denies_when_ip_passes_but_auth_denies) | test(=deny_source_range_blocks_under_satisfy_any_despite_ip_and_auth_passing)
   | test(=status_reports_load_balancer_ip)
   | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
   | test(=timeouts_request_returns_504) | test(=timeouts_backend_request_returns_504)
@@ -136,4 +141,4 @@ fail-fast = false
 
 [[profile.e2e-serial.scripts]]
 filter = 'all()'
-setup = ['e2e-setup']
+setup = ['e2e-setup', 'e2e-serial-marker']
