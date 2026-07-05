@@ -63,6 +63,8 @@ jobs:
               - 'scripts/check-annotation-coverage.sh'
               - 'scripts/check-e2e-plane-layout.sh'
               - 'scripts/check-e2e-images-pinned.sh'
+              - 'scripts/check-e2e-mutators-serialized.sh'
+              - '.config/nextest.toml'
               - '.github/workflows/ci.yml'
 
   fmt:
@@ -207,3 +209,5 @@ jobs:
         run: bash scripts/check-e2e-plane-layout.sh
       - name: e2e fixture images are @sha256:-pinned
         run: bash scripts/check-e2e-images-pinned.sh
+      - name: e2e global-config mutators are serialized (no parallel-pass helm rolls)
+        run: bash scripts/check-e2e-mutators-serialized.sh

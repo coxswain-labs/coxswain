@@ -7,7 +7,8 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 
 use crate::harness::bootstrap::{
-    COXSWAIN_NAMESPACE, E2E_IMAGE, GATEWAY_HTTP_PORT, HelmOverrides, helm_install, workspace_root,
+    COXSWAIN_NAMESPACE, E2E_IMAGE, GATEWAY_HTTP_PORT, HelmOverrides, ensure_default_release,
+    helm_install, workspace_root,
 };
 
 /// Fixed port the Helm chart sets for HTTP ingress (`proxy.ingress.http.port`).
@@ -119,6 +120,15 @@ impl ControllerProcess {
             helm_install(&root, &overrides)
                 .await
                 .context("helm upgrade with overrides")?;
+        } else {
+            // Mutator tests leave their `helm upgrade` deployed; if one leaked
+            // (or the serial pass just finished), a default-options test would
+            // otherwise run against e.g. a PROXY-protocol-required proxy and
+            // die in opaque connection-reset timeouts. Detect and restore.
+            let root = workspace_root().context("workspace root")?;
+            ensure_default_release(&root)
+                .await
+                .context("restore default helm release config")?;
         }
 
         // When ingress is disabled the chart omits the external LoadBalancer Service

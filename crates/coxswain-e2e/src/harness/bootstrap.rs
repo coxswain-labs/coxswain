@@ -360,6 +360,168 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
     Ok(())
 }
 
+/// Helm-values paths only a non-default [`HelmOverrides`] can set. Returns the
+/// paths present in `values` (helm's user-supplied values as JSON) — i.e. the
+/// evidence that a global-config mutator's configuration is still deployed.
+/// Keep in lockstep with the `--set` args built in [`helm_install`] above.
+fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
+    let mut dirty = Vec::new();
+    let mut check = |path: &[&str], is_dirty: bool| {
+        if is_dirty {
+            dirty.push(path.join("."));
+        }
+    };
+    let get = |path: &[&str]| {
+        let mut v = values;
+        for seg in path {
+            v = v.get(seg)?;
+        }
+        Some(v)
+    };
+    check(
+        &["controller", "statusAddress"],
+        get(&["controller", "statusAddress"]).is_some(),
+    );
+    check(
+        &["proxy", "shared", "ingressDefaultBackend"],
+        get(&["proxy", "shared", "ingressDefaultBackend"]).is_some(),
+    );
+    check(
+        &["proxy", "shared", "acceptProxyProtocol"],
+        get(&["proxy", "shared", "acceptProxyProtocol"]).and_then(serde_json::Value::as_bool)
+            == Some(true),
+    );
+    check(
+        &["proxy", "shared", "trustedSources"],
+        get(&["proxy", "shared", "trustedSources"])
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|a| !a.is_empty()),
+    );
+    check(
+        &["proxy", "shared", "accessLog"],
+        get(&["proxy", "shared", "accessLog"]).is_some(),
+    );
+    check(
+        &["proxy", "shared", "accessLogPathMode"],
+        get(&["proxy", "shared", "accessLogPathMode"]).is_some(),
+    );
+    check(
+        &["discovery", "svidTtl"],
+        get(&["discovery", "svidTtl"]).is_some(),
+    );
+    check(
+        &["controller", "gatewayApi", "enabled"],
+        get(&["controller", "gatewayApi", "enabled"]).is_some(),
+    );
+    check(
+        &["controller", "ingress", "enabled"],
+        get(&["controller", "ingress", "enabled"]).is_some(),
+    );
+    dirty
+}
+
+/// Read the deployed release's user-supplied Helm values as JSON.
+async fn deployed_values() -> anyhow::Result<serde_json::Value> {
+    let out = Command::new("helm")
+        .args([
+            "get",
+            "values",
+            HELM_RELEASE,
+            "--namespace",
+            COXSWAIN_NAMESPACE,
+            "--output",
+            "json",
+        ])
+        .output()
+        .await
+        .context("helm get values")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "helm get values failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).context("parse helm values JSON")
+}
+
+/// Removes the restore lock file on drop, including on the error paths.
+struct RestoreLock(PathBuf);
+impl Drop for RestoreLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Guarantee the shared release runs with DEFAULT configuration before a
+/// default-options test proceeds.
+///
+/// A global-config mutator (serial pass) leaves its `helm upgrade` deployed
+/// when it finishes — nothing restores defaults. Any later default-options
+/// test would then run against a proxy in e.g. PROXY-protocol-required mode
+/// and fail with opaque 60–90 s connection-reset timeouts (the security-suite
+/// "cliff"). This makes the harness self-healing and the failure mode
+/// self-diagnosing: detect the leaked overrides by inspecting the deployed
+/// values, log exactly which keys leaked, and restore defaults.
+///
+/// Concurrency: parallel-pass tests may all detect the same leak at once, and
+/// concurrent `helm upgrade`s on one release fail with "another operation in
+/// progress". A cross-process lock file serializes the restore; waiters
+/// re-check the values after the holder finishes and skip their own upgrade.
+///
+/// # Errors
+///
+/// Returns an error if Helm cannot be queried/upgraded or the lock cannot be
+/// acquired within the deadline.
+pub(crate) async fn ensure_default_release(root: &Path) -> anyhow::Result<()> {
+    let dirty = dirty_override_paths(&deployed_values().await?);
+    if dirty.is_empty() {
+        return Ok(());
+    }
+    tracing::warn!(
+        leaked = %dirty.join(", "),
+        "shared Helm release has non-default config leaked by a global-config \
+         mutator test; restoring defaults (see scripts/check-e2e-mutators-serialized.sh)"
+    );
+
+    // Cross-process lock (nextest runs one process per test).
+    let lock_path = std::env::temp_dir().join("coxswain-e2e-helm-restore.lock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
+    let _lock = loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(_) => break RestoreLock(lock_path.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Stale-lock recovery: a killed test process cannot clean up.
+                if let Ok(meta) = std::fs::metadata(&lock_path)
+                    && let Ok(modified) = meta.modified()
+                    && modified.elapsed().unwrap_or_default() > std::time::Duration::from_secs(300)
+                {
+                    let _ = std::fs::remove_file(&lock_path);
+                    continue;
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for another test's helm restore \
+                     (lock {lock_path:?})"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(e).context("create helm restore lock"),
+        }
+    };
+
+    // Another process may have restored while we waited for the lock.
+    let dirty = dirty_override_paths(&deployed_values().await?);
+    if dirty.is_empty() {
+        return Ok(());
+    }
+    helm_install(root, &HelmOverrides::default())
+        .await
+        .context("helm restore to default values")
+}
+
 /// Poll the `coxswain-leader-lock` Lease until its `holderIdentity` is one of
 /// the currently-running controller pods, the controller Deployment's rollout
 /// has fully settled (no extra terminating pods surviving a rolling update),
