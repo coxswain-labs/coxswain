@@ -2431,3 +2431,41 @@ async fn gateway_listenerset_routes_to_backend_on_new_port() -> anyhow::Result<(
 
     Ok(())
 }
+
+/// Gateway API `HTTPRouteNoBackendRefs` (#517): a rule with omitted or empty
+/// `backendRefs` must route with a distinct **500**, not fall through to a 404.
+///   - happy: the sibling rule WITH real backendRefs routes to the backend (200);
+///   - sad: rules with `backendRefs: []` and with the field omitted both return 500.
+#[tokio::test]
+async fn route_returns_500_when_rule_has_no_backend_refs() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-no-backends").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::HTTPROUTE_NO_BACKEND_REFS, FixtureVars::new(&ns.name)).await?;
+
+    let addr = h.gateway_http_addr(&ns.name).await?;
+    let gw = HttpClient::new(addr)?;
+    let host = format!("no-backends.{}.local", ns.name);
+
+    // Happy: the rule with real backendRefs routes to the backend. This also
+    // confirms the HTTPRoute is fully reconciled before the 500 assertions below.
+    let resp = wait::wait_for_route(&gw, &host, "/forward", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    // Sad: both no-backend rules return a distinct 500 (not a 404). A 404 here
+    // would mean the rule was skipped rather than installed as an error route.
+    assert_eq!(
+        gw.get_status(&host, "/empty").await?,
+        500,
+        "a rule with empty backendRefs must return 500, not 404"
+    );
+    assert_eq!(
+        gw.get_status(&host, "/omitted").await?,
+        500,
+        "a rule with omitted backendRefs must return 500, not 404"
+    );
+
+    Ok(())
+}

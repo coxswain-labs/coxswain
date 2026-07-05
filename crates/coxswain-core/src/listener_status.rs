@@ -116,6 +116,19 @@ pub enum ListenerReadiness {
         /// Human-readable description of what is not supported.
         message: String,
     },
+    /// Listener declares a `protocol` this implementation does not route
+    /// (anything other than `HTTP`, `HTTPS`, or `TLS`).
+    ///
+    /// Surfaces `Accepted=False, reason=UnsupportedProtocol` and an empty
+    /// `supportedKinds` on the Gateway listener; the Gateway itself rolls up to
+    /// `Accepted` reason `ListenersNotValid` (conformance
+    /// `GatewayListenerUnsupportedProtocol`, #517). Distinct from
+    /// [`Self::Unsupported`] (`UnsupportedValue`) so the reason string matches the
+    /// spec exactly.
+    UnsupportedProtocol {
+        /// Human-readable description naming the unsupported protocol.
+        message: String,
+    },
     /// HTTPS listener; at least one `certificateRef` resolved but at least one
     /// failed (e.g. Secret missing, wrong type, or a denied `ReferenceGrant`).
     ///
@@ -191,6 +204,7 @@ impl ListenerReadiness {
             }
             Self::Invalid { .. } => "Invalid",
             Self::Unsupported { .. } => "UnsupportedValue",
+            Self::UnsupportedProtocol { .. } => "UnsupportedProtocol",
             Self::VipPending => "Pending",
             Self::NotApplicable | Self::Resolved | Self::TlsPassthrough | Self::TlsTerminate => {
                 "Resolved"
@@ -207,6 +221,7 @@ impl ListenerReadiness {
             | Self::InvalidCertificateRef { message }
             | Self::Invalid { message }
             | Self::Unsupported { message }
+            | Self::UnsupportedProtocol { message }
             | Self::ResolvedPartial { message } => message.as_str(),
             Self::VipPending => "waiting for VIP port allocation",
             Self::NotApplicable | Self::Resolved | Self::TlsPassthrough | Self::TlsTerminate => "",
@@ -229,6 +244,25 @@ impl ListenerReadiness {
     pub fn is_tls_terminate(&self) -> bool {
         matches!(self, Self::TlsTerminate)
     }
+}
+
+/// The Gateway listener `protocol` values coxswain implements routing for.
+///
+/// `HTTP` (cleartext L7), `HTTPS` (TLS-terminated L7), and `TLS`
+/// (passthrough/terminate L4, GEP-2643). A listener declaring any other protocol
+/// is not Accepted — see [`is_supported_listener_protocol`] and
+/// [`ListenerReadiness::UnsupportedProtocol`].
+pub const SUPPORTED_LISTENER_PROTOCOLS: [&str; 3] = ["HTTP", "HTTPS", "TLS"];
+
+/// Whether `protocol` is one coxswain routes ([`SUPPORTED_LISTENER_PROTOCOLS`]).
+///
+/// Drives the `GatewayListenerUnsupportedProtocol` conformance behaviour (#517):
+/// a listener whose protocol fails this check gets
+/// `Accepted=False, reason=UnsupportedProtocol` with empty `supportedKinds`, and
+/// the owning Gateway rolls up to `Accepted` reason `ListenersNotValid`.
+#[must_use]
+pub fn is_supported_listener_protocol(protocol: &str) -> bool {
+    SUPPORTED_LISTENER_PROTOCOLS.contains(&protocol)
 }
 
 /// Outcome of resolving one HTTPS listener's GEP-91 frontend client-certificate

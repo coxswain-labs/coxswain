@@ -4,14 +4,13 @@ use super::conditions::{has_condition, make_condition};
 use super::config::StatusAddress;
 use crate::status_common::addresses::StaticAddressOutcome;
 use crate::status_common::{
-    OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_route_kind_info,
+    OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_is_accepted,
+    listener_route_kind_info,
 };
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::constants::{GatewayConditionReason, GatewayConditionType};
 use coxswain_reflector::gw_types::v::gateways::{Gateway, GatewayStatusListeners};
-use coxswain_reflector::status::{
-    GatewayListenerStatus, ListenerReadiness, ListenerSource, ListenerStatusKey,
-};
+use coxswain_reflector::status::{GatewayListenerStatus, ListenerSource, ListenerStatusKey};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// The shared-pool address inputs for one Gateway reconcile: the legacy
@@ -26,19 +25,19 @@ pub(super) struct SharedAddressDecision {
     pub(super) legacy_addr: Option<StatusAddress>,
     /// Result of validating `Gateway.spec.addresses` against the resolved VIP.
     pub(super) static_outcome: StaticAddressOutcome,
+    /// `true` when the Gateway carries a `spec.infrastructure.parametersRef` that
+    /// this implementation does not support (conformance
+    /// `GatewayInvalidParametersRef`). The shared-pool writer only ever sees
+    /// non-dedicated Gateways — the reconcile dispatch skips any Gateway whose
+    /// `parametersRef` targets coxswain's own `CoxswainGatewayParameters`
+    /// (`is_dedicated_mode`, `controller/mod.rs`), routing it to the operator's
+    /// `InvalidParameters` handling instead. So a `parametersRef` present *here*
+    /// is by construction an unsupported kind → `Accepted=False`. Existence of
+    /// the ref is the whole signal; no target resolution is needed.
+    pub(super) params_ref_unsupported: bool,
 }
 
 impl SharedAddressDecision {
-    /// Desired `(status, reason)` for the top-level `Accepted` condition:
-    /// `(False, UnsupportedAddress)` when a requested address type is
-    /// unsupported, else the canonical `(True, Accepted)`.
-    fn desired_accepted(&self) -> (&'static str, GatewayConditionReason) {
-        match self.static_outcome.accepted_override {
-            Some(reason) => ("False", reason),
-            None => ("True", GatewayConditionReason::Accepted),
-        }
-    }
-
     /// Desired `(status, reason)` for the top-level `Programmed` condition:
     /// `(False, AddressNotUsable | Invalid)` when a requested address could not
     /// be honored, else the canonical `(True, Programmed)`.
@@ -48,6 +47,49 @@ impl SharedAddressDecision {
             None => ("True", GatewayConditionReason::Programmed),
         }
     }
+}
+
+/// Desired `(status, reason)` for the top-level Gateway `Accepted` condition,
+/// folding three sources in precedence order:
+///
+/// 1. An unsupported `spec.infrastructure.parametersRef` — `InvalidParameters`,
+///    a spec-level rejection that outranks everything (#517).
+/// 2. A requested `spec.addresses` type this implementation cannot honor —
+///    `UnsupportedAddress` (#260).
+/// 3. The per-listener rollup — `ListenersNotValid` whenever **any** listener is
+///    unaccepted, with `status=False` only when **every** listener is unaccepted
+///    (`GatewayListenerUnsupportedProtocol`, #517). A Gateway with no listeners,
+///    or with all listeners accepted, stays `(True, Accepted)`.
+///
+/// Shared by [`gateway_needs_status_patch`] and [`build_gateway_status_patch`]
+/// so the staleness check and the emitted patch can never disagree on the
+/// Accepted condition.
+fn desired_gateway_accepted(
+    gw: &Gateway,
+    health: &GatewayListenerStatus,
+    decision: &SharedAddressDecision,
+) -> (&'static str, GatewayConditionReason) {
+    if decision.params_ref_unsupported {
+        return ("False", GatewayConditionReason::InvalidParameters);
+    }
+    if let Some(reason) = decision.static_outcome.accepted_override {
+        return ("False", reason);
+    }
+    let mut any_accepted = false;
+    let mut any_unaccepted = false;
+    for l in &gw.spec.listeners {
+        let info = health.listeners.get(&ListenerStatusKey::gateway(&l.name));
+        if listener_is_accepted(info) {
+            any_accepted = true;
+        } else {
+            any_unaccepted = true;
+        }
+    }
+    if any_unaccepted {
+        let status = if any_accepted { "True" } else { "False" };
+        return (status, GatewayConditionReason::ListenersNotValid);
+    }
+    ("True", GatewayConditionReason::Accepted)
 }
 
 /// Returns true when the Gateway's current status does not yet reflect the
@@ -62,7 +104,7 @@ pub(super) fn gateway_needs_status_patch(
     // True — a requested `spec.addresses` can drive them to False. Compare the
     // current condition's `(status, reason)` against the desired pair so a
     // True→False flip (or a reason change) forces a patch.
-    let (want_acc_status, want_acc_reason) = decision.desired_accepted();
+    let (want_acc_status, want_acc_reason) = desired_gateway_accepted(gw, health, decision);
     if !condition_matches(gw, "Accepted", want_acc_status, want_acc_reason) {
         return true;
     }
@@ -173,13 +215,14 @@ pub(super) fn gateway_needs_status_patch(
         if desired_healthy != current_resolved {
             return true;
         }
-        // GEP-2643: a TLS/Terminate listener is computed Unsupported only after the
-        // reflector processes the Gateway, *after* the controller's first reconcile
-        // wrote Accepted=True from an empty health. Mirror build_listener_status'
-        // Accepted logic (frontend CA failure or an Unsupported outcome → False) so
-        // the transition True→False is detected and patched, not left stuck.
-        let desired_accepted_false = frontend_impacts
-            || info.is_some_and(|i| matches!(i.readiness, ListenerReadiness::Unsupported { .. }));
+        // GEP-2643 / #517: a listener's Accepted flips to False for a TLS/Terminate
+        // Unsupported outcome, a frontend CA failure, or an UnsupportedProtocol —
+        // all computed only after the reflector processes the Gateway, *after* the
+        // controller's first reconcile wrote Accepted=True from empty health. Reuse
+        // `listener_is_accepted` (the single source of truth shared with
+        // `build_listener_status`) so this staleness check can never drift from the
+        // written condition — a mismatch would repatch on every reconcile forever.
+        let desired_accepted_false = !listener_is_accepted(info);
         let current_accepted_false = current_listener
             .and_then(|sl| sl.conditions.iter().find(|c| c.type_ == "Accepted"))
             .is_some_and(|c| c.status != "True");
@@ -297,10 +340,13 @@ pub(super) fn build_gateway_status_patch(
     // them. The operator side mirrors the convention by preserving everything
     // NOT prefixed with that domain. See `crate::operator::status` for the
     // counterparty.
-    // GatewayStaticAddresses (#260): a requested `spec.addresses` can drive
-    // Accepted/Programmed to False. `desired_*` returns the canonical True pair
-    // when the feature is not engaged, so the legacy happy path is unchanged.
-    let (acc_status, acc_reason) = decision.desired_accepted();
+    // GatewayStaticAddresses (#260) + GatewayInvalidParametersRef /
+    // GatewayListenerUnsupportedProtocol (#517): a requested `spec.addresses`, an
+    // unsupported `parametersRef`, or an unaccepted listener can drive Accepted
+    // to False / a non-`Accepted` reason. `desired_gateway_accepted` folds all
+    // three; `desired_programmed` returns the canonical True pair when no address
+    // override applies, so the legacy happy path is unchanged.
+    let (acc_status, acc_reason) = desired_gateway_accepted(gw, health, decision);
     let (prog_status, prog_reason) = decision.desired_programmed();
     let mut conditions = vec![
         make_condition(
@@ -428,6 +474,12 @@ pub(super) fn build_gateway_status_patch(
 /// the legacy behaviour.
 fn static_address_message(reason: GatewayConditionReason) -> &'static str {
     match reason {
+        GatewayConditionReason::InvalidParameters => {
+            "spec.infrastructure.parametersRef targets a kind this implementation does not support"
+        }
+        GatewayConditionReason::ListenersNotValid => {
+            "one or more listeners are not accepted; see the per-listener conditions"
+        }
         GatewayConditionReason::UnsupportedAddress => {
             "spec.addresses contains an address type this implementation does not support"
         }
@@ -445,10 +497,12 @@ fn static_address_message(reason: GatewayConditionReason) -> &'static str {
 mod tests {
     use super::super::config::StatusAddress;
     use super::super::gateway_status::{
-        SharedAddressDecision, build_gateway_status_patch, gateway_needs_status_patch,
+        SharedAddressDecision, build_gateway_status_patch, desired_gateway_accepted,
+        gateway_needs_status_patch,
     };
     use crate::status_common::addresses::StaticAddressOutcome;
     use coxswain_reflector::gw_types::constants::GatewayConditionReason;
+    use coxswain_reflector::status::{ListenerInfo, ListenerReadiness, ListenerStatusKey};
 
     /// A not-engaged decision with no legacy address — the common case for tests
     /// that pre-date GatewayStaticAddresses (#260).
@@ -456,6 +510,7 @@ mod tests {
         SharedAddressDecision {
             legacy_addr: None,
             static_outcome: StaticAddressOutcome::not_engaged(),
+            params_ref_unsupported: false,
         }
     }
 
@@ -464,6 +519,7 @@ mod tests {
         SharedAddressDecision {
             legacy_addr: Some(addr),
             static_outcome: StaticAddressOutcome::not_engaged(),
+            params_ref_unsupported: false,
         }
     }
     use coxswain_reflector::gw_types::v::gateways::{
@@ -826,6 +882,7 @@ mod tests {
                 status_addresses,
                 feature_engaged: true,
             },
+            params_ref_unsupported: false,
         }
     }
 
@@ -862,6 +919,217 @@ mod tests {
         assert_eq!(prog["reason"], "Invalid");
         // No usable address → empty array clears any stale address.
         assert_eq!(patch["status"]["addresses"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn patch_sets_accepted_false_on_invalid_parameters_ref() {
+        // GatewayInvalidParametersRef (#517): a Gateway that reaches the
+        // shared-pool writer carrying a `spec.infrastructure.parametersRef`
+        // (necessarily an unsupported kind — dedicated Gateways are dispatched
+        // elsewhere) must report `Accepted=False, reason=InvalidParameters`. The
+        // reason outranks the address override, so pair it with an unsupported
+        // address to prove precedence.
+        let gw = gateway(1, None, None);
+        let decision = SharedAddressDecision {
+            legacy_addr: None,
+            static_outcome: StaticAddressOutcome {
+                accepted_override: Some(GatewayConditionReason::UnsupportedAddress),
+                programmed_override: None,
+                status_addresses: vec![],
+                feature_engaged: true,
+            },
+            params_ref_unsupported: true,
+        };
+        let patch = build_gateway_status_patch(
+            &gw,
+            &default_status(),
+            1,
+            &epoch(),
+            &decision,
+            IngressPorts::default(),
+        );
+        let conds = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        let acc = conds
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("Accepted");
+        assert_eq!(acc["status"], "False");
+        assert_eq!(
+            acc["reason"], "InvalidParameters",
+            "unsupported parametersRef must outrank the address override"
+        );
+    }
+
+    // ── GatewayListenerUnsupportedProtocol (#517) ────────────────────────────
+
+    /// A Gateway whose spec carries the given `(listener_name, protocol)` pairs.
+    fn gateway_with_listeners(pairs: &[(&str, &str)]) -> Gateway {
+        Gateway {
+            metadata: kube::api::ObjectMeta {
+                generation: Some(1),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                listeners: pairs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, protocol))| {
+                        coxswain_reflector::gw_types::v::gateways::GatewayListeners {
+                            name: (*name).to_string(),
+                            // Distinct ports so listeners don't port-conflict.
+                            port: 80 + i as i32,
+                            protocol: (*protocol).to_string(),
+                            ..Default::default()
+                        }
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    /// Health map assigning each named listener the given readiness.
+    fn health_with_readiness(pairs: &[(&str, ListenerReadiness)]) -> GatewayListenerStatus {
+        let mut h = GatewayListenerStatus::default();
+        for (name, readiness) in pairs {
+            let mut info = ListenerInfo::default();
+            info.readiness = readiness.clone();
+            h.listeners.insert(ListenerStatusKey::gateway(*name), info);
+        }
+        h
+    }
+
+    fn unsupported() -> ListenerReadiness {
+        ListenerReadiness::UnsupportedProtocol {
+            message: "protocol \"INVALID\" is not supported".to_string(),
+        }
+    }
+
+    #[test]
+    fn gateway_accepted_false_when_all_listeners_unsupported_protocol() {
+        // Single listener with an unsupported protocol → the Gateway has no
+        // accepted listener, so Accepted=False/ListenersNotValid, and the
+        // listener reports Accepted=False/UnsupportedProtocol with empty
+        // supportedKinds.
+        let gw = gateway_with_listeners(&[("invalid", "INVALID")]);
+        let health = health_with_readiness(&[("invalid", unsupported())]);
+
+        assert_eq!(
+            desired_gateway_accepted(&gw, &health, &no_addr()),
+            ("False", GatewayConditionReason::ListenersNotValid)
+        );
+
+        let patch = build_gateway_status_patch(
+            &gw,
+            &health,
+            1,
+            &epoch(),
+            &no_addr(),
+            IngressPorts::default(),
+        );
+        let acc = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("Accepted");
+        assert_eq!(acc["status"], "False");
+        assert_eq!(acc["reason"], "ListenersNotValid");
+
+        let listener = patch["status"]["listeners"]
+            .as_array()
+            .expect("listeners")
+            .iter()
+            .find(|l| l["name"] == "invalid")
+            .expect("invalid listener");
+        assert_eq!(
+            listener["supportedKinds"],
+            serde_json::json!([]),
+            "unsupported-protocol listener must advertise no supported kinds"
+        );
+        let l_acc = listener["conditions"]
+            .as_array()
+            .expect("listener conditions")
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("listener Accepted");
+        assert_eq!(l_acc["status"], "False");
+        assert_eq!(l_acc["reason"], "UnsupportedProtocol");
+    }
+
+    #[test]
+    fn gateway_accepted_true_listenersnotvalid_when_mixed() {
+        // One valid HTTP listener + one unsupported-protocol listener → the
+        // Gateway is still Accepted (status True) because at least one listener
+        // is accepted, but the reason is ListenersNotValid.
+        let gw = gateway_with_listeners(&[("http", "HTTP"), ("invalid", "INVALID")]);
+        // The HTTP listener has no health entry (defaults to accepted); the
+        // invalid one is unaccepted.
+        let health = health_with_readiness(&[("invalid", unsupported())]);
+
+        assert_eq!(
+            desired_gateway_accepted(&gw, &health, &no_addr()),
+            ("True", GatewayConditionReason::ListenersNotValid)
+        );
+
+        let patch = build_gateway_status_patch(
+            &gw,
+            &health,
+            1,
+            &epoch(),
+            &no_addr(),
+            IngressPorts::default(),
+        );
+        let acc = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("Accepted");
+        assert_eq!(acc["status"], "True");
+        assert_eq!(acc["reason"], "ListenersNotValid");
+    }
+
+    #[test]
+    fn gateway_accepted_when_all_listeners_supported() {
+        // Sanity: an all-HTTP/HTTPS Gateway with healthy listeners stays
+        // (True, Accepted) — the rollup does not regress the happy path.
+        let gw = gateway_with_listeners(&[("http", "HTTP"), ("https", "HTTPS")]);
+        let health = health_with_readiness(&[("https", ListenerReadiness::Resolved)]);
+        assert_eq!(
+            desired_gateway_accepted(&gw, &health, &no_addr()),
+            ("True", GatewayConditionReason::Accepted)
+        );
+    }
+
+    #[test]
+    fn needs_patch_is_idempotent_for_unsupported_protocol_listener() {
+        // Regression (#517): build the status patch for a Gateway with an
+        // unsupported-protocol listener, apply it back, and confirm
+        // gateway_needs_status_patch is then False. A mirror-drift between the
+        // written per-listener Accepted condition and the staleness check would
+        // otherwise repatch on every reconcile forever.
+        let gw = gateway_with_listeners(&[("http", "HTTP"), ("invalid", "INVALID")]);
+        let health = health_with_readiness(&[("invalid", unsupported())]);
+        let patch = build_gateway_status_patch(
+            &gw,
+            &health,
+            1,
+            &epoch(),
+            &no_addr(),
+            IngressPorts::default(),
+        );
+        let status: GatewayStatus =
+            serde_json::from_value(patch["status"].clone()).expect("status deserializes");
+        let mut patched = gw.clone();
+        patched.status = Some(status);
+        assert!(
+            !gateway_needs_status_patch(&patched, &health, &no_addr()),
+            "status must converge: needs_patch should be False after applying its own patch"
+        );
     }
 
     #[test]

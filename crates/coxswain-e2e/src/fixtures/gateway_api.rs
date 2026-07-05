@@ -8,6 +8,22 @@ macro_rules! fixture {
 
 /// HTTPRoute path-based routing rules.
 pub const PATH_MATCHING: &str = fixture!("path_matching.yaml");
+/// HTTPRoute whose rules omit / empty their `backendRefs` (#517). One rule has
+/// real backends (routes 200); one omits `backendRefs`; one sets it to `[]`.
+/// Both no-backend rules must return a distinct 500, not a 404.
+/// Placeholders: `TESTNS`.
+pub const HTTPROUTE_NO_BACKEND_REFS: &str = fixture!("httproute_no_backend_refs.yaml");
+
+/// Two shared-pool Gateways for `parametersRef` validation (#517): `coxswain-clean`
+/// (no `parametersRef` → Accepted=True) and `coxswain-bad-params` (a foreign
+/// `parametersRef` kind → Accepted=False/InvalidParameters). Status-only.
+pub const GATEWAY_INVALID_PARAMS_REF: &str = fixture!("gateway_invalid_params_ref.yaml");
+
+/// Two Gateways for listener-protocol validation (#517): `coxswain-all-bad`
+/// (one unsupported-protocol listener → Gateway Accepted=False/ListenersNotValid)
+/// and `coxswain-mixed` (one HTTP + one unsupported → Gateway
+/// Accepted=True/ListenersNotValid). Status-only.
+pub const GATEWAY_UNSUPPORTED_PROTOCOL: &str = fixture!("gateway_unsupported_protocol.yaml");
 /// One Gateway with two HTTPRoutes — a resolvable backend and a missing one —
 /// for asserting per-parent `ResolvedRefs` (`True` vs `False/BackendNotFound`)
 /// while both stay `Accepted=True`.
@@ -317,6 +333,16 @@ pub const FRONTEND_MTLS_INSECURE_FALLBACK: &str = fixture!("frontend_mtls_insecu
 /// Hostnamed `${HOSTNAME}`.
 /// Placeholders: `HOSTNAME`, `SECRET_NAME`, `TLS_CRT_B64`, `TLS_KEY_B64`.
 pub const FRONTEND_MTLS_MISSING_CA: &str = fixture!("frontend_mtls_missing_ca.yaml");
+
+/// Gateway with TWO HTTPS listeners on different ports, each validating client
+/// certs against a different CA: listener A via `spec.tls.frontend.default`, and
+/// listener B (on `${PORT_B}`) via `spec.tls.frontend.perPort`. Guards the
+/// per-port enforcement regression from #517 — a cert signed by the default CA
+/// must be rejected on listener B.
+/// Placeholders: `HOSTNAME_A`, `HOSTNAME_B`, `PORT_B`, `SECRET_A`, `SECRET_B`,
+/// `TLS_CRT_A_B64`, `TLS_KEY_A_B64`, `TLS_CRT_B_B64`, `TLS_KEY_B_B64`,
+/// `CA_A_PEM`, `CA_B_PEM`.
+pub const FRONTEND_MTLS_PER_PORT: &str = fixture!("frontend_mtls_per_port.yaml");
 
 /// Gateway HTTP listener + HTTPRoute → echo-tls backend + BackendTLSPolicy +
 /// `spec.tls.backend.clientCertificateRef` pointing to a `kubernetes.io/tls` Secret.

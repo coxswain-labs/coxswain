@@ -55,10 +55,10 @@ Implementation-specific capabilities — such as `RegularExpression` path, heade
 
 ## Gateway
 
-A `Gateway` object defines one or more listeners, each binding a port and protocol to a set of allowed routes. `HTTP`, `HTTPS`, and `TLS` listeners are processed; other protocol values are ignored.
+A `Gateway` object defines one or more listeners, each binding a port and protocol to a set of allowed routes. Coxswain routes the `HTTP`, `HTTPS`, and `TLS` protocols. A listener declaring any other protocol is rejected: it gets `Accepted=False, reason=UnsupportedProtocol` with an empty `supportedKinds`, and the Gateway's own `Accepted` condition rolls up to `reason=ListenersNotValid` (status `False` when *every* listener is unsupported, `True` when at least one listener is still valid).
 
 !!! tip "Dedicated proxy per Gateway"
-    A `Gateway` can be opted into its own isolated proxy pool via `spec.infrastructure.parametersRef`. See [Dedicated proxy pools](dedicated-mode.md) for the full walkthrough.
+    A `Gateway` can be opted into its own isolated proxy pool via `spec.infrastructure.parametersRef` pointing at a `CoxswainGatewayParameters`. See [Dedicated proxy pools](dedicated-mode.md) for the full walkthrough. A `parametersRef` targeting any other (unrecognized) kind is rejected with `Accepted=False, reason=InvalidParameters`.
 
 !!! info "Infrastructure metadata propagation (GEP-1867)"
     `spec.infrastructure.labels` and `spec.infrastructure.annotations` propagate onto the resources Coxswain provisions for the Gateway, in **both** deployment models. In dedicated mode they land on the per-Gateway `Deployment`, `Service`, and `ServiceAccount`; in shared mode they land on the per-Gateway VIP `Service` (e.g. cloud load-balancer annotations) and on a per-Gateway identity `ServiceAccount` provisioned in the Gateway's namespace. The four reserved GEP-1762 label keys (`app.kubernetes.io/{name,instance,managed-by,component}` and `gateway.networking.k8s.io/gateway-name`) cannot be overridden — a collision is dropped with a warning, since the Service/Deployment selectors depend on them.

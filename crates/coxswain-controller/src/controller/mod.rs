@@ -650,9 +650,21 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         gw.spec.addresses.as_deref().unwrap_or_default(),
         &resolved,
     );
+    // GatewayInvalidParametersRef (#517): dedicated Gateways already returned
+    // above via `is_dedicated_mode`, so any `spec.infrastructure.parametersRef`
+    // still present here targets a kind this shared-pool writer does not
+    // support → `Accepted=False, reason=InvalidParameters`. Existence of the ref
+    // is the whole signal; the target is never resolved.
+    let params_ref_unsupported = gw
+        .spec
+        .infrastructure
+        .as_ref()
+        .and_then(|i| i.parameters_ref.as_ref())
+        .is_some();
     let decision = gateway_status::SharedAddressDecision {
         legacy_addr: owned_status_addr,
         static_outcome,
+        params_ref_unsupported,
     };
 
     // The per-Gateway VIP Service and its LoadBalancer IP are provisioned

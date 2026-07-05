@@ -50,8 +50,8 @@ use crate::status_common::addresses::{
     StaticAddressOutcome, SupportedAddressType, TypedAddress, evaluate_static_addresses,
 };
 use crate::status_common::{
-    OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_route_kind_info,
-    make_condition,
+    OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_is_accepted,
+    listener_route_kind_info, make_condition,
 };
 use coxswain_reflector::gw_types::constants::{GatewayConditionReason, GatewayConditionType};
 use coxswain_reflector::gw_types::v::gateways::{
@@ -169,7 +169,11 @@ pub(crate) fn build_dedicated_gateway_status_patch(
     let addresses = compute_addresses(inputs.service, inputs.nodes);
     let static_outcome = evaluate_dedicated_static(inputs.gw, &addresses);
 
-    let accepted = accepted_outcome(inputs.accepted, &static_outcome);
+    let accepted = accepted_outcome(
+        inputs.accepted,
+        &static_outcome,
+        listener_acceptance_rollup(inputs),
+    );
     let programmed = programmed_outcome(
         inputs.accepted,
         inputs.ready_pod_count,
@@ -277,7 +281,11 @@ pub(crate) fn dedicated_gateway_needs_status_patch(
     let desired_addresses = compute_addresses(inputs.service, inputs.nodes);
     let static_outcome = evaluate_dedicated_static(inputs.gw, &desired_addresses);
 
-    let accepted = accepted_outcome(inputs.accepted, &static_outcome);
+    let accepted = accepted_outcome(
+        inputs.accepted,
+        &static_outcome,
+        listener_acceptance_rollup(inputs),
+    );
     let programmed = programmed_outcome(
         inputs.accepted,
         inputs.ready_pod_count,
@@ -526,21 +534,54 @@ struct CutOverOutcome {
     message: &'static str,
 }
 
+/// Per-listener acceptance rollup for one dedicated Gateway: `(any_accepted,
+/// any_unaccepted)` over its listeners, using the same
+/// [`listener_is_accepted`] predicate as the shared-pool writer so the two paths
+/// agree (`GatewayListenerUnsupportedProtocol`, #517).
+fn listener_acceptance_rollup(inputs: &DedicatedGatewayStatusInputs<'_>) -> (bool, bool) {
+    let mut any_accepted = false;
+    let mut any_unaccepted = false;
+    for l in &inputs.gw.spec.listeners {
+        let info = inputs
+            .listener_status
+            .listeners
+            .get(&ListenerStatusKey::gateway(&l.name));
+        if listener_is_accepted(info) {
+            any_accepted = true;
+        } else {
+            any_unaccepted = true;
+        }
+    }
+    (any_accepted, any_unaccepted)
+}
+
 fn accepted_outcome(
     accepted: AcceptedOutcome,
     static_outcome: &StaticAddressOutcome,
+    listener_rollup: (bool, bool),
 ) -> ConditionOutcome {
     match accepted {
         AcceptedOutcome::Accepted => {
             // GatewayStaticAddresses (#260): a missing parametersRef target is
             // more fundamental than an address-type problem, so InvalidParameters
             // already short-circuited above. Here the params resolved, so an
-            // unsupported requested address type is the only Accepted=False cause.
+            // unsupported requested address type is the next Accepted=False cause.
             if static_outcome.accepted_override.is_some() {
                 return ConditionOutcome {
                     status: "False",
                     reason: GatewayConditionReason::UnsupportedAddress,
                     message: "spec.addresses contains an address type this implementation does not support",
+                };
+            }
+            // GatewayListenerUnsupportedProtocol (#517): roll the per-listener
+            // acceptance up to the Gateway. `ListenersNotValid` whenever any
+            // listener is unaccepted; `status=False` only when every listener is.
+            let (any_accepted, any_unaccepted) = listener_rollup;
+            if any_unaccepted {
+                return ConditionOutcome {
+                    status: if any_accepted { "True" } else { "False" },
+                    reason: GatewayConditionReason::ListenersNotValid,
+                    message: "one or more listeners are not accepted; see the per-listener conditions",
                 };
             }
             ConditionOutcome {

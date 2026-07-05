@@ -2729,6 +2729,133 @@ async fn gateway_frontend_mtls_insecure_fallback_admits_missing_cert() -> anyhow
     Ok(())
 }
 
+/// Per-port frontend client-cert validation (#517 regression). A Gateway with two
+/// HTTPS listeners on different ports, each validating client certs against its
+/// OWN CA: listener A via `spec.tls.frontend.default`, listener B (on `PORT_B`)
+/// via `spec.tls.frontend.perPort`. Proves per-port enforcement is real, not the
+/// gateway-wide default leaking onto every listener:
+///   - CA A is accepted on listener A (the default CA is genuinely valid);
+///   - CA B is accepted on listener B (its per-port CA works);
+///   - **CA A is REJECTED on listener B** — the regression guard. Before this was
+///     enforced, a request with the default CA's cert succeeded on the per-port
+///     listener; it must now fail the TLS handshake.
+#[tokio::test]
+async fn per_port_frontend_client_cert_enforced_on_second_listener() -> anyhow::Result<()> {
+    // Second HTTPS listener port; the per-Gateway VIP (#472) exposes it alongside
+    // the default HTTPS port, each mapped to its own internal bind port.
+    const PORT_B: u16 = 8543;
+
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-mtls-perport").await?;
+
+    // Two independent CAs, each with a client cert signed by it.
+    let ca_a = MtlsCerts::generate();
+    let ca_b = MtlsCerts::generate();
+    let host_a = format!("mtls-a.{}.local", ns.name);
+    let host_b = format!("mtls-b.{}.local", ns.name);
+    let server_a = GeneratedCert::for_host(&host_a);
+    let server_b = GeneratedCert::for_host(&host_b);
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        gwa::FRONTEND_MTLS_PER_PORT,
+        FixtureVars::new(&ns.name)
+            .with("HOSTNAME_A", &host_a)
+            .with("HOSTNAME_B", &host_b)
+            .with("PORT_B", &PORT_B.to_string())
+            .with("SECRET_A", "mtls-server-a")
+            .with("SECRET_B", "mtls-server-b")
+            .with("TLS_CRT_A_B64", server_a.cert_b64())
+            .with("TLS_KEY_A_B64", server_a.key_b64())
+            .with("TLS_CRT_B_B64", server_b.cert_b64())
+            .with("TLS_KEY_B_B64", server_b.key_b64())
+            .with("CA_A_PEM", &ca_a.ca_cert_pem)
+            .with("CA_B_PEM", &ca_b.ca_cert_pem),
+    )
+    .await?;
+
+    // Resolve the Gateway VIP on the per-port listener B; listener A shares the VIP
+    // IP on the default HTTPS port.
+    let gw_b = wait::wait_for_single_gateway_address(
+        &h.client,
+        &ns.name,
+        PORT_B,
+        Duration::from_secs(120),
+    )
+    .await?;
+    let gw_a = std::net::SocketAddr::new(gw_b.ip(), GATEWAY_HTTPS_PORT);
+
+    // Listener A admits the DEFAULT CA's client cert (also proves mTLS is live).
+    let resp_a = wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            format!("default listener {host_a} to admit a cert signed by the default CA (200)")
+        },
+        || async {
+            match http::https_get_with_client_cert(
+                &host_a,
+                "/",
+                gw_a,
+                &ca_a.client_cert_pem,
+                &ca_a.client_key_pem,
+            )
+            .await
+            {
+                Ok((_, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+    resp_a.assert_backend("echo-a");
+
+    // Listener B admits its OWN per-port CA's client cert.
+    let resp_b = wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            format!("per-port listener {host_b}:{PORT_B} to admit a cert signed by its per-port CA (200)")
+        },
+        || async {
+            match http::https_get_with_client_cert(
+                &host_b,
+                "/",
+                gw_b,
+                &ca_b.client_cert_pem,
+                &ca_b.client_key_pem,
+            )
+            .await
+            {
+                Ok((_, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+    resp_b.assert_backend("echo-a");
+
+    // Regression guard: a client cert signed by the DEFAULT CA (valid on listener
+    // A) is the WRONG identity for listener B and MUST be rejected at the TLS
+    // handshake — the per-port CA override is enforced, not the gateway default.
+    let wrong = http::https_get_with_client_cert(
+        &host_b,
+        "/",
+        gw_b,
+        &ca_a.client_cert_pem,
+        &ca_a.client_key_pem,
+    )
+    .await;
+    assert!(
+        wrong.is_err(),
+        "per-port listener B must REJECT a client cert signed by the default CA \
+         (it enforces its own per-port CA), but the request succeeded: {wrong:?}"
+    );
+
+    Ok(())
+}
+
 // ── GEP-3155: Gateway backend client certificate ──────────────────────────────
 
 /// GEP-3155 happy path: proxy presents client cert to mTLS upstream.

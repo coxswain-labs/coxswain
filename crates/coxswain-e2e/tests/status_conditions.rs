@@ -522,6 +522,170 @@ async fn invalid_parameters_yields_accepted_false_invalid_parameters() -> anyhow
     Ok(())
 }
 
+/// Gateway API `GatewayInvalidParametersRef` (#517), shared-pool path: a Gateway
+/// whose `spec.infrastructure.parametersRef` targets a kind coxswain does not
+/// recognize gets `Accepted=False, reason=InvalidParameters`. (The dedicated-mode
+/// counterpart — a missing `CoxswainGatewayParameters` — is covered above.)
+///   - happy: a Gateway with no `parametersRef` is `Accepted=True/Accepted`;
+///   - sad: a Gateway with a foreign `parametersRef` kind is
+///     `Accepted=False/InvalidParameters`.
+#[tokio::test]
+async fn gateway_rejected_when_parameters_ref_unsupported() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-bad-params").await?;
+
+    fixtures::apply_fixture(gwa::GATEWAY_INVALID_PARAMS_REF, FixtureVars::new(&ns.name)).await?;
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // Sad: the foreign-parametersRef Gateway is rejected.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let observed = gateways.get("coxswain-bad-params").await.ok().map_or_else(
+                || "<none>".to_string(),
+                |gw| format!("{:?}", gateway_condition(&gw, "Accepted")),
+            );
+            format!(
+                "coxswain-bad-params to be Accepted=False(InvalidParameters); observed {observed}"
+            )
+        },
+        || async {
+            let gw = gateways.get("coxswain-bad-params").await.ok()?;
+            (gateway_condition(&gw, "Accepted")?
+                == ("False".to_string(), "InvalidParameters".to_string()))
+                .then_some(())
+        },
+    )
+    .await?;
+
+    // Happy: the clean Gateway (no parametersRef) is accepted.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { "coxswain-clean to be Accepted=True(Accepted)".to_string() },
+        || async {
+            let gw = gateways.get("coxswain-clean").await.ok()?;
+            (gateway_condition(&gw, "Accepted")? == ("True".to_string(), "Accepted".to_string()))
+                .then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Gateway API `GatewayListenerUnsupportedProtocol` (#517): a listener whose
+/// protocol coxswain does not route gets `Accepted=False, reason=UnsupportedProtocol`
+/// with empty `supportedKinds`, and the Gateway rolls up to `ListenersNotValid`.
+///   - all-unsupported: Gateway `Accepted=False/ListenersNotValid`, the listener
+///     `Accepted=False/UnsupportedProtocol` with `supportedKinds: []`;
+///   - mixed: Gateway `Accepted=True/ListenersNotValid` (one listener still valid),
+///     the HTTP listener `Accepted=True`, the bad listener `Accepted=False/UnsupportedProtocol`.
+#[tokio::test]
+async fn gateway_listener_protocol_validation() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-bad-proto").await?;
+
+    fixtures::apply_fixture(
+        gwa::GATEWAY_UNSUPPORTED_PROTOCOL,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // ── all-unsupported: Gateway not accepted, listener UnsupportedProtocol ──
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-all-bad",
+        &ns.name,
+        "Accepted",
+        "False",
+        Duration::from_secs(60),
+    )
+    .await?;
+    wait::wait_for_gateway_listener_condition(
+        &h.client,
+        "coxswain-all-bad",
+        &ns.name,
+        "invalid",
+        "Accepted",
+        "False",
+        Duration::from_secs(30),
+    )
+    .await?;
+    let gw = gateways.get("coxswain-all-bad").await?;
+    assert_eq!(
+        gateway_condition(&gw, "Accepted"),
+        Some(("False".to_string(), "ListenersNotValid".to_string())),
+        "all-unsupported Gateway must be Accepted=False/ListenersNotValid"
+    );
+    let inv = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.listeners.as_ref())
+        .and_then(|ls| ls.iter().find(|l| l.name == "invalid"))
+        .expect("invalid listener status");
+    let inv_acc = inv
+        .conditions
+        .iter()
+        .find(|c| c.type_ == "Accepted")
+        .expect("invalid listener Accepted condition");
+    assert_eq!(
+        (inv_acc.status.as_str(), inv_acc.reason.as_str()),
+        ("False", "UnsupportedProtocol"),
+        "unsupported-protocol listener must be Accepted=False/UnsupportedProtocol"
+    );
+    assert!(
+        inv.supported_kinds.as_ref().is_none_or(|k| k.is_empty()),
+        "unsupported-protocol listener must advertise empty supportedKinds, got {:?}",
+        inv.supported_kinds
+    );
+
+    // ── mixed: Gateway accepted (True) but reason ListenersNotValid ──
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-mixed",
+        &ns.name,
+        "Accepted",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let gw = gateways.get("coxswain-mixed").await?;
+    assert_eq!(
+        gateway_condition(&gw, "Accepted"),
+        Some(("True".to_string(), "ListenersNotValid".to_string())),
+        "mixed Gateway must be Accepted=True/ListenersNotValid (one listener still valid)"
+    );
+    let listeners = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.listeners.as_ref())
+        .expect("mixed listener statuses");
+    let http_acc = listeners
+        .iter()
+        .find(|l| l.name == "http")
+        .and_then(|l| l.conditions.iter().find(|c| c.type_ == "Accepted"))
+        .expect("http listener Accepted condition");
+    assert_eq!(
+        http_acc.status, "True",
+        "valid HTTP listener must be Accepted=True"
+    );
+    let bad_acc = listeners
+        .iter()
+        .find(|l| l.name == "invalid")
+        .and_then(|l| l.conditions.iter().find(|c| c.type_ == "Accepted"))
+        .expect("invalid listener Accepted condition");
+    assert_eq!(
+        (bad_acc.status.as_str(), bad_acc.reason.as_str()),
+        ("False", "UnsupportedProtocol"),
+        "unsupported listener on the mixed Gateway must be Accepted=False/UnsupportedProtocol"
+    );
+
+    Ok(())
+}
+
 /// 15 — `Programmed=True` plus `status.addresses` populated for a ClusterIP
 /// dedicated-mode Gateway. (Sibling of test 8 which also pins ClusterIP, but
 /// gates only on conditions/addresses without the cutover-and-traffic plumbing.)
