@@ -1,0 +1,91 @@
+# GEP-1713 `ListenerSetAllowedRoutesCrossNamespace` (#515), tenant namespace side.
+# TESTNS = primary namespace (where the Gateway + ListenerSet from
+# listenerset_xns_route.yaml live). This file is applied to a SEPARATE tenant
+# namespace.
+#
+# Two HTTPRoutes, each targeting one `team-ls` listener via `sectionName` and
+# backed by a same-namespace echo (no ReferenceGrant needed: cross-namespace
+# route ATTACHMENT is governed by allowedRoutes, unlike a cross-namespace
+# backendRef):
+#   - xns-route-same targets `ls-same` (allowedRoutes.namespaces: Same) — must be
+#     rejected (Accepted=False/NotAllowedByListeners), since this namespace is
+#     not the ListenerSet's own namespace.
+#   - xns-route-all targets `ls-all` (allowedRoutes.namespaces: All) — must be
+#     accepted (Accepted=True).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: echo-xns
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: echo-xns
+  template:
+    metadata:
+      labels:
+        app: echo-xns
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: echo
+          image: ${ECHO_IMAGE}
+          ports:
+            - containerPort: 3000
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: echo-xns
+spec:
+  selector:
+    app: echo-xns
+  ports:
+    - port: 3000
+      targetPort: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: xns-route-same
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: ListenerSet
+      name: team-ls
+      namespace: ${TESTNS}
+      sectionName: ls-same
+  hostnames:
+    - "xns-same.${TESTNS}.local"
+  rules:
+    - backendRefs:
+        - name: echo-xns
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: xns-route-all
+spec:
+  parentRefs:
+    - group: gateway.networking.k8s.io
+      kind: ListenerSet
+      name: team-ls
+      namespace: ${TESTNS}
+      sectionName: ls-all
+  hostnames:
+    - "xns-all.${TESTNS}.local"
+  rules:
+    - backendRefs:
+        - name: echo-xns
+          port: 3000

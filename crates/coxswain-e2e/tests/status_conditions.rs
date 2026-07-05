@@ -2255,3 +2255,111 @@ async fn httproute_on_listenerset_reports_listenerset_parent_accepted() -> anyho
 
     Ok(())
 }
+
+/// GEP-1713 `ListenerSetAllowedRoutesCrossNamespace` (#515): a ListenerSet
+/// listener's `allowedRoutes.namespaces` default (`Same`) scopes to the
+/// ListenerSet's OWN namespace, not the parent Gateway's —
+/// `listener_merge.rs::ls_route_namespaces` resolves it via the ListenerSet's
+/// `metadata.namespace`. A route in a different (tenant) namespace targeting
+/// that listener is rejected (`Accepted=False/NotAllowedByListeners`); the same
+/// tenant route targeting a sibling listener widened to `All` is accepted.
+#[tokio::test]
+async fn gateway_listenerset_cross_namespace_route_scoped_to_own_namespace_by_default()
+-> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-ls-xns-primary").await?;
+    let tenant = NamespaceGuard::create(&h.client, "sc-ls-xns-tenant").await?;
+
+    fixtures::apply_fixture(gwa::LISTENERSET_XNS_ROUTE, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        gwa::LISTENERSET_XNS_TENANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&tenant.name, &["echo-xns"]).await?;
+
+    let api: Api<HttpRoute> = Api::namespaced(h.client.clone(), &tenant.name);
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let same = api
+                .get("xns-route-same")
+                .await
+                .ok()
+                .and_then(|r| route_listenerset_parent_condition(&r, "team-ls", "Accepted"));
+            let all = api
+                .get("xns-route-all")
+                .await
+                .ok()
+                .and_then(|r| route_listenerset_parent_condition(&r, "team-ls", "Accepted"));
+            format!(
+                "xns-route-same (targets ls-same, namespaces=Same) to be \
+                 Accepted=False/NotAllowedByListeners and xns-route-all (targets \
+                 ls-all, namespaces=All) to be Accepted=True; observed same={same:?}, all={all:?}"
+            )
+        },
+        || async {
+            let same_route = api.get("xns-route-same").await.ok()?;
+            let all_route = api.get("xns-route-all").await.ok()?;
+            let same = route_listenerset_parent_condition(&same_route, "team-ls", "Accepted")?;
+            let all = route_listenerset_parent_condition(&all_route, "team-ls", "Accepted")?;
+            (same == ("False".to_string(), "NotAllowedByListeners".to_string()) && all.0 == "True")
+                .then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// GEP-1713 `ListenerSetAllowedRoutesSupportedKinds` (#515): a ListenerSet
+/// TLS-passthrough listener whose `allowedRoutes.kinds` is restricted to a kind
+/// incompatible with its protocol (`HTTPRoute` on `TLS`, which only ever carries
+/// `TLSRoute`) reports `ResolvedRefs=False/InvalidRouteKinds` on its OWN listener
+/// status — no route needs to attach for this to trigger. A sibling listener
+/// restricted to the matching `TLSRoute` kind reports `ResolvedRefs=True`.
+#[tokio::test]
+async fn gateway_listenerset_kind_restriction_matches_protocol() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-ls-kinds").await?;
+
+    fixtures::apply_fixture(
+        gwa::LISTENERSET_KIND_RESTRICTION,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let api: Api<ListenerSet> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let observed = api.get("team-ls").await.ok().map_or_else(
+                || "<no ListenerSet>".to_string(),
+                |ls| {
+                    format!(
+                        "ls-bad-kind.ResolvedRefs={:?}, ls-good-kind.ResolvedRefs={:?}",
+                        ls_listener_condition(&ls, "ls-bad-kind", "ResolvedRefs"),
+                        ls_listener_condition(&ls, "ls-good-kind", "ResolvedRefs"),
+                    )
+                },
+            );
+            format!(
+                "ListenerSet team-ls listener ls-bad-kind to be \
+                 ResolvedRefs=False/InvalidRouteKinds and ls-good-kind to be \
+                 ResolvedRefs=True; observed {observed}"
+            )
+        },
+        || async {
+            let ls = api.get("team-ls").await.ok()?;
+            let bad = ls_listener_condition(&ls, "ls-bad-kind", "ResolvedRefs")?;
+            let good = ls_listener_condition(&ls, "ls-good-kind", "ResolvedRefs")?;
+            (bad == ("False".to_string(), "InvalidRouteKinds".to_string()) && good.0 == "True")
+                .then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}

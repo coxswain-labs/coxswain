@@ -103,6 +103,24 @@ Gateway's own listeners — only `kind: ListenerSet` targets the ListenerSet.
 `HTTPRoute`/`GRPCRoute` to its `HTTP`/`HTTPS` listeners, `TLSRoute` to its
 `TLS`/`Passthrough` listeners.
 
+### Route namespace scoping
+
+Each ListenerSet listener's own `allowedRoutes.namespaces` governs which
+namespaces its routes may come from — same as a Gateway listener, with one
+distinction: `Same` (the default) means the **ListenerSet's own namespace**, not
+the parent Gateway's. A route in a third namespace (neither the Gateway's nor
+the ListenerSet's) is rejected — `Accepted: False`, reason `NotAllowedByListeners`
+— unless the listener widens to `All` or `Selector`.
+
+### Route kind restriction
+
+`allowedRoutes.kinds` restricts which route kinds may attach, same as a Gateway
+listener. The kind must match the listener's protocol family (`HTTPRoute`/
+`GRPCRoute` for `HTTP`/`HTTPS`, `TLSRoute` for `TLS`/`Passthrough`) — a mismatched
+kind (e.g. `HTTPRoute` on a `TLS` listener) marks the listener itself
+`ResolvedRefs: False` with reason `InvalidRouteKinds`, independent of whether any
+route actually attempts to attach.
+
 ## Precedence and duplicate names
 
 The parent's effective listener set is ordered:
