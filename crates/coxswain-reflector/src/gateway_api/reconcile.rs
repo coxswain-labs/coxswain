@@ -5,25 +5,24 @@ use super::GatewayApiReconciler;
 use super::backend_policy::{BackendPolicyIndex, ResolvedBackendPolicy};
 use super::backend_tls::{BackendTlsIndex, ResolvedPolicy};
 use super::bindings::{ListenerBinding, compute_listener_bindings};
+use super::reconcile_tls::{
+    GatewayTlsTarget, grants_for_source, resolve_listener_tls, resolve_route_client_cert,
+};
 use crate::endpoints;
 use crate::gw_types::{
     HttpRoute,
     v::httproutes::{
-        HttpRouteParentRefs, HttpRouteRulesBackendRefs, HttpRouteRulesFilters,
-        HttpRouteRulesFiltersType, HttpRouteRulesMatchesPathType,
+        HttpRouteRulesBackendRefs, HttpRouteRulesFilters, HttpRouteRulesFiltersType,
+        HttpRouteRulesMatchesPathType,
     },
 };
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
-use crate::reconciler::listener_merge::EffectiveListener;
-use crate::status::{
-    GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerSource, ListenerStatusKey,
-};
-use crate::tls::load_tls_cert;
+use crate::status::{GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerStatusKey};
 use coxswain_core::crd::{
     BasicAuth, Compression, IpAccessControl, PathRewriteRegex, RateLimit, RequestSizeLimit,
 };
-use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
+use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendClientCert, BackendGroup, BackendProtocol, CompressionConfig, FilterAction,
@@ -76,6 +75,11 @@ pub struct RouteResolution<'a> {
     /// consumed by a resolved `BasicAuth` CR's `secretRef` (#442). The same store
     /// the Ingress `auth-basic-secret` annotation reads — no duplicate watcher.
     pub auth_secrets: &'a reflector::Store<Secret>,
+    /// `BasicAuth → Secret` ReferenceGrants (#520). A `BasicAuth` CR whose
+    /// `secretRef.namespace` differs from the route namespace requires a matching
+    /// grant; without one the cross-namespace ref fails closed, so a tenant cannot
+    /// bind another namespace's auth Secret.
+    pub basic_auth_secret_grants: &'a HashSet<ReferenceGrantKey>,
     /// `RequestSizeLimit` CR store for resolving `ExtensionRef` filters on
     /// `HTTPRouteRule`s (#443). HTTPRoute-only — NOT enforced on GRPCRoute (#509): a
     /// mid-stream body cap on HTTP/2 deadlocks the client under pingora, and gRPC
@@ -126,6 +130,7 @@ impl GatewayApiReconciler {
             ip_access,
             basic_auths,
             auth_secrets,
+            basic_auth_secret_grants,
             request_size_limits,
             compressions,
             backend_client_certs,
@@ -357,6 +362,7 @@ impl GatewayApiReconciler {
                 route_ns,
                 basic_auths,
                 auth_secrets,
+                basic_auth_secret_grants,
             );
             let max_body_size = super::filters::resolve_request_size_limit(
                 rule_filters,
@@ -397,46 +403,6 @@ impl GatewayApiReconciler {
             // If bindings is empty, the route has no matching listener — skip.
         }
     }
-}
-
-/// Resolve the GEP-3155 backend client cert inherited by this route from its
-/// owned parent Gateways.
-///
-/// Walks `parent_refs` in declaration order, skipping refs to non-owned Gateways.
-/// Returns `(Some(cert), false)` for the first owned parent with a resolved cert,
-/// `(None, true)` if the first owned parent with a cert ref failed to resolve it,
-/// and `(None, false)` if no owned parent has any cert ref.
-///
-/// Declaration-order precedence is intentional: when a route is attached to multiple
-/// owned Gateways with different certs, the first parentRef wins (the cert rides the
-/// route's single shared `BackendGroup`, so per-parent divergence cannot be expressed).
-fn resolve_route_client_cert<'a>(
-    parent_refs: &[HttpRouteParentRefs],
-    route_ns: &str,
-    owned_gateways: &HashSet<ObjectKey>,
-    backend_client_certs: &'a HashMap<ObjectKey, Arc<BackendClientCert>>,
-    backend_client_cert_failures: &HashSet<ObjectKey>,
-) -> (Option<&'a Arc<BackendClientCert>>, bool) {
-    for p in parent_refs {
-        if !parent_ref_owned(
-            p.group.as_deref(),
-            p.kind.as_deref(),
-            p.namespace.as_deref(),
-            &p.name,
-            route_ns,
-            owned_gateways,
-        ) {
-            continue;
-        }
-        let key = ObjectKey::new(p.namespace.as_deref().unwrap_or(route_ns), p.name.as_str());
-        if let Some(cc) = backend_client_certs.get(&key) {
-            return (Some(cc), false);
-        }
-        if backend_client_cert_failures.contains(&key) {
-            return (None, true);
-        }
-    }
-    (None, false)
 }
 
 /// Resolve each backendRef to `(pod_addresses, weight)`.
@@ -997,192 +963,12 @@ impl GatewayApiReconciler {
     }
 }
 
-/// Per-Gateway context passed to [`GatewayApiReconciler::reconcile_tls`].
-///
-/// Groups the 7+ parameters into a single struct to satisfy the workspace
-/// `clippy::too_many_arguments` policy.
-pub(crate) struct GatewayTlsTarget<'a> {
-    /// Gateway `metadata.name` — used in diagnostic log messages.
-    pub(crate) gw_name: &'a str,
-    /// Effective listeners for this Gateway (its own plus any merged ListenerSet
-    /// listeners, GEP-1713).
-    pub(crate) listeners: &'a [EffectiveListener],
-    /// `listenerPort → internalPort` mapping.
-    ///
-    /// For the **shared reconciler**: built from VIP Services (#472). An absent
-    /// entry (maps to 0 via `unwrap_or`) means the VIP Service has not yet been
-    /// created — readiness is deferred (`VipPending`) until the next rebuild.
-    ///
-    /// For the **dedicated reconciler**: pre-populated with identity mappings
-    /// (`spec_port → spec_port`) so `internal_port` is never 0. The dedicated
-    /// proxy binds the spec port directly; treating 0 as "pending" would prevent
-    /// the listener from ever reaching `TlsPassthrough` / `TlsTerminate`.
-    pub(crate) internal_ports: &'a HashMap<u16, u16>,
-}
-
-/// Select the applicable ReferenceGrant set for a listener based on its source kind.
-///
-/// A `Gateway` listener's cross-namespace cert is permitted by `from.kind: Gateway` grants;
-/// a `ListenerSet` listener's by `from.kind: ListenerSet` grants (GEP-1713).
-fn grants_for_source<'g>(
-    source: &ListenerSource,
-    cert_grants: &'g HashSet<ReferenceGrantKey>,
-    ls_cert_grants: &'g HashSet<ReferenceGrantKey>,
-) -> &'g HashSet<ReferenceGrantKey> {
-    match source {
-        ListenerSource::Gateway => cert_grants,
-        ListenerSource::ListenerSet(_) => ls_cert_grants,
-    }
-}
-
-fn resolve_listener_tls(
-    gw_name: &str,
-    listener: &EffectiveListener,
-    secrets: &reflector::Store<Secret>,
-    cert_grants: &HashSet<ReferenceGrantKey>,
-    builder: &mut PortTlsStoreBuilder,
-    bind_port: u16,
-) -> ListenerReadiness {
-    // ListenerSet listeners resolve their certificateRefs in the ListenerSet's own
-    // namespace (GEP-1713), not the parent Gateway's; Gateway listeners use the
-    // Gateway namespace. Both are carried as `owning_namespace`.
-    let owning_ns = listener.owning_namespace.as_str();
-    let tls = match &listener.tls {
-        Some(t) => t,
-        None => {
-            return ListenerReadiness::InvalidCertificateRef {
-                message: "HTTPS listener has no tls configuration".to_string(),
-            };
-        }
-    };
-
-    if tls.passthrough {
-        return ListenerReadiness::Invalid {
-            message: "tls.mode: Passthrough is not supported; use Terminate".to_string(),
-        };
-    }
-
-    // Empty/absent hostname means "match any SNI" — stored as the default cert.
-    let hostname = listener
-        .hostname
-        .as_deref()
-        .filter(|h| !h.is_empty())
-        .unwrap_or("");
-
-    let refs = tls.certificate_refs.as_slice();
-    if refs.is_empty() {
-        return ListenerReadiness::InvalidCertificateRef {
-            message: "tls.certificateRefs is empty".to_string(),
-        };
-    }
-
-    // Load all certificateRefs (GEP-851). Each ref is validated independently;
-    // failures on individual refs do not prevent the others from being loaded.
-    // Tracks failures to detect partial success (ResolvedPartial).
-    let mut resolved_count: u32 = 0;
-    // `(message, is_ref_not_permitted)` for each failed ref.
-    let mut failures: Vec<(String, bool)> = Vec::new();
-
-    for cert_ref in refs {
-        // Only core/Secret (empty group, "core", or absent) is supported.
-        let ref_kind = cert_ref.kind.as_deref().unwrap_or("Secret");
-        let ref_group = cert_ref.group.as_deref().unwrap_or("");
-        if ref_kind != "Secret" || (!ref_group.is_empty() && ref_group != "core") {
-            let msg = format!(
-                "unsupported certificateRef {ref_group}/{ref_kind}: only core/Secret is supported"
-            );
-            failures.push((msg, false));
-            continue;
-        }
-
-        let ref_ns = cert_ref.namespace.as_deref().unwrap_or(owning_ns);
-
-        if ref_ns != owning_ns
-            && !reference_grants::backend_ref_allowed(
-                owning_ns,
-                ref_ns,
-                &cert_ref.name,
-                cert_grants,
-            )
-        {
-            tracing::warn!(
-                gateway = %format!("{gw_name}"),
-                listener = %listener.name,
-                secret = %format!("{ref_ns}/{}", cert_ref.name),
-                "Cross-namespace certificateRef denied — no matching ReferenceGrant"
-            );
-            let msg = format!(
-                "cross-namespace Secret {ref_ns}/{} requires a ReferenceGrant",
-                cert_ref.name
-            );
-            failures.push((msg, true));
-            continue;
-        }
-
-        match load_tls_cert(ref_ns, &cert_ref.name, secrets) {
-            Ok(cert) => {
-                builder.add_cert(bind_port, hostname, Arc::new(cert));
-                resolved_count += 1;
-                tracing::debug!(
-                    gateway = %format!("{gw_name}"),
-                    listener = %listener.name,
-                    secret = %format!("{ref_ns}/{}", cert_ref.name),
-                    hostname,
-                    "Gateway TLS cert installed"
-                );
-            }
-            Err(e) => {
-                tracing::warn!(
-                    gateway = %format!("{gw_name}"),
-                    listener = %listener.name,
-                    secret = %format!("{ref_ns}/{}", cert_ref.name),
-                    error = %e,
-                    "Gateway TLS Secret unusable — continuing with remaining refs"
-                );
-                failures.push((e.to_string(), false));
-            }
-        }
-    }
-
-    if resolved_count == 0 {
-        // Every ref failed — surface the most specific failure kind.
-        // RefNotPermitted takes priority (operator needs to add a ReferenceGrant)
-        // over generic cert errors.
-        let any_ref_not_permitted = failures.iter().any(|(_, rnp)| *rnp);
-        let messages: Vec<String> = failures.into_iter().map(|(m, _)| m).collect();
-        let message = messages.join("; ");
-        if any_ref_not_permitted {
-            return ListenerReadiness::RefNotPermitted { message };
-        }
-        return ListenerReadiness::InvalidCertificateRef { message };
-    }
-
-    if !failures.is_empty() {
-        // Some refs failed but at least one resolved — listener serves the good
-        // certs and surfaces the failures via a degraded condition.
-        let messages: Vec<String> = failures.into_iter().map(|(m, _)| m).collect();
-        let message = format!(
-            "{} of {} certificateRef(s) failed: {}",
-            messages.len(),
-            resolved_count as usize + messages.len(),
-            messages.join("; ")
-        );
-        tracing::warn!(
-            gateway = %format!("{gw_name}"),
-            listener = %listener.name,
-            ?message,
-            "Listener is serving only a subset of its certificateRefs (ResolvedPartial)"
-        );
-        return ListenerReadiness::ResolvedPartial { message };
-    }
-
-    ListenerReadiness::Resolved
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gateway_api::tests::*;
+    use crate::reconciler::listener_merge::EffectiveListener;
+    use crate::status::ListenerSource;
 
     // ── GEP-1713: ListenerSet cross-namespace cert grant selection ────────────
 
@@ -1420,6 +1206,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1464,6 +1251,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1508,6 +1296,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1544,6 +1333,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1579,6 +1369,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1653,6 +1444,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1703,6 +1495,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1778,6 +1571,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1864,6 +1658,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1925,6 +1720,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2019,6 +1815,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2070,6 +1867,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2113,6 +1911,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2158,6 +1957,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2195,6 +1995,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2238,6 +2039,7 @@ mod tests {
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
                 auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),

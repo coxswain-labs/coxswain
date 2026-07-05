@@ -30,4 +30,6 @@ multiple-versions = "warn"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/coxswain-labs/gateway-api-rs"]
+# No git sources: gateway-api types are first-party (crates/gateway-api-types, #516).
+# Leaving this empty keeps `unknown-git = "deny"` armed against any git dependency.
+allow-git = []

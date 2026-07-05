@@ -237,6 +237,15 @@ async fn enforce_ext_authz(
 
 // ── Basic auth ────────────────────────────────────────────────────────────────
 
+/// A valid bcrypt hash used solely to equalize verification timing on a username
+/// miss, closing the username-enumeration oracle (a miss would otherwise skip the
+/// expensive KDF a hit runs). Generated once at a fixed cost; the plaintext and the
+/// verify result are irrelevant — only that the KDF actually runs. `None` if hash
+/// generation ever fails, in which case the equalization is skipped (no panic on the
+/// data plane).
+static DUMMY_BCRYPT_HASH: std::sync::LazyLock<Option<String>> =
+    std::sync::LazyLock::new(|| bcrypt::hash("coxswain-timing-equalization", 12).ok());
+
 async fn enforce_basic(
     creds: &Arc<[coxswain_core::routing::BasicCredential]>,
     session: &mut Session,
@@ -287,10 +296,12 @@ async fn enforce_basic(
     };
 
     // Verify against the credential list.
+    let mut matched_user = false;
     for cred in creds.iter() {
         if cred.username.as_ref() != username {
             continue;
         }
+        matched_user = true;
         let verified = match &cred.hash {
             PasswordHash::Bcrypt(hash) => {
                 let hash_owned: Box<str> = hash.clone();
@@ -327,6 +338,18 @@ async fn enforce_basic(
         // entries with the same username (if any) won't help and iterating
         // further would create a timing oracle.
         break;
+    }
+
+    // Timing equalization: a username miss did no expensive KDF work, so run one
+    // fixed-cost bcrypt verify against a dummy hash to make a miss cost ~the same
+    // as a hit — closing the username-enumeration oracle. Result is discarded.
+    if !matched_user && let Some(dummy) = DUMMY_BCRYPT_HASH.as_ref() {
+        let dummy = dummy.clone();
+        let pass_owned: Zeroizing<Vec<u8>> = Zeroizing::new(pass_bytes.to_vec());
+        let _ = tokio::task::spawn_blocking(move || {
+            bcrypt::verify(std::str::from_utf8(&pass_owned).unwrap_or(""), &dummy).unwrap_or(false)
+        })
+        .await;
     }
 
     challenge_401(session).await

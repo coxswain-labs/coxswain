@@ -100,8 +100,11 @@ pub fn parse_deny_source_range(
 /// `"true"` — the proxy uses the L4 peer address as the client IP (current
 /// behavior, fail-safe). When truthy, the header name defaults to
 /// `X-Forwarded-For` when `forwarded-for-header` is absent. Invalid CIDR tokens
-/// in `forwarded-for-trusted-cidrs` emit a `WARN` and are skipped; a completely
-/// empty list after skipping is treated the same as absent (trust unconditionally).
+/// in `forwarded-for-trusted-cidrs` emit a `WARN` and are skipped. An empty
+/// `trusted_cidrs` after parsing is **fail-closed**: the proxy trusts no peer and
+/// ignores the forwarded header (using the L4 peer address), so this parser emits a
+/// `WARN` telling the operator the header will not be honored until they configure
+/// `forwarded-for-trusted-cidrs`.
 ///
 /// # Arguments
 /// * `annotations` — raw annotation map for the Ingress.
@@ -143,6 +146,22 @@ pub fn parse_forwarded_for(
         .and_then(|s| parse_cidr_list(s, FORWARDED_FOR_TRUSTED_CIDRS, route_id, diag))
         .unwrap_or_default()
         .into_boxed_slice();
+
+    if trusted_cidrs.is_empty() {
+        tracing::warn!(
+            ingress = %route_id,
+            annotation = TRUST_FORWARDED_FOR,
+            "trust-forwarded-for is enabled but no forwarded-for-trusted-cidrs are set — \
+             the forwarded header will NOT be honored (fail-closed anti-spoofing); the L4 \
+             peer address is used until trusted proxy CIDRs are configured"
+        );
+        diag.push(AnnotationIssue {
+            annotation: TRUST_FORWARDED_FOR,
+            message: "trust-forwarded-for enabled without forwarded-for-trusted-cidrs — \
+                      header ignored (fail-closed); configure trusted proxy CIDRs to honor it"
+                .to_string(),
+        });
+    }
 
     Some(ForwardedForConfig::new(header, trusted_cidrs))
 }
@@ -477,6 +496,18 @@ mod tests {
         let cfg = parse_forwarded_for(&m, "ns/test", &mut vec![]).expect("Some");
         assert_eq!(&*cfg.header, "X-Forwarded-For");
         assert!(cfg.trusted_cidrs.is_empty());
+    }
+
+    #[test]
+    fn forwarded_for_empty_trusted_cidrs_pushes_fail_closed_diag() {
+        // trust-forwarded-for enabled without trusted CIDRs is fail-closed at the
+        // proxy; the parser must surface that the header will be ignored.
+        let m = ann(&[(TRUST_FORWARDED_FOR, "true")]);
+        let mut diag = vec![];
+        let cfg = parse_forwarded_for(&m, "ns/test", &mut diag).expect("Some");
+        assert!(cfg.trusted_cidrs.is_empty());
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, TRUST_FORWARDED_FOR);
     }
 
     #[test]

@@ -40,28 +40,47 @@ static PRIVATE_NETS: std::sync::LazyLock<[ipnet::IpNet; 9]> = std::sync::LazyLoc
     ]
 });
 
-/// Scan a comma-separated header value for the first non-private, non-loopback
-/// IP address.  Returns `None` when every token is private, unparseable, or the
-/// value is empty.
+/// Walk a comma-separated forwarded-for header **right-to-left** and return the
+/// first address that is not a known trusted-proxy hop — the real client as far
+/// as the trust chain can attest ("rightmost-untrusted").
 ///
-/// "First" is left-to-right per the XFF convention: the leftmost value is the
-/// one closest to the original client and furthest from potential LB injection.
-fn first_non_private_ip(header_value: &str) -> Option<std::net::IpAddr> {
+/// Each hop a trusted proxy appends is the address *it* received from; reading
+/// from the right we skip our own trusted proxies (`trusted`) and private/reserved
+/// infrastructure until we reach the first address we did not receive from a
+/// trusted hop. Everything to the *left* of that is client-controlled and ignored
+/// — which is what defeats `X-Forwarded-For: <forged>, <real>` spoofing (the old
+/// leftmost-wins scan returned the attacker-supplied `<forged>` token).
+///
+/// Addresses are canonicalized with [`std::net::IpAddr::to_canonical`] so an
+/// IPv4-mapped IPv6 form (`::ffff:a.b.c.d`) is classified and returned as its
+/// IPv4 address. Returns `None` when every token is a trusted/private hop,
+/// unparseable, or the value is empty.
+fn rightmost_untrusted_ip(
+    header_value: &str,
+    trusted: &[ipnet::IpNet],
+) -> Option<std::net::IpAddr> {
     header_value
-        .split(',')
+        .rsplit(',')
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .filter_map(|t| t.parse::<std::net::IpAddr>().ok())
-        .find(|ip| !PRIVATE_NETS.iter().any(|n| n.contains(ip)))
+        .map(|ip| ip.to_canonical())
+        .find(|ip| {
+            !trusted.iter().any(|n| n.contains(ip)) && !PRIVATE_NETS.iter().any(|n| n.contains(ip))
+        })
 }
 
 /// Resolve the effective client IP for the current request.
 ///
-/// Resolution order (per `ForwardedForConfig` doc):
-/// 1. If no config → L4 IP (current behavior).
-/// 2. If `trusted_cidrs` non-empty AND L4 IP ∉ any CIDR → L4 IP (anti-spoofing).
-/// 3. Else extract the first non-private IP from the configured header; fall back
-///    to L4 IP when absent or all entries are private.
+/// Resolution order:
+/// 1. No `ForwardedForConfig` → the L4 peer address.
+/// 2. Config present but the L4 peer is **not** inside `trusted_cidrs` → the L4
+///    peer address. The empty-`trusted_cidrs` case lands here: an empty trust set
+///    trusts no peer, so the forwarded header is ignored (fail-closed). Only a
+///    configured trusted proxy can have its forwarded header honored.
+/// 3. L4 peer trusted → the rightmost-untrusted address from the configured header
+///    (see [`rightmost_untrusted_ip`]), falling back to the L4 peer when the header
+///    is absent or yields no untrusted address.
 pub(crate) fn resolve_client_ip(
     session: &Session,
     real_client_addr: Option<std::net::SocketAddr>,
@@ -79,21 +98,21 @@ pub(crate) fn resolve_client_ip(
         return l4_ip;
     };
 
-    // Anti-spoofing gate: if trusted CIDRs are configured, only trust the header
-    // when the L4 peer is within one of those CIDRs.
-    if !cfg.trusted_cidrs.is_empty()
-        && !l4_ip.is_some_and(|ip| cfg.trusted_cidrs.iter().any(|n| n.contains(&ip)))
-    {
+    // Fail-closed anti-spoofing gate: only honor the forwarded header when the L4
+    // peer is a configured trusted proxy. An empty `trusted_cidrs` matches no peer,
+    // so the header is ignored and the L4 address wins — a client cannot forge its
+    // source IP by setting the header when no trust is configured.
+    let l4_trusted = l4_ip.is_some_and(|ip| cfg.trusted_cidrs.iter().any(|n| n.contains(&ip)));
+    if !l4_trusted {
         return l4_ip;
     }
 
-    // Trust the header: grab the forwarded-IP value and find the first public IP.
     let header_ip = session
         .req_header()
         .headers
         .get(cfg.header.as_ref())
         .and_then(|v| v.to_str().ok())
-        .and_then(first_non_private_ip);
+        .and_then(|hv| rightmost_untrusted_ip(hv, &cfg.trusted_cidrs));
 
     header_ip.or(l4_ip)
 }
@@ -102,11 +121,15 @@ pub(crate) fn resolve_client_ip(
 ///
 /// Fail-closed: a `None` client IP (the peer could not be determined) is
 /// rejected — an un-attributable request must not pass a security allow-list.
-/// Matching is strict (no IPv4-mapped-IPv6 normalization), matching `ipnet`'s
-/// default and the `TrustedSources` PROXY-protocol check.
+/// The client IP is canonicalized ([`std::net::IpAddr::to_canonical`]) before
+/// matching, so an IPv4-mapped IPv6 form (`::ffff:a.b.c.d`) is tested as its IPv4
+/// address and cannot slip past a v4 allow-list by presenting the mapped form.
 #[must_use]
 pub(crate) fn ip_allowed(client_ip: Option<std::net::IpAddr>, nets: &[ipnet::IpNet]) -> bool {
-    client_ip.is_some_and(|ip| nets.iter().any(|n| n.contains(&ip)))
+    client_ip.is_some_and(|ip| {
+        let ip = ip.to_canonical();
+        nets.iter().any(|n| n.contains(&ip))
+    })
 }
 
 /// Returns `true` if `client_ip` falls inside any CIDR in the deny-list `nets`.
@@ -115,10 +138,14 @@ pub(crate) fn ip_allowed(client_ip: Option<std::net::IpAddr>, nets: &[ipnet::IpN
 /// is **not** considered to match any CIDR and is therefore **not** denied — a block
 /// list only blocks IPs it can positively attribute to a listed range. This is the
 /// inverse of [`ip_allowed`]'s fail-closed semantics.
-/// Matching is strict (no IPv4-mapped-IPv6 normalization).
+/// The client IP is canonicalized ([`std::net::IpAddr::to_canonical`]) before
+/// matching, so an IPv4-mapped IPv6 form cannot evade a v4 deny CIDR.
 #[must_use]
 pub(crate) fn ip_denied(client_ip: Option<std::net::IpAddr>, nets: &[ipnet::IpNet]) -> bool {
-    client_ip.is_some_and(|ip| nets.iter().any(|n| n.contains(&ip)))
+    client_ip.is_some_and(|ip| {
+        let ip = ip.to_canonical();
+        nets.iter().any(|n| n.contains(&ip))
+    })
 }
 
 #[cfg(test)]
@@ -177,10 +204,10 @@ mod tests {
     }
 
     #[test]
-    fn v4_mapped_v6_does_not_match_v4_cidr() {
-        // Strict matching: an IPv4-mapped IPv6 client does NOT satisfy an IPv4 CIDR.
-        // Locks the documented behavior so leniency would be a deliberate change.
-        assert!(!ip_allowed(ip("::ffff:10.0.0.1"), &nets(&["10.0.0.0/8"])));
+    fn v4_mapped_v6_matches_v4_cidr() {
+        // Canonicalized matching: an IPv4-mapped IPv6 client is tested as its IPv4
+        // address, so it satisfies an IPv4 CIDR — no mapped-form allow-list bypass.
+        assert!(ip_allowed(ip("::ffff:10.0.0.1"), &nets(&["10.0.0.0/8"])));
     }
 
     // ── ip_denied ─────────────────────────────────────────────────────────────
@@ -218,41 +245,74 @@ mod tests {
     }
 
     #[test]
-    fn v4_mapped_v6_does_not_match_deny_v4_cidr() {
-        // Strict matching: an IPv4-mapped IPv6 client does NOT match an IPv4 deny CIDR.
-        assert!(!ip_denied(ip("::ffff:10.0.0.1"), &nets(&["10.0.0.0/8"])));
+    fn v4_mapped_v6_matches_deny_v4_cidr() {
+        // Canonicalized matching: an IPv4-mapped IPv6 client cannot evade an IPv4
+        // deny CIDR by presenting the mapped form.
+        assert!(ip_denied(ip("::ffff:10.0.0.1"), &nets(&["10.0.0.0/8"])));
     }
 
-    // ── first_non_private_ip ──────────────────────────────────────────────────
+    // ── rightmost_untrusted_ip ────────────────────────────────────────────────
 
     #[test]
-    fn first_non_private_ip_skips_private_finds_public() {
-        let result = super::first_non_private_ip("10.0.0.1, 203.0.113.5, 198.51.100.1");
-        assert_eq!(result, "203.0.113.5".parse::<IpAddr>().ok());
-    }
-
-    #[test]
-    fn first_non_private_ip_single_public() {
-        let result = super::first_non_private_ip("1.2.3.4");
-        assert_eq!(result, "1.2.3.4".parse::<IpAddr>().ok());
-    }
-
-    #[test]
-    fn first_non_private_ip_all_private_is_none() {
-        let result = super::first_non_private_ip("10.0.0.1, 192.168.0.1, 172.16.0.1");
-        assert!(result.is_none());
+    fn rightmost_untrusted_ignores_left_forged_entry() {
+        // Attacker forges the leftmost token; the trusted LB appends the real
+        // client to the right. Rightmost-untrusted returns the real client — the
+        // forgery to its left is ignored.
+        let trusted = nets(&["192.0.2.0/24"]);
+        let r = super::rightmost_untrusted_ip("1.1.1.1, 203.0.113.7", &trusted);
+        assert_eq!(r, "203.0.113.7".parse::<IpAddr>().ok());
     }
 
     #[test]
-    fn first_non_private_ip_empty_is_none() {
-        assert!(super::first_non_private_ip("").is_none());
-        assert!(super::first_non_private_ip("  ,  ").is_none());
+    fn rightmost_untrusted_skips_trailing_trusted_hops() {
+        // chain: realclient, trusted-hop-1, trusted-hop-2 — skip both trusted hops.
+        let trusted = nets(&["192.0.2.0/24", "198.51.100.0/24"]);
+        let r = super::rightmost_untrusted_ip("203.0.113.7, 192.0.2.5, 198.51.100.9", &trusted);
+        assert_eq!(r, "203.0.113.7".parse::<IpAddr>().ok());
     }
 
     #[test]
-    fn first_non_private_ip_loopback_is_private() {
-        assert!(super::first_non_private_ip("127.0.0.1").is_none());
-        assert!(super::first_non_private_ip("::1").is_none());
+    fn rightmost_untrusted_skips_private_hops() {
+        // Private/reserved infra is skipped even with no configured trusted CIDRs.
+        let r = super::rightmost_untrusted_ip("203.0.113.7, 10.0.0.5", &[]);
+        assert_eq!(r, "203.0.113.7".parse::<IpAddr>().ok());
+    }
+
+    #[test]
+    fn rightmost_untrusted_single_public() {
+        // Single-hop LB: the header carries just the real client.
+        let r = super::rightmost_untrusted_ip("1.2.3.4", &[]);
+        assert_eq!(r, "1.2.3.4".parse::<IpAddr>().ok());
+    }
+
+    #[test]
+    fn rightmost_untrusted_all_trusted_is_none() {
+        let trusted = nets(&["192.0.2.0/24"]);
+        assert!(super::rightmost_untrusted_ip("192.0.2.1, 192.0.2.2", &trusted).is_none());
+    }
+
+    #[test]
+    fn rightmost_untrusted_all_private_is_none() {
+        assert!(super::rightmost_untrusted_ip("10.0.0.1, 192.168.0.1, 172.16.0.1", &[]).is_none());
+    }
+
+    #[test]
+    fn rightmost_untrusted_empty_is_none() {
+        assert!(super::rightmost_untrusted_ip("", &[]).is_none());
+        assert!(super::rightmost_untrusted_ip("  ,  ", &[]).is_none());
+    }
+
+    #[test]
+    fn rightmost_untrusted_loopback_is_private() {
+        assert!(super::rightmost_untrusted_ip("127.0.0.1", &[]).is_none());
+        assert!(super::rightmost_untrusted_ip("::1", &[]).is_none());
+    }
+
+    #[test]
+    fn rightmost_untrusted_canonicalizes_mapped_v6() {
+        // A mapped-v6 real client is returned as its canonical v4 form.
+        let r = super::rightmost_untrusted_ip("::ffff:203.0.113.7", &[]);
+        assert_eq!(r, "203.0.113.7".parse::<IpAddr>().ok());
     }
 
     // ── resolve_client_ip: unit tests (no Session available; tested via integration) ─

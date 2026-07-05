@@ -30,7 +30,7 @@
 //! cleartext upstream connections skip them entirely.
 
 use crate::config::AccessLogPathMode;
-use crate::ctx::{CONN_INFO, MirrorDispatch, ProxyCtx, ResolvedRoute};
+use crate::ctx::{CONN_INFO, ProxyCtx, ResolvedRoute};
 use crate::edge::tls::ConnTlsInfo;
 use crate::edge::upstream_ca::{
     BackendClientCertCache, SanCheckHookCache, UpstreamCaCache, UpstreamSanMismatch,
@@ -41,13 +41,12 @@ use crate::filters::cors::try_cors_preflight;
 use crate::filters::redirect::{extract_host, try_redirect};
 use crate::policy::access_control::{ip_allowed, ip_denied, resolve_client_ip};
 use crate::policy::affinity;
-use crate::policy::auth;
 use crate::routing::engine::RoutingEngine;
 use crate::routing::outcome::{merge_timeouts, resolve_outcome};
 use bytes::Bytes;
 use coxswain_core::routing::{
-    BackendGroup, FilterAction, HashSource, MirrorFraction, RateLimitKey, RequestContext, RetryOn,
-    SessionAffinity, affinity_hash, affinity_hash_parts,
+    HashSource, RateLimitKey, RequestContext, RetryOn, SessionAffinity, affinity_hash,
+    affinity_hash_parts,
 };
 use coxswain_core::tls::ClientCertConfigState;
 use http::header;
@@ -58,18 +57,6 @@ use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::Session;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio_stream::StreamExt as _;
-
-/// Headers stripped from mirror sub-requests beyond the standard hop-by-hop set.
-///
-/// `Authorization` and `Cookie` carry per-user credentials that must not be
-/// forwarded to mirror (shadow) backends — those backends are secondary/test
-/// endpoints that the Ingress author may not fully control.  Leaking them would
-/// make the mirror a credential-harvesting surface.
-///
-/// `proxy-authorization` is already covered by [`crate::policy::auth::HOP_BY_HOP`];
-/// it is listed here for documentation clarity.
-const MIRROR_CREDENTIAL_HEADERS: &[&str] = &["authorization", "cookie", "proxy-authorization"];
 
 /// Construct a fresh per-request context, seeding from the connection-local
 /// `CONN_INFO` task-local when present (PROXY-protocol path).
@@ -446,141 +433,9 @@ pub(crate) async fn request_filter<K>(
         circuit_breaker: m.circuit_breaker,
     });
 
-    // ── Mirror setup (#283, #261) ───────────────────────────────────────────
-    // Collect all Mirror filters, applying per-filter sampling gates (GEP-3171).
-    // Non-mirror routes pay nothing — the filter() short-circuits immediately when
-    // no Mirror variant is present and no Vec is allocated (the iterator is lazy).
-    let mirror_backends: Vec<(Arc<BackendGroup>, Option<MirrorFraction>)> = ctx
-        .resolved
-        .as_ref()
-        .map(|r| {
-            r.filters
-                .iter()
-                .filter_map(|f| {
-                    if let FilterAction::Mirror { backend, fraction } = f {
-                        Some((Arc::clone(backend), *fraction))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if !mirror_backends.is_empty() {
-        // Apply GEP-3171 sampling: draw one random u32 per mirror candidate and
-        // discard candidates whose fraction gate rejects the draw.
-        // `None` fraction == 100% — never filtered out.
-        let surviving: Vec<Arc<BackendGroup>> = mirror_backends
-            .into_iter()
-            .filter(|(_, fraction)| fraction.is_none_or(|f| f.should_sample(rand::random::<u32>())))
-            .map(|(b, _)| b)
-            .collect();
-
-        if !surviving.is_empty() {
-            let method;
-            let headers: Vec<(http::header::HeaderName, http::header::HeaderValue)>;
-            {
-                // Re-borrow req_header to capture method + forwardable headers.
-                // The mutable session borrows above (auth, rate-limit, redirect) have already
-                // completed; this is a fresh immutable borrow, released before the ctx mutation.
-                let req = session.req_header();
-                method = req.method.clone();
-                headers = req
-                    .headers
-                    .iter()
-                    .filter_map(|(name, value)| {
-                        let lower = name.as_str().to_ascii_lowercase();
-                        if lower == "host"
-                            // content-length is stripped because the streaming mirror body uses
-                            // Transfer-Encoding: chunked; forwarding the original CL alongside
-                            // chunked TE violates RFC 9112 §6.1 and confuses strict backends.
-                            || lower == "content-length"
-                            || auth::HOP_BY_HOP.contains(&lower.as_str())
-                            || MIRROR_CREDENTIAL_HEADERS.contains(&lower.as_str())
-                        {
-                            return None;
-                        }
-                        Some((name.clone(), value.clone()))
-                    })
-                    .collect();
-            } // req borrow released
-
-            let resolved = ctx
-                .resolved
-                .as_ref()
-                .unwrap_or_else(|| panic!("invariant: resolved is Some after assignment above"));
-            let host = resolved.original_host.clone();
-            let original_path = resolved.original_path.clone();
-            let metric_route_id = Arc::clone(&resolved.metric_route_id);
-            // Reuse the captured `Arc<str>` when there is no query to append — only the
-            // query arm allocates (#397).
-            let path_and_query: Arc<str> = match query.as_deref() {
-                Some(q) => {
-                    let mut pq = String::with_capacity(original_path.len() + 1 + q.len());
-                    pq.push_str(&original_path);
-                    pq.push('?');
-                    pq.push_str(q);
-                    Arc::from(pq)
-                }
-                None => Arc::clone(&original_path),
-            };
-
-            // Dispatch mirror tasks per surviving backend.
-            //
-            // Methods that cannot carry a request body (GET, HEAD, OPTIONS, CONNECT,
-            // TRACE) are dispatched immediately with an empty body — no channel needed.
-            // This also avoids the H2 bodyless edge case where Pingora never calls
-            // `request_body_filter` for methods with no DATA frames.
-            //
-            // All other methods (POST, PUT, PATCH, DELETE, …) open a bounded mpsc
-            // channel per backend and wrap its receiver as a streaming reqwest::Body so
-            // the body is forwarded chunk-by-chunk in `request_body_filter`, concurrent
-            // with primary forwarding — no buffering and no max-body-size dependency
-            // (#360).  H2 streaming bodies without Content-Length (RFC-legal for H2)
-            // are handled correctly: the channel stays open until request_body_filter
-            // delivers end_of_stream or ProxyCtx drops.
-            let method_has_body = !matches!(
-                method,
-                http::Method::GET
-                    | http::Method::HEAD
-                    | http::Method::OPTIONS
-                    | http::Method::CONNECT
-                    | http::Method::TRACE
-            );
-            let mut txs = Vec::with_capacity(surviving.len());
-            for backend in surviving {
-                let dispatch = MirrorDispatch {
-                    backend,
-                    method: method.clone(),
-                    host: Arc::clone(&host),
-                    path_and_query: Arc::clone(&path_and_query),
-                    headers: headers.clone(),
-                    metric_route_id: Arc::clone(&metric_route_id),
-                };
-                let body = if method_has_body {
-                    let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(
-                        crate::filters::mirror::MIRROR_CHANNEL_CAP,
-                    );
-                    let body = reqwest::Body::wrap_stream(
-                        tokio_stream::wrappers::ReceiverStream::new(rx)
-                            .map(Ok::<Bytes, std::io::Error>),
-                    );
-                    txs.push(tx);
-                    body
-                } else {
-                    reqwest::Body::default()
-                };
-                crate::filters::mirror::spawn_mirror_dispatch(
-                    dispatch,
-                    cfg.auth_client.clone(),
-                    body,
-                    &cfg.mirror_tracker,
-                );
-            }
-            ctx.mirror_txs = txs;
-        }
-    }
+    // Mirror setup (#283, #261): sample Mirror filters, open per-backend channels,
+    // and spawn fire-and-forget mirror tasks (delegated to the mirror module).
+    crate::filters::mirror::setup(session, ctx, cfg, query.as_deref());
 
     Ok(false)
 }

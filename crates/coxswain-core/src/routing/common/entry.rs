@@ -226,15 +226,18 @@ pub struct RouteEntry {
 ///
 /// Parsed from the `ingress.coxswain-labs.dev/trust-forwarded-for` family of annotations.
 /// When present on a `RouteEntry`, the proxy extracts the real client IP from `header`
-/// instead of using the L4 peer address. The `trusted_cidrs` set gates this trust: if
-/// non-empty, the header is only trusted when the L4 peer falls inside one of those
-/// CIDRs (anti-spoofing guard). An empty `trusted_cidrs` means unconditional trust.
+/// instead of using the L4 peer address. The `trusted_cidrs` set gates this trust
+/// (fail-closed): the header is only honored when the L4 peer falls inside one of those
+/// CIDRs (anti-spoofing guard). An empty `trusted_cidrs` trusts **no** peer, so the
+/// header is ignored and the L4 address is used — a client cannot forge its source IP by
+/// setting the header when no trusted proxy is configured. Within a trusted chain the
+/// proxy reads the header rightmost-untrusted, so a forged leftmost token is ignored.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardedForConfig {
     /// Header name to read the client IP from (case-insensitive; e.g. `X-Forwarded-For`).
     pub header: Box<str>,
-    /// L4-peer CIDR gate. Empty = trust the header unconditionally.
+    /// L4-peer CIDR gate (fail-closed). Empty = trust no peer; the header is ignored.
     pub trusted_cidrs: Box<[ipnet::IpNet]>,
 }
 

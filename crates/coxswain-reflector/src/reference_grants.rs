@@ -28,9 +28,28 @@ pub type GrantSet = HashSet<ReferenceGrantKey>;
 /// [`ReferenceGrantKey::specific`].
 #[must_use]
 pub fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
-    let backend_grants = flatten(grants, "HTTPRoute", "Service");
-    let cert_grants = flatten(grants, "Gateway", "Secret");
+    let backend_grants = flatten(grants, GATEWAY_API_GROUP, "HTTPRoute", "Service");
+    let cert_grants = flatten(grants, GATEWAY_API_GROUP, "Gateway", "Secret");
     (backend_grants, cert_grants)
+}
+
+/// The upstream Gateway API `from.group` most cross-namespace refs originate from.
+const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
+
+/// The coxswain-proprietary CRD group (`BasicAuth`, `RateLimit`, … ExtensionRef CRDs).
+const COXSWAIN_GROUP: &str = "gateway.coxswain-labs.dev";
+
+/// Flatten the `BasicAuth → Secret` grants that authorize a `BasicAuth` CR to
+/// reference its htpasswd `secretRef` in another namespace (#520).
+///
+/// The referrer is the `BasicAuth` CR itself, so the grant's `from.kind` is
+/// `BasicAuth` in the proprietary `gateway.coxswain-labs.dev` group — mirroring how
+/// Envoy Gateway's `SecurityPolicy` gates its secret refs by its own kind/group,
+/// not by the route kind. Without a matching grant a cross-namespace `secretRef`
+/// fails closed, so a tenant cannot bind another namespace's auth Secret.
+#[must_use]
+pub fn flatten_basic_auth_secret_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
+    flatten(grants, COXSWAIN_GROUP, "BasicAuth", "Secret")
 }
 
 /// Flatten the `Gateway → ConfigMap` grants used by GEP-91 frontend
@@ -38,7 +57,7 @@ pub fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
 /// ConfigMap in another namespace (#86). Same filter rules as [`flatten_grants`].
 #[must_use]
 pub fn flatten_ca_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
-    flatten(grants, "Gateway", "ConfigMap")
+    flatten(grants, GATEWAY_API_GROUP, "Gateway", "ConfigMap")
 }
 
 /// Flatten the `ListenerSet → Secret` grants used when a `ListenerSet` HTTPS
@@ -48,10 +67,15 @@ pub fn flatten_ca_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
 /// (which [`flatten_grants`] handles for Gateway-owned listeners).
 #[must_use]
 pub fn flatten_ls_cert_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
-    flatten(grants, "ListenerSet", "Secret")
+    flatten(grants, GATEWAY_API_GROUP, "ListenerSet", "Secret")
 }
 
-fn flatten(grants: &[Arc<ReferenceGrant>], from_kind: &str, to_kind: &str) -> GrantSet {
+fn flatten(
+    grants: &[Arc<ReferenceGrant>],
+    from_group: &str,
+    from_kind: &str,
+    to_kind: &str,
+) -> GrantSet {
     grants
         .iter()
         .filter_map(|grant| {
@@ -63,7 +87,7 @@ fn flatten(grants: &[Arc<ReferenceGrant>], from_kind: &str, to_kind: &str) -> Gr
                 .spec
                 .from
                 .iter()
-                .filter(|f| f.group == "gateway.networking.k8s.io" && f.kind == from_kind)
+                .filter(|f| f.group == from_group && f.kind == from_kind)
                 .map(|f| f.namespace.clone())
                 .collect();
             let to_entries: Vec<_> = grant

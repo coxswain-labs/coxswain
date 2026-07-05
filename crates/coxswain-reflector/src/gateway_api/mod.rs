@@ -12,6 +12,7 @@ mod grpc_reconcile;
 mod grpc_status;
 mod hostnames;
 mod reconcile;
+mod reconcile_tls;
 mod route_status;
 mod status;
 mod timeouts;
@@ -26,9 +27,15 @@ pub use client_traffic_policy::{
 };
 pub use grpc_reconcile::GrpcRouteResolution;
 pub(crate) use hostnames::hostnames_intersect;
-pub(crate) use reconcile::GatewayTlsTarget;
 pub use reconcile::RouteResolution;
+pub(crate) use reconcile_tls::GatewayTlsTarget;
 pub(crate) use route_status::RouteLike;
+
+/// API group for the coxswain-proprietary `ExtensionRef` CRDs (`RateLimit`,
+/// `IpAccessControl`, `BasicAuth`, `RequestSizeLimit`, `Compression`,
+/// `PathRewriteRegex`). Single source of truth for the `ExtensionRef.group`
+/// dispatch — a stray literal that misspells this silently disables a filter.
+pub(super) const COXSWAIN_GROUP: &str = "gateway.coxswain-labs.dev";
 
 #[cfg(test)]
 mod tests;

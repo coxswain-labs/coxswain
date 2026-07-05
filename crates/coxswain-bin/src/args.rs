@@ -141,6 +141,12 @@ pub(crate) struct CommonArgs {
     /// restrict access; leave at `0.0.0.0` so kubelet probes and Prometheus
     /// scraping work out of the box. Independent from the data-plane
     /// `--proxy-bind-address`.
+    ///
+    /// SECURITY: on the controller role the admin API relays cluster data —
+    /// pod logs (`/api/v1/pods/{name}/logs`) and verbatim Kubernetes manifests
+    /// (`/api/v1/manifests/...`) — and is currently unauthenticated. When bound to
+    /// `0.0.0.0` it MUST be fenced by a NetworkPolicy that admits only trusted
+    /// scrapers/probes; admin-port authentication is tracked in #251.
     #[arg(
         long,
         env = "COXSWAIN_MANAGEMENT_BIND_ADDRESS",

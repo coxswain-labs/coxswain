@@ -182,7 +182,10 @@ pub(crate) fn extract_client_key(
     match &config.key {
         RateLimitKey::ClientIp => client_ip.map(ClientKey::Ip),
         RateLimitKey::Header(_) => header_value.map(|v| ClientKey::Header(Box::from(v))),
-        _ => unreachable!("invariant: RateLimitKey has only ClientIp and Header variants"),
+        // `RateLimitKey` is cross-crate `#[non_exhaustive]`: a variant added in
+        // coxswain-core reaches this arm at runtime on the request hot path. Return
+        // `None` (fail-open, per this fn's contract) rather than panicking.
+        _ => None,
     }
 }
 

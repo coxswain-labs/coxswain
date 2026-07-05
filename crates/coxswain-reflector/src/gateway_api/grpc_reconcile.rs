@@ -25,12 +25,11 @@ use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, FilterAction, GatewayRoutingTableBuilder, HeaderMod,
     HeaderPredicate, HostRouterBuilder, MatchPredicates, RouteEntry, RouteTimeouts, UpstreamTls,
-    ValueMatch, WildcardKind,
+    ValueMatch, WildcardKind, compile_bounded,
 };
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -503,7 +502,7 @@ fn build_header_predicates(
 
         let matcher = match h.r#type.as_ref() {
             Some(GrpcRouteRulesMatchesHeadersType::RegularExpression) => {
-                let re = Regex::new(&h.value).ok()?;
+                let re = compile_bounded(&h.value).ok()?;
                 ValueMatch::Regex(re)
             }
             _ => ValueMatch::Exact(h.value.clone()),
@@ -600,7 +599,7 @@ fn build_filters(filters: &[GrpcRouteRulesFilters]) -> Vec<FilterAction> {
                 // RequestSizeLimit (#443, see #509: a mid-stream h2 body cap deadlocks
                 // the client under pingora; gRPC is limited by the backend instead).
                 let supported = f.extension_ref.as_ref().is_some_and(|ext| {
-                    ext.group == "gateway.coxswain-labs.dev"
+                    ext.group == super::COXSWAIN_GROUP
                         && (ext.kind == "RateLimit" || ext.kind == "IpAccessControl")
                 });
                 if !supported {

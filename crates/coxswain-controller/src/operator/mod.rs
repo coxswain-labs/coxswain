@@ -51,7 +51,9 @@ pub(crate) mod merge;
 pub(crate) mod params;
 pub(crate) mod reconciler;
 pub(crate) mod render;
+pub(crate) mod render_shared;
 pub(crate) mod shared_alloc;
 pub(crate) mod status;
+pub(crate) mod vip;
 
 pub use reconciler::{Operator, OperatorConfig};

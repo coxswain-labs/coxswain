@@ -1,0 +1,56 @@
+# Cross-namespace BasicAuth: route-side fixture (apply to TESTNS, after backends::ECHO).
+#
+# The BasicAuth CR's secretRef points at a Secret in TENANTNS; resolving it
+# requires a matching BasicAuth -> Secret ReferenceGrant in TENANTNS (supplied by
+# gwa::BASIC_AUTH_XNS_TENANT). Without the grant the proxy fails closed (503).
+#
+# TENANTNS = namespace holding the htpasswd Secret + ReferenceGrant.
+# Gateway: coxswain-basicauth-xns on GATEWAY_HTTP_PORT.
+# Route host: gwbasicauthxns.TESTNS.local, path / -> echo-a:3000.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-basicauth-xns
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: BasicAuth
+metadata:
+  name: basicauth
+spec:
+  secretRef:
+    name: gw-auth-htpasswd
+    namespace: ${TENANTNS}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: basicauth-xns-route
+spec:
+  parentRefs:
+    - name: coxswain-basicauth-xns
+  hostnames:
+    - "gwbasicauthxns.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: BasicAuth
+            name: basicauth
+      backendRefs:
+        - name: echo-a
+          port: 3000

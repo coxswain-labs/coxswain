@@ -1,0 +1,31 @@
+# Cross-namespace BasicAuth: tenant-side fixture (apply to TENANTNS).
+#
+# Holds the htpasswd Secret and a BasicAuth -> Secret ReferenceGrant that permits
+# a BasicAuth CR in TESTNS (the route namespace) to reference this Secret. Pair
+# with gwa::BASIC_AUTH_XNS_ROUTE applied to TESTNS.
+#
+# TESTNS = the route namespace whose BasicAuth CR references this Secret.
+# Credentials: alice:secret (bcrypt).
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: gw-auth-htpasswd
+  labels:
+    ingress.coxswain-labs.dev/auth-basic: "true"
+type: Opaque
+data:
+  auth: YWxpY2U6JDJ5JDA0JHdyUkZRU0NCZXpZTFR5V1hKS1dldXVPaHRGdWtyQWo3UHpQWXRRc09ORWg4ck9PampJTGFLCg==
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-basicauth-from-${TESTNS}
+spec:
+  from:
+    - group: gateway.coxswain-labs.dev
+      kind: BasicAuth
+      namespace: ${TESTNS}
+  to:
+    - group: ""
+      kind: Secret

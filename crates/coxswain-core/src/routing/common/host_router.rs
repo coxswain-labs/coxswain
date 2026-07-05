@@ -12,7 +12,7 @@ use super::path_normalize::NormalizeLevel;
 use super::predicate::{MatchPredicates, RequestContext, ValueMatch};
 use super::rate_limit::RateLimitConfig;
 use matchit::Router;
-use regex::RegexSet;
+use regex::{RegexSet, RegexSetBuilder};
 use std::cmp::Reverse;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -137,10 +137,39 @@ impl RouteMatch {
 /// compiles here is guaranteed to compile there.
 ///
 /// # Errors
-/// Returns [`regex::Error`] if `pattern` is not a valid regular expression.
+/// Returns [`regex::Error`] if `pattern` is not a valid regular expression or its
+/// compiled program would exceed [`REGEX_SIZE_LIMIT`].
 #[must_use = "the compiled Regex is the result; dropping it discards the compile work"]
 pub fn compile_path_regex(pattern: &str) -> Result<regex::Regex, regex::Error> {
-    regex::Regex::new(pattern)
+    compile_bounded(pattern)
+}
+
+/// Compiled-program size cap for every regex compiled from tenant-supplied input.
+///
+/// The `regex` crate defaults to a 10 MB compiled-program `size_limit`; a tenant
+/// creating many route/CRD matchers could force ~10 MB of controller memory per
+/// pattern — a reflector memory-exhaustion DoS. 64 KiB is ample for realistic
+/// host/path/header/query patterns while bounding the per-pattern memory a hostile
+/// CRD can demand.
+pub const REGEX_SIZE_LIMIT: usize = 64 * 1024;
+
+/// Compile a regular expression from (potentially tenant-supplied) input with a
+/// bounded compiled-program size ([`REGEX_SIZE_LIMIT`]).
+///
+/// This is the single sanctioned entry point for compiling any pattern that
+/// originates from an Ingress annotation, `HTTPRoute`/`GRPCRoute` match, or CRD
+/// field. Bare `regex::Regex::new` on such input is banned by
+/// `scripts/check-bounded-regex.sh` because the crate default (10 MB) is a
+/// memory-exhaustion DoS vector — see [`REGEX_SIZE_LIMIT`].
+///
+/// # Errors
+/// Returns [`regex::Error`] if `pattern` is invalid or its compiled program would
+/// exceed [`REGEX_SIZE_LIMIT`].
+#[must_use = "the compiled Regex is the result; dropping it discards the compile work"]
+pub fn compile_bounded(pattern: &str) -> Result<regex::Regex, regex::Error> {
+    regex::RegexBuilder::new(pattern)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .build()
 }
 
 /// One entry in the cold wire side-table: `(path_pattern, kind, entry)`.
@@ -581,8 +610,12 @@ impl HostRouterBuilder {
                     Arc::clone(e),
                 ));
             }
-            // RegexSet::new already validates the pattern; the second compile is redundant.
-            let set = RegexSet::new([&pattern])?;
+            // RegexSet::new already validates the pattern; the second compile is
+            // redundant. Bounded to REGEX_SIZE_LIMIT so a tenant pattern cannot force
+            // an oversized compiled program at the matcher (parity with compile_bounded).
+            let set = RegexSetBuilder::new([&pattern])
+                .size_limit(REGEX_SIZE_LIMIT)
+                .build()?;
             let frozen = sort_and_freeze(entries);
             compiled_regex_routes.push((set, frozen));
         }
@@ -648,6 +681,30 @@ mod tests {
     use super::*;
     use crate::routing::tests::*;
     use std::sync::Arc;
+
+    #[test]
+    fn compile_bounded_accepts_ordinary_pattern() {
+        let re = compile_bounded(r"^/api/v\d+/.*$").expect("valid pattern compiles");
+        assert!(re.is_match("/api/v2/users"));
+    }
+
+    #[test]
+    fn compile_bounded_rejects_oversized_program() {
+        // A large bounded-repetition pattern compiles to a program far exceeding
+        // REGEX_SIZE_LIMIT; the bounded builder must reject it rather than allocate.
+        let hostile = format!(r"(?:a{{1000}}){{1000}}{}", "b".repeat(10));
+        assert!(
+            compile_bounded(&hostile).is_err(),
+            "oversized pattern must be rejected by the size limit"
+        );
+    }
+
+    #[test]
+    fn compile_path_regex_is_bounded() {
+        // compile_path_regex routes through compile_bounded, so it enforces the same cap.
+        let hostile = format!(r"(?:a{{1000}}){{1000}}{}", "c".repeat(10));
+        assert!(compile_path_regex(&hostile).is_err());
+    }
 
     #[test]
     fn wildcard_host_multi_label_matches() {
