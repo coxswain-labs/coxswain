@@ -1,0 +1,57 @@
+---
+# GEP-1713 `ListenerSetAllowedRoutesSupportedKinds` (#515). Mirrors the upstream
+# v1.6.0 conformance fixture
+# (gateway-api/conformance/tests/listenerset-allowed-routes-supported-kinds.yaml):
+# a ListenerSet TLS-passthrough listener whose `allowedRoutes.kinds` is
+# restricted to a kind that does NOT match its protocol (`HTTPRoute` on a `TLS`
+# listener, which only ever carries `TLSRoute`) must report
+# `ResolvedRefs=False/InvalidRouteKinds` — this is asserted purely from the
+# listener's own config, no route needs to attach. A sibling listener with the
+# CORRECT kind (`TLSRoute`) is the happy-path pair: `ResolvedRefs=True`.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  allowedListeners:
+    namespaces:
+      from: Same
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: team-ls
+spec:
+  parentRef:
+    name: coxswain-test
+  listeners:
+    - name: ls-bad-kind
+      port: 9001
+      protocol: TLS
+      hostname: "ls-bad-kind.local"
+      tls:
+        mode: Passthrough
+      allowedRoutes:
+        namespaces:
+          from: Same
+        kinds:
+          - kind: HTTPRoute
+    - name: ls-good-kind
+      port: 9002
+      protocol: TLS
+      hostname: "ls-good-kind.local"
+      tls:
+        mode: Passthrough
+      allowedRoutes:
+        namespaces:
+          from: Same
+        kinds:
+          - kind: TLSRoute

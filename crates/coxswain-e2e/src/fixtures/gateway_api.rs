@@ -89,6 +89,26 @@ pub const LISTENERSET_DUPLICATE_NAME: &str = fixture!("listenerset_duplicate_nam
 /// hostname conflict to the parent Gateway and one that programs cleanly. The
 /// set must stay `Accepted=True`/`Programmed=True` despite the losing listener.
 pub const LISTENERSET_CONFLICT: &str = fixture!("listenerset_conflict.yaml");
+/// GEP-1713 `ListenerSetAllowedRoutesCrossNamespace` (#515), primary namespace
+/// side: a Gateway + ListenerSet `team-ls` with two listeners, `ls-same`
+/// (`allowedRoutes.namespaces: Same`, the ListenerSet's OWN namespace) and
+/// `ls-all` (`allowedRoutes.namespaces: All`). Pair with
+/// [`LISTENERSET_XNS_TENANT`] applied to a separate namespace.
+pub const LISTENERSET_XNS_ROUTE: &str = fixture!("listenerset_xns_route.yaml");
+/// GEP-1713 `ListenerSetAllowedRoutesCrossNamespace` (#515), tenant namespace
+/// side: two HTTPRoutes targeting `team-ls`'s listeners by `sectionName`.
+/// `xns-route-same` (targets `ls-same`) must be rejected
+/// (`Accepted=False/NotAllowedByListeners`); `xns-route-all` (targets
+/// `ls-all`) must be accepted. Requires `TESTNS` substitution.
+pub const LISTENERSET_XNS_TENANT: &str = fixture!("listenerset_xns_tenant.yaml");
+/// GEP-1713 `ListenerSetAllowedRoutesSupportedKinds` (#515): a ListenerSet with
+/// two TLS-passthrough listeners — `ls-bad-kind` restricts `allowedRoutes.kinds`
+/// to `HTTPRoute` (incompatible with its `TLS` protocol, which only ever
+/// carries `TLSRoute`) and must report `ResolvedRefs=False/InvalidRouteKinds`;
+/// `ls-good-kind` restricts to the matching `TLSRoute` kind and must report
+/// `ResolvedRefs=True`. Asserted purely from listener config — no route needs
+/// to attach.
+pub const LISTENERSET_KIND_RESTRICTION: &str = fixture!("listenerset_kind_restriction.yaml");
 /// HTTPRoute backend using `kubernetes.io/h2c` app protocol.
 pub const GATEWAY_APP_PROTOCOL_H2C: &str = fixture!("gateway_app_protocol_h2c.yaml");
 /// BackendTLSPolicy test: Gateway + HTTPRoute + ConfigMap CA + policy targeting the TLS echo Service.

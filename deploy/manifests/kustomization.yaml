@@ -29,6 +29,7 @@ resources:
   - crds/basicauths.yaml
   - crds/requestsizelimits.yaml
   - crds/compressions.yaml
+  - crds/coxswainingressclassparameters.yaml
   - gateway-class.yaml
   - ingress-class.yaml
   - vap-ingress-annotations.yaml

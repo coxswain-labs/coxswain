@@ -1,6 +1,7 @@
 .cargo/config.toml
-.claude/
+.claude/*
 !.claude/skills/
+!.claude/CLAUDE.md
 .idea/
 .venv/
 .wip/

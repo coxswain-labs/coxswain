@@ -24,6 +24,7 @@ jobs:
       code: ${{ steps.filter.outputs.code }}
       parity: ${{ steps.filter.outputs.parity }}
       stability: ${{ steps.filter.outputs.stability }}
+      crd_manifests: ${{ steps.filter.outputs.crd_manifests }}
       anti_drift: ${{ steps.filter.outputs.anti_drift }}
     steps:
       - uses: actions/checkout@v6
@@ -46,6 +47,12 @@ jobs:
             stability:
               - 'crates/**/src/**'
               - 'scripts/check-public-types-stability.sh'
+              - '.github/workflows/ci.yml'
+            crd_manifests:
+              - 'deploy/manifests/crds/**'
+              - 'charts/coxswain/crds/**'
+              - '.gateway-api-version'
+              - 'scripts/check-crd-kubeconform.sh'
               - '.github/workflows/ci.yml'
             anti_drift:
               - 'crates/**'
@@ -170,6 +177,16 @@ jobs:
       - uses: actions/checkout@v6
       - name: Check every public type carries #[non_exhaustive] or an open rationale
         run: bash scripts/check-public-types-stability.sh
+
+  crd-kubeconform:
+    name: crd-kubeconform
+    needs: changes
+    if: needs.changes.outputs.crd_manifests == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Shipped CRDs + pinned upstream Gateway API CRDs pass kubeconform -strict
+        run: bash scripts/check-crd-kubeconform.sh
 
   anti-drift:
     name: anti-drift
