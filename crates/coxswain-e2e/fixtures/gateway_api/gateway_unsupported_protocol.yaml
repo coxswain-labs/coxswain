@@ -1,0 +1,50 @@
+# Gateway listener protocol validation (#517).
+#
+# Gateway API `GatewayListenerUnsupportedProtocol`: a listener whose protocol is
+# not one coxswain routes (HTTP/HTTPS/TLS) gets `Accepted=False,
+# reason=UnsupportedProtocol` with empty `supportedKinds`. The Gateway rolls up
+# to `Accepted` reason `ListenersNotValid` — status `False` when EVERY listener
+# is unsupported, `True` when at least one listener is still valid.
+#
+# Two Gateways:
+#   - `coxswain-all-bad` — a single unsupported-protocol listener → Gateway
+#     Accepted=False/ListenersNotValid, listener Accepted=False/UnsupportedProtocol.
+#   - `coxswain-mixed`   — one valid HTTP listener + one unsupported → Gateway
+#     Accepted=True/ListenersNotValid, HTTP listener Accepted=True, bad listener
+#     Accepted=False/UnsupportedProtocol.
+#
+# Placeholders: none (status-only; no traffic).
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-all-bad
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: invalid
+      port: 8081
+      protocol: FOOBAR
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-mixed
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: invalid
+      port: 8082
+      protocol: FOOBAR
+      allowedRoutes:
+        namespaces:
+          from: Same

@@ -21,7 +21,9 @@ use coxswain_reflector::gw_types::v::gateways::{
     GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::status::{FrontendValidationOutcome, ListenerInfo, ListenerReadiness};
+use coxswain_reflector::status::{
+    FrontendValidationOutcome, ListenerInfo, ListenerReadiness, is_supported_listener_protocol,
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 
 /// Conditions whose `type` starts with this prefix are owned by the
@@ -84,6 +86,12 @@ pub(crate) fn listener_route_kind_info(
     listener: &GatewayListeners,
 ) -> (bool, Vec<GatewayStatusListenersSupportedKinds>) {
     const GW_GROUP: &str = "gateway.networking.k8s.io";
+    // GatewayListenerUnsupportedProtocol (#517): a listener whose protocol is
+    // not one coxswain routes supports no route kinds — the conformance suite
+    // asserts `supportedKinds: []` on the unaccepted listener.
+    if !is_supported_listener_protocol(&listener.protocol) {
+        return (false, Vec::new());
+    }
     let http_route_kind = || GatewayStatusListenersSupportedKinds {
         group: Some(GW_GROUP.to_string()),
         kind: "HTTPRoute".to_string(),
@@ -141,9 +149,11 @@ pub(crate) fn listener_route_kind_info(
 /// conditions plus `attached_routes` and `supported_kinds`.
 ///
 /// Conditions are derived from:
-/// - **Accepted**: always `True, reason=Accepted` (listener-level acceptance
-///   is granted at the Gateway level today; per-listener `Accepted=False`
-///   reasons like `UnsupportedProtocol` are not yet implemented).
+/// - **Accepted**: `True, reason=Accepted` unless the listener's frontend CA
+///   failed (`NoValidCACertificate`), it uses an unsupported protocol/mode
+///   (`UnsupportedValue`), or it declares a protocol coxswain does not route
+///   (`UnsupportedProtocol`, #517). See [`listener_is_accepted`] for the
+///   Gateway-level rollup that mirrors this.
 /// - **ResolvedRefs**: `False, reason=InvalidRouteKinds` if any
 ///   `allowedRoutes.kinds` is unsupported; else `True, reason=ResolvedRefs`
 ///   if the listener's TLS outcome is healthy; else
@@ -264,6 +274,14 @@ pub(crate) fn listener_condition_triplet(
             ListenerConditionReason::UnsupportedValue.to_string(),
             message.as_str(),
         )
+    } else if let ListenerReadiness::UnsupportedProtocol { message } = &outcome {
+        // GatewayListenerUnsupportedProtocol (#517): the listener's protocol is
+        // not one coxswain routes.
+        (
+            "False",
+            ListenerConditionReason::UnsupportedProtocol.to_string(),
+            message.as_str(),
+        )
     } else {
         ("True", ListenerConditionReason::Accepted.to_string(), "")
     };
@@ -326,4 +344,31 @@ pub(crate) fn listener_condition_triplet(
             now.clone(),
         ),
     ]
+}
+
+/// Whether one listener's `Accepted` condition is `True`, given its health
+/// snapshot and `allowedRoutes.kinds` validity.
+///
+/// Mirrors the `accepted_status` computation in [`listener_condition_triplet`]
+/// (a listener is not accepted when its frontend CA failed, or its readiness is
+/// [`ListenerReadiness::Unsupported`] / [`ListenerReadiness::UnsupportedProtocol`])
+/// so the Gateway-level `Accepted` rollup and the per-listener condition can
+/// never disagree. `has_invalid_kinds` does **not** flip `Accepted` — it drives
+/// `ResolvedRefs` only — so it is intentionally not consulted here.
+///
+/// Used by both status writers to compute the Gateway/ListenerSet `Accepted`
+/// condition: `False` iff **every** listener is unaccepted, and reason
+/// `ListenersNotValid` iff **any** listener is unaccepted
+/// (`GatewayListenerUnsupportedProtocol`, #517).
+#[must_use]
+pub(crate) fn listener_is_accepted(info: Option<&ListenerInfo>) -> bool {
+    let readiness = info.map(|i| i.readiness.clone()).unwrap_or_default();
+    let frontend_ca_failed = info
+        .map(|i| &i.frontend_outcome)
+        .is_some_and(FrontendValidationOutcome::is_failed);
+    !(frontend_ca_failed
+        || matches!(
+            readiness,
+            ListenerReadiness::Unsupported { .. } | ListenerReadiness::UnsupportedProtocol { .. }
+        ))
 }

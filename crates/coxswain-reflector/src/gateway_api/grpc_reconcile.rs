@@ -156,11 +156,14 @@ pub(super) fn reconcile(
             Arc::from(format!("grpcroute/{route_ns}/{route_name}:{rule_index}"));
         let rule_filters = rule.filters.as_deref().unwrap_or(&[]);
 
-        // GRPCRoute has no RequestRedirect — every rule resolves backends.
-        let backend_refs = match rule.backend_refs.as_deref() {
-            Some(b) if !b.is_empty() => b,
-            _ => continue,
-        };
+        // GRPCRoute has no RequestRedirect — every rule resolves backends. A
+        // rule with omitted or empty `backendRefs` is not skipped: like HTTPRoute
+        // (see reconcile.rs), it routes with a distinct 500 rather than falling
+        // through to a 404. GRPCRoute has no direct conformance analog of
+        // `HTTPRouteNoBackendRefs`, so this is defensive parity — an empty slice
+        // flows through to an empty `BackendGroup` whose `error_status` is 500.
+        let backend_refs: &[GrpcRouteRulesBackendRefs] =
+            rule.backend_refs.as_deref().unwrap_or(&[]);
 
         let resolved = resolve_weighted_backends(backend_refs, route_ns, slices, services, grants);
         let group_name = backend_group_name(backend_refs, route_ns);
@@ -1211,6 +1214,89 @@ mod tests {
             resolve_grpc_rate_limit(&[grpc_rate_limit_filter("absent")], "default", &store)
                 .is_none(),
             "missing CR must fail open (no rate limiting)"
+        );
+    }
+
+    /// A GRPCRoute attached to owned Gateway `default/gw` whose single rule
+    /// (matching every method) carries the given `backend_refs` verbatim.
+    fn grpc_route_with_backend_refs(
+        backend_refs: Option<Vec<GrpcRouteRulesBackendRefs>>,
+    ) -> GrpcRoute {
+        use crate::gw_types::v::grpcroutes::{GrpcRouteParentRefs, GrpcRouteRules, GrpcRouteSpec};
+        use kube::api::ObjectMeta;
+        GrpcRoute {
+            metadata: ObjectMeta {
+                name: Some("grpc-route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: GrpcRouteSpec {
+                parent_refs: Some(vec![GrpcRouteParentRefs {
+                    name: "gw".to_string(),
+                    ..Default::default()
+                }]),
+                hostnames: None,
+                rules: Some(vec![GrpcRouteRules {
+                    backend_refs,
+                    ..Default::default()
+                }]),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Reconcile `route` against empty stores + a single listener on `default/gw`
+    /// (port 80, any hostname) and return the built routing table.
+    fn reconcile_grpc_route_only(route: &GrpcRoute) -> coxswain_core::routing::GatewayRoutingTable {
+        use crate::gateway_api::tests::{default_owned, make_listener_info};
+        use crate::tests::fixtures::{
+            empty_ip_access_store, empty_rate_limit_store, empty_svc_store,
+        };
+        let listener_info = make_listener_info("default", "gw", &[("l1", "", 80)]);
+        let mut builder = GatewayRoutingTableBuilder::new();
+        reconcile(
+            route,
+            &crate::tests::fixtures::slice_store(vec![]),
+            &empty_svc_store(),
+            &default_owned(),
+            &HashSet::new(),
+            GrpcRouteResolution {
+                listener_info: &listener_info,
+                policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
+                ip_access: &empty_ip_access_store(),
+            },
+            &mut builder,
+        );
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn grpc_omitted_backend_refs_installs_500() {
+        // Defensive parity with HTTPRoute (no gRPC conformance analog): a rule
+        // with omitted backendRefs routes with a distinct 500, not a 404.
+        use crate::gateway_api::tests::ctx_get;
+        let table = reconcile_grpc_route_only(&grpc_route_with_backend_refs(None));
+        assert!(
+            matches!(
+                table.find(80, "any.example.com", "/", &ctx_get()),
+                coxswain_core::routing::RouteOutcome::Error(500)
+            ),
+            "gRPC rule with omitted backendRefs must resolve to Error(500)"
+        );
+    }
+
+    #[test]
+    fn grpc_empty_backend_refs_installs_500() {
+        use crate::gateway_api::tests::ctx_get;
+        let table = reconcile_grpc_route_only(&grpc_route_with_backend_refs(Some(vec![])));
+        assert!(
+            matches!(
+                table.find(80, "any.example.com", "/", &ctx_get()),
+                coxswain_core::routing::RouteOutcome::Error(500)
+            ),
+            "gRPC rule with empty backendRefs must resolve to Error(500)"
         );
     }
 }

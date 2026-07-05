@@ -21,7 +21,7 @@ use tokio::sync::watch;
 pub use coxswain_core::listener_status::{
     BackendClientCertOutcome, ConflictReason, FrontendValidationOutcome, FrontendValidationStatus,
     GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerSource, ListenerStatusKey,
-    RouteNamespaceSet, SharedGatewayListenerStatus,
+    RouteNamespaceSet, SharedGatewayListenerStatus, is_supported_listener_protocol,
 };
 
 /// Status record for one (HTTPRoute/GRPCRoute/TLSRoute, parent Gateway) pair.

@@ -1,0 +1,133 @@
+# Gateway frontend client-certificate mTLS, per-port override — GEP-91 (#86, #517).
+#
+# Two HTTPS listeners on DIFFERENT ports, each validating client certs against a
+# DIFFERENT CA:
+#   - listener A (default port) uses spec.tls.frontend.default.validation → CA A.
+#   - listener B (second port) is overridden by
+#     spec.tls.frontend.perPort[port=B].tls.validation → CA B.
+#
+# This guards the per-port enforcement regression from #517: a client cert signed
+# by the DEFAULT CA (A) must be REJECTED on listener B, proving B enforces its own
+# per-port CA (B) and not the gateway-wide default.
+#
+# Placeholders:
+#   HOSTNAME_A / HOSTNAME_B — listener + HTTPRoute hostnames
+#   PORT_B                  — the second (per-port-overridden) HTTPS listener port
+#   SECRET_A / SECRET_B     — kubernetes.io/tls server-cert Secret names
+#   TLS_CRT_A_B64 / TLS_KEY_A_B64 — base64 PEM server cert/key for listener A
+#   TLS_CRT_B_B64 / TLS_KEY_B_B64 — base64 PEM server cert/key for listener B
+#   CA_A_PEM / CA_B_PEM     — PEM CA certificates stored verbatim in ConfigMaps
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${SECRET_A}
+type: kubernetes.io/tls
+data:
+  tls.crt: ${TLS_CRT_A_B64}
+  tls.key: ${TLS_KEY_A_B64}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${SECRET_B}
+type: kubernetes.io/tls
+data:
+  tls.crt: ${TLS_CRT_B_B64}
+  tls.key: ${TLS_KEY_B_B64}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-ca-a
+data:
+  ca.crt: |
+    ${CA_A_PEM}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-ca-b
+data:
+  ca.crt: |
+    ${CA_B_PEM}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-frontend-mtls-perport
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: https-a
+      port: ${GATEWAY_HTTPS_PORT}
+      protocol: HTTPS
+      hostname: "${HOSTNAME_A}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: ${SECRET_A}
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: https-b
+      port: ${PORT_B}
+      protocol: HTTPS
+      hostname: "${HOSTNAME_B}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: ${SECRET_B}
+      allowedRoutes:
+        namespaces:
+          from: Same
+  # GEP-91 frontend validation: gateway-wide default (CA A) plus a per-port
+  # override for listener B's port (CA B).
+  tls:
+    frontend:
+      default:
+        validation:
+          caCertificateRefs:
+            - group: ""
+              kind: ConfigMap
+              name: frontend-ca-a
+      perPort:
+        - port: ${PORT_B}
+          tls:
+            validation:
+              caCertificateRefs:
+                - group: ""
+                  kind: ConfigMap
+                  name: frontend-ca-b
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: frontend-mtls-route-a
+spec:
+  parentRefs:
+    - name: coxswain-frontend-mtls-perport
+      sectionName: https-a
+  hostnames:
+    - "${HOSTNAME_A}"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: frontend-mtls-route-b
+spec:
+  parentRefs:
+    - name: coxswain-frontend-mtls-perport
+      sectionName: https-b
+  hostnames:
+    - "${HOSTNAME_B}"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000

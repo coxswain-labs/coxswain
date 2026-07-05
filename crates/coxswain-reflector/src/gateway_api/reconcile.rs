@@ -240,10 +240,15 @@ impl GatewayApiReconciler {
             ) = if has_redirect {
                 (None, None, None)
             } else {
-                let backend_refs = match rule.backend_refs.as_deref() {
-                    Some(b) if !b.is_empty() => b,
-                    _ => continue,
-                };
+                // A rule with omitted or empty `backendRefs` is not skipped: the
+                // Gateway API requires it to route with a distinct 500 response
+                // (conformance `HTTPRouteNoBackendRefs`), not fall through to a
+                // 404. Feeding an empty slice through the normal pipeline yields
+                // an empty `BackendGroup` whose `error_status` resolves to 500
+                // below (no backend ref failed to *resolve* — there simply were
+                // none — so `ResolvedRefs` stays True).
+                let backend_refs: &[HttpRouteRulesBackendRefs] =
+                    rule.backend_refs.as_deref().unwrap_or(&[]);
 
                 let resolved =
                     resolve_weighted_backends(backend_refs, route_ns, slices, services, grants);
@@ -918,8 +923,20 @@ impl GatewayApiReconciler {
                         other => other,
                     }
                 }
-            } else if listener.protocol != "HTTPS" {
+            } else if listener.protocol == "HTTP" {
+                // Cleartext HTTP: nothing to resolve, ready by default.
                 ListenerReadiness::NotApplicable
+            } else if listener.protocol != "HTTPS" {
+                // Not TLS (handled above), not HTTP, not HTTPS → a protocol
+                // coxswain does not route. GatewayListenerUnsupportedProtocol
+                // (#517): the listener is not Accepted and its owning Gateway
+                // rolls up to `ListenersNotValid`.
+                ListenerReadiness::UnsupportedProtocol {
+                    message: format!(
+                        "listener protocol {:?} is not supported; coxswain routes HTTP, HTTPS, and TLS",
+                        listener.protocol
+                    ),
+                }
             } else if vip_pending {
                 // Same VIP race as TLS listeners: defer until the internal port is
                 // known so Programmed=True is not published before kube-proxy NAT
@@ -2010,6 +2027,89 @@ mod tests {
                 coxswain_core::routing::RouteOutcome::Error(500)
             ),
             "missing Service backendRef must resolve to 500"
+        );
+    }
+
+    /// A route whose single rule matches `/` on `example.com` but carries the
+    /// given `backend_refs` verbatim — used to exercise the omitted vs empty
+    /// `backendRefs` cases (`HTTPRouteNoBackendRefs`).
+    fn route_with_backend_refs(
+        ns: &str,
+        backend_refs: Option<Vec<HttpRouteRulesBackendRefs>>,
+    ) -> HttpRoute {
+        HttpRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                parent_refs: default_parents(),
+                hostnames: Some(vec!["example.com".to_string()]),
+                rules: Some(vec![HttpRouteRules {
+                    backend_refs,
+                    ..Default::default()
+                }]),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Reconcile `route` against empty stores and return the built routing table.
+    fn reconcile_route_only(route: &HttpRoute) -> coxswain_core::routing::GatewayRoutingTable {
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            route,
+            &slice_store(vec![]),
+            &empty_svc_store(),
+            &default_owned(),
+            &HashSet::new(),
+            crate::gateway_api::RouteResolution {
+                listener_info: &no_listener_info(),
+                policy_index: &HashMap::new(),
+                backend_policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
+                path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
+            },
+            &mut builder,
+        );
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn omitted_backend_refs_installs_500() {
+        // Rule with `backendRefs` entirely omitted (None). Gateway API
+        // `HTTPRouteNoBackendRefs`: must route with a distinct 500, not fall
+        // through to a 404 (which is what skipping the rule would produce).
+        let table = reconcile_route_only(&route_with_backend_refs("default", None));
+        assert!(
+            matches!(
+                table.find(80, "example.com", "/", &ctx_get()),
+                coxswain_core::routing::RouteOutcome::Error(500)
+            ),
+            "rule with omitted backendRefs must resolve to Error(500), not NoPath/404"
+        );
+    }
+
+    #[test]
+    fn empty_backend_refs_installs_500() {
+        // Rule with `backendRefs: []` (present but empty) — same 500 requirement
+        // as the omitted case.
+        let table = reconcile_route_only(&route_with_backend_refs("default", Some(vec![])));
+        assert!(
+            matches!(
+                table.find(80, "example.com", "/", &ctx_get()),
+                coxswain_core::routing::RouteOutcome::Error(500)
+            ),
+            "rule with empty backendRefs must resolve to Error(500), not NoPath/404"
         );
     }
 

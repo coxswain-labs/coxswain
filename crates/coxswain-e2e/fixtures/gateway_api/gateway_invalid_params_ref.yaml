@@ -1,0 +1,46 @@
+# Shared-pool Gateway `parametersRef` validation (#517).
+#
+# Gateway API `GatewayInvalidParametersRef`: a Gateway whose
+# `spec.infrastructure.parametersRef` targets a kind this implementation does not
+# support must get `Accepted=False, reason=InvalidParameters`. Coxswain only
+# recognizes `gateway.coxswain-labs.dev/CoxswainGatewayParameters` (dedicated
+# mode); any other kind reaching the shared-pool writer is rejected.
+#
+# Two Gateways:
+#   - `coxswain-clean`      — no parametersRef → Accepted=True (happy).
+#   - `coxswain-bad-params` — a foreign parametersRef kind → Accepted=False (sad).
+#
+# Placeholders: none (status-only; no traffic).
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-clean
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-bad-params
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    parametersRef:
+      group: invalid.example.com
+      kind: NotAThing
+      name: does-not-exist
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
