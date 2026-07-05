@@ -100,11 +100,37 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
         ListenerReadiness::Unsupported { message } => {
             (p::ListenerReadiness::Unsupported, message.clone())
         }
+        // #517: a protocol coxswain does not route. The proxy makes no functional
+        // distinction between this and `Unsupported` (both mean "this listener
+        // serves no traffic"); the Gateway status *reason* (`UnsupportedProtocol`
+        // vs `UnsupportedValue`) is written to Kubernetes by the controller, not
+        // carried on the wire — so reuse the existing `Unsupported` wire value
+        // rather than growing the proto for a proxy-invisible distinction.
+        ListenerReadiness::UnsupportedProtocol { message } => {
+            (p::ListenerReadiness::Unsupported, message.clone())
+        }
         ListenerReadiness::TlsTerminate => (p::ListenerReadiness::TlsTerminate, String::new()),
-        &_ => unreachable!(
-            "invariant: all ListenerReadiness variants handled; \
-             add a new arm when the core type gains a variant"
-        ),
+        // A shared-mode HTTPS/TLS listener still waiting for its VIP internal port
+        // (#472). It has no dedicated wire value: the distinction is proxy-invisible
+        // and transient (the next rebuild replaces it with the resolved outcome).
+        // Encode as `Unsupported` so the proxy's `derive_gateway_specs` treats it as
+        // an HTTPS listener (its `_ => Https` default) — VipPending is *always* an
+        // HTTPS/TLS listener, so degrading it to the plaintext-HTTP `NotApplicable`
+        // would bind the wrong protocol during the transient window.
+        ListenerReadiness::VipPending => (p::ListenerReadiness::Unsupported, String::new()),
+        // Data-plane safety: `ListenerReadiness` is a `#[non_exhaustive]` core
+        // enum, so this wildcard is reachable the moment a *future* variant is
+        // added. A panic here would take down the controller's discovery snapshot
+        // push and stall the whole data plane, so degrade an unmapped readiness to
+        // `NotApplicable` — the safe "proxy does nothing special with this
+        // listener" default — and log it instead.
+        other => {
+            tracing::warn!(
+                readiness = ?other,
+                "unmapped ListenerReadiness in discovery wire encode; degrading to NotApplicable"
+            );
+            (p::ListenerReadiness::NotApplicable, String::new())
+        }
     };
     p::ListenerInfo {
         readiness: outcome as i32,
@@ -261,6 +287,34 @@ mod tests {
             passthrough_info,
         );
 
+        // #517: a listener whose spec `protocol` coxswain does not route resolves to
+        // `UnsupportedProtocol`. Encoding it previously hit an `unreachable!()`
+        // wildcard in `listener_info_to_wire` and crashed the controller's discovery
+        // serializer, starving the proxy of every snapshot. It has no dedicated wire
+        // value: the proxy makes no functional distinction, so it encodes as the
+        // existing `Unsupported` and decodes back to `Unsupported` (lossy by design —
+        // the k8s status reason is written by the controller, never carried here).
+        let mut unsupported_proto_info = ListenerInfo::default();
+        unsupported_proto_info.readiness = ListenerReadiness::UnsupportedProtocol {
+            message: "protocol \"FOO\" is not supported".to_string(),
+        };
+        unsupported_proto_info.port = 5555;
+        status.listeners.insert(
+            ListenerStatusKey::gateway("unsupported-protocol"),
+            unsupported_proto_info,
+        );
+
+        // #472: a shared-mode HTTPS listener still awaiting its VIP internal port
+        // resolves to `VipPending`. Like `UnsupportedProtocol` it has no dedicated
+        // wire value; it encodes as `Unsupported` (→ HTTPS on the proxy) and must
+        // not hit the panic the old `unreachable!()` wildcard would have raised.
+        let mut vip_pending_info = ListenerInfo::default();
+        vip_pending_info.readiness = ListenerReadiness::VipPending;
+        vip_pending_info.port = 6666;
+        status
+            .listeners
+            .insert(ListenerStatusKey::gateway("vip-pending"), vip_pending_info);
+
         // GEP-1713: a listener contributed by a ListenerSet shares the name "http"
         // with the Gateway's own listener but lives under a distinct ListenerSource
         // and on a different port. It must survive the round-trip as its own entry.
@@ -292,7 +346,7 @@ mod tests {
         let h2 = map2
             .get(&ObjectKey::new("default", "my-gw"))
             .expect("key found");
-        assert_eq!(h2.listeners.len(), 6, "listener count preserved");
+        assert_eq!(h2.listeners.len(), 8, "listener count preserved");
         let gw_http = ListenerStatusKey::gateway("http");
         let gw_https = ListenerStatusKey::gateway("https");
         assert_eq!(
@@ -334,6 +388,24 @@ mod tests {
                 ListenerReadiness::TlsPassthrough
             ),
             "TlsPassthrough outcome preserved"
+        );
+        // #517: `UnsupportedProtocol` encodes without panicking and decodes to
+        // `Unsupported` (no dedicated wire value), message preserved.
+        assert!(
+            matches!(
+                &h2.listeners[&ListenerStatusKey::gateway("unsupported-protocol")].readiness,
+                ListenerReadiness::Unsupported { message }
+                    if message == "protocol \"FOO\" is not supported"
+            ),
+            "UnsupportedProtocol encodes as Unsupported + message preserved"
+        );
+        // #472: VipPending encodes without panicking and decodes to Unsupported.
+        assert!(
+            matches!(
+                h2.listeners[&ListenerStatusKey::gateway("vip-pending")].readiness,
+                ListenerReadiness::Unsupported { .. }
+            ),
+            "VipPending encodes as Unsupported (no dedicated wire value)"
         );
         // GEP-1713: the ListenerSet-sourced "http" is a distinct entry from the
         // Gateway's own "http", proving (source, name) keying survives the wire.
