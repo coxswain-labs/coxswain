@@ -40,6 +40,7 @@
 
 use super::{apply, params, render, render_shared, status, vip};
 use async_trait::async_trait;
+use coxswain_core::Shared;
 use coxswain_core::crd::{CoxswainGatewayParameters, ServiceType};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::ListenerSet;
@@ -66,7 +67,7 @@ use kube::{
 };
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash as _, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -186,6 +187,11 @@ pub struct OperatorConfig {
     /// Service type for the per-Gateway shared-mode VIP Services (#472).
     /// `LoadBalancer` by default so each Gateway gets its own external address.
     pub shared_vip_service_type: ServiceType,
+    /// Shared handle for publishing definitively-failed static-address VIP
+    /// provisioning to the status writer (#531/#533). Constructed in
+    /// `coxswain-bin` and cloned into the `Controller` too, so the single
+    /// serialized VIP reconciler is the writer and the status writer the reader.
+    pub vip_failures: Shared<HashSet<ObjectKey>>,
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
@@ -272,6 +278,12 @@ pub(super) struct ReconcileContext {
     /// pass (#472). Per-Gateway reconciles only *signal* here — they never
     /// provision VIP Services themselves, so the allocation stays single-writer.
     pub(super) vip_trigger: Arc<tokio::sync::Notify>,
+    /// Shared-mode Gateways whose static-address VIP provisioning has
+    /// definitively failed (all requested clusterIPs rejected). Written by
+    /// [`run_vip_reconciler`] each pass, read by the shared-pool status writer so
+    /// it settles their `AddressNotUsable` while holding still-provisioning
+    /// Gateways at `Pending` (#531/#533).
+    pub(super) vip_failures: Shared<HashSet<ObjectKey>>,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
 }
 
@@ -520,6 +532,7 @@ impl BackgroundService for Operator {
             shared_proxy_selector: self.config.shared_proxy_selector.clone(),
             shared_vip_service_type: self.config.shared_vip_service_type,
             vip_trigger: Arc::new(tokio::sync::Notify::new()),
+            vip_failures: self.config.vip_failures.clone(),
             last_hashes: Mutex::new(HashMap::new()),
         });
 

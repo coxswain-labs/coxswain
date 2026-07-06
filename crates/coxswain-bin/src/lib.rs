@@ -148,6 +148,10 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     let discovery_rebuild_rx = route_status.subscribe();
     let node_registry = coxswain_core::node_registry::SharedNodeRegistry::new();
     let node_registry_for_agg = node_registry.clone();
+    // Definitively-failed static-address VIP set (#533): written by the operator's
+    // VIP reconciler, read by the status writer so a Gateway still provisioning
+    // its VIP is held Pending rather than briefly reporting AddressNotUsable.
+    let vip_failures = Shared::<HashSet<ObjectKey>>::new();
     let discovery_source = coxswain_discovery::SnapshotSource {
         ingress: status_writer.outputs.ingress_routes.clone(),
         gateway: status_writer.outputs.gateway_routes.clone(),
@@ -187,7 +191,12 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         },
     ));
 
-    server.add_service(background_service("controller", status_writer.controller));
+    server.add_service(background_service(
+        "controller",
+        status_writer
+            .controller
+            .with_vip_failures(vip_failures.clone()),
+    ));
     server.add_service(background_service("reconciler", status_writer.reconciler));
 
     server.add_service(background_service(
@@ -222,6 +231,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             controller_namespace: args.common.pod_namespace.clone(),
             shared_proxy_selector: args.controller.shared_proxy_selector.clone(),
             shared_vip_service_type: args.controller.shared_vip_service_type,
+            vip_failures,
         }),
     ));
 

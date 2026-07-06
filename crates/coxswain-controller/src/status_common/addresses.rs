@@ -97,6 +97,28 @@ impl StaticAddressOutcome {
             feature_engaged: false,
         }
     }
+
+    /// Whether the `Programmed` override is the provisioning-sensitive
+    /// `AddressNotUsable` — an empty/mismatched `resolved` set — as opposed to a
+    /// deterministic `Invalid` (unsupported address *type*). Only the former is
+    /// ambiguous between "VIP still provisioning" and "settled unusable": both
+    /// present identically (no bound address) until the VIP reconciler either
+    /// binds the requested clusterIP or confirms it cannot (#533 provisioning gap).
+    #[must_use]
+    pub(crate) fn is_address_not_usable(&self) -> bool {
+        self.programmed_override == Some(GatewayConditionReason::AddressNotUsable)
+    }
+
+    /// Downgrade a premature `AddressNotUsable` to "still provisioning": clear the
+    /// `Programmed` override and any gated addresses so the shared status writer's
+    /// convergence gate holds `Programmed` at `gen-1` (`Pending`) instead of
+    /// stamping a settled negative while the VIP is still being provisioned. Only
+    /// applied while the VIP is unresolved AND the operator has not recorded a
+    /// definitive provisioning failure for the Gateway.
+    pub(crate) fn hold_pending_address(&mut self) {
+        self.programmed_override = None;
+        self.status_addresses.clear();
+    }
 }
 
 /// One classified `spec.addresses` entry: a supported type plus either a
@@ -274,6 +296,38 @@ mod tests {
             Some(GatewayConditionReason::UnsupportedAddress)
         );
         assert!(out.status_addresses.is_empty());
+    }
+
+    #[test]
+    fn address_not_usable_detected_and_downgradable() {
+        // Requested IP, nothing resolved yet → AddressNotUsable: the ambiguous
+        // "provisioning or settled?" case (#533).
+        let mut out = evaluate_static_addresses(&[req(Some("IPAddress"), Some("10.96.0.10"))], &[]);
+        assert!(out.is_address_not_usable());
+        assert_eq!(
+            out.programmed_override,
+            Some(GatewayConditionReason::AddressNotUsable)
+        );
+        out.hold_pending_address();
+        assert!(!out.is_address_not_usable());
+        assert!(out.programmed_override.is_none());
+        assert!(out.status_addresses.is_empty());
+    }
+
+    #[test]
+    fn invalid_type_is_not_address_not_usable() {
+        // Unsupported address *type* is a deterministic Invalid — never downgraded.
+        let out = evaluate_static_addresses(&[req(Some("test/fake"), Some("x"))], &[]);
+        assert!(!out.is_address_not_usable());
+    }
+
+    #[test]
+    fn usable_address_is_not_address_not_usable() {
+        let out = evaluate_static_addresses(
+            &[req(Some("IPAddress"), Some("10.96.0.10"))],
+            &[ip("10.96.0.10")],
+        );
+        assert!(!out.is_address_not_usable());
     }
 
     #[test]
