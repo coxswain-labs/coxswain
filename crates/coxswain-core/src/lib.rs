@@ -17,6 +17,7 @@ pub mod listener_status;
 pub mod naming;
 pub mod node_registry;
 pub mod ownership;
+pub mod publish_index;
 pub mod reference_grants;
 pub mod routing;
 pub mod shared;
@@ -32,5 +33,6 @@ pub use identity::{
 };
 pub use listener_status::SharedGatewayListenerStatus;
 pub use node_registry::{NodeEntry, NodeRegistry, NodeScope, SharedNodeRegistry};
+pub use publish_index::{PublishStamp, SharedGatewayPublishIndex};
 pub use shared::Shared;
 pub use source::RoutingSource;

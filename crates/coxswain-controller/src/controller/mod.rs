@@ -154,6 +154,12 @@ pub struct Controller {
     /// `Programmed` readiness gate (#531). `None` (tests/dev) disables the
     /// gate — today's address-only convergence behaviour.
     node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
+    /// Per-Gateway publish-sequence index (#531). Paired with `node_registry`:
+    /// the ack half of the `Programmed` gate — every connected shared-pool
+    /// node must have Ack'd a snapshot containing the Gateway's current
+    /// generation, not merely have its ports bound (pre-bound ports satisfy
+    /// the bind gate instantly while the config is still propagating).
+    publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
 }
 
 impl Controller {
@@ -178,6 +184,7 @@ impl Controller {
             vip_failures: Shared::new(),
             leadership_watch: None,
             node_registry: None,
+            publish_index: None,
         }
     }
 
@@ -211,6 +218,18 @@ impl Controller {
         registry: coxswain_core::node_registry::SharedNodeRegistry,
     ) -> Self {
         self.node_registry = Some(registry);
+        self
+    }
+
+    /// Wire the reflector's per-Gateway publish-sequence index (#531) so the
+    /// shared-mode `Programmed` gate also requires every connected proxy to
+    /// have Ack'd a snapshot containing the Gateway's current generation.
+    #[must_use]
+    pub fn with_publish_index(
+        mut self,
+        index: coxswain_core::publish_index::SharedGatewayPublishIndex,
+    ) -> Self {
+        self.publish_index = Some(index);
         self
     }
 
@@ -317,6 +336,7 @@ impl Controller {
             gateways: gateways_reader.clone(),
             vip_failures: self.vip_failures.clone(),
             node_registry: self.node_registry.clone(),
+            publish_index: self.publish_index.clone(),
         });
 
         // One re-drive channel per work-queue. Each is fed by the relevant
@@ -804,6 +824,9 @@ struct ReconcileContext {
     /// connected shared-pool node having bound the Gateway's VIP internal
     /// ports. `None` disables the gate (tests / dev).
     node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
+    /// Per-Gateway publish-sequence index (#531): the ack half of the
+    /// `Programmed` gate. `None` disables it (tests / dev).
+    publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
 }
 
 /// Error policy shared by every work-queue. The status reconcilers are
@@ -941,19 +964,46 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     // query for the steady-state majority of reconciles.
     let latched = gateway_programmed_at_current_gen(gw);
 
-    // Proxy-pool bind gate (#531): beyond the VIP address resolving, every
-    // connected shared-pool proxy node must have reported the VIP's internal
-    // ports bound — otherwise `Programmed=True` races real traffic into a
-    // not-yet-listening (or cert-less) port. All-connected-nodes quorum: the
-    // VIP load-balances across every pool member, so one unbound pod means
-    // real connections can black-hole. Zero connected nodes fails closed.
+    // Proxy-pool readiness gate (#531), two halves:
+    //
+    //  * Bind: every connected shared-pool proxy node must have reported the
+    //    VIP's internal ports bound — otherwise `Programmed=True` races real
+    //    traffic into a not-yet-listening port.
+    //  * Ack: every connected node must have Ack'd a snapshot containing this
+    //    Gateway's current generation (publish-sequence comparison). Bind
+    //    alone is instantly true when the ports were already bound for other
+    //    Gateways while this Gateway's routes/cert config is still
+    //    propagating — the `GatewayFrontendClientCertificateValidation` race.
+    //
+    // All-connected-nodes quorum: the VIP load-balances across every pool
+    // member, so one stale pod means real connections can black-hole or serve
+    // pre-update config. Zero connected nodes fails closed; a Gateway not yet
+    // stamped by the reflector (or stamped at an older generation) fails
+    // closed too.
     let (proxies_bound, proxy_pending_detail) = match &ctx.node_registry {
         Some(registry) if ctx.shared_vip_addressing && !latched => {
-            let bound = registry.all_shared_nodes_bound(&vip.internal_ports);
-            // Snapshot clone only on the unbound path, where the pending
+            let ports_bound = registry.all_shared_nodes_bound(&vip.internal_ports);
+            let snapshot_acked = match &ctx.publish_index {
+                Some(index) => index.get(&key).is_some_and(|stamp| {
+                    stamp.generation >= gw.metadata.generation.unwrap_or(0)
+                        && registry.all_shared_nodes_acked(stamp.seq)
+                }),
+                None => true,
+            };
+            let bound = ports_bound && snapshot_acked;
+            // Snapshot clone only on the held path, where the pending
             // message needs the per-node view.
-            let detail = (!bound && !awaiting_own_vip)
-                .then(|| proxy_bind_pending_detail(&registry.load(), &vip.internal_ports));
+            let detail = (!bound && !awaiting_own_vip).then(|| {
+                if ports_bound {
+                    format!(
+                        "waiting for all connected shared proxies to apply the routing \
+                         snapshot containing generation {}",
+                        gw.metadata.generation.unwrap_or(0)
+                    )
+                } else {
+                    proxy_bind_pending_detail(&registry.load(), &vip.internal_ports)
+                }
+            });
             (bound, detail)
         }
         // Latched, no registry (tests / dev), or per-Gateway addressing off

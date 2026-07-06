@@ -148,6 +148,11 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     // streams so proxy readiness reports land on the status-writing leader.
     // Bootstrap (SVID issuance) stays un-gated on every replica.
     let discovery_rebuild_rx = route_status.subscribe();
+    // Per-Gateway publish-sequence index (#531): stamped by the reconciler's
+    // rebuild loop, captured by the discovery server before every snapshot
+    // build, and consulted (with the node registry's acked sequences) by both
+    // Programmed status writers as the ack half of the readiness gate.
+    let publish_index = status_writer.reconciler.publish_index();
     let node_registry = coxswain_core::node_registry::SharedNodeRegistry::new();
     let node_registry_for_agg = node_registry.clone();
     let node_registry_for_controller = node_registry.clone();
@@ -170,6 +175,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         dedicated: status_writer.outputs.dedicated_registry.clone(),
         passthrough_routes: status_writer.outputs.passthrough_routes.clone(),
         terminate_routes: status_writer.outputs.terminate_routes.clone(),
+        publish: publish_index.clone(),
     };
     let discovery_service = coxswain_discovery::DiscoveryService::new(
         discovery_source,
@@ -207,7 +213,8 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             .controller
             .with_vip_failures(vip_failures.clone())
             .with_leadership_watch(leader_watch_tx)
-            .with_node_registry(node_registry_for_controller),
+            .with_node_registry(node_registry_for_controller)
+            .with_publish_index(publish_index.clone()),
     ));
     server.add_service(background_service("reconciler", status_writer.reconciler));
 
@@ -249,6 +256,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             vip_failures,
             leadership_rx: Some(leader_watch_rx),
             node_registry: Some(node_registry_for_operator),
+            publish_index: Some(publish_index),
         }),
     ));
 

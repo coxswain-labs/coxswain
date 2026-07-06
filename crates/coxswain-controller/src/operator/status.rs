@@ -191,17 +191,25 @@ pub(crate) fn build_dedicated_gateway_status_patch(
     );
     let cut_over = cut_over_outcome(inputs.accepted, inputs.ready_pod_count);
 
-    // #533: the dedicated-proxy Service address (its `clusterIP`, LoadBalancer
-    // ingress, or NodePort node IPs) resolves through the watch-lagged
-    // `services_store`/`nodes` AFTER `metadata.generation` is already visible, so
-    // `AddressNotAssigned` (address genuinely not yet resolved, everything else
-    // on track) must NOT claim generation N is fully processed. Hold that one
-    // Programmed condition's `observedGeneration` one below the current
-    // generation so a one-shot "conditions are latest" check waits until the
-    // address lands and `status.addresses` is published in the same pass. Every
-    // other outcome — `True`, the settled negatives `Invalid`/`AddressNotUsable`,
-    // and the `Pending` (no Ready Pod, #211) transient — stamps normally.
-    let programmed_generation = if programmed.reason == GatewayConditionReason::AddressNotAssigned {
+    // #533/#531: transient convergence holds must NOT claim generation N is
+    // fully processed. Two rungs qualify:
+    //   * `AddressNotAssigned` — the dedicated-proxy Service address resolves
+    //     through the watch-lagged `services_store`/`nodes` AFTER
+    //     `metadata.generation` is already visible.
+    //   * `Pending` — the pod is not Ready yet, or the proxy has not yet
+    //     bound/applied the current generation's listeners (#531 bind+ack
+    //     gate; mirrors the shared writer's held-Pending trailing).
+    // Hold those Programmed conditions' `observedGeneration` one below the
+    // current generation so a one-shot "conditions are latest" check waits
+    // until convergence, and a per-tick trailing invariant never observes
+    // `Programmed` claiming generation N while the data plane lags. The
+    // settled outcomes — `True` and the negatives `Invalid`/`AddressNotUsable`
+    // — stamp normally (conformance requires settled conditions AT the
+    // current generation).
+    let programmed_generation = if matches!(
+        programmed.reason,
+        GatewayConditionReason::AddressNotAssigned | GatewayConditionReason::Pending
+    ) {
         generation.saturating_sub(1)
     } else {
         generation
@@ -1435,6 +1443,45 @@ mod tests {
             condition_of(&patch, "Accepted"),
             Some(("True".to_string(), "Accepted".to_string()))
         );
+    }
+
+    #[test]
+    fn pending_hold_trails_programmed_observed_generation() {
+        // #531: while Programmed is held at Pending (pod not Ready, or the
+        // proxy hasn't bound/applied the current generation), the condition's
+        // observedGeneration must trail at gen-1 — mirroring the shared
+        // writer — so a per-tick trailing invariant never observes Programmed
+        // claiming generation N before the data plane converged.
+        let gw = gateway(3, vec![("http", 80)], None);
+        let svc = service_clusterip("10.96.7.42");
+        let mut held = inputs(
+            &gw,
+            Some(&svc),
+            &[],
+            empty_status(),
+            AcceptedOutcome::Accepted,
+            1,
+        );
+        held.proxy_bound = false;
+        let patch = build_dedicated_gateway_status_patch(&held, 3, &epoch());
+        let conditions = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        let programmed = conditions
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed condition");
+        assert_eq!(programmed["reason"], "Pending");
+        assert_eq!(
+            programmed["observedGeneration"], 2,
+            "held Pending must stamp gen-1"
+        );
+        // Accepted still claims the live generation — only Programmed trails.
+        let accepted = conditions
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("Accepted condition");
+        assert_eq!(accepted["observedGeneration"], 3);
     }
 
     #[test]

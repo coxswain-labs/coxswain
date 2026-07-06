@@ -210,6 +210,11 @@ pub struct OperatorConfig {
     /// before a listener *added by a spec change* is bound. `None` disables
     /// the gate (tests).
     pub node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
+    /// Per-Gateway publish-sequence index (#531): the ack half of the
+    /// dedicated `Programmed` gate — the Gateway's own proxy must have Ack'd
+    /// a snapshot containing the current generation, not merely hold its
+    /// (possibly stale) port binds. `None` disables it (tests).
+    pub publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
@@ -305,6 +310,8 @@ pub(super) struct ReconcileContext {
     /// Connected-proxy registry (#531): gates dedicated `Programmed=True` on
     /// the Gateway's own proxy reporting its listener ports bound.
     node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
+    /// Per-Gateway publish-sequence index (#531): ack half of the gate.
+    publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
 }
 
@@ -555,6 +562,7 @@ impl BackgroundService for Operator {
             vip_trigger: Arc::new(tokio::sync::Notify::new()),
             vip_failures: self.config.vip_failures.clone(),
             node_registry: self.config.node_registry.clone(),
+            publish_index: self.config.publish_index.clone(),
             last_hashes: Mutex::new(HashMap::new()),
         });
 
@@ -1058,19 +1066,34 @@ async fn reconcile_inner(
     let nodes: Vec<Arc<Node>> = ctx.nodes_store.state();
     let listener_status_map = ctx.listener_status.load();
     let gateway_health = listener_status_map.get(&key).cloned().unwrap_or_default();
-    // Proxy bind gate (#531): pod readiness alone flips before a listener added
-    // by a spec change is actually bound (bind is watch-driven, after the
-    // snapshot applies). Require this Gateway's own connected proxy to report
-    // the effective listener ports bound. The anti-flap latch keeps an
-    // already-Programmed generation immune to pod-replacement churn.
+    // Proxy readiness gate (#531), two halves — same shape as the shared
+    // writer's:
+    //  * Bind: this Gateway's own connected proxy must report the effective
+    //    listener ports bound (pod readiness alone flips before a listener
+    //    added by a spec change is bound).
+    //  * Ack: the proxy must have Ack'd a snapshot containing the current
+    //    generation — a config-only spec change (no new port) leaves the bind
+    //    set unchanged, so bind alone would open the gate while the new
+    //    config is still propagating.
+    // The anti-flap latch keeps an already-Programmed generation immune to
+    // pod-replacement churn.
     let proxy_bound = match &ctx.node_registry {
         Some(registry) => {
-            crate::status_common::gateway_programmed_at_current_gen(&gw)
-                || registry.load().gateway_node_bound(
-                    gw_namespace,
-                    gw_name,
-                    &dedicated_ports.iter().map(|p| p.port).collect(),
-                )
+            crate::status_common::gateway_programmed_at_current_gen(&gw) || {
+                let snapshot_acked = match &ctx.publish_index {
+                    Some(index) => index.get(&key).is_some_and(|stamp| {
+                        stamp.generation >= gw.metadata.generation.unwrap_or(0)
+                            && registry.gateway_node_acked(gw_namespace, gw_name, stamp.seq)
+                    }),
+                    None => true,
+                };
+                snapshot_acked
+                    && registry.load().gateway_node_bound(
+                        gw_namespace,
+                        gw_name,
+                        &dedicated_ports.iter().map(|p| p.port).collect(),
+                    )
+            }
         }
         None => true,
     };

@@ -37,6 +37,7 @@ use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
 use coxswain_core::listener_status::SharedGatewayListenerStatus;
 use coxswain_core::node_registry::{NodeScope, SharedNodeRegistry};
 use coxswain_core::ownership::ObjectKey;
+use coxswain_core::publish_index::SharedGatewayPublishIndex;
 use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
 };
@@ -90,6 +91,12 @@ pub struct SnapshotSource {
     /// Only populated for [`Scope::SharedPool`] subscribers; dedicated proxies
     /// receive an empty table (TLSRoutes are shared-pool only).
     pub terminate_routes: SharedTlsPassthroughTable,
+    /// Per-Gateway publish-sequence index (#531). The server captures its
+    /// counter **before** loading any cell for a snapshot build; a node that
+    /// Acks that snapshot has therefore applied every rebuild stamped at a
+    /// sequence `<=` the captured value — the content-convergence input to
+    /// the `Programmed` ack gate.
+    pub publish: SharedGatewayPublishIndex,
 }
 
 impl Clone for SnapshotSource {
@@ -103,6 +110,7 @@ impl Clone for SnapshotSource {
             dedicated: self.dedicated.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
             terminate_routes: self.terminate_routes.clone(),
+            publish: self.publish.clone(),
         }
     }
 }
@@ -205,6 +213,9 @@ fn next_nonce() -> Vec<u8> {
 #[derive(Clone)]
 struct SnapshotContent {
     version: String,
+    /// Publish sequence captured before the cells were read (never on the
+    /// wire): recorded into the node registry when this snapshot is Ack'd.
+    seq: u64,
     ingress_routing: p::RoutingTable,
     gateway_routing: p::RoutingTable,
     tls_store: p::PortTlsStore,
@@ -250,7 +261,12 @@ fn build_snapshot(
     scope: &Scope,
     peer_svid: Option<&PeerSvid>,
 ) -> SnapshotContent {
-    match scope {
+    // Capture the publish sequence BEFORE reading any cell: every rebuild
+    // stamped at a sequence <= this value stored its cells before bumping the
+    // counter, so the content loaded below is at least that new. Capturing
+    // after the loads would claim content the snapshot may not have.
+    let seq = source.publish.current_seq();
+    let mut content = match scope {
         Scope::SharedPool => {
             let ingress = source.ingress.load();
             let gateway = source.gateway.load();
@@ -286,17 +302,26 @@ fn build_snapshot(
                             &snap.expected_proxy_sa,
                         )
                     {
-                        return assemble_snapshot(
-                            p::RoutingTable::default(),
-                            p::RoutingTable::default(),
-                            p::PortTlsStore::default(),
-                            p::ClientCertStore::default(),
-                            p::GatewayListenerStatus::default(),
-                            // Dedicated proxies never serve TLS passthrough routes.
-                            p::TlsPassthroughTable::default(),
-                            // Dedicated proxies never serve TLS terminate routes.
-                            p::TlsPassthroughTable::default(),
-                        );
+                        // seq 0, NOT the captured seq: this snapshot is a
+                        // deliberately-emptied world, so an Ack of it must not
+                        // advance the node's convergence stamp — a real seq
+                        // here would let the #531 ack gate certify content the
+                        // node never received. 0 is a no-op under the
+                        // registry's monotone max.
+                        return SnapshotContent {
+                            seq: 0,
+                            ..assemble_snapshot(
+                                p::RoutingTable::default(),
+                                p::RoutingTable::default(),
+                                p::PortTlsStore::default(),
+                                p::ClientCertStore::default(),
+                                p::GatewayListenerStatus::default(),
+                                // Dedicated proxies never serve TLS passthrough routes.
+                                p::TlsPassthroughTable::default(),
+                                // Dedicated proxies never serve TLS terminate routes.
+                                p::TlsPassthroughTable::default(),
+                            )
+                        };
                     }
                     assemble_snapshot(
                         // A dedicated proxy never serves Ingress resources.
@@ -313,18 +338,28 @@ fn build_snapshot(
                 }
                 // Fail closed: the Gateway is not (yet) cut over, so this proxy
                 // receives an empty world rather than another scope's routes.
-                None => assemble_snapshot(
-                    p::RoutingTable::default(),
-                    p::RoutingTable::default(),
-                    p::PortTlsStore::default(),
-                    p::ClientCertStore::default(),
-                    p::GatewayListenerStatus::default(),
-                    p::TlsPassthroughTable::default(),
-                    p::TlsPassthroughTable::default(),
-                ),
+                // seq 0 for the same reason as the identity-mismatch branch
+                // above: an Ack of a fail-closed empty world must not advance
+                // the node's #531 convergence stamp.
+                None => {
+                    return SnapshotContent {
+                        seq: 0,
+                        ..assemble_snapshot(
+                            p::RoutingTable::default(),
+                            p::RoutingTable::default(),
+                            p::PortTlsStore::default(),
+                            p::ClientCertStore::default(),
+                            p::GatewayListenerStatus::default(),
+                            p::TlsPassthroughTable::default(),
+                            p::TlsPassthroughTable::default(),
+                        )
+                    };
+                }
             }
         }
-    }
+    };
+    content.seq = seq;
+    content
 }
 
 /// Assemble a [`SnapshotContent`] from pre-built wire DTOs.
@@ -367,6 +402,8 @@ fn assemble_snapshot(
 
     SnapshotContent {
         version,
+        // Placeholder — build_snapshot overwrites with the pre-load capture.
+        seq: 0,
         ingress_routing: ingress_dto,
         gateway_routing: gateway_dto,
         tls_store: tls_dto,
@@ -695,6 +732,10 @@ async fn run_stream(
                         node_id = %sub.node_id,
                         "discovery: rebuild produced same version as last Ack — no push needed"
                     );
+                    // Same content as the node's last Ack: advance its
+                    // convergence stamp to the freshly-captured sequence so
+                    // the #531 ack gate converges without a content change.
+                    registry.advance_acked_seq(&sub.node_id, current.seq);
                 }
             }
         }
@@ -720,7 +761,20 @@ async fn handle_ack(
     state: &mut StreamState,
 ) -> Result<(), ()> {
     debug!(node_id = %sub.node_id, version = %ack.version, "discovery: Ack received");
-    registry.record_ack(&sub.node_id, ack.version.clone(), SystemTime::now());
+    // The Ack'd snapshot's publish sequence comes from the retained last-sent
+    // content (Acks echo the version we pushed). A stale Ack for some other
+    // version records sequence 0 — a no-op under the registry's monotone max.
+    let acked_seq = state
+        .last_sent
+        .as_ref()
+        .filter(|sent| sent.version == ack.version)
+        .map_or(0, |sent| sent.seq);
+    registry.record_ack(
+        &sub.node_id,
+        ack.version.clone(),
+        acked_seq,
+        SystemTime::now(),
+    );
     crate::metrics::acks_total().inc();
     state.last_acked = Some(ack.version);
     state.in_flight = None;
@@ -732,6 +786,11 @@ async fn handle_ack(
         state.in_flight = Some(current.version.clone());
         state.last_sent = Some(current.clone());
         send_content(tx, current).await?;
+    } else {
+        // Identical content: the node's applied snapshot is equivalent to the
+        // freshly-captured sequence, so advance its convergence stamp without
+        // a push (#531 ack gate liveness on a quiet cluster).
+        registry.advance_acked_seq(&sub.node_id, current.seq);
     }
     Ok(())
 }
@@ -857,6 +916,7 @@ mod tests {
         addr: SocketAddr,
         registry: SharedNodeRegistry,
         rebuild_tx: watch::Sender<u64>,
+        publish: SharedGatewayPublishIndex,
     }
 
     fn empty_source() -> SnapshotSource {
@@ -869,6 +929,7 @@ mod tests {
             dedicated: DedicatedRoutingRegistry::new(),
             passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
             terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
+            publish: SharedGatewayPublishIndex::new(),
         }
     }
 
@@ -901,11 +962,13 @@ mod tests {
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
 
+        let publish = source.publish.clone();
         let _ = source; // populated in coxswain-bin; empty for tests
         TestHarness {
             addr,
             registry,
             rebuild_tx,
+            publish,
         }
     }
 
@@ -1268,6 +1331,90 @@ mod tests {
             gw_routing.ports.is_empty(),
             "no dedicated entry → empty gateway snapshot"
         );
+        drop(tx);
+    }
+
+    // ── publish-sequence ack recording (#531) ─────────────────────────────────
+
+    /// Acking a fail-closed EMPTY dedicated snapshot (no registry entry for
+    /// the Gateway) must NOT advance the node's convergence stamp — a real
+    /// sequence there would let the ack gate certify content the node never
+    /// received (the pre-cutover / identity-mismatch worlds are deliberately
+    /// empty).
+    #[tokio::test]
+    async fn ack_of_fail_closed_empty_dedicated_snapshot_does_not_advance_seq() {
+        let h = start_harness().await;
+        // Sequence is non-zero, so a leaked capture would be observable.
+        h.publish.stamp_rebuild(std::iter::empty());
+
+        let (tx, mut inbound) = open_stream_with_subscribe(
+            h.addr,
+            p::Subscribe {
+                node_id: "ded-node".to_owned(),
+                wire_version: WIRE_VERSION,
+                scope: Some(crate::wire::scope_to_wire(
+                    &crate::subscription::Scope::Gateway {
+                        name: "some-gw".to_owned(),
+                        namespace: "prod".to_owned(),
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("gateway scope accepted");
+        let snap = recv_snapshot(&mut inbound).await;
+        send_ack(&tx, &snap).await;
+
+        // The ack lands (version recorded) but the seq stamp stays at 0.
+        let entry = poll_until(|| {
+            let reg = h.registry.load();
+            let e = reg.nodes.get("ded-node")?;
+            e.last_acked_version.is_some().then(|| e.clone())
+        })
+        .await;
+        assert_eq!(
+            entry.last_acked_seq,
+            Some(0),
+            "fail-closed empty snapshot must record seq 0, not the live capture"
+        );
+        drop(tx);
+    }
+
+    /// An Ack records the publish sequence captured before the snapshot was
+    /// built, and a rebuild that produces identical content (no push) still
+    /// advances the node's acked sequence — the quiet-cluster liveness path.
+    #[tokio::test]
+    async fn ack_records_publish_seq_and_no_push_rebuild_advances_it() {
+        let h = start_harness().await;
+        // One stamped rebuild before the client connects: sequence becomes 1.
+        h.publish.stamp_rebuild(std::iter::empty());
+
+        let (tx, mut inbound) = open_stream(h.addr, "node-1").await;
+        let initial = recv_snapshot(&mut inbound).await;
+        send_ack(&tx, &initial).await;
+        poll_until(|| {
+            h.registry
+                .load()
+                .nodes
+                .get("node-1")
+                .and_then(|e| e.last_acked_seq)
+                .filter(|s| *s >= 1)
+        })
+        .await;
+
+        // Advance the sequence with NO content change, then tick the rebuild
+        // watch: the server's no-push branch must advance the acked seq.
+        h.publish.stamp_rebuild(std::iter::empty());
+        h.rebuild_tx.send(1).unwrap();
+        poll_until(|| {
+            h.registry
+                .load()
+                .nodes
+                .get("node-1")
+                .and_then(|e| e.last_acked_seq)
+                .filter(|s| *s >= 2)
+        })
+        .await;
         drop(tx);
     }
 

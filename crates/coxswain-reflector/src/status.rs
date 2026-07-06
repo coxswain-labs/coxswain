@@ -97,6 +97,17 @@ impl SharedRouteStatus {
         self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
     }
 
+    /// Re-fire the change notification without touching the stored map.
+    ///
+    /// The rebuild loop calls this once at the very end of a rebuild, after
+    /// the publish index is stamped (#531): discovery subscription loops woken
+    /// by the mid-rebuild [`Self::store_and_notify`] may have captured a
+    /// pre-stamp publish sequence, and without a trailing tick a quiet
+    /// cluster would strand the ack gate until the next content change.
+    pub fn notify_rebuilt(&self) {
+        self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
     /// Returns a `watch::Receiver` for subscribing to change notifications.
     /// See [`SharedGatewayListenerStatus::subscribe`].
     pub fn subscribe(&self) -> watch::Receiver<u64> {

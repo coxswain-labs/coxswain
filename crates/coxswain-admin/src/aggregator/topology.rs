@@ -192,7 +192,7 @@ mod tests {
             reg.record_target(node_id, t.to_owned());
         }
         if let Some(a) = acked {
-            reg.record_ack(node_id, a.to_owned(), epoch());
+            reg.record_ack(node_id, a.to_owned(), 1, epoch());
         }
         reg
     }
@@ -266,7 +266,7 @@ mod tests {
         let reg = SharedNodeRegistry::new();
         reg.connect("node-a", NodeScope::SharedPool, epoch());
         reg.record_target("node-a", "v1".to_owned());
-        reg.record_ack("node-a", "v1".to_owned(), epoch());
+        reg.record_ack("node-a", "v1".to_owned(), 1, epoch());
         let agg = super::super::tests::make_agg_with_registry(
             SharedFleet::default(),
             SharedClusterSummary::default(),

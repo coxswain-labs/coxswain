@@ -74,6 +74,16 @@ pub struct NodeEntry {
     /// Missing in JSON from pre-#531 peers → `None` via `serde(default)`.
     #[serde(default)]
     pub bound_ports: Option<BTreeSet<u16>>,
+    /// Publish sequence (see [`crate::publish_index`]) captured by the
+    /// discovery server before it built the snapshot this node last Ack'd, or
+    /// `None` until the first Ack lands. Because the sequence is captured
+    /// *before* the cells are read, `last_acked_seq >= s` proves the node's
+    /// applied snapshot contains every rebuild stamped at sequence `<= s` —
+    /// the content-convergence half of the #531 `Programmed` gate (bound
+    /// ports alone can't cover a Gateway whose ports were already bound for
+    /// other Gateways).
+    #[serde(default)]
+    pub last_acked_seq: Option<u64>,
 }
 
 impl NodeEntry {
@@ -171,6 +181,32 @@ impl NodeRegistry {
         )
     }
 
+    /// #531 shared-mode content convergence: whether **every**
+    /// currently-connected [`NodeScope::SharedPool`] node has Ack'd a snapshot
+    /// whose captured publish sequence is `>= min_seq`, with at least one such
+    /// node connected.
+    ///
+    /// Fails closed like [`Self::all_shared_nodes_bound`]: an empty pool or a
+    /// node that has not Ack'd yet (`last_acked_seq == None`) holds the gate.
+    #[must_use]
+    pub fn all_shared_nodes_acked(&self, min_seq: u64) -> bool {
+        self.nodes_acked(|e| e.scope == NodeScope::SharedPool, min_seq)
+    }
+
+    /// #531 dedicated-mode content convergence: whether every connected
+    /// [`NodeScope::Gateway`] node for `namespace`/`name` has Ack'd a snapshot
+    /// at publish sequence `>= min_seq`, with at least one connected.
+    #[must_use]
+    pub fn gateway_node_acked(&self, namespace: &str, name: &str, min_seq: u64) -> bool {
+        self.nodes_acked(
+            |e| {
+                matches!(&e.scope, NodeScope::Gateway { namespace: ns, name: n }
+                    if ns == namespace && n == name)
+            },
+            min_seq,
+        )
+    }
+
     /// Shared quorum core for both gates: every node matching `scope_pred` has
     /// reported a bound set covering `required`, and at least one matches. The
     /// fail-closed semantics (unreported `None` ≠ bound, empty match set fails)
@@ -188,6 +224,20 @@ impl NodeRegistry {
                 .as_ref()
                 .is_some_and(|bound| required.is_subset(bound))
             {
+                return false;
+            }
+        }
+        any
+    }
+
+    /// Ack-sequence quorum core, mirroring [`Self::nodes_bound`]'s fail-closed
+    /// shape: every matching node has `last_acked_seq >= min_seq`, and at
+    /// least one matches.
+    fn nodes_acked(&self, scope_pred: impl Fn(&NodeEntry) -> bool, min_seq: u64) -> bool {
+        let mut any = false;
+        for entry in self.nodes.values().filter(|e| scope_pred(e)) {
+            any = true;
+            if entry.last_acked_seq.is_none_or(|s| s < min_seq) {
                 return false;
             }
         }
@@ -266,6 +316,7 @@ impl SharedNodeRegistry {
             last_ack_at: None,
             connected_since: now,
             bound_ports: None,
+            last_acked_seq: None,
         };
         self.0.map.lock().nodes.insert(node_id.to_owned(), entry);
         self.bump();
@@ -273,13 +324,33 @@ impl SharedNodeRegistry {
 
     /// Record a successful ACK from a node, updating its convergence state.
     ///
+    /// `seq` is the publish sequence the discovery server captured before
+    /// building the Ack'd snapshot (see [`NodeEntry::last_acked_seq`]).
     /// If the node is not in the registry (e.g. late call after `disconnect`),
-    /// this is a no-op.
-    pub fn record_ack(&self, node_id: &str, version: String, now: SystemTime) {
+    /// this is a no-op. Deliberately does NOT bump the change watch: Acks
+    /// arrive on every snapshot push, and the gate writers' requeue backstops
+    /// re-evaluate within seconds.
+    pub fn record_ack(&self, node_id: &str, version: String, seq: u64, now: SystemTime) {
         let mut guard = self.0.map.lock();
         if let Some(entry) = guard.nodes.get_mut(node_id) {
             entry.last_acked_version = Some(version);
             entry.last_ack_at = Some(now);
+            entry.last_acked_seq = Some(entry.last_acked_seq.unwrap_or(0).max(seq));
+        }
+    }
+
+    /// Advance a node's Ack'd publish sequence without a new Ack.
+    ///
+    /// Used by the discovery server's "rebuild produced the same content hash
+    /// as the node's last Ack" branch: identical content means the node's
+    /// applied snapshot is already equivalent to the freshly-captured
+    /// sequence, so its convergence stamp can advance without a push. Without
+    /// this, a quiet cluster would strand the #531 ack gate at the sequence
+    /// of the last *content-changing* push. Monotone: never moves backwards.
+    pub fn advance_acked_seq(&self, node_id: &str, seq: u64) {
+        let mut guard = self.0.map.lock();
+        if let Some(entry) = guard.nodes.get_mut(node_id) {
+            entry.last_acked_seq = Some(entry.last_acked_seq.unwrap_or(0).max(seq));
         }
     }
 
@@ -365,6 +436,23 @@ impl SharedNodeRegistry {
             .gateway_node_bound(namespace, name, required)
     }
 
+    /// Quorum query without a snapshot clone (#531): evaluates
+    /// [`NodeRegistry::all_shared_nodes_acked`] under the mutex.
+    #[must_use]
+    pub fn all_shared_nodes_acked(&self, min_seq: u64) -> bool {
+        self.0.map.lock().all_shared_nodes_acked(min_seq)
+    }
+
+    /// Quorum query without a snapshot clone (#531): evaluates
+    /// [`NodeRegistry::gateway_node_acked`] under the mutex.
+    #[must_use]
+    pub fn gateway_node_acked(&self, namespace: &str, name: &str, min_seq: u64) -> bool {
+        self.0
+            .map
+            .lock()
+            .gateway_node_acked(namespace, name, min_seq)
+    }
+
     /// Remove a node's row on stream exit.
     ///
     /// No-op if the node is not present.
@@ -438,7 +526,7 @@ mod tests {
         let reg = SharedNodeRegistry::new();
         reg.connect("node-a", shared(), now());
         let ack_time = SystemTime::UNIX_EPOCH;
-        reg.record_ack("node-a", "abc123".to_owned(), ack_time);
+        reg.record_ack("node-a", "abc123".to_owned(), 1, ack_time);
         let snap = reg.load();
         assert_eq!(
             snap.nodes["node-a"].last_acked_version.as_deref(),
@@ -451,7 +539,7 @@ mod tests {
     fn record_ack_on_unknown_node_is_noop() {
         let reg = SharedNodeRegistry::new();
         // Must not panic
-        reg.record_ack("phantom", "hash".to_owned(), now());
+        reg.record_ack("phantom", "hash".to_owned(), 1, now());
         assert!(reg.load().nodes.is_empty());
     }
 
@@ -461,7 +549,7 @@ mod tests {
         reg.connect("node-a", shared(), now());
         reg.record_target("node-a", "v1".to_owned());
         assert!(!reg.load().nodes["node-a"].in_sync(), "not yet acked");
-        reg.record_ack("node-a", "v1".to_owned(), now());
+        reg.record_ack("node-a", "v1".to_owned(), 1, now());
         assert!(reg.load().nodes["node-a"].in_sync(), "acked the target");
     }
 
@@ -470,7 +558,7 @@ mod tests {
         let reg = SharedNodeRegistry::new();
         reg.connect("node-a", shared(), now());
         reg.record_target("node-a", "v2".to_owned());
-        reg.record_ack("node-a", "v1".to_owned(), now());
+        reg.record_ack("node-a", "v1".to_owned(), 1, now());
         assert!(
             !reg.load().nodes["node-a"].in_sync(),
             "node acked an old version while target advanced"
@@ -495,10 +583,10 @@ mod tests {
         let reg = SharedNodeRegistry::new();
         reg.connect("node-a", shared(), now());
         reg.record_target("node-a", "v2".to_owned());
-        reg.record_ack("node-a", "v1".to_owned(), now());
+        reg.record_ack("node-a", "v1".to_owned(), 1, now());
         reg.connect("node-b", shared(), now());
         reg.record_target("node-b", "v2".to_owned());
-        reg.record_ack("node-b", "v2".to_owned(), now());
+        reg.record_ack("node-b", "v2".to_owned(), 1, now());
         assert!(
             !reg.all_in_sync(),
             "one laggard makes the whole fleet out of sync"
@@ -764,6 +852,76 @@ mod tests {
         assert!(!reg.load().gateway_node_bound("ns", "gw", &ports(&[443])));
     }
 
+    // ── ack-sequence quorum (#531 content convergence) ───────────────────────
+
+    #[test]
+    fn all_shared_nodes_acked_true_when_every_node_reached_the_seq() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect("node-a", shared(), now());
+        reg.connect("node-b", shared(), now());
+        reg.record_ack("node-a", "v1".to_owned(), 7, now());
+        reg.record_ack("node-b", "v1".to_owned(), 9, now());
+        assert!(reg.all_shared_nodes_acked(7), "both at seq >= 7");
+        assert!(!reg.all_shared_nodes_acked(8), "node-a is behind seq 8");
+    }
+
+    #[test]
+    fn all_shared_nodes_acked_fails_closed_on_empty_pool_and_unacked_node() {
+        let reg = SharedNodeRegistry::new();
+        assert!(!reg.all_shared_nodes_acked(0), "empty pool fails closed");
+        reg.connect("node-a", shared(), now());
+        assert!(
+            !reg.all_shared_nodes_acked(0),
+            "connected-but-never-acked node fails closed"
+        );
+    }
+
+    #[test]
+    fn acked_seq_never_moves_backwards() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect("node-a", shared(), now());
+        reg.record_ack("node-a", "v2".to_owned(), 5, now());
+        reg.record_ack("node-a", "v1".to_owned(), 3, now());
+        assert!(
+            reg.all_shared_nodes_acked(5),
+            "a late lower-seq ack must not regress the stamp"
+        );
+    }
+
+    #[test]
+    fn advance_acked_seq_moves_forward_without_an_ack() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect("node-a", shared(), now());
+        reg.record_ack("node-a", "v1".to_owned(), 2, now());
+        reg.advance_acked_seq("node-a", 6);
+        assert!(reg.all_shared_nodes_acked(6));
+        reg.advance_acked_seq("node-a", 4);
+        assert!(reg.all_shared_nodes_acked(6), "advance is monotone");
+        assert_eq!(
+            reg.load().nodes["node-a"].last_acked_version.as_deref(),
+            Some("v1"),
+            "advance must not touch the acked content hash"
+        );
+    }
+
+    #[test]
+    fn gateway_node_acked_scopes_to_its_gateway() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect("ded-a", gw("ns", "gw"), now());
+        reg.connect("other", gw("ns", "other-gw"), now());
+        reg.record_ack("ded-a", "v1".to_owned(), 4, now());
+        assert!(reg.gateway_node_acked("ns", "gw", 4));
+        assert!(!reg.gateway_node_acked("ns", "gw", 5));
+        assert!(
+            !reg.gateway_node_acked("ns", "other-gw", 1),
+            "the other gateway's node never acked"
+        );
+        assert!(
+            !reg.gateway_node_acked("ns", "absent", 0),
+            "no connected node fails closed"
+        );
+    }
+
     #[test]
     fn watch_fires_on_membership_and_bound_changes_but_not_acks() {
         let reg = SharedNodeRegistry::new();
@@ -775,7 +933,7 @@ mod tests {
         rx.borrow_and_update();
 
         reg.record_target("node-a", "v1".to_owned());
-        reg.record_ack("node-a", "v1".to_owned(), now());
+        reg.record_ack("node-a", "v1".to_owned(), 1, now());
         assert!(
             !rx.has_changed().unwrap_or(true),
             "ack/target stamps must not fire the gate watch"
@@ -823,7 +981,7 @@ mod tests {
         let reg = SharedNodeRegistry::new();
         reg.connect("node-a", gw("default", "my-gw"), now());
         reg.record_target("node-a", "v1".to_owned());
-        reg.record_ack("node-a", "v1".to_owned(), now());
+        reg.record_ack("node-a", "v1".to_owned(), 1, now());
         let snap = reg.load();
 
         let json = serde_json::to_string(&snap).expect("serialize");
