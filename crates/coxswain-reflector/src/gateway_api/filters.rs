@@ -1,6 +1,7 @@
 //! Translates `HTTPRouteRule` filter specs into [`FilterAction`][coxswain_core::routing::FilterAction]s.
 
 use crate::endpoints;
+use crate::gw_types::v::grpcroutes::{GrpcRouteRulesFilters, GrpcRouteRulesFiltersType};
 use crate::gw_types::v::httproutes::{
     HttpRouteRulesBackendRefsFilters, HttpRouteRulesBackendRefsFiltersType, HttpRouteRulesFilters,
     HttpRouteRulesFiltersCors, HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType,
@@ -32,6 +33,64 @@ pub(super) struct BackendStores<'a> {
     pub(super) slices: &'a reflector::Store<EndpointSlice>,
     pub(super) services: &'a reflector::Store<Service>,
     pub(super) grants: &'a HashSet<ReferenceGrantKey>,
+}
+
+/// Outcome of resolving one route-rule `ExtensionRef` against a specific coxswain
+/// filter kind. Replaces the earlier ad-hoc per-resolver shapes (`Option<Option<T>>`,
+/// an `(allow, deny)` tuple, and an overloaded `Option`) with three named,
+/// mutually-exclusive states, so a single shared scan ([`ext_refs`]) drives every
+/// resolver. `NotMine` means keep scanning the rule's filters; `Resolved`/`FailOpen`
+/// both mean "this ref was a hit" — whether that stops the scan (first-match-wins) is
+/// each wrapper's choice (all stop except `resolve_basic_auth`, which preserves its
+/// historical keep-scanning-on-missing-CR behaviour).
+#[non_exhaustive]
+pub(super) enum RefResolution<T> {
+    /// The ref does not target this resolver's kind — keep scanning.
+    NotMine,
+    /// The ref targets this kind and resolved to an enforceable value.
+    Resolved(T),
+    /// The ref targets this kind but the CR is missing / a no-op — fail open (no
+    /// enforcement on the route). Distinct from [`Self::NotMine`]: the kind matched.
+    FailOpen,
+}
+
+/// One route-rule filter that may carry an `ExtensionRef` payload, abstracted over
+/// HTTPRoute/GRPCRoute so the ext-ref scan is written once ([`ext_refs`]). kopium
+/// emits a distinct filter struct per route kind with an identical `type` +
+/// `extension_ref` shape, so a one-method accessor collapses the two — mirroring the
+/// [`ParentRefLike`][super::bindings] pattern used for listener binding.
+pub(super) trait ExtRefFilter {
+    /// `(group, kind, name)` when this filter is an `ExtensionRef` carrying a payload;
+    /// `None` for any other filter type, or an `ExtensionRef` with no payload (skipped,
+    /// matching the pre-refactor `continue`).
+    fn ext_ref(&self) -> Option<(&str, &str, &str)>;
+}
+
+impl ExtRefFilter for HttpRouteRulesFilters {
+    fn ext_ref(&self) -> Option<(&str, &str, &str)> {
+        if !matches!(self.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
+            return None;
+        }
+        let ext = self.extension_ref.as_ref()?;
+        Some((ext.group.as_str(), ext.kind.as_str(), ext.name.as_str()))
+    }
+}
+
+impl ExtRefFilter for GrpcRouteRulesFilters {
+    fn ext_ref(&self) -> Option<(&str, &str, &str)> {
+        if !matches!(self.r#type, GrpcRouteRulesFiltersType::ExtensionRef) {
+            return None;
+        }
+        let ext = self.extension_ref.as_ref()?;
+        Some((ext.group.as_str(), ext.kind.as_str(), ext.name.as_str()))
+    }
+}
+
+/// Iterate a rule's filters, yielding `(group, kind, name)` for each `ExtensionRef`
+/// that carries a payload. The single scan every `resolve_*` wrapper `find_map`s over
+/// — replaces the seven byte-identical hand-rolled loops (#523).
+pub(super) fn ext_refs<F: ExtRefFilter>(filters: &[F]) -> impl Iterator<Item = (&str, &str, &str)> {
+    filters.iter().filter_map(F::ext_ref)
 }
 
 /// Translates `HTTPRouteFilter` entries into `FilterAction` values.
@@ -618,45 +677,40 @@ pub(super) fn build_backend_ref_filters(
 /// "unsupported ExtensionRef" WARN, so this scan stays silent on them. Missing
 /// CRs or a zero `requestsPerSecond` value log a warning and return `None`
 /// (fail-open: the route is not limited).
-pub(super) fn resolve_rate_limit(
-    filters: &[HttpRouteRulesFilters],
+pub(super) fn resolve_rate_limit<F: ExtRefFilter>(
+    filters: &[F],
     route_ns: &str,
     rate_limits: &reflector::Store<RateLimit>,
 ) -> Option<Arc<RateLimitConfig>> {
-    for f in filters {
-        if !matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
-            continue;
-        }
-        let Some(ext) = &f.extension_ref else {
-            continue;
-        };
-        if let Some(cfg) =
-            resolve_rate_limit_ref(&ext.group, &ext.kind, &ext.name, route_ns, rate_limits)
-        {
-            return cfg;
-        }
-    }
-    None
+    ext_refs(filters)
+        .find_map(
+            |(g, k, n)| match resolve_rate_limit_ref(g, k, n, route_ns, rate_limits) {
+                RefResolution::NotMine => None,
+                RefResolution::Resolved(cfg) => Some(Some(cfg)),
+                RefResolution::FailOpen => Some(None),
+            },
+        )
+        .flatten()
 }
 
 /// Resolve a single `ExtensionRef` (by `group`/`kind`/`name`) into a
 /// [`RateLimitConfig`], if it targets a `RateLimit` CR.
 ///
-/// Returns `None` when the ref is **not** a `RateLimit` (`group ==
-/// gateway.coxswain-labs.dev`, `kind == RateLimit`) so the caller keeps scanning.
-/// When it *is*, returns `Some(cfg_opt)`: `Some(None)` on a missing CR or
-/// `requestsPerSecond=0` (WARN + fail-open), `Some(Some(cfg))` otherwise. Shared
-/// by the HTTPRoute and GRPCRoute reconcilers (rate limiting is protocol-agnostic;
-/// only the differently-typed filter-list iteration differs).
+/// Returns [`RefResolution::NotMine`] when the ref is **not** a `RateLimit` (`group ==
+/// gateway.coxswain-labs.dev`, `kind == RateLimit`) so the caller keeps scanning;
+/// [`RefResolution::FailOpen`] on a missing CR or `requestsPerSecond=0` (WARN — the
+/// route is not limited); [`RefResolution::Resolved`] otherwise. Shared by the
+/// HTTPRoute and GRPCRoute reconcilers (rate limiting is protocol-agnostic; only the
+/// differently-typed filter-list iteration differs).
 pub(super) fn resolve_rate_limit_ref(
     ext_group: &str,
     ext_kind: &str,
     ext_name: &str,
     route_ns: &str,
     rate_limits: &reflector::Store<RateLimit>,
-) -> Option<Option<Arc<RateLimitConfig>>> {
+) -> RefResolution<Arc<RateLimitConfig>> {
     if ext_group != super::COXSWAIN_GROUP || ext_kind != "RateLimit" {
-        return None;
+        return RefResolution::NotMine;
     }
     let obj_ref = reflector::ObjectRef::<RateLimit>::new(ext_name).within(route_ns);
     let Some(cr) = rate_limits.get(&obj_ref) else {
@@ -665,7 +719,7 @@ pub(super) fn resolve_rate_limit_ref(
             name = ext_name,
             "RateLimit CR not found — rate limiting skipped (fail-open)"
         );
-        return Some(None);
+        return RefResolution::FailOpen;
     };
     let Some(rps) = NonZeroU32::new(cr.spec.requests_per_second) else {
         tracing::warn!(
@@ -673,17 +727,13 @@ pub(super) fn resolve_rate_limit_ref(
             name = ext_name,
             "RateLimit CR has requestsPerSecond=0 — rate limiting skipped (fail-open)"
         );
-        return Some(None);
+        return RefResolution::FailOpen;
     };
     let key = match &cr.spec.by_header {
         Some(h) => RateLimitKey::Header(Arc::from(h.to_ascii_lowercase().as_str())),
         None => RateLimitKey::ClientIp,
     };
-    Some(Some(Arc::new(RateLimitConfig::new(
-        rps,
-        cr.spec.burst,
-        key,
-    ))))
+    RefResolution::Resolved(Arc::new(RateLimitConfig::new(rps, cr.spec.burst, key)))
 }
 
 /// Scans `filters` for an `ExtensionRef` pointing at an `IpAccessControl` CR
@@ -699,44 +749,40 @@ pub(super) fn resolve_rate_limit_ref(
 /// CR logs a WARN and returns `(None, None)` (fail-open: the route is not
 /// filtered). Each CIDR set is `None` when empty or entirely unparseable, so an
 /// empty/typo'd list never silently changes the route's admit behaviour.
-pub(super) fn resolve_ip_access(
-    filters: &[HttpRouteRulesFilters],
+pub(super) fn resolve_ip_access<F: ExtRefFilter>(
+    filters: &[F],
     route_ns: &str,
     ip_access: &reflector::Store<IpAccessControl>,
 ) -> (CidrSet, CidrSet) {
-    for f in filters {
-        if !matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
-            continue;
-        }
-        let Some(ext) = &f.extension_ref else {
-            continue;
-        };
-        if let Some(res) =
-            resolve_ip_access_ref(&ext.group, &ext.kind, &ext.name, route_ns, ip_access)
-        {
-            return res;
-        }
-    }
-    (None, None)
+    ext_refs(filters)
+        .find_map(
+            |(g, k, n)| match resolve_ip_access_ref(g, k, n, route_ns, ip_access) {
+                RefResolution::NotMine => None,
+                RefResolution::Resolved(sets) => Some(sets),
+                RefResolution::FailOpen => Some((None, None)),
+            },
+        )
+        .unwrap_or((None, None))
 }
 
 /// Resolve a single `ExtensionRef` (identified by its `group`/`kind`/`name`) into
 /// the `(allow, deny)` source-IP CIDR sets, if it targets an `IpAccessControl` CR.
 ///
-/// Returns `None` when the ref is **not** an `IpAccessControl` (`group ==
-/// gateway.coxswain-labs.dev`, `kind == IpAccessControl`) so the caller keeps
-/// scanning. When it *is*, returns `Some((allow, deny))`: a missing CR logs a WARN
-/// and yields `Some((None, None))` (fail-open). Shared by the HTTPRoute and
-/// GRPCRoute reconcilers, which iterate their own (differently-typed) filter lists.
+/// Returns [`RefResolution::NotMine`] when the ref is **not** an `IpAccessControl`
+/// (`group == gateway.coxswain-labs.dev`, `kind == IpAccessControl`) so the caller
+/// keeps scanning; [`RefResolution::FailOpen`] when the CR is missing (WARN — the
+/// route is not filtered); [`RefResolution::Resolved((allow, deny))`] otherwise (each
+/// set `None` when empty/unparseable). Shared by the HTTPRoute and GRPCRoute
+/// reconcilers, which iterate their own (differently-typed) filter lists.
 pub(super) fn resolve_ip_access_ref(
     ext_group: &str,
     ext_kind: &str,
     ext_name: &str,
     route_ns: &str,
     ip_access: &reflector::Store<IpAccessControl>,
-) -> Option<(CidrSet, CidrSet)> {
+) -> RefResolution<(CidrSet, CidrSet)> {
     if ext_group != super::COXSWAIN_GROUP || ext_kind != "IpAccessControl" {
-        return None;
+        return RefResolution::NotMine;
     }
     let obj_ref = reflector::ObjectRef::<IpAccessControl>::new(ext_name).within(route_ns);
     let Some(cr) = ip_access.get(&obj_ref) else {
@@ -745,11 +791,11 @@ pub(super) fn resolve_ip_access_ref(
             name = ext_name,
             "IpAccessControl CR not found — IP access control skipped (fail-open)"
         );
-        return Some((None, None));
+        return RefResolution::FailOpen;
     };
     let deny = parse_cidr_set(&cr.spec.deny, route_ns, ext_name, "deny");
     let allow = parse_cidr_set(&cr.spec.allow, route_ns, ext_name, "allow");
-    Some((allow, deny))
+    RefResolution::Resolved((allow, deny))
 }
 
 /// Parse an `IpAccessControl` CIDR list into an `Arc<Vec<IpNet>>`, promoting bare
@@ -805,45 +851,34 @@ fn parse_cidr_set(
 /// "unsupported ExtensionRef" WARN. Returns `None` when no `BasicAuth`
 /// `ExtensionRef` is present on this rule (no auth on the route) or the
 /// referenced CR itself is missing (fail-open — matches `resolve_rate_limit`).
-pub(super) fn resolve_basic_auth(
-    filters: &[HttpRouteRulesFilters],
+pub(super) fn resolve_basic_auth<F: ExtRefFilter>(
+    filters: &[F],
     route_ns: &str,
     basic_auths: &reflector::Store<BasicAuth>,
     auth_secrets: &reflector::Store<Secret>,
     secret_grants: &HashSet<ReferenceGrantKey>,
 ) -> Option<Arc<IngressAuthConfig>> {
-    for f in filters {
-        if !matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
-            continue;
+    // `FailOpen` (missing CR) maps to `None` — unlike the other resolvers, basic-auth
+    // historically *kept scanning* after a missing CR rather than stopping, so a later
+    // `BasicAuth` ref on the same rule could still resolve. Preserved verbatim.
+    ext_refs(filters).find_map(|(g, k, n)| {
+        match resolve_basic_auth_ref(g, k, n, route_ns, basic_auths, auth_secrets, secret_grants) {
+            RefResolution::NotMine | RefResolution::FailOpen => None,
+            RefResolution::Resolved(cfg) => Some(cfg),
         }
-        let Some(ext) = &f.extension_ref else {
-            continue;
-        };
-        if let Some(cfg) = resolve_basic_auth_ref(
-            &ext.group,
-            &ext.kind,
-            &ext.name,
-            route_ns,
-            basic_auths,
-            auth_secrets,
-            secret_grants,
-        ) {
-            return Some(cfg);
-        }
-    }
-    None
+    })
 }
 
 /// Resolve a single `ExtensionRef` (by `group`/`kind`/`name`) into an
 /// [`IngressAuthConfig`], if it targets a `BasicAuth` CR.
 ///
-/// Returns `None` when the ref is **not** a `BasicAuth` so the caller keeps
-/// scanning, or when the `BasicAuth` CR itself is missing (fail-open — no
-/// auth on the route, mirroring `resolve_rate_limit_ref`'s missing-CR
-/// handling). Once a CR is found, every subsequent failure (missing/unlabeled
-/// Secret, missing `auth` key, zero parseable credentials) fails **closed**
-/// (`Some(Unavailable)`) — an operator who attached this filter expects auth
-/// enforcement, so a broken Secret must not silently open the route.
+/// Returns [`RefResolution::NotMine`] when the ref is **not** a `BasicAuth` so the
+/// caller keeps scanning, or [`RefResolution::FailOpen`] when the `BasicAuth` CR
+/// itself is missing (no auth on the route). Once a CR is found, every subsequent
+/// failure (missing/unlabeled Secret, missing `auth` key, zero parseable credentials)
+/// fails **closed** — [`RefResolution::Resolved`] carrying
+/// [`IngressAuthConfig::Unavailable`] — because an operator who attached this filter
+/// expects auth enforcement, so a broken Secret must not silently open the route.
 pub(super) fn resolve_basic_auth_ref(
     ext_group: &str,
     ext_kind: &str,
@@ -852,9 +887,9 @@ pub(super) fn resolve_basic_auth_ref(
     basic_auths: &reflector::Store<BasicAuth>,
     auth_secrets: &reflector::Store<Secret>,
     secret_grants: &HashSet<ReferenceGrantKey>,
-) -> Option<Arc<IngressAuthConfig>> {
+) -> RefResolution<Arc<IngressAuthConfig>> {
     if ext_group != super::COXSWAIN_GROUP || ext_kind != "BasicAuth" {
-        return None;
+        return RefResolution::NotMine;
     }
     let obj_ref = reflector::ObjectRef::<BasicAuth>::new(ext_name).within(route_ns);
     let Some(cr) = basic_auths.get(&obj_ref) else {
@@ -863,7 +898,7 @@ pub(super) fn resolve_basic_auth_ref(
             name = ext_name,
             "BasicAuth CR not found — auth skipped (fail-open)"
         );
-        return None;
+        return RefResolution::FailOpen;
     };
     let route_id = format!("{route_ns}/{ext_name}");
     let secret_ref = &cr.spec.secret_ref;
@@ -888,7 +923,7 @@ pub(super) fn resolve_basic_auth_ref(
             "BasicAuth secretRef crosses namespaces with no matching ReferenceGrant — \
              failing closed (503)"
         );
-        return Some(Arc::new(IngressAuthConfig::Unavailable));
+        return RefResolution::Resolved(Arc::new(IngressAuthConfig::Unavailable));
     }
 
     let secret_obj_ref =
@@ -903,7 +938,7 @@ pub(super) fn resolve_basic_auth_ref(
              is the Secret labeled ingress.coxswain-labs.dev/auth-basic=true? \
              failing closed (503)"
         );
-        return Some(Arc::new(IngressAuthConfig::Unavailable));
+        return RefResolution::Resolved(Arc::new(IngressAuthConfig::Unavailable));
     };
     let Some(data) = secret
         .data
@@ -919,7 +954,7 @@ pub(super) fn resolve_basic_auth_ref(
             "BasicAuth Secret has no 'auth' data key (expected htpasswd file) — \
              failing closed (503)"
         );
-        return Some(Arc::new(IngressAuthConfig::Unavailable));
+        return RefResolution::Resolved(Arc::new(IngressAuthConfig::Unavailable));
     };
     let mut diag = Vec::new();
     let creds = crate::ingress::annotations::auth::parse_htpasswd(data, &route_id, &mut diag);
@@ -932,9 +967,9 @@ pub(super) fn resolve_basic_auth_ref(
             "BasicAuth Secret has no parseable htpasswd entries \
              (supported: bcrypt $2y/$2b/$2a, SHA1 {{SHA}}...) — failing closed (503)"
         );
-        return Some(Arc::new(IngressAuthConfig::Unavailable));
+        return RefResolution::Resolved(Arc::new(IngressAuthConfig::Unavailable));
     }
-    Some(Arc::new(IngressAuthConfig::Basic(creds.into())))
+    RefResolution::Resolved(Arc::new(IngressAuthConfig::Basic(creds.into())))
 }
 
 /// Scans `filters` for an `ExtensionRef` pointing at a `RequestSizeLimit` CR
@@ -947,37 +982,28 @@ pub(super) fn resolve_basic_auth_ref(
 /// unparseable `maxSize` values log a WARN and return `None` (fail-open: no
 /// limit enforced). Protocol-agnostic — shared by the HTTPRoute and
 /// GRPCRoute reconcilers (#443); only the filter-list iteration differs.
-pub(super) fn resolve_request_size_limit(
-    filters: &[HttpRouteRulesFilters],
+pub(super) fn resolve_request_size_limit<F: ExtRefFilter>(
+    filters: &[F],
     route_ns: &str,
     request_size_limits: &reflector::Store<RequestSizeLimit>,
 ) -> Option<u64> {
-    for f in filters {
-        if !matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
-            continue;
-        }
-        let Some(ext) = &f.extension_ref else {
-            continue;
-        };
-        if let Some(limit) = resolve_request_size_limit_ref(
-            &ext.group,
-            &ext.kind,
-            &ext.name,
-            route_ns,
-            request_size_limits,
-        ) {
-            return limit;
-        }
-    }
-    None
+    ext_refs(filters)
+        .find_map(|(g, k, n)| {
+            match resolve_request_size_limit_ref(g, k, n, route_ns, request_size_limits) {
+                RefResolution::NotMine => None,
+                RefResolution::Resolved(limit) => Some(Some(limit)),
+                RefResolution::FailOpen => Some(None),
+            }
+        })
+        .flatten()
 }
 
 /// Resolve a single `ExtensionRef` into a byte-count limit, if it targets a
 /// `RequestSizeLimit` CR.
 ///
-/// Returns `None` when the ref is **not** a `RequestSizeLimit` so the caller
-/// keeps scanning. When it *is*, returns `Some(limit_opt)`: `Some(None)` on a
-/// missing CR or unparseable `maxSize` (WARN + fail-open), `Some(Some(n))`
+/// Returns [`RefResolution::NotMine`] when the ref is **not** a `RequestSizeLimit` so
+/// the caller keeps scanning; [`RefResolution::FailOpen`] on a missing CR or an
+/// unparseable `maxSize` (WARN — no limit enforced); [`RefResolution::Resolved(n)`]
 /// otherwise.
 pub(super) fn resolve_request_size_limit_ref(
     ext_group: &str,
@@ -985,9 +1011,9 @@ pub(super) fn resolve_request_size_limit_ref(
     ext_name: &str,
     route_ns: &str,
     request_size_limits: &reflector::Store<RequestSizeLimit>,
-) -> Option<Option<u64>> {
+) -> RefResolution<u64> {
     if ext_group != super::COXSWAIN_GROUP || ext_kind != "RequestSizeLimit" {
-        return None;
+        return RefResolution::NotMine;
     }
     let obj_ref = reflector::ObjectRef::<RequestSizeLimit>::new(ext_name).within(route_ns);
     let Some(cr) = request_size_limits.get(&obj_ref) else {
@@ -996,18 +1022,20 @@ pub(super) fn resolve_request_size_limit_ref(
             name = ext_name,
             "RequestSizeLimit CR not found — limit skipped (fail-open)"
         );
-        return Some(None);
+        return RefResolution::FailOpen;
     };
-    let limit = crate::ingress::annotations::parse_byte_size(&cr.spec.max_size);
-    if limit.is_none() {
-        tracing::warn!(
-            ns = route_ns,
-            name = ext_name,
-            value = %cr.spec.max_size,
-            "RequestSizeLimit CR has invalid maxSize — limit skipped (fail-open)"
-        );
+    match crate::ingress::annotations::parse_byte_size(&cr.spec.max_size) {
+        Some(limit) => RefResolution::Resolved(limit),
+        None => {
+            tracing::warn!(
+                ns = route_ns,
+                name = ext_name,
+                value = %cr.spec.max_size,
+                "RequestSizeLimit CR has invalid maxSize — limit skipped (fail-open)"
+            );
+            RefResolution::FailOpen
+        }
     }
-    Some(limit)
 }
 
 /// Scans `filters` for an `ExtensionRef` pointing at a `Compression` CR
@@ -1019,42 +1047,38 @@ pub(super) fn resolve_request_size_limit_ref(
 /// `brotli` are `false` the CR is a no-op and `None` is returned, mirroring
 /// `parse_compression`'s Ingress-annotation behaviour — the proxy never
 /// constructs an encoder for a route with nothing to compress.
-pub(super) fn resolve_compression(
-    filters: &[HttpRouteRulesFilters],
+pub(super) fn resolve_compression<F: ExtRefFilter>(
+    filters: &[F],
     route_ns: &str,
     compressions: &reflector::Store<Compression>,
 ) -> Option<Arc<CompressionConfig>> {
-    for f in filters {
-        if !matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef) {
-            continue;
-        }
-        let Some(ext) = &f.extension_ref else {
-            continue;
-        };
-        if let Some(cfg) =
-            resolve_compression_ref(&ext.group, &ext.kind, &ext.name, route_ns, compressions)
-        {
-            return cfg;
-        }
-    }
-    None
+    ext_refs(filters)
+        .find_map(
+            |(g, k, n)| match resolve_compression_ref(g, k, n, route_ns, compressions) {
+                RefResolution::NotMine => None,
+                RefResolution::Resolved(cfg) => Some(Some(cfg)),
+                RefResolution::FailOpen => Some(None),
+            },
+        )
+        .flatten()
 }
 
 /// Resolve a single `ExtensionRef` into a [`CompressionConfig`], if it
 /// targets a `Compression` CR.
 ///
-/// Returns `None` when the ref is **not** a `Compression` so the caller keeps
-/// scanning. When it *is*, returns `Some(cfg_opt)`: `Some(None)` on a missing
-/// CR or a CR with both `gzip`/`brotli` disabled, `Some(Some(cfg))` otherwise.
+/// Returns [`RefResolution::NotMine`] when the ref is **not** a `Compression` so the
+/// caller keeps scanning; [`RefResolution::FailOpen`] on a missing CR or a CR with
+/// both `gzip`/`brotli` disabled (a no-op — the proxy builds no encoder);
+/// [`RefResolution::Resolved(cfg)`] otherwise.
 pub(super) fn resolve_compression_ref(
     ext_group: &str,
     ext_kind: &str,
     ext_name: &str,
     route_ns: &str,
     compressions: &reflector::Store<Compression>,
-) -> Option<Option<Arc<CompressionConfig>>> {
+) -> RefResolution<Arc<CompressionConfig>> {
     if ext_group != super::COXSWAIN_GROUP || ext_kind != "Compression" {
-        return None;
+        return RefResolution::NotMine;
     }
     let obj_ref = reflector::ObjectRef::<Compression>::new(ext_name).within(route_ns);
     let Some(cr) = compressions.get(&obj_ref) else {
@@ -1063,10 +1087,10 @@ pub(super) fn resolve_compression_ref(
             name = ext_name,
             "Compression CR not found — compression skipped (fail-open)"
         );
-        return Some(None);
+        return RefResolution::FailOpen;
     };
     if !cr.spec.gzip && !cr.spec.brotli {
-        return Some(None);
+        return RefResolution::FailOpen;
     }
     let level = cr.spec.level.filter(|l| (1..=9).contains(l)).unwrap_or(6);
     let min_size = cr.spec.min_size.unwrap_or(1024);
@@ -1080,13 +1104,13 @@ pub(super) fn resolve_compression_ref(
             .collect::<Vec<_>>()
             .into_boxed_slice()
     };
-    Some(Some(Arc::new(CompressionConfig::new(
+    RefResolution::Resolved(Arc::new(CompressionConfig::new(
         cr.spec.gzip,
         cr.spec.brotli,
         level,
         min_size,
         types,
-    ))))
+    )))
 }
 
 #[cfg(test)]
@@ -1518,7 +1542,7 @@ mod tests {
     #[test]
     fn resolve_ip_access_no_ext_ref_is_none() {
         let store = empty_ip_access_store();
-        let (allow, deny) = resolve_ip_access(&[], "default", &store);
+        let (allow, deny) = resolve_ip_access::<HttpRouteRulesFilters>(&[], "default", &store);
         assert!(allow.is_none());
         assert!(deny.is_none());
     }
@@ -1633,7 +1657,7 @@ mod tests {
         let basic_auths = empty_basic_auth_store();
         let auth_secrets = empty_secret_store();
         assert!(
-            resolve_basic_auth(
+            resolve_basic_auth::<HttpRouteRulesFilters>(
                 &[],
                 "default",
                 &basic_auths,
@@ -1816,7 +1840,9 @@ mod tests {
     #[test]
     fn resolve_request_size_limit_no_ext_ref_is_none() {
         let store = empty_request_size_limit_store();
-        assert!(resolve_request_size_limit(&[], "default", &store).is_none());
+        assert!(
+            resolve_request_size_limit::<HttpRouteRulesFilters>(&[], "default", &store).is_none()
+        );
     }
 
     #[test]
@@ -1878,7 +1904,7 @@ mod tests {
     #[test]
     fn resolve_compression_no_ext_ref_is_none() {
         let store = empty_compression_store();
-        assert!(resolve_compression(&[], "default", &store).is_none());
+        assert!(resolve_compression::<HttpRouteRulesFilters>(&[], "default", &store).is_none());
     }
 
     #[test]
