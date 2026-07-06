@@ -248,9 +248,11 @@ pub(super) fn reconcile(
             (Some(group), None)
         };
 
+        // `GrpcRouteRulesFilters` implements `ExtRefFilter`, so the shared HTTP
+        // resolvers drive gRPC directly — no gRPC-specific scan loop (#523).
         let (allow_source_range, deny_source_range) =
-            resolve_grpc_ip_access(rule_filters, route_ns, ip_access);
-        let rate_limit = resolve_grpc_rate_limit(rule_filters, route_ns, rate_limits);
+            super::filters::resolve_ip_access(rule_filters, route_ns, ip_access);
+        let rate_limit = super::filters::resolve_rate_limit(rule_filters, route_ns, rate_limits);
         let ctx = GrpcRuleContext {
             filters: rule_filters,
             error_status,
@@ -272,62 +274,6 @@ pub(super) fn reconcile(
             apply_grpc_rule(hb, rule, group_opt.as_ref(), &ctx);
         }
     }
-}
-
-/// GRPCRoute counterpart to [`super::filters::resolve_ip_access`]: scans a rule's
-/// filters for an `IpAccessControl` `ExtensionRef` and resolves it into the
-/// `(allow, deny)` source-IP CIDR sets (#479). Source-IP filtering is
-/// protocol-agnostic, so gRPC reuses the same per-ref resolver as HTTP; only the
-/// filter-list iteration differs (the two route types have distinct filter structs).
-fn resolve_grpc_ip_access(
-    filters: &[GrpcRouteRulesFilters],
-    route_ns: &str,
-    ip_access: &reflector::Store<IpAccessControl>,
-) -> (super::filters::CidrSet, super::filters::CidrSet) {
-    for f in filters {
-        if !matches!(f.r#type, GrpcRouteRulesFiltersType::ExtensionRef) {
-            continue;
-        }
-        let Some(ext) = &f.extension_ref else {
-            continue;
-        };
-        if let Some(res) = super::filters::resolve_ip_access_ref(
-            &ext.group, &ext.kind, &ext.name, route_ns, ip_access,
-        ) {
-            return res;
-        }
-    }
-    (None, None)
-}
-
-/// GRPCRoute counterpart to [`super::filters::resolve_rate_limit`]: scans a rule's
-/// filters for a `RateLimit` `ExtensionRef` and resolves it into a
-/// [`RateLimitConfig`] (#25). Rate limiting is protocol-agnostic (gRPC is HTTP/2;
-/// IP- and header-keyed limiting both apply), so gRPC reuses the same per-ref
-/// resolver as HTTP; only the filter-list iteration differs.
-fn resolve_grpc_rate_limit(
-    filters: &[GrpcRouteRulesFilters],
-    route_ns: &str,
-    rate_limits: &reflector::Store<RateLimit>,
-) -> Option<Arc<coxswain_core::routing::RateLimitConfig>> {
-    for f in filters {
-        if !matches!(f.r#type, GrpcRouteRulesFiltersType::ExtensionRef) {
-            continue;
-        }
-        let Some(ext) = &f.extension_ref else {
-            continue;
-        };
-        if let Some(cfg) = super::filters::resolve_rate_limit_ref(
-            &ext.group,
-            &ext.kind,
-            &ext.name,
-            route_ns,
-            rate_limits,
-        ) {
-            return cfg;
-        }
-    }
-    None
 }
 
 struct GrpcRuleContext<'a> {
@@ -1099,7 +1045,7 @@ mod tests {
         );
     }
 
-    // ── resolve_grpc_ip_access (#479) ─────────────────────────────────────────
+    // ── IpAccessControl on GRPCRoute via shared resolve_ip_access (#479) ──────
 
     fn grpc_ip_access_filter(name: &str) -> GrpcRouteRulesFilters {
         use crate::gw_types::v::grpcroutes::GrpcRouteRulesFiltersExtensionRef;
@@ -1142,8 +1088,11 @@ mod tests {
             &["203.0.113.0/24"],
             &["10.0.0.0/8"],
         )]);
-        let (allow, deny) =
-            resolve_grpc_ip_access(&[grpc_ip_access_filter("policy")], "default", &store);
+        let (allow, deny) = super::super::filters::resolve_ip_access(
+            &[grpc_ip_access_filter("policy")],
+            "default",
+            &store,
+        );
         assert_eq!(
             *allow.expect("allow set"),
             vec!["203.0.113.0/24".parse::<ipnet::IpNet>().expect("valid")]
@@ -1157,22 +1106,29 @@ mod tests {
     #[test]
     fn grpc_ip_access_no_ext_ref_is_none() {
         let store = crate::tests::fixtures::empty_ip_access_store();
-        let (allow, deny) = resolve_grpc_ip_access(&[], "default", &store);
+        let (allow, deny) = super::super::filters::resolve_ip_access::<GrpcRouteRulesFilters>(
+            &[],
+            "default",
+            &store,
+        );
         assert!(allow.is_none() && deny.is_none());
     }
 
     #[test]
     fn grpc_ip_access_missing_cr_fails_open() {
         let store = crate::tests::fixtures::empty_ip_access_store();
-        let (allow, deny) =
-            resolve_grpc_ip_access(&[grpc_ip_access_filter("absent")], "default", &store);
+        let (allow, deny) = super::super::filters::resolve_ip_access(
+            &[grpc_ip_access_filter("absent")],
+            "default",
+            &store,
+        );
         assert!(
             allow.is_none() && deny.is_none(),
             "missing CR must not filter"
         );
     }
 
-    // ── resolve_grpc_rate_limit (#25) ─────────────────────────────────────────
+    // ── RateLimit on GRPCRoute via shared resolve_rate_limit (#25) ────────────
 
     fn grpc_rate_limit_filter(name: &str) -> GrpcRouteRulesFilters {
         use crate::gw_types::v::grpcroutes::GrpcRouteRulesFiltersExtensionRef;
@@ -1202,23 +1158,38 @@ mod tests {
     fn grpc_rate_limit_resolves_config() {
         let store =
             crate::tests::fixtures::make_rate_limit_store(vec![rate_limit_cr("default", "rl", 10)]);
-        let cfg = resolve_grpc_rate_limit(&[grpc_rate_limit_filter("rl")], "default", &store)
-            .expect("rate limit resolved");
+        let cfg = super::super::filters::resolve_rate_limit(
+            &[grpc_rate_limit_filter("rl")],
+            "default",
+            &store,
+        )
+        .expect("rate limit resolved");
         assert_eq!(cfg.requests_per_second.get(), 10);
     }
 
     #[test]
     fn grpc_rate_limit_no_ext_ref_is_none() {
         let store = crate::tests::fixtures::empty_rate_limit_store();
-        assert!(resolve_grpc_rate_limit(&[], "default", &store).is_none());
+        assert!(
+            super::super::filters::resolve_rate_limit::<GrpcRouteRulesFilters>(
+                &[],
+                "default",
+                &store
+            )
+            .is_none()
+        );
     }
 
     #[test]
     fn grpc_rate_limit_missing_cr_fails_open() {
         let store = crate::tests::fixtures::empty_rate_limit_store();
         assert!(
-            resolve_grpc_rate_limit(&[grpc_rate_limit_filter("absent")], "default", &store)
-                .is_none(),
+            super::super::filters::resolve_rate_limit(
+                &[grpc_rate_limit_filter("absent")],
+                "default",
+                &store
+            )
+            .is_none(),
             "missing CR must fail open (no rate limiting)"
         );
     }

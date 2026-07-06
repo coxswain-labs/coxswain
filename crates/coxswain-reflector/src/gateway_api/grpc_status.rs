@@ -55,7 +55,7 @@ impl RouteLike for GrpcRoute {
                 if matches!(f.r#type, GrpcRouteRulesFiltersType::ExtensionRef)
                     && let Some(ext) = &f.extension_ref
                 {
-                    return ext.group != "gateway.coxswain-labs.dev"
+                    return ext.group != super::COXSWAIN_GROUP
                         || !matches!(
                             ext.kind.as_str(),
                             "RateLimit" | "IpAccessControl" | "RequestSizeLimit"
