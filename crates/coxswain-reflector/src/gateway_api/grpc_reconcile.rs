@@ -152,8 +152,14 @@ pub(super) fn reconcile(
     );
 
     for (rule_index, rule) in rules.iter().enumerate() {
-        let metric_route_id: Arc<str> =
-            Arc::from(format!("grpcroute/{route_ns}/{route_name}:{rule_index}"));
+        // A named rule (GEP-995) gets a reorder-stable identifier; an unnamed
+        // rule keeps the positional index it always had, so existing `route`
+        // metric labels / `route_id` access-log values are unaffected unless
+        // the operator opts into naming.
+        let metric_route_id: Arc<str> = match rule.name.as_deref() {
+            Some(name) => Arc::from(format!("grpcroute/{route_ns}/{route_name}:{name}")),
+            None => Arc::from(format!("grpcroute/{route_ns}/{route_name}:{rule_index}")),
+        };
         let rule_filters = rule.filters.as_deref().unwrap_or(&[]);
 
         // GRPCRoute has no RequestRedirect — every rule resolves backends. A

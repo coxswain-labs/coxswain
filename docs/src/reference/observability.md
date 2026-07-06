@@ -12,7 +12,7 @@ The `route` Prometheus label is a **stable rule identifier**, not a request path
 
 Route id formats:
 
-- HTTPRoute: `httproute/<namespace>/<name>:<rule_index>` — `rule_index` is the position in `spec.rules[]`.
+- HTTPRoute / GRPCRoute: `httproute/<namespace>/<name>:<rule-id>` / `grpcroute/<namespace>/<name>:<rule-id>` — `rule-id` is the rule's `.name` (`HTTPRouteNamedRouteRule` / `GRPCRouteNamedRouteRule`, GEP-995) when the operator sets one; otherwise the position in `spec.rules[]`. A rule's id is stable across reorders only when named — an unnamed rule's index-based id shifts if a preceding rule is added or removed.
 - Ingress per-rule: `ingress/<namespace>/<name>:<r>.<p>` — nested `(rules, paths)` index, mirroring the YAML structure.
 - Ingress `spec.defaultBackend`: `ingress/<namespace>/<name>:default`.
 - The controller-wide `--ingress-default-backend` fallback: `ingress-default-backend/<service-namespace>/<service-name>`.

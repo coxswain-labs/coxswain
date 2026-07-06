@@ -16,6 +16,7 @@ pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "BackendTLSPolicy",
     "BackendTLSPolicySANValidation",
     "GRPCRoute",
+    "GRPCRouteNamedRouteRule",
     "Gateway",
     "GatewayAddressEmpty",
     "GatewayBackendClientCertificate",
