@@ -81,6 +81,22 @@ pub(super) fn gateway_accepted(gw: &Gateway) -> bool {
     )
 }
 
+/// `true` when the Gateway already reports top-level `Programmed=True` observed
+/// at (or after) its current generation.
+///
+/// The anti-flap guard on the shared-mode convergence gate (#533): once a
+/// Gateway is `Programmed` for its live spec, a transient dip in shared-pool
+/// convergence (e.g. an unrelated Gateway churning the snapshot version) must
+/// not downgrade it back to `Pending`. Mirrors
+/// `operator::reconciler::shared_pool_is_serving`.
+pub(super) fn gateway_programmed_at_current_gen(gw: &Gateway) -> bool {
+    has_condition_at_gen(
+        gw.status.as_ref().and_then(|s| s.conditions.as_deref()),
+        "Programmed",
+        gw.metadata.generation.unwrap_or(0),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

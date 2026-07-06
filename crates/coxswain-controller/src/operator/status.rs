@@ -182,6 +182,22 @@ pub(crate) fn build_dedicated_gateway_status_patch(
     );
     let cut_over = cut_over_outcome(inputs.accepted, inputs.ready_pod_count);
 
+    // #533: the dedicated-proxy Service address (its `clusterIP`, LoadBalancer
+    // ingress, or NodePort node IPs) resolves through the watch-lagged
+    // `services_store`/`nodes` AFTER `metadata.generation` is already visible, so
+    // `AddressNotAssigned` (address genuinely not yet resolved, everything else
+    // on track) must NOT claim generation N is fully processed. Hold that one
+    // Programmed condition's `observedGeneration` one below the current
+    // generation so a one-shot "conditions are latest" check waits until the
+    // address lands and `status.addresses` is published in the same pass. Every
+    // other outcome — `True`, the settled negatives `Invalid`/`AddressNotUsable`,
+    // and the `Pending` (no Ready Pod, #211) transient — stamps normally.
+    let programmed_generation = if programmed.reason == GatewayConditionReason::AddressNotAssigned {
+        generation.saturating_sub(1)
+    } else {
+        generation
+    };
+
     let mut conditions = vec![
         make_condition(
             GatewayConditionType::Accepted,
@@ -196,7 +212,7 @@ pub(crate) fn build_dedicated_gateway_status_patch(
             programmed.status,
             programmed.reason,
             programmed.message,
-            generation,
+            programmed_generation,
             now.clone(),
         ),
         make_condition(
@@ -1306,6 +1322,41 @@ mod tests {
         assert_eq!(
             condition_of(&patch, "Programmed"),
             Some(("False".to_string(), "AddressNotAssigned".to_string()))
+        );
+    }
+
+    #[test]
+    fn programmed_observedgeneration_held_below_current_until_address_resolves() {
+        // #533: while the dedicated Service address is unresolved
+        // (AddressNotAssigned), the Programmed condition's observedGeneration is
+        // held one below the current generation so a "conditions are latest"
+        // check waits for the address, while Accepted advances immediately.
+        let gw = gateway(5, vec![("http", 80)], None);
+        let svc = service_loadbalancer(vec![]); // ready pod, no address yet
+        let inputs = inputs(
+            &gw,
+            Some(&svc),
+            &[],
+            empty_status(),
+            AcceptedOutcome::Accepted,
+            1,
+        );
+        let patch = build_dedicated_gateway_status_patch(&inputs, 5, &epoch());
+        let conds = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        let observed = |type_: &str| {
+            conds
+                .iter()
+                .find(|c| c["type"] == type_)
+                .and_then(|c| c["observedGeneration"].as_i64())
+                .unwrap_or_else(|| panic!("{type_} condition or its observedGeneration missing"))
+        };
+        assert_eq!(observed("Accepted"), 5, "Accepted advances immediately");
+        assert_eq!(
+            observed("Programmed"),
+            4,
+            "Programmed held one generation below current until the address resolves"
         );
     }
 

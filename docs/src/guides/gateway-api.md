@@ -206,7 +206,9 @@ A request for two distinct IPs is always `AddressNotUsable` — one `Service` bi
 | Condition | True when |
 |-----------|-----------|
 | `Accepted` | The controller has claimed this Gateway |
-| `Programmed` | All listeners are configured and ready |
+| `Programmed` | All listeners are configured and the Gateway's address has resolved |
+
+The controller does not stamp `Programmed` as processed for the current `metadata.generation` until the Gateway's own address has resolved into `status.addresses`. Until then `Programmed` stays `False`/`Pending` and its `observedGeneration` trails `metadata.generation`, so a client that waits for the latest conditions never observes `Programmed` claiming a generation while `status.addresses` is still empty — the same reconcile that flips `Programmed=True` also publishes the address. `Accepted` advances immediately. (A *settled* negative such as `AddressNotUsable` is not held back — it is a final answer for the current generation.)
 
 Per-listener conditions are also written: `Accepted`, `ResolvedRefs`, and `Programmed`. Inspect them when a listener is not serving traffic:
 
