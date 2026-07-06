@@ -4,11 +4,9 @@
 # `Service.status.loadBalancer.ingress` manually to simulate the LB
 # controller and verify Gateway.status.addresses + Programmed transitions.
 #
-# `image` is pinned to the upstream pause container so the Pod transitions
-# to Ready immediately regardless of which coxswain build is cached. This
-# test only exercises the operator's status writer — the rendered proxy
-# never serves traffic — so a no-op container is the cleanest stub. Same
-# story in `dedicated_gateway_clusterip.yaml`.
+# No `image` override: the operator renders the real coxswain image (see
+# `dedicated_gateway_clusterip.yaml` — Programmed gates on the proxy's
+# bound-port report over discovery, so a stub container never converges).
 # TESTNS is substituted at runtime.
 ---
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -18,7 +16,6 @@ metadata:
 spec:
   replicas: 1
   serviceType: LoadBalancer
-  image: ${PAUSE_IMAGE}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway

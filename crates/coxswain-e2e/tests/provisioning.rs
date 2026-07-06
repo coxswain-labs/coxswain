@@ -685,9 +685,8 @@ async fn lifecycle_reference_grant_revocation_drops_backend() -> anyhow::Result<
 /// 16 — Gateway deletion cascades to Deployment/Service/ServiceAccount via
 /// owner-ref GC, and the Gateway itself is removed after the dedicated-cleanup
 /// finalizer runs. (Sibling of test 2 which asserts the same against
-/// `DEDICATED_GATEWAY` without the pause stub; this variant exercises the same
-/// path with a pause-image fixture for consistency with the rest of the
-/// lifecycle suite.)
+/// `DEDICATED_GATEWAY`; this variant exercises the same path with the
+/// lifecycle-suite fixture for consistency with the rest of the suite.)
 #[tokio::test]
 async fn lifecycle_gateway_deletion_cascades_resources() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -1028,7 +1027,7 @@ async fn params_autoscaling_disabled_provisions_no_hpa() -> anyhow::Result<()> {
     // A single-replica, no-autoscaling fixture (`replicas: 1`, no `autoscaling`
     // block) → neither HPA nor PDB should be provisioned (floor < 2). The
     // ClusterIP fixture fits exactly; the test only inspects the rendered
-    // Deployment, not Pod readiness, so its pause-image stub is irrelevant here.
+    // Deployment, not Pod readiness.
     fixtures::apply_fixture(
         dedicated::DEDICATED_GATEWAY_CLUSTERIP,
         FixtureVars::new(&ns.name),

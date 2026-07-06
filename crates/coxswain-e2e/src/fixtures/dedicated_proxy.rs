@@ -19,16 +19,17 @@ pub const DEDICATED_GATEWAY: &str = fixture!("dedicated_gateway.yaml");
 pub const DEDICATED_GATEWAY_WITH_ROUTE: &str = fixture!("dedicated_gateway_with_route.yaml");
 
 /// Dedicated-mode `Gateway` with `serviceType: ClusterIP` (#211 Scenario A).
-/// Pins the proxy `image` to `registry.k8s.io/pause:3.10` so the Pod becomes
-/// Ready instantly — this test gates `Programmed=True` on Pod readiness but
-/// only exercises the operator's status writer, not the proxy data plane.
+/// Runs the real coxswain image (no `image` override): `Programmed=True`
+/// requires the dedicated proxy to report its listener ports bound over
+/// discovery (#531), so a stub container would never converge.
 pub const DEDICATED_GATEWAY_CLUSTERIP: &str = fixture!("dedicated_gateway_clusterip.yaml");
 
 /// Dedicated-mode `Gateway` with `serviceType: LoadBalancer` (#211 Scenario
 /// B). Used to verify the operator's address resolution from
 /// `Service.status.loadBalancer.ingress` and the `Programmed` transition
 /// from `AddressNotAssigned` → `True` once the harness injects a synthetic
-/// LB ingress. Same pause-image stub as `DEDICATED_GATEWAY_CLUSTERIP`.
+/// LB ingress. Runs the real coxswain image, like
+/// [`DEDICATED_GATEWAY_CLUSTERIP`].
 pub const DEDICATED_GATEWAY_LOADBALANCER: &str = fixture!("dedicated_gateway_loadbalancer.yaml");
 
 /// Dedicated-mode `Gateway` whose `parametersRef` targets a missing
@@ -51,9 +52,8 @@ pub const DEDICATED_GATEWAY_FROM_ALL: &str = fixture!("dedicated_gateway_from_al
 
 // -----------------------------------------------------------------------------
 // Step 13 (#212) — full-lifecycle suite fixtures. Listener ports use the
-// harness-substituted `GATEWAY_HTTP_PORT`, and the dedicated pod's image is
-// pinned to `registry.k8s.io/pause:3.10` so the Pod becomes Ready without a
-// coxswain image build.
+// harness-substituted `GATEWAY_HTTP_PORT`; the dedicated pod runs the real
+// coxswain image so the #531 bound-port Programmed gate can converge.
 // -----------------------------------------------------------------------------
 
 /// Dedicated-mode Gateway + `CoxswainGatewayParameters` (no HTTPRoute). Used

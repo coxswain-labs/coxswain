@@ -236,18 +236,18 @@ async fn gatewayclass_supported_features() -> anyhow::Result<()> {
 }
 
 /// 8 — Scenario A (#211, ClusterIP happy path): apply a dedicated Gateway with
-/// `serviceType: ClusterIP`, wait for pod Ready, then assert the operator
+/// `serviceType: ClusterIP`, wait for the provisioned proxy to come up and
+/// report its listener ports bound (#531), then assert the operator
 /// writes `Accepted=True`, `Programmed=True`,
 /// `gateway.coxswain-labs.dev/DedicatedProxyReady=True/Ready`, and
 /// `status.addresses[0]` matching the provisioned Service's `spec.clusterIP`.
 ///
-/// Uses [`dedicated::DEDICATED_GATEWAY_CLUSTERIP`] rather than the shared
-/// `DEDICATED_GATEWAY` fixture because Pod-Ready gating requires a
-/// stub-image container — the default `coxswain:<version>` image cached
-/// on the cluster predates the controller/proxy CLI split and CrashLoops
-/// against the operator-rendered args, so it never reports Ready.
+/// Uses [`dedicated::DEDICATED_GATEWAY_CLUSTERIP`], which runs the real
+/// coxswain image: since #531 `Programmed=True` additionally requires the
+/// dedicated proxy to connect to discovery and report the Gateway's
+/// listener ports bound, which no stub container can do.
 #[tokio::test]
-async fn writes_clusterip_address_and_programmed_true_when_pod_ready() -> anyhow::Result<()> {
+async fn writes_clusterip_address_and_programmed_true_when_proxy_binds() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "sc-dedgw-status-clusterip").await?;
 
@@ -270,11 +270,13 @@ async fn writes_clusterip_address_and_programmed_true_when_pod_ready() -> anyhow
     );
 
     let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
-    // Programmed=True takes a moment: we wait for both pod readiness and
-    // the operator's reconcile to propagate. 60s window accommodates image
-    // pull and pod startup on a cold local cluster.
+    // Programmed=True takes a moment: the provisioned proxy must start,
+    // bootstrap its SVID over discovery, receive its first snapshot, bind the
+    // listener, and report the bound port back before the operator's status
+    // write converges. 90s accommodates all of that on a cold cluster,
+    // matching the sibling dedicated tests on the same convergence path.
     let gw = wait::poll_until(
-        Duration::from_secs(60),
+        Duration::from_secs(90),
         wait::POLL,
         || async {
             let observed = gateways.get(GATEWAY_NAME).await.ok().map_or_else(
@@ -350,7 +352,8 @@ async fn loadbalancer_status_patch_drives_addresses_and_programmed_true() -> any
 
     // Before any LB ingress is assigned the operator must surface
     // Programmed=False with one of two reasons:
-    //   * Pending — pod not yet Ready (precedence: pod-ready > address)
+    //   * Pending — pod not yet Ready, or the proxy has not yet reported the
+    //     Gateway's listener ports bound (#531)
     //   * AddressNotAssigned — pod is Ready but no LB IP yet
     wait::poll_until(
         Duration::from_secs(45),
@@ -696,7 +699,9 @@ async fn lifecycle_gateway_status_conditions_and_addresses() -> anyhow::Result<(
 
     fixtures::apply_fixture(dedicated::PROVISIONING, FixtureVars::new(&ns.name)).await?;
 
-    wait::wait_for_gateway_programmed(&h.client, GATEWAY_NAME, &ns.name, Duration::from_secs(60))
+    // 90s: real-proxy convergence (schedule → SVID bootstrap → snapshot →
+    // bind → bound-port report), matching the sibling dedicated tests.
+    wait::wait_for_gateway_programmed(&h.client, GATEWAY_NAME, &ns.name, Duration::from_secs(90))
         .await?;
 
     let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
