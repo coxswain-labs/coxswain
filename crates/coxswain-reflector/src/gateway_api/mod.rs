@@ -35,7 +35,9 @@ pub(crate) use route_status::RouteLike;
 /// `IpAccessControl`, `BasicAuth`, `RequestSizeLimit`, `Compression`,
 /// `PathRewriteRegex`). Single source of truth for the `ExtensionRef.group`
 /// dispatch — a stray literal that misspells this silently disables a filter.
-pub(super) const COXSWAIN_GROUP: &str = "gateway.coxswain-labs.dev";
+/// `pub(crate)` so [`crate::reference_grants`] (BasicAuth secret grants, same
+/// group) shares this one definition rather than keeping its own copy.
+pub(crate) const COXSWAIN_GROUP: &str = "gateway.coxswain-labs.dev";
 
 #[cfg(test)]
 mod tests;

@@ -4,6 +4,9 @@
 //! the dedicated-mode snapshot builder derive identical permitted-reference
 //! sets from the same input, so the two code paths cannot drift.
 
+// The coxswain-proprietary CRD group (`BasicAuth`, `RateLimit`, … ExtensionRef CRDs);
+// re-uses the single definition in `gateway_api` rather than a second local copy.
+use crate::gateway_api::COXSWAIN_GROUP;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
 use coxswain_core::reference_grants::ReferenceGrantKey;
 use std::collections::HashSet;
@@ -35,9 +38,6 @@ pub fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
 
 /// The upstream Gateway API `from.group` most cross-namespace refs originate from.
 const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
-
-/// The coxswain-proprietary CRD group (`BasicAuth`, `RateLimit`, … ExtensionRef CRDs).
-const COXSWAIN_GROUP: &str = "gateway.coxswain-labs.dev";
 
 /// Flatten the `BasicAuth → Secret` grants that authorize a `BasicAuth` CR to
 /// reference its htpasswd `secretRef` in another namespace (#520).

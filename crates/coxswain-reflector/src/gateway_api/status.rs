@@ -47,7 +47,7 @@ impl RouteLike for HttpRoute {
                 if matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef)
                     && let Some(ext) = &f.extension_ref
                 {
-                    return ext.group != "gateway.coxswain-labs.dev"
+                    return ext.group != super::COXSWAIN_GROUP
                         || (ext.kind != "RateLimit"
                             && ext.kind != "PathRewriteRegex"
                             && ext.kind != "IpAccessControl");
