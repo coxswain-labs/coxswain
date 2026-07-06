@@ -1266,6 +1266,196 @@ async fn programmed_true_and_address_written_when_usable_clusterip_requested() -
     Ok(())
 }
 
+// ── observedGeneration-vs-address convergence (#533) ─────────────────────────
+
+/// The `(status, reason, observedGeneration)` of a Gateway's top-level
+/// `Programmed` condition — `observedGeneration` is not exposed by the shared
+/// `gateway_condition` helper but is the crux of the #533 coherence invariant.
+fn programmed_full(gw: &Gateway) -> Option<(String, String, i64)> {
+    gw.status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.type_ == "Programmed")
+        .map(|c| {
+            (
+                c.status.clone(),
+                c.reason.clone(),
+                c.observed_generation.unwrap_or(0),
+            )
+        })
+}
+
+/// #533 happy path + coherence invariant (shared): the `Programmed` condition's
+/// `observedGeneration` must never reach `metadata.generation` while the
+/// requested static address is still missing from `status.addresses`. Sample
+/// rapidly through the convergence window and fail the instant that coherence
+/// breaks; converge on `Programmed=True` carrying the requested IP.
+#[tokio::test]
+async fn shared_gateway_generation_trails_address_until_resolved() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-gw-gen-trails-addr").await?;
+
+    // Probe a known-free in-CIDR clusterIP the Gateway can then request (same
+    // technique as `programmed_true_and_address_written_when_usable_clusterip_requested`).
+    let svc_api: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let probe = Service {
+        metadata: kube::api::ObjectMeta {
+            name: Some("gen-trails-probe".to_string()),
+            ..Default::default()
+        },
+        spec: Some(ServiceSpec {
+            type_: Some("ClusterIP".to_string()),
+            ports: Some(vec![ServicePort {
+                port: 80,
+                ..Default::default()
+            }]),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let created = svc_api.create(&Default::default(), &probe).await?;
+    let usable_ip = created
+        .spec
+        .and_then(|s| s.cluster_ip)
+        .filter(|ip| !ip.is_empty() && ip != "None")
+        .ok_or_else(|| anyhow::anyhow!("probe Service got no clusterIP"))?;
+    svc_api
+        .delete("gen-trails-probe", &Default::default())
+        .await?;
+
+    fixtures::apply_fixture(
+        gwa::STATIC_ADDRESS,
+        FixtureVars::new(&ns.name)
+            .with("ADDR_TYPE", "IPAddress")
+            .with("ADDR_VALUE", &usable_ip),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let usable_for_assert = usable_ip.clone();
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok();
+            format!(
+                "Programmed=True carrying {usable_ip}; observed Programmed={:?} addresses={:?}",
+                gw.as_ref().and_then(programmed_full),
+                gw.as_ref().map(gateway_addresses).unwrap_or_default()
+            )
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let generation = gw.metadata.generation.unwrap_or(0);
+            let (status, _reason, observed) = programmed_full(&gw)?;
+            let has_ip = gateway_addresses(&gw)
+                .iter()
+                .any(|(t, v)| t == "IPAddress" && v == &usable_for_assert);
+            // #533 invariant: Programmed cannot claim generation N is fully
+            // processed while the requested address is unresolved.
+            assert!(
+                !(observed >= generation && !has_ip),
+                "#533 violated: Programmed observedGeneration {observed} >= generation {generation} \
+                 while status.addresses is missing {usable_for_assert}"
+            );
+            (status == "True" && has_ip).then_some(())
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// #533 sad companion (shared): a *settled negative* — a requested static IP
+/// outside the service CIDR that can never be assigned — must stamp its
+/// `Programmed=False/AddressNotUsable` at the current generation, NOT be held
+/// below it. The convergence hold applies only to states still racing to
+/// converge, never to a real, final negative outcome.
+#[tokio::test]
+async fn shared_gateway_settled_address_not_usable_stamps_current_generation() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-gw-settled-negative-gen").await?;
+
+    fixtures::apply_fixture(
+        gwa::STATIC_ADDRESS,
+        FixtureVars::new(&ns.name)
+            .with("ADDR_TYPE", "IPAddress")
+            .with("ADDR_VALUE", "192.0.2.1"), // TEST-NET-1: never in the service CIDR
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok();
+            format!(
+                "Programmed=False/AddressNotUsable at current generation; observed {:?}",
+                gw.as_ref().and_then(programmed_full)
+            )
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let generation = gw.metadata.generation.unwrap_or(0);
+            let (status, reason, observed) = programmed_full(&gw)?;
+            (status == "False" && reason == "AddressNotUsable" && observed == generation)
+                .then_some(())
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// #533 happy path + coherence invariant (dedicated): the dedicated-proxy
+/// Service address resolves through the watch-lagged services store, so the
+/// operator's `Programmed` writer must never report `AddressNotAssigned` at the
+/// current generation — that transient is held one generation below until the
+/// address lands. Sample through convergence and converge on `Programmed=True`
+/// carrying the Service's clusterIP.
+#[tokio::test]
+async fn dedicated_gateway_generation_trails_address_until_resolved() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-dedgw-gen-trails-addr").await?;
+
+    fixtures::apply_fixture(
+        dedicated::DEDICATED_GATEWAY_CLUSTERIP,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            let gw = gateways.get(GATEWAY_NAME).await.ok();
+            format!(
+                "dedicated Programmed=True with an address; observed Programmed={:?} addresses={:?}",
+                gw.as_ref().and_then(programmed_full),
+                gw.as_ref().map(gateway_addresses).unwrap_or_default()
+            )
+        },
+        || async {
+            let gw = gateways.get(GATEWAY_NAME).await.ok()?;
+            let generation = gw.metadata.generation.unwrap_or(0);
+            let (status, reason, observed) = programmed_full(&gw)?;
+            // #533 invariant: `AddressNotAssigned` (address genuinely unresolved)
+            // must never be stamped at the current generation.
+            assert!(
+                !(reason == "AddressNotAssigned" && observed >= generation),
+                "#533 violated (dedicated): AddressNotAssigned stamped at generation {generation} \
+                 (observedGeneration {observed}) while the Service address is unresolved"
+            );
+            (status == "True" && !gateway_addresses(&gw).is_empty()).then_some(())
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 // ── ValidatingAdmissionPolicy (#29) ──────────────────────────────────────────
 
 /// VAP positive path: a well-formed Ingress with valid coxswain annotations

@@ -35,15 +35,34 @@ pub(super) struct SharedAddressDecision {
     /// is by construction an unsupported kind → `Accepted=False`. Existence of
     /// the ref is the whole signal; no target resolution is needed.
     pub(super) params_ref_unsupported: bool,
+    /// Whether the Gateway is fully converged for its current generation (#533):
+    /// its own VIP address has resolved. `false` holds the top-level
+    /// `Programmed` condition at `False/Pending` with an `observedGeneration`
+    /// below the current generation, so a one-shot "conditions are latest" check
+    /// waits until the address lands and `Programmed=True@N` is published in the
+    /// same patch that carries `status.addresses`. A settled *negative* address
+    /// outcome (`programmed_override`) is unaffected — it is a real result for
+    /// the current generation.
+    pub(super) converged: bool,
 }
 
 impl SharedAddressDecision {
+    /// Whether the top-level `Programmed` condition must be held at
+    /// `False/Pending` because the Gateway is not yet fully converged (#533):
+    /// there is no settled negative address outcome, and the reconcile has not
+    /// yet observed the Gateway's VIP address resolve.
+    fn programmed_pending(&self) -> bool {
+        self.static_outcome.programmed_override.is_none() && !self.converged
+    }
+
     /// Desired `(status, reason)` for the top-level `Programmed` condition:
     /// `(False, AddressNotUsable | Invalid)` when a requested address could not
-    /// be honored, else the canonical `(True, Programmed)`.
+    /// be honored; `(False, Pending)` while not yet converged (#533);
+    /// else the canonical `(True, Programmed)`.
     fn desired_programmed(&self) -> (&'static str, GatewayConditionReason) {
         match self.static_outcome.programmed_override {
             Some(reason) => ("False", reason),
+            None if !self.converged => ("False", GatewayConditionReason::Pending),
             None => ("True", GatewayConditionReason::Programmed),
         }
     }
@@ -348,6 +367,19 @@ pub(super) fn build_gateway_status_patch(
     // override applies, so the legacy happy path is unchanged.
     let (acc_status, acc_reason) = desired_gateway_accepted(gw, health, decision);
     let (prog_status, prog_reason) = decision.desired_programmed();
+    // #533: while the Gateway is not yet converged, hold the `Programmed`
+    // condition's `observedGeneration` one below the current generation so a
+    // one-shot "conditions are latest" check (conformance
+    // `GatewayMustHaveLatestConditions`) keeps waiting until the VIP address has
+    // landed AND the data plane has ack'd — at which point the same patch that
+    // flips `Programmed` to `True@generation` also carries `status.addresses`.
+    // `Accepted` always advances immediately; a settled negative Programmed
+    // outcome stamps at the current generation.
+    let prog_generation = if decision.programmed_pending() {
+        generation.saturating_sub(1)
+    } else {
+        generation
+    };
     let mut conditions = vec![
         make_condition(
             GatewayConditionType::Accepted,
@@ -362,7 +394,7 @@ pub(super) fn build_gateway_status_patch(
             prog_status,
             prog_reason,
             static_address_message(prog_reason),
-            generation,
+            prog_generation,
             now.clone(),
         ),
     ];
@@ -511,6 +543,7 @@ mod tests {
             legacy_addr: None,
             static_outcome: StaticAddressOutcome::not_engaged(),
             params_ref_unsupported: false,
+            converged: true,
         }
     }
 
@@ -520,6 +553,7 @@ mod tests {
             legacy_addr: Some(addr),
             static_outcome: StaticAddressOutcome::not_engaged(),
             params_ref_unsupported: false,
+            converged: true,
         }
     }
     use coxswain_reflector::gw_types::v::gateways::{
@@ -883,6 +917,7 @@ mod tests {
                 feature_engaged: true,
             },
             params_ref_unsupported: false,
+            converged: true,
         }
     }
 
@@ -939,6 +974,7 @@ mod tests {
                 feature_engaged: true,
             },
             params_ref_unsupported: true,
+            converged: true,
         };
         let patch = build_gateway_status_patch(
             &gw,
@@ -1192,6 +1228,134 @@ mod tests {
             .expect("Programmed")
             .clone();
         assert_eq!(prog["status"], "True");
+    }
+
+    // ── convergence gate (#533) ───────────────────────────────────────
+
+    /// A decision that is otherwise the happy path but not yet converged.
+    fn not_converged() -> SharedAddressDecision {
+        SharedAddressDecision {
+            legacy_addr: None,
+            static_outcome: StaticAddressOutcome::not_engaged(),
+            params_ref_unsupported: false,
+            converged: false,
+        }
+    }
+
+    #[test]
+    fn patch_holds_programmed_pending_below_generation_until_converged() {
+        // Not converged (VIP unresolved and/or proxy not ack'd): Programmed is
+        // held at False/Pending with observedGeneration BELOW the current
+        // generation so `GatewayMustHaveLatestConditions` keeps waiting, while
+        // Accepted advances immediately.
+        let gw = gateway(3, None, None);
+        let patch = build_gateway_status_patch(
+            &gw,
+            &default_status(),
+            3,
+            &epoch(),
+            &not_converged(),
+            IngressPorts::default(),
+        );
+        let conds = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        let acc = conds
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("Accepted");
+        assert_eq!(acc["status"], "True", "Accepted advances immediately");
+        assert_eq!(acc["observedGeneration"], 3);
+        let prog = conds
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed");
+        assert_eq!(prog["status"], "False");
+        assert_eq!(prog["reason"], "Pending");
+        assert_eq!(
+            prog["observedGeneration"], 2,
+            "Programmed held one generation below current until converged"
+        );
+    }
+
+    #[test]
+    fn patch_flips_programmed_true_at_generation_once_converged() {
+        let gw = gateway(3, None, None);
+        let patch = build_gateway_status_patch(
+            &gw,
+            &default_status(),
+            3,
+            &epoch(),
+            &no_addr(), // converged
+            IngressPorts::default(),
+        );
+        let prog = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed")
+            .clone();
+        assert_eq!(prog["status"], "True");
+        assert_eq!(prog["reason"], "Programmed");
+        assert_eq!(
+            prog["observedGeneration"], 3,
+            "converged Programmed stamps the current generation"
+        );
+    }
+
+    #[test]
+    fn needs_patch_when_pending_flips_to_converged() {
+        // A Gateway currently Programmed=False/Pending must re-patch when it
+        // converges (Pending → True/Programmed), even though Accepted is
+        // unchanged — otherwise Programmed would never advance to True.
+        let pending = Condition {
+            type_: "Programmed".to_string(),
+            status: "False".to_string(),
+            reason: "Pending".to_string(),
+            message: String::new(),
+            observed_generation: Some(1),
+            last_transition_time: epoch(),
+        };
+        let gw = gateway(
+            2,
+            Some(vec![condition("Accepted", 2), pending]),
+            Some(vec![listener_status("http", 2)]),
+        );
+        assert!(
+            gateway_needs_status_patch(&gw, &default_status(), &no_addr()),
+            "a pending→converged transition must force a patch"
+        );
+    }
+
+    #[test]
+    fn settled_negative_programmed_stamps_current_generation_even_if_not_converged() {
+        // A real negative outcome (AddressNotUsable) is settled for the current
+        // generation — the not-yet-converged hold must NOT apply to it.
+        let gw = gateway(4, None, None);
+        let mut decision = engaged(None, Some(GatewayConditionReason::AddressNotUsable), vec![]);
+        decision.converged = false;
+        let patch = build_gateway_status_patch(
+            &gw,
+            &default_status(),
+            4,
+            &epoch(),
+            &decision,
+            IngressPorts::default(),
+        );
+        let prog = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed")
+            .clone();
+        assert_eq!(prog["status"], "False");
+        assert_eq!(prog["reason"], "AddressNotUsable");
+        assert_eq!(
+            prog["observedGeneration"], 4,
+            "settled negative stamps the current generation, not held"
+        );
     }
 
     #[test]

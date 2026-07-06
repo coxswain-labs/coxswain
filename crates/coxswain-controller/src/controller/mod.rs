@@ -69,7 +69,7 @@ mod tls_route_events;
 
 pub use config::{ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress};
 
-use conditions::gateway_accepted;
+use conditions::{gateway_accepted, gateway_programmed_at_current_gen};
 use gateway_class_status::gateway_class_needs_status_patch;
 use gateway_status::gateway_needs_status_patch;
 use ingress_status::ingress_lb_already_matches;
@@ -661,11 +661,6 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         .as_ref()
         .and_then(|i| i.parameters_ref.as_ref())
         .is_some();
-    let decision = gateway_status::SharedAddressDecision {
-        legacy_addr: owned_status_addr,
-        static_outcome,
-        params_ref_unsupported,
-    };
 
     // The per-Gateway VIP Service and its LoadBalancer IP are provisioned
     // asynchronously by the separate `run_vip_reconciler` task, which fires no
@@ -673,6 +668,25 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     // must REQUEUE (not `await_change`) or `status.addresses` would stay stale
     // until an unrelated Gateway edit. Only a `Resolved` own-VIP is terminal.
     let awaiting_own_vip = ctx.shared_vip_addressing && !matches!(vip, VipAddress::Resolved(_));
+
+    // Convergence gate (#533): a shared-mode Gateway is fully converged for its
+    // current generation only once its own VIP address has resolved — otherwise
+    // `status.addresses` is still empty. Until then the status patch holds
+    // `Programmed` at `False/Pending` with its `observedGeneration` below the
+    // current generation, so a one-shot "conditions are latest" check keeps
+    // waiting and never observes `Programmed` claiming generation N while the
+    // address is unresolved; the same patch that flips `Programmed=True@N` also
+    // publishes the address. Once the Gateway is already Programmed at its live
+    // generation the gate is a no-op — transient VIP re-resolution must never
+    // flap an established `Programmed=True` back to `Pending`.
+    let converged = gateway_programmed_at_current_gen(gw) || !awaiting_own_vip;
+
+    let decision = gateway_status::SharedAddressDecision {
+        legacy_addr: owned_status_addr,
+        static_outcome,
+        params_ref_unsupported,
+        converged,
+    };
 
     let key = ObjectKey::new(
         gw.metadata.namespace.clone().unwrap_or_default(),
@@ -691,10 +705,13 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
             )
             .await;
         }
-        if awaiting_own_vip {
-            Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
-        } else {
+        // Requeue until fully converged so `Programmed` lands promptly once the
+        // VIP resolves AND the proxy acks, rather than waiting for an unrelated
+        // Gateway event.
+        if converged {
             Action::await_change()
+        } else {
+            Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
         }
     } else if !gateway_accepted(gw) {
         // Before the data plane is synced, write the minimal Accepted-oriented
