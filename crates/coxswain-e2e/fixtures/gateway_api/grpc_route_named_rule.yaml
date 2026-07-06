@@ -1,0 +1,47 @@
+# Gateway + GRPCRoute (#504): first rule carries `name: named-rule` (matches
+# GrpcEcho/Echo), second rule is unnamed (matches GrpcEcho/EchoTwo). Mirrors
+# the upstream `GRPCRouteNamedRule` conformance manifest's rule shape.
+#
+# Both rules resolve to the same `grpc-echo` backend — this fixture proves the
+# named rule is accepted and routes, and that naming one rule does not widen
+# or perturb the sibling unnamed rule's matching.
+# Backend: grpc-echo Service port 50051, appProtocol kubernetes.io/h2c.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-named-rule-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-named-rule-route
+spec:
+  hostnames:
+    - "grpc-named-rule.${TESTNS}.local"
+  parentRefs:
+    - name: coxswain-grpc-named-rule-test
+  rules:
+    - name: named-rule
+      matches:
+        - method:
+            type: Exact
+            service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+            method: Echo
+      backendRefs:
+        - name: grpc-echo
+          port: 50051
+    - matches:
+        - method:
+            type: Exact
+            service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+            method: EchoTwo
+      backendRefs:
+        - name: grpc-echo
+          port: 50051

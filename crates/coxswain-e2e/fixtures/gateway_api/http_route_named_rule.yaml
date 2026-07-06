@@ -1,0 +1,44 @@
+# Gateway + HTTPRoute (#504): first rule carries `name: named-rule` (matches
+# /a), second rule is unnamed (matches /b). Used to prove the rule name
+# replaces the positional index in the proxy's `route` metric label and the
+# access-log `route_id` field.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-http-named-rule-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: http-named-rule-route
+spec:
+  parentRefs:
+    - name: coxswain-http-named-rule-test
+  hostnames:
+    - "http-named-rule.${TESTNS}.local"
+  rules:
+    - name: named-rule
+      matches:
+        - path:
+            type: PathPrefix
+            value: /a
+      backendRefs:
+        - name: echo-a
+          port: 3000
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /b
+      backendRefs:
+        - name: echo-b
+          port: 3000

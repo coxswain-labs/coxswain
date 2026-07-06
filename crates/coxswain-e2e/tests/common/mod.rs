@@ -9,3 +9,4 @@
 
 pub mod dedicated;
 pub mod discovery;
+pub mod grpc_echo;

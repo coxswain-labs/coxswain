@@ -25,32 +25,6 @@ use coxswain_e2e::{
     harness::{http, wait},
 };
 use gateway_api_types::apis::standard::httproutes::HttpRoute;
-
-// Minimal prost message types for the GrpcEcho conformance service.
-// Service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
-// Derived by hand from grpcecho.proto — avoids a prost-build dependency.
-mod grpcecho {
-    #[derive(Clone, PartialEq, prost::Message)]
-    pub struct EchoRequest {}
-
-    #[derive(Clone, PartialEq, prost::Message)]
-    pub struct GrpcContext {
-        #[prost(string, tag = "4")]
-        pub pod: String,
-    }
-
-    #[derive(Clone, PartialEq, prost::Message)]
-    pub struct EchoAssertions {
-        #[prost(message, optional, tag = "4")]
-        pub context: Option<GrpcContext>,
-    }
-
-    #[derive(Clone, PartialEq, prost::Message)]
-    pub struct EchoResponse {
-        #[prost(message, optional, tag = "1")]
-        pub assertions: Option<EchoAssertions>,
-    }
-}
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -62,6 +36,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 mod common;
+use common::grpc_echo as grpcecho;
 
 /// Tests both the per-Ingress spec.defaultBackend and the controller-wide
 /// --ingress-default-backend flag. Backends are deployed before the controller
@@ -1928,6 +1903,185 @@ async fn grpc_route_unmatched_method_is_not_served() -> anyhow::Result<()> {
     assert!(
         result.is_err(),
         "call to unmatched GrpcEcho/EchoTwo must fail, but got a successful response"
+    );
+
+    Ok(())
+}
+
+// ── GRPCRouteNamedRouteRule — GEP-995 (#504) ─────────────────────────────────
+
+/// A `GRPCRoute` rule carrying `.name` still routes correctly, and the name
+/// replaces the positional rule index as the proxy's `route` metric label —
+/// the reorder-stable identifier the field exists to provide. The sibling
+/// unnamed rule is unaffected: it keeps its positional-index label.
+#[tokio::test]
+async fn grpc_route_with_named_rule_routes_by_method() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-grpc-named-rule").await?;
+
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_ROUTE_NAMED_RULE, FixtureVars::new(&ns.name)).await?;
+
+    wait::wait_for_grpcroute_programmed(
+        &h.client,
+        "grpc-named-rule-route",
+        &ns.name,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let host = format!("grpc-named-rule.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+    let origin: tonic::transport::Uri = format!("http://{}:{}", host, gw_addr.port()).parse()?;
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))?.origin(origin);
+
+    // Poll until the data plane picks up the new route and the named rule's
+    // method (Echo) succeeds.
+    let inner = wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("gRPC Echo call via {host} (named rule) to succeed") },
+        || async {
+            let channel = endpoint.clone().connect().await.ok()?;
+            let mut client = tonic::client::Grpc::new(channel);
+            client.ready().await.ok()?;
+            let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo"
+                .parse::<tonic::codegen::http::uri::PathAndQuery>()
+                .ok()?;
+            let codec =
+                tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+            client
+                .unary(tonic::Request::new(grpcecho::EchoRequest {}), path, codec)
+                .await
+                .ok()
+                .map(tonic::Response::into_inner)
+        },
+    )
+    .await?;
+    let pod = inner
+        .assertions
+        .and_then(|a| a.context)
+        .map(|c| c.pod)
+        .unwrap_or_default();
+    assert!(
+        pod.starts_with("grpc-echo-"),
+        "named-rule call must be served by grpc-echo-* pod, got {pod:?}"
+    );
+
+    // The sibling unnamed rule (EchoTwo) must still route — naming rule 0
+    // must not perturb rule 1's matching.
+    let channel = endpoint.connect().await.context("connect to gateway")?;
+    let mut client = tonic::client::Grpc::new(channel);
+    client
+        .ready()
+        .await
+        .map_err(|e| anyhow::anyhow!("gRPC channel not ready: {e}"))?;
+    let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/EchoTwo"
+        .parse::<tonic::codegen::http::uri::PathAndQuery>()?;
+    let codec = tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+    let response = client
+        .unary(tonic::Request::new(grpcecho::EchoRequest {}), path, codec)
+        .await
+        .map_err(|e| anyhow::anyhow!("unnamed-rule EchoTwo call failed: {e}"))?
+        .into_inner();
+    let pod = response
+        .assertions
+        .and_then(|a| a.context)
+        .map(|c| c.pod)
+        .unwrap_or_default();
+    assert!(
+        pod.starts_with("grpc-echo-"),
+        "unnamed-rule call must be served by grpc-echo-* pod, got {pod:?}"
+    );
+
+    // The named rule's metric label uses the name; the unnamed rule (index 1)
+    // still uses its positional index.
+    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let named_label = format!(
+        "route=\"grpcroute/{}/grpc-named-rule-route:named-rule\"",
+        ns.name
+    );
+    assert!(
+        metrics.lines().any(|l| l.contains(&named_label)),
+        "requests_total must carry a route label using the rule name `{named_label}`, metrics:\n{metrics}"
+    );
+    let indexed_label = format!("route=\"grpcroute/{}/grpc-named-rule-route:1\"", ns.name);
+    assert!(
+        metrics.lines().any(|l| l.contains(&indexed_label)),
+        "the unnamed sibling rule must keep its positional-index label `{indexed_label}`, metrics:\n{metrics}"
+    );
+
+    Ok(())
+}
+
+/// A gRPC call to a method matched by neither rule of a named-rule
+/// `GRPCRoute` is not served — naming one rule must not widen matching for
+/// the route as a whole.
+#[tokio::test]
+async fn grpc_route_named_rule_unmatched_method_is_not_served() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-grpc-named-rule-unmatched").await?;
+
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_ROUTE_NAMED_RULE, FixtureVars::new(&ns.name)).await?;
+
+    wait::wait_for_grpcroute_programmed(
+        &h.client,
+        "grpc-named-rule-route",
+        &ns.name,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let host = format!("grpc-named-rule.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+    let origin: tonic::transport::Uri = format!("http://{}:{}", host, gw_addr.port()).parse()?;
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))?.origin(origin);
+
+    // First confirm the happy path is live so we know the data plane is ready.
+    wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("gRPC Echo warm-up via {host} to succeed") },
+        || async {
+            let channel = endpoint.clone().connect().await.ok()?;
+            let mut client = tonic::client::Grpc::new(channel);
+            client.ready().await.ok()?;
+            let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo"
+                .parse::<tonic::codegen::http::uri::PathAndQuery>()
+                .ok()?;
+            let codec =
+                tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+            client
+                .unary(tonic::Request::new(grpcecho::EchoRequest {}), path, codec)
+                .await
+                .ok()
+                .map(|_| ())
+        },
+    )
+    .await?;
+
+    // EchoThree is matched by neither rule → must fail.
+    let channel = endpoint.connect().await.context("connect to gateway")?;
+    let mut client = tonic::client::Grpc::new(channel);
+    client
+        .ready()
+        .await
+        .map_err(|e| anyhow::anyhow!("gRPC channel not ready: {e}"))?;
+    let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/EchoThree"
+        .parse::<tonic::codegen::http::uri::PathAndQuery>()?;
+    let codec = tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+    let result = client
+        .unary(tonic::Request::new(grpcecho::EchoRequest {}), path, codec)
+        .await;
+
+    assert!(
+        result.is_err(),
+        "call to unmatched GrpcEcho/EchoThree must fail, but got a successful response"
     );
 
     Ok(())
