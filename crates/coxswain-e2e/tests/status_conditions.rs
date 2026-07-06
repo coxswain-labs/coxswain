@@ -2553,3 +2553,348 @@ async fn gateway_listenerset_kind_restriction_matches_protocol() -> anyhow::Resu
 
     Ok(())
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// #531 — shared-mode `Programmed=True` gated on proxy listener-bind readiness
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The `message` of a Gateway's top-level `Programmed` condition.
+fn programmed_message(gw: &Gateway) -> Option<String> {
+    gw.status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.type_ == "Programmed")
+        .map(|c| c.message.clone())
+}
+
+/// The `lastTransitionTime` of the `Programmed` condition — bumped only on a
+/// status change, so equality across a churn window proves zero flaps even
+/// between poll ticks.
+fn programmed_transition_time(gw: &Gateway) -> Option<Time> {
+    gw.status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .find(|c| c.type_ == "Programmed")
+        .map(|c| c.last_transition_time.clone())
+}
+
+/// #531 happy path + coherence invariant (shared): `Programmed` must never be
+/// stamped at the current generation while not `True` (the pre-bind hold
+/// trails at `generation - 1`), and the moment it flips `True` the Gateway's
+/// VIP must already serve traffic — `Programmed=True` is a data-plane
+/// guarantee, not a status-only signal. This is the assertion that fails on
+/// the old status-ahead-of-dataplane race (the conformance
+/// `GatewayFrontendClientCertificateValidation` flake).
+#[tokio::test]
+async fn shared_gateway_generation_trails_programmed_until_pool_binds() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-gw-pool-bind-gate").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async {
+            format!(
+                "Programmed=True at the current generation; observed {:?}",
+                gw_api
+                    .get("coxswain-test")
+                    .await
+                    .ok()
+                    .as_ref()
+                    .and_then(programmed_full)
+            )
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let generation = gw.metadata.generation.unwrap_or(0);
+            let (status, _reason, observed) = programmed_full(&gw)?;
+            // #531 invariant: a not-yet-bound Gateway must trail at gen-1 —
+            // Programmed may never claim generation N while not True.
+            assert!(
+                !(observed >= generation && status != "True"),
+                "#531 violated: Programmed observedGeneration {observed} >= generation \
+                 {generation} while status is {status:?} (pre-bind hold must trail)"
+            );
+            (status == "True" && observed >= generation).then_some(())
+        },
+    )
+    .await?;
+
+    // Programmed=True now implies every connected pool member bound the VIP's
+    // internal ports — the VIP must serve immediately. The short bound absorbs
+    // host-side LB/conntrack propagation only; the race detector is the
+    // per-tick invariant above.
+    let host = format!("echo.{}.local", ns.name);
+    let gw_http = h.gateway_http(&ns.name).await?;
+    wait::wait_for_backend(&gw_http, &host, "/a", "echo-a", Duration::from_secs(10)).await?;
+    Ok(())
+}
+
+/// #531 sad path (shared): with ZERO connected shared-pool proxies the gate
+/// fails closed — the Gateway holds `Programmed=False/Pending` below its
+/// generation and must never claim readiness for a VIP nothing serves. When
+/// the pool returns, the readiness report re-drives the reconcile and the
+/// Gateway converges to `True` with the VIP actually serving (the recovery is
+/// part of the assertion, so a broken restore fails loudly here).
+#[tokio::test]
+async fn shared_gateway_with_no_connected_proxies_holds_programmed_pending_until_pool_returns()
+-> anyhow::Result<()> {
+    use common::shared_proxy::{SharedProxyScaleGuard, scale_shared_proxy};
+
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-gw-pool-empty-holds").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    // Panic-safe restore; the explicit scale-up below is the real assertion.
+    let _restore = SharedProxyScaleGuard;
+    scale_shared_proxy(0).await?;
+
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    // Phase 1: the hold is observable *steadily* — scale-to-zero freezes the
+    // usually-subsecond pre-bind window open.
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!(
+                "Programmed held at False/Pending below generation with the pool at 0; \
+                 observed {:?} message {:?}",
+                gw_api
+                    .get("coxswain-test")
+                    .await
+                    .ok()
+                    .as_ref()
+                    .and_then(programmed_full),
+                gw_api
+                    .get("coxswain-test")
+                    .await
+                    .ok()
+                    .as_ref()
+                    .and_then(programmed_message),
+            )
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let generation = gw.metadata.generation.unwrap_or(0);
+            let (status, reason, observed) = programmed_full(&gw)?;
+            assert!(
+                status != "True",
+                "must never report Programmed=True with zero connected shared proxies"
+            );
+            (status == "False" && reason == "Pending" && observed < generation).then_some(())
+        },
+    )
+    .await?;
+
+    // Phase 2: pool returns → NodeStatus re-populates the registry → the
+    // re-drive flips Programmed without waiting for an unrelated event.
+    scale_shared_proxy(1).await?;
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async {
+            format!(
+                "Programmed=True after the pool returned; observed {:?}",
+                gw_api
+                    .get("coxswain-test")
+                    .await
+                    .ok()
+                    .as_ref()
+                    .and_then(programmed_full)
+            )
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let generation = gw.metadata.generation.unwrap_or(0);
+            let (status, _reason, observed) = programmed_full(&gw)?;
+            (status == "True" && observed >= generation).then_some(())
+        },
+    )
+    .await?;
+
+    let host = format!("echo.{}.local", ns.name);
+    let gw_http = h.gateway_http(&ns.name).await?;
+    wait::wait_for_backend(&gw_http, &host, "/a", "echo-a", Duration::from_secs(30)).await?;
+    Ok(())
+}
+
+/// #531 anti-flap: an established `Programmed=True` generation must survive a
+/// shared-proxy rollout untouched — the replacement pod connects with an empty
+/// bound set and the draining pod disconnects, but pool churn never re-arms
+/// the gate for an already-programmed generation. Terminal condition is a real
+/// event (rollout settled + VIP serving again); every tick asserts the
+/// condition unchanged, and the final `lastTransitionTime` equality catches
+/// even a sub-tick flap (Kubernetes bumps it on any status change).
+#[tokio::test]
+async fn programmed_gateway_stays_true_through_shared_proxy_rollout() -> anyhow::Result<()> {
+    use common::shared_proxy::{rollout_restart_shared_proxy, shared_proxy_settled};
+
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-gw-antiflap-rollout").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("echo.{}.local", ns.name);
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::wait_for_gateway_programmed(
+        &h.client,
+        "coxswain-test",
+        &ns.name,
+        Duration::from_secs(120),
+    )
+    .await?;
+    let gw_http = h.gateway_http(&ns.name).await?;
+    wait::wait_for_backend(&gw_http, &host, "/a", "echo-a", Duration::from_secs(60)).await?;
+
+    let baseline_gw = gw_api.get("coxswain-test").await?;
+    let baseline = programmed_full(&baseline_gw)
+        .ok_or_else(|| anyhow::anyhow!("no Programmed condition on the baseline Gateway"))?;
+    let baseline_ltt = programmed_transition_time(&baseline_gw)
+        .ok_or_else(|| anyhow::anyhow!("no lastTransitionTime on the baseline Programmed"))?;
+
+    rollout_restart_shared_proxy().await?;
+
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async {
+            "shared-proxy rollout settled and the VIP serving again, with Programmed \
+             unchanged at every tick"
+                .to_string()
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let now = programmed_full(&gw)?;
+            assert_eq!(
+                now, baseline,
+                "#531 anti-flap violated: Programmed changed during shared-proxy rollout"
+            );
+            if !shared_proxy_settled(1).await.unwrap_or(false) {
+                return None;
+            }
+            // Rollout settled — terminal once the VIP serves from the new pod.
+            let resp = gw_http.get(&host, "/a").await.ok()?;
+            resp.pod
+                .as_deref()
+                .is_some_and(|pod| pod.starts_with("echo-a-"))
+                .then_some(())
+        },
+    )
+    .await?;
+
+    // Catch sub-tick flaps: any True→Pending→True bounce bumps the timestamp.
+    let final_gw = gw_api.get("coxswain-test").await?;
+    let final_ltt = programmed_transition_time(&final_gw)
+        .ok_or_else(|| anyhow::anyhow!("no lastTransitionTime after the rollout"))?;
+    anyhow::ensure!(
+        final_ltt == baseline_ltt,
+        "#531 anti-flap violated between poll ticks: Programmed lastTransitionTime moved \
+         {baseline_ltt:?} -> {final_ltt:?} across the shared-proxy rollout"
+    );
+    Ok(())
+}
+
+/// #531 dedicated-mode coherence: adding a listener to an already-Programmed
+/// dedicated Gateway (generation bump) must hold `Programmed` below the new
+/// generation until the dedicated proxy actually re-binds — pod readiness
+/// alone is stale here (the pod was Ready long before the new port). Converges
+/// at `True@gen2` only once the proxy's bound-port report covers the new
+/// listener.
+#[tokio::test]
+async fn dedicated_gateway_listener_addition_trails_programmed_until_rebound() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-ded-listener-add-gate").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        dedicated::DEDICATED_GATEWAY_CLUSTERIP,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::wait_for_gateway_programmed(&h.client, GATEWAY_NAME, &ns.name, Duration::from_secs(180))
+        .await?;
+
+    // Generation bump: add a second HTTP listener on a fresh port.
+    // Merge-patch replaces the whole listeners list: keep the fixture's
+    // existing http/8100 listener and add a second one on a fresh port.
+    let patch = serde_json::json!({
+        "spec": { "listeners": [
+            {
+                "name": "http",
+                "port": 8100,
+                "protocol": "HTTP",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            },
+            {
+                "name": "http-extra",
+                "port": 8190,
+                "protocol": "HTTP",
+                "allowedRoutes": { "namespaces": { "from": "Same" } }
+            },
+        ]}
+    });
+    gw_api
+        .patch(
+            GATEWAY_NAME,
+            &PatchParams::apply("e2e-listener-add"),
+            &Patch::Merge(&patch),
+        )
+        .await?;
+
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async {
+            format!(
+                "Programmed=True at the bumped generation; observed {:?} generation {:?}",
+                gw_api
+                    .get(GATEWAY_NAME)
+                    .await
+                    .ok()
+                    .as_ref()
+                    .and_then(programmed_full),
+                gw_api
+                    .get(GATEWAY_NAME)
+                    .await
+                    .ok()
+                    .and_then(|g| g.metadata.generation)
+            )
+        },
+        || async {
+            let gw = gw_api.get(GATEWAY_NAME).await.ok()?;
+            let generation = gw.metadata.generation.unwrap_or(0);
+            // The listener add landed: generation must be past the initial 1.
+            if generation < 2 {
+                return None;
+            }
+            let (status, _reason, observed) = programmed_full(&gw)?;
+            assert!(
+                !(observed >= generation && status != "True"),
+                "#531 (dedicated) violated: Programmed claims generation {generation} \
+                 while {status:?} — the rebind hold must trail"
+            );
+            (status == "True" && observed >= generation).then_some(())
+        },
+    )
+    .await?;
+    Ok(())
+}

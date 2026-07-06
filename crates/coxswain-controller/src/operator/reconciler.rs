@@ -83,6 +83,12 @@ use tokio::task::JoinSet;
 /// TTL defaults to 15 s).
 const NON_LEADER_REQUEUE: Duration = Duration::from_secs(20);
 
+/// Re-queue interval while a dedicated Gateway's `Programmed` is held on the
+/// proxy bind gate (#531). Mirrors the shared writer's
+/// `DEFERRED_PROGRAMMED_REQUEUE`: the node-registry forwarder is the prompt
+/// signal; this is the backstop.
+const BIND_GATE_REQUEUE: Duration = Duration::from_secs(2);
+
 /// Default re-queue after a reconcile error. Short backoff is fine — most
 /// errors here are transient (apiserver hiccup, missing object that's about
 /// to be created).
@@ -192,6 +198,18 @@ pub struct OperatorConfig {
     /// `coxswain-bin` and cloned into the `Controller` too, so the single
     /// serialized VIP reconciler is the writer and the status writer the reader.
     pub vip_failures: Shared<HashSet<ObjectKey>>,
+    /// Leadership watch (#531): a rising edge (standby → leader) immediately
+    /// re-drives every owned Gateway and the VIP reconciler, collapsing the
+    /// 15–20 s post-failover provisioning lag that the `NON_LEADER_REQUEUE` /
+    /// `VIP_RESYNC_INTERVAL` backstops would otherwise impose. The status
+    /// writer's lease loop is the sender. `None` in tests.
+    pub leadership_rx: Option<tokio::sync::watch::Receiver<bool>>,
+    /// Connected-proxy registry with per-node bound-port reports (#531). Read
+    /// to gate a dedicated Gateway's `Programmed=True` on its own proxy having
+    /// actually bound the effective listener ports — pod readiness alone flips
+    /// before a listener *added by a spec change* is bound. `None` disables
+    /// the gate (tests).
+    pub node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
@@ -284,6 +302,9 @@ pub(super) struct ReconcileContext {
     /// it settles their `AddressNotUsable` while holding still-provisioning
     /// Gateways at `Pending` (#531/#533).
     pub(super) vip_failures: Shared<HashSet<ObjectKey>>,
+    /// Connected-proxy registry (#531): gates dedicated `Programmed=True` on
+    /// the Gateway's own proxy reporting its listener ports bound.
+    node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
 }
 
@@ -533,6 +554,7 @@ impl BackgroundService for Operator {
             shared_vip_service_type: self.config.shared_vip_service_type,
             vip_trigger: Arc::new(tokio::sync::Notify::new()),
             vip_failures: self.config.vip_failures.clone(),
+            node_registry: self.config.node_registry.clone(),
             last_hashes: Mutex::new(HashMap::new()),
         });
 
@@ -583,6 +605,48 @@ impl BackgroundService for Operator {
                 }
             });
         }
+        // Bind-report re-drive (#531): a proxy's NodeStatus landing in the
+        // node registry must re-reconcile owned Gateways promptly — the
+        // dedicated Programmed bind gate waits on exactly that report, and
+        // no k8s watch event fires for it.
+        if let Some(registry) = &self.config.node_registry {
+            let mut reg_rx = registry.subscribe();
+            let tx = trigger_tx.clone();
+            tasks.spawn(async move {
+                let _ = reg_rx.borrow_and_update();
+                while reg_rx.changed().await.is_ok() {
+                    if tx.unbounded_send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+
+        // Promotion re-drive (#531): a standby ingests Gateways with all writes
+        // gated off; on promotion it must act on them NOW, not at the next
+        // watch event or periodic backstop. Rising edge → re-drive the Gateway
+        // work-queue and kick the VIP reconciler.
+        if let Some(mut leader_rx) = self.config.leadership_rx.clone() {
+            let tx = trigger_tx.clone();
+            let vip_trigger = Arc::clone(&ctx.vip_trigger);
+            tasks.spawn(async move {
+                let mut was_leader = *leader_rx.borrow_and_update();
+                while leader_rx.changed().await.is_ok() {
+                    let now_leader = *leader_rx.borrow_and_update();
+                    if now_leader && !was_leader {
+                        tracing::info!(
+                            "operator: promoted to leader; re-driving Gateway and VIP reconciliation"
+                        );
+                        if tx.unbounded_send(()).is_err() {
+                            break;
+                        }
+                        vip_trigger.notify_one();
+                    }
+                    was_leader = now_leader;
+                }
+            });
+        }
+
         // Drop the construction-site sender so the receiver closes if both
         // forwarder tasks exit. Without this, the receiver would stay alive
         // forever and `Controller::reconcile_all_on` would hold a permanent
@@ -882,6 +946,8 @@ async fn reconcile_inner(
                 ingress_ports: ctx.ingress_ports,
                 accepted: status::AcceptedOutcome::InvalidParameters,
                 ready_pod_count: 0,
+                // Unreached: InvalidParameters outranks the bind gate.
+                proxy_bound: false,
             };
             status::patch_dedicated_gateway_status(&ctx.client, &inputs).await?;
             return Ok(Action::requeue(ERROR_REQUEUE));
@@ -992,6 +1058,22 @@ async fn reconcile_inner(
     let nodes: Vec<Arc<Node>> = ctx.nodes_store.state();
     let listener_status_map = ctx.listener_status.load();
     let gateway_health = listener_status_map.get(&key).cloned().unwrap_or_default();
+    // Proxy bind gate (#531): pod readiness alone flips before a listener added
+    // by a spec change is actually bound (bind is watch-driven, after the
+    // snapshot applies). Require this Gateway's own connected proxy to report
+    // the effective listener ports bound. The anti-flap latch keeps an
+    // already-Programmed generation immune to pod-replacement churn.
+    let proxy_bound = match &ctx.node_registry {
+        Some(registry) => {
+            crate::status_common::gateway_programmed_at_current_gen(&gw)
+                || registry.load().gateway_node_bound(
+                    gw_namespace,
+                    gw_name,
+                    &dedicated_ports.iter().map(|p| p.port).collect(),
+                )
+        }
+        None => true,
+    };
     let inputs = status::DedicatedGatewayStatusInputs {
         gw: &gw,
         service: service.as_ref(),
@@ -1000,6 +1082,7 @@ async fn reconcile_inner(
         ingress_ports: ctx.ingress_ports,
         accepted: status::AcceptedOutcome::Accepted,
         ready_pod_count,
+        proxy_bound,
     };
     status::patch_dedicated_gateway_status(&ctx.client, &inputs).await?;
 
@@ -1022,6 +1105,15 @@ async fn reconcile_inner(
             gateway = %gateway_id(&gw),
             "operator: re-render produced identical specs; SSA was a no-op server-side"
         );
+    }
+
+    // Bind-gate backstop (#531): while this Gateway's Programmed is held on
+    // the proxy's bound-port report, requeue shortly instead of parking on
+    // await_change — the registry forwarder re-drives on the report landing,
+    // and this backstop covers a forwarder/event race the same way the shared
+    // writer's DEFERRED_PROGRAMMED_REQUEUE does.
+    if !proxy_bound {
+        return Ok(Action::requeue(BIND_GATE_REQUEUE));
     }
 
     Ok(Action::await_change())

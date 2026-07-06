@@ -27,7 +27,7 @@
 //!   terminate listeners strip the PROXY header before the SNI peek so the
 //!   raw TLS stream reaches the backend unchanged.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -248,6 +248,11 @@ where
     terminate_table: SharedTlsPassthroughTable,
     /// Timeout for dialling a passthrough or terminate backend.
     l4_dial_timeout: Duration,
+    /// Publishes the set of ports with a live accept loop after every listener
+    /// reconcile (#531). `None` (default) = no reporting. The discovery client
+    /// forwards changes to the controller as `NodeStatus`, feeding the Gateway
+    /// `Programmed` readiness gate.
+    bound_ports_tx: Option<watch::Sender<BTreeSet<u16>>>,
 }
 
 impl<P> ProxyAcceptor<P>
@@ -301,8 +306,42 @@ where
             passthrough_table: passthrough.table,
             terminate_table: passthrough.terminate_table,
             l4_dial_timeout: passthrough.dial_timeout,
+            bound_ports_tx: None,
         })
     }
+
+    /// Report actually-bound listener ports on `tx` after every reconcile (#531).
+    ///
+    /// The published set contains exactly the ports with a live accept loop:
+    /// bind failures never enter it and draining listeners leave it at
+    /// drain-start. A transient shrink during a rebind is expected and legal —
+    /// the controller-side consumer anti-flaps.
+    #[must_use]
+    pub fn with_bound_ports_tx(mut self, tx: watch::Sender<BTreeSet<u16>>) -> Self {
+        self.bound_ports_tx = Some(tx);
+        self
+    }
+}
+
+/// Publish the current bound-port set derived from `active` (#531).
+///
+/// `send_if_modified` suppresses no-op publishes so spec flips that rebind
+/// nothing (e.g. an in-place PROXY-config change) do not wake the discovery
+/// client.
+fn publish_bound_ports(
+    tx: Option<&watch::Sender<BTreeSet<u16>>>,
+    active: &HashMap<SocketAddr, ListenerHandle>,
+) {
+    let Some(tx) = tx else { return };
+    let ports: BTreeSet<u16> = active.keys().map(SocketAddr::port).collect();
+    tx.send_if_modified(|current| {
+        if *current == ports {
+            false
+        } else {
+            *current = ports;
+            true
+        }
+    });
 }
 
 #[async_trait]
@@ -339,6 +378,7 @@ where
             shutdown.clone(),
         )
         .await;
+        publish_bound_ports(self.bound_ports_tx.as_ref(), &active);
 
         loop {
             tokio::select! {
@@ -374,6 +414,7 @@ where
                         &cfg,
                         shutdown.clone(),
                     ).await;
+                    publish_bound_ports(self.bound_ports_tx.as_ref(), &active);
                 }
 
                 // Reap completed listener tasks.
@@ -1512,6 +1553,70 @@ mod tests {
             protocol,
             proxy_protocol,
         }
+    }
+
+    fn dummy_handle() -> ListenerHandle {
+        ListenerHandle {
+            drain_token: CancellationToken::new(),
+            conn_shutdown_tx: watch::Sender::new(false),
+            proto_tx: watch::Sender::new(ListenerProtocol::Http),
+            proxy_config_tx: watch::Sender::new(None),
+        }
+    }
+
+    fn active_map(ports: &[u16]) -> HashMap<SocketAddr, ListenerHandle> {
+        ports
+            .iter()
+            .map(|p| {
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), *p);
+                (addr, dummy_handle())
+            })
+            .collect()
+    }
+
+    // ── publish_bound_ports (#531) ───────────────────────────────────────────────
+
+    #[test]
+    fn publish_bound_ports_without_sender_is_noop() {
+        publish_bound_ports(None, &active_map(&[8080]));
+    }
+
+    #[test]
+    fn publish_bound_ports_reports_active_listener_ports() {
+        let tx = watch::Sender::new(BTreeSet::new());
+        let mut rx = tx.subscribe();
+        publish_bound_ports(Some(&tx), &active_map(&[8443, 8080]));
+        assert!(rx.has_changed().unwrap_or(false));
+        let got = rx.borrow_and_update().clone();
+        assert_eq!(got, [8080u16, 8443].into_iter().collect::<BTreeSet<_>>());
+    }
+
+    #[test]
+    fn publish_bound_ports_suppresses_identical_republish() {
+        let tx = watch::Sender::new(BTreeSet::new());
+        let mut rx = tx.subscribe();
+        publish_bound_ports(Some(&tx), &active_map(&[8080]));
+        rx.borrow_and_update();
+        // Same set again — e.g. an in-place PROXY-config flip that rebinds nothing.
+        publish_bound_ports(Some(&tx), &active_map(&[8080]));
+        assert!(
+            !rx.has_changed().unwrap_or(true),
+            "identical set must not wake the discovery client"
+        );
+    }
+
+    #[test]
+    fn publish_bound_ports_reports_empty_when_all_drained() {
+        let tx = watch::Sender::new(BTreeSet::new());
+        let mut rx = tx.subscribe();
+        publish_bound_ports(Some(&tx), &active_map(&[8080]));
+        rx.borrow_and_update();
+        publish_bound_ports(Some(&tx), &active_map(&[]));
+        assert!(rx.has_changed().unwrap_or(false));
+        assert!(
+            rx.borrow_and_update().is_empty(),
+            "drain-to-zero is an affirmative empty report, not a suppressed publish"
+        );
     }
 
     #[test]

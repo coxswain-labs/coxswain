@@ -26,7 +26,8 @@ const E2E_IMAGE: &str = "coxswain:e2e";
 const DISCOVERY_ENDPOINT: &str = "https://coxswain-controller-discovery.coxswain-system.svc:50051";
 
 /// Bootstrap endpoint (server-auth-only TLS; issues SVIDs to fresh proxies).
-const BOOTSTRAP_ENDPOINT: &str = "https://coxswain-controller-discovery.coxswain-system.svc:50052";
+const BOOTSTRAP_ENDPOINT: &str =
+    "https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052";
 
 /// SA token audience the controller validates at bootstrap time.
 const DISCOVERY_AUDIENCE: &str = "coxswain-discovery";

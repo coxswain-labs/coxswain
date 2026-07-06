@@ -149,11 +149,15 @@ spec:
       targetPort: admin
       protocol: TCP
 ---
-# Discovery control-plane Service (#423). Fixed name `coxswain-controller-discovery`
-# so the controller operator's rendered dedicated-proxy endpoint and the
-# shared-proxy endpoint env both resolve to it. The controller binary hardcodes
-# the endpoint it hands to dedicated proxies as
-# `https://coxswain-controller-discovery.<ns>.svc:<port>` (coxswain-bin/src/lib.rs).
+# Discovery control-plane Services (#423, #531). Fixed names
+# `coxswain-controller-discovery` / `coxswain-controller-discovery-bootstrap`
+# so the controller operator's rendered dedicated-proxy endpoints and the
+# shared-proxy endpoint envs resolve to them (coxswain-bin/src/lib.rs).
+#
+# The stream Service additionally selects the `discovery.coxswain-labs.dev/leader`
+# pod label the lease holder maintains on itself, so proxy dials
+# deterministically reach the leader (standbys also reject stray streams).
+# Bootstrap keeps its own all-replicas Service: SVID issuance is stateless.
 apiVersion: v1
 kind: Service
 metadata:
@@ -167,11 +171,27 @@ spec:
   selector:
     app.kubernetes.io/name: coxswain
     app.kubernetes.io/component: controller
+    discovery.coxswain-labs.dev/leader: "true"
   ports:
     - name: discovery
       port: 50051
       targetPort: discovery
       protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coxswain-controller-discovery-bootstrap
+  namespace: coxswain-system
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+  ports:
     - name: bootstrap
       port: 50052
       targetPort: bootstrap

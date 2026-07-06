@@ -33,10 +33,13 @@ pub const STATE_DEGRADED: i64 = 2;
 /// Gauge: number of proxy nodes with a live discovery stream right now.
 ///
 /// Incremented when a stream is accepted and the node is registered;
-/// decremented when the per-stream task exits (disconnect). `sum()` across
-/// controller replicas is meaningless — only the leader serves streams — so
-/// scrape the leader. A drop to `0` during steady-state means the whole proxy
-/// fleet lost its control-plane link.
+/// decremented when the per-stream task exits (disconnect). The `Stream` RPC is
+/// leader-gated (#531): standby replicas reject streams at accept
+/// (`streams_total{result="rejected_not_leader"}`) and hold this gauge at `0`,
+/// so `sum()` across controller replicas equals the leader's value and a
+/// non-zero reading on a standby indicates a gating bug. A drop to `0` on the
+/// leader during steady-state means the whole proxy fleet lost its
+/// control-plane link.
 ///
 /// # Panics
 ///
@@ -58,8 +61,11 @@ pub fn connected_proxies() -> &'static IntGauge {
 ///
 /// Labels: `result` (`accepted` — Subscribe validated and node registered;
 /// `rejected` — wire-version mismatch, malformed scope, or SVID/scope-binding
-/// denial before registration). A rising `rejected` rate flags misconfigured or
-/// hostile clients.
+/// denial before registration; `rejected_not_leader` — dial reached a standby
+/// replica while the Stream RPC is leader-gated, #531). A rising `rejected`
+/// rate flags misconfigured or hostile clients; a steady `rejected_not_leader`
+/// trickle during leader churn is expected (proxies redial until they land on
+/// the leader).
 ///
 /// # Panics
 ///

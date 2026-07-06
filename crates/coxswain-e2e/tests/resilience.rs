@@ -1207,3 +1207,56 @@ async fn shared_gateway_port_recycle_keeps_survivor_and_newcomer_routing() -> an
 
     Ok(())
 }
+
+/// #531 HA rider: a Gateway created in the leaderless window between killing
+/// the live leader and the warm standby's promotion must be reconciled by the
+/// promotion re-drive — the standby ingested it with writes gated off, and
+/// without the re-drive it would sit unprogrammed until the next watch event
+/// or periodic relist. The generous bound guards the regression class
+/// ("stuck until relist"), not a latency SLO.
+#[tokio::test]
+async fn promotion_redrives_gateway_created_before_leadership_acquired() -> anyhow::Result<()> {
+    use coxswain_e2e::harness::leader;
+
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "res-promotion-redrive").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let old_leader = leader::leader_pod_name(&h.client).await?;
+    let pods_api: Api<Pod> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    pods_api
+        .delete(&old_leader, &DeleteParams::default())
+        .await
+        .context("delete the live leader pod")?;
+
+    // Apply the Gateway IMMEDIATELY — before waiting for the new leader — so
+    // its creation lands while no replica is writing status.
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+    let new_leader =
+        leader::wait_for_new_leader(&h.client, &old_leader, Duration::from_secs(90)).await?;
+    anyhow::ensure!(
+        new_leader != old_leader,
+        "sanity: takeover must elect a different pod"
+    );
+
+    // The promotion re-drive (leadership_txs + operator/VIP notify) must
+    // program the Gateway promptly — end to end through VIP provisioning and
+    // the pool-bind readiness gate on the NEW leader's registry.
+    wait::wait_for_gateway_programmed(
+        &h.client,
+        "coxswain-test",
+        &ns.name,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // And the data plane serves it (the reconnected proxy received the new
+    // Gateway's snapshot from the new leader).
+    let host = format!("echo.{}.local", ns.name);
+    let gw_http = h.gateway_http(&ns.name).await?;
+    wait::wait_for_backend(&gw_http, &host, "/a", "echo-a", Duration::from_secs(30)).await?;
+    Ok(())
+}

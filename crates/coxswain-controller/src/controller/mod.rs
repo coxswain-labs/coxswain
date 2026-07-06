@@ -63,6 +63,7 @@ mod grpc_route_events;
 mod ingress_event_recorder;
 mod ingress_events;
 mod ingress_status;
+mod leader_label;
 mod listenerset_events;
 mod listenerset_status;
 mod route_events;
@@ -145,6 +146,14 @@ pub struct Controller {
     /// Read to distinguish a settled `AddressNotUsable` from a still-provisioning
     /// Gateway (held `Pending`). Empty when unset (dev/in-process).
     vip_failures: Shared<HashSet<ObjectKey>>,
+    /// Publishes leadership to the discovery server's stream gate and the
+    /// operator's promotion re-drive (#531). `None` in tests; the bin always
+    /// wires it. The lease loop is the single sender.
+    leadership_watch: Option<tokio::sync::watch::Sender<bool>>,
+    /// Connected-proxy registry (bound-port reports) read by the shared-mode
+    /// `Programmed` readiness gate (#531). `None` (tests/dev) disables the
+    /// gate — today's address-only convergence behaviour.
+    node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
 }
 
 impl Controller {
@@ -167,6 +176,8 @@ impl Controller {
             subscriptions: parking_lot::Mutex::new(Some(subscriptions)),
             ingress_event_rx: parking_lot::Mutex::new(ingress_event_rx),
             vip_failures: Shared::new(),
+            leadership_watch: None,
+            node_registry: None,
         }
     }
 
@@ -179,6 +190,37 @@ impl Controller {
         self
     }
 
+    /// Publish leadership over a watch channel (#531).
+    ///
+    /// The bin hands the receiver ends to the discovery server (stream gate)
+    /// and the operator (promotion re-drive). Initialized `false` by the
+    /// creator, so the discovery server starts gated-closed on every replica
+    /// and opens on first promotion — no startup-order dependency.
+    #[must_use]
+    pub fn with_leadership_watch(mut self, tx: tokio::sync::watch::Sender<bool>) -> Self {
+        self.leadership_watch = Some(tx);
+        self
+    }
+
+    /// Wire the connected-proxy registry so shared-mode Gateways gate
+    /// `Programmed=True` on every connected shared-pool proxy having bound
+    /// their VIP internal ports (#531).
+    #[must_use]
+    pub fn with_node_registry(
+        mut self,
+        registry: coxswain_core::node_registry::SharedNodeRegistry,
+    ) -> Self {
+        self.node_registry = Some(registry);
+        self
+    }
+
+    /// Publish a leadership state to the watch (no-op when unwired).
+    fn publish_leadership(&self, leading: bool) {
+        if let Some(tx) = &self.leadership_watch {
+            let _ = tx.send(leading);
+        }
+    }
+
     async fn run_controllers(&self, mut shutdown: ShutdownWatch) {
         let client = match Client::try_default().await {
             Ok(c) => c,
@@ -187,6 +229,9 @@ impl Controller {
                 return;
             }
         };
+        // `client` is moved into ReconcileContext below; the leader-label task
+        // and the shutdown-time unlabel need their own handle.
+        let client_for_label = client.clone();
 
         let lease_lock = LeaseLock::new(
             client.clone(),
@@ -201,9 +246,16 @@ impl Controller {
         // Acquire leadership before building the work-queues so the initial
         // reconcile burst (driven by the shared informers' InitApply) runs with
         // the correct leader state.
-        let mut is_leader = Self::try_renew(&lease_lock, &self.config.pod_name).await;
+        let mut lease_state =
+            LeadershipState::new(self.config.lease.ttl, self.config.lease.renew_interval);
+        let renew_bound = self.config.lease.renew_interval;
+        let mut is_leader = lease_state.observe(
+            Self::try_renew(&lease_lock, &self.config.pod_name, renew_bound).await,
+            tokio::time::Instant::now(),
+        );
         self.leader.store(is_leader, Ordering::Release);
         crate::metrics::leader().set(i64::from(is_leader));
+        self.publish_leadership(is_leader);
 
         let subs = self
             .subscriptions
@@ -264,6 +316,7 @@ impl Controller {
             ingress_classes: ingress_classes_reader,
             gateways: gateways_reader.clone(),
             vip_failures: self.vip_failures.clone(),
+            node_registry: self.node_registry.clone(),
         });
 
         // One re-drive channel per work-queue. Each is fed by the relevant
@@ -296,6 +349,23 @@ impl Controller {
 
         let mut tasks = JoinSet::new();
 
+        // Discovery leader label (#531): converged by its own task off the
+        // leadership watch — label I/O (own-pod PATCH, promotion LIST + strip
+        // PATCHes) must never sit on the lease renewal path, where a stalled
+        // apiserver call would erode the renew-before-TTL fencing margin. The
+        // startup leadership value was published above, so the task's first
+        // convergence pass covers the crashed-prior-incarnation stale label.
+        if let Some(tx) = &self.leadership_watch {
+            tasks.spawn(leader_label::run(
+                leader_label::LeaderLabel::new(
+                    client_for_label.clone(),
+                    &self.config.pod_namespace,
+                    self.config.pod_name.clone(),
+                ),
+                tx.subscribe(),
+            ));
+        }
+
         // Ingress diagnostic event recorder: receives route-conflict and
         // annotation-parse-failure events from the reconciler and emits
         // Kubernetes Warning Events on the affected Ingress objects.
@@ -315,7 +385,14 @@ impl Controller {
         // (Send, !Sync) onto the `mpsc::Unbounded` stream `reconcile_all_on`
         // wants, dropping the initial value so a fresh subscription does not
         // spuriously re-drive before any health flip occurs.
-        spawn_health_forwarder(&mut tasks, self.channels.tls.subscribe(), gw_tx);
+        spawn_health_forwarder(&mut tasks, self.channels.tls.subscribe(), gw_tx.clone());
+        // Proxy-pool readiness (#531): a shared-pool node connecting,
+        // disconnecting, or changing its bound-port report re-drives every
+        // Gateway so `Programmed` flips promptly once the pool binds — the 2 s
+        // deferred requeue is only the backstop.
+        if let Some(registry) = &self.node_registry {
+            spawn_health_forwarder(&mut tasks, registry.subscribe(), gw_tx);
+        }
         spawn_health_forwarder(&mut tasks, self.channels.route.subscribe(), route_tx);
         spawn_health_forwarder(
             &mut tasks,
@@ -461,6 +538,24 @@ impl Controller {
             tokio::select! {
                 _ = shutdown.changed() => {
                     if is_leader {
+                        // Publish the demotion FIRST so the discovery server
+                        // terminates its streams while this process can still
+                        // flush them — proxies redial and land on the next
+                        // leader instead of waiting out TCP death (#531). The
+                        // label task sees the same flip and unlabels; a
+                        // bounded best-effort unlabel here covers the case
+                        // where task teardown wins that race.
+                        self.publish_leadership(false);
+                        let mut label = leader_label::LeaderLabel::new(
+                            client_for_label.clone(),
+                            &self.config.pod_namespace,
+                            self.config.pod_name.clone(),
+                        );
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(2),
+                            label.ensure(false),
+                        )
+                        .await;
                         match lease_lock.step_down().await {
                             Ok(()) => tracing::info!(pod = %self.config.pod_name, "Stepped down from leadership"),
                             Err(kube_leader_election::Error::ReleaseLockWhenNotLeading { .. }) => {}
@@ -470,7 +565,10 @@ impl Controller {
                     break;
                 }
                 _ = renewal_interval.tick() => {
-                    let leading = Self::try_renew(&lease_lock, &self.config.pod_name).await;
+                    let leading = lease_state.observe(
+                        Self::try_renew(&lease_lock, &self.config.pod_name, renew_bound).await,
+                        tokio::time::Instant::now(),
+                    );
                     if leading != is_leader {
                         if leading {
                             tracing::info!(pod = %self.config.pod_name, "Acquired leadership");
@@ -481,6 +579,7 @@ impl Controller {
                         self.leader.store(is_leader, Ordering::Release);
                         crate::metrics::leader().set(i64::from(is_leader));
                         crate::metrics::leader_transitions_total().inc();
+                        self.publish_leadership(is_leader);
                         if is_leader {
                             // Promotion: re-drive every work-queue so Gateways /
                             // routes / policies observed while we were standby
@@ -504,15 +603,112 @@ impl Controller {
         tasks.shutdown().await;
     }
 
-    async fn try_renew(lease_lock: &LeaseLock, pod_name: &str) -> bool {
-        match lease_lock.try_acquire_or_renew().await {
-            Ok(LeaseLockResult::Acquired(_)) => true,
-            Ok(LeaseLockResult::NotAcquired(_)) => false,
-            Err(e) => {
-                tracing::warn!(pod = %pod_name, error = %e, "Lease operation failed, assuming standby");
-                false
+    /// One lease acquire/renew attempt, bounded to `bound` wall-clock time.
+    ///
+    /// The bound matters for fencing: an unbounded kube call can hang for its
+    /// full client timeout (30 s+) during an apiserver partition, freezing the
+    /// renewal loop while the lease expires under us. Bounding each attempt to
+    /// one renew interval keeps [`LeadershipState`]'s wall-clock demotion
+    /// deadline observable in time.
+    async fn try_renew(lease_lock: &LeaseLock, pod_name: &str, bound: Duration) -> RenewOutcome {
+        match tokio::time::timeout(bound, lease_lock.try_acquire_or_renew()).await {
+            Ok(Ok(LeaseLockResult::Acquired(_))) => RenewOutcome::Leading,
+            Ok(Ok(LeaseLockResult::NotAcquired(_))) => RenewOutcome::Standby,
+            Ok(Err(e)) => {
+                tracing::warn!(pod = %pod_name, error = %e, "Lease operation failed");
+                RenewOutcome::RenewError
+            }
+            Err(_) => {
+                tracing::warn!(pod = %pod_name, bound = ?bound, "Lease operation timed out");
+                RenewOutcome::RenewError
             }
         }
+    }
+}
+
+/// One lease-loop observation, as [`LeadershipState`]'s input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenewOutcome {
+    /// The lease is held (acquired or renewed) by this replica.
+    Leading,
+    /// Another replica positively holds the lease.
+    Standby,
+    /// The lease operation failed (apiserver blip, timeout) — the lease's true
+    /// state is unknown.
+    RenewError,
+}
+
+/// Pure leadership decision state: tolerates transient renew errors while
+/// leading, bounded by a **wall-clock** deadline inside the lease TTL.
+///
+/// A single failed renew does NOT demote: the lease is still validly held
+/// server-side (nobody else can acquire it before the TTL expires), so
+/// dropping leadership on one apiserver blip trades a real 5-10 s writer
+/// outage + full re-drive burst against no split-brain benefit. But the
+/// tolerance must be measured in elapsed time since the last *successful*
+/// renew, never in error counts: a slow-failing call (bounded by
+/// [`Controller::try_renew`]'s timeout, but still real time) would otherwise
+/// stretch a "two errors" budget past the TTL while another replica
+/// legitimately acquires the expired lease. Demotion fires once
+/// `ttl - renew_interval` has elapsed since the last confirmed hold — one
+/// renew interval of fencing margin before the lease can be stolen. A
+/// positive `Standby` observation always demotes immediately, and errors
+/// never promote a standby.
+struct LeadershipState {
+    is_leader: bool,
+    /// Instant of the last successful acquire/renew; `None` while standby.
+    last_confirmed: Option<tokio::time::Instant>,
+    /// Elapsed-time budget after which errors demote: `ttl - renew_interval`.
+    error_deadline: Duration,
+}
+
+impl LeadershipState {
+    fn new(ttl: Duration, renew_interval: Duration) -> Self {
+        // Floor at one renew interval so degenerate settings (ttl == renew)
+        // demote on the first error rather than never tolerating anything —
+        // and never underflow to a zero deadline that demotes spuriously.
+        let error_deadline = ttl
+            .saturating_sub(renew_interval)
+            .max(renew_interval.min(ttl));
+        Self {
+            is_leader: false,
+            last_confirmed: None,
+            error_deadline,
+        }
+    }
+
+    /// Fold one renew observation at `now`; returns the resulting leadership.
+    fn observe(&mut self, outcome: RenewOutcome, now: tokio::time::Instant) -> bool {
+        match outcome {
+            RenewOutcome::Leading => {
+                self.is_leader = true;
+                self.last_confirmed = Some(now);
+            }
+            RenewOutcome::Standby => {
+                self.is_leader = false;
+                self.last_confirmed = None;
+            }
+            RenewOutcome::RenewError => {
+                if self.is_leader {
+                    // `last_confirmed` is always Some while leading; a missing
+                    // value fails safe (demote).
+                    let held_for = self
+                        .last_confirmed
+                        .map_or(self.error_deadline, |t| now.duration_since(t));
+                    if held_for >= self.error_deadline {
+                        tracing::warn!(
+                            held_for = ?held_for,
+                            deadline = ?self.error_deadline,
+                            "renew-error budget exhausted; demoting before the lease TTL can expire"
+                        );
+                        self.is_leader = false;
+                        self.last_confirmed = None;
+                    }
+                }
+                // A standby stays standby on errors: never promote blind.
+            }
+        }
+        self.is_leader
     }
 }
 
@@ -603,6 +799,11 @@ struct ReconcileContext {
     /// operator VIP reconciler; read to hold a still-provisioning Gateway at
     /// `Pending` instead of a premature `AddressNotUsable`.
     vip_failures: Shared<HashSet<ObjectKey>>,
+    /// Connected-proxy registry with per-node bound-port reports (#531). Read
+    /// by the shared-Gateway reconcile to gate `Programmed=True` on every
+    /// connected shared-pool node having bound the Gateway's VIP internal
+    /// ports. `None` disables the gate (tests / dev).
+    node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
 }
 
 /// Error policy shared by every work-queue. The status reconcilers are
@@ -611,6 +812,23 @@ struct ReconcileContext {
 /// satisfy `Controller::run`.
 fn error_policy<K>(_obj: Arc<K>, _err: &Infallible, _ctx: Arc<ReconcileContext>) -> Action {
     Action::requeue(ERROR_REQUEUE)
+}
+
+/// Last-moment leadership re-check before a status write (#531 HA rider).
+///
+/// The entry check at the top of each reconcile can be stale by the entire
+/// reconcile body (including apiserver GETs); re-checking immediately before
+/// the patch narrows the stale-leader double-writer window from
+/// `renew_interval + reconcile duration` to one patch RTT. The residual window
+/// (fence → apiserver processing) is accepted last-write-wins: both writers
+/// compute from warm identical stores, so the racing content is near-identical
+/// and the next watch event re-converges it.
+fn leader_write_fence(ctx: &ReconcileContext) -> bool {
+    let leading = ctx.leader.load(Ordering::Acquire);
+    if !leading {
+        tracing::debug!("write fence: leadership lost mid-reconcile; skipping status patch");
+    }
+    leading
 }
 
 async fn reconcile_gateway(
@@ -654,8 +872,11 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         ctx.shared_vip_addressing,
     )
     .await;
-    let owned_status_addr =
-        select_shared_gateway_address(&vip, ctx.shared_vip_addressing, ctx.status_address.as_ref());
+    let owned_status_addr = select_shared_gateway_address(
+        &vip.address,
+        ctx.shared_vip_addressing,
+        ctx.status_address.as_ref(),
+    );
 
     // GatewayStaticAddresses (#260): validate any requested `spec.addresses`
     // against the address coxswain actually advertises/bound. The advertised
@@ -688,7 +909,8 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     // Gateway event — so a shared Gateway reconciled before its own VIP resolves
     // must REQUEUE (not `await_change`) or `status.addresses` would stay stale
     // until an unrelated Gateway edit. Only a `Resolved` own-VIP is terminal.
-    let awaiting_own_vip = ctx.shared_vip_addressing && !matches!(vip, VipAddress::Resolved(_));
+    let awaiting_own_vip =
+        ctx.shared_vip_addressing && !matches!(vip.address, VipAddress::Resolved(_));
 
     let key = ObjectKey::new(
         gw.metadata.namespace.clone().unwrap_or_default(),
@@ -711,29 +933,56 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         static_outcome.hold_pending_address();
     }
 
-    // Convergence gate (#533): a shared-mode Gateway is fully converged for its
-    // current generation only once its own VIP address has resolved — otherwise
-    // `status.addresses` is still empty. Until then the status patch holds
-    // `Programmed` at `False/Pending` with its `observedGeneration` below the
-    // current generation, so a one-shot "conditions are latest" check keeps
-    // waiting and never observes `Programmed` claiming generation N while the
-    // address is unresolved; the same patch that flips `Programmed=True@N` also
-    // publishes the address. Once the Gateway is already Programmed at its live
-    // generation the gate is a no-op — transient VIP re-resolution must never
-    // flap an established `Programmed=True` back to `Pending`.
-    let converged = gateway_programmed_at_current_gen(gw) || !awaiting_own_vip;
+    // Anti-flap latch first (#533, #531): once the Gateway is Programmed at
+    // its live generation, convergence is settled — VIP re-resolution and pool
+    // churn (rollouts, leader failover emptying the registry) must never flap
+    // an established `Programmed=True` back to `Pending`; only a spec change
+    // (new generation) re-arms the gate. Latch-first also skips the registry
+    // query for the steady-state majority of reconciles.
+    let latched = gateway_programmed_at_current_gen(gw);
+
+    // Proxy-pool bind gate (#531): beyond the VIP address resolving, every
+    // connected shared-pool proxy node must have reported the VIP's internal
+    // ports bound — otherwise `Programmed=True` races real traffic into a
+    // not-yet-listening (or cert-less) port. All-connected-nodes quorum: the
+    // VIP load-balances across every pool member, so one unbound pod means
+    // real connections can black-hole. Zero connected nodes fails closed.
+    let (proxies_bound, proxy_pending_detail) = match &ctx.node_registry {
+        Some(registry) if ctx.shared_vip_addressing && !latched => {
+            let bound = registry.all_shared_nodes_bound(&vip.internal_ports);
+            // Snapshot clone only on the unbound path, where the pending
+            // message needs the per-node view.
+            let detail = (!bound && !awaiting_own_vip)
+                .then(|| proxy_bind_pending_detail(&registry.load(), &vip.internal_ports));
+            (bound, detail)
+        }
+        // Latched, no registry (tests / dev), or per-Gateway addressing off
+        // (no internal ports to await): the gate is inert.
+        _ => (true, None),
+    };
+
+    // Convergence gate (#533, #531): a shared-mode Gateway is fully converged
+    // for its current generation only once its own VIP address has resolved
+    // AND the shared pool has bound its internal ports. Until then the status
+    // patch holds `Programmed` at `False/Pending` with its `observedGeneration`
+    // below the current generation, so a one-shot "conditions are latest" check
+    // keeps waiting and never observes `Programmed` claiming generation N while
+    // the address is unresolved or the data plane dark; the same patch that
+    // flips `Programmed=True@N` also publishes the address.
+    let converged = latched || (!awaiting_own_vip && proxies_bound);
 
     let decision = gateway_status::SharedAddressDecision {
         legacy_addr: owned_status_addr,
         static_outcome,
         params_ref_unsupported,
         converged,
+        pending_detail: proxy_pending_detail,
     };
 
     if ctx.health.is_subsystem_ready("controller") {
         let health_map = ctx.listener_status.load();
         let health = health_map.get(&key).cloned().unwrap_or_default();
-        if gateway_needs_status_patch(gw, &health, &decision) {
+        if gateway_needs_status_patch(gw, &health, &decision) && leader_write_fence(ctx) {
             gateway_events::patch_gateway_status(
                 &ctx.client,
                 gw,
@@ -756,7 +1005,7 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         // status and requeue to revisit `Programmed` once ready. This requeue
         // replaces the old process-wide resync backstop.
         let empty_status = GatewayListenerStatus::default();
-        if gateway_needs_status_patch(gw, &empty_status, &decision) {
+        if gateway_needs_status_patch(gw, &empty_status, &decision) && leader_write_fence(ctx) {
             gateway_events::patch_gateway_status(
                 &ctx.client,
                 gw,
@@ -817,6 +1066,35 @@ enum VipAddress {
     Resolved(StatusAddress),
 }
 
+/// A shared Gateway's VIP resolution: address state plus the VIP Service's
+/// internal `targetPort`s (#531).
+///
+/// The `targetPort`s are the controller-allocated internal ports the shared
+/// pool binds for this Gateway — read back from the same Service GET that
+/// resolves the address, so the `Programmed` bind gate compares against the
+/// single-writer VIP reconciler's authoritative allocation (never watch-lagged
+/// reflector state). By construction the set excludes Ingress ports and
+/// includes ListenerSet-merged listeners.
+struct SharedVip {
+    address: VipAddress,
+    /// Empty when the Service does not exist, the feature is off, or the
+    /// lookup failed — states in which the address term of the convergence
+    /// gate already holds `Pending`.
+    internal_ports: std::collections::BTreeSet<u16>,
+}
+
+impl SharedVip {
+    /// No VIP Service observed (feature off, 404, or lookup error): the
+    /// address degrades per [`VipAddress::NotProvisioned`] and there are no
+    /// internal ports to gate on.
+    fn not_provisioned() -> Self {
+        Self {
+            address: VipAddress::NotProvisioned,
+            internal_ports: std::collections::BTreeSet::new(),
+        }
+    }
+}
+
 /// Read a shared-mode Gateway's own VIP Service and classify its address state.
 ///
 /// Best-effort: a 404 (no Service) and any API error both map to
@@ -828,36 +1106,96 @@ async fn resolve_shared_vip_address(
     gw: &Gateway,
     controller_namespace: &str,
     enabled: bool,
-) -> VipAddress {
+) -> SharedVip {
     use k8s_openapi::api::core::v1::Service;
     if !enabled {
-        return VipAddress::NotProvisioned;
+        return SharedVip::not_provisioned();
     }
     let (Some(ns), Some(gw_name)) = (
         gw.metadata.namespace.as_deref(),
         gw.metadata.name.as_deref(),
     ) else {
-        return VipAddress::NotProvisioned;
+        return SharedVip::not_provisioned();
     };
     // The VIP Service lives in the controller namespace (with the shared proxy
     // pod) under a namespace-qualified name (#472).
     let svc_name = crate::operator::render::shared_gateway_service_name(ns, gw_name);
     let api: kube::Api<Service> = kube::Api::namespaced(client.clone(), controller_namespace);
     match api.get_opt(&svc_name).await {
-        Ok(Some(svc)) => match service_vip_address(&svc) {
-            Some(addr) => VipAddress::Resolved(addr),
-            None => VipAddress::Pending,
-        },
-        Ok(None) => VipAddress::NotProvisioned,
+        Ok(Some(svc)) => {
+            let address = match service_vip_address(&svc) {
+                Some(addr) => VipAddress::Resolved(addr),
+                None => VipAddress::Pending,
+            };
+            SharedVip {
+                address,
+                internal_ports: service_internal_ports(&svc),
+            }
+        }
+        Ok(None) => SharedVip::not_provisioned(),
         Err(e) => {
             tracing::debug!(
                 gateway = %format!("{ns}/{gw_name}"),
                 error = %e,
                 "shared VIP Service lookup failed; using global status address"
             );
-            VipAddress::NotProvisioned
+            SharedVip::not_provisioned()
         }
     }
+}
+
+/// Extract a VIP Service's internal `targetPort`s — the ports the shared pool
+/// must bind for this Gateway (#531). Named `targetPort`s (`IntOrString::
+/// String`) cannot occur on VIP Services (the reconciler renders numeric
+/// allocations) and are skipped defensively.
+fn service_internal_ports(
+    svc: &k8s_openapi::api::core::v1::Service,
+) -> std::collections::BTreeSet<u16> {
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+    svc.spec
+        .as_ref()
+        .and_then(|s| s.ports.as_ref())
+        .into_iter()
+        .flatten()
+        .filter_map(|p| match &p.target_port {
+            Some(IntOrString::Int(i)) => u16::try_from(*i).ok(),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Render the `Programmed=False/Pending` message for the proxy-pool bind gate
+/// (#531): who the Gateway is waiting on. Message-only — never part of the
+/// patch-staleness comparison.
+fn proxy_bind_pending_detail(
+    snapshot: &coxswain_core::node_registry::NodeRegistry,
+    required: &std::collections::BTreeSet<u16>,
+) -> String {
+    use coxswain_core::node_registry::NodeScope;
+    let shared: Vec<_> = snapshot
+        .nodes
+        .values()
+        .filter(|e| e.scope == NodeScope::SharedPool)
+        .collect();
+    if shared.is_empty() {
+        return "no shared proxy nodes connected; waiting for the pool before \
+                declaring the Gateway programmed"
+            .to_owned();
+    }
+    let unbound = shared
+        .iter()
+        .filter(|e| {
+            !e.bound_ports
+                .as_ref()
+                .is_some_and(|bound| required.is_subset(bound))
+        })
+        .count();
+    let ports: Vec<String> = required.iter().map(u16::to_string).collect();
+    format!(
+        "waiting for {unbound}/{} connected shared proxy node(s) to bind internal port(s) [{}]",
+        shared.len(),
+        ports.join(", ")
+    )
 }
 
 /// Convert a [`StatusAddress`] (the address coxswain advertises for a Gateway)
@@ -962,7 +1300,8 @@ async fn reconcile_listenerset_inner(ls: &ListenerSet, ctx: &ReconcileContext) -
         parent_health,
         accepted,
         ctx.ingress_ports,
-    ) {
+    ) && leader_write_fence(ctx)
+    {
         listenerset_events::patch_listenerset_status(
             &ctx.client,
             ls,
@@ -1001,7 +1340,9 @@ async fn reconcile_gateway_class_inner(gc: &GatewayClass, ctx: &ReconcileContext
             return Action::await_change();
         };
         let name = gc.metadata.name.as_deref().unwrap_or_default();
-        gateway_class_events::patch_gateway_class_status(&ctx.client, name, generation).await;
+        if leader_write_fence(ctx) {
+            gateway_class_events::patch_gateway_class_status(&ctx.client, name, generation).await;
+        }
     }
     Action::await_change()
 }
@@ -1026,8 +1367,16 @@ async fn reconcile_route_inner(route: &HttpRoute, ctx: &ReconcileContext) -> Act
     // churning `lastTransitionTime`.
     let owned = ctx.owned_gateways.load();
     let rh = ctx.route_status.load();
-    route_events::mark_http_route_programmed(&ctx.client, route, &ctx.controller_name, &owned, &rh)
+    if leader_write_fence(ctx) {
+        route_events::mark_http_route_programmed(
+            &ctx.client,
+            route,
+            &ctx.controller_name,
+            &owned,
+            &rh,
+        )
         .await;
+    }
     Action::await_change()
 }
 
@@ -1047,14 +1396,16 @@ async fn reconcile_grpc_route_inner(route: &GrpcRoute, ctx: &ReconcileContext) -
     }
     let owned = ctx.owned_gateways.load();
     let rh = ctx.grpc_route_status.load();
-    grpc_route_events::mark_grpc_route_programmed(
-        &ctx.client,
-        route,
-        &ctx.controller_name,
-        &owned,
-        &rh,
-    )
-    .await;
+    if leader_write_fence(ctx) {
+        grpc_route_events::mark_grpc_route_programmed(
+            &ctx.client,
+            route,
+            &ctx.controller_name,
+            &owned,
+            &rh,
+        )
+        .await;
+    }
     Action::await_change()
 }
 
@@ -1074,14 +1425,16 @@ async fn reconcile_tls_route_inner(route: &TlsRoute, ctx: &ReconcileContext) -> 
     }
     let owned = ctx.owned_gateways.load();
     let rh = ctx.tls_route_status.load();
-    tls_route_events::mark_tls_route_programmed(
-        &ctx.client,
-        route,
-        &ctx.controller_name,
-        &owned,
-        &rh,
-    )
-    .await;
+    if leader_write_fence(ctx) {
+        tls_route_events::mark_tls_route_programmed(
+            &ctx.client,
+            route,
+            &ctx.controller_name,
+            &owned,
+            &rh,
+        )
+        .await;
+    }
     Action::await_change()
 }
 
@@ -1108,7 +1461,8 @@ async fn reconcile_ingress_inner(ing: &Ingress, ctx: &ReconcileContext) -> Actio
         Some(c) => owned_classes.contains(c),
         None => !default_classes.is_empty(),
     };
-    if owned && !ingress_lb_already_matches(ing, addr, ctx.ingress_ports) {
+    if owned && !ingress_lb_already_matches(ing, addr, ctx.ingress_ports) && leader_write_fence(ctx)
+    {
         ingress_events::patch_ingress_status(&ctx.client, ing, addr, ctx.ingress_ports).await;
     }
     Action::await_change()
@@ -1129,13 +1483,15 @@ async fn reconcile_policy_inner(policy: &BackendTlsPolicy, ctx: &ReconcileContex
         return Action::requeue(NON_LEADER_REQUEUE);
     }
     let ph = ctx.policy_status.load();
-    backend_tls_events::patch_backend_tls_policy_status(
-        &ctx.client,
-        policy,
-        &ctx.controller_name,
-        &ph,
-    )
-    .await;
+    if leader_write_fence(ctx) {
+        backend_tls_events::patch_backend_tls_policy_status(
+            &ctx.client,
+            policy,
+            &ctx.controller_name,
+            &ph,
+        )
+        .await;
+    }
     Action::await_change()
 }
 
@@ -1154,13 +1510,15 @@ async fn reconcile_ctp_inner(policy: &ClientTrafficPolicy, ctx: &ReconcileContex
         return Action::requeue(NON_LEADER_REQUEUE);
     }
     let ch = ctx.ctp_status.load();
-    client_traffic_policy_events::patch_client_traffic_policy_status(
-        &ctx.client,
-        policy,
-        &ctx.controller_name,
-        &ch,
-    )
-    .await;
+    if leader_write_fence(ctx) {
+        client_traffic_policy_events::patch_client_traffic_policy_status(
+            &ctx.client,
+            policy,
+            &ctx.controller_name,
+            &ch,
+        )
+        .await;
+    }
     Action::await_change()
 }
 
@@ -1179,13 +1537,15 @@ async fn reconcile_cbp_inner(policy: &CoxswainBackendPolicy, ctx: &ReconcileCont
         return Action::requeue(NON_LEADER_REQUEUE);
     }
     let ch = ctx.cbp_status.load();
-    coxswain_backend_policy_events::patch_coxswain_backend_policy_status(
-        &ctx.client,
-        policy,
-        &ctx.controller_name,
-        &ch,
-    )
-    .await;
+    if leader_write_fence(ctx) {
+        coxswain_backend_policy_events::patch_coxswain_backend_policy_status(
+            &ctx.client,
+            policy,
+            &ctx.controller_name,
+            &ch,
+        )
+        .await;
+    }
     Action::await_change()
 }
 
@@ -1295,6 +1655,183 @@ mod tests {
             StatusAddress::Ip(i) => Some(*i),
             StatusAddress::Hostname(_) => None,
         }
+    }
+
+    // ── proxy-pool bind gate helpers (#531) ──────────────────────────────────
+
+    #[test]
+    fn service_internal_ports_extracts_numeric_target_ports() {
+        use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
+        use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+        let svc = Service {
+            spec: Some(ServiceSpec {
+                ports: Some(vec![
+                    ServicePort {
+                        port: 443,
+                        target_port: Some(IntOrString::Int(30001)),
+                        ..Default::default()
+                    },
+                    ServicePort {
+                        port: 80,
+                        target_port: Some(IntOrString::Int(30002)),
+                        ..Default::default()
+                    },
+                    // Named targetPort cannot occur on VIP Services; skipped.
+                    ServicePort {
+                        port: 8443,
+                        target_port: Some(IntOrString::String("named".to_owned())),
+                        ..Default::default()
+                    },
+                    // Absent targetPort (defaults to `port` server-side); skipped —
+                    // the VIP reconciler always renders explicit allocations.
+                    ServicePort {
+                        port: 9443,
+                        target_port: None,
+                        ..Default::default()
+                    },
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            service_internal_ports(&svc),
+            [30001u16, 30002].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn proxy_bind_pending_detail_names_empty_pool() {
+        let reg = coxswain_core::node_registry::SharedNodeRegistry::new();
+        let detail = proxy_bind_pending_detail(&reg.load(), &[30001u16].into_iter().collect());
+        assert!(
+            detail.contains("no shared proxy nodes connected"),
+            "got: {detail}"
+        );
+    }
+
+    #[test]
+    fn proxy_bind_pending_detail_counts_unbound_nodes_and_ports() {
+        use coxswain_core::node_registry::{NodeScope, SharedNodeRegistry};
+        let reg = SharedNodeRegistry::new();
+        let now = std::time::SystemTime::UNIX_EPOCH;
+        reg.connect("node-a", NodeScope::SharedPool, now);
+        reg.record_bound_ports("node-a", [30001u16, 30002].into_iter().collect());
+        reg.connect("node-b", NodeScope::SharedPool, now);
+        // node-b never reported. A dedicated node must not count either way:
+        reg.connect(
+            "node-d",
+            NodeScope::Gateway {
+                namespace: "ns".to_owned(),
+                name: "gw".to_owned(),
+            },
+            now,
+        );
+        let detail =
+            proxy_bind_pending_detail(&reg.load(), &[30001u16, 30002].into_iter().collect());
+        assert_eq!(
+            detail,
+            "waiting for 1/2 connected shared proxy node(s) to bind internal port(s) [30001, 30002]"
+        );
+    }
+
+    // ── LeadershipState renew-error tolerance (#531) ─────────────────────────
+
+    /// Default lease settings: ttl 15 s / renew 5 s → tolerate errors until
+    /// 10 s have elapsed since the last successful renew (one renew interval
+    /// of fencing margin before the 15 s TTL can expire).
+    fn default_lease_state() -> LeadershipState {
+        LeadershipState::new(Duration::from_secs(15), Duration::from_secs(5))
+    }
+
+    fn at(base: tokio::time::Instant, secs: u64) -> tokio::time::Instant {
+        base + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn transient_renew_error_within_budget_keeps_leadership() {
+        let t0 = tokio::time::Instant::now();
+        let mut s = default_lease_state();
+        assert!(s.observe(RenewOutcome::Leading, t0));
+        assert!(
+            s.observe(RenewOutcome::RenewError, at(t0, 5)),
+            "one apiserver blip at 5 s must not demote a leader whose lease is still valid"
+        );
+        assert!(
+            s.observe(RenewOutcome::Leading, at(t0, 10)),
+            "a successful renew resets the wall-clock budget"
+        );
+        assert!(
+            s.observe(RenewOutcome::RenewError, at(t0, 15)),
+            "budget is measured from the LAST successful renew (5 s elapsed here)"
+        );
+    }
+
+    #[test]
+    fn renew_errors_demote_at_the_wall_clock_deadline() {
+        let t0 = tokio::time::Instant::now();
+        let mut s = default_lease_state();
+        assert!(s.observe(RenewOutcome::Leading, t0));
+        assert!(s.observe(RenewOutcome::RenewError, at(t0, 5)));
+        assert!(
+            !s.observe(RenewOutcome::RenewError, at(t0, 10)),
+            "10 s since the last successful renew must demote — one renew interval \
+             before the 15 s TTL can expire and another replica can acquire"
+        );
+    }
+
+    #[test]
+    fn slow_failing_renew_cannot_outlive_the_ttl() {
+        // The failure mode tick-counting missed: each renew call itself takes
+        // seconds (apiserver blackhole), so the FIRST error can already land
+        // past the deadline and must demote immediately.
+        let t0 = tokio::time::Instant::now();
+        let mut s = default_lease_state();
+        assert!(s.observe(RenewOutcome::Leading, t0));
+        assert!(
+            !s.observe(RenewOutcome::RenewError, at(t0, 12)),
+            "a single error observed 12 s after the last success is past the 10 s \
+             deadline and must demote — error counts are irrelevant"
+        );
+    }
+
+    #[test]
+    fn not_acquired_demotes_immediately() {
+        let t0 = tokio::time::Instant::now();
+        let mut s = default_lease_state();
+        assert!(s.observe(RenewOutcome::Leading, t0));
+        assert!(
+            !s.observe(RenewOutcome::Standby, at(t0, 5)),
+            "a positive observation that another replica holds the lease is never tolerated"
+        );
+    }
+
+    #[test]
+    fn renew_error_while_standby_never_promotes() {
+        let t0 = tokio::time::Instant::now();
+        let mut s = default_lease_state();
+        assert!(!s.observe(RenewOutcome::Standby, t0));
+        for i in 0..10u64 {
+            assert!(
+                !s.observe(RenewOutcome::RenewError, at(t0, i)),
+                "errors carry no information about the lease; a standby must stay standby"
+            );
+        }
+    }
+
+    #[test]
+    fn degenerate_lease_settings_demote_on_first_late_error() {
+        // ttl == renew_interval leaves no fencing margin; the deadline floors
+        // at one renew interval, so the first error at/after a full interval
+        // demotes rather than the deadline underflowing to zero (which would
+        // demote on an error arriving instantly after a successful renew).
+        let t0 = tokio::time::Instant::now();
+        let mut s = LeadershipState::new(Duration::from_secs(5), Duration::from_secs(5));
+        assert!(s.observe(RenewOutcome::Leading, t0));
+        assert!(
+            !s.observe(RenewOutcome::RenewError, at(t0, 5)),
+            "with ttl == renew the first error a full interval later must demote"
+        );
     }
 
     #[test]

@@ -11,6 +11,8 @@ use coxswain_reflector::gw_types::v::gateways::Gateway;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use std::collections::HashSet;
 
+pub(super) use crate::status_common::gateway_programmed_at_current_gen;
+use crate::status_common::has_condition_at_gen;
 pub(super) use crate::status_common::make_condition;
 
 /// Gateway API group, the default for an unset `parentRef.group`.
@@ -54,18 +56,6 @@ pub(super) fn has_condition(conditions: Option<&[Condition]>, type_: &str) -> bo
     has_condition_at_gen(conditions, type_, 0)
 }
 
-fn has_condition_at_gen(conditions: Option<&[Condition]>, type_: &str, min_gen: i64) -> bool {
-    conditions
-        .map(|conds| {
-            conds.iter().any(|c| {
-                c.type_ == type_
-                    && c.status == "True"
-                    && c.observed_generation.unwrap_or(0) >= min_gen
-            })
-        })
-        .unwrap_or(false)
-}
-
 pub(super) fn gateway_class_accepted(gc: &GatewayClass) -> bool {
     has_condition_at_gen(
         gc.status.as_ref().and_then(|s| s.conditions.as_deref()),
@@ -78,22 +68,6 @@ pub(super) fn gateway_accepted(gw: &Gateway) -> bool {
     has_condition(
         gw.status.as_ref().and_then(|s| s.conditions.as_deref()),
         "Accepted",
-    )
-}
-
-/// `true` when the Gateway already reports top-level `Programmed=True` observed
-/// at (or after) its current generation.
-///
-/// The anti-flap guard on the shared-mode convergence gate (#533): once a
-/// Gateway is `Programmed` for its live spec, a transient dip in shared-pool
-/// convergence (e.g. an unrelated Gateway churning the snapshot version) must
-/// not downgrade it back to `Pending`. Mirrors
-/// `operator::reconciler::shared_pool_is_serving`.
-pub(super) fn gateway_programmed_at_current_gen(gw: &Gateway) -> bool {
-    has_condition_at_gen(
-        gw.status.as_ref().and_then(|s| s.conditions.as_deref()),
-        "Programmed",
-        gw.metadata.generation.unwrap_or(0),
     )
 }
 

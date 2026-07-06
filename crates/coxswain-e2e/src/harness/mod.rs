@@ -4,6 +4,7 @@
 pub mod bootstrap;
 pub mod controller;
 pub mod http;
+pub mod leader;
 pub mod namespace;
 pub mod tls;
 pub mod wait;

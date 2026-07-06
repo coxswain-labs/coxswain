@@ -18,7 +18,7 @@ pub(crate) mod addresses;
 
 use coxswain_reflector::gw_types::constants::{ListenerConditionReason, ListenerConditionType};
 use coxswain_reflector::gw_types::v::gateways::{
-    GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
+    Gateway, GatewayListeners, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
 use coxswain_reflector::ingress::IngressPorts;
 use coxswain_reflector::status::{
@@ -34,6 +34,43 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 /// writer doesn't clobber writes from the other. See `crate::operator::status`
 /// for the counterparty preservation logic.
 pub(crate) const OPERATOR_OWNED_CONDITION_TYPE_PREFIX: &str = "gateway.coxswain-labs.dev/";
+
+/// `true` when `conditions` carries `type_` with `status: "True"` observed at
+/// or after `min_gen`. `min_gen = 0` degrades to a plain presence check.
+#[must_use]
+pub(crate) fn has_condition_at_gen(
+    conditions: Option<&[Condition]>,
+    type_: &str,
+    min_gen: i64,
+) -> bool {
+    conditions
+        .map(|conds| {
+            conds.iter().any(|c| {
+                c.type_ == type_
+                    && c.status == "True"
+                    && c.observed_generation.unwrap_or(0) >= min_gen
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// `true` when the Gateway already reports top-level `Programmed=True` observed
+/// at (or after) its current generation.
+///
+/// The anti-flap latch on both writers' convergence gates (#533, #531): once a
+/// Gateway is `Programmed` for its live spec, data-plane churn — pool rollouts,
+/// a leader failover emptying the node registry, a dedicated pod replacing
+/// itself — must never downgrade it back to `Pending`. Only a spec change (new
+/// generation) re-arms the gate. Shared by the shared-pool status writer and
+/// the dedicated operator writer so their latch semantics cannot drift.
+#[must_use]
+pub(crate) fn gateway_programmed_at_current_gen(gw: &Gateway) -> bool {
+    has_condition_at_gen(
+        gw.status.as_ref().and_then(|s| s.conditions.as_deref()),
+        "Programmed",
+        gw.metadata.generation.unwrap_or(0),
+    )
+}
 
 /// Build a `metav1.Condition` with `observed_generation` set.
 ///

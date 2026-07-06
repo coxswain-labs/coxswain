@@ -192,6 +192,13 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "create", "patch"]
+  # Discovery leader label (#531): the lease holder labels its own pod so the
+  # leader-selected discovery stream Service routes proxy dials to it, and
+  # strips stale labels from crashed ex-leader pods on promotion. Namespaced
+  # and controller-only; the proxy ServiceAccount keeps zero write verbs.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

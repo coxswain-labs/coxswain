@@ -89,6 +89,16 @@ coxswain-controller-discovery
 {{- end }}
 
 {{/*
+Discovery bootstrap Service name (#531). A separate Service from the stream:
+the stream Service selects the leader pod label, while bootstrap must reach
+ALL controller replicas (stateless SVID issuance). Fixed name for the same
+reason as `coxswain.discovery.serviceName`.
+*/}}
+{{- define "coxswain.discovery.bootstrapServiceName" -}}
+coxswain-controller-discovery-bootstrap
+{{- end }}
+
+{{/*
 Controller selector labels — selectorLabels + component=controller.
 */}}
 {{- define "coxswain.controller.selectorLabels" -}}
@@ -142,7 +152,7 @@ its SVID via SA token + CSR before opening the mTLS stream. Matches the value
 the controller binary hardcodes for dedicated proxies (coxswain-bin/src/lib.rs).
 */}}
 {{- define "coxswain.controller.discoveryBootstrapEndpoint" -}}
-{{- printf "https://%s.%s.svc:%d" (include "coxswain.discovery.serviceName" .) (include "coxswain.namespace" .) (.Values.discovery.bootstrapPort | int) }}
+{{- printf "https://%s.%s.svc:%d" (include "coxswain.discovery.bootstrapServiceName" .) (include "coxswain.namespace" .) (.Values.discovery.bootstrapPort | int) }}
 {{- end }}
 
 {{/*
