@@ -263,6 +263,51 @@ async fn access_log_emits_required_fields_on_success() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An `HTTPRoute` rule carrying `.name` (GEP-995, `HTTPRouteNamedRouteRule`)
+/// has the name surface as the identifier in both the Prometheus `route`
+/// label and the access-log `route_id` field, replacing the positional rule
+/// index that unnamed rules still use.
+#[tokio::test]
+async fn named_http_rule_surfaces_rule_name_in_route_metric() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-http-named-rule").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::HTTP_ROUTE_NAMED_RULE, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("http-named-rule.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/a", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+
+    let expected_route_id = format!("httproute/{}/http-named-rule-route:named-rule", ns.name);
+
+    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let named_label = format!("route=\"{expected_route_id}\"");
+    assert!(
+        metrics.lines().any(|l| l.contains(&named_label)),
+        "requests_total must carry a route label using the rule name `{named_label}`, metrics:\n{metrics}"
+    );
+
+    let logs = h.controller.shared_proxy_access_logs().await?;
+    let row = logs
+        .iter()
+        .rev()
+        .find(|line| {
+            line.get("host").and_then(|h| h.as_str()) == Some(host.as_str())
+                && line.get("path").and_then(|p| p.as_str()) == Some("/a")
+        })
+        .expect("at least one access-log row for the named-rule request");
+    let route_id = row["route_id"].as_str().expect("route_id is a string");
+    assert_eq!(
+        route_id, expected_route_id,
+        "route_id must use the rule name for a named rule, got `{route_id}`"
+    );
+
+    Ok(())
+}
+
 /// `--access-log-path-mode=pattern` replaces the concrete request path with
 /// the matched rule's `path_pattern`. Same Ingress, same backend, just a
 /// redacted `path` field.

@@ -103,6 +103,8 @@ func TestConformance(t *testing.T) {
 		features.SupportReferenceGrant,
 		// Standard: GRPCRoute — GEP-1016 (#33)
 		features.SupportGRPCRoute,
+		// Extended: named route rules — GEP-995 (#504)
+		features.SupportGRPCRouteNamedRouteRule,
 		// Standard: TLSRoute passthrough — GEP-2643 (#70)
 		features.SupportTLSRoute,
 		// Extended: TLSRoute terminate mode — #481

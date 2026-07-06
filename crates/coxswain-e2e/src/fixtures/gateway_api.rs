@@ -8,6 +8,11 @@ macro_rules! fixture {
 
 /// HTTPRoute path-based routing rules.
 pub const PATH_MATCHING: &str = fixture!("path_matching.yaml");
+/// HTTPRoute (#504) with a first rule named `named-rule` (matches `/a`) and a
+/// second unnamed rule (matches `/b`). Hostnamed
+/// `http-named-rule.${TESTNS}.local`. Backends: `echo-a`/`echo-b` (via
+/// `backends::ECHO`).
+pub const HTTP_ROUTE_NAMED_RULE: &str = fixture!("http_route_named_rule.yaml");
 /// HTTPRoute whose rules omit / empty their `backendRefs` (#517). One rule has
 /// real backends (routes 200); one omits `backendRefs`; one sets it to `[]`.
 /// Both no-backend rules must return a distinct 500, not a 404.
@@ -298,6 +303,12 @@ pub const REJECT_HTTPROUTE_INVALID_PATH_TYPE: &str =
 /// `gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo`.
 /// Hostnamed `grpc-echo.${TESTNS}.local`. Backend: `grpc-echo:50051` (h2c).
 pub const GRPC_ROUTE_EXACT_METHOD: &str = fixture!("grpc_route_exact_method.yaml");
+
+/// Gateway + GRPCRoute (#504) with a first rule named `named-rule` (matches
+/// `GrpcEcho/Echo`) and a second unnamed rule (matches `GrpcEcho/EchoTwo`).
+/// Both resolve to the `grpc-echo` backend. Hostnamed
+/// `grpc-named-rule.${TESTNS}.local`.
+pub const GRPC_ROUTE_NAMED_RULE: &str = fixture!("grpc_route_named_rule.yaml");
 
 /// Gateway + two GRPCRoutes: `good-grpc-route` (resolvable backend) and
 /// `ghost-grpc-route` (missing backend). Used for status-condition assertions.
