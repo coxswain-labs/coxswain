@@ -162,6 +162,12 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
     // (alongside the shared proxy pod) so its selector resolves and the cloud LB
     // assigns a real address (#472).
     let ctrl_ns = ctx.controller_namespace.as_str();
+    // Gateways whose static-address VIP provisioning definitively failed this
+    // pass (all requested clusterIPs rejected) — published so the status writer
+    // reports a settled `AddressNotUsable` for them, while a Gateway still
+    // mid-provisioning (absent here) is held `Pending` (#531/#533).
+    let mut static_vip_failures: std::collections::HashSet<ObjectKey> =
+        std::collections::HashSet::new();
     for gw in gateways.iter().filter(|g| is_shared(g)) {
         let key = gateway_key(gw);
         if allocation.is_gateway_exhausted(&key) {
@@ -190,7 +196,7 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
                 .and_then(|s| s.spec.as_ref())
                 .and_then(|sp| sp.cluster_ip.as_deref())
                 .and_then(|s| s.parse::<std::net::IpAddr>().ok());
-            bind_static_vip_service(StaticVipBinding {
+            let failed = bind_static_vip_service(StaticVipBinding {
                 ctx,
                 gw,
                 ctrl_ns,
@@ -200,6 +206,9 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
                 live_ip,
             })
             .await;
+            if failed {
+                static_vip_failures.insert(key.clone());
+            }
             continue;
         }
         // Auto-address (legacy/default) path: no static IP requested, so keep the
@@ -218,6 +227,12 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
             log_vip_apply_failure(gw, &e, "Service");
         }
     }
+
+    // Publish this pass's definitive static-VIP failures (full replace — a
+    // Gateway that has since bound drops out of the set) so the status writer
+    // can settle their `AddressNotUsable` while holding still-provisioning
+    // Gateways at `Pending` (#531/#533).
+    ctx.vip_failures.store(Arc::new(static_vip_failures));
 
     // Orphan-prune: the VIP Services live in the controller namespace and carry
     // NO owner reference (a cross-namespace owner ref to the Gateway is illegal),
@@ -332,7 +347,14 @@ struct StaticVipBinding<'a> {
 ///
 /// If no candidate binds (all out-of-CIDR), no Service is left and the status
 /// writer reports `AddressNotUsable`; the next pass retries.
-async fn bind_static_vip_service(b: StaticVipBinding<'_>) {
+///
+/// Returns `true` when provisioning **definitively failed** — every requested
+/// clusterIP candidate was rejected by the apiserver, so no VIP Service exists.
+/// The caller records this so the status writer can distinguish a settled
+/// `AddressNotUsable` from a Gateway still mid-provisioning (#531/#533): both
+/// present as "no Service yet", but only the latter must be held `Pending`.
+/// A deferred retry (repin delete pending) or a bound Service returns `false`.
+async fn bind_static_vip_service(b: StaticVipBinding<'_>) -> bool {
     let svc_name = render_shared::shared_gateway_service_name(
         b.gw.metadata.namespace.as_deref().unwrap_or_default(),
         b.gw.metadata.name.as_deref().unwrap_or_default(),
@@ -344,7 +366,7 @@ async fn bind_static_vip_service(b: StaticVipBinding<'_>) {
             if let Err(e) = apply_static_vip_candidate(&b, ip).await {
                 log_vip_apply_failure(b.gw, &e, "Service");
             }
-            return;
+            return false;
         }
         // Live clusterIP is not requested (auto-assigned, or a stale pin from a
         // prior spec) — free it so a requested candidate can bind.
@@ -361,14 +383,14 @@ async fn bind_static_vip_service(b: StaticVipBinding<'_>) {
                     "operator: failed to delete VIP Service for clusterIP repin; will retry"
                 );
                 // Try to bind anyway next pass once the delete lands.
-                return;
+                return false;
             }
         }
     }
 
     for &cand in b.candidates {
         match apply_static_vip_candidate(&b, cand).await {
-            Ok(()) => return,
+            Ok(()) => return false,
             Err(e) => tracing::debug!(
                 service = %format!("{}/{svc_name}", b.ctrl_ns),
                 candidate = %cand,
@@ -378,7 +400,8 @@ async fn bind_static_vip_service(b: StaticVipBinding<'_>) {
         }
     }
     // No candidate bound: leave no Service so the status writer reports
-    // AddressNotUsable. Retried next pass.
+    // AddressNotUsable. Retried next pass. Definitive failure for this pass.
+    true
 }
 
 /// Render and SSA the static-address Gateway's VIP Service with `cluster_ip`

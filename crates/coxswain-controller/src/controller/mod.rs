@@ -16,6 +16,7 @@
 //! truth-source the dedicated-mode operator also reads.
 
 use async_trait::async_trait;
+use coxswain_core::Shared;
 use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
 use coxswain_core::crd::coxswain_backend_policy::CoxswainBackendPolicy;
 use coxswain_core::health::HealthRegistry;
@@ -139,6 +140,11 @@ pub struct Controller {
     /// [`ingress_event_recorder::run`]. `None` in test / dev configurations
     /// that do not wire up an `ingress_event_tx` on the reconciler.
     ingress_event_rx: parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<IngressEvent>>>,
+    /// Shared-mode Gateways whose static-address VIP provisioning has
+    /// definitively failed (#533), published by the operator's VIP reconciler.
+    /// Read to distinguish a settled `AddressNotUsable` from a still-provisioning
+    /// Gateway (held `Pending`). Empty when unset (dev/in-process).
+    vip_failures: Shared<HashSet<ObjectKey>>,
 }
 
 impl Controller {
@@ -160,7 +166,17 @@ impl Controller {
             config,
             subscriptions: parking_lot::Mutex::new(Some(subscriptions)),
             ingress_event_rx: parking_lot::Mutex::new(ingress_event_rx),
+            vip_failures: Shared::new(),
         }
+    }
+
+    /// Share the operator VIP reconciler's definitively-failed static-address set
+    /// (#533) so a Gateway still provisioning its VIP is held `Pending` rather
+    /// than briefly reporting a settled `AddressNotUsable`.
+    #[must_use]
+    pub fn with_vip_failures(mut self, vip_failures: Shared<HashSet<ObjectKey>>) -> Self {
+        self.vip_failures = vip_failures;
+        self
     }
 
     async fn run_controllers(&self, mut shutdown: ShutdownWatch) {
@@ -247,6 +263,7 @@ impl Controller {
             gateway_classes: gateway_classes_reader,
             ingress_classes: ingress_classes_reader,
             gateways: gateways_reader.clone(),
+            vip_failures: self.vip_failures.clone(),
         });
 
         // One re-drive channel per work-queue. Each is fed by the relevant
@@ -582,6 +599,10 @@ struct ReconcileContext {
     /// Synced Gateway store, read by the ListenerSet reconciler to resolve a
     /// ListenerSet's parent Gateway and its ownership/mode (GEP-1713).
     gateways: kube::runtime::reflector::Store<Gateway>,
+    /// Definitively-failed static-address VIP set (#533), published by the
+    /// operator VIP reconciler; read to hold a still-provisioning Gateway at
+    /// `Pending` instead of a premature `AddressNotUsable`.
+    vip_failures: Shared<HashSet<ObjectKey>>,
 }
 
 /// Error policy shared by every work-queue. The status reconcilers are
@@ -646,7 +667,7 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         .map(status_address_to_typed)
         .into_iter()
         .collect();
-    let static_outcome = crate::status_common::addresses::evaluate_static_addresses(
+    let mut static_outcome = crate::status_common::addresses::evaluate_static_addresses(
         gw.spec.addresses.as_deref().unwrap_or_default(),
         &resolved,
     );
@@ -669,6 +690,27 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     // until an unrelated Gateway edit. Only a `Resolved` own-VIP is terminal.
     let awaiting_own_vip = ctx.shared_vip_addressing && !matches!(vip, VipAddress::Resolved(_));
 
+    let key = ObjectKey::new(
+        gw.metadata.namespace.clone().unwrap_or_default(),
+        gw.metadata.name.clone().unwrap_or_default(),
+    );
+
+    // Hold a still-provisioning static-address VIP at `Pending` (#533). While
+    // `awaiting_own_vip`, an empty `resolved` set makes `evaluate_static_addresses`
+    // report `AddressNotUsable` — but that is indistinguishable from a Gateway
+    // whose VIP is merely mid-provisioning. The operator's VIP reconciler is the
+    // authority: only once it records a *definitive* failure (all requested
+    // clusterIPs rejected) is the negative settled. Until then, downgrade the
+    // premature override so the convergence gate holds `Programmed` at `gen-1`
+    // rather than stamping `AddressNotUsable@N` with empty `status.addresses` (the
+    // transient that raced the conformance `GatewayMustHaveLatestConditions` check).
+    if awaiting_own_vip
+        && static_outcome.is_address_not_usable()
+        && !ctx.vip_failures.load().contains(&key)
+    {
+        static_outcome.hold_pending_address();
+    }
+
     // Convergence gate (#533): a shared-mode Gateway is fully converged for its
     // current generation only once its own VIP address has resolved — otherwise
     // `status.addresses` is still empty. Until then the status patch holds
@@ -688,10 +730,6 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         converged,
     };
 
-    let key = ObjectKey::new(
-        gw.metadata.namespace.clone().unwrap_or_default(),
-        gw.metadata.name.clone().unwrap_or_default(),
-    );
     if ctx.health.is_subsystem_ready("controller") {
         let health_map = ctx.listener_status.load();
         let health = health_map.get(&key).cloned().unwrap_or_default();
