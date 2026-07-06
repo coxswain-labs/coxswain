@@ -220,53 +220,51 @@ pub(super) fn build_filters(
                     tracing::warn!("Skipping ExtensionRef filter — payload is missing");
                     continue;
                 };
-                if ext.group == super::COXSWAIN_GROUP && ext.kind == "PathRewriteRegex" {
-                    let obj_ref =
-                        reflector::ObjectRef::<coxswain_core::crd::PathRewriteRegex>::new(
-                            &ext.name,
-                        )
-                        .within(route_ns);
-                    if let Some(cr) = path_rewrites.get(&obj_ref) {
-                        match compile_bounded(&cr.spec.pattern) {
-                            Ok(regex) => {
-                                out.push(FilterAction::UrlRewrite {
-                                    hostname: None,
-                                    path: Some(PathModifier::RegexReplace {
-                                        regex: Arc::new(regex),
-                                        replacement: Box::from(cr.spec.replacement.as_str()),
-                                    }),
-                                });
+                match (ext.group.as_str(), ext.kind.as_str()) {
+                    (super::COXSWAIN_GROUP, "PathRewriteRegex") => {
+                        let obj_ref =
+                            reflector::ObjectRef::<coxswain_core::crd::PathRewriteRegex>::new(
+                                &ext.name,
+                            )
+                            .within(route_ns);
+                        if let Some(cr) = path_rewrites.get(&obj_ref) {
+                            match compile_bounded(&cr.spec.pattern) {
+                                Ok(regex) => {
+                                    out.push(FilterAction::UrlRewrite {
+                                        hostname: None,
+                                        path: Some(PathModifier::RegexReplace {
+                                            regex: Arc::new(regex),
+                                            replacement: Box::from(cr.spec.replacement.as_str()),
+                                        }),
+                                    });
+                                }
+                                Err(e) => tracing::warn!(
+                                    name = %ext.name,
+                                    ns = route_ns,
+                                    error = %e,
+                                    "PathRewriteRegex CR has invalid regex — filter skipped"
+                                ),
                             }
-                            Err(e) => tracing::warn!(
+                        } else {
+                            tracing::warn!(
                                 name = %ext.name,
                                 ns = route_ns,
-                                error = %e,
-                                "PathRewriteRegex CR has invalid regex — filter skipped"
-                            ),
+                                "PathRewriteRegex CR not found — filter skipped"
+                            );
                         }
-                    } else {
-                        tracing::warn!(
-                            name = %ext.name,
-                            ns = route_ns,
-                            "PathRewriteRegex CR not found — filter skipped"
-                        );
                     }
-                } else if ext.group == super::COXSWAIN_GROUP && ext.kind == "RateLimit" {
-                    // Handled separately by `resolve_rate_limit`.
-                } else if ext.group == super::COXSWAIN_GROUP && ext.kind == "IpAccessControl" {
-                    // Handled separately by `resolve_ip_access`.
-                } else if ext.group == super::COXSWAIN_GROUP && ext.kind == "BasicAuth" {
-                    // Handled separately by `resolve_basic_auth`.
-                } else if ext.group == super::COXSWAIN_GROUP && ext.kind == "RequestSizeLimit" {
-                    // Handled separately by `resolve_request_size_limit`.
-                } else if ext.group == super::COXSWAIN_GROUP && ext.kind == "Compression" {
-                    // Handled separately by `resolve_compression`.
-                } else {
-                    tracing::warn!(
+                    // Resolved separately by the `resolve_*` scanners into per-route
+                    // config off the filter list — no `FilterAction` emitted here.
+                    (
+                        super::COXSWAIN_GROUP,
+                        "RateLimit" | "IpAccessControl" | "BasicAuth" | "RequestSizeLimit"
+                        | "Compression",
+                    ) => {}
+                    _ => tracing::warn!(
                         group = %ext.group,
                         kind = %ext.kind,
                         "Skipping unsupported ExtensionRef filter"
-                    );
+                    ),
                 }
             }
             HttpRouteRulesFiltersType::Cors => {
