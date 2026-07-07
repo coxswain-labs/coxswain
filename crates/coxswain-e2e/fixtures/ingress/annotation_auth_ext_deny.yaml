@@ -11,7 +11,7 @@ kind: Ingress
 metadata:
   name: auth-ext-deny-ingress
   annotations:
-    ingress.coxswain-labs.dev/auth-url: "http://auth-deny.${TESTNS}.svc.cluster.local:4001/"
+    ingress.coxswain-labs.dev/ext-auth-backend: "auth-deny:4001"
 spec:
   ingressClassName: coxswain
   rules:

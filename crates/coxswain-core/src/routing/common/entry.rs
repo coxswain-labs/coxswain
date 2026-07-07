@@ -13,8 +13,16 @@ use super::compression::CompressionConfig;
 use super::filters::FilterAction;
 use super::predicate::MatchPredicates;
 use super::rate_limit::RateLimitConfig;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
+
+/// The shared empty authentication chain — the default for every route with no
+/// auth. Cloning it is a refcount bump, so the common no-auth case never
+/// allocates.
+fn empty_auth_chain() -> Arc<[Arc<IngressAuthConfig>]> {
+    static EMPTY: LazyLock<Arc<[Arc<IngressAuthConfig>]>> = LazyLock::new(|| Arc::from(Vec::new()));
+    EMPTY.clone()
+}
 
 /// Per-rule timeout configuration.
 ///
@@ -179,15 +187,19 @@ pub struct RouteEntry {
     /// the route. Shared as an `Arc` so cloning into the lookup result is a
     /// refcount bump, not a heap copy, on the hot path.
     pub rate_limit: Option<Arc<RateLimitConfig>>,
-    /// Authentication configuration resolved from the
-    /// `ingress.coxswain-labs.dev/auth-*` annotations.
+    /// Authentication checks the proxy enforces before touching the upstream.
     ///
-    /// `None` (the default, and the value for all Gateway-API routes until the
-    /// `SecurityPolicy` binding in #23) disables authentication — requests
-    /// pass through to the upstream without a check.  `Some(cfg)` makes the
-    /// proxy enforce auth before touching the upstream.  Shared as an `Arc` so
-    /// the per-request cost is a refcount bump.
-    pub auth: Option<Arc<IngressAuthConfig>>,
+    /// An **additive chain**: the request must pass *every* check, in order —
+    /// the first hard-deny wins (#23). An empty chain (the default) disables
+    /// authentication — requests pass straight through. The Ingress
+    /// `auth-*` annotations and a route-level `CoxswainExternalAuth`
+    /// `extensionRef` each contribute at most one entry; a Gateway-attached
+    /// `CoxswainExternalAuth` policy prepends a mandatory entry that a route
+    /// cannot remove (GEP-713 override posture). Each entry is an `Arc` so a
+    /// Gateway-level config is shared across every route on the Gateway by a
+    /// refcount bump; the outer `Arc<[_]>` makes cloning onto a lookup result
+    /// cheap on the hot path.
+    pub auth: Arc<[Arc<IngressAuthConfig>]>,
     /// Per-route response-compression configuration from the
     /// `ingress.coxswain-labs.dev/compression-*` annotations.
     ///
@@ -274,7 +286,7 @@ impl RouteEntry {
             deny_source_range: None,
             access_log_enabled: None,
             rate_limit: None,
-            auth: None,
+            auth: empty_auth_chain(),
             compression: None,
             forwarded_for: None,
             circuit_breaker: None,
@@ -303,7 +315,7 @@ impl RouteEntry {
             deny_source_range: None,
             access_log_enabled: None,
             rate_limit: None,
-            auth: None,
+            auth: empty_auth_chain(),
             compression: None,
             forwarded_for: None,
             circuit_breaker: None,
@@ -337,7 +349,7 @@ impl RouteEntry {
             deny_source_range: None,
             access_log_enabled: None,
             rate_limit: None,
-            auth: None,
+            auth: empty_auth_chain(),
             compression: None,
             forwarded_for: None,
             circuit_breaker: None,
@@ -374,7 +386,7 @@ impl RouteEntry {
             deny_source_range: None,
             access_log_enabled: None,
             rate_limit: None,
-            auth: None,
+            auth: empty_auth_chain(),
             compression: None,
             forwarded_for: None,
             circuit_breaker: None,
@@ -498,15 +510,31 @@ impl RouteEntry {
         self
     }
 
-    /// Set the authentication config for this route (builder-style).
+    /// Set a single authentication check for this route (builder-style).
     ///
-    /// Used by the Ingress reconciler to attach the config resolved from the
-    /// `ingress.coxswain-labs.dev/auth-*` annotations.  `None` (the default,
-    /// and the value for all Gateway-API routes) disables authentication.  The
-    /// reconciler shares one `Arc` across every path of an Ingress so cloning
-    /// onto each entry is a refcount bump.
+    /// `None` (the default) disables authentication; `Some(cfg)` installs a
+    /// one-element [`auth`](Self::auth) chain. Used by the Ingress reconciler
+    /// and the route-level `CoxswainExternalAuth` `extensionRef`, which each
+    /// contribute at most one check. Callers needing an additive multi-check
+    /// chain (a Gateway-attached policy plus a route check) use
+    /// [`with_auth_chain`](Self::with_auth_chain).
     #[must_use]
     pub fn with_auth(mut self, auth: Option<Arc<IngressAuthConfig>>) -> Self {
+        self.auth = match auth {
+            Some(a) => Arc::from([a]),
+            None => empty_auth_chain(),
+        };
+        self
+    }
+
+    /// Set the full additive authentication chain for this route (builder-style).
+    ///
+    /// Every check runs in order; the first hard-deny wins (#23). An empty
+    /// chain disables authentication. Used by the Gateway API reconciler to
+    /// combine a Gateway-attached `CoxswainExternalAuth` policy with a
+    /// route-level `extensionRef` check.
+    #[must_use]
+    pub fn with_auth_chain(mut self, auth: Arc<[Arc<IngressAuthConfig>]>) -> Self {
         self.auth = auth;
         self
     }
@@ -586,7 +614,8 @@ impl RouteEntry {
 // Bumped 312→320 by adding forwarded_for: Option<Arc<ForwardedForConfig>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/trust-forwarded-for trusted-proxy headers (#271).
 // satisfy: Satisfy (#273) added without a bump — 1-byte enum occupies existing struct padding.
 // Bumped 320→328 by adding circuit_breaker: Option<Arc<CircuitBreakerConfig>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/circuit-breaker-* per-endpoint circuit breaker (#282).
-static_assertions::assert_eq_size!(RouteEntry, [u8; 328]);
+// Bumped 328→336 by widening auth: Option<Arc<IngressAuthConfig>> (8 bytes) → Arc<[Arc<IngressAuthConfig>]> (16-byte fat pointer) for the additive ext_authz chain (#23).
+static_assertions::assert_eq_size!(RouteEntry, [u8; 336]);
 
 #[cfg(test)]
 mod tests {
@@ -608,6 +637,7 @@ mod tests {
         // Bumped 312→320: forwarded_for: Option<Arc<ForwardedForConfig>> added for trust-forwarded-for (#271).
         // satisfy: Satisfy (#273) added without a bump — 1-byte enum occupies existing struct padding.
         // Bumped 320→328: circuit_breaker: Option<Arc<CircuitBreakerConfig>> added for circuit-breaker-* annotations (#282).
-        static_assertions::assert_eq_size!(RouteEntry, [u8; 328]);
+        // Bumped 328→336: auth widened Option<Arc<_>> → Arc<[Arc<_>]> (additive ext_authz chain, #23).
+        static_assertions::assert_eq_size!(RouteEntry, [u8; 336]);
     }
 }

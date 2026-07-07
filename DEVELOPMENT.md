@@ -264,6 +264,7 @@ cd conformance && go test -v -timeout 60m -run TestConformance -args \
   --organization=coxswain-labs --project=coxswain \
   --url=https://github.com/coxswain-labs/coxswain \
   --version="$(git describe --tags --always)" \
+  --contact=https://github.com/coxswain-labs/coxswain/issues \
   --report-output=reports/local-report.yaml
 ```
 

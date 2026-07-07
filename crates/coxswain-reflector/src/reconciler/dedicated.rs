@@ -87,6 +87,7 @@ pub(super) fn build_dedicated_gateway_snapshot(
         basic_auth_secret_grants: base.basic_auth_secret_grants,
         policy_index: base.policy_index,
         backend_policy_index: base.backend_policy_index,
+        external_auth_gateway_index: base.external_auth_gateway_index,
         backend_client_certs: &inputs.dedicated_certs.certs,
         backend_client_cert_failures: &inputs.dedicated_certs.failures,
         // Same merged map: the dedicated proxy serves its Gateway's effective listeners

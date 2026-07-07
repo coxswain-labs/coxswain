@@ -334,20 +334,23 @@ pub(crate) async fn request_filter<K>(
         }
     }
 
-    // Per-route external auth (#24). Runs after the allow-list (denied clients
-    // never consume an auth-service round-trip) and before redirect (an
-    // unauthenticated client must not receive a redirect leaking the canonical
-    // URL). `enforce()` writes a denial response and returns `Ok(true)`.
-    if let Some(auth) = m.auth.as_deref()
-        && crate::policy::auth::enforce(
+    // Per-route external auth (#24, #23). The additive chain runs in order — a
+    // Gateway-attached policy check precedes a route-level check — and the first
+    // hard-deny wins. Runs after the allow-list (denied clients never consume an
+    // auth-service round-trip) and before redirect (an unauthenticated client
+    // must not receive a redirect leaking the canonical URL). `enforce()` writes
+    // a denial response and returns `Ok(true)`.
+    for auth in m.auth.iter() {
+        if crate::policy::auth::enforce(
             &cfg.auth_client,
             auth,
             session,
             &mut ctx.auth_response_headers,
         )
         .await?
-    {
-        return Ok(true);
+        {
+            return Ok(true);
+        }
     }
 
     let timeouts = merge_timeouts(&m.timeouts, &cfg.default_timeouts);

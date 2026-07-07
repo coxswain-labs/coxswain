@@ -42,15 +42,16 @@ use crate::reference_grants::{
 };
 use crate::status::{
     ListenerSource, SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus,
-    SharedCoxswainBackendPolicyStatus, SharedGatewayListenerStatus, SharedRouteStatus,
+    SharedCoxswainBackendPolicyStatus, SharedCoxswainExternalAuthStatus,
+    SharedGatewayListenerStatus, SharedRouteStatus,
 };
 use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
 use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
 use coxswain_core::crd::coxswain_backend_policy::CoxswainBackendPolicy;
 use coxswain_core::crd::{
-    BasicAuth, Compression, CoxswainIngressClassParameters, IpAccessControl, PathRewriteRegex,
-    RateLimit, RequestSizeLimit,
+    BasicAuth, Compression, CoxswainExternalAuth, CoxswainIngressClassParameters, IpAccessControl,
+    PathRewriteRegex, RateLimit, RequestSizeLimit,
 };
 use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 use coxswain_core::fleet::{self, SharedFleet};
@@ -308,6 +309,8 @@ pub struct SharedProxyReconciler {
     ctp_status: SharedClientTrafficPolicyStatus,
     /// Per-`CoxswainBackendPolicy` ancestor health (#354).
     cbp_status: SharedCoxswainBackendPolicyStatus,
+    /// Per-`CoxswainExternalAuth` ancestor health (#23).
+    external_auth_status: SharedCoxswainExternalAuthStatus,
     /// Per-Gateway publish-sequence stamps for the #531 `Programmed` ack
     /// gate. Stamped at the end of every rebuild, after all cells above.
     publish_index: SharedGatewayPublishIndex,
@@ -397,6 +400,8 @@ pub struct StatusSubscriptions {
     pub client_traffic_policies: ReflectHandle<ClientTrafficPolicy>,
     /// Applied-`CoxswainBackendPolicy` stream + reader (#354).
     pub coxswain_backend_policies: ReflectHandle<CoxswainBackendPolicy>,
+    /// Applied-`CoxswainExternalAuth` stream + reader (#23).
+    pub coxswain_external_auths: ReflectHandle<CoxswainExternalAuth>,
 }
 
 /// Pre-created shared-store writers for the status-relevant types.
@@ -416,6 +421,7 @@ struct StatusStoreWriters {
     listener_sets: reflector::store::Writer<ListenerSet>,
     client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
     coxswain_backend_policies: reflector::store::Writer<CoxswainBackendPolicy>,
+    coxswain_external_auths: reflector::store::Writer<CoxswainExternalAuth>,
 }
 
 /// `Option`-wrapped form of [`StatusStoreWriters`] produced by
@@ -434,6 +440,7 @@ struct StatusStoreOptionWriters {
     listener_sets: Option<reflector::store::Writer<ListenerSet>>,
     client_traffic_policies: Option<reflector::store::Writer<ClientTrafficPolicy>>,
     coxswain_backend_policies: Option<reflector::store::Writer<CoxswainBackendPolicy>>,
+    coxswain_external_auths: Option<reflector::store::Writer<CoxswainExternalAuth>>,
 }
 
 impl StatusStoreWriters {
@@ -456,6 +463,7 @@ impl StatusStoreWriters {
                 listener_sets: Some(w.listener_sets),
                 client_traffic_policies: Some(w.client_traffic_policies),
                 coxswain_backend_policies: Some(w.coxswain_backend_policies),
+                coxswain_external_auths: Some(w.coxswain_external_auths),
             },
             None => StatusStoreOptionWriters {
                 routes: None,
@@ -469,6 +477,7 @@ impl StatusStoreWriters {
                 listener_sets: None,
                 client_traffic_policies: None,
                 coxswain_backend_policies: None,
+                coxswain_external_auths: None,
             },
         }
     }
@@ -525,6 +534,8 @@ impl SharedProxyReconciler {
                 reflector::store_shared::<ClientTrafficPolicy>(STATUS_SUBSCRIBE_BUFFER);
             let (_, coxswain_backend_policies) =
                 reflector::store_shared::<CoxswainBackendPolicy>(STATUS_SUBSCRIBE_BUFFER);
+            let (_, coxswain_external_auths) =
+                reflector::store_shared::<CoxswainExternalAuth>(STATUS_SUBSCRIBE_BUFFER);
             let subs = StatusSubscriptions {
                 gateways: gateways.subscribe().unwrap_or_else(|| {
                     panic!("invariant: store_shared writer must yield a Gateway subscriber")
@@ -567,6 +578,13 @@ impl SharedProxyReconciler {
                         )
                     },
                 ),
+                coxswain_external_auths: coxswain_external_auths.subscribe().unwrap_or_else(
+                    || {
+                        panic!(
+                            "invariant: store_shared writer must yield a CoxswainExternalAuth subscriber"
+                        )
+                    },
+                ),
             };
             let writers = StatusStoreWriters {
                 gateways,
@@ -580,6 +598,7 @@ impl SharedProxyReconciler {
                 listener_sets,
                 client_traffic_policies,
                 coxswain_backend_policies,
+                coxswain_external_auths,
             };
             (Some(writers), Some(subs))
         } else {
@@ -602,6 +621,7 @@ impl SharedProxyReconciler {
             policy_status: SharedBackendTlsPolicyStatus::new(),
             ctp_status: SharedClientTrafficPolicyStatus::new(),
             cbp_status: SharedCoxswainBackendPolicyStatus::new(),
+            external_auth_status: SharedCoxswainExternalAuthStatus::new(),
             publish_index: SharedGatewayPublishIndex::new(),
             fleet: SharedFleet::new(),
             owned_gateways,
@@ -671,6 +691,12 @@ impl SharedProxyReconciler {
     /// can write `status.ancestors[]` when leader (#354).
     pub fn cbp_status(&self) -> SharedCoxswainBackendPolicyStatus {
         self.cbp_status.clone()
+    }
+
+    /// Returns the shared `CoxswainExternalAuth` status handle so the Controller
+    /// can write `status.ancestors[]` when leader (#23).
+    pub fn external_auth_status(&self) -> SharedCoxswainExternalAuthStatus {
+        self.external_auth_status.clone()
     }
 
     /// Returns the SNI-keyed TLS passthrough routing table (GEP-2643, #70).
@@ -770,6 +796,10 @@ pub(super) struct ReflectorStores<'a> {
     /// `BasicAuth` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters, HTTPRoute-only (#442).
     pub(super) basic_auths: &'a reflector::Store<BasicAuth>,
+    /// `CoxswainExternalAuth` CRs in scope — resolved from `HTTPRouteRule`
+    /// `ExternalAuth` `ExtensionRef` filters (and, later, Gateway policies) into
+    /// per-route ext_authz config, HTTPRoute-only (#23).
+    pub(super) external_auths: &'a reflector::Store<CoxswainExternalAuth>,
     /// `RequestSizeLimit` CRs in scope — resolved from `HTTPRouteRule`/`GRPCRouteRule`
     /// `ExtensionRef` filters into a per-route body-size cap (#443).
     pub(super) request_size_limits: &'a reflector::Store<RequestSizeLimit>,
@@ -799,6 +829,7 @@ pub(super) struct SharedOutputs<'a> {
     pub(super) policy_status: &'a SharedBackendTlsPolicyStatus,
     pub(super) ctp_status: &'a SharedClientTrafficPolicyStatus,
     pub(super) cbp_status: &'a SharedCoxswainBackendPolicyStatus,
+    pub(super) external_auth_status: &'a SharedCoxswainExternalAuthStatus,
     pub(super) passthrough_routes: &'a SharedTlsPassthroughTable,
     pub(super) terminate_routes: &'a SharedTlsPassthroughTable,
     pub(super) publish_index: &'a SharedGatewayPublishIndex,
@@ -833,6 +864,10 @@ pub(super) struct Ownership<'a> {
     /// Consulted during Gateway API route building to set per-backend timeouts.
     /// Folded into `Ownership` for the same arity reason as `policy_index`.
     pub(super) backend_policy_index: &'a BackendPolicyIndex,
+    /// Per-Gateway ext-auth mandate from `CoxswainExternalAuth` `targetRefs`
+    /// policies (#23). Prepended to every bound route's auth chain during Gateway
+    /// API route building. Folded into `Ownership` for the same arity reason.
+    pub(super) external_auth_gateway_index: &'a crate::gateway_api::ExternalAuthGatewayIndex,
     /// Resolved GEP-3155 backend client certs, keyed by `ObjectKey(ns, gw_name)`.
     /// Populated from `resolve_backend_client_certs` before the route build. Folded
     /// into `Ownership` (same rationale as `policy_index`) to keep arities clean.
@@ -970,6 +1005,7 @@ impl BackgroundService for SharedProxyReconciler {
             policy_status: self.policy_status.clone(),
             ctp_status: self.ctp_status.clone(),
             cbp_status: self.cbp_status.clone(),
+            external_auth_status: self.external_auth_status.clone(),
             publish_index: self.publish_index.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
             terminate_routes: self.terminate_routes.clone(),
@@ -1016,6 +1052,7 @@ struct SharedHandles {
     policy_status: SharedBackendTlsPolicyStatus,
     ctp_status: SharedClientTrafficPolicyStatus,
     cbp_status: SharedCoxswainBackendPolicyStatus,
+    external_auth_status: SharedCoxswainExternalAuthStatus,
     /// Per-Gateway publish-sequence stamps for the #531 ack gate.
     publish_index: SharedGatewayPublishIndex,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
@@ -1065,6 +1102,7 @@ struct GatewayApiStoreWriters {
     path_rewrites: reflector::store::Writer<PathRewriteRegex>,
     ip_access: reflector::store::Writer<IpAccessControl>,
     basic_auths: reflector::store::Writer<BasicAuth>,
+    external_auths: reflector::store::Writer<CoxswainExternalAuth>,
     request_size_limits: reflector::store::Writer<RequestSizeLimit>,
     compressions: reflector::store::Writer<Compression>,
     listener_sets: reflector::store::Writer<ListenerSet>,
@@ -1100,6 +1138,7 @@ fn add_gateway_api_reflectors(
         path_rewrites,
         ip_access,
         basic_auths,
+        external_auths,
         request_size_limits,
         compressions,
         listener_sets,
@@ -1208,6 +1247,14 @@ fn add_gateway_api_reflectors(
     );
     spawn_reflector(
         set,
+        external_auths,
+        scoped_api::<CoxswainExternalAuth>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "coxswain_external_auth", metrics),
+        "CoxswainExternalAuth",
+    );
+    spawn_reflector(
+        set,
         request_size_limits,
         scoped_api::<RequestSizeLimit>(client.clone(), ns),
         watcher::Config::default(),
@@ -1287,6 +1334,7 @@ async fn spawn_tasks(
         policy_status,
         ctp_status,
         cbp_status,
+        external_auth_status,
         publish_index,
         passthrough_routes,
         terminate_routes,
@@ -1332,6 +1380,12 @@ async fn spawn_tasks(
     let (path_rewrite_reader, path_rewrite_writer) = reflector::store::<PathRewriteRegex>();
     let (ip_access_reader, ip_access_writer) = reflector::store::<IpAccessControl>();
     let (basic_auth_reader, basic_auth_writer) = reflector::store::<BasicAuth>();
+    // CoxswainExternalAuth is a status-relevant store: the controller role
+    // subscribes to it via `StatusSubscriptions.coxswain_external_auths` (#23) to
+    // write `status.ancestors[]`, and the data-plane reader resolves both the
+    // route-level ExtensionRef filter and the Gateway-attached policy index.
+    let (external_auth_reader, external_auth_writer) =
+        reader_writer::<CoxswainExternalAuth>(pre.coxswain_external_auths);
     let (request_size_limit_reader, request_size_limit_writer) =
         reflector::store::<RequestSizeLimit>();
     let (compression_reader, compression_writer) = reflector::store::<Compression>();
@@ -1473,6 +1527,7 @@ async fn spawn_tasks(
             path_rewrites: path_rewrite_writer,
             ip_access: ip_access_writer,
             basic_auths: basic_auth_writer,
+            external_auths: external_auth_writer,
             request_size_limits: request_size_limit_writer,
             compressions: compression_writer,
             listener_sets: listener_set_writer,
@@ -1625,6 +1680,7 @@ async fn spawn_tasks(
                 path_rewrites: &path_rewrite_reader,
                 ip_access: &ip_access_reader,
                 basic_auths: &basic_auth_reader,
+                external_auths: &external_auth_reader,
                 request_size_limits: &request_size_limit_reader,
                 compressions: &compression_reader,
                 client_traffic_policies: &ctp_reader,
@@ -1645,6 +1701,7 @@ async fn spawn_tasks(
                 policy_status: &policy_status,
                 ctp_status: &ctp_status,
                 cbp_status: &cbp_status,
+                external_auth_status: &external_auth_status,
                 publish_index: &publish_index,
                 passthrough_routes: &passthrough_routes,
                 terminate_routes: &terminate_routes,
@@ -1744,6 +1801,19 @@ fn rebuild(
     let (backend_policy_index, cbp_status_map) =
         build_backend_policy_index(stores.coxswain_backend_policies);
 
+    // Per-Gateway ext-auth mandate from `CoxswainExternalAuth` `targetRefs`
+    // policies (#23). The index is prepended to every bound route's auth chain
+    // during Gateway API route building; the status map feeds the controller's
+    // `status.ancestors[]` writer (published at the end of the rebuild).
+    let (external_auth_gateway_index, external_auth_status_map) =
+        crate::gateway_api::resolve_gateway_policies(
+            stores.external_auths,
+            &owned_gateways,
+            stores.services,
+            stores.slices,
+            &backend_grants,
+        );
+
     // GEP-3155: resolve each Gateway's backend client cert once. `certs` is attached
     // to UpstreamTls during the route build; `health` feeds the gateway-level
     // ResolvedRefs condition merged into `gateway_listener_status` below.
@@ -1773,6 +1843,7 @@ fn rebuild(
         basic_auth_secret_grants: &basic_auth_secret_grants,
         policy_index: &policy_index,
         backend_policy_index: &backend_policy_index,
+        external_auth_gateway_index: &external_auth_gateway_index,
         backend_client_certs: &backend_client_certs.certs,
         backend_client_cert_failures: &backend_client_certs.failures,
         effective_gateways: &effective,
@@ -1960,6 +2031,9 @@ fn rebuild(
     outputs.policy_status.store_and_notify(policy_status_map);
     outputs.ctp_status.store_and_notify(ctp_status_map);
     outputs.cbp_status.store_and_notify(cbp_status_map);
+    outputs
+        .external_auth_status
+        .store_and_notify(external_auth_status_map);
 
     // Build per-cut-over-Gateway snapshots for the dedicated registry (#426).
     //

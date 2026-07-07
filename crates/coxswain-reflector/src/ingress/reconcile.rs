@@ -191,6 +191,8 @@ impl IngressReconciler {
         let auth = resolve_auth_config(
             ann.auth.as_ref(),
             auth_secrets,
+            services,
+            slices,
             &route_id,
             ns,
             &mut annotation_issues,

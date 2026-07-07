@@ -141,7 +141,7 @@ fn route_entry_to_wire(path: &str, kind: RouteKind, e: &RouteEntry) -> p::RouteE
         deny_source_range,
         access_log_enabled: e.access_log_enabled,
         rate_limit: e.rate_limit.as_deref().map(rate_limit_to_wire),
-        auth: e.auth.as_deref().map(auth_to_wire),
+        auth: e.auth.iter().map(|a| auth_to_wire(a)).collect(),
         compression: e.compression.as_deref().map(compression_to_wire),
         forwarded_for: e.forwarded_for.as_deref().map(forwarded_for_to_wire),
         circuit_breaker: e.circuit_breaker.as_deref().map(circuit_breaker_to_wire),
@@ -486,20 +486,40 @@ fn rate_limit_to_wire(rl: &RateLimitConfig) -> p::RateLimitConfig {
 fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfig {
     let a = match auth {
         IngressAuthConfig::External(ext) => {
-            p::ingress_auth_config::Auth::External(p::ExtAuthConfig {
-                timeout: Some(duration_to_wire(ext.timeout)),
-                http: Some(match &ext.transport {
-                    ExtAuthTransport::Http(h) => p::HttpExtAuthConfig {
-                        url: h.url.to_string(),
+            // Exactly one of `http`/`grpc` is set per the resolved transport. A
+            // future `#[non_exhaustive]` transport encodes as neither: the decoder
+            // then fails that auth entry closed (Unavailable) rather than the
+            // encoder panicking and taking down the whole routing stream.
+            let (http, grpc) = match &ext.transport {
+                ExtAuthTransport::Http(h) => (
+                    Some(p::HttpExtAuthConfig {
                         response_headers: h
                             .response_headers
                             .iter()
                             .map(|s| s.to_string())
                             .collect(),
                         always_set_cookie: h.always_set_cookie,
-                    },
-                    _ => unreachable!("invariant: all ExtAuthTransport variants handled; update wire.rs when adding new variants"),
-                }),
+                    }),
+                    None,
+                ),
+                ExtAuthTransport::Grpc(g) => (
+                    None,
+                    Some(p::GrpcExtAuthConfig {
+                        response_headers: g
+                            .response_headers
+                            .iter()
+                            .map(|s| s.to_string())
+                            .collect(),
+                    }),
+                ),
+                _ => (None, None),
+            };
+            p::ingress_auth_config::Auth::External(p::ExtAuthConfig {
+                timeout: Some(duration_to_wire(ext.timeout)),
+                endpoints: ext.endpoints.iter().map(|a| a.to_string()).collect(),
+                fail_closed: ext.fail_closed,
+                http,
+                grpc,
             })
         }
         IngressAuthConfig::Basic(creds) => {

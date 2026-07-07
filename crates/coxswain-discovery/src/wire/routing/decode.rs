@@ -13,12 +13,12 @@ use std::time::{Duration, UNIX_EPOCH};
 use coxswain_core::routing::{
     BackendClientCert, BackendGroup, BackendProtocol, BasicCredential, CircuitBreakerConfig,
     CompressionConfig, CorsConfig, CorsOrigin, ExtAuthConfig, ExtAuthTransport, FilterAction,
-    ForwardedForConfig, GatewayRoutingTable, HashSource, HeaderMod, HeaderPredicate,
-    HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable, LoadBalance,
-    MatchPredicates, MirrorFraction, NormalizeLevel, PasswordHash, PathModifier, QueryPredicate,
-    RateLimitConfig, RateLimitKey, RouteEntry, RouteKind, RouteTimeouts, RouterError,
-    SessionAffinity, SubjectAltName, TlsPassthroughTable, TlsPassthroughTableBuilder, UpstreamCa,
-    UpstreamTls, ValueMatch, WildcardKind,
+    ForwardedForConfig, GatewayRoutingTable, GrpcExtAuthConfig, HashSource, HeaderMod,
+    HeaderPredicate, HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable,
+    LoadBalance, MatchPredicates, MirrorFraction, NormalizeLevel, PasswordHash, PathModifier,
+    QueryPredicate, RateLimitConfig, RateLimitKey, RouteEntry, RouteKind, RouteTimeouts,
+    RouterError, SessionAffinity, SubjectAltName, TlsPassthroughTable, TlsPassthroughTableBuilder,
+    UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
 };
 
 use super::MAX_MIRROR_DEPTH;
@@ -195,8 +195,13 @@ fn build_route_entry(dto: &p::RouteEntry) -> Result<RouteEntry, WireError> {
     if let Some(rl_dto) = &dto.rate_limit {
         entry = entry.with_rate_limit(Some(Arc::new(rate_limit_from_wire(rl_dto)?)));
     }
-    if let Some(auth_dto) = &dto.auth {
-        entry = entry.with_auth(Some(Arc::new(auth_from_wire(auth_dto)?)));
+    if !dto.auth.is_empty() {
+        let chain = dto
+            .auth
+            .iter()
+            .map(|a| auth_from_wire(a).map(Arc::new))
+            .collect::<Result<Vec<_>, _>>()?;
+        entry = entry.with_auth_chain(Arc::from(chain));
     }
     if let Some(c_dto) = &dto.compression {
         entry = entry.with_compression(Some(Arc::new(compression_from_wire(c_dto))));
@@ -650,22 +655,42 @@ fn auth_from_wire(dto: &p::IngressAuthConfig) -> Result<IngressAuthConfig, WireE
         field: "ingress_auth_config.auth",
     })? {
         p::ingress_auth_config::Auth::External(ext) => {
-            let http = ext.http.as_ref().ok_or(WireError::MissingRequiredField {
-                field: "ext_auth.http",
-            })?;
-            Ok(IngressAuthConfig::External(ExtAuthConfig::new(
-                ext.timeout
-                    .as_ref()
-                    .map(duration_from_wire)
-                    .unwrap_or_default(),
+            let endpoints: Arc<[SocketAddr]> = ext
+                .endpoints
+                .iter()
+                .map(|s| s.parse::<SocketAddr>().map_err(WireError::InvalidAddr))
+                .collect::<Result<Vec<_>, _>>()?
+                .into();
+            // Transport is whichever of grpc/http is present (grpc wins if both,
+            // which the encoder never emits). Neither present → a forward-
+            // incompatible or malformed entry: fail that route's auth **closed**
+            // (Unavailable → 503) rather than erroring the whole snapshot decode.
+            let transport = if let Some(g) = ext.grpc.as_ref() {
+                ExtAuthTransport::Grpc(GrpcExtAuthConfig::new(
+                    g.response_headers
+                        .iter()
+                        .map(|s| Box::from(s.as_str()))
+                        .collect::<Arc<[_]>>(),
+                ))
+            } else if let Some(http) = ext.http.as_ref() {
                 ExtAuthTransport::Http(HttpExtAuthConfig::new(
-                    Arc::from(http.url.as_str()),
                     http.response_headers
                         .iter()
                         .map(|s| Box::from(s.as_str()))
                         .collect::<Arc<[_]>>(),
                     http.always_set_cookie,
-                )),
+                ))
+            } else {
+                return Ok(IngressAuthConfig::Unavailable);
+            };
+            Ok(IngressAuthConfig::External(ExtAuthConfig::new(
+                ext.timeout
+                    .as_ref()
+                    .map(duration_from_wire)
+                    .unwrap_or_default(),
+                endpoints,
+                ext.fail_closed,
+                transport,
             )))
         }
         p::ingress_auth_config::Auth::Basic(list) => {

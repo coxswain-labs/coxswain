@@ -911,6 +911,7 @@ dependencies = [
  "coxswain-core",
  "criterion",
  "dashmap",
+ "envoy-types",
  "failsafe",
  "governor",
  "http",
@@ -931,6 +932,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tonic",
  "tracing",
  "zeroize",
 ]
@@ -1367,6 +1369,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "envoy-types"
+version = "0.7.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "37abf079717ace2178cabfee5486d68622c0142dfc7de46be59186e9046b2ad6"
+dependencies = [
+ "futures-core",
+ "prost",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

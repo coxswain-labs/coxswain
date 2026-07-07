@@ -942,6 +942,8 @@ mod tests {
                 path_rewrites: &crate::tests::fixtures::empty_path_rewrite_store(),
                 ip_access: &crate::tests::fixtures::empty_ip_access_store(),
                 basic_auths: &crate::tests::fixtures::empty_basic_auth_store(),
+                external_auths: &crate::tests::fixtures::empty_external_auth_store(),
+                external_auth_gateway_index: &HashMap::new(),
                 auth_secrets: &crate::tests::fixtures::empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &crate::tests::fixtures::empty_request_size_limit_store(),

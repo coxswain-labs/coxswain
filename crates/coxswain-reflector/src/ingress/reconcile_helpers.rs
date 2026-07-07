@@ -4,12 +4,12 @@
 //! beside the reconcile entry point but out of it to bound that file's size.
 
 use super::annotations::AnnotationIssue;
-use super::annotations::auth::{AuthAnnotation, parse_htpasswd};
+use super::annotations::auth::{AuthAnnotation, ExtAuthProtocol, parse_htpasswd};
 use crate::endpoints;
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, BasicCredential, ExtAuthConfig, ExtAuthTransport, FilterAction,
-    HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTableBuilder,
-    NormalizeLevel, WildcardKind,
+    GrpcExtAuthConfig, HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig,
+    IngressRoutingTableBuilder, NormalizeLevel, WildcardKind,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -119,6 +119,8 @@ pub(super) fn resolve_mirror_filter(
 pub(super) fn resolve_auth_config(
     annotation: Option<&AuthAnnotation>,
     auth_secrets: &reflector::Store<Secret>,
+    services: &reflector::Store<Service>,
+    slices: &reflector::Store<EndpointSlice>,
     route_id: &str,
     ingress_ns: &str,
     diag: &mut Vec<AnnotationIssue>,
@@ -126,23 +128,50 @@ pub(super) fn resolve_auth_config(
     let ann = annotation?;
     match ann {
         AuthAnnotation::External {
-            url,
+            backend,
+            protocol,
             timeout,
             response_headers,
             always_set_cookie,
+            fail_closed,
         } => {
+            // Resolve the auth-service backendRef to pod endpoints, same as any
+            // other backend. No ready endpoints → fail closed (503).
+            let ns = backend.namespace.as_deref().unwrap_or(ingress_ns);
+            let resolved =
+                endpoints::resolve(ns, &backend.name, i32::from(backend.port), slices, services);
+            if resolved.addrs.is_empty() {
+                tracing::warn!(
+                    ingress = %route_id,
+                    auth_ns = %ns,
+                    auth_svc = %backend.name,
+                    auth_port = backend.port,
+                    "ext-auth-backend resolved to no ready endpoints — failing closed (503)"
+                );
+                return Some(IngressAuthConfig::Unavailable);
+            }
+            let endpoints_arc: Arc<[SocketAddr]> = resolved.addrs.into();
             let resp_hdrs: Arc<[Box<str>]> = response_headers
                 .iter()
                 .map(|s| s.as_str().into())
                 .collect::<Vec<Box<str>>>()
                 .into();
+            let transport = match protocol {
+                ExtAuthProtocol::Http => {
+                    ExtAuthTransport::Http(HttpExtAuthConfig::new(resp_hdrs, *always_set_cookie))
+                }
+                ExtAuthProtocol::Grpc => {
+                    // Envoy `envoy.service.auth.v3.Authorization/Check` (#23 P4).
+                    // `always_set_cookie` has no gRPC analogue (the auth service
+                    // returns typed OK/Denied responses, not raw HTTP headers).
+                    ExtAuthTransport::Grpc(GrpcExtAuthConfig::new(resp_hdrs))
+                }
+            };
             Some(IngressAuthConfig::External(ExtAuthConfig::new(
                 *timeout,
-                ExtAuthTransport::Http(HttpExtAuthConfig::new(
-                    Arc::from(url.as_str()),
-                    resp_hdrs,
-                    *always_set_cookie,
-                )),
+                endpoints_arc,
+                *fail_closed,
+                transport,
             )))
         }
         AuthAnnotation::Basic(secret_ref) => {

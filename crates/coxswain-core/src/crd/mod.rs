@@ -9,6 +9,7 @@ pub mod basic_auth;
 pub mod client_traffic_policy;
 pub mod compression;
 pub mod coxswain_backend_policy;
+pub mod coxswain_external_auth;
 pub mod gateway_parameters;
 pub mod ingress_parameters;
 pub mod ip_access_control;
@@ -25,6 +26,11 @@ pub use compression::{Compression, CompressionSpec};
 pub use coxswain_backend_policy::{
     BackendPolicyAncestorRef, BackendPolicyAncestorStatus, BackendPolicyTargetRef, BackendTimeouts,
     CoxswainBackendPolicy, CoxswainBackendPolicySpec, CoxswainBackendPolicyStatus,
+};
+pub use coxswain_external_auth::{
+    CoxswainExternalAuth, CoxswainExternalAuthSpec, CoxswainExternalAuthStatus,
+    ExternalAuthAncestorRef, ExternalAuthAncestorStatus, ExternalAuthBackendRef,
+    ExternalAuthProtocol, ExternalAuthTargetRef, ForwardBodyConfig,
 };
 pub use gateway_parameters::{
     AutoscalingParams, CoxswainGatewayParameters, CoxswainGatewayParametersSpec, ServiceType,

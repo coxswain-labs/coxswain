@@ -1191,6 +1191,79 @@ async fn request_rejected_when_ext_authz_times_out() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `ext-auth-fail-closed: "false"`: when the auth service is unreachable (times
+/// out), the proxy fails **open** and forwards the request to the upstream
+/// unauthorized instead of returning 503 (#23 happy path — the fail-open
+/// opt-in). Mirror of `request_rejected_when_ext_authz_times_out`, which fails
+/// closed by default.
+#[tokio::test]
+async fn request_allowed_when_ext_auth_times_out_and_fail_open() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-fail-open").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_FAIL_OPEN,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let host = format!("authfailopen.{}.local", ns.name);
+
+    // The auth check to slow-echo times out at 500ms; fail-closed=false means the
+    // request then proceeds to echo-a rather than 503. Assert it reaches the backend.
+    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(90)).await?;
+    resp.assert_backend("echo-a");
+    Ok(())
+}
+
+/// `ext-auth-protocol: grpc` allow path (#23): the Ingress ext-auth check speaks
+/// the Envoy `envoy.service.auth.v3` proto; a request with `x-ext-authz: allow`
+/// is allowed to the backend. This is the e2e effect test for the
+/// `ext-auth-protocol` annotation.
+#[tokio::test]
+async fn request_allowed_when_ext_authz_grpc_allows() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-grpc-ok").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
+    let host = format!("authgrpc.{}.local", ns.name);
+
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async { format!("Ingress gRPC ext_authz to allow x-ext-authz:allow at {host}") },
+        || async {
+            match h
+                .http
+                .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+    Ok(())
+}
+
+/// `ext-auth-protocol: grpc` deny path (#23): a request WITHOUT `x-ext-authz:
+/// allow` is denied by the gRPC auth service → 403, backend never reached.
+#[tokio::test]
+async fn request_denied_when_ext_authz_grpc_denies() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-grpc-deny").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
+    let host = format!("authgrpc.{}.local", ns.name);
+
+    wait::wait_for_route_status(&h.http, &host, "/", 403, Duration::from_secs(120)).await?;
+    Ok(())
+}
+
 /// `auth-response-headers`: when auth allows (2xx), the named response headers
 /// from the auth service are forwarded to the upstream on the request (#24).
 #[tokio::test]
@@ -1582,6 +1655,144 @@ async fn gateway_basic_auth_cross_namespace_requires_reference_grant() -> anyhow
     )
     .await?;
 
+    Ok(())
+}
+
+// ── CoxswainExternalAuth ExtensionRef + Gateway policy (Gateway API, #23) ─────
+
+/// `CoxswainExternalAuth` via `ExtensionRef`: the ext_authz service allows (200),
+/// so the request reaches the backend (#23 happy path — also proves the
+/// `ExternalAuth` ExtensionRef kind is accepted on HTTPRoute).
+#[tokio::test]
+async fn gateway_external_auth_extensionref_allows_when_authz_2xx() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-ok").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::EXTERNAL_AUTH_ROUTE_ALLOW, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwextauthallow.{}.local", ns.name);
+
+    // The route + auth-allow Pod must both be ready; auth-allow returns 200 → the
+    // proxy allows → echo-a responds. 404 = not programmed; 503 = auth Pod not ready.
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(90)).await?;
+    resp.assert_backend("echo-a");
+    Ok(())
+}
+
+/// `CoxswainExternalAuth` via `ExtensionRef`: the ext_authz service denies (403),
+/// so the proxy returns 403 and the backend is never reached (#23 sad path).
+#[tokio::test]
+async fn gateway_external_auth_extensionref_denies_when_authz_403() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-deny").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::EXTERNAL_AUTH_ROUTE_DENY, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwextauthdeny.{}.local", ns.name);
+
+    // 404 = not yet programmed; a single 403 proves the proxy forwarded the deny.
+    wait::wait_for_route_status(&gw, &host, "/", 403, Duration::from_secs(90)).await?;
+    Ok(())
+}
+
+/// Gateway-attached `CoxswainExternalAuth` mandate (`targetRefs`): every route on
+/// the Gateway is subject to the check even with no route-level filter, so a route
+/// pointed at a denying auth service returns 403 (#23 — the Gateway policy surface).
+#[tokio::test]
+async fn gateway_external_auth_policy_applies_to_route_without_filter() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-mandate").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        gwa::EXTERNAL_AUTH_GATEWAY_ADDITIVE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    // This route carries NO ExtensionRef filter — the Gateway-level mandate alone
+    // (auth-deny) must deny it.
+    let host = format!("gwextauthmandate.{}.local", ns.name);
+
+    wait::wait_for_route_status(&gw, &host, "/", 403, Duration::from_secs(90)).await?;
+    Ok(())
+}
+
+/// Additive precedence (GEP-713 override posture): a route whose OWN `ExtensionRef`
+/// would allow is still denied because the Gateway-attached mandate is prepended
+/// and both checks run — a route cannot weaken a Gateway-level auth mandate (#23).
+#[tokio::test]
+async fn gateway_external_auth_policy_is_additive_and_cannot_be_removed() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-additive").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        gwa::EXTERNAL_AUTH_GATEWAY_ADDITIVE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    // This route's ExtensionRef points at auth-allow (would pass on its own), but
+    // the Gateway mandate (auth-deny) runs first and denies → 403, proving the
+    // mandate is additive and not removable from below.
+    let host = format!("gwextauthadditive.{}.local", ns.name);
+
+    wait::wait_for_route_status(&gw, &host, "/", 403, Duration::from_secs(90)).await?;
+    Ok(())
+}
+
+/// gRPC ext_authz transport (#23 happy path): the proxy speaks the Envoy
+/// `envoy.service.auth.v3` Check proto to the auth pod. A request carrying
+/// `x-ext-authz: allow` is allowed → echo-a.
+#[tokio::test]
+async fn gateway_external_auth_grpc_allows_with_header() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-grpc-ok").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::EXTERNAL_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwextauthgrpc.{}.local", ns.name);
+
+    // Route + ext-authz gRPC Pod must be ready; `x-ext-authz: allow` → allow → echo-a.
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async { format!("gRPC ext_authz to allow x-ext-authz:allow at {host}") },
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+    Ok(())
+}
+
+/// gRPC ext_authz transport (#23 sad path): a request WITHOUT `x-ext-authz: allow`
+/// is denied by the auth service (PermissionDenied) → the proxy returns 403 and
+/// the backend is never reached.
+#[tokio::test]
+async fn gateway_external_auth_grpc_denies_without_header() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-grpc-deny").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::EXTERNAL_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwextauthgrpc.{}.local", ns.name);
+
+    // No `x-ext-authz` header → the gRPC auth service denies → 403 (404 while the
+    // route is not yet programmed; 503 while the auth Pod is not ready — keep polling).
+    wait::wait_for_route_status(&gw, &host, "/", 403, Duration::from_secs(120)).await?;
     Ok(())
 }
 

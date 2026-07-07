@@ -56,6 +56,17 @@ pub const AUTH_STUB: &str = concat!(
     "/fixtures/backends/auth_stub.yaml"
 );
 
+/// Istio's `ext-authz` sample server for gRPC ext_authz e2e (#23).
+///
+/// Creates one `ext-authz-grpc` Service exposing an HTTP check server on `:8000`
+/// and a gRPC (`envoy.service.auth.v3`) check server on `:9000`. A request is
+/// allowed iff it carries `x-ext-authz: allow`; otherwise denied (403 /
+/// PermissionDenied). Tests drive allow/deny via that request header.
+pub const EXT_AUTHZ_GRPC: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/ext_authz_grpc.yaml"
+);
+
 /// Mixed-latency backend pair for load-balance algorithm tests (#275).
 ///
 /// Creates:

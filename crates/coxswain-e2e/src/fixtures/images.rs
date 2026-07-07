@@ -43,3 +43,10 @@ pub(crate) const GO_HTTPBIN: &str = "ghcr.io/mccutchen/go-httpbin:latest@sha256:
 /// GHCR publishes only `:latest` for Pebble; pinned by index digest so a re-push
 /// cannot silently change what the test exercises (rubric #7).
 pub(crate) const PEBBLE: &str = "ghcr.io/letsencrypt/pebble:latest@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199";
+
+/// `istio/ext-authz` — Istio's sample external-authorization server (#23). Serves
+/// BOTH an HTTP check server on :8000 and a gRPC (`envoy.service.auth.v3`) check
+/// server on :9000, allowing a request iff it carries `x-ext-authz: allow` and
+/// denying (403 / PermissionDenied) otherwise. Used to exercise the gRPC ext_authz
+/// transport end-to-end. Pinned by multi-arch index digest (arm64 + amd64).
+pub(crate) const EXT_AUTHZ: &str = "istio/ext-authz:1.30.2@sha256:9a68e93dc6561d274829e6d29ff8256772106697c62294b2c78997ec8e319b00";

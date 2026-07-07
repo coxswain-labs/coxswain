@@ -6,6 +6,7 @@ mod backend_policy;
 mod backend_tls;
 mod bindings;
 mod client_traffic_policy;
+mod external_auth;
 mod filters;
 pub(crate) mod frontend_tls;
 mod grpc_reconcile;
@@ -25,6 +26,7 @@ pub(crate) use bindings::parent_listener_source;
 pub use client_traffic_policy::{
     ClientTrafficPolicyIndex, effective_proxy_config, resolve_client_traffic_policies,
 };
+pub use external_auth::{ExternalAuthGatewayIndex, resolve_gateway_policies};
 pub use grpc_reconcile::GrpcRouteResolution;
 pub(crate) use hostnames::hostnames_intersect;
 pub use reconcile::RouteResolution;

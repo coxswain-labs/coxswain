@@ -53,12 +53,12 @@ pub struct RouteMatch {
     pub access_log_enabled: Option<bool>,
     /// Per-route rate-limiting configuration (`None` = no rate limiting).
     pub rate_limit: Option<Arc<RateLimitConfig>>,
-    /// Authentication configuration for this route (`None` = no auth required).
+    /// The additive authentication chain for this route (empty = no auth).
     ///
-    /// Populated from `RouteEntry::auth`; `Some` only for Ingress routes that
-    /// carry one of the `ingress.coxswain-labs.dev/auth-*` annotations.  The
-    /// proxy enforces it in `request_filter` before forwarding to upstream.
-    pub auth: Option<Arc<IngressAuthConfig>>,
+    /// Cloned from [`RouteEntry::auth`]; the proxy enforces every check in order
+    /// in `request_filter` before forwarding to upstream, and the first hard-deny
+    /// wins (#23).
+    pub auth: Arc<[Arc<IngressAuthConfig>]>,
     /// Per-route response-compression configuration (`None` = no compression).
     ///
     /// Populated from `RouteEntry::compression`; `Some` only for Ingress routes

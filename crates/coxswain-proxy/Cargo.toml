@@ -17,6 +17,11 @@ base64 = { workspace = true }
 bcrypt = { workspace = true }
 bytes = { workspace = true }
 constant_time_eq = { workspace = true }
+# gRPC ext_authz transport (#23): Envoy envoy.service.auth.v3 client. Cleartext
+# tonic transport to the resolved auth pod — no TLS feature (no boringssl/ring
+# clash with pingora).
+envoy-types = { workspace = true }
+tonic = { workspace = true }
 http = { workspace = true }
 ipnet = { workspace = true }
 itoa = { workspace = true }

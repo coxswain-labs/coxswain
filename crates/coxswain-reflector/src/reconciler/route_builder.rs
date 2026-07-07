@@ -228,6 +228,8 @@ pub(super) fn build_gateway_routes(
                 path_rewrites: stores.path_rewrites,
                 ip_access: stores.ip_access,
                 basic_auths: stores.basic_auths,
+                external_auths: stores.external_auths,
+                external_auth_gateway_index: ownership.external_auth_gateway_index,
                 auth_secrets: stores.auth_secrets,
                 basic_auth_secret_grants: ownership.basic_auth_secret_grants,
                 request_size_limits: stores.request_size_limits,

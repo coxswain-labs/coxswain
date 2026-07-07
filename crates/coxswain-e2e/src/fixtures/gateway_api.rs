@@ -221,6 +221,21 @@ pub const GRPC_RATE_LIMIT: &str = fixture!("grpc_rate_limit.yaml");
 /// HTTPRoute with `ExtensionRef` (#442). Valid `Authorization: Basic`
 /// credentials are admitted; missing/invalid credentials get 401.
 pub const BASIC_AUTH_EXTENSIONREF: &str = fixture!("basic_auth_extensionref.yaml");
+/// Gateway + `CoxswainExternalAuth` (HTTP, auth-allow:4000) + HTTPRoute with an
+/// `ExtensionRef` filter (#23 happy path). The ext_authz check allows → echo-a.
+pub const EXTERNAL_AUTH_ROUTE_ALLOW: &str = fixture!("external_auth_route_allow.yaml");
+/// Gateway + `CoxswainExternalAuth` (HTTP, auth-deny:4001) + HTTPRoute with an
+/// `ExtensionRef` filter (#23 sad path). The ext_authz check denies → 403.
+pub const EXTERNAL_AUTH_ROUTE_DENY: &str = fixture!("external_auth_route_deny.yaml");
+/// Gateway with a `CoxswainExternalAuth` `targetRefs` mandate (auth-deny) plus a
+/// route whose own `ExtensionRef` filter would allow (#23). Proves the mandate
+/// applies to every route and is additive — a route cannot weaken it (both hosts
+/// return 403).
+pub const EXTERNAL_AUTH_GATEWAY_ADDITIVE: &str = fixture!("external_auth_gateway_additive.yaml");
+/// Gateway + `CoxswainExternalAuth` (protocol: GRPC, `ext-authz-grpc:9000`) +
+/// HTTPRoute `ExtensionRef` (#23 gRPC transport). Allowed with `x-ext-authz:
+/// allow`, denied (403) otherwise. Apply `backends::EXT_AUTHZ_GRPC` first.
+pub const EXTERNAL_AUTH_GRPC: &str = fixture!("external_auth_grpc.yaml");
 /// Gateway + `BasicAuth` CR referencing an UNLABELED htpasswd Secret +
 /// HTTPRoute with `ExtensionRef` (#442 sad path). The reflector never loads
 /// the Secret, so the proxy fails closed with 503 even for valid credentials.

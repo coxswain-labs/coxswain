@@ -7,7 +7,9 @@ use crate::gw_types::v::httproutes::{
     HttpRouteRulesFiltersCors, HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType,
     HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesQueryParamsType,
 };
-use coxswain_core::crd::{BasicAuth, Compression, IpAccessControl, RateLimit, RequestSizeLimit};
+use coxswain_core::crd::{
+    BasicAuth, Compression, CoxswainExternalAuth, IpAccessControl, RateLimit, RequestSizeLimit,
+};
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, CompressionConfig, CorsConfig, CorsOrigin, FilterAction, HeaderMod,
@@ -258,7 +260,7 @@ pub(super) fn build_filters(
                     (
                         super::COXSWAIN_GROUP,
                         "RateLimit" | "IpAccessControl" | "BasicAuth" | "RequestSizeLimit"
-                        | "Compression",
+                        | "Compression" | "ExternalAuth",
                     ) => {}
                     _ => tracing::warn!(
                         group = %ext.group,
@@ -867,6 +869,42 @@ pub(super) fn resolve_basic_auth<F: ExtRefFilter>(
     })
 }
 
+/// Resolve the first `CoxswainExternalAuth` `ExtensionRef` on the rule into an
+/// [`IngressAuthConfig`] (#23).
+///
+/// Returns `None` when no `ExternalAuth` ref is present (no ext-auth on the
+/// route) or the referenced CR is missing (fail-open — matches the other
+/// ExtensionRef resolvers). A present-but-broken backend (no endpoints, ungranted
+/// cross-namespace ref, unsupported protocol) fails **closed** via
+/// [`IngressAuthConfig::Unavailable`], resolved in
+/// [`super::external_auth::resolve_spec`].
+pub(super) fn resolve_external_auth<F: ExtRefFilter>(
+    filters: &[F],
+    route_ns: &str,
+    external_auths: &reflector::Store<CoxswainExternalAuth>,
+    services: &reflector::Store<Service>,
+    slices: &reflector::Store<EndpointSlice>,
+    grants: &HashSet<ReferenceGrantKey>,
+) -> Option<Arc<IngressAuthConfig>> {
+    ext_refs(filters).find_map(|(g, k, n)| {
+        if g != super::COXSWAIN_GROUP || k != "ExternalAuth" {
+            return None;
+        }
+        let obj_ref = reflector::ObjectRef::<CoxswainExternalAuth>::new(n).within(route_ns);
+        let Some(cr) = external_auths.get(&obj_ref) else {
+            tracing::warn!(
+                ns = route_ns,
+                name = n,
+                "CoxswainExternalAuth CR not found — ext-auth skipped (fail-open)"
+            );
+            return None;
+        };
+        Some(Arc::new(super::external_auth::resolve_spec(
+            &cr.spec, route_ns, services, slices, grants,
+        )))
+    })
+}
+
 /// Resolve a single `ExtensionRef` (by `group`/`kind`/`name`) into an
 /// [`IngressAuthConfig`], if it targets a `BasicAuth` CR.
 ///
@@ -1209,6 +1247,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1267,6 +1307,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1323,6 +1365,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1385,6 +1429,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1454,6 +1500,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),

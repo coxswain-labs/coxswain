@@ -15,6 +15,7 @@ Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io
 | `ReferenceGrant` | `gateway.networking.k8s.io/v1beta1` | Cross-namespace backend and certificate access |
 | `BackendTLSPolicy` | `gateway.networking.k8s.io/v1` | Upstream TLS configuration referencing a CA `ConfigMap` or `Secret` |
 | `CoxswainBackendPolicy` | `gateway.coxswain-labs.dev/v1alpha1` | Coxswain-native per-`Service` connection policy: connect/idle timeouts, load-balancing algorithm, circuit breaker — see [below](#coxswainbackendpolicy) |
+| `CoxswainExternalAuth` | `gateway.coxswain-labs.dev/v1alpha1` | External authorization (`ext_authz`, HTTP or gRPC) as an HTTPRoute `ExtensionRef` filter or a Gateway-attached `targetRefs` policy — see [below](#external-authorization-ext_authz) |
 
 !!! warning "Not supported"
     `TCPRoute` and `UDPRoute` are not implemented.
@@ -274,7 +275,7 @@ spec:
 | `URLRewrite` | Supported (hostname and path rewrite) |
 | `RequestRedirect` | Supported (scheme, hostname, port, path, status code) |
 | `RequestMirror` | Supported — GEP-3171 fire-and-forget shadow traffic with optional `percent` or `fraction` sampling; multiple filters per rule for multiple mirrors |
-| `ExtensionRef` | Supported (for `RateLimit`, `PathRewriteRegex`, `IpAccessControl`, `BasicAuth`, `RequestSizeLimit`, and `Compression` Coxswain extensions) |
+| `ExtensionRef` | Supported (for `RateLimit`, `PathRewriteRegex`, `IpAccessControl`, `BasicAuth`, `ExternalAuth`, `RequestSizeLimit`, and `Compression` Coxswain extensions) |
 | `CORS` | Supported — GEP-1767 preflight short-circuit and response-header injection |
 
 ### Attaching to a Gateway
@@ -573,6 +574,75 @@ spec:
     - group: ""
       kind: Secret
 ```
+
+### External authorization (ext_authz)
+
+`CoxswainExternalAuth` (`gateway.coxswain-labs.dev/v1alpha1`) delegates an allow/deny decision to an external authorization service before a request reaches its upstream — the Coxswain implementation of [GEP-1494] and the Envoy / Istio / kgateway `ext_authz` model. The auth service is named by a **`backendRef`** (a `Service` + port), resolved to pod endpoints and load-balanced like any other backend; there is no URL form.
+
+It is **dual-surface**:
+
+- **Route filter** — reference it from an `HTTPRouteRule` via an `ExtensionRef` filter (like `BasicAuth`).
+- **Gateway policy** — attach it to a `Gateway` via `spec.targetRefs` (like `ClientTrafficPolicy`), making it a default applied to **every** HTTPRoute on that Gateway.
+
+Precedence is **additive** (GEP-713 override posture): when both a Gateway-attached policy and a route filter apply, the request must pass **both** checks, and the first hard-deny wins. A route filter can add checks but **cannot** remove a Gateway-level mandate — a platform-admin requirement is not weakenable by a tenant. Two policies targeting the same Gateway conflict: the older (by `creationTimestamp`, ties by name) wins and the loser gets `Accepted=False, reason=Conflicted` in its `status.ancestors[]`.
+
+Two transports, selected by `spec.protocol`:
+
+- **`HTTP`** — forward-auth: the original method, Host, path, and client headers are replayed to the service (no body); **2xx** allows, any other status is returned to the client.
+- **`GRPC`** — the Envoy `envoy.service.auth.v3.Authorization/Check` proto: the request context is sent as a `CheckRequest`; an `OK` status allows (copying `allowedResponseHeaders` from the OK response onto the upstream request), any other status denies with the denied response's HTTP status (default `403`), headers, and body.
+
+`CoxswainExternalAuth` is **HTTPRoute-only** (a Gateway-attached policy covers the HTTPRoutes on the Gateway); `GRPCRoute` is not yet supported.
+
+```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
+metadata:
+  name: oauth2
+spec:
+  protocol: HTTP          # or GRPC
+  backendRef:
+    name: oauth2-proxy
+    port: 4180
+  timeout: 250ms
+  failClosed: true        # deny (503) on auth-service error/timeout (default)
+  allowedResponseHeaders: # copied onto the upstream request on allow
+    - x-auth-user
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+# ...
+    filters:
+      - type: ExtensionRef
+        extensionRef:
+          group: gateway.coxswain-labs.dev
+          kind: ExternalAuth
+          name: oauth2
+```
+
+To make the check a Gateway-wide mandate instead, add `targetRefs` and omit the route filter:
+
+```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
+metadata:
+  name: gateway-authn
+spec:
+  protocol: GRPC
+  backendRef:
+    name: ext-authz
+    port: 9000
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: my-gateway
+```
+
+Fail-closed and cross-namespace rules:
+
+- `failClosed: true` (the default) denies with **503** when the auth service is unreachable, errors, or times out; `failClosed: false` fails **open** (request proceeds unauthorized). A `backendRef` that resolves to no ready endpoints — or an unsupported protocol — always fails **closed**, regardless of `failClosed`.
+- A `backendRef` whose `namespace` differs from the policy's namespace requires a matching `ReferenceGrant` — `from` a `CoxswainExternalAuth` (`gateway.coxswain-labs.dev`) `to` a core `Service`. Without it the reference fails **closed** (503). Same-namespace refs need no grant.
+
+[GEP-1494]: https://gateway-api.sigs.k8s.io/geps/gep-1494/
 
 ### Request size limit
 
