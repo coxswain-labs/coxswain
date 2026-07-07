@@ -14,8 +14,10 @@ info:
       - `routing/*` — config resources (Gateways, HTTPRoutes, Ingresses)
 
     The `/api/v1/*` surface is served only by the controller role;
-    proxy pods return 404 for everything except `/api/v1/health`, `/metrics`,
-    and the proxy-local `/routes`.
+    proxy pods return 404 for everything except `/api/v1/health` (proxy pods
+    carry no other admin query surface beyond `/metrics`, #537). A proxy's
+    compiled routing table is served from the controller's own local
+    snapshot at `fleet/proxies/{name}/routes`, never fetched from the pod.
 
 servers:
   - url: http://localhost:8082
@@ -42,47 +44,6 @@ paths:
       summary: Prometheus metrics (all roles)
       responses:
         '200': { description: Prometheus text exposition, content: { text/plain: {} } }
-
-  /api/v1/routes:
-    get:
-      tags: [role-local]
-      summary: Proxy-local compiled routing table (proxy only; 404 on controller)
-      description: >-
-        Accepts the shared list filter/pagination params; with none, returns the
-        legacy `{ingress, gateway}` full dump. With params, each spec block is
-        filtered/windowed and gains `total`/`returned`/`offset` (#286).
-      parameters:
-        - { $ref: '#/components/parameters/hostQuery' }
-        - { $ref: '#/components/parameters/namespaceQuery' }
-        - { $ref: '#/components/parameters/pathQuery' }
-        - { $ref: '#/components/parameters/status' }
-        - { $ref: '#/components/parameters/limit' }
-        - { $ref: '#/components/parameters/offset' }
-      responses:
-        '200':
-          description: Per-spec compiled routes
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ingress: { $ref: '#/components/schemas/RouteBlock' }
-                  gateway: { $ref: '#/components/schemas/RouteBlock' }
-
-  /api/v1/facets:
-    get:
-      tags: [role-local]
-      summary: Distinct hosts + route namespaces this proxy serves (proxy only; 404 on controller)
-      description: >-
-        Filter-dropdown options for the proxy route table — far smaller than the
-        route set, so shipped whole. The controller relays this via
-        /api/v1/fleet/proxies/{name}/facets.
-      responses:
-        '200':
-          description: Distinct hosts and namespaces
-          content:
-            application/json:
-              schema: { $ref: '#/components/schemas/Facets' }
 
   /api/v1/health:
     get:
@@ -175,7 +136,7 @@ paths:
   /api/v1/fleet/proxies/{name}/routes:
     get:
       tags: [fleet]
-      summary: A proxy's compiled routing table (filter/pagination relayed to the proxy, #286)
+      summary: A proxy's compiled routing table, served from the controller's local snapshot (#537, filter/pagination applied there)
       parameters:
         - { $ref: '#/components/parameters/podName' }
         - { $ref: '#/components/parameters/hostQuery' }
@@ -186,7 +147,7 @@ paths:
         - { $ref: '#/components/parameters/offset' }
       responses:
         '200':
-          description: Wrapped proxy routes (or reachable=false on timeout)
+          description: Wrapped proxy routes (reachable is true whenever the pod is a known fleet member)
           content:
             application/json:
               schema:
@@ -199,18 +160,20 @@ paths:
                     properties:
                       ingress: { $ref: '#/components/schemas/RouteBlock' }
                       gateway: { $ref: '#/components/schemas/RouteBlock' }
+        '404': { description: Unknown pod }
 
   /api/v1/fleet/proxies/{name}/facets:
     get:
       tags: [fleet]
-      summary: Distinct hosts + route namespaces for a proxy's route-table filters (relayed)
+      summary: Distinct hosts + route namespaces for a proxy's route-table filters, from the controller's local snapshot (#537)
       parameters: [{ $ref: '#/components/parameters/podName' }]
       responses:
         '200':
-          description: Distinct hosts and namespaces (empty lists when the pod is unreachable)
+          description: Distinct hosts and namespaces (empty lists if the proxy's scope has no compiled routes yet)
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Facets' }
+        '404': { description: Unknown pod }
 
   /api/v1/fleet/proxies/{name}/health:
     get:
@@ -339,12 +302,11 @@ paths:
       summary: Route detail — traffic-served status + effective config
       description: >
         Interpreted detail for a single route, sourced from the live Kubernetes
-        object (no proxy fan-out — that is the on-demand `/check` sub-resource).
-        HTTPRoute carries `hostnames`, per-parentRef `parent_statuses` (conditions),
-        and `rules` (match predicates, weighted backends, filter kinds). Ingress
-        carries `class`, inline `tls`, optional `default_backend`, `load_balancer`
-        address, and `rules` (host/path/pathType → backend). Both carry the
-        traffic-served `status`.
+        object. HTTPRoute carries `hostnames`, per-parentRef `parent_statuses`
+        (conditions), and `rules` (match predicates, weighted backends, filter
+        kinds). Ingress carries `class`, inline `tls`, optional
+        `default_backend`, `load_balancer` address, and `rules`
+        (host/path/pathType → backend). Both carry the traffic-served `status`.
       parameters:
         - name: kind
           in: path
@@ -354,73 +316,6 @@ paths:
         - { $ref: '#/components/parameters/name' }
       responses:
         '200': { description: Route detail (shape varies by kind) }
-        '404': { description: Unknown kind or route }
-        '503': { description: Kubernetes API unavailable }
-
-  /api/v1/routing/routes/{kind}/{namespace}/{name}/check:
-    get:
-      tags: [routing]
-      summary: Data-plane consistency check for a single route (on-demand)
-      description: >
-        Independent ground-truth: fans out `GET /routes` to the proxies that
-        should serve the route (the shared pool, or the dedicated proxies of the
-        route's parent Gateways) and diffs the route-tagged rows across them.
-        `consistent` is false when a serving proxy is unreachable, is missing a
-        row its peers have, or the route is absent from every proxy. Heavier than
-        the detail endpoint (N-pod fan-out) — fired only on operator request.
-      parameters:
-        - name: kind
-          in: path
-          required: true
-          schema: { type: string, enum: [httproute, ingress] }
-        - { $ref: '#/components/parameters/namespace' }
-        - { $ref: '#/components/parameters/name' }
-      responses:
-        '200':
-          description: Reconcile report
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  kind: { type: string, enum: [httproute, ingress] }
-                  namespace: { type: string }
-                  name: { type: string }
-                  consistent: { type: boolean }
-                  expected:
-                    type: array
-                    description: Union of (host, path, backend_group) keys seen across serving proxies.
-                    items:
-                      type: object
-                      properties:
-                        host: { type: string }
-                        path: { type: string }
-                        backend_group: { type: string }
-                  proxies:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        pod_name: { type: string }
-                        reachable: { type: boolean }
-                        rows:
-                          type: array
-                          items:
-                            type: object
-                            properties:
-                              host: { type: string }
-                              path: { type: string }
-                              backend_group: { type: string }
-                              endpoints: { type: array, items: { type: string } }
-                              dead: { type: boolean }
-                        missing:
-                          type: array
-                          items:
-                            type: object
-                            properties:
-                              host: { type: string }
-                              path: { type: string }
-                              backend_group: { type: string }
         '404': { description: Unknown kind or route }
         '503': { description: Kubernetes API unavailable }
 

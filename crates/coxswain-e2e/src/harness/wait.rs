@@ -441,8 +441,10 @@ pub async fn wait_for_distinct_backends(
     .await
 }
 
-/// Poll the proxy admin `/api/v1/routes` until the route serving `host` exposes
-/// at least `expected` compiled endpoints, returning the count observed.
+/// Poll the controller's per-proxy routes view
+/// (`fleet/proxies/{pod}/routes`, see [`super::Harness::shared_proxy_routes_url`])
+/// until the route serving `host` exposes at least `expected` compiled
+/// endpoints, returning the count observed.
 ///
 /// Mode-independent companion to [`wait_for_distinct_backends`] for load-balancing
 /// tests whose client cannot distribute requests across the backend set — e.g.
@@ -464,11 +466,13 @@ pub async fn wait_for_route_endpoints(
 ) -> anyhow::Result<usize> {
     let client = reqwest::Client::new();
     // Largest endpoint count across any compiled route (ingress or gateway
-    // surface) whose host group matches `host`.
+    // surface) whose host group matches `host`. `routes_url` is the
+    // controller's wrapped envelope (#537): `{"routes": {"ingress", "gateway"}}`.
     let count_for = |json: &serde_json::Value, host: &str| -> usize {
+        let routes = &json["routes"];
         ["ingress", "gateway"]
             .iter()
-            .filter_map(|surface| json[surface]["hosts"].as_array())
+            .filter_map(|surface| routes[surface]["hosts"].as_array())
             .flatten()
             .filter(|hg| hg["host"].as_str() == Some(host))
             .flat_map(|hg| hg["routes"].as_array().into_iter().flatten())

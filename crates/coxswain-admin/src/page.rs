@@ -131,35 +131,6 @@ impl ListParams {
             Some(needle) => haystack.to_ascii_lowercase().contains(needle),
         }
     }
-
-    /// Re-encode the params as a query string (omitting defaults). Used by the
-    /// controller to relay the filter to a proxy's `/api/v1/routes` endpoint,
-    /// which does the filtering at the source (#286).
-    pub(crate) fn to_query(&self) -> String {
-        let mut ser = form_urlencoded::Serializer::new(String::new());
-        if let Some(name) = &self.name {
-            ser.append_pair("name", name);
-        }
-        if let Some(namespace) = &self.namespace {
-            ser.append_pair("namespace", namespace);
-        }
-        if let Some(host) = &self.host {
-            ser.append_pair("host", host);
-        }
-        if let Some(path) = &self.path {
-            ser.append_pair("path", path);
-        }
-        if let Some(limit) = self.limit {
-            ser.append_pair("limit", &limit.to_string());
-        }
-        if self.offset > 0 {
-            ser.append_pair("offset", &self.offset.to_string());
-        }
-        if self.problems_only {
-            ser.append_pair("status", "problem");
-        }
-        ser.finish()
-    }
 }
 
 /// A windowed page of already-filtered rows plus the counts the UI needs to show

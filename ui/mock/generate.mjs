@@ -512,96 +512,6 @@ function emitHttproutes() {
     httproute('tenant-b', 'b-api-route', oneParent('tenant-b-gw', [ACCEPTED, NOT_PROGRAMMED, RESOLVED])));
 }
 
-// ── route check (on-demand data-plane consistency) ───────────────────────────────────────────────────
-// Mirrors `check_route`: per serving proxy, the route-tagged rows + the union
-// keys each is missing; `consistent` is false on any unreachable/missing/absent.
-const rrow = (host, path, bg, endpoints) => ({ host, path, backend_group: bg, endpoints, dead: endpoints.length === 0 });
-const rkey = (host, path, bg) => ({ host, path, backend_group: bg });
-function check(kind, ns, name, { expected, proxies }) {
-  // Derive `consistent` the same way the server does.
-  const consistent = expected.length > 0 && proxies.every((p) =>
-    p.reachable && (p.missing ?? []).length === 0);
-  write(`/api/v1/routing/routes/${kind}/${ns}/${name}/check`,
-    { kind, namespace: ns, name, consistent, expected, proxies });
-}
-function emitCheck() {
-  const [ah, bk] = [PROXIES[0].name, PROXIES[1].name];   // shared pool
-  const taPods = PROXIES.filter((p) => p.gw === 'tenant-a-gw').map((p) => p.name);
-  const tbPods = PROXIES.filter((p) => p.gw === 'tenant-b-gw');
-
-  // healthy + consistent across the shared pool
-  check('httproute', 'demo', 'docs-route', {
-    expected: [rkey('docs.demo.local', '/', 'demo/web')],
-    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
-      rows: [rrow('docs.demo.local', '/', 'demo/web', EP2)] })),
-  });
-  // consistent presence, but dead backend on both (rows flagged dead)
-  check('httproute', 'demo', 'api-route', {
-    expected: [rkey('api.demo.local', '/', 'demo/api')],
-    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
-      rows: [rrow('api.demo.local', '/', 'demo/api', [])] })),
-  });
-  // DRIFT — controller says ok, but the /admin rule is missing on bk9p4
-  check('httproute', 'demo', 'multi-gw-route', {
-    expected: [rkey('app.demo.local', '/', 'demo/web'), rkey('app.demo.local', '/admin', 'demo/admin')],
-    proxies: [
-      { pod_name: ah, reachable: true, missing: [],
-        rows: [rrow('app.demo.local', '/', 'demo/web', EP2), rrow('app.demo.local', '/admin', 'demo/admin', EP1)] },
-      { pod_name: bk, reachable: true, missing: [rkey('app.demo.local', '/admin', 'demo/admin')],
-        rows: [rrow('app.demo.local', '/', 'demo/web', EP2)] },
-    ],
-  });
-  check('httproute', 'demo', 'web-route', {
-    expected: [rkey('app.demo.local', '/', 'demo/web')],
-    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
-      rows: [rrow('app.demo.local', '/', 'demo/web', EP2)] })),
-  });
-  check('httproute', 'demo', 'health-probe-route', {
-    expected: [rkey('app.demo.local', '/health', 'demo/api')],
-    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
-      rows: [rrow('app.demo.local', '/health', 'demo/api', [])] })),
-  });
-  // unresolved refs — absent from every serving proxy (consistent=false, empty)
-  check('httproute', 'demo', 'payments-route', {
-    expected: [],
-    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [], rows: [] })),
-  });
-  // dedicated, healthy + consistent
-  check('httproute', 'tenant-a', 'a-web-route', {
-    expected: [rkey('app.tenant-a.local', '/', 'tenant-a/web')],
-    proxies: taPods.map((pod) => ({ pod_name: pod, reachable: true, missing: [],
-      rows: [rrow('app.tenant-a.local', '/', 'tenant-a/web', EP2)] })),
-  });
-  // dedicated, dead backend + one proxy unreachable (consistent=false)
-  check('httproute', 'tenant-b', 'b-api-route', {
-    expected: [rkey('app.tenant-b.local', '/', 'tenant-b/api')],
-    proxies: tbPods.map((p) => (p.reachable === false
-      ? { pod_name: p.name, reachable: false }
-      : { pod_name: p.name, reachable: true, missing: [],
-          rows: [rrow('app.tenant-b.local', '/', 'tenant-b/api', [])] })),
-  });
-  // Ingress — shared pool, consistent (with one dead path)
-  check('ingress', 'demo', 'demo-ingress', {
-    expected: [rkey('demo.local', '/', 'demo/web'), rkey('demo.local', '/api', 'demo/api')],
-    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
-      rows: [rrow('demo.local', '/', 'demo/web', EP2), rrow('demo.local', '/api', 'demo/api', [])] })),
-  });
-  check('ingress', 'demo', 'frontend-ingress', {
-    expected: [rkey('demo.local', '/', 'demo/frontend')],
-    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
-      rows: [rrow('demo.local', '/', 'demo/frontend', EP1)] })),
-  });
-  check('ingress', 'staging', 'staging-ingress', {
-    expected: [rkey('staging.local', '/', 'staging/app'), rkey('staging.local', '/api', 'staging/app')],
-    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
-      rows: [rrow('staging.local', '/', 'staging/app', []), rrow('staging.local', '/api', 'staging/app', [])] })),
-  });
-  check('ingress', 'tenant-b', 'tenant-b-ingress', {
-    expected: [rkey('app.tenant-b.local', '/', 'tenant-b/web')],
-    proxies: [ah, bk].map((pod) => ({ pod_name: pod, reachable: true, missing: [],
-      rows: [rrow('app.tenant-b.local', '/', 'tenant-b/web', EP2)] })),
-  });
-}
 
 // ── Ingresses ─────────────────────────────────────────────────────────────────
 // healthy rules · all-dead rules · tenant-namespaced
@@ -740,7 +650,6 @@ emitGateways();
 emitHttproutesList();
 emitHttproutes();
 emitIngresses();
-emitCheck();
 emitSummaries();
 emitProblems();
 emitHealth();

@@ -6,7 +6,6 @@ import { Breadcrumb } from '../components/Breadcrumb.jsx';
 import { DetailHeader } from '../components/DetailHeader.jsx';
 import { StatusBadge } from '../components/StatusBadge.jsx';
 import { Badge } from '../components/Badge.jsx';
-import { CheckDialog } from '../components/CheckDialog.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
 import { ManifestDialog } from '../components/ManifestDialog.jsx';
 import { Icon } from '../components/Icon.jsx';
@@ -24,8 +23,8 @@ import { useEffect, useState } from 'preact/hooks';
  *
  * Ingress is a flat resource — no parent Gateways, no per-parent conditions —
  * so the page is deliberately leaner than HTTPRoute: header (address + class),
- * inline TLS blocks, the effective config (host/path → backend, overlaid with
- * runtime problems), and the on-demand data-plane check.
+ * inline TLS blocks, and the effective config (host/path → backend, overlaid
+ * with runtime problems).
  *
  * Deep-linkable via `#/routes/ingress/{ns}/{name}`. Refreshes on
  * `rebuild.completed` SSE.
@@ -38,7 +37,6 @@ export function IngressDetail({ namespace, name }) {
   const problems = useApi(getProblems);
   const sse = useSSE('/api/v1/events');
   const [showManifest, setShowManifest] = useState(false);
-  const [showCheck, setShowCheck] = useState(false);
 
   useEffect(() => {
     return sse.subscribe('rebuild.completed', () => {
@@ -95,14 +93,9 @@ export function IngressDetail({ namespace, name }) {
         )}
         badges={<StatusBadge status={status} />}
         actions={(
-          <>
-            <button class="btn btn-icon" onClick={() => setShowCheck(true)}>
-              <Icon name="refresh" size={15} /> Check
-            </button>
-            <button class="btn btn-icon" onClick={() => setShowManifest(true)}>
-              <Icon name="code" size={15} /> Manifest
-            </button>
-          </>
+          <button class="btn btn-icon" onClick={() => setShowManifest(true)}>
+            <Icon name="code" size={15} /> Manifest
+          </button>
         )}
       />
 
@@ -112,16 +105,6 @@ export function IngressDetail({ namespace, name }) {
           namespace={namespace}
           name={name}
           onClose={() => setShowManifest(false)}
-        />
-      )}
-
-      {showCheck && (
-        <CheckDialog
-          kind="ingress"
-          kindLabel="Ingress"
-          namespace={namespace}
-          name={name}
-          onClose={() => setShowCheck(false)}
         />
       )}
 

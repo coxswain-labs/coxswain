@@ -9,10 +9,12 @@
 //! - cross-cutting: `/api/v1/{health,problems,events,manifests/*,pods/*/logs}`.
 //!
 //! The routing list endpoints and `fleet/proxies/{name}/routes` accept the
-//! shared filter/pagination envelope (see [`page`]). Role-local: the proxy's own
-//! compiled table at `/api/v1/routes` (relayed by the controller through
-//! `fleet/proxies/{name}/routes`), alongside `/metrics` and the embedded operator
-//! UI at `GET /` — the two convention-bound endpoints that stay outside
+//! shared filter/pagination envelope (see [`page`]). Proxy pods are dumb data
+//! planes (#537): they carry no query surface of their own beyond
+//! `/api/v1/health` and `/metrics`. `fleet/proxies/{name}/routes` is served
+//! from the controller's own routing snapshot, filtered to the target proxy's
+//! scope — never a fan-out to the pod. `/metrics` and the embedded operator UI
+//! at `GET /` are the two convention-bound endpoints that stay outside
 //! `/api/v1/` (Prometheus scrape path and the web root).
 //!
 //! The full surface (paths + response schemas) is described in
@@ -32,7 +34,6 @@ pub use events::EventSources;
 use aggregator::json_response;
 use async_trait::async_trait;
 use coxswain_core::health::{HealthRegistry, SubsystemSnapshot};
-use coxswain_core::routing::{RoutingTable, SharedGatewayRoutingTable, SharedIngressRoutingTable};
 use http::{HeaderValue, Response, StatusCode, header};
 use page::ListParams;
 use pingora_core::apps::{HttpPersistentSettings, HttpServerApp, ReusedHttpStream};
@@ -43,9 +44,8 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::services::listening::Service;
 use pingora_http::ResponseHeader;
 use prometheus::{Encoder, TextEncoder};
-use routes_dto::{ConflictRow, HostGroup, RouteBlock, RouteRow, RoutesResponse};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,7 +71,6 @@ const UI_HTML: &str = include_str!(concat!(
 /// | `GET /` (operator UI) | | ✓ |
 /// | `/metrics` | ✓ | |
 /// | `/api/v1/health` | ✓ | |
-/// | `/api/v1/routes` | proxy + dev only | |
 /// | `/api/v1/fleet/{summary,controllers,proxies}` (+ sub-resources) | | ✓ |
 /// | `/api/v1/routing/{summary,gateways,httproutes,ingresses}` | | ✓ |
 /// | `/api/v1/routing/routes/{kind}/{ns}/{name}` | | ✓ |
@@ -101,9 +100,6 @@ pub struct AdminServer {
     pub health: HealthRegistry,
     /// Flipped to `true` while this replica holds the leader-election lease.
     pub leader: Arc<AtomicBool>,
-    /// Routing tables for the `/api/v1/routes` endpoint. `None` on the controller
-    /// role (its `/api/v1/routes` returns 404); `Some` on proxy and dev roles.
-    pub routes: Option<(SharedIngressRoutingTable, SharedGatewayRoutingTable)>,
     /// Optional aggregator for the controller's `/api/v1/*` fan-out endpoints.
     /// `None` on proxy roles (those endpoints return 404).
     pub aggregator: Option<OperatorAggregator>,
@@ -125,8 +121,8 @@ pub struct AdminServer {
 impl AdminServer {
     /// Construct an `AdminServer` with the minimum required collaborators.
     ///
-    /// Call `.with_routes()` and/or `.with_aggregator()` to enable optional
-    /// capabilities.
+    /// Call `.with_aggregator()` and/or the other `with_*` methods to enable
+    /// optional capabilities.
     #[must_use]
     pub fn new(health: HealthRegistry, leader: Arc<AtomicBool>) -> Self {
         let mut modules = HttpModules::new();
@@ -134,7 +130,6 @@ impl AdminServer {
         Self {
             health,
             leader,
-            routes: None,
             aggregator: None,
             events: None,
             serve_ui: false,
@@ -153,21 +148,6 @@ impl AdminServer {
             gateway_api,
             ingress,
         };
-        self
-    }
-
-    /// Enable `GET /api/v1/routes` by supplying the proxy's local routing tables.
-    ///
-    /// Called only from proxy and dev pod roles. The controller omits this so
-    /// its `/api/v1/routes` returns 404 — the controller's routing view is the
-    /// aggregate `/api/v1/routing/*` surface instead.
-    #[must_use]
-    pub fn with_routes(
-        mut self,
-        ingress: SharedIngressRoutingTable,
-        gateway: SharedGatewayRoutingTable,
-    ) -> Self {
-        self.routes = Some((ingress, gateway));
         self
     }
 
@@ -316,16 +296,14 @@ impl AdminServer {
     /// endpoints exist per pod role; unwired capabilities resolve to 404.
     async fn build_response(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
         let path = session.req_header().uri.path();
-        // Shared filter/pagination params for the list endpoints (and the
-        // proxy-local `/api/v1/routes`). Cheap to parse unconditionally.
+        // Shared filter/pagination params for the list endpoints. Cheap to
+        // parse unconditionally.
         let params = ListParams::parse(session.req_header().uri.query());
 
         // Fast path: exact matches.
         match path {
             "/" => return self.ui_response(),
             "/metrics" => return metrics_response(),
-            "/api/v1/routes" => return self.routes_response(&params),
-            "/api/v1/facets" => return self.facets_response(),
             "/api/v1/health" => {
                 // The apiserver version is fetched + cached by the aggregator
                 // (controller/dev roles only); proxy roles wire none, so the
@@ -376,9 +354,6 @@ impl AdminServer {
             ["routing", "routes", kind, namespace, name] => {
                 agg.get_route(kind, namespace, name).await
             }
-            ["routing", "routes", kind, namespace, name, "check"] => {
-                agg.check_route(kind, namespace, name).await
-            }
 
             // ── cross-cutting ─────────────────────────────────────────────────
             ["manifests", kind, namespace, name] => agg.get_manifest(kind, namespace, name).await,
@@ -426,180 +401,6 @@ fn metrics_response() -> Response<Vec<u8>> {
     *r.status_mut() = StatusCode::OK;
     r.headers_mut().insert(header::CONTENT_TYPE, content_type);
     r
-}
-
-// ── /api/v1/routes ──────────────────────────────────────────────────────────
-
-impl AdminServer {
-    /// Build the `/api/v1/routes` response from the local routing tables.
-    ///
-    /// Returns 404 when no routing tables are wired (controller pod role). When
-    /// `params` carry a `host`/`path` filter or `limit`/`offset`, each spec block
-    /// is filtered + windowed and gains `total`/`returned`/`offset` counts; with
-    /// no params the legacy `{hosts, conflicts}` shape is reproduced (#286). The
-    /// controller relays this whole body through `fleet/proxies/{name}/routes`.
-    fn routes_response(&self, params: &ListParams) -> Response<Vec<u8>> {
-        let Some((ingress, gateway)) = self.routes.as_ref() else {
-            let mut r = Response::new(Vec::new());
-            *r.status_mut() = StatusCode::NOT_FOUND;
-            return r;
-        };
-        let body = serde_json::json!(RoutesResponse {
-            ingress: routes_block(ingress.load().as_ref(), params),
-            gateway: routes_block(gateway.load().as_ref(), params),
-        })
-        .to_string();
-        json_response(body)
-    }
-
-    /// Build the `/api/v1/facets` response: the distinct hosts and route
-    /// namespaces this proxy serves, so the operator UI can populate the route
-    /// table's host/namespace filter dropdowns without fetching the whole table.
-    /// Both lists are far smaller than the route set (many routes per host, and a
-    /// bounded namespace count), so shipping them whole is cheap. Returns 404 when
-    /// no routing tables are wired (controller role); the controller relays this
-    /// through `fleet/proxies/{name}/facets`.
-    fn facets_response(&self) -> Response<Vec<u8>> {
-        let Some((ingress, gateway)) = self.routes.as_ref() else {
-            let mut r = Response::new(Vec::new());
-            *r.status_mut() = StatusCode::NOT_FOUND;
-            return r;
-        };
-        let mut hosts: BTreeSet<String> = BTreeSet::new();
-        let mut namespaces: BTreeSet<String> = BTreeSet::new();
-        collect_facets(ingress.load().as_ref(), &mut hosts, &mut namespaces);
-        collect_facets(gateway.load().as_ref(), &mut hosts, &mut namespaces);
-        let body = serde_json::json!({
-            "hosts": hosts.into_iter().collect::<Vec<_>>(),
-            "namespaces": namespaces.into_iter().collect::<Vec<_>>(),
-        })
-        .to_string();
-        json_response(body)
-    }
-}
-
-/// Collect the distinct hosts and route namespaces from one typed table into the
-/// shared sorted sets (`BTreeSet` keeps them de-duplicated and ordered for a
-/// stable dropdown). Skips placeholder routes with no backend, matching the rows
-/// the route table actually shows.
-fn collect_facets<K>(
-    table: &RoutingTable<K>,
-    hosts: &mut BTreeSet<String>,
-    namespaces: &mut BTreeSet<String>,
-) {
-    for (_port, host, router) in table.host_routes() {
-        hosts.insert(host.clone());
-        for r in router
-            .routes()
-            .iter()
-            .filter(|r| !r.backend_group.name().is_empty())
-        {
-            if let Some((ns, _)) = r.route_id.split_once('/').filter(|(ns, _)| !ns.is_empty()) {
-                namespaces.insert(ns.to_string());
-            }
-        }
-    }
-}
-
-/// Build the per-spec block of the `/api/v1/routes` payload from a typed table.
-///
-/// Generic over `Kind` so the same body serialises both the Ingress and the
-/// Gateway-API tables; the type parameter prevents the caller from passing the
-/// wrong table to the wrong block label.
-///
-/// `params` filter the flattened route rows by `host` (exact), `path` (substring),
-/// `namespace` (exact, the route's namespace) and `status=problem` (keep only
-/// dead-backend rows — zero ready endpoints), then window them by `limit`/`offset`.
-/// The same host/path/namespace predicates also narrow the conflict list (a
-/// conflict belongs to a host/path and a rejected route's namespace), so a scoped
-/// view shows only the conflicts in scope; `problems_only` leaves conflicts whole
-/// (a conflict is itself a problem). When [`ListParams::is_empty`] the output is
-/// structurally the legacy full dump; when any param is set the block also carries
-/// `total`/`returned`/`offset` over the post-filter rows.
-fn routes_block<K>(table: &RoutingTable<K>, params: &ListParams) -> RouteBlock {
-    // Flatten to (port, host, RouteRow) so the offset/limit window applies across
-    // the whole table, not per host-group. The exact `host` filter skips a whole
-    // host-group; `path`/`namespace` filter per row.
-    let mut matched: Vec<(u16, String, RouteRow)> = Vec::new();
-    for (port, host, router) in table.host_routes() {
-        if !params.host_matches(&host) {
-            continue;
-        }
-        for r in router
-            .routes()
-            .iter()
-            .filter(|r| !r.backend_group.name().is_empty())
-        {
-            if !params.path_matches(&r.path) {
-                continue;
-            }
-            // `RouteRow::from_info` splits `route_id` into `namespace`/`name` so the
-            // UI can deep-link a compiled row back to its source resource.
-            let row = RouteRow::from_info(r);
-            if !params.namespace_matches(&row.namespace) {
-                continue;
-            }
-            // `status=problem`: a compiled route "with a problem" is one serving
-            // zero ready endpoints (a dead backend) — the only per-row health the
-            // compiled table can see.
-            if params.problems_only && !row.endpoints.is_empty() {
-                continue;
-            }
-            matched.push((port, host.clone(), row));
-        }
-    }
-
-    let total = matched.len();
-    let offset = params.offset.min(total);
-    let limit = params.effective_limit();
-    let windowed: Vec<(u16, String, RouteRow)> = if params.is_empty() {
-        matched
-    } else {
-        matched.into_iter().skip(offset).take(limit).collect()
-    };
-    let returned = windowed.len();
-
-    // Regroup the (possibly windowed) rows back into `(port, host)` host-groups.
-    let mut hosts: Vec<HostGroup> = Vec::new();
-    for (port, host, route) in windowed {
-        match hosts.last_mut() {
-            Some(last) if last.port == port && last.host == host => last.routes.push(route),
-            _ => hosts.push(HostGroup {
-                port,
-                host,
-                routes: vec![route],
-            }),
-        }
-    }
-
-    let conflicts: Vec<ConflictRow> = table
-        .conflicts()
-        .iter()
-        .map(ConflictRow::from_conflict)
-        // Narrow conflicts by the same host/path/namespace scope as the rows
-        // (problems_only is intentionally ignored — a conflict is a problem).
-        .filter(|c| {
-            params.host_matches(&c.host)
-                && params.path_matches(&c.path)
-                && params.namespace_matches(&c.namespace)
-        })
-        .collect();
-
-    if params.is_empty() {
-        RouteBlock {
-            hosts,
-            conflicts,
-            ..RouteBlock::default()
-        }
-    } else {
-        RouteBlock {
-            hosts,
-            conflicts,
-            total: Some(total),
-            returned: Some(returned),
-            offset: Some(offset),
-        }
-    }
 }
 
 // ── GET / (operator UI) ───────────────────────────────────────────────────────
@@ -734,21 +535,6 @@ mod tests {
             "field must be omitted when the apiserver version is unavailable"
         );
         assert_eq!(v["leader"], serde_json::Value::Bool(false));
-    }
-
-    #[test]
-    fn admin_server_without_routes_returns_404_on_routes_path() {
-        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false));
-        assert!(admin.routes.is_none());
-    }
-
-    #[test]
-    fn admin_server_with_routes_enables_routes_endpoint() {
-        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false)).with_routes(
-            SharedIngressRoutingTable::new(),
-            SharedGatewayRoutingTable::new(),
-        );
-        assert!(admin.routes.is_some());
     }
 
     #[test]

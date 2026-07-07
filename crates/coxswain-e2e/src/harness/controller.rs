@@ -71,14 +71,17 @@ pub struct ControllerProcess {
     pub tls_addr: SocketAddr,
     /// Local port-forwarded address for `/healthz` / `/readyz`.
     pub health_addr: SocketAddr,
-    /// Local port-forwarded address for `/metrics` / `/api/v1/routes` /
-    /// `/api/v1/health` on the shared-proxy pod.
+    /// Local port-forwarded address for `/metrics` / `/api/v1/health` on the
+    /// shared-proxy pod. The proxy carries no other admin query surface
+    /// (#537) — routing views live on the controller.
     pub admin_addr: SocketAddr,
     /// Local port-forwarded address for the controller pod's admin endpoint.
     /// Serves `/api/v1/health` and the aggregator surface
     /// `/api/v1/{fleet,routing}/*` plus `/api/v1/{problems,manifests/*}`.
-    /// `/api/v1/routes` returns 404 on the controller — use the proxy
-    /// admin (`admin_addr`) for the raw per-pod routing table.
+    /// Use `fleet/proxies/{pod}/routes` (see
+    /// [`super::Harness::shared_proxy_routes_url`]) for a proxy's compiled
+    /// routing table — served from the controller's own local snapshot, not
+    /// a fan-out to the pod.
     pub controller_admin_addr: SocketAddr,
     health_pf: Child,
     admin_pf: Child,

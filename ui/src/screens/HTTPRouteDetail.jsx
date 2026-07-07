@@ -7,7 +7,6 @@ import { DetailHeader } from '../components/DetailHeader.jsx';
 import { StatusBadge } from '../components/StatusBadge.jsx';
 import { ConditionRow } from '../components/ConditionRow.jsx';
 import { Badge } from '../components/Badge.jsx';
-import { CheckDialog } from '../components/CheckDialog.jsx';
 import { Spinner, ErrorState, EmptyState } from '../components/Spinner.jsx';
 import { ManifestDialog } from '../components/ManifestDialog.jsx';
 import { Icon } from '../components/Icon.jsx';
@@ -23,11 +22,11 @@ import { useEffect, useState } from 'preact/hooks';
 /**
  * HTTPRoute detail (Gateway API).
  *
- * Three on-language sections: the per-parentRef conditions (the route's
+ * Two on-language sections: the per-parentRef conditions (the route's
  * acceptance/resolution verdict — the richest Gateway-API troubleshooting
- * surface), the effective config (declared rules: match predicates, weighted
- * backends, filters — overlaid with runtime problems from `/problems`), and the
- * on-demand data-plane check. No eager proxy fan-out.
+ * surface), and the effective config (declared rules: match predicates,
+ * weighted backends, filters — overlaid with runtime problems from
+ * `/problems`).
  *
  * Deep-linkable via `#/routes/httproute/{ns}/{name}`. Refreshes on
  * `rebuild.completed` SSE so a route can be watched converging after an apply.
@@ -40,7 +39,6 @@ export function HTTPRouteDetail({ namespace, name }) {
   const problems = useApi(getProblems);
   const sse = useSSE('/api/v1/events');
   const [showManifest, setShowManifest] = useState(false);
-  const [showCheck, setShowCheck] = useState(false);
 
   useEffect(() => {
     return sse.subscribe('rebuild.completed', () => {
@@ -101,14 +99,9 @@ export function HTTPRouteDetail({ namespace, name }) {
         )}
         badges={<StatusBadge status={status} />}
         actions={(
-          <>
-            <button class="btn btn-icon" onClick={() => setShowCheck(true)}>
-              <Icon name="refresh" size={15} /> Check
-            </button>
-            <button class="btn btn-icon" onClick={() => setShowManifest(true)}>
-              <Icon name="code" size={15} /> Manifest
-            </button>
-          </>
+          <button class="btn btn-icon" onClick={() => setShowManifest(true)}>
+            <Icon name="code" size={15} /> Manifest
+          </button>
         )}
       />
 
@@ -118,16 +111,6 @@ export function HTTPRouteDetail({ namespace, name }) {
           namespace={namespace}
           name={name}
           onClose={() => setShowManifest(false)}
-        />
-      )}
-
-      {showCheck && (
-        <CheckDialog
-          kind="httproute"
-          kindLabel="HTTPRoute"
-          namespace={namespace}
-          name={name}
-          onClose={() => setShowCheck(false)}
         />
       )}
 

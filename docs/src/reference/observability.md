@@ -148,11 +148,18 @@ Example output:
 
 ## Routes endpoint
 
+Proxy pods carry no query surface beyond `/metrics` and `/api/v1/health` — a
+proxy's compiled routing table is served from the **controller's** own local
+routing snapshot, not fetched from the pod:
+
 ```bash
-curl -s http://localhost:8082/api/v1/routes | jq .
+curl -s http://<controller-admin-address>:8082/api/v1/fleet/proxies/<pod-name>/routes | jq .
 ```
 
-Returns the active routing table as JSON — all hostname entries, their rules, and resolved upstream addresses. Useful for debugging routing decisions without reading raw Kubernetes objects.
+Returns the named pod's routing table as JSON, nested under `routes`: all
+hostname entries, their rules, and resolved upstream addresses. Useful for
+debugging routing decisions without reading raw Kubernetes objects. List pod
+names with `curl -s http://<controller-admin-address>:8082/api/v1/fleet/proxies | jq .`.
 
 ## Access logs
 

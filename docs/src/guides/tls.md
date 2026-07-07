@@ -441,10 +441,11 @@ kubectl get secret example-com-tls -o jsonpath='{.type}'
 kubectl get secret example-com-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text -noout
 ```
 
-Check the routing table and logs:
+Check the routing table (from the controller's admin port — see
+[Observability reference](../reference/observability.md#routes-endpoint)) and logs:
 
 ```bash
-curl http://localhost:8082/api/v1/routes
+curl http://<controller-admin-address>:8082/api/v1/fleet/proxies/<pod-name>/routes
 curl http://localhost:8082/api/v1/health
 ```
 

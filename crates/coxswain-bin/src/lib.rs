@@ -15,7 +15,7 @@ use coxswain_core::health::{HealthRegistry, SubsystemHandle};
 use coxswain_core::identity::{SpiffeId, SvidIssuer};
 use coxswain_core::listener_status::ProxyProtocolListenerConfig;
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::routing::{RouteTimeouts, SharedGatewayRoutingTable, SharedIngressRoutingTable};
+use coxswain_core::routing::RouteTimeouts;
 use coxswain_core::shared::Shared;
 use coxswain_discovery::{
     BootstrapClient, BootstrapClientConfig, BootstrapRunner, BootstrapService,
@@ -260,10 +260,17 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         }),
     ));
 
+    // The aggregator's per-proxy routes/facets/problems views read these same
+    // cells directly (#537) rather than fanning out to the proxy over HTTP —
+    // it's the controller's own intent, the exact thing it pushes to proxies
+    // over the discovery stream.
     let aggregator = OperatorAggregator::new(
         fleet,
         status_writer.outputs.cluster_summary,
         Some(node_registry_for_agg),
+        status_writer.outputs.ingress_routes.clone(),
+        status_writer.outputs.gateway_routes.clone(),
+        status_writer.outputs.dedicated_registry.clone(),
     );
 
     let health_addr = SocketAddr::new(args.common.management_bind_address, args.common.health_port);
@@ -279,8 +286,9 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     });
 
     let admin_addr = SocketAddr::new(args.common.management_bind_address, args.common.admin_port);
-    // The controller does NOT wire .with_routes() — its /api/v1/routes returns
-    // 404. The aggregate routing surface is /api/v1/routing/* via the aggregator.
+    // The controller has no local routing tables of its own to wire — its
+    // routing surface is the aggregate `/api/v1/{fleet,routing}/*` above, and
+    // the proxy admin query surface (`/api/v1/routes`) was retired in #537.
     server.add_service(
         AdminServer::new(health, status_writer.leader)
             .with_aggregator(aggregator)
@@ -356,12 +364,7 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
     wire_management_servers(
         &mut server,
         &args.common,
-        ManagementServerConfig {
-            health,
-            leader,
-            ingress_routes: client.ingress_routes(),
-            gateway_routes: client.gateway_routes(),
-        },
+        ManagementServerConfig { health, leader },
     );
 
     tracing::info!(
@@ -434,12 +437,7 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
     wire_management_servers(
         &mut server,
         &args.common,
-        ManagementServerConfig {
-            health,
-            leader,
-            ingress_routes: client.ingress_routes(),
-            gateway_routes: client.gateway_routes(),
-        },
+        ManagementServerConfig { health, leader },
     );
 
     tracing::info!(
@@ -1304,14 +1302,9 @@ fn build_ingress_listeners(common: &CommonArgs, proxy: &ProxyArgs) -> Vec<Listen
 }
 
 /// Configuration bundle for [`wire_management_servers`].
-///
-/// Grouped to keep the function signature under the workspace
-/// `>7-arg` threshold.
 struct ManagementServerConfig {
     health: HealthRegistry,
     leader: Arc<AtomicBool>,
-    ingress_routes: SharedIngressRoutingTable,
-    gateway_routes: SharedGatewayRoutingTable,
 }
 
 fn wire_management_servers(
@@ -1332,8 +1325,10 @@ fn wire_management_servers(
     });
 
     let admin_addr = SocketAddr::new(common.management_bind_address, common.admin_port);
+    // Proxy roles carry no admin query surface beyond /metrics and
+    // /api/v1/health (#537) — the routing view lives on the controller,
+    // served from its own local snapshot at `fleet/proxies/{name}/routes`.
     let admin = AdminServer::new(config.health, config.leader)
-        .with_routes(config.ingress_routes, config.gateway_routes)
         .with_api_surfaces(!common.disable_gateway_api, !common.disable_ingress);
     server.add_service(admin.into_service(admin_addr));
 }

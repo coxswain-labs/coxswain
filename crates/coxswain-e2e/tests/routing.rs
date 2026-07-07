@@ -1162,16 +1162,16 @@ async fn parent_ref_port_match_binds_only_pinned_listener() -> anyhow::Result<()
         "route-wrong-port must not be routable on HTTP_PORT (no attached route → 404)"
     );
 
-    // Verify routing-table isolation via admin /api/v1/routes.
-    // Once pinned.* and both.* are live the table is fully settled.
+    // Verify routing-table isolation via the controller's per-proxy routes
+    // view (#537). Once pinned.* and both.* are live the table is fully settled.
     //
-    // Since the IngressProxy/GatewayProxy split (#201), `/api/v1/routes` reports
+    // Since the IngressProxy/GatewayProxy split (#201), the response reports
     // the two tables under separate keys; this test only inspects Gateway-API routes.
-    let routes: serde_json::Value = reqwest::get(h.admin_url("/api/v1/routes"))
+    let routes: serde_json::Value = reqwest::get(h.shared_proxy_routes_url().await?)
         .await?
         .json()
         .await?;
-    let hosts = routes["gateway"]["hosts"]
+    let hosts = routes["routes"]["gateway"]["hosts"]
         .as_array()
         .expect("gateway.hosts array");
 
