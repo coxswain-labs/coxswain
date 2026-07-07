@@ -48,7 +48,21 @@ pub(super) async fn patch_gateway_status(
             "Gateway frontend CA ref unresolvable — proxy fail-closing mTLS handshakes"
         );
     }
-    let patch = build_gateway_status_patch(gw, health, generation, &now, decision, ingress_ports);
+    let mut patch =
+        build_gateway_status_patch(gw, health, generation, &now, decision, ingress_ports);
+    // Optimistic concurrency (#531): the decision above was computed from a
+    // possibly-lagging store object — the work queue can deliver a reconcile
+    // holding a pre-latch Gateway AFTER a newer reconcile already published
+    // `Programmed=True` + addresses, and an unconditional merge patch from
+    // that stale view clobbers the fresh status (observed as `True` with
+    // empty `status.addresses` in the conformance GatewayStaticAddresses
+    // read window). Pinning the observed `resourceVersion` makes the
+    // apiserver reject the stale write with 409 Conflict instead; the very
+    // conflict proves a newer object event is on its way, which re-drives
+    // this reconcile with fresh state.
+    if let Some(rv) = gw.metadata.resource_version.as_deref() {
+        patch["metadata"] = serde_json::json!({ "resourceVersion": rv });
+    }
     let started = std::time::Instant::now();
     let result = api
         .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
@@ -56,6 +70,14 @@ pub(super) async fn patch_gateway_status(
     crate::metrics::observe_status_patch("gateway", started, &result);
     match result {
         Ok(_) => tracing::info!(name, ns, "Gateway status patched"),
+        Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
+            tracing::debug!(
+                name,
+                ns,
+                "Gateway status patch skipped: object changed since this reconcile \
+                 observed it (stale view); the newer object's event re-drives"
+            );
+        }
         Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Gateway status"),
     }
 }
