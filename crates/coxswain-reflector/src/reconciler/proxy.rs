@@ -2025,15 +2025,33 @@ fn rebuild(
     // above has been stored — the sequence bump is the publication fence the
     // discovery server's pre-build capture relies on. Covers both worlds:
     // shared-pool Gateways (config in the shared cells) and cut-over Gateways
-    // (config in the dedicated registry), each at its current generation.
-    // Then re-tick the rebuild watch so subscription loops that woke on the
-    // mid-rebuild `store_and_notify` re-capture a post-stamp sequence —
-    // without it a quiet cluster strands the gate until the next content
-    // change.
+    // (config in the dedicated registry), each at its current generation plus
+    // a fingerprint of its own published listener-status entry: a
+    // same-generation content change (a frontendValidation CA resolving one
+    // rebuild after the spec was first processed, a cert ref flipping, a
+    // route attaching) re-arms the stamp so proxies must apply THAT content
+    // before Programmed flips. Then re-tick the rebuild watch so
+    // subscription loops that woke on the mid-rebuild `store_and_notify`
+    // re-capture a post-stamp sequence — without it a quiet cluster strands
+    // the gate until the next content change.
+    let published_listener_status = outputs.listener_status.load();
     let stamped = stamp_gateways.iter().filter_map(|g| {
         let key = ObjectKey::from_meta(&g.metadata)?;
-        (owned_gateways.contains(&key) || dedicated_keys.contains(&key))
-            .then(|| (key, g.metadata.generation.unwrap_or(0)))
+        (owned_gateways.contains(&key) || dedicated_keys.contains(&key)).then(|| {
+            let fingerprint = {
+                use std::hash::{Hash as _, Hasher as _};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                // Debug-format hashing: the entry's types carry no Hash impl,
+                // but their derived Debug output is a pure function of the
+                // state (readiness enums, resolution outcomes, counts —
+                // no timestamps), which is exactly what the stamp needs.
+                if let Some(entry) = published_listener_status.get(&key) {
+                    format!("{entry:?}").hash(&mut h);
+                }
+                h.finish()
+            };
+            (key, g.metadata.generation.unwrap_or(0), fingerprint)
+        })
     });
     outputs.publish_index.stamp_rebuild(stamped);
     outputs.route_status.notify_rebuilt();
