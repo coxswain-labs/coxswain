@@ -1,6 +1,6 @@
 //! Kubernetes API calls that write `HTTPRoute` status patches.
 
-use super::conditions::{make_condition, route_parent_gets_status};
+use super::conditions::{CoxswainConditionType, make_condition, route_parent_gets_status};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::constants::RouteConditionType;
 use coxswain_reflector::gw_types::{
@@ -90,14 +90,10 @@ pub(super) async fn mark_http_route_programmed(
                 observed_gen,
                 now.clone(),
             );
-            // "Programmed" is not a Gateway API `RouteConditionType` (the spec
-            // only defines Accepted/ResolvedRefs/PartiallyInvalid for routes —
-            // Programmed is Gateway/Listener-only); it's a coxswain-specific
-            // addition, so it stays a plain literal rather than a forced,
-            // nonexistent enum variant. Condition semantics are out of scope
-            // for #510 — see that issue's "Out of scope" section.
+            // See `CoxswainConditionType` for why this isn't a
+            // `RouteConditionType` variant.
             let programmed_cond = make_condition(
-                "Programmed",
+                CoxswainConditionType::Programmed,
                 prog_status,
                 prog_reason,
                 "",
@@ -242,7 +238,7 @@ mod tests {
         let desired = vec![parent(
             "coxswain",
             vec![make_condition(
-                "Programmed",
+                CoxswainConditionType::Programmed,
                 "True",
                 "Programmed",
                 "",
@@ -253,7 +249,7 @@ mod tests {
         let existing = vec![parent(
             "coxswain",
             vec![make_condition(
-                "Programmed",
+                CoxswainConditionType::Programmed,
                 "True",
                 "Programmed",
                 "",
@@ -271,7 +267,7 @@ mod tests {
         let desired = vec![parent(
             "coxswain",
             vec![make_condition(
-                "Programmed",
+                CoxswainConditionType::Programmed,
                 "False",
                 "Pending",
                 "",
@@ -282,7 +278,7 @@ mod tests {
         let existing = vec![parent(
             "coxswain",
             vec![make_condition(
-                "Programmed",
+                CoxswainConditionType::Programmed,
                 "True",
                 "Programmed",
                 "",
@@ -298,7 +294,7 @@ mod tests {
         let desired = vec![parent(
             "coxswain",
             vec![make_condition(
-                "Programmed",
+                CoxswainConditionType::Programmed,
                 "True",
                 "Programmed",
                 "",
@@ -309,7 +305,7 @@ mod tests {
         let existing = vec![parent(
             "coxswain",
             vec![make_condition(
-                "Programmed",
+                CoxswainConditionType::Programmed,
                 "True",
                 "Programmed",
                 "",
@@ -325,7 +321,7 @@ mod tests {
         let desired = vec![parent(
             "coxswain",
             vec![make_condition(
-                "Programmed",
+                CoxswainConditionType::Programmed,
                 "True",
                 "Programmed",
                 "",

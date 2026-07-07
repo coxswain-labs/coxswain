@@ -3,7 +3,7 @@
 //! Sibling of `route_events.rs` — forked for the `GRPCRoute` concrete type per the
 //! no-generic-reconciler constraint in issue #33.
 
-use super::conditions::{make_condition, route_parent_gets_status};
+use super::conditions::{CoxswainConditionType, make_condition, route_parent_gets_status};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::constants::RouteConditionType;
 use coxswain_reflector::gw_types::{
@@ -93,10 +93,10 @@ pub(super) async fn mark_grpc_route_programmed(
                 observed_gen,
                 now.clone(),
             );
-            // "Programmed" is not a Gateway API `RouteConditionType` — see the
-            // identical note in `route_events.rs`.
+            // See `CoxswainConditionType` for why this isn't a
+            // `RouteConditionType` variant.
             let programmed_cond = make_condition(
-                "Programmed",
+                CoxswainConditionType::Programmed,
                 prog_status,
                 prog_reason,
                 "",

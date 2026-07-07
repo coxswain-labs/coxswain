@@ -3,7 +3,7 @@
 //! Writes `status.ancestors[]` with `Accepted` and `Conflicted` conditions
 //! for each Gateway (and optional listener) targeted by the policy.
 
-use super::conditions::make_condition;
+use super::conditions::{CoxswainConditionType, make_condition};
 use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::constants::PolicyConditionType;
@@ -90,12 +90,10 @@ fn build_ancestors(
         now.clone(),
     ))
     .unwrap_or(serde_json::Value::Null);
-    // "Conflicted" is not a GEP-713 `PolicyConditionType` (the spec only
-    // defines ResolvedRefs/Accepted; Conflicted is documented there as a
-    // *reason* on Accepted) — coxswain models it as its own condition type,
-    // a pre-existing design choice out of scope for #510 (type source only).
+    // See `CoxswainConditionType` for why this isn't a `PolicyConditionType`
+    // variant.
     let conflicted_val = serde_json::to_value(make_condition(
-        "Conflicted",
+        CoxswainConditionType::Conflicted,
         con_status,
         con_reason,
         "",
