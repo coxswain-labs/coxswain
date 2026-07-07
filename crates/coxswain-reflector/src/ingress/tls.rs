@@ -120,12 +120,18 @@ impl IngressReconciler {
     /// **v1 limitation:** `auth-tls-*` is read directly from
     /// `ingress.metadata.annotations` and does not inherit IngressClass-parameter
     /// annotation defaults.
+    ///
+    /// `https_port` is the fixed Ingress data-plane HTTPS bind port (#472):
+    /// every mTLS config is keyed under it so the proxy's port-scoped lookup
+    /// finds it, and so Ingress configs can never collide with Gateway
+    /// listeners (which key their own internal ports).
     pub fn reconcile_client_certs(
         ingress: &Ingress,
         auth_tls_secrets: &reflector::Store<Secret>,
         owned_classes: &HashSet<String>,
         owned_default_class: Option<&str>,
         builder: &mut ClientCertStoreBuilder,
+        https_port: u16,
     ) {
         let claimed_class = claimed_ingress_class(ingress);
         match claimed_class {
@@ -186,11 +192,11 @@ impl IngressReconciler {
                     .into_iter()
                     .collect();
                 for host in &fallback {
-                    builder.add_client_cert(host, Arc::clone(&config_state));
+                    builder.add_client_cert(https_port, host, Arc::clone(&config_state));
                 }
             } else {
                 for host in hosts {
-                    builder.add_client_cert(host, Arc::clone(&config_state));
+                    builder.add_client_cert(https_port, host, Arc::clone(&config_state));
                 }
             }
         }
@@ -767,9 +773,9 @@ mod tests {
         let mut builder = ClientCertStoreBuilder::new();
         reconcile_client_certs_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         let store = builder.build();
-        assert!(store.find_config("example.com").is_some());
+        assert!(store.find_config(443, "example.com").is_some());
         assert!(matches!(
-            store.find_config("example.com").unwrap().as_ref(),
+            store.find_config(443, "example.com").unwrap().as_ref(),
             ClientCertConfigState::Config(_)
         ));
     }
@@ -788,7 +794,7 @@ mod tests {
         );
         let mut builder = ClientCertStoreBuilder::new();
         reconcile_client_certs_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().find_config("example.com").is_none());
+        assert!(builder.build().find_config(443, "example.com").is_none());
     }
 
     #[test]
@@ -809,7 +815,7 @@ mod tests {
         reconcile_client_certs_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         let store = builder.build();
         assert!(matches!(
-            store.find_config("example.com").unwrap().as_ref(),
+            store.find_config(443, "example.com").unwrap().as_ref(),
             ClientCertConfigState::Unavailable
         ));
         assert!(logs_contain("auth-tls-secret not found"));
@@ -835,7 +841,7 @@ mod tests {
         reconcile_client_certs_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         let store = builder.build();
         assert!(matches!(
-            store.find_config("example.com").unwrap().as_ref(),
+            store.find_config(443, "example.com").unwrap().as_ref(),
             ClientCertConfigState::Unavailable
         ));
         assert!(logs_contain("missing label"));
@@ -861,7 +867,7 @@ mod tests {
         reconcile_client_certs_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
         let store = builder.build();
         assert!(matches!(
-            store.find_config("example.com").unwrap().as_ref(),
+            store.find_config(443, "example.com").unwrap().as_ref(),
             ClientCertConfigState::Unavailable
         ));
         assert!(logs_contain("no 'ca.crt' data key"));
@@ -881,6 +887,6 @@ mod tests {
         );
         let mut builder = ClientCertStoreBuilder::new();
         reconcile_client_certs_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
-        assert!(builder.build().find_config("example.com").is_none());
+        assert!(builder.build().find_config(443, "example.com").is_none());
     }
 }

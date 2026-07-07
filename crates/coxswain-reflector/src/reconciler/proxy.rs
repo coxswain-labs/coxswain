@@ -1798,7 +1798,7 @@ fn rebuild(
         outputs.tls,
         outputs.listener_hostnames,
         true,
-        ingress_ports.https.unwrap_or(443),
+        ingress_ports.https,
     );
     build_client_certs(
         stores,
@@ -1807,6 +1807,7 @@ fn rebuild(
         outputs.client_certs,
         &mut gateway_listener_status,
         true,
+        ingress_ports.https,
     );
     merge_backend_client_cert_health(&mut gateway_listener_status, &backend_client_certs.health);
 

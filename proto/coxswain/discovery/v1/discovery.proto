@@ -643,16 +643,19 @@ enum KeyAlgorithm {
 // 2b  Client-cert (mTLS) store DTO
 // ────────────────────────────────────────────────────────────────────────────
 
-// Mirrors ClientCertStore.  Sorted by host pattern ascending.
+// Mirrors ClientCertStore (port-scoped — GEP-91 same-hostname collision fix):
+// every (bind port, host pattern) → state mapping. Encoding is canonical so
+// equal stores hash to equal snapshot versions: ports ascending, patterns
+// sorted within each port, and the port's default (catch-all) entry — empty
+// host_pattern — appended last. A leading "*." marks a wildcard pattern.
 message ClientCertStore {
-  ClientCertConfigState default = 1;
-  repeated ClientCertEntry exact = 2;
-  repeated ClientCertEntry wildcard = 3;
+  repeated ClientCertEntry entries = 1;
 }
 
 message ClientCertEntry {
   string host_pattern = 1;
   ClientCertConfigState state = 2;
+  uint32 port = 3; // u16 bind port
 }
 
 message ClientCertConfigState {

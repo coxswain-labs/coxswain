@@ -2729,6 +2729,101 @@ async fn gateway_frontend_mtls_insecure_fallback_admits_missing_cert() -> anyhow
     Ok(())
 }
 
+/// Cross-Gateway mTLS isolation (GEP-91 collision regression, #531 fallout).
+/// Two Gateways in different namespaces declare HTTPS listeners with the SAME
+/// hostname — one strict (AllowValidOnly), one AllowInsecureFallback — exactly
+/// the topology of the upstream `GatewayFrontendClientCertificateValidation` +
+/// `...InsecureFallback` conformance tests running concurrently. The client-cert
+/// store is keyed by bind port, so each Gateway's policy applies only on its own
+/// VIP ports:
+///   - the strict Gateway admits its own CA's client cert (control);
+///   - the fallback Gateway admits a certless connection (control — proves its
+///     config is live in the same store snapshot);
+///   - **the strict Gateway still rejects a certless connection** — the
+///     regression guard. Before port scoping, the fallback Gateway's
+///     same-hostname config overwrote the strict one (last-writer-wins on a
+///     global SNI key) and the strict Gateway accepted everything.
+#[tokio::test]
+async fn strict_gateway_rejects_certless_when_same_hostname_fallback_gateway_exists()
+-> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns_strict = NamespaceGuard::create(&h.client, "gw-mtls-collide-strict").await?;
+    let ns_fallback = NamespaceGuard::create(&h.client, "gw-mtls-collide-fb").await?;
+
+    // The SAME hostname on both Gateways — the collision key.
+    let host = format!("gw-mtls-collide.{}.local", ns_strict.name);
+    let server_cert = GeneratedCert::for_host(&host);
+    let mtls = MtlsCerts::generate();
+
+    for ns in [&ns_strict.name, &ns_fallback.name] {
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(ns)).await?;
+        wait::wait_for_backends(ns).await?;
+    }
+    fixtures::apply_fixture(
+        gwa::FRONTEND_MTLS_CONFIGMAP,
+        FixtureVars::new(&ns_strict.name)
+            .with("HOSTNAME", &host)
+            .with("SECRET_NAME", "gw-mtls-server-cert")
+            .with("TLS_CRT_B64", server_cert.cert_b64())
+            .with("TLS_KEY_B64", server_cert.key_b64())
+            .with("CA_CRT_PEM", &mtls.ca_cert_pem),
+    )
+    .await?;
+    fixtures::apply_fixture(
+        gwa::FRONTEND_MTLS_INSECURE_FALLBACK,
+        FixtureVars::new(&ns_fallback.name)
+            .with("HOSTNAME", &host)
+            .with("SECRET_NAME", "gw-mtls-server-cert")
+            .with("TLS_CRT_B64", server_cert.cert_b64())
+            .with("TLS_KEY_B64", server_cert.key_b64())
+            .with("CA_CRT_PEM", &mtls.ca_cert_pem),
+    )
+    .await?;
+
+    // Control 1: the strict Gateway serves its own CA's client cert.
+    let strict_tls = h.gateway_tls_addr(&ns_strict.name).await?;
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("strict Gateway {host}/ to admit its own CA's client cert") },
+        || async {
+            match http::https_get_with_client_cert(
+                &host,
+                "/",
+                strict_tls,
+                &mtls.client_cert_pem,
+                &mtls.client_key_pem,
+            )
+            .await
+            {
+                Ok((_, Some(_))) => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    // Control 2: the fallback Gateway admits a certless connection — both
+    // Gateways' configs are live in the store before the negative assertion.
+    let fallback_tls = h.gateway_tls_addr(&ns_fallback.name).await?;
+    let resp =
+        wait::wait_for_https_route(fallback_tls, &host, "/", Duration::from_secs(90)).await?;
+    resp.assert_backend("echo-a");
+
+    // Regression guard: with the fallback Gateway's same-hostname config live,
+    // the strict Gateway must STILL abort a certless handshake on its own port.
+    let certless = http::https_get(&host, "/", strict_tls).await;
+    anyhow::ensure!(
+        certless.is_err(),
+        "strict (AllowValidOnly) Gateway admitted a certless connection while a \
+         same-hostname AllowInsecureFallback Gateway exists — its mTLS config was \
+         overwritten across Gateways (bind-port scoping regression); got Ok: {:?}",
+        certless.ok()
+    );
+
+    Ok(())
+}
+
 /// Per-port frontend client-cert validation (#517 regression). A Gateway with two
 /// HTTPS listeners on different ports, each validating client certs against its
 /// OWN CA: listener A via `spec.tls.frontend.default`, listener B (on `PORT_B`)

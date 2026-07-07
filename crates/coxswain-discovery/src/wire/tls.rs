@@ -154,37 +154,45 @@ fn key_algorithm_to_wire(algo: KeyAlgorithm) -> p::KeyAlgorithm {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Serialise a [`ClientCertStore`] to its wire DTO.
+///
+/// Entries are sorted by `(port, host pattern)` so equal stores hash to equal
+/// snapshot versions. Wildcard patterns carry their `*.` prefix; an empty
+/// host pattern is the port's default (catch-all) config.
 #[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
 pub fn client_cert_to_wire(store: &ClientCertStore) -> p::ClientCertStore {
-    let mut exact_entries: Vec<(&str, Arc<ClientCertConfigState>)> = store
-        .iter_exact()
-        .map(|(h, s)| (h, Arc::clone(s)))
-        .collect();
-    exact_entries.sort_by_key(|(h, _)| *h);
+    let mut ports: Vec<(u16, &coxswain_core::tls::HostClientCertConfigs)> =
+        store.iter_ports().collect();
+    ports.sort_by_key(|(p, _)| *p);
 
-    let mut wildcard_entries: Vec<(&str, Arc<ClientCertConfigState>)> = store
-        .iter_wildcard()
-        .map(|(s, cfg)| (s, Arc::clone(cfg)))
-        .collect();
-    wildcard_entries.sort_by_key(|(s, _)| *s);
-
-    p::ClientCertStore {
-        exact: exact_entries
-            .into_iter()
-            .map(|(h, s)| p::ClientCertEntry {
-                host_pattern: h.to_string(),
-                state: Some(client_cert_state_to_wire(&s)),
-            })
-            .collect(),
-        wildcard: wildcard_entries
-            .into_iter()
-            .map(|(s, cfg)| p::ClientCertEntry {
-                host_pattern: s.to_string(),
-                state: Some(client_cert_state_to_wire(&cfg)),
-            })
-            .collect(),
-        default: store.default_state().map(|s| client_cert_state_to_wire(s)),
+    let mut entries: Vec<p::ClientCertEntry> = Vec::new();
+    for (port, configs) in ports {
+        let mut host_entries: Vec<(String, Arc<ClientCertConfigState>)> = configs
+            .iter_exact()
+            .map(|(h, s)| (h.to_string(), Arc::clone(s)))
+            .chain(
+                configs
+                    .iter_wildcard()
+                    .map(|(suffix, s)| (format!("*.{suffix}"), Arc::clone(s))),
+            )
+            .collect();
+        host_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        for (pattern, state) in host_entries {
+            entries.push(p::ClientCertEntry {
+                host_pattern: pattern,
+                state: Some(client_cert_state_to_wire(&state)),
+                port: u32::from(port),
+            });
+        }
+        if let Some(default) = configs.default_state() {
+            entries.push(p::ClientCertEntry {
+                host_pattern: String::new(),
+                state: Some(client_cert_state_to_wire(default)),
+                port: u32::from(port),
+            });
+        }
     }
+
+    p::ClientCertStore { entries }
 }
 
 fn client_cert_state_to_wire(s: &ClientCertConfigState) -> p::ClientCertConfigState {
@@ -269,26 +277,17 @@ fn cert_from_wire(dto: &p::TlsCert) -> TlsCert {
 #[must_use = "the rebuilt client-cert store must be stored for the proxy to use it"]
 pub fn client_cert_from_wire(dto: &p::ClientCertStore) -> Result<ClientCertStore, WireError> {
     let mut builder = ClientCertStoreBuilder::new();
-    for entry in &dto.exact {
+    for entry in &dto.entries {
         let state = client_cert_state_from_wire(entry.state.as_ref().ok_or(
             WireError::MissingRequiredField {
                 field: "client_cert_entry.state",
             },
         )?);
-        builder.add_config(&entry.host_pattern, Arc::new(state));
-    }
-    for entry in &dto.wildcard {
-        let state = client_cert_state_from_wire(entry.state.as_ref().ok_or(
-            WireError::MissingRequiredField {
-                field: "client_cert_entry.state",
-            },
-        )?);
-        let pattern = format!("*.{}", entry.host_pattern);
-        builder.add_config(&pattern, Arc::new(state));
-    }
-    if let Some(default_dto) = &dto.default {
-        let state = client_cert_state_from_wire(default_dto);
-        builder.add_config("", Arc::new(state));
+        // u32 narrowing matches the routing decoder: the sole producer writes
+        // `u32::from(u16)`, so the value is in range by construction.
+        let port = entry.port as u16;
+        // Empty host_pattern → the port's default bucket in add_config.
+        builder.add_config(port, &entry.host_pattern, Arc::new(state));
     }
     Ok(builder.build())
 }
@@ -410,15 +409,15 @@ mod tests {
         let unavail = Arc::new(ClientCertConfigState::Unavailable);
 
         let mut b = ClientCertStoreBuilder::new();
-        b.add_config("strict.example.com", cfg);
-        b.add_config("fallback.example.com", fallback_cfg);
-        b.add_config("*.example.com", unavail);
+        b.add_config(30001, "strict.example.com", cfg);
+        b.add_config(30001, "fallback.example.com", fallback_cfg);
+        b.add_config(30001, "*.example.com", unavail);
         let store = b.build();
 
         let dto = client_cert_to_wire(&store);
         let store2 = client_cert_from_wire(&dto).expect("from_wire");
 
-        match store2.find_config("strict.example.com").as_deref() {
+        match store2.find_config(30001, "strict.example.com").as_deref() {
             Some(ClientCertConfigState::Config(c)) => {
                 assert_eq!(c.verify_depth, 3, "verify_depth preserved");
                 assert!(c.pass_to_upstream, "pass_to_upstream preserved");
@@ -429,7 +428,7 @@ mod tests {
             }
             other => panic!("expected Config, got {other:?}"),
         }
-        match store2.find_config("fallback.example.com").as_deref() {
+        match store2.find_config(30001, "fallback.example.com").as_deref() {
             Some(ClientCertConfigState::Config(c)) => {
                 assert!(
                     c.allow_insecure_fallback,
@@ -438,9 +437,54 @@ mod tests {
             }
             other => panic!("expected Config for fallback, got {other:?}"),
         }
-        match store2.find_config("sub.example.com").as_deref() {
+        match store2.find_config(30001, "sub.example.com").as_deref() {
             Some(ClientCertConfigState::Unavailable) => {}
             other => panic!("expected Unavailable, got {other:?}"),
         }
+    }
+
+    /// The GEP-91 same-hostname collision fix: the wire format keys every
+    /// entry (including per-port defaults) by bind port, and the round-trip
+    /// preserves the isolation — the strict and insecure-fallback configs for
+    /// the SAME hostname come back on their own ports.
+    #[test]
+    fn client_cert_store_port_scoping_round_trips() {
+        let strict = Arc::new(ClientCertConfigState::Config(ClientCertConfig::new(
+            b"CA-STRICT".to_vec(),
+            1,
+            false,
+        )));
+        let fallback = Arc::new(ClientCertConfigState::Config(
+            ClientCertConfig::new(b"CA-FALLBACK".to_vec(), 1, false).with_insecure_fallback(true),
+        ));
+
+        let mut b = ClientCertStoreBuilder::new();
+        b.add_config(30001, "second-example.org", strict);
+        b.add_config(30002, "second-example.org", fallback);
+        b.add_config(30001, "", Arc::new(ClientCertConfigState::Unavailable));
+        let store = b.build();
+
+        let store2 = client_cert_from_wire(&client_cert_to_wire(&store)).expect("from_wire");
+
+        match store2.find_config(30001, "second-example.org").as_deref() {
+            Some(ClientCertConfigState::Config(c)) => {
+                assert!(!c.allow_insecure_fallback, "port 30001 keeps strict mode");
+            }
+            other => panic!("expected strict Config on 30001, got {other:?}"),
+        }
+        match store2.find_config(30002, "second-example.org").as_deref() {
+            Some(ClientCertConfigState::Config(c)) => {
+                assert!(c.allow_insecure_fallback, "port 30002 keeps fallback mode");
+            }
+            other => panic!("expected fallback Config on 30002, got {other:?}"),
+        }
+        match store2.find_config(30001, "unmatched.org").as_deref() {
+            Some(ClientCertConfigState::Unavailable) => {}
+            other => panic!("expected 30001's default (Unavailable), got {other:?}"),
+        }
+        assert!(
+            store2.find_config(30002, "unmatched.org").is_none(),
+            "30001's default must not leak onto 30002"
+        );
     }
 }

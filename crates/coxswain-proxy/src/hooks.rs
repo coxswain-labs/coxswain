@@ -226,7 +226,7 @@ pub(crate) async fn request_filter<K>(
     // HTTP-layer guard must mirror that and let the request through.
     {
         let cc_store = cfg.client_certs.load();
-        if let Some(config_state) = cc_store.find_config(&host) {
+        if let Some(config_state) = cc_store.find_config(port, &host) {
             let ssl_digest = session
                 .as_downstream()
                 .digest()

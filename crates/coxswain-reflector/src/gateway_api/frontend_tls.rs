@@ -7,6 +7,11 @@
 //! effective config is the `perPort[listener.port]` override if present, else
 //! the gateway-wide `default`.
 //!
+//! **Scope**: `spec.tls.frontend` applies to the Gateway's OWN `spec.listeners`
+//! only. ListenerSet-merged listeners (GEP-1713) carry no GEP-91 hook in the
+//! spec and get no validation config — their handshakes are one-way TLS unless
+//! a future GEP extends validation to ListenerSets.
+//!
 //! **Core support**: a single `core/ConfigMap` reference with key `ca.crt`.
 //! Cross-namespace refs are permitted via a `Gateway → ConfigMap`
 //! [`ReferenceGrant`](crate::reference_grants). Each resolution failure is
@@ -126,16 +131,37 @@ pub(crate) fn reconcile_frontend_validation(
             any_failed = true;
         }
 
-        // Empty hostname → default slot in ClientCertStore (matches any SNI not
-        // covered by an exact or wildcard entry).
+        // Empty hostname → the port's default slot in ClientCertStore (matches
+        // any SNI not covered by an exact or wildcard entry on that port).
+        //
+        // The config is keyed by the listener's BIND port (#472 semantics): the
+        // internal targetPort in shared mode, the spec port in dedicated mode.
+        // Port scoping is what isolates this Gateway's validation policy from a
+        // sibling Gateway that declares the same hostname. `internal_port == 0`
+        // in shared mode means the VIP Service has not allocated a port yet
+        // (`VipPending`) — skip registration exactly like `reconcile_tls` does,
+        // so a pre-VIP Gateway's config can never leak onto the shared Ingress
+        // HTTPS port; the next rebuild after allocation registers it. The
+        // status outcome below is still recorded either way.
+        // GEP-1713-conflicted listeners are not programmed (`reconcile_tls`
+        // skips their certs) — skip their validation config too, so a losing
+        // listener's policy can never apply to the winner's traffic.
         let hostname = listener.hostname.as_deref().unwrap_or("");
-        builder.add_client_cert(hostname, Arc::new(state));
+        let listener_key = ListenerStatusKey::gateway(listener.name.clone());
+        let bind_port = health
+            .listeners
+            .get(&listener_key)
+            .filter(|li| li.internal_port != 0 && !li.conflict.is_conflicted())
+            .map(coxswain_core::listener_status::ListenerInfo::bind_port);
+        if let Some(bind_port) = bind_port {
+            builder.add_client_cert(bind_port, hostname, Arc::new(state));
+        }
 
         // Record the per-listener outcome. The entry was created by build_tls;
         // or_default() keeps this robust if the ordering ever changes.
         health
             .listeners
-            .entry(ListenerStatusKey::gateway(listener.name.clone()))
+            .entry(listener_key)
             .or_default()
             .frontend_outcome = outcome;
     }
@@ -364,6 +390,19 @@ mod tests {
         reader
     }
 
+    /// Health pre-seeded with a listener entry carrying an allocated bind
+    /// port, as `build_tls` produces before `reconcile_frontend_validation`
+    /// runs — the config is keyed under that port.
+    fn health_with_bind_port(listener: &str, internal_port: u16) -> GatewayListenerStatus {
+        let mut health = GatewayListenerStatus::default();
+        let mut li = coxswain_core::listener_status::ListenerInfo::default();
+        li.internal_port = internal_port;
+        health
+            .listeners
+            .insert(ListenerStatusKey::gateway(listener), li);
+        health
+    }
+
     #[test]
     fn no_frontend_validation_is_no_op() {
         let gw = make_gateway("default", "gw", vec![("l1", "example.com")], None, None);
@@ -387,7 +426,7 @@ mod tests {
         );
         let cms = cm_store_with("default", "my-ca", FAKE_PEM);
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerStatus::default();
+        let mut health = health_with_bind_port("l1", 30443);
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         let fv = health.frontend_validation.as_ref().unwrap();
@@ -396,7 +435,7 @@ mod tests {
 
         let store = builder.build();
         assert_eq!(store.host_count(), 1);
-        let state = store.find_config("example.com").unwrap();
+        let state = store.find_config(30443, "example.com").unwrap();
         assert!(
             matches!(state.as_ref(), ClientCertConfigState::Config(cfg) if !cfg.allow_insecure_fallback),
             "AllowValidOnly: allow_insecure_fallback should be false"
@@ -414,7 +453,7 @@ mod tests {
         );
         let cms = empty_cm_store();
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerStatus::default();
+        let mut health = health_with_bind_port("l1", 30443);
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         let fv = health.frontend_validation.as_ref().unwrap();
@@ -423,7 +462,7 @@ mod tests {
 
         let store = builder.build();
         assert_eq!(store.host_count(), 1);
-        let state = store.find_config("example.com").unwrap();
+        let state = store.find_config(30443, "example.com").unwrap();
         assert!(
             matches!(state.as_ref(), ClientCertConfigState::Unavailable),
             "missing ConfigMap should produce Unavailable"
@@ -442,7 +481,7 @@ mod tests {
         );
         let cms = cm_store_with("default", "my-ca", FAKE_PEM);
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerStatus::default();
+        let mut health = health_with_bind_port("l1", 30443);
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         let fv = health.frontend_validation.as_ref().unwrap();
@@ -450,7 +489,7 @@ mod tests {
         assert!(fv.resolved_refs);
 
         let store = builder.build();
-        let state = store.find_config("example.com").unwrap();
+        let state = store.find_config(30443, "example.com").unwrap();
         assert!(
             matches!(state.as_ref(), ClientCertConfigState::Config(cfg) if cfg.allow_insecure_fallback),
             "allow_insecure_fallback should be set on the config"
@@ -504,7 +543,7 @@ mod tests {
         };
         let cms = empty_cm_store();
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerStatus::default();
+        let mut health = health_with_bind_port("l1", 30443);
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         let fv = health.frontend_validation.as_ref().unwrap();
@@ -521,7 +560,7 @@ mod tests {
             ),
             "non-ConfigMap kind → InvalidCACertificateKind, got {outcome:?}"
         );
-        let state = builder.build().find_config("example.com").unwrap();
+        let state = builder.build().find_config(30443, "example.com").unwrap();
         assert!(
             matches!(state.as_ref(), ClientCertConfigState::Unavailable),
             "non-ConfigMap kind should produce Unavailable"
@@ -631,7 +670,7 @@ mod tests {
         );
         let cms = cm_store_with("ns", "pp-ca", PEM); // only the perPort CA exists
         let mut builder = ClientCertStoreBuilder::new();
-        let mut health = GatewayListenerStatus::default();
+        let mut health = health_with_bind_port("l1", 30843);
         reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
 
         // The listener resolved against the perPort CA (which exists), not the default.
@@ -647,11 +686,48 @@ mod tests {
         assert!(matches!(
             builder
                 .build()
-                .find_config("second-example.org")
+                .find_config(30843, "second-example.org")
                 .unwrap()
                 .as_ref(),
             ClientCertConfigState::Config(_)
         ));
+    }
+
+    /// A shared-mode listener whose VIP has not allocated an internal port yet
+    /// (no health entry / `internal_port == 0`) must not register any config —
+    /// keying it at the spec port could land on the shared Ingress HTTPS port.
+    /// The status outcome is still recorded.
+    #[test]
+    fn pre_vip_listener_records_outcome_but_registers_no_config() {
+        const PEM: &str = "-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n";
+        let gw = make_gateway(
+            "default",
+            "gw",
+            vec![("l1", "example.com")],
+            Some("my-ca"),
+            None,
+        );
+        let cms = cm_store_with("default", "my-ca", PEM);
+        let mut builder = ClientCertStoreBuilder::new();
+        let mut health = GatewayListenerStatus::default();
+        reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
+
+        assert!(
+            matches!(
+                health
+                    .listeners
+                    .get(&ListenerStatusKey::gateway("l1"))
+                    .unwrap()
+                    .frontend_outcome,
+                FrontendValidationOutcome::Resolved
+            ),
+            "outcome must be recorded even before the VIP allocates a port"
+        );
+        assert_eq!(
+            builder.build().host_count(),
+            0,
+            "no bind port yet — nothing may be keyed"
+        );
     }
 
     #[test]
