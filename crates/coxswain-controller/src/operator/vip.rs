@@ -364,15 +364,24 @@ struct StaticVipBinding<'a> {
 ///   writer matches to publish `status.addresses` and decide
 ///   `AddressNotUsable` vs `Programmed`.
 ///
-/// If no candidate binds (all out-of-CIDR), no Service is left and the status
-/// writer reports `AddressNotUsable`; the next pass retries.
+/// If no candidate binds, no Service is left and the status writer reports
+/// `AddressNotUsable` (out-of-range candidates) or holds `Pending` (transiently
+/// unallocatable candidates); the next pass retries.
 ///
-/// Returns `true` when provisioning **definitively failed** — every requested
-/// clusterIP candidate was rejected by the apiserver, so no VIP Service exists.
-/// The caller records this so the status writer can distinguish a settled
-/// `AddressNotUsable` from a Gateway still mid-provisioning (#531/#533): both
-/// present as "no Service yet", but only the latter must be held `Pending`.
-/// A deferred retry (repin delete pending) or a bound Service returns `false`.
+/// Returns `true` only when provisioning **definitively failed** — every
+/// requested clusterIP candidate was rejected by the apiserver for a *permanent*
+/// reason (out of the Service CIDR), so no VIP Service exists and the address is
+/// genuinely unusable. The caller records this so the status writer settles
+/// `AddressNotUsable` (#531/#533). A deferred retry — a pending repin delete, or
+/// a candidate that is valid but momentarily **already allocated** — returns
+/// `false` so the Gateway is held `Pending` and retried, never prematurely
+/// settled `AddressNotUsable`.
+///
+/// clusterIP is immutable, so a repin is a delete + a *later-pass* recreate: the
+/// delete and the recreate are split across passes (`return false` after the
+/// delete) so the recreate never races the apiserver's ClusterIP allocator
+/// releasing the just-deleted IP — the churn that surfaced as the flaky
+/// `GatewayStaticAddresses` `AddressNotUsable` (#542).
 async fn bind_static_vip_service(b: StaticVipBinding<'_>) -> bool {
     let svc_name = render_shared::shared_gateway_service_name(
         b.gw.metadata.namespace.as_deref().unwrap_or_default(),
@@ -388,39 +397,77 @@ async fn bind_static_vip_service(b: StaticVipBinding<'_>) -> bool {
             return false;
         }
         // Live clusterIP is not requested (auto-assigned, or a stale pin from a
-        // prior spec) — free it so a requested candidate can bind.
+        // prior spec) — free it so a requested candidate can bind. The recreate
+        // is DEFERRED to a later pass: recreating in this same pass would race
+        // the apiserver releasing the just-deleted clusterIP and be rejected
+        // `provided IP is already allocated`, a self-sustaining delete/recreate
+        // churn (#542). One Service mutation per pass; the next pass finds no
+        // Service and binds a candidate against a settled allocator.
         let svc_api: Api<Service> = Api::namespaced(b.ctx.client.clone(), b.ctrl_ns);
         match ignore_not_found(svc_api.delete(&svc_name, &DeleteParams::default()).await) {
             Ok(()) => tracing::info!(
                 service = %format!("{}/{svc_name}", b.ctrl_ns),
-                "operator: deleting VIP Service to repin requested clusterIP (#260)"
+                "operator: deleted VIP Service to repin requested clusterIP; recreate deferred to next pass (#260, #542)"
             ),
-            Err(e) => {
-                tracing::warn!(
-                    service = %format!("{}/{svc_name}", b.ctrl_ns),
-                    error = %e,
-                    "operator: failed to delete VIP Service for clusterIP repin; will retry"
-                );
-                // Try to bind anyway next pass once the delete lands.
-                return false;
-            }
+            Err(e) => tracing::warn!(
+                service = %format!("{}/{svc_name}", b.ctrl_ns),
+                error = %e,
+                "operator: failed to delete VIP Service for clusterIP repin; will retry"
+            ),
         }
+        // Deferred (not a definitive failure): hold `Pending`, retry next pass.
+        return false;
     }
 
+    // No live Service: try each requested candidate. Distinguish a *permanent*
+    // rejection (out of the Service CIDR → the address is genuinely unusable)
+    // from a *transient* one (`already allocated` → the IP is valid but a prior
+    // incarnation's allocation has not been released yet, so retry next pass).
+    let mut any_transient = false;
     for &cand in b.candidates {
         match apply_static_vip_candidate(&b, cand).await {
             Ok(()) => return false,
-            Err(e) => tracing::debug!(
-                service = %format!("{}/{svc_name}", b.ctrl_ns),
-                candidate = %cand,
-                error = %e,
-                "operator: requested clusterIP not usable; trying next (#260)"
-            ),
+            Err(e) => {
+                if apply_error_is_transient(&e) {
+                    any_transient = true;
+                }
+                tracing::debug!(
+                    service = %format!("{}/{svc_name}", b.ctrl_ns),
+                    candidate = %cand,
+                    error = %e,
+                    transient = apply_error_is_transient(&e),
+                    "operator: requested clusterIP not bound; trying next (#260, #542)"
+                );
+            }
         }
     }
-    // No candidate bound: leave no Service so the status writer reports
-    // AddressNotUsable. Retried next pass. Definitive failure for this pass.
-    true
+    // A transient rejection means a candidate is valid but momentarily
+    // unallocatable — defer (hold `Pending`, retry) rather than settle
+    // `AddressNotUsable`. Only an all-permanent-rejection set is a definitive
+    // failure.
+    !any_transient
+}
+
+/// Whether an SSA apply rejection is a **transient** ClusterIP-allocation
+/// conflict. Extracts the apiserver `Status` code + message from the boxed
+/// `kube::Error::Api` and delegates to [`is_transient_alloc_rejection`].
+fn apply_error_is_transient(e: &apply::ApplyError) -> bool {
+    let apply::ApplyError::Service(kube::Error::Api(status)) = e else {
+        return false;
+    };
+    is_transient_alloc_rejection(status.code, &status.message)
+}
+
+/// Classify a Service SSA rejection: `true` for the transient ClusterIP-allocator
+/// conflict — the apiserver's `provided IP is already allocated` (a prior Service
+/// incarnation holds the valid IP but will release it → retry) — and `false` for
+/// a permanent rejection like an out-of-CIDR address (`the provided network does
+/// not match the current range` → the address is genuinely unusable). Keyed on
+/// the `Invalid` (422) status message: the IP-allocator errors carry no dedicated
+/// `reason`/cause code, so the message substring is the only available signal;
+/// these allocator strings are stable across Kubernetes releases.
+fn is_transient_alloc_rejection(code: u16, message: &str) -> bool {
+    code == 422 && message.contains("already allocated")
 }
 
 /// Render and SSA the static-address Gateway's VIP Service with `cluster_ip`
@@ -749,5 +796,25 @@ mod tests {
             ..Default::default()
         };
         assert!(!vip_service_should_prune(&foreign, &gateways, is_shared));
+    }
+
+    #[test]
+    fn already_allocated_is_transient_out_of_range_is_definitive() {
+        // "provided IP is already allocated" — a prior Service incarnation still
+        // holds the (valid) IP; retriable, must NOT settle AddressNotUsable.
+        assert!(is_transient_alloc_rejection(
+            422,
+            "Service \"gw-shared-gw\" is invalid: spec.clusterIPs: Invalid value: \
+             [\"10.96.0.42\"]: failed to allocate IP 10.96.0.42: provided IP is already allocated"
+        ));
+        // Out of the Service CIDR — the address is genuinely unusable; definitive.
+        assert!(!is_transient_alloc_rejection(
+            422,
+            "Service \"gw-shared-gw\" is invalid: spec.clusterIPs: Invalid value: \
+             [\"192.0.2.1\"]: failed to allocate IP 192.0.2.1: the provided network \
+             does not match the current range"
+        ));
+        // A non-422 status is never treated as a transient repin.
+        assert!(!is_transient_alloc_rejection(409, "already allocated"));
     }
 }
