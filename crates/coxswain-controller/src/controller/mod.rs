@@ -93,8 +93,11 @@ const ERROR_REQUEUE: Duration = Duration::from_secs(15);
 /// rebuild. Replaces the old `STATUS_RESYNC_INTERVAL` backstop: instead of a
 /// process-wide periodic scan, only the Gateways actually waiting on readiness
 /// requeue, and only until the subsystem flips ready (then the `listener_status`
-/// re-drive and normal events take over).
-const DEFERRED_PROGRAMMED_REQUEUE: Duration = Duration::from_secs(2);
+/// re-drive and normal events take over). 1 s: this is also the sampling
+/// cadence for the #531 bind+ack gate opening (snapshot acks deliberately
+/// don't re-drive the queue), and it sits directly on the conformance
+/// suite's Programmed-convergence critical path.
+const DEFERRED_PROGRAMMED_REQUEUE: Duration = Duration::from_secs(1);
 
 /// The three reflector-published health channels the status reconcilers read
 /// (a `.load()` snapshot per reconcile) and subscribe to (to re-drive the
@@ -964,6 +967,24 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     // query for the steady-state majority of reconciles.
     let latched = gateway_programmed_at_current_gen(gw);
 
+    // Latched address preservation (#531): the latch keeps `Programmed=True`
+    // through a transiently-unresolved VIP (the operator deletes + recreates
+    // the Service to repin a requested clusterIP; an LB re-assigns), but the
+    // static-address patch path rewrites `status.addresses` from the current
+    // resolution — publishing `Programmed=True` with an EMPTY address set, an
+    // inconsistent state the conformance `GatewayStaticAddresses` fetch races
+    // into. While latched-True with no settled negative, keep the currently
+    // published addresses instead of wiping them: a *real* address change
+    // arrives with a generation bump, which re-arms the gate (`latched` goes
+    // false) and traverses the `Pending` hold, never this branch.
+    if latched
+        && static_outcome.feature_engaged
+        && static_outcome.programmed_override.is_none()
+        && static_outcome.status_addresses.is_empty()
+    {
+        static_outcome.status_addresses = current_status_typed_addresses(gw);
+    }
+
     // Proxy-pool readiness gate (#531), two halves:
     //
     //  * Bind: every connected shared-pool proxy node must have reported the
@@ -1256,6 +1277,33 @@ fn status_address_to_typed(addr: &StatusAddress) -> crate::status_common::addres
         StatusAddress::Ip(ip) => TypedAddress::new(SupportedAddressType::IpAddress, ip.to_string()),
         StatusAddress::Hostname(h) => TypedAddress::new(SupportedAddressType::Hostname, h.clone()),
     }
+}
+
+/// The Gateway's currently-published `status.addresses`, re-parsed into the
+/// typed form (#531 latched address preservation). Entries with an
+/// unrecognised type tag are dropped — only coxswain writes this field, and
+/// it only writes the two supported types.
+fn current_status_typed_addresses(
+    gw: &Gateway,
+) -> Vec<crate::status_common::addresses::TypedAddress> {
+    use crate::status_common::addresses::{SupportedAddressType, TypedAddress};
+    gw.status
+        .as_ref()
+        .and_then(|s| s.addresses.as_ref())
+        .map(|addrs| {
+            addrs
+                .iter()
+                .filter_map(|a| {
+                    let type_ = match a.r#type.as_deref() {
+                        Some("IPAddress") => SupportedAddressType::IpAddress,
+                        Some("Hostname") => SupportedAddressType::Hostname,
+                        _ => return None,
+                    };
+                    Some(TypedAddress::new(type_, a.value.clone()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Derive a single [`StatusAddress`] from a VIP Service by its type:
@@ -1705,6 +1753,50 @@ mod tests {
             StatusAddress::Ip(i) => Some(*i),
             StatusAddress::Hostname(_) => None,
         }
+    }
+
+    // ── latched address preservation (#531) ──────────────────────────────────
+
+    #[test]
+    fn current_status_typed_addresses_parses_published_entries() {
+        use crate::status_common::addresses::SupportedAddressType;
+        use coxswain_reflector::gw_types::v::gateways::{
+            Gateway, GatewayStatus, GatewayStatusAddresses,
+        };
+        let gw = Gateway {
+            metadata: ObjectMeta::default(),
+            spec: Default::default(),
+            status: Some(GatewayStatus {
+                addresses: Some(vec![
+                    GatewayStatusAddresses {
+                        r#type: Some("IPAddress".to_string()),
+                        value: "10.96.9.11".to_string(),
+                    },
+                    GatewayStatusAddresses {
+                        r#type: Some("Hostname".to_string()),
+                        value: "lb.example.com".to_string(),
+                    },
+                    GatewayStatusAddresses {
+                        r#type: Some("NamedAddress".to_string()),
+                        value: "bogus".to_string(),
+                    },
+                ]),
+                ..Default::default()
+            }),
+        };
+        let typed = current_status_typed_addresses(&gw);
+        assert_eq!(typed.len(), 2, "unsupported type tags are dropped");
+        assert_eq!(typed[0].type_, SupportedAddressType::IpAddress);
+        assert_eq!(typed[0].value, "10.96.9.11");
+        assert_eq!(typed[1].type_, SupportedAddressType::Hostname);
+        assert_eq!(typed[1].value, "lb.example.com");
+
+        let empty = Gateway {
+            metadata: ObjectMeta::default(),
+            spec: Default::default(),
+            status: None,
+        };
+        assert!(current_status_typed_addresses(&empty).is_empty());
     }
 
     // ── proxy-pool bind gate helpers (#531) ──────────────────────────────────

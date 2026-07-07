@@ -86,8 +86,9 @@ const NON_LEADER_REQUEUE: Duration = Duration::from_secs(20);
 /// Re-queue interval while a dedicated Gateway's `Programmed` is held on the
 /// proxy bind gate (#531). Mirrors the shared writer's
 /// `DEFERRED_PROGRAMMED_REQUEUE`: the node-registry forwarder is the prompt
-/// signal; this is the backstop.
-const BIND_GATE_REQUEUE: Duration = Duration::from_secs(2);
+/// signal; this is the backstop, and the sampling cadence for the ack half
+/// of the gate (snapshot acks don't re-drive the queue).
+const BIND_GATE_REQUEUE: Duration = Duration::from_secs(1);
 
 /// Default re-queue after a reconcile error. Short backoff is fine — most
 /// errors here are transient (apiserver hiccup, missing object that's about
