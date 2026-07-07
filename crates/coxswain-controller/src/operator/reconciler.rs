@@ -87,8 +87,9 @@ const NON_LEADER_REQUEUE: Duration = Duration::from_secs(20);
 /// proxy bind gate (#531). Mirrors the shared writer's
 /// `DEFERRED_PROGRAMMED_REQUEUE`: the node-registry forwarder is the prompt
 /// signal; this is the backstop, and the sampling cadence for the ack half
-/// of the gate (snapshot acks don't re-drive the queue).
-const BIND_GATE_REQUEUE: Duration = Duration::from_secs(1);
+/// of the gate (snapshot acks don't re-drive the queue). Keep at 2 s — see
+/// the shared writer's constant for why shorter cadences backfire.
+const BIND_GATE_REQUEUE: Duration = Duration::from_secs(2);
 
 /// Default re-queue after a reconcile error. Short backoff is fine — most
 /// errors here are transient (apiserver hiccup, missing object that's about

@@ -1134,7 +1134,11 @@ async fn proxies_reconnect_to_new_leader_after_leader_pod_kill() -> anyhow::Resu
     .await?;
 
     // The proxy's stream must re-land on the new leader (fast-retry through
-    // the re-labelled Service), observable as its gauge + leadership metrics.
+    // the re-labelled Service), observable as its leadership gauge plus a
+    // connected proxy. Deliberately NO transitions-counter assertion: the
+    // Deployment replaces the killed pod, and the replacement can win the
+    // lease over the warm standby — a fresh pod's initial acquisition is not
+    // a "transition", so the counter is legitimately absent on that path.
     wait::poll_until(
         Duration::from_secs(90),
         wait::POLL,
@@ -1142,12 +1146,10 @@ async fn proxies_reconnect_to_new_leader_after_leader_pod_kill() -> anyhow::Resu
             let new_leader = new_leader.clone();
             async move {
                 format!(
-                    "new leader {new_leader} to show leader=1, >=1 connected proxy, and a \
-                     recorded leadership transition; observed leader={:?} connected={:?} transitions={:?}",
+                    "new leader {new_leader} to show leader=1 and >=1 connected proxy; \
+                     observed leader={:?} connected={:?}",
                     leader::pod_metric_value(&new_leader, "coxswain_controller_leader").await,
                     leader::pod_metric_value(&new_leader, "coxswain_discovery_connected_proxies")
-                        .await,
-                    leader::pod_metric_value(&new_leader, "coxswain_controller_leader_transitions_total")
                         .await,
                 )
             }
@@ -1158,19 +1160,11 @@ async fn proxies_reconnect_to_new_leader_after_leader_pod_kill() -> anyhow::Resu
                 let leading = leader::pod_metric_value(&new_leader, "coxswain_controller_leader")
                     .await
                     .ok()??;
-                let connected = leader::pod_metric_value(
-                    &new_leader,
-                    "coxswain_discovery_connected_proxies",
-                )
-                .await
-                .ok()??;
-                let transitions = leader::pod_metric_value(
-                    &new_leader,
-                    "coxswain_controller_leader_transitions_total",
-                )
-                .await
-                .ok()??;
-                (leading == 1.0 && connected >= 1.0 && transitions >= 1.0).then_some(())
+                let connected =
+                    leader::pod_metric_value(&new_leader, "coxswain_discovery_connected_proxies")
+                        .await
+                        .ok()??;
+                (leading == 1.0 && connected >= 1.0).then_some(())
             }
         },
     )

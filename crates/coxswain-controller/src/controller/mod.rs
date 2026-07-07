@@ -93,11 +93,13 @@ const ERROR_REQUEUE: Duration = Duration::from_secs(15);
 /// rebuild. Replaces the old `STATUS_RESYNC_INTERVAL` backstop: instead of a
 /// process-wide periodic scan, only the Gateways actually waiting on readiness
 /// requeue, and only until the subsystem flips ready (then the `listener_status`
-/// re-drive and normal events take over). 1 s: this is also the sampling
-/// cadence for the #531 bind+ack gate opening (snapshot acks deliberately
-/// don't re-drive the queue), and it sits directly on the conformance
-/// suite's Programmed-convergence critical path.
-const DEFERRED_PROGRAMMED_REQUEUE: Duration = Duration::from_secs(1);
+/// re-drive and normal events take over). Also the sampling cadence for the
+/// #531 bind+ack gate opening (snapshot acks deliberately don't re-drive the
+/// queue). Do NOT shorten below 2 s: every held-Pending patch is a Gateway
+/// event that re-triggers the operator and the VIP pass, and a 1 s cadence
+/// was observed outpacing store convergence on CI — feeding reconcile storms
+/// instead of converging faster.
+const DEFERRED_PROGRAMMED_REQUEUE: Duration = Duration::from_secs(2);
 
 /// The three reflector-published health channels the status reconcilers read
 /// (a `.load()` snapshot per reconcile) and subscribe to (to re-drive the
@@ -1040,7 +1042,17 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     // keeps waiting and never observes `Programmed` claiming generation N while
     // the address is unresolved or the data plane dark; the same patch that
     // flips `Programmed=True@N` also publishes the address.
-    let converged = latched || (!awaiting_own_vip && proxies_bound);
+    //
+    // Structural backstop for the same invariant in the other direction: a
+    // static-address Gateway with no settled negative and NOTHING to publish
+    // in `status.addresses` (nothing resolved now, nothing preserved from the
+    // latch) must never surface `Programmed=True` with an empty address set —
+    // whatever transient produced that combination (VIP churn mid-repin, a
+    // stale object), hold `Pending` and requeue instead.
+    let publishable_addresses = !static_outcome.feature_engaged
+        || static_outcome.programmed_override.is_some()
+        || !static_outcome.status_addresses.is_empty();
+    let converged = (latched || (!awaiting_own_vip && proxies_bound)) && publishable_addresses;
 
     let decision = gateway_status::SharedAddressDecision {
         legacy_addr: owned_status_addr,
