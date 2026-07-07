@@ -71,14 +71,6 @@ export const getIngressRoute = (ns, name) =>
     `/api/v1/routing/routes/ingress/${encodeURIComponent(ns)}/${encodeURIComponent(name)}`,
   );
 
-// On-demand data-plane consistency check for a single route (`kind` is the URL
-// kind: `httproute` | `ingress`). Heavier than the detail fetch — fired only
-// when the operator clicks "Check".
-export const getRouteCheck = (kind, ns, name) =>
-  fetchJson(
-    `/api/v1/routing/routes/${encodeURIComponent(kind)}/${encodeURIComponent(ns)}/${encodeURIComponent(name)}/check`,
-  );
-
 // ── Manifests ─────────────────────────────────────────────────────────────────
 
 export const getManifest = (kind, ns, name) =>

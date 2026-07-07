@@ -1,21 +1,15 @@
-//! `/api/v1/routing/routes/{kind}/{ns}/{name}` route detail + its `/check`
-//! data-plane consistency endpoint, plus the effective-config serialization
-//! helpers that render the route detail bodies.
+//! `/api/v1/routing/routes/{kind}/{ns}/{name}` route detail, plus the
+//! effective-config serialization helpers that render the route detail
+//! bodies.
 
 use http::Response;
 
 use coxswain_core::cluster::GatewayCondition;
-use coxswain_core::fleet::FleetEntry;
-use futures::future::join_all;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::Api;
 
-use super::route_check::{route_kind_key, route_rows_for, row_key, serving_proxies_for_parents};
-use super::{
-    OperatorAggregator, internal_error, json_response, not_found, pod_base_url, service_unavailable,
-};
+use super::{OperatorAggregator, internal_error, json_response, not_found, service_unavailable};
 use crate::gw_types::{self, HttpRoute};
-use crate::routes_dto::{ProxyCheck, ProxyRoutes, RouteCheck, RouteKey, RoutesResponse};
 
 impl OperatorAggregator {
     /// `GET /api/v1/routing/routes/{kind}/{namespace}/{name}` — kind-dispatching
@@ -171,189 +165,6 @@ impl OperatorAggregator {
             v["load_balancer"] = serde_json::Value::String(load_balancer);
         }
         json_response(v.to_string())
-    }
-
-    /// `GET …/routes/{kind}/{ns}/{name}/check` — on-demand data-plane
-    /// consistency check against the controller for a single route.
-    ///
-    /// Everything else on the route detail page reflects the *controller's*
-    /// view (status, conditions, `/problems`). This is the one check that asks
-    /// each proxy directly. It targets only the proxies that *should* serve the
-    /// route — the shared pool, or the dedicated proxies of the route's parent
-    /// Gateways (matched by the `gateway-name` label) — fans out to their
-    /// `/api/v1/routes`, and diffs the route-tagged rows across them: a proxy missing a
-    /// row its peers have is drift.
-    ///
-    /// # Errors
-    ///
-    /// 400 for an unknown kind, 404 when the route does not exist, 503 when the
-    /// Kubernetes client is unavailable, 500 for other Kubernetes errors.
-    pub(crate) async fn check_route(
-        &self,
-        kind: &str,
-        namespace: &str,
-        name: &str,
-    ) -> Response<Vec<u8>> {
-        let Some(spec_key) = route_kind_key(kind) else {
-            return not_found();
-        };
-
-        let kube = match self.kube().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "kube client unavailable for route check");
-                return service_unavailable("kubernetes client not available");
-            }
-        };
-
-        // Resolve which proxies should serve this route. HTTPRoute follows its
-        // parent Gateways (dedicated → those pods, otherwise the shared pool);
-        // Ingress is always served by the shared pool.
-        let snapshot = self.fleet.load();
-        let serving: Vec<FleetEntry> = match kind {
-            "httproute" => {
-                let api: Api<HttpRoute> = Api::namespaced(kube.clone(), namespace);
-                let route = match api.get(name).await {
-                    Ok(r) => r,
-                    Err(kube::Error::Api(e)) if e.code == 404 => return not_found(),
-                    Err(e) => {
-                        tracing::warn!(error = %e, namespace, name, "K8s GET HTTPRoute (check) failed");
-                        return internal_error();
-                    }
-                };
-                let parents = route.spec.parent_refs.as_deref().unwrap_or_default();
-                serving_proxies_for_parents(&snapshot, namespace, parents)
-            }
-            "ingress" => {
-                let api: Api<Ingress> = Api::namespaced(kube.clone(), namespace);
-                match api.get(name).await {
-                    Ok(_) => {}
-                    Err(kube::Error::Api(e)) if e.code == 404 => return not_found(),
-                    Err(e) => {
-                        tracing::warn!(error = %e, namespace, name, "K8s GET Ingress (check) failed");
-                        return internal_error();
-                    }
-                }
-                snapshot.shared_proxies.clone()
-            }
-            _ => return not_found(),
-        };
-
-        let pod_results = self.fan_out_routes_to(&serving).await;
-
-        // Pass 1: per-pod route-tagged rows + the union of (host, path, backend)
-        // keys seen across all reachable serving proxies — the expected set.
-        let mut union: Vec<RouteKey> = Vec::new();
-        let mut union_seen: std::collections::HashSet<RouteKey> = std::collections::HashSet::new();
-        let mut pod_rows: Vec<(String, Option<Vec<_>>)> = Vec::new();
-        for pr in &pod_results {
-            let Some(routes) = &pr.routes else {
-                pod_rows.push((pr.pod_name.clone(), None));
-                continue;
-            };
-            let rows = route_rows_for(routes, spec_key, namespace, name);
-            for r in &rows {
-                let key = row_key(r);
-                if union_seen.insert(key.clone()) {
-                    union.push(key);
-                }
-            }
-            pod_rows.push((pr.pod_name.clone(), Some(rows)));
-        }
-
-        // Pass 2: per-pod present rows (flagging dead backends) + the union keys
-        // each pod is missing. Any unreachable pod, any missing key, or a route
-        // absent from every proxy means the data plane disagrees.
-        let mut consistent = !union.is_empty();
-        let mut proxies: Vec<ProxyCheck> = Vec::new();
-        for (pod_name, rows) in pod_rows {
-            let Some(rows) = rows else {
-                consistent = false;
-                proxies.push(ProxyCheck {
-                    pod_name,
-                    reachable: false,
-                    rows: None,
-                    missing: None,
-                });
-                continue;
-            };
-            let present: std::collections::HashSet<RouteKey> = rows.iter().map(row_key).collect();
-            let missing: Vec<RouteKey> = union
-                .iter()
-                .filter(|k| !present.contains(*k))
-                .cloned()
-                .collect();
-            if !missing.is_empty() {
-                consistent = false;
-            }
-            proxies.push(ProxyCheck {
-                pod_name,
-                reachable: true,
-                rows: Some(rows),
-                missing: Some(missing),
-            });
-        }
-
-        json_response(
-            serde_json::json!(RouteCheck {
-                kind: kind.to_owned(),
-                namespace: namespace.to_owned(),
-                name: name.to_owned(),
-                consistent,
-                expected: union,
-                proxies,
-            })
-            .to_string(),
-        )
-    }
-
-    /// Fan out `GET /api/v1/routes` to all proxy pods in parallel.
-    ///
-    /// Returns one [`ProxyRoutes`] per pod: the parsed body when the pod responds,
-    /// or `routes: None` (`reachable: false`) on timeout, error, or unparseable body.
-    pub(super) async fn fan_out_routes(&self) -> Vec<ProxyRoutes> {
-        let snapshot = self.fleet.load();
-        let entries: Vec<FleetEntry> = snapshot
-            .shared_proxies
-            .iter()
-            .chain(&snapshot.dedicated_proxies)
-            .cloned()
-            .collect();
-        self.fan_out_routes_to(&entries).await
-    }
-
-    /// Fan out `GET /api/v1/routes` to a specific set of proxy pods in parallel —
-    /// the check path targets only the proxies that should serve a given route,
-    /// not the whole fleet.
-    async fn fan_out_routes_to(&self, entries: &[FleetEntry]) -> Vec<ProxyRoutes> {
-        let http = &self.http;
-        let futures: Vec<_> = entries
-            .iter()
-            .map(|e| {
-                let url = format!("{}/api/v1/routes", pod_base_url(e));
-                let pod_name = e.pod_name.clone();
-                async move {
-                    // `routes` is `Some` only when the pod responds 2xx with a body
-                    // that parses into the typed contract; anything else is unreachable.
-                    let routes = match http
-                        .get(&url)
-                        .send()
-                        .await
-                        .ok()
-                        .filter(|r| r.status().is_success())
-                    {
-                        Some(resp) => resp.json::<RoutesResponse>().await.ok(),
-                        None => None,
-                    };
-                    ProxyRoutes {
-                        pod_name,
-                        reachable: routes.is_some(),
-                        routes,
-                    }
-                }
-            })
-            .collect();
-        join_all(futures).await
     }
 }
 
@@ -582,12 +393,13 @@ fn ingress_rules_json(spec: &k8s_openapi::api::networking::v1::IngressSpec) -> s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routes_dto::{ProxyRoutes, RoutesResponse};
 
     // ── routes JSON parse ─────────────────────────────────────────────────────
 
     #[test]
     fn routes_response_parses_proxy_routes_shape() {
-        // Simulates the body returned by a proxy pod's GET /api/v1/routes.
+        // Simulates a `RoutesResponse` built from a proxy's local routing tables.
         let raw = serde_json::json!({
             "ingress": {
                 "hosts": [
@@ -618,7 +430,7 @@ mod tests {
         assert_eq!(parsed.ingress.hosts[0].routes[0].kind, "prefix");
         assert!(parsed.gateway.hosts.is_empty());
 
-        // ...and the fan-out envelope round-trips it (reachable mirrors routes presence).
+        // ...and the per-proxy envelope round-trips it (reachable mirrors routes presence).
         let envelope = ProxyRoutes {
             pod_name: "proxy-0".to_owned(),
             reachable: true,

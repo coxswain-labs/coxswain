@@ -63,8 +63,8 @@ Common causes for the **proxy** being `Pending`:
 ## Routes are not being picked up
 
 ```bash
-# Check the routing table
-curl -s http://localhost:8082/api/v1/routes | jq .
+# Check the routing table — served from the controller's admin port, not the proxy's
+curl -s http://<controller-admin-address>:8082/api/v1/fleet/proxies/<pod-name>/routes | jq .
 
 # Check HTTPRoute status
 kubectl describe httproute my-route
@@ -85,7 +85,7 @@ Status:
       Type:                  ResolvedRefs
 ```
 
-And in `curl -s http://localhost:8082/api/v1/routes | jq .` the host entry will either be absent or show no upstream addresses.
+And in the routes query above, the host entry will either be absent or show no upstream addresses.
 
 ## TLS certificate is not being served
 

@@ -1,17 +1,18 @@
-//! Typed serde model of the proxy `/api/v1/routes` wire contract and the
-//! aggregator response payloads built from it (`/api/v1/problems`, route `…/check`).
+//! Typed serde model of a proxy's compiled routing table
+//! (`fleet/proxies/{name}/routes|facets`) and the aggregator response
+//! payloads built from it (`/api/v1/problems`).
 //!
-//! One struct set is shared across both ends of the boundary: `AdminServer::routes_block`
-//! (the producer, running on proxy pods) serialises these types, and the controller
-//! aggregator (`aggregator::{routing,problems,route_check}`) deserialises them. That
-//! turns a producer-side field rename into a compile error instead of a silently broken
-//! aggregation — the previous code re-parsed the JSON stringly via `as_str().unwrap_or("")`.
+//! One struct set spans both producer and consumer: `aggregator::proxies::routes_block`
+//! builds these types from the controller's own local routing snapshot (#537),
+//! and `aggregator::{routing,problems}` consume them. That turns a field rename
+//! into a compile error instead of a silently broken aggregation — the previous
+//! code re-parsed the JSON stringly via `as_str().unwrap_or("")`.
 //!
 //! Shapes mirror the schemas in `api/openapi.yaml` (`RouteBlock`,
-//! `Problems`/`Problem`, and the route-check response); keep both in sync. Object-key
-//! ordering is not part of the contract — serde emits fields in declaration order, the
-//! previous `serde_json::json!` path emitted them key-sorted; every consumer parses JSON,
-//! so this is structurally identical.
+//! `Problems`/`Problem`); keep both in sync. Object-key ordering is not part of
+//! the contract — serde emits fields in declaration order, the previous
+//! `serde_json::json!` path emitted them key-sorted; every consumer parses
+//! JSON, so this is structurally identical.
 //!
 //! These types are `pub(crate)` (crate-internal, not a cross-crate API), so they are
 //! exempt from the `#[non_exhaustive]` stability gate and are constructed via field
@@ -20,11 +21,11 @@
 use coxswain_core::routing::{RouteConflict, RouteInfo};
 use serde::{Deserialize, Serialize};
 
-// ── Wire payload: GET /api/v1/routes ──────────────────────────────────────────
+// ── Compiled routing table: fleet/proxies/{name}/routes ───────────────────────
 
-/// Top-level `/api/v1/routes` body: one [`RouteBlock`] per routing surface. A
-/// missing surface deserialises to an empty block (tolerant reader — the producer
-/// always emits both).
+/// A proxy's compiled routing table: one [`RouteBlock`] per routing surface. A
+/// missing surface deserialises to an empty block (tolerant reader — the
+/// producer always emits both).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct RoutesResponse {
     #[serde(default)]
@@ -133,11 +134,12 @@ impl ConflictRow {
     }
 }
 
-// ── Aggregator fan-out envelope (admin-internal) ──────────────────────────────
+// ── Aggregator per-proxy envelope (admin-internal) ────────────────────────────
 
-/// One proxy's `/api/v1/routes` fan-out result: the parsed body, or `None` when the
-/// pod was unreachable or returned an unparseable response. `reachable` mirrors
-/// `routes.is_some()`.
+/// One proxy's local-snapshot routing view (#537): `pod_name` plus its
+/// [`RoutesResponse`], or `None` when the pod isn't a known fleet member.
+/// `reachable` mirrors `routes.is_some()` — a vestige of the pre-#537 HTTP
+/// fan-out envelope, kept for API/UI shape compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ProxyRoutes {
     pub(crate) pod_name: String,
@@ -181,57 +183,12 @@ pub(crate) struct RouteRef {
     pub(crate) name: String,
 }
 
-// ── Output: route …/check ─────────────────────────────────────────────────────
-
-/// `…/routes/{kind}/{ns}/{name}/check` response: the union of expected route keys
-/// and each serving proxy's view of them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RouteCheck {
-    pub(crate) kind: String,
-    pub(crate) namespace: String,
-    pub(crate) name: String,
-    pub(crate) consistent: bool,
-    pub(crate) expected: Vec<RouteKey>,
-    pub(crate) proxies: Vec<ProxyCheck>,
-}
-
-/// `(host, path, backend_group)` identity of a compiled route; also the set-membership
-/// key when diffing rows across proxies.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct RouteKey {
-    pub(crate) host: String,
-    pub(crate) path: String,
-    pub(crate) backend_group: String,
-}
-
-/// One serving proxy's view in a route check. `rows`/`missing` are absent when the
-/// pod is unreachable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct ProxyCheck {
-    pub(crate) pod_name: String,
-    pub(crate) reachable: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) rows: Option<Vec<CheckRow>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) missing: Option<Vec<RouteKey>>,
-}
-
-/// A route row present on a proxy, flagged `dead` when it serves zero endpoints.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct CheckRow {
-    pub(crate) host: String,
-    pub(crate) path: String,
-    pub(crate) backend_group: String,
-    pub(crate) endpoints: Vec<String>,
-    pub(crate) dead: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A representative proxy `/api/v1/routes` body (unfiltered variant: no
-    /// `total`/`returned`/`offset`), as the aggregator fans out without params.
+    /// A representative `RoutesResponse` body (unfiltered variant: no
+    /// `total`/`returned`/`offset`), as built without list params.
     fn sample_unfiltered() -> serde_json::Value {
         serde_json::json!({
             "ingress": {

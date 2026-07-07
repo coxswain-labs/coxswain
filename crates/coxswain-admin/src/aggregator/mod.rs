@@ -24,7 +24,9 @@ use std::time::Duration;
 use tokio::sync::{OnceCell, Semaphore};
 
 use coxswain_core::cluster::SharedClusterSummary;
+use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
 use coxswain_core::node_registry::SharedNodeRegistry;
+use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
 
 mod controllers;
 mod gateways;
@@ -33,7 +35,6 @@ mod manifests;
 mod pod_logs;
 mod problems;
 mod proxies;
-mod route_check;
 mod routing;
 mod topology;
 
@@ -54,6 +55,21 @@ pub struct OperatorAggregator {
     /// Connected proxy node registry, populated by the discovery server.
     /// `None` in dev and proxy roles (discovery not active).
     node_registry: Option<SharedNodeRegistry>,
+    /// The controller's own shared-pool Ingress routing table — the same
+    /// [`Shared`](coxswain_core::Shared) cell fed to the discovery server and
+    /// pushed to every `SharedPool`-scoped proxy. Backs the local re-source of
+    /// `fleet/proxies/{name}/routes|facets` (#537) for shared-pool pods,
+    /// instead of an HTTP fan-out to the pod.
+    ingress_routes: SharedIngressRoutingTable,
+    /// The controller's own shared-pool Gateway-API routing table. See
+    /// [`Self::ingress_routes`].
+    gateway_routes: SharedGatewayRoutingTable,
+    /// Per-Gateway dedicated routing snapshots, keyed by the owning Gateway's
+    /// [`ObjectKey`](coxswain_core::ownership::ObjectKey). Backs the local
+    /// re-source of `fleet/proxies/{name}/routes|facets` for dedicated-proxy
+    /// pods. A Gateway absent from the registry (e.g. a cutover still in
+    /// flight) reads as an empty routing table, not an error.
+    dedicated_registry: DedicatedRoutingRegistry,
     /// Kubernetes client, initialised lazily on the first K8s-backed request.
     kube: OnceCell<Client>,
     /// Apiserver GitVersion (e.g. `v1.31.2`), fetched once from the `/version`
@@ -70,18 +86,25 @@ pub struct OperatorAggregator {
 const MAX_CONCURRENT_LOG_STREAMS: usize = 8;
 
 impl OperatorAggregator {
-    /// Construct an aggregator with the given fleet, cluster, and node-registry
-    /// handles.
+    /// Construct an aggregator with the given fleet, cluster, node-registry,
+    /// and routing-table handles.
     ///
     /// `node_registry` is `Some` on controller roles (discovery is active) and
-    /// `None` on dev/proxy roles.  Installs the `ring` rustls crypto provider
-    /// (idempotent) so the reqwest client can be built; fan-out targets are
-    /// plain HTTP and TLS is never exercised at request time.
+    /// `None` on dev/proxy roles. `ingress_routes`/`gateway_routes`/
+    /// `dedicated_registry` are the same cells the controller feeds to the
+    /// discovery server (#537) — this aggregator never fans out to a proxy
+    /// pod to answer "what does it serve", it reads its own copy of what it
+    /// pushed. Installs the `ring` rustls crypto provider (idempotent) so the
+    /// reqwest client can be built; the remaining fan-out targets (pod
+    /// health/logs) are plain HTTP and TLS is never exercised at request time.
     #[must_use]
     pub fn new(
         fleet: SharedFleet,
         cluster: SharedClusterSummary,
         node_registry: Option<SharedNodeRegistry>,
+        ingress_routes: SharedIngressRoutingTable,
+        gateway_routes: SharedGatewayRoutingTable,
+        dedicated_registry: DedicatedRoutingRegistry,
     ) -> Self {
         // reqwest 0.13 uses rustls-no-provider; install ring as the
         // process-default provider. The call is idempotent — the `Err`
@@ -99,6 +122,9 @@ impl OperatorAggregator {
             fleet,
             cluster,
             node_registry,
+            ingress_routes,
+            gateway_routes,
+            dedicated_registry,
             kube: OnceCell::new(),
             k8s_version: OnceCell::new(),
             log_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOG_STREAMS)),
@@ -380,24 +406,12 @@ pub(super) mod tests {
     ///
     /// Struct literal is allowed here because tests live inside the defining
     /// crate (`#[non_exhaustive]` only blocks external-crate construction).
+    /// Routing tables/registry always default to empty.
     pub(crate) fn make_agg(
         fleet: SharedFleet,
         cluster: SharedClusterSummary,
     ) -> OperatorAggregator {
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_millis(200))
-            .build()
-            .unwrap_or_else(|e| panic!("invariant: {e}"));
-        OperatorAggregator {
-            http,
-            fleet,
-            cluster,
-            node_registry: None,
-            kube: OnceCell::new(),
-            k8s_version: OnceCell::new(),
-            log_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOG_STREAMS)),
-        }
+        make_agg_full(fleet, cluster, None)
     }
 
     /// Build an [`OperatorAggregator`] with a populated [`SharedNodeRegistry`]
@@ -407,6 +421,14 @@ pub(super) mod tests {
         cluster: SharedClusterSummary,
         node_registry: SharedNodeRegistry,
     ) -> OperatorAggregator {
+        make_agg_full(fleet, cluster, Some(node_registry))
+    }
+
+    fn make_agg_full(
+        fleet: SharedFleet,
+        cluster: SharedClusterSummary,
+        node_registry: Option<SharedNodeRegistry>,
+    ) -> OperatorAggregator {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_millis(200))
@@ -416,7 +438,10 @@ pub(super) mod tests {
             http,
             fleet,
             cluster,
-            node_registry: Some(node_registry),
+            node_registry,
+            ingress_routes: SharedIngressRoutingTable::new(),
+            gateway_routes: SharedGatewayRoutingTable::new(),
+            dedicated_registry: DedicatedRoutingRegistry::new(),
             kube: OnceCell::new(),
             k8s_version: OnceCell::new(),
             log_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOG_STREAMS)),

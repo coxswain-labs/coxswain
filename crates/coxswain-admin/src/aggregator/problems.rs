@@ -7,12 +7,14 @@ use coxswain_core::cluster::{CategorySummary, Severity};
 use coxswain_core::fleet::FleetEntry;
 use futures::future::join_all;
 
+use super::proxies::routes_block;
 use super::{OperatorAggregator, json_response, non_ready_checks, pod_base_url};
-use crate::routes_dto::{Problem, ProxyRoutes, RouteRef, RoutingProblems};
+use crate::page::ListParams;
+use crate::routes_dto::{Problem, ProxyRoutes, RouteRef, RoutesResponse, RoutingProblems};
 
 impl OperatorAggregator {
-    /// `GET /api/v1/problems` — cluster-wide routing problems derived from
-    /// fan-out to all proxy `/api/v1/routes` endpoints.
+    /// `GET /api/v1/problems` — cluster-wide routing problems derived from the
+    /// controller's own local routing snapshot (#537).
     ///
     /// Cross-cutting problem aggregate, namespaced by the two API axes (#301):
     /// ```json
@@ -22,16 +24,48 @@ impl OperatorAggregator {
     /// }
     /// ```
     ///
-    /// `routing` conflicts/dead-routes come from fanning out to every proxy's
-    /// `/api/v1/routes` (deduped, `kind`-tagged). `fleet` classes come from probing each
+    /// `routing` conflicts/dead-routes come from [`Self::local_proxy_routes`]
+    /// (deduped, `kind`-tagged) rather than a fan-out — no proxy query surface
+    /// remains beyond metrics. `fleet` classes still come from probing each
     /// pod's `/api/v1/health`: `unreachable` pods don't answer, `degraded` pods
     /// answer with failing checks, and `leaderless` is `true` when no reachable
     /// controller reports `leader`. The operator UI renders this directly rather
     /// than re-deriving severity client-side.
     pub(crate) async fn list_problems(&self) -> Response<Vec<u8>> {
-        let (raw, fleet) = tokio::join!(self.fan_out_routes(), self.fleet_problems());
+        let raw = self.local_proxy_routes();
+        let fleet = self.fleet_problems().await;
         let routing = aggregate_problems(&raw);
         json_response(serde_json::json!({ "fleet": fleet, "routing": routing }).to_string())
+    }
+
+    /// Build a [`ProxyRoutes`] entry for every shared + dedicated proxy pod
+    /// from the controller's own local routing state (#537) — no HTTP
+    /// involved. Shared-pool pods all share one identical compiled table
+    /// (read once per pod, cheap in-memory work, not a network round-trip);
+    /// each dedicated pod reads its owning Gateway's registry entry via
+    /// [`super::proxies::OperatorAggregator::local_route_tables`]. `reachable`
+    /// is always `true` — this is a local read, not a liveness probe.
+    /// Mirrors the shape the old per-pod HTTP fan-out produced, so
+    /// [`aggregate_problems`]'s dedup logic is unchanged.
+    fn local_proxy_routes(&self) -> Vec<ProxyRoutes> {
+        let snapshot = self.fleet.load();
+        let full = ListParams::default();
+        snapshot
+            .shared_proxies
+            .iter()
+            .chain(&snapshot.dedicated_proxies)
+            .map(|e| {
+                let (ingress, gateway) = self.local_route_tables(e);
+                ProxyRoutes {
+                    pod_name: e.pod_name.clone(),
+                    reachable: true,
+                    routes: Some(RoutesResponse {
+                        ingress: routes_block(&ingress, &full),
+                        gateway: routes_block(&gateway, &full),
+                    }),
+                }
+            })
+            .collect()
     }
 
     /// Probe every coxswain pod's `/api/v1/health` and bucket the fleet problem
@@ -135,9 +169,9 @@ impl OperatorAggregator {
     }
 }
 
-/// De-dupe and aggregate fanned-out proxy `/api/v1/routes` results into the
+/// De-dupe and aggregate per-proxy [`ProxyRoutes`] results into the
 /// `/api/v1/problems` payload. Split out from [`OperatorAggregator::list_problems`]
-/// so it is unit-testable without a live fan-out.
+/// so it is unit-testable without touching the fleet snapshot.
 ///
 /// Shared proxies carry an identical table, so each problem is keyed by
 /// `(host, path, group, kind)` and de-duped across pods; `pods` lists which
@@ -259,7 +293,34 @@ fn aggregate_problems(raw: &[ProxyRoutes]) -> RoutingProblems {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aggregator::tests::*;
     use crate::routes_dto::ProxyRoutes;
+    use coxswain_core::cluster::SharedClusterSummary;
+
+    // ── local_proxy_routes (#537) ─────────────────────────────────────────────
+
+    #[test]
+    fn local_proxy_routes_attributes_every_shared_and_dedicated_pod() {
+        // No mock HTTP server: local_proxy_routes reads the aggregator's own
+        // (default-empty) table cells directly, one entry per fleet pod.
+        let pods = [
+            make_pod("shared-0", "shared-proxy", "10.0.0.1", "8082", None),
+            make_pod("shared-1", "shared-proxy", "10.0.0.2", "8082", None),
+            make_pod("ded-0", "dedicated-proxy", "10.0.0.3", "8082", Some("gw-a")),
+        ];
+        let agg = make_agg(fleet_with(pods), SharedClusterSummary::default());
+
+        let raw = agg.local_proxy_routes();
+        let mut names: Vec<&str> = raw.iter().map(|p| p.pod_name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["ded-0", "shared-0", "shared-1"]);
+        // Every entry is a local read — always reachable, always carries a body,
+        // never the `routes: None` shape an HTTP timeout used to produce.
+        assert!(
+            raw.iter().all(|p| p.reachable && p.routes.is_some()),
+            "local read never reports unreachable"
+        );
+    }
 
     /// Build a fake proxy-routes fan-out result for list_problems testing.
     fn fake_routes_result(

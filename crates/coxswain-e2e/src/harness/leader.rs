@@ -14,6 +14,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::Pod;
+use kube::api::ListParams;
 use kube::{Api, Client};
 
 use super::controller::{free_port, start_port_forward};
@@ -46,6 +47,31 @@ pub async fn leader_pod_name(client: &Client) -> anyhow::Result<String> {
         .and_then(|s| s.holder_identity)
         .filter(|h| !h.is_empty())
         .ok_or_else(|| anyhow::anyhow!("Lease {LEASE_NAME} has no holderIdentity (no leader)"))
+}
+
+/// Resolve the name of a live shared-proxy pod (#537).
+///
+/// Needed to target the controller's per-proxy routes view
+/// (`fleet/proxies/{pod}/routes`) — the proxy no longer serves its own
+/// `/api/v1/routes`, so tests that used to hit it directly via `admin_url`
+/// now go through the controller and need a pod name to ask about. Returns
+/// the first matching pod; the harness's default install runs one shared-proxy
+/// replica, so there is no ambiguity to resolve.
+///
+/// # Errors
+///
+/// Fails if the pod list request errors, or if no shared-proxy pod exists.
+#[must_use = "the pod name is needed to build the controller's per-proxy routes URL"]
+pub async fn shared_proxy_pod_name(client: &Client) -> anyhow::Result<String> {
+    let api: Api<Pod> = Api::namespaced(client.clone(), SYSTEM_NAMESPACE);
+    let list = api
+        .list(&ListParams::default().labels("app.kubernetes.io/component=shared-proxy"))
+        .await
+        .context("list shared-proxy pods")?;
+    list.items
+        .into_iter()
+        .find_map(|p| p.metadata.name)
+        .ok_or_else(|| anyhow::anyhow!("no shared-proxy pod found in {SYSTEM_NAMESPACE}"))
 }
 
 /// Wait until the Lease is held by a pod other than `old_holder` AND that pod

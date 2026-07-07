@@ -275,7 +275,7 @@ async fn backend_policy_least_conn_routes_more_to_fast_upstream() -> anyhow::Res
     // BOTH lb-pool endpoints must be compiled before the burst, else the
     // distribution assertions are decided by whichever endpoint landed first.
     wait::wait_for_route_endpoints(
-        &h.admin_url("/api/v1/routes"),
+        &h.shared_proxy_routes_url().await?,
         &host,
         2,
         Duration::from_secs(60),
@@ -1755,7 +1755,7 @@ async fn least_conn_sends_more_requests_to_the_fast_upstream() -> anyhow::Result
     // first. lb-slow (go-httpbin) sets no POD_NAME, so count endpoints via the
     // admin route table rather than by sampling distinct pod names.
     wait::wait_for_route_endpoints(
-        &h.admin_url("/api/v1/routes"),
+        &h.shared_proxy_routes_url().await?,
         &host,
         2,
         Duration::from_secs(60),
@@ -1858,7 +1858,7 @@ async fn ip_hash_pins_a_client_to_one_upstream() -> anyhow::Result<()> {
     // A single hash key can't sample the whole set, so confirm both endpoints are
     // compiled into the proxy route table before pinning the baseline.
     wait::wait_for_route_endpoints(
-        &h.admin_url("/api/v1/routes"),
+        &h.shared_proxy_routes_url().await?,
         &host,
         2,
         Duration::from_secs(60),
@@ -1931,7 +1931,7 @@ async fn same_uri_always_reaches_the_same_upstream() -> anyhow::Result<()> {
     // A single hash key can't sample the whole set, so confirm both endpoints are
     // compiled into the proxy route table before pinning the baseline.
     wait::wait_for_route_endpoints(
-        &h.admin_url("/api/v1/routes"),
+        &h.shared_proxy_routes_url().await?,
         &host,
         2,
         Duration::from_secs(60),

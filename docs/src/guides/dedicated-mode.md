@@ -137,10 +137,11 @@ cargo run --bin coxswain -- serve proxy --dedicated \
   --log-format console
 ```
 
-Verify only that Gateway's routes are loaded:
+Verify only that Gateway's routes are loaded — via the controller's admin port, naming this
+dedicated proxy's pod (the proxy itself carries no routes query surface, #537):
 
 ```bash
-curl -s http://localhost:8082/api/v1/routes | jq .
+curl -s http://<controller-admin-address>:8082/api/v1/fleet/proxies/<pod-name>/routes | jq .
 ```
 
 The output lists exactly the hosts the target Gateway's HTTPRoutes serve; Ingress routes and routes

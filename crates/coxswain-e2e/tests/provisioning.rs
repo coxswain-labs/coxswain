@@ -516,11 +516,12 @@ async fn lifecycle_dedicated_proxy_routes_traffic() -> anyhow::Result<()> {
     // docs/src/guides/running-in-production.md — "removed ports … socket is
     // released"). With this the only Gateway, the shared proxy unbinds the gateway
     // port entirely, so a data-plane probe is TCP-refused, never a 404. The
-    // relinquish is faithfully observed as the host leaving `/api/v1/routes`.
-    let routes_url = h.admin_url("/api/v1/routes");
+    // relinquish is faithfully observed as the host leaving the controller's
+    // per-proxy routes view (#537) — the same intent the shared pool was pushed.
+    let routes_url = h.shared_proxy_routes_url().await?;
     let client = reqwest::Client::new();
     let still_serving = |json: &serde_json::Value, host: &str| -> bool {
-        json["gateway"]["hosts"]
+        json["routes"]["gateway"]["hosts"]
             .as_array()
             .is_some_and(|hosts| hosts.iter().any(|e| e["host"].as_str() == Some(host)))
     };

@@ -138,7 +138,9 @@ impl Harness {
     }
 
     /// Build an admin endpoint URL targeting the shared-proxy pod
-    /// (e.g. `admin_url("/api/v1/routes")`).
+    /// (e.g. `admin_url("/metrics")`). The proxy carries no query surface of
+    /// its own beyond `/metrics` and `/api/v1/health` (#537) — routing views
+    /// live on the controller; see [`Self::shared_proxy_routes_url`].
     pub fn admin_url(&self, path: &str) -> String {
         format!("http://{}{path}", self.controller.admin_addr)
     }
@@ -147,5 +149,23 @@ impl Harness {
     /// Use for controller-specific paths like `/api/v1/routing/gateways`.
     pub fn controller_admin_url(&self, path: &str) -> String {
         format!("http://{}{path}", self.controller.controller_admin_addr)
+    }
+
+    /// Build the controller's per-proxy routes URL for the (single, by
+    /// default) shared-proxy pod: `fleet/proxies/{pod}/routes` (#537).
+    ///
+    /// Replaces the old direct `admin_url("/api/v1/routes")` — the proxy no
+    /// longer serves that endpoint; the controller answers from its own local
+    /// routing snapshot instead. The response nests one level deeper than the
+    /// old proxy-local shape: `{"pod_name", "reachable", "routes": {"ingress",
+    /// "gateway"}}` rather than a bare `{"ingress", "gateway"}`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if no shared-proxy pod can be resolved (see
+    /// [`leader::shared_proxy_pod_name`]).
+    pub async fn shared_proxy_routes_url(&self) -> anyhow::Result<String> {
+        let pod = leader::shared_proxy_pod_name(&self.client).await?;
+        Ok(self.controller_admin_url(&format!("/api/v1/fleet/proxies/{pod}/routes")))
     }
 }

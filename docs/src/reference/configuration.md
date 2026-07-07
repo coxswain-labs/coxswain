@@ -68,7 +68,7 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_INGRESS_HTTPS_PORT` | `--ingress-https-port` | _(none)_ | Port for inbound HTTPS traffic (SNI TLS); unset to bind no static Ingress HTTPS listener |
 | `COXSWAIN_LOG` | `--log` | `info` | Log level; supports `RUST_LOG` directive syntax (e.g. `info,coxswain=debug`) |
 | `COXSWAIN_LOG_FORMAT` | `--log-format` | `json` | `json` (production) or `console` (human-readable) |
-| `COXSWAIN_MANAGEMENT_BIND_ADDRESS` | `--management-bind-address` | `0.0.0.0` | IP the health (`/healthz`, `/readyz`) and admin (`/metrics`, `/api/v1/routes`) servers bind to |
+| `COXSWAIN_MANAGEMENT_BIND_ADDRESS` | `--management-bind-address` | `0.0.0.0` | IP the health (`/healthz`, `/readyz`) and admin (`/metrics`, `/api/v1/health`) servers bind to |
 | `COXSWAIN_INGRESS_ACCEPT_PROXY_PROTOCOL` | `--ingress-accept-proxy-protocol` | `false` | Require HAProxy PROXY v1/v2 on **Ingress** inbound connections; must be combined with `--ingress-proxy-trusted-sources`. Note: h2c prior-knowledge and h2 ALPN are not available on PROXY-wrapped connections (h1-only on that path). Gateway listeners use `ClientTrafficPolicy` instead (see below). |
 | `COXSWAIN_PROXY_BIND_ADDRESS` | `--proxy-bind-address` | `0.0.0.0` | IP the data-plane HTTP/HTTPS proxy listeners bind to; health and admin bind separately via `--management-bind-address` |
 | `COXSWAIN_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT` | `--proxy-default-backend-request-timeout` | _(none)_ | Default upstream-only timeout when `HTTPRouteRule.timeouts.backendRequest` is not set |
@@ -94,7 +94,7 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | HTTP proxy | _(none)_ | `COXSWAIN_INGRESS_HTTP_PORT` | Inbound HTTP data plane |
 | HTTPS proxy | _(none)_ | `COXSWAIN_INGRESS_HTTPS_PORT` | Inbound HTTPS data plane (SNI TLS) |
 | Health | `8081` | `COXSWAIN_HEALTH_PORT` | `/healthz`, `/readyz` |
-| Admin | `8082` | `COXSWAIN_ADMIN_PORT` | `/metrics`, `/api/v1/routes`, `/api/v1/health` |
+| Admin | `8082` | `COXSWAIN_ADMIN_PORT` | `/metrics`, `/api/v1/health` (controller role also serves `/api/v1/{fleet,routing,problems,...}`) |
 | Discovery (Stream) | `50051` | `COXSWAIN_DISCOVERY_PORT` | _(controller)_ mTLS gRPC routing-snapshot stream |
 | Bootstrap | `50052` | `COXSWAIN_DISCOVERY_BOOTSTRAP_PORT` | _(controller)_ server-auth gRPC SVID issuance |
 
@@ -173,7 +173,7 @@ for the model, CA provisioning modes (`auto` / `external` + cert-manager / BYO),
 SVID rotation, and troubleshooting.
 
 !!! note
-    The data plane and the management surface bind independently: `COXSWAIN_PROXY_BIND_ADDRESS` for the HTTP/HTTPS proxy listeners, and `COXSWAIN_MANAGEMENT_BIND_ADDRESS` for the health and admin servers. Both default to `0.0.0.0`; set the management address to a management-network IP to keep `/metrics`, `/api/v1/routes`, and the health endpoints off the data-plane interface.
+    The data plane and the management surface bind independently: `COXSWAIN_PROXY_BIND_ADDRESS` for the HTTP/HTTPS proxy listeners, and `COXSWAIN_MANAGEMENT_BIND_ADDRESS` for the health and admin servers. Both default to `0.0.0.0`; set the management address to a management-network IP to keep `/metrics`, `/api/v1/health`, and the health endpoints off the data-plane interface.
 
 ## Leader election
 
