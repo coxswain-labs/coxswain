@@ -141,7 +141,7 @@ fn route_entry_to_wire(path: &str, kind: RouteKind, e: &RouteEntry) -> p::RouteE
         deny_source_range,
         access_log_enabled: e.access_log_enabled,
         rate_limit: e.rate_limit.as_deref().map(rate_limit_to_wire),
-        auth: e.auth.as_deref().map(auth_to_wire),
+        auth: e.auth.iter().map(|a| auth_to_wire(a)).collect(),
         compression: e.compression.as_deref().map(compression_to_wire),
         forwarded_for: e.forwarded_for.as_deref().map(forwarded_for_to_wire),
         circuit_breaker: e.circuit_breaker.as_deref().map(circuit_breaker_to_wire),
@@ -488,9 +488,10 @@ fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfig {
         IngressAuthConfig::External(ext) => {
             p::ingress_auth_config::Auth::External(p::ExtAuthConfig {
                 timeout: Some(duration_to_wire(ext.timeout)),
+                endpoints: ext.endpoints.iter().map(|a| a.to_string()).collect(),
+                fail_closed: ext.fail_closed,
                 http: Some(match &ext.transport {
                     ExtAuthTransport::Http(h) => p::HttpExtAuthConfig {
-                        url: h.url.to_string(),
                         response_headers: h
                             .response_headers
                             .iter()

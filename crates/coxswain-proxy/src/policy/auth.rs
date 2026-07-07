@@ -27,8 +27,25 @@ use coxswain_core::routing::{ExtAuthTransport, IngressAuthConfig, PasswordHash};
 use pingora_core::Result;
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use zeroize::Zeroizing;
+
+/// Round-robin cursor for spreading ext_authz sub-requests across a resolved
+/// auth service's endpoints. Process-wide and `Relaxed` — approximate fairness
+/// is all that's needed; exact distribution is not a correctness property.
+static EXT_AUTH_RR: AtomicUsize = AtomicUsize::new(0);
+
+/// Pick the next auth endpoint round-robin. `None` only when the slice is
+/// empty (the caller fails closed); a resolved `ExtAuthConfig` is never empty.
+fn pick_endpoint(endpoints: &[SocketAddr]) -> Option<SocketAddr> {
+    match endpoints.len() {
+        0 => None,
+        1 => Some(endpoints[0]),
+        n => Some(endpoints[EXT_AUTH_RR.fetch_add(1, Ordering::Relaxed) % n]),
+    }
+}
 
 // ── Hop-by-hop headers stripped when forwarding to the auth service ──────────
 
@@ -109,10 +126,19 @@ async fn enforce_ext_authz(
     let method_str = req_hdr.method.as_str();
     let method = reqwest::Method::from_bytes(method_str.as_bytes()).unwrap_or(reqwest::Method::GET);
 
-    // The auth URL comes from the annotation; use its path verbatim — this is
-    // the Envoy model (fixed check endpoint) not the nginx model (pass the
-    // whole original URL to a /auth proxy).
-    let url = http_cfg.url.as_ref().to_string();
+    // Send the check to a resolved auth-service endpoint (round-robin), replaying
+    // the original request path — the Envoy `ext_authz`-HTTP model. The proxy
+    // connects to a pod IP directly, the same as every other backend.
+    let Some(addr) = pick_endpoint(&cfg.endpoints) else {
+        tracing::warn!("ext_authz has no resolved endpoints — refusing request (503)");
+        write_simple(session, 503).await?;
+        return Ok(true);
+    };
+    let path_and_query = req_hdr
+        .uri
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str);
+    let url = format!("http://{addr}{path_and_query}");
 
     let mut builder = client.request(method, &url);
 
@@ -139,17 +165,26 @@ async fn enforce_ext_authz(
     let auth_response = match tokio::time::timeout(cfg.timeout, builder.send()).await {
         Ok(Ok(resp)) => resp,
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "ext_authz request failed — refusing (503)");
-            write_simple(session, 503).await?;
-            return Ok(true);
+            // Auth service unreachable/errored: fail closed (503) unless the
+            // operator opted into fail-open (`failClosed: false`).
+            tracing::warn!(error = %e, fail_closed = cfg.fail_closed, "ext_authz request failed");
+            if cfg.fail_closed {
+                write_simple(session, 503).await?;
+                return Ok(true);
+            }
+            return Ok(false);
         }
         Err(_) => {
             tracing::warn!(
                 timeout_ms = cfg.timeout.as_millis(),
-                "ext_authz request timed out — refusing (503)"
+                fail_closed = cfg.fail_closed,
+                "ext_authz request timed out"
             );
-            write_simple(session, 503).await?;
-            return Ok(true);
+            if cfg.fail_closed {
+                write_simple(session, 503).await?;
+                return Ok(true);
+            }
+            return Ok(false);
         }
     };
 

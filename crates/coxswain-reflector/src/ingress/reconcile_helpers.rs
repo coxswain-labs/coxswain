@@ -4,7 +4,7 @@
 //! beside the reconcile entry point but out of it to bound that file's size.
 
 use super::annotations::AnnotationIssue;
-use super::annotations::auth::{AuthAnnotation, parse_htpasswd};
+use super::annotations::auth::{AuthAnnotation, ExtAuthProtocol, parse_htpasswd};
 use crate::endpoints;
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, BasicCredential, ExtAuthConfig, ExtAuthTransport, FilterAction,
@@ -119,6 +119,8 @@ pub(super) fn resolve_mirror_filter(
 pub(super) fn resolve_auth_config(
     annotation: Option<&AuthAnnotation>,
     auth_secrets: &reflector::Store<Secret>,
+    services: &reflector::Store<Service>,
+    slices: &reflector::Store<EndpointSlice>,
     route_id: &str,
     ingress_ns: &str,
     diag: &mut Vec<AnnotationIssue>,
@@ -126,23 +128,57 @@ pub(super) fn resolve_auth_config(
     let ann = annotation?;
     match ann {
         AuthAnnotation::External {
-            url,
+            backend,
+            protocol,
             timeout,
             response_headers,
             always_set_cookie,
+            fail_closed,
         } => {
+            // Resolve the auth-service backendRef to pod endpoints, same as any
+            // other backend. No ready endpoints → fail closed (503).
+            let ns = backend.namespace.as_deref().unwrap_or(ingress_ns);
+            let resolved =
+                endpoints::resolve(ns, &backend.name, i32::from(backend.port), slices, services);
+            if resolved.addrs.is_empty() {
+                tracing::warn!(
+                    ingress = %route_id,
+                    auth_ns = %ns,
+                    auth_svc = %backend.name,
+                    auth_port = backend.port,
+                    "ext-auth-backend resolved to no ready endpoints — failing closed (503)"
+                );
+                return Some(IngressAuthConfig::Unavailable);
+            }
+            let endpoints_arc: Arc<[SocketAddr]> = resolved.addrs.into();
             let resp_hdrs: Arc<[Box<str>]> = response_headers
                 .iter()
                 .map(|s| s.as_str().into())
                 .collect::<Vec<Box<str>>>()
                 .into();
+            let transport = match protocol {
+                ExtAuthProtocol::Http => {
+                    ExtAuthTransport::Http(HttpExtAuthConfig::new(resp_hdrs, *always_set_cookie))
+                }
+                ExtAuthProtocol::Grpc => {
+                    // #23 P4 wires ExtAuthTransport::Grpc here.
+                    tracing::warn!(
+                        ingress = %route_id,
+                        "ext-auth-protocol grpc is not yet supported on Ingress — failing closed (503)"
+                    );
+                    diag.push(AnnotationIssue {
+                        annotation: super::annotations::auth::EXT_AUTH_PROTOCOL,
+                        message: "ext-auth-protocol grpc not yet supported — auth failing closed"
+                            .into(),
+                    });
+                    return Some(IngressAuthConfig::Unavailable);
+                }
+            };
             Some(IngressAuthConfig::External(ExtAuthConfig::new(
                 *timeout,
-                ExtAuthTransport::Http(HttpExtAuthConfig::new(
-                    Arc::from(url.as_str()),
-                    resp_hdrs,
-                    *always_set_cookie,
-                )),
+                endpoints_arc,
+                *fail_closed,
+                transport,
             )))
         }
         AuthAnnotation::Basic(secret_ref) => {

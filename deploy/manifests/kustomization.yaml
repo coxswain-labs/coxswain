@@ -23,6 +23,7 @@ resources:
   - crds/coxswaingatewayparameters.yaml
   - crds/clienttrafficpolicies.yaml
   - crds/coxswainbackendpolicies.yaml
+  - crds/coxswainexternalauths.yaml
   - crds/ratelimits.yaml
   - crds/pathrewriteregexes.yaml
   - crds/ipaccesscontrols.yaml

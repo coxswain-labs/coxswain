@@ -231,7 +231,11 @@ message RouteEntry {
   MatchPredicates predicates = 11;
   RouteTimeouts timeouts = 12;
   RateLimitConfig rate_limit = 13;
-  IngressAuthConfig auth = 14;
+  // Additive ext_authz chain (#23): every check must pass, in order. A single
+  // Ingress/route check encodes as one element; a Gateway policy + route check
+  // as two. Empty = no auth. (Was a singular message pre-#23; a 1-element
+  // repeated is wire-identical, and controller+proxy ship as a matched pair.)
+  repeated IngressAuthConfig auth = 14;
   CompressionConfig compression = 15;
   ForwardedForConfig forwarded_for = 16;
   CircuitBreakerConfig circuit_breaker = 17;
@@ -544,16 +548,17 @@ message BasicCredList {
   repeated BasicCred credentials = 1;
 }
 
-// Mirrors ExtAuthConfig.
-// ExtAuthTransport has one variant (Http) so the HttpExtAuthConfig is embedded directly.
+// Mirrors ExtAuthConfig. The auth-service backendRef is resolved to `endpoints`
+// ("ip:port") at reconcile time; the proxy connects to one directly.
 message ExtAuthConfig {
   Duration timeout = 1;
-  HttpExtAuthConfig http = 2; // always Http for now; field number reserved for future variants
+  HttpExtAuthConfig http = 2; // present for protocol=HTTP; grpc field added in #23 P4
+  repeated string endpoints = 3; // resolved backendRef pod addresses
+  bool fail_closed = 4; // deny (503) on auth-service error/timeout; resolved from CRD failClosed
 }
 
-// Mirrors HttpExtAuthConfig.
+// Mirrors HttpExtAuthConfig. Check-target endpoints live on ExtAuthConfig.
 message HttpExtAuthConfig {
-  string url = 1;
   bool always_set_cookie = 2;
   repeated string response_headers = 3;
 }
