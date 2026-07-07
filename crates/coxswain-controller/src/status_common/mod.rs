@@ -107,6 +107,33 @@ pub(crate) fn make_condition(
     }
 }
 
+/// Condition `type` values coxswain writes that have no Gateway API constant.
+///
+/// `Programmed` on a route's per-parent status is not a valid
+/// `RouteConditionType` — the spec defines that type only for Gateways and
+/// Listeners, not routes — and `Conflicted` on a policy's `status.ancestors[]`
+/// is not a valid `PolicyConditionType` — GEP-713 documents `Conflicted` as a
+/// *reason* on `Accepted`, not its own condition type. Both are pre-existing
+/// coxswain design choices (#510 left them as string literals rather than
+/// force a nonexistent spec-enum variant); this only gives the literal a
+/// typed, single-definition home instead of five duplicated hand-typed
+/// strings and cross-referencing comments.
+///
+/// Distinct from the *Gateway*-level `Programmed`
+/// (`GatewayConditionType::Programmed` in `gateway-api-types`) — same wire
+/// string, different condition. Do not substitute one for the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CoxswainConditionType {
+    Programmed,
+    Conflicted,
+}
+
+impl std::fmt::Display for CoxswainConditionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
 /// Returns `(has_any_invalid, supported_kinds)` for a listener's
 /// `allowedRoutes.kinds`.
 ///
@@ -408,4 +435,18 @@ pub(crate) fn listener_is_accepted(info: Option<&ListenerInfo>) -> bool {
             readiness,
             ListenerReadiness::Unsupported { .. } | ListenerReadiness::UnsupportedProtocol { .. }
         ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coxswain_condition_type_displays_the_exact_wire_string() {
+        // These are the literal `Condition.type` values written to the API
+        // server — a `Debug`/rename drift here is a wire-format bug, not just
+        // a cosmetic one.
+        assert_eq!(CoxswainConditionType::Programmed.to_string(), "Programmed");
+        assert_eq!(CoxswainConditionType::Conflicted.to_string(), "Conflicted");
+    }
 }

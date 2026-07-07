@@ -3,7 +3,7 @@
 //! Writes `status.ancestors[]` with an `Accepted` condition for each `Service`
 //! targeted by the policy (the ancestor is the targeted Service itself).
 
-use super::conditions::make_condition;
+use super::conditions::{CoxswainConditionType, make_condition};
 use coxswain_core::crd::coxswain_backend_policy::CoxswainBackendPolicy;
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::constants::PolicyConditionType;
@@ -89,11 +89,10 @@ fn build_ancestors(
         now.clone(),
     ))
     .unwrap_or(serde_json::Value::Null);
-    // "Conflicted" is not a GEP-713 `PolicyConditionType` (see the identical
-    // note in `client_traffic_policy_events.rs`) — a pre-existing coxswain
-    // design choice, out of scope for #510.
+    // See `CoxswainConditionType` for why this isn't a `PolicyConditionType`
+    // variant.
     let conflicted_val = serde_json::to_value(make_condition(
-        "Conflicted",
+        CoxswainConditionType::Conflicted,
         con_status,
         con_reason,
         "",

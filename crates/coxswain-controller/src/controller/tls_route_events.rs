@@ -3,7 +3,7 @@
 //! Sibling of `grpc_route_events.rs` — forked for the `TLSRoute` concrete type per the
 //! no-generic-reconciler constraint in issue #33.
 
-use super::conditions::make_condition;
+use super::conditions::{CoxswainConditionType, make_condition};
 use coxswain_core::ownership::{self, ObjectKey};
 use coxswain_reflector::gw_types::constants::RouteConditionType;
 use coxswain_reflector::gw_types::{
@@ -90,10 +90,10 @@ pub(super) async fn mark_tls_route_programmed(
                 observed_gen,
                 now.clone(),
             );
-            // "Programmed" is not a Gateway API `RouteConditionType` — see the
-            // identical note in `route_events.rs`.
+            // See `CoxswainConditionType` for why this isn't a
+            // `RouteConditionType` variant.
             let programmed_cond = make_condition(
-                "Programmed",
+                CoxswainConditionType::Programmed,
                 prog_status,
                 prog_reason,
                 "",

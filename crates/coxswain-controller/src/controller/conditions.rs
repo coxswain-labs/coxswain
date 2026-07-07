@@ -11,6 +11,7 @@ use coxswain_reflector::gw_types::v::gateways::Gateway;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use std::collections::HashSet;
 
+pub(super) use crate::status_common::CoxswainConditionType;
 pub(super) use crate::status_common::gateway_programmed_at_current_gen;
 use crate::status_common::has_condition_at_gen;
 pub(super) use crate::status_common::make_condition;
