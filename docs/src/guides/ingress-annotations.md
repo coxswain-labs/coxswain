@@ -43,10 +43,12 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/rate-limit-rps` | integer | _none_ (disabled) | `"100"` |
 | `ingress.coxswain-labs.dev/rate-limit-burst` | integer | `0` | `"50"` |
 | `ingress.coxswain-labs.dev/rate-limit-by` | `ip` or `header:Name` | `"ip"` | `"header:X-Api-Key"` |
-| `ingress.coxswain-labs.dev/auth-url` | URL | _none_ | `"http://auth.ns.svc/auth"` |
-| `ingress.coxswain-labs.dev/auth-timeout` | duration | `"2s"` | `"500ms"` |
-| `ingress.coxswain-labs.dev/auth-response-headers` | csv | _none_ | `"X-Auth-User"` |
-| `ingress.coxswain-labs.dev/auth-always-set-cookie` | boolean | `false` | `"true"` |
+| `ingress.coxswain-labs.dev/ext-auth-backend` | `[ns/]service:port` | _none_ | `"oauth2-proxy:4180"` |
+| `ingress.coxswain-labs.dev/ext-auth-protocol` | `http` or `grpc` | `"http"` | `"grpc"` |
+| `ingress.coxswain-labs.dev/ext-auth-timeout` | duration | `"2s"` | `"500ms"` |
+| `ingress.coxswain-labs.dev/ext-auth-fail-closed` | boolean | `true` | `"false"` |
+| `ingress.coxswain-labs.dev/ext-auth-response-headers` | csv | _none_ | `"X-Auth-User"` |
+| `ingress.coxswain-labs.dev/ext-auth-always-set-cookie` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/auth-basic-secret` | `namespace/name` | _none_ | `"my-ns/my-htpasswd"` |
 | `ingress.coxswain-labs.dev/compression-gzip` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/compression-brotli` | boolean | `false` | `"true"` |
@@ -721,36 +723,58 @@ An unrecognised `rate-limit-by` value emits a controller warning and falls back 
 
 ## Authentication
 
-Coxswain supports two authentication modes on Ingresses: **external auth** (HTTP sub-request) and **basic auth** (htpasswd Secret). Both are enforced at the proxy before any upstream connection; a failure never reaches the backend.
+Coxswain supports two authentication modes on Ingresses: **external authorization** (`ext_authz`, delegated to an auth service) and **basic auth** (htpasswd Secret). Both are enforced at the proxy before any upstream connection; a failure never reaches the backend.
 
-`auth-url` and `auth-basic-secret` are mutually exclusive. If both are present, `auth-url` wins and a controller warning is emitted.
+`ext-auth-backend` and `auth-basic-secret` are mutually exclusive. If both are present, `ext-auth-backend` wins and a controller warning is emitted.
 
-### `auth-url`
+> **Migration from `auth-url` (breaking).** Earlier releases used a single `auth-url: "http://svc/path"` string (an nginx-ism). External auth is now modelled the Gateway-API / Envoy way — a **`backendRef`** (Service + port) resolved to pod endpoints — so it gains endpoint load-balancing, in-cluster addressing (no DNS), and a choice of transport. Replace:
+>
+> | Old | New |
+> |---|---|
+> | `auth-url: "http://oauth2-proxy.oauth.svc:4180/auth"` | `ext-auth-backend: "oauth/oauth2-proxy:4180"` |
+> | `auth-timeout: "500ms"` | `ext-auth-timeout: "500ms"` |
+> | `auth-response-headers: "X-Auth-User"` | `ext-auth-response-headers: "X-Auth-User"` |
+> | `auth-always-set-cookie: "true"` | `ext-auth-always-set-cookie: "true"` |
+>
+> There is **no** URL-based transport any more; `auth-url` is silently ignored.
 
-Forwards a sub-request to an external authorization service before proxying. If the service returns **2xx** the original request is forwarded; any other status code is returned to the client as-is (body + headers), and the upstream is never hit.
+### `ext-auth-backend`
 
-The sub-request is sent to the configured URL using the **original request method and Host header**, carrying the client's headers (`Authorization`, `Cookie`, etc.) — the auth service sees the genuine request context. No body is forwarded. On a network error or timeout (configurable via `auth-timeout`), the proxy returns **503** and blocks the request (fail-closed).
+The auth service, as `[namespace/]service:port`. The namespace defaults to the Ingress's own namespace; a cross-namespace reference is resolved directly (Ingress is single-tenant by namespace, so no ReferenceGrant is required — unlike the Gateway API surface). The Service is resolved to its ready pod endpoints and the check is load-balanced across them, exactly like any other backend.
+
+The transport is chosen by [`ext-auth-protocol`](#ext-auth-protocol). On a network error or timeout (see [`ext-auth-timeout`](#ext-auth-timeout)) the proxy returns **503** and blocks the request unless [`ext-auth-fail-closed`](#ext-auth-fail-closed) is `"false"`.
 
 ```yaml
 metadata:
   annotations:
-    ingress.coxswain-labs.dev/auth-url: "http://oauth2-proxy.oauth.svc.cluster.local/oauth2/auth"
-    ingress.coxswain-labs.dev/auth-timeout: "2s"
-    ingress.coxswain-labs.dev/auth-response-headers: "X-Auth-User,X-Auth-Groups"
-    ingress.coxswain-labs.dev/auth-always-set-cookie: "true"
+    ingress.coxswain-labs.dev/ext-auth-backend: "oauth/oauth2-proxy:4180"
+    ingress.coxswain-labs.dev/ext-auth-timeout: "2s"
+    ingress.coxswain-labs.dev/ext-auth-response-headers: "X-Auth-User,X-Auth-Groups"
+    ingress.coxswain-labs.dev/ext-auth-always-set-cookie: "true"
 ```
 
-### `auth-timeout`
+### `ext-auth-protocol`
 
-Maximum time to wait for the auth sub-request to respond. Accepts any duration string (e.g. `"500ms"`, `"5s"`). Default: `2s`. On timeout the proxy returns **503** (fail-closed).
+Selects the transport spoken to the auth service:
 
-### `auth-response-headers`
+- **`http`** (default) — forward-auth (Envoy `ext_authz`-HTTP semantics). The proxy replays the original method, Host, and path to the auth service with the client's headers (no body). **2xx** allows; any other status is returned to the client verbatim (body + controlled headers) and the upstream is never hit.
+- **`grpc`** — the Envoy `envoy.service.auth.v3.Authorization/Check` proto. The proxy sends the request context (method, path, host, headers) and maps the `CheckResponse`: an `OK` status allows (copying the OK response's `allowed_upstream_headers` — see [`ext-auth-response-headers`](#ext-auth-response-headers) — onto the upstream request); any other status denies with the response's HTTP status (default **403**), headers, and body.
 
-Comma-separated list of header names to copy from a **2xx auth response** onto the **upstream request** (so the backend sees e.g. `X-Auth-User`). The echo backend reflects them back in its JSON body, making this assertion testable end-to-end.
+### `ext-auth-timeout`
 
-### `auth-always-set-cookie`
+Maximum time to wait for the auth check to respond. Accepts any duration string (e.g. `"500ms"`, `"5s"`). Default: `2s`. On timeout the proxy fails closed (**503**) unless `ext-auth-fail-closed: "false"`.
 
-When `"true"`, any `Set-Cookie` header present in the auth **deny response** is forwarded to the client. This enables login-redirect flows where the IdP sets a session cookie on the 302 response. Default: `false`.
+### `ext-auth-fail-closed`
+
+When the auth service is unreachable, errors, or times out: `"true"` (the default and only safe posture) **denies** the request with **503**; `"false"` **fails open**, letting the request proceed to the upstream unauthorized. Only set this to `"false"` when the auth service is advisory.
+
+### `ext-auth-response-headers`
+
+Comma-separated list of header names to copy from an **allow** response onto the **upstream request** (so the backend sees e.g. `X-Auth-User`). For the HTTP transport these come from the 2xx response headers; for gRPC, from the `OkHttpResponse` headers. The echo backend reflects them back in its JSON body, making this assertion testable end-to-end.
+
+### `ext-auth-always-set-cookie`
+
+*(HTTP transport only.)* When `"true"`, any `Set-Cookie` header present in the auth **deny response** is forwarded to the client. This enables login-redirect flows where the IdP sets a session cookie on the 302 response. Default: `false`.
 
 ### `auth-basic-secret`
 

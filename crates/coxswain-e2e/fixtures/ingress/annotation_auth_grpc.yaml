@@ -1,0 +1,31 @@
+# ext_authz gRPC transport on Ingress (#23). Apply backends::ECHO and
+# backends::EXT_AUTHZ_GRPC first.
+#
+# ext-auth-backend points at the Istio ext-authz gRPC check server
+# (ext-authz-grpc:9000) and ext-auth-protocol selects the gRPC transport. The
+# proxy speaks the envoy.service.auth.v3 Check proto: a request with
+# `x-ext-authz: allow` is allowed to echo-a; without it the request is denied
+# (403). This fixture is the e2e effect test for the ext-auth-protocol annotation.
+#
+# Host: authgrpc.TESTNS.local / -> echo-a:3000 (reached only on allow).
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-grpc-ingress
+  annotations:
+    ingress.coxswain-labs.dev/ext-auth-backend: "ext-authz-grpc:9000"
+    ingress.coxswain-labs.dev/ext-auth-protocol: "grpc"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: authgrpc.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

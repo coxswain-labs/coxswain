@@ -109,6 +109,11 @@ pub(crate) fn empty_basic_auth_store() -> reflector::Store<BasicAuth> {
     reflector::store::Writer::<BasicAuth>::default().as_reader()
 }
 
+pub(crate) fn empty_external_auth_store()
+-> reflector::Store<coxswain_core::crd::CoxswainExternalAuth> {
+    reflector::store::Writer::<coxswain_core::crd::CoxswainExternalAuth>::default().as_reader()
+}
+
 pub(crate) fn make_basic_auth_store(crs: Vec<BasicAuth>) -> reflector::Store<BasicAuth> {
     let mut writer = reflector::store::Writer::<BasicAuth>::default();
     for cr in crs {

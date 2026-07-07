@@ -8,8 +8,8 @@ use super::annotations::auth::{AuthAnnotation, ExtAuthProtocol, parse_htpasswd};
 use crate::endpoints;
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, BasicCredential, ExtAuthConfig, ExtAuthTransport, FilterAction,
-    HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTableBuilder,
-    NormalizeLevel, WildcardKind,
+    GrpcExtAuthConfig, HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig,
+    IngressRoutingTableBuilder, NormalizeLevel, WildcardKind,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -161,17 +161,10 @@ pub(super) fn resolve_auth_config(
                     ExtAuthTransport::Http(HttpExtAuthConfig::new(resp_hdrs, *always_set_cookie))
                 }
                 ExtAuthProtocol::Grpc => {
-                    // #23 P4 wires ExtAuthTransport::Grpc here.
-                    tracing::warn!(
-                        ingress = %route_id,
-                        "ext-auth-protocol grpc is not yet supported on Ingress — failing closed (503)"
-                    );
-                    diag.push(AnnotationIssue {
-                        annotation: super::annotations::auth::EXT_AUTH_PROTOCOL,
-                        message: "ext-auth-protocol grpc not yet supported — auth failing closed"
-                            .into(),
-                    });
-                    return Some(IngressAuthConfig::Unavailable);
+                    // Envoy `envoy.service.auth.v3.Authorization/Check` (#23 P4).
+                    // `always_set_cookie` has no gRPC analogue (the auth service
+                    // returns typed OK/Denied responses, not raw HTTP headers).
+                    ExtAuthTransport::Grpc(GrpcExtAuthConfig::new(resp_hdrs))
                 }
             };
             Some(IngressAuthConfig::External(ExtAuthConfig::new(

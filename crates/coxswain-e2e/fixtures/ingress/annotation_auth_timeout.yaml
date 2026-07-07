@@ -13,8 +13,8 @@ kind: Ingress
 metadata:
   name: auth-timeout-ingress
   annotations:
-    ingress.coxswain-labs.dev/auth-url: "http://slow-echo.${TESTNS}.svc.cluster.local:3000/"
-    ingress.coxswain-labs.dev/auth-timeout: "500ms"
+    ingress.coxswain-labs.dev/ext-auth-backend: "slow-echo:3000"
+    ingress.coxswain-labs.dev/ext-auth-timeout: "500ms"
 spec:
   ingressClassName: coxswain
   rules:

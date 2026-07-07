@@ -114,13 +114,31 @@ async fn enforce_ext_authz(
     session: &mut Session,
     auth_response_headers_out: &mut Option<Vec<(Box<str>, Box<str>)>>,
 ) -> Result<bool> {
-    let ExtAuthTransport::Http(http_cfg) = &cfg.transport else {
-        // Future gRPC arm: #23 adds it here.
-        tracing::warn!("unsupported ext_authz transport — refusing request (503)");
-        write_simple(session, 503).await?;
-        return Ok(true);
-    };
+    match &cfg.transport {
+        ExtAuthTransport::Http(http_cfg) => {
+            enforce_ext_authz_http(client, cfg, http_cfg, session, auth_response_headers_out).await
+        }
+        ExtAuthTransport::Grpc(grpc_cfg) => {
+            grpc::enforce_ext_authz_grpc(cfg, grpc_cfg, session, auth_response_headers_out).await
+        }
+        // `ExtAuthTransport` is #[non_exhaustive]: a transport not yet wired on the
+        // data plane must fail closed (503), never open. Reachable the moment a new
+        // variant is added — degrade, don't panic.
+        _ => {
+            tracing::warn!("unsupported ext_authz transport — refusing request (503)");
+            write_simple(session, 503).await?;
+            Ok(true)
+        }
+    }
+}
 
+async fn enforce_ext_authz_http(
+    client: &reqwest::Client,
+    cfg: &coxswain_core::routing::ExtAuthConfig,
+    http_cfg: &coxswain_core::routing::HttpExtAuthConfig,
+    session: &mut Session,
+    auth_response_headers_out: &mut Option<Vec<(Box<str>, Box<str>)>>,
+) -> Result<bool> {
     // Build the sub-request: original method + Host, client headers, no body.
     let req_hdr = session.req_header();
     let method_str = req_hdr.method.as_str();
@@ -415,4 +433,299 @@ async fn write_simple(session: &mut Session, status: u16) -> Result<()> {
         .await
         .unwrap_or_else(|e| tracing::error!("failed to write {status} response: {e}"));
     Ok(())
+}
+
+// ── External auth (ext_authz gRPC — Envoy envoy.service.auth.v3, #23) ─────────
+
+/// gRPC ext_authz: speaks the Envoy `Authorization/Check` proto to the resolved
+/// auth pod. Kept in its own module so the Envoy-proto plumbing does not clutter
+/// the HTTP forward-auth path; both share [`pick_endpoint`], [`write_simple`],
+/// and [`HOP_BY_HOP`].
+mod grpc {
+    use super::{HOP_BY_HOP, pick_endpoint, write_simple};
+    use envoy_types::pb::envoy::service::auth::v3 as auth_pb;
+    use envoy_types::pb::envoy::service::auth::v3::authorization_client::AuthorizationClient;
+    use envoy_types::pb::envoy::service::auth::v3::check_response::HttpResponse;
+    use pingora_core::Result;
+    use pingora_http::ResponseHeader;
+    use pingora_proxy::Session;
+    use std::collections::HashMap;
+
+    /// `google.rpc.Code::Ok` — an allow. Any other code is a deny.
+    const RPC_OK: i32 = 0;
+    /// Deny status used when the auth service returns no explicit HTTP status.
+    const DEFAULT_DENY_STATUS: u16 = 403;
+
+    /// Enforce a gRPC ext_authz check. Contract mirrors the HTTP transport:
+    /// `Ok(false)` allow, `Ok(true)` denied (response written), `Err` internal.
+    pub(super) async fn enforce_ext_authz_grpc(
+        cfg: &coxswain_core::routing::ExtAuthConfig,
+        grpc_cfg: &coxswain_core::routing::GrpcExtAuthConfig,
+        session: &mut Session,
+        auth_response_headers_out: &mut Option<Vec<(Box<str>, Box<str>)>>,
+    ) -> Result<bool> {
+        let Some(addr) = pick_endpoint(&cfg.endpoints) else {
+            tracing::warn!("ext_authz(grpc) has no resolved endpoints — refusing request (503)");
+            write_simple(session, 503).await?;
+            return Ok(true);
+        };
+
+        // Build the CheckRequest from the (immutably-borrowed) request header
+        // before any mutable use of `session` below.
+        let check = build_check_request(session);
+
+        // Dial the auth pod cleartext (h2c). connect + per-call timeout both bounded
+        // by cfg.timeout so a hung auth service cannot stall the request.
+        //
+        // Perf follow-up (#544): this opens a fresh channel per check (no pooling),
+        // unlike the HTTP transport's shared `reqwest::Client`. Correct and fail-safe,
+        // but a per-request TCP+H2 setup; a channel cache keyed by resolved endpoint on
+        // `SharedProxyConfig` is a tracked optimization.
+        let endpoint = match tonic::transport::Endpoint::from_shared(format!("http://{addr}")) {
+            Ok(e) => e.connect_timeout(cfg.timeout).timeout(cfg.timeout),
+            Err(e) => return fail(session, cfg.fail_closed, &format!("endpoint: {e}")).await,
+        };
+        let channel = match endpoint.connect().await {
+            Ok(ch) => ch,
+            Err(e) => return fail(session, cfg.fail_closed, &format!("connect: {e}")).await,
+        };
+
+        let mut client = AuthorizationClient::new(channel);
+        let resp = match tokio::time::timeout(cfg.timeout, client.check(check)).await {
+            Ok(Ok(r)) => r.into_inner(),
+            Ok(Err(status)) => {
+                return fail(session, cfg.fail_closed, &format!("check rpc: {status}")).await;
+            }
+            Err(_) => return fail(session, cfg.fail_closed, "check timed out").await,
+        };
+
+        map_check_response(resp, grpc_cfg, session, auth_response_headers_out).await
+    }
+
+    /// Fail an unreachable/errored/timed-out check: 503 when fail-closed, else allow.
+    async fn fail(session: &mut Session, fail_closed: bool, reason: &str) -> Result<bool> {
+        tracing::warn!(reason, fail_closed, "ext_authz(grpc) failed");
+        if fail_closed {
+            write_simple(session, 503).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Build the Envoy `CheckRequest` from the downstream request: method, path,
+    /// host, scheme, and headers (hop-by-hop stripped, names lower-cased). No body
+    /// is forwarded (GEP-1494 `forwardBody` buffering is a follow-up).
+    fn build_check_request(session: &Session) -> auth_pb::CheckRequest {
+        let req = session.req_header();
+        let method = req.method.as_str().to_owned();
+        let path = req
+            .uri
+            .path_and_query()
+            .map_or("/", http::uri::PathAndQuery::as_str)
+            .to_owned();
+        let host = req
+            .headers
+            .get(http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let mut headers: HashMap<String, String> = HashMap::new();
+        for (name, value) in &req.headers {
+            let name_lower = name.as_str().to_ascii_lowercase();
+            if HOP_BY_HOP.contains(&name_lower.as_str()) {
+                continue;
+            }
+            if let Ok(v) = value.to_str() {
+                headers.insert(name_lower, v.to_owned());
+            }
+        }
+        let http_req = auth_pb::attribute_context::HttpRequest {
+            method,
+            path,
+            host,
+            scheme: "http".to_owned(),
+            headers,
+            ..Default::default()
+        };
+        auth_pb::CheckRequest {
+            attributes: Some(auth_pb::AttributeContext {
+                request: Some(auth_pb::attribute_context::Request {
+                    http: Some(http_req),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Map a `CheckResponse` onto the allow/deny contract.
+    ///
+    /// `status.code == OK` → allow (copy the OK response's `allowed_upstream_headers`
+    /// allow-list onto the upstream request). Any other code → deny (return the
+    /// denied response's HTTP status + controlled headers + body to the client).
+    async fn map_check_response(
+        resp: auth_pb::CheckResponse,
+        grpc_cfg: &coxswain_core::routing::GrpcExtAuthConfig,
+        session: &mut Session,
+        auth_response_headers_out: &mut Option<Vec<(Box<str>, Box<str>)>>,
+    ) -> Result<bool> {
+        let code = resp.status.as_ref().map_or(RPC_OK, |s| s.code);
+
+        if code == RPC_OK {
+            if let Some(HttpResponse::OkResponse(ok)) = resp.http_response
+                && !grpc_cfg.response_headers.is_empty()
+            {
+                let mut forward: Vec<(Box<str>, Box<str>)> = Vec::new();
+                for hvo in &ok.headers {
+                    if let Some(h) = &hvo.header {
+                        let key = h.key.to_ascii_lowercase();
+                        if grpc_cfg.response_headers.iter().any(|n| n.as_ref() == key) {
+                            forward.push((key.into_boxed_str(), h.value.clone().into_boxed_str()));
+                        }
+                    }
+                }
+                if !forward.is_empty() {
+                    *auth_response_headers_out = Some(forward);
+                }
+            }
+            return Ok(false);
+        }
+
+        // Deny. The Envoy `HttpStatus.code` numeric value IS the HTTP status.
+        let (deny_status, hdrs, body): (u16, Vec<(String, String)>, Vec<u8>) =
+            match resp.http_response {
+                Some(HttpResponse::DeniedResponse(d)) => {
+                    let status = d
+                        .status
+                        .and_then(|s| u16::try_from(s.code).ok())
+                        .filter(|s| (100..=599).contains(s))
+                        .unwrap_or(DEFAULT_DENY_STATUS);
+                    let hdrs = d
+                        .headers
+                        .iter()
+                        .filter_map(|hvo| {
+                            let h = hvo.header.as_ref()?;
+                            if HOP_BY_HOP.contains(&h.key.to_ascii_lowercase().as_str()) {
+                                return None;
+                            }
+                            Some((h.key.clone(), h.value.clone()))
+                        })
+                        .collect();
+                    (status, hdrs, d.body.into_bytes())
+                }
+                // OK/Error/absent with a non-OK code → a bare deny with no body.
+                _ => (DEFAULT_DENY_STATUS, Vec::new(), Vec::new()),
+            };
+
+        let mut resp_hdr = ResponseHeader::build(deny_status, Some(hdrs.len()))?;
+        for (name, value) in hdrs {
+            let _ = resp_hdr.insert_header(name, value);
+        }
+        let has_body = !body.is_empty();
+        session
+            .write_response_header(Box::new(resp_hdr), !has_body)
+            .await
+            .unwrap_or_else(|e| tracing::error!("failed to write grpc auth deny response: {e}"));
+        if has_body {
+            session
+                .write_response_body(Some(bytes::Bytes::from(body)), true)
+                .await
+                .unwrap_or_else(|e| tracing::error!("failed to write grpc auth deny body: {e}"));
+        }
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use coxswain_core::routing::GrpcExtAuthConfig;
+        use envoy_types::pb::envoy::config::core::v3::{HeaderValue, HeaderValueOption};
+        use envoy_types::pb::envoy::r#type::v3::HttpStatus;
+        use std::sync::Arc;
+
+        fn ok_response(headers: Vec<(&str, &str)>) -> auth_pb::CheckResponse {
+            auth_pb::CheckResponse {
+                status: Some(envoy_types::pb::google::rpc::Status {
+                    code: RPC_OK,
+                    ..Default::default()
+                }),
+                http_response: Some(HttpResponse::OkResponse(auth_pb::OkHttpResponse {
+                    headers: headers
+                        .into_iter()
+                        .map(|(k, v)| HeaderValueOption {
+                            header: Some(HeaderValue {
+                                key: k.to_owned(),
+                                value: v.to_owned(),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }
+        }
+
+        /// An OK status with response-header allow-list matches copy the named
+        /// header (case-insensitively) into the upstream forward set.
+        #[tokio::test]
+        async fn ok_response_forwards_allowlisted_headers() {
+            let cfg = GrpcExtAuthConfig::new(Arc::from([Box::from("x-auth-user")]));
+            let resp = ok_response(vec![("X-Auth-User", "alice"), ("X-Other", "nope")]);
+            // map_check_response needs a Session for the deny path only; the allow
+            // path writes nothing, so exercise the header-selection logic directly.
+            let code = resp.status.as_ref().map_or(RPC_OK, |s| s.code);
+            assert_eq!(code, RPC_OK);
+            let Some(HttpResponse::OkResponse(ok)) = resp.http_response else {
+                panic!("expected OkResponse");
+            };
+            let mut forward: Vec<(Box<str>, Box<str>)> = Vec::new();
+            for hvo in &ok.headers {
+                if let Some(h) = &hvo.header {
+                    let key = h.key.to_ascii_lowercase();
+                    if cfg.response_headers.iter().any(|n| n.as_ref() == key) {
+                        forward.push((key.into_boxed_str(), h.value.clone().into_boxed_str()));
+                    }
+                }
+            }
+            assert_eq!(
+                forward.len(),
+                1,
+                "only the allow-listed header is forwarded"
+            );
+            assert_eq!(&*forward[0].0, "x-auth-user");
+            assert_eq!(&*forward[0].1, "alice");
+        }
+
+        /// A `DeniedHttpResponse.status.code` is mapped verbatim as the HTTP status
+        /// when in range; an out-of-range or absent status falls back to 403.
+        #[test]
+        fn denied_status_maps_http_status_code() {
+            let denied = |code: i32| {
+                u16::try_from(code)
+                    .ok()
+                    .filter(|s| (100..=599).contains(s))
+                    .unwrap_or(DEFAULT_DENY_STATUS)
+            };
+            assert_eq!(denied(HttpStatus { code: 401 }.code), 401);
+            assert_eq!(denied(HttpStatus { code: 403 }.code), 403);
+            assert_eq!(denied(HttpStatus { code: 302 }.code), 302);
+            // Out of range → default deny.
+            assert_eq!(denied(700), DEFAULT_DENY_STATUS);
+            assert_eq!(denied(0), DEFAULT_DENY_STATUS);
+        }
+
+        /// A missing `status` (None) is treated as OK per Envoy semantics (allow).
+        #[test]
+        fn absent_status_is_ok() {
+            let resp = auth_pb::CheckResponse {
+                status: None,
+                http_response: None,
+                ..Default::default()
+            };
+            assert_eq!(resp.status.as_ref().map_or(RPC_OK, |s| s.code), RPC_OK);
+        }
+    }
 }

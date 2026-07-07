@@ -13,8 +13,8 @@ kind: Ingress
 metadata:
   name: auth-cookie-ingress
   annotations:
-    ingress.coxswain-labs.dev/auth-url: "http://auth-deny.${TESTNS}.svc.cluster.local:4001/"
-    ingress.coxswain-labs.dev/auth-always-set-cookie: "true"
+    ingress.coxswain-labs.dev/ext-auth-backend: "auth-deny:4001"
+    ingress.coxswain-labs.dev/ext-auth-always-set-cookie: "true"
 spec:
   ingressClassName: coxswain
   rules:

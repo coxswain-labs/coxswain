@@ -159,6 +159,14 @@ pub const ANNOTATION_AUTH_EXT_DENY: &str = fixture!("annotation_auth_ext_deny.ya
 /// and `auth-timeout: 500ms` (#24 sad path — timeout). Used to verify the proxy returns 503
 /// when the auth sub-request exceeds its timeout. Depends on `backends::SLOW_ECHO`.
 pub const ANNOTATION_AUTH_TIMEOUT: &str = fixture!("annotation_auth_timeout.yaml");
+/// ext-auth fail-open (#23): auth times out but `ext-auth-fail-closed: "false"`
+/// lets the request through to the backend instead of 503.
+pub const ANNOTATION_AUTH_FAIL_OPEN: &str = fixture!("annotation_auth_fail_open.yaml");
+/// ext-auth gRPC transport (#23): `ext-auth-backend: ext-authz-grpc:9000` +
+/// `ext-auth-protocol: grpc`. Allowed with `x-ext-authz: allow`, denied (403)
+/// otherwise. The e2e effect test for the `ext-auth-protocol` annotation. Depends
+/// on `backends::EXT_AUTHZ_GRPC`.
+pub const ANNOTATION_AUTH_GRPC: &str = fixture!("annotation_auth_grpc.yaml");
 /// Ingress with `auth-url` (auth-allow) and `auth-response-headers: X-Auth-User` (#24).
 /// Used to verify the proxy copies the named header from the auth response onto the upstream
 /// request; echo-a reflects it back in its JSON body. Depends on `backends::AUTH_STUB`.

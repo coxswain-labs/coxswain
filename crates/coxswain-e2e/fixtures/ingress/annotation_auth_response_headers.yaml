@@ -13,8 +13,8 @@ kind: Ingress
 metadata:
   name: auth-hdrs-ingress
   annotations:
-    ingress.coxswain-labs.dev/auth-url: "http://auth-allow.${TESTNS}.svc.cluster.local:4000/"
-    ingress.coxswain-labs.dev/auth-response-headers: "X-Auth-User"
+    ingress.coxswain-labs.dev/ext-auth-backend: "auth-allow:4000"
+    ingress.coxswain-labs.dev/ext-auth-response-headers: "X-Auth-User"
 spec:
   ingressClassName: coxswain
   rules:

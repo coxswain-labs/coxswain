@@ -15,8 +15,8 @@ pub mod passthrough;
 mod tests;
 
 pub use common::auth::{
-    BasicCredential, ExtAuthConfig, ExtAuthTransport, HttpExtAuthConfig, IngressAuthConfig,
-    PasswordHash,
+    BasicCredential, ExtAuthConfig, ExtAuthTransport, GrpcExtAuthConfig, HttpExtAuthConfig,
+    IngressAuthConfig, PasswordHash,
 };
 pub use common::backend::{
     BackendGroup, BackendGroupSpec, HashSource, LoadBalance, LoadBalanceParseError, Selected,

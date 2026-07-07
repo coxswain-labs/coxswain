@@ -107,10 +107,10 @@ rules:
   # ExtensionRef filters resolve into per-route config. Read-only.
   - apiGroups: ["gateway.coxswain-labs.dev"]
     resources:
-      ["coxswaingatewayparameters", "clienttrafficpolicies", "coxswainbackendpolicies", "ratelimits", "pathrewriteregexes", "ipaccesscontrols", "basicauths", "requestsizelimits", "compressions"]
+      ["coxswaingatewayparameters", "clienttrafficpolicies", "coxswainbackendpolicies", "coxswainexternalauths", "ratelimits", "pathrewriteregexes", "ipaccesscontrols", "basicauths", "requestsizelimits", "compressions"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.coxswain-labs.dev"]
-    resources: ["clienttrafficpolicies/status", "coxswainbackendpolicies/status"]
+    resources: ["clienttrafficpolicies/status", "coxswainbackendpolicies/status", "coxswainexternalauths/status"]
     verbs: ["patch", "update"]
   # Server-side-apply provisioning of dedicated-mode proxy Deployments
   # (#208). The Deployments are owner-referenced to the Gateway so K8s

@@ -13,12 +13,12 @@ use std::time::{Duration, UNIX_EPOCH};
 use coxswain_core::routing::{
     BackendClientCert, BackendGroup, BackendProtocol, BasicCredential, CircuitBreakerConfig,
     CompressionConfig, CorsConfig, CorsOrigin, ExtAuthConfig, ExtAuthTransport, FilterAction,
-    ForwardedForConfig, GatewayRoutingTable, HashSource, HeaderMod, HeaderPredicate,
-    HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable, LoadBalance,
-    MatchPredicates, MirrorFraction, NormalizeLevel, PasswordHash, PathModifier, QueryPredicate,
-    RateLimitConfig, RateLimitKey, RouteEntry, RouteKind, RouteTimeouts, RouterError,
-    SessionAffinity, SubjectAltName, TlsPassthroughTable, TlsPassthroughTableBuilder, UpstreamCa,
-    UpstreamTls, ValueMatch, WildcardKind,
+    ForwardedForConfig, GatewayRoutingTable, GrpcExtAuthConfig, HashSource, HeaderMod,
+    HeaderPredicate, HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable,
+    LoadBalance, MatchPredicates, MirrorFraction, NormalizeLevel, PasswordHash, PathModifier,
+    QueryPredicate, RateLimitConfig, RateLimitKey, RouteEntry, RouteKind, RouteTimeouts,
+    RouterError, SessionAffinity, SubjectAltName, TlsPassthroughTable, TlsPassthroughTableBuilder,
+    UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
 };
 
 use super::MAX_MIRROR_DEPTH;
@@ -655,15 +655,34 @@ fn auth_from_wire(dto: &p::IngressAuthConfig) -> Result<IngressAuthConfig, WireE
         field: "ingress_auth_config.auth",
     })? {
         p::ingress_auth_config::Auth::External(ext) => {
-            let http = ext.http.as_ref().ok_or(WireError::MissingRequiredField {
-                field: "ext_auth.http",
-            })?;
             let endpoints: Arc<[SocketAddr]> = ext
                 .endpoints
                 .iter()
                 .map(|s| s.parse::<SocketAddr>().map_err(WireError::InvalidAddr))
                 .collect::<Result<Vec<_>, _>>()?
                 .into();
+            // Transport is whichever of grpc/http is present (grpc wins if both,
+            // which the encoder never emits). Neither present → a forward-
+            // incompatible or malformed entry: fail that route's auth **closed**
+            // (Unavailable → 503) rather than erroring the whole snapshot decode.
+            let transport = if let Some(g) = ext.grpc.as_ref() {
+                ExtAuthTransport::Grpc(GrpcExtAuthConfig::new(
+                    g.response_headers
+                        .iter()
+                        .map(|s| Box::from(s.as_str()))
+                        .collect::<Arc<[_]>>(),
+                ))
+            } else if let Some(http) = ext.http.as_ref() {
+                ExtAuthTransport::Http(HttpExtAuthConfig::new(
+                    http.response_headers
+                        .iter()
+                        .map(|s| Box::from(s.as_str()))
+                        .collect::<Arc<[_]>>(),
+                    http.always_set_cookie,
+                ))
+            } else {
+                return Ok(IngressAuthConfig::Unavailable);
+            };
             Ok(IngressAuthConfig::External(ExtAuthConfig::new(
                 ext.timeout
                     .as_ref()
@@ -671,13 +690,7 @@ fn auth_from_wire(dto: &p::IngressAuthConfig) -> Result<IngressAuthConfig, WireE
                     .unwrap_or_default(),
                 endpoints,
                 ext.fail_closed,
-                ExtAuthTransport::Http(HttpExtAuthConfig::new(
-                    http.response_headers
-                        .iter()
-                        .map(|s| Box::from(s.as_str()))
-                        .collect::<Arc<[_]>>(),
-                    http.always_set_cookie,
-                )),
+                transport,
             )))
         }
         p::ingress_auth_config::Auth::Basic(list) => {

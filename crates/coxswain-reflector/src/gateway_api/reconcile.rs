@@ -20,7 +20,8 @@ use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
 use crate::status::{GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerStatusKey};
 use coxswain_core::crd::{
-    BasicAuth, Compression, IpAccessControl, PathRewriteRegex, RateLimit, RequestSizeLimit,
+    BasicAuth, Compression, CoxswainExternalAuth, IpAccessControl, PathRewriteRegex, RateLimit,
+    RequestSizeLimit,
 };
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
@@ -71,6 +72,16 @@ pub struct RouteResolution<'a> {
     /// `BasicAuth` CR store for resolving `ExtensionRef` filters on `HTTPRouteRule`s
     /// (#442). HTTPRoute-only — not supported on GRPCRoute.
     pub basic_auths: &'a reflector::Store<BasicAuth>,
+    /// `CoxswainExternalAuth` CR store for resolving `ExternalAuth` `ExtensionRef`
+    /// filters on `HTTPRouteRule`s into per-route ext_authz config (#23).
+    /// HTTPRoute-only. The auth-service `backendRef` is resolved to endpoints
+    /// against `services`/`slices`, gated by the same backend `grants`.
+    pub external_auths: &'a reflector::Store<CoxswainExternalAuth>,
+    /// Per-Gateway ext-auth mandate from `CoxswainExternalAuth` policies attached
+    /// via `targetRefs` (#23, GEP-713). A route bound to a Gateway present here has
+    /// the mandate **prepended** to every rule's auth chain — additive precedence:
+    /// a route filter can add checks but cannot remove the Gateway-level one.
+    pub external_auth_gateway_index: &'a super::ExternalAuthGatewayIndex,
     /// Label-scoped htpasswd Secrets (`ingress.coxswain-labs.dev/auth-basic=true`)
     /// consumed by a resolved `BasicAuth` CR's `secretRef` (#442). The same store
     /// the Ingress `auth-basic-secret` annotation reads — no duplicate watcher.
@@ -129,6 +140,8 @@ impl GatewayApiReconciler {
             path_rewrites,
             ip_access,
             basic_auths,
+            external_auths,
+            external_auth_gateway_index,
             auth_secrets,
             basic_auth_secret_grants,
             request_size_limits,
@@ -208,6 +221,35 @@ impl GatewayApiReconciler {
             route_ns,
             listener_info,
         );
+
+        // Gateway-attached ext-auth mandate (#23): the resolved check for every
+        // owned Gateway this route is parented to. Prepended to each rule's auth
+        // chain below — additive precedence, so a route-level filter can add
+        // checks but never remove the Gateway-level one. Deduped by Gateway key so
+        // a route with two parentRefs to the same Gateway prepends the check once.
+        let gateway_auths: Vec<Arc<IngressAuthConfig>> = {
+            let mut seen: HashSet<ObjectKey> = HashSet::new();
+            let mut out: Vec<Arc<IngressAuthConfig>> = Vec::new();
+            for p in route.spec.parent_refs.as_deref().unwrap_or(&[]) {
+                let is_gateway = p
+                    .group
+                    .as_deref()
+                    .is_none_or(|g| g.is_empty() || g == "gateway.networking.k8s.io")
+                    && p.kind.as_deref().is_none_or(|k| k == "Gateway");
+                if !is_gateway {
+                    continue;
+                }
+                let gw_ns = p.namespace.as_deref().unwrap_or(route_ns);
+                let gw_key = ObjectKey::new(gw_ns, &p.name);
+                if !seen.insert(gw_key.clone()) {
+                    continue;
+                }
+                if let Some(cfg) = external_auth_gateway_index.get(&gw_key) {
+                    out.push(Arc::clone(cfg));
+                }
+            }
+            out
+        };
 
         tracing::debug!(
             name = ?route.metadata.name,
@@ -368,13 +410,30 @@ impl GatewayApiReconciler {
                 super::filters::resolve_rate_limit(rule_filters, route_ns, rate_limits);
             let (allow_source_range, deny_source_range) =
                 super::filters::resolve_ip_access(rule_filters, route_ns, ip_access);
-            let auth = super::filters::resolve_basic_auth(
+            let basic_auth = super::filters::resolve_basic_auth(
                 rule_filters,
                 route_ns,
                 basic_auths,
                 auth_secrets,
                 basic_auth_secret_grants,
             );
+            let ext_auth = super::filters::resolve_external_auth(
+                rule_filters,
+                route_ns,
+                external_auths,
+                services,
+                slices,
+                grants,
+            );
+            // Additive chain (#23): Gateway-attached mandate(s) first, then the
+            // route-level BasicAuth and ExternalAuth `ExtensionRef`s. Every check
+            // runs in order and the first hard-deny wins at the proxy — a route
+            // cannot weaken a Gateway-level auth mandate (GEP-713 override posture).
+            let auth: Arc<[Arc<IngressAuthConfig>]> = gateway_auths
+                .iter()
+                .cloned()
+                .chain([basic_auth, ext_auth].into_iter().flatten())
+                .collect();
             let max_body_size = super::filters::resolve_request_size_limit(
                 rule_filters,
                 route_ns,
@@ -503,8 +562,10 @@ struct RuleContext<'a> {
     /// Per-backend circuit breaker from the rule's winning `CoxswainBackendPolicy`
     /// (#478). Shared across every entry the rule installs (one refcount bump each).
     circuit_breaker: Option<Arc<coxswain_core::routing::CircuitBreakerConfig>>,
-    /// Auth config resolved from the rule's `BasicAuth` `ExtensionRef` (#442).
-    auth: Option<Arc<IngressAuthConfig>>,
+    /// Additive authentication chain resolved from the rule's `BasicAuth` and
+    /// `CoxswainExternalAuth` `ExtensionRef`s (#442, #23). Every check runs in
+    /// order; the first hard-deny wins. Empty = no auth on the rule.
+    auth: Arc<[Arc<IngressAuthConfig>]>,
     /// Request-body byte cap resolved from the rule's `RequestSizeLimit`
     /// `ExtensionRef` (#443).
     max_body_size: Option<u64>,
@@ -556,7 +617,7 @@ fn apply_rule(
             .with_allow_source_range(ctx.allow_source_range.clone())
             .with_deny_source_range(ctx.deny_source_range.clone())
             .with_circuit_breaker(ctx.circuit_breaker.clone())
-            .with_auth(ctx.auth.clone())
+            .with_auth_chain(ctx.auth.clone())
             .with_max_body_size(ctx.max_body_size)
             .with_compression(ctx.compression.clone())
     };
@@ -1228,6 +1289,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1273,6 +1336,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1318,6 +1383,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1355,6 +1422,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1391,6 +1460,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1466,6 +1537,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1517,6 +1590,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1593,6 +1668,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1680,6 +1757,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1742,6 +1821,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1837,6 +1918,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1889,6 +1972,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1933,6 +2018,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1979,6 +2066,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -2017,6 +2106,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -2078,6 +2169,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -2144,6 +2237,8 @@ mod tests {
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),

@@ -15,11 +15,11 @@ pub(super) use kube::api::ObjectMeta;
 pub(super) use std::collections::{HashMap, HashSet};
 
 pub(super) use crate::tests::fixtures::{
-    empty_basic_auth_store, empty_compression_store, empty_ip_access_store,
-    empty_path_rewrite_store, empty_rate_limit_store, empty_request_size_limit_store,
-    empty_secret_store, empty_svc_store, make_basic_auth_store, make_compression_store,
-    make_ip_access_store, make_request_size_limit_store, make_secret_store, make_slice,
-    slice_store,
+    empty_basic_auth_store, empty_compression_store, empty_external_auth_store,
+    empty_ip_access_store, empty_path_rewrite_store, empty_rate_limit_store,
+    empty_request_size_limit_store, empty_secret_store, empty_svc_store, make_basic_auth_store,
+    make_compression_store, make_ip_access_store, make_request_size_limit_store, make_secret_store,
+    make_slice, slice_store,
 };
 
 pub(super) fn owned(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {

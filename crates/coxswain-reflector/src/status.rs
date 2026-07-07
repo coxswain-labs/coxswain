@@ -275,6 +275,90 @@ impl SharedClientTrafficPolicyStatus {
     }
 }
 
+/// Status record for one `CoxswainExternalAuth` (#23).
+///
+/// Produced during each reconciler rebuild for every policy that attaches to a
+/// Gateway via `targetRefs`, and consumed by the controller's leader-gated status
+/// writer to patch `status.ancestors[]` (one ancestor per targeted `Gateway`).
+/// Mirrors [`ClientTrafficPolicyStatus`] — the controller turns these flags into
+/// per-ancestor `Accepted`/`Conflicted` conditions. An `extensionRef`-only policy
+/// (no `targetRefs`) never appears here; its resolution is reflected on the
+/// referencing route's own status instead.
+#[non_exhaustive]
+#[derive(Clone, Debug)]
+pub struct CoxswainExternalAuthStatus {
+    /// `true` when the policy is accepted (won conflict resolution on every
+    /// targeted Gateway).
+    pub accepted: bool,
+    /// Reason string for the `Accepted` condition.
+    pub accepted_reason: &'static str,
+    /// `true` when the policy lost conflict resolution on at least one Gateway
+    /// (an older policy already attached).
+    pub conflicted: bool,
+    /// Human-readable reason for the `Conflicted` condition when `conflicted` is `true`.
+    pub conflicted_reason: &'static str,
+}
+
+impl Default for CoxswainExternalAuthStatus {
+    fn default() -> Self {
+        Self {
+            accepted: true,
+            accepted_reason: "Accepted",
+            conflicted: false,
+            conflicted_reason: "NoConflicts",
+        }
+    }
+}
+
+/// Map from `(policy_namespace, policy_name)` to its status.
+pub type CoxswainExternalAuthStatusMap = HashMap<ObjectKey, CoxswainExternalAuthStatus>;
+
+struct SharedCoxswainExternalAuthStatusInner {
+    map: ArcSwap<CoxswainExternalAuthStatusMap>,
+    tx: watch::Sender<u64>,
+}
+
+/// Shared handle to per-`CoxswainExternalAuth` status, produced after each
+/// reconciler rebuild. The controller reads this to write `status.ancestors[]`
+/// when leader (#23).
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct SharedCoxswainExternalAuthStatus(Arc<SharedCoxswainExternalAuthStatusInner>);
+
+impl Default for SharedCoxswainExternalAuthStatus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedCoxswainExternalAuthStatus {
+    /// Construct a new shared policy status map (initially empty, generation 0).
+    #[must_use]
+    pub fn new() -> Self {
+        let (tx, _) = watch::channel(0u64);
+        Self(Arc::new(SharedCoxswainExternalAuthStatusInner {
+            map: ArcSwap::from_pointee(HashMap::new()),
+            tx,
+        }))
+    }
+
+    /// Load the current policy status map snapshot.
+    pub fn load(&self) -> arc_swap::Guard<Arc<CoxswainExternalAuthStatusMap>> {
+        self.0.map.load()
+    }
+
+    /// Store a new status map and notify subscribers via the generation counter.
+    pub fn store_and_notify(&self, map: CoxswainExternalAuthStatusMap) {
+        self.0.map.store(Arc::new(map));
+        self.0.tx.send_modify(|g| *g = g.wrapping_add(1));
+    }
+
+    /// Returns a `watch::Receiver` for subscribing to change notifications.
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.tx.subscribe()
+    }
+}
+
 /// Status record for one `CoxswainBackendPolicy` (#354).
 ///
 /// Produced during each reconciler rebuild and consumed by the controller's

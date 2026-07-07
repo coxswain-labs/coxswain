@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use coxswain_core::Shared;
 use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
 use coxswain_core::crd::coxswain_backend_policy::CoxswainBackendPolicy;
+use coxswain_core::crd::coxswain_external_auth::CoxswainExternalAuth;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_reflector::gw_types::ListenerSet;
@@ -27,7 +28,8 @@ use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::gw_types::{BackendTlsPolicy, GrpcRoute, HttpRoute, TlsRoute};
 use coxswain_reflector::status::{
     GatewayListenerStatus, SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus,
-    SharedCoxswainBackendPolicyStatus, SharedGatewayListenerStatus, SharedRouteStatus,
+    SharedCoxswainBackendPolicyStatus, SharedCoxswainExternalAuthStatus,
+    SharedGatewayListenerStatus, SharedRouteStatus,
 };
 use coxswain_reflector::{IngressEvent, StatusSubscriptions};
 use futures::StreamExt;
@@ -55,6 +57,7 @@ mod client_traffic_policy_events;
 mod conditions;
 mod config;
 mod coxswain_backend_policy_events;
+mod coxswain_external_auth_events;
 mod gateway_class_events;
 mod gateway_class_status;
 mod gateway_events;
@@ -126,6 +129,8 @@ pub struct StatusChannels {
     pub ctp: SharedClientTrafficPolicyStatus,
     /// Per-`CoxswainBackendPolicy` ancestor health (#354).
     pub cbp: SharedCoxswainBackendPolicyStatus,
+    /// Per-`CoxswainExternalAuth` ancestor health (#23).
+    pub external_auth: SharedCoxswainExternalAuthStatus,
 }
 
 /// Leader-elected status writer. Registered as a Pingora `BackgroundService`
@@ -298,6 +303,7 @@ impl Controller {
             listener_sets,
             client_traffic_policies,
             coxswain_backend_policies,
+            coxswain_external_auths,
             ..
         } = subs;
 
@@ -316,6 +322,7 @@ impl Controller {
         let listener_sets_reader = listener_sets.reader();
         let ctps_reader = client_traffic_policies.reader();
         let cbps_reader = coxswain_backend_policies.reader();
+        let external_auths_reader = coxswain_external_auths.reader();
         let gateway_classes_for_gateways = gateway_classes.clone();
         let gateways_for_listener_sets = gateways.clone();
 
@@ -336,6 +343,7 @@ impl Controller {
             policy_status: self.channels.policy.clone(),
             ctp_status: self.channels.ctp.clone(),
             cbp_status: self.channels.cbp.clone(),
+            external_auth_status: self.channels.external_auth.clone(),
             gateway_classes: gateway_classes_reader,
             ingress_classes: ingress_classes_reader,
             gateways: gateways_reader.clone(),
@@ -359,6 +367,7 @@ impl Controller {
         let (ls_tx, ls_rx) = mpsc::unbounded::<()>();
         let (ctp_tx, ctp_rx) = mpsc::unbounded::<()>();
         let (cbp_tx, cbp_rx) = mpsc::unbounded::<()>();
+        let (ea_tx, ea_rx) = mpsc::unbounded::<()>();
         let leadership_txs = vec![
             gw_tx.clone(),
             gc_tx.clone(),
@@ -370,6 +379,7 @@ impl Controller {
             ls_tx.clone(),
             ctp_tx.clone(),
             cbp_tx.clone(),
+            ea_tx.clone(),
         ];
 
         let mut tasks = JoinSet::new();
@@ -432,6 +442,7 @@ impl Controller {
         spawn_health_forwarder(&mut tasks, self.channels.policy.subscribe(), pol_tx);
         spawn_health_forwarder(&mut tasks, self.channels.ctp.subscribe(), ctp_tx);
         spawn_health_forwarder(&mut tasks, self.channels.cbp.subscribe(), cbp_tx);
+        spawn_health_forwarder(&mut tasks, self.channels.external_auth.subscribe(), ea_tx);
         // GEP-1713: a TLS-health flip changes which listeners (incl. ListenerSet
         // ones) are programmed, so re-drive ListenerSet status off the same channel.
         spawn_health_forwarder(&mut tasks, self.channels.tls.subscribe(), ls_tx);
@@ -551,6 +562,14 @@ impl Controller {
             .reconcile_all_on(cbp_rx)
             .run(reconcile_cbp, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, cbp_ctrl, "CoxswainBackendPolicy");
+
+        // --- CoxswainExternalAuth: primary only; re-driven on external-auth-health
+        // flips + promotion (#23). ---
+        let ea_ctrl =
+            KubeController::for_shared_stream(coxswain_external_auths, external_auths_reader)
+                .reconcile_all_on(ea_rx)
+                .run(reconcile_external_auth, error_policy, ctx.clone());
+        spawn_controller_stream(&mut tasks, ea_ctrl, "CoxswainExternalAuth");
 
         tracing::info!(pod = %self.config.pod_name, is_leader, "Status-writer work-queues active");
 
@@ -813,6 +832,7 @@ struct ReconcileContext {
     policy_status: SharedBackendTlsPolicyStatus,
     ctp_status: SharedClientTrafficPolicyStatus,
     cbp_status: SharedCoxswainBackendPolicyStatus,
+    external_auth_status: SharedCoxswainExternalAuthStatus,
     /// Synced GatewayClass store, read for Gateway ownership at reconcile time.
     gateway_classes: kube::runtime::reflector::Store<GatewayClass>,
     /// Synced IngressClass store, read for Ingress ownership at reconcile time.
@@ -1649,6 +1669,36 @@ async fn reconcile_cbp_inner(policy: &CoxswainBackendPolicy, ctx: &ReconcileCont
     let ch = ctx.cbp_status.load();
     if leader_write_fence(ctx) {
         coxswain_backend_policy_events::patch_coxswain_backend_policy_status(
+            &ctx.client,
+            policy,
+            &ctx.controller_name,
+            &ch,
+        )
+        .await;
+    }
+    Action::await_change()
+}
+
+async fn reconcile_external_auth(
+    policy: Arc<CoxswainExternalAuth>,
+    ctx: Arc<ReconcileContext>,
+) -> Result<Action, Infallible> {
+    let started = std::time::Instant::now();
+    let res: Result<Action, Infallible> = Ok(reconcile_external_auth_inner(&policy, &ctx).await);
+    crate::metrics::observe_reconcile("status_writer", started, &res);
+    res
+}
+
+async fn reconcile_external_auth_inner(
+    policy: &CoxswainExternalAuth,
+    ctx: &ReconcileContext,
+) -> Action {
+    if !ctx.leader.load(Ordering::Acquire) {
+        return Action::requeue(NON_LEADER_REQUEUE);
+    }
+    let ch = ctx.external_auth_status.load();
+    if leader_write_fence(ctx) {
+        coxswain_external_auth_events::patch_coxswain_external_auth_status(
             &ctx.client,
             policy,
             &ctx.controller_name,

@@ -1,0 +1,97 @@
+# CoxswainExternalAuth Gateway-attached policy + additive precedence (#23). Apply
+# backends::ECHO and backends::AUTH_STUB first.
+#
+# Two CoxswainExternalAuth policies:
+#   * gw-mandate — attached to the Gateway via targetRefs, points at auth-deny:4001
+#     (a Gateway-level mandate that denies every route on the Gateway).
+#   * route-allow — points at auth-allow:4000, referenced by one route's
+#     ExtensionRef filter (would allow on its own).
+#
+# Two routes on the same Gateway prove:
+#   * gwextauthmandate — NO filter: the Gateway mandate alone denies it (403).
+#   * gwextauthadditive — an ExtensionRef to route-allow: the route's own check
+#     would pass, but the Gateway mandate is ADDITIVE and cannot be removed from
+#     below, so the request is still denied (403). GEP-713 override posture.
+#
+# Depends on backends::AUTH_STUB (auth-allow:4000 → 200, auth-deny:4001 → 403)
+# and backends::ECHO. Gateway: coxswain-extauth-gw on GATEWAY_HTTP_PORT.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-extauth-gw
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
+metadata:
+  name: gw-mandate
+spec:
+  protocol: HTTP
+  backendRef:
+    name: auth-deny
+    port: 4001
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      name: coxswain-extauth-gw
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
+metadata:
+  name: route-allow
+spec:
+  protocol: HTTP
+  backendRef:
+    name: auth-allow
+    port: 4000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: extauth-mandate-route
+spec:
+  parentRefs:
+    - name: coxswain-extauth-gw
+  hostnames:
+    - "gwextauthmandate.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: extauth-additive-route
+spec:
+  parentRefs:
+    - name: coxswain-extauth-gw
+  hostnames:
+    - "gwextauthadditive.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: ExternalAuth
+            name: route-allow
+      backendRefs:
+        - name: echo-a
+          port: 3000

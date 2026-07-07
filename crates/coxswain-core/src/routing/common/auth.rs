@@ -87,9 +87,8 @@ impl ExtAuthConfig {
 
 /// Transport-specific ext_authz wiring.
 ///
-/// `#[non_exhaustive]` so adding `Grpc(GrpcExtAuthConfig)` in #23 P4 is a
-/// backwards-compatible change: existing `match` arms with `_ => …` continue
-/// to compile.
+/// `#[non_exhaustive]` so a future transport is a backwards-compatible change:
+/// existing `match` arms with `_ => …` continue to compile.
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum ExtAuthTransport {
@@ -103,6 +102,18 @@ pub enum ExtAuthTransport {
     ///   adds `Set-Cookie` to the downstream response (enables `302 → IdP`).
     /// - timeout/connect error → fail-closed 503; backend never hit.
     Http(HttpExtAuthConfig),
+    /// gRPC — the Envoy `envoy.service.auth.v3.Authorization/Check` proto (#23).
+    ///
+    /// The proxy sends a `CheckRequest` carrying the downstream request's method,
+    /// path, host, and headers to a resolved auth endpoint and maps the
+    /// `CheckResponse`:
+    /// - `status.code == OK` → allow; copy `response_headers` from the
+    ///   `OkHttpResponse` headers onto the upstream request.
+    /// - `status.code != OK` → deny; return the `DeniedHttpResponse` HTTP status
+    ///   (default 403) + headers + body to the client.
+    /// - transport error / timeout → fail-closed 503 (backend never hit) unless
+    ///   `failClosed: false`.
+    Grpc(GrpcExtAuthConfig),
 }
 
 /// HTTP forward-auth wiring: the response-header allow-list knobs. The check
@@ -130,6 +141,28 @@ impl HttpExtAuthConfig {
             response_headers,
             always_set_cookie,
         }
+    }
+}
+
+/// gRPC ext_authz wiring: the response-header allow-list. The check-target
+/// endpoints live on the parent [`ExtAuthConfig`]. The Envoy proto forwards the
+/// full downstream request context to the auth service, so — unlike the HTTP
+/// transport — there is no request-header allow-list knob here.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct GrpcExtAuthConfig {
+    /// Header names to copy from the auth service's `OkHttpResponse.headers` onto
+    /// the upstream *request* when the check allows (Envoy
+    /// `allowed_upstream_headers`; GEP-1494 `allowedResponseHeaders`). Lower-cased
+    /// at reconcile time for case-insensitive lookup.
+    pub response_headers: Arc<[Box<str>]>,
+}
+
+impl GrpcExtAuthConfig {
+    /// Construct a [`GrpcExtAuthConfig`] with the given allowed response headers.
+    #[must_use]
+    pub fn new(response_headers: Arc<[Box<str>]>) -> Self {
+        Self { response_headers }
     }
 }
 

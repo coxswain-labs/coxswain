@@ -21,7 +21,8 @@ use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames};
 use coxswain_reflector::{
     ControllerReconciler, IngressEvent, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
     SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus,
-    SharedCoxswainBackendPolicyStatus, SharedGatewayListenerStatus, SharedRouteStatus,
+    SharedCoxswainBackendPolicyStatus, SharedCoxswainExternalAuthStatus,
+    SharedGatewayListenerStatus, SharedRouteStatus,
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -172,6 +173,7 @@ pub fn spawn_status_writer(
         "path_rewrite_regex",
         "ip_access_control",
         "basic_auth",
+        "coxswain_external_auth",
         "request_size_limit",
         "compression",
     ];
@@ -249,6 +251,7 @@ pub fn spawn_status_writer(
     let policy_status: SharedBackendTlsPolicyStatus = reconciler.policy_status();
     let ctp_status: SharedClientTrafficPolicyStatus = reconciler.ctp_status();
     let cbp_status: SharedCoxswainBackendPolicyStatus = reconciler.cbp_status();
+    let external_auth_status: SharedCoxswainExternalAuthStatus = reconciler.external_auth_status();
 
     // Take the shared-informer subscriptions the reconciler created (it must
     // hand them over since we set `status_subscriptions = true` above).
@@ -268,6 +271,7 @@ pub fn spawn_status_writer(
             policy: policy_status,
             ctp: ctp_status,
             cbp: cbp_status,
+            external_auth: external_auth_status,
         },
         subscriptions,
         controller,

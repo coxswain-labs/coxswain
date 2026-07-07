@@ -11,7 +11,7 @@ kind: Ingress
 metadata:
   name: auth-ext-allow-ingress
   annotations:
-    ingress.coxswain-labs.dev/auth-url: "http://auth-allow.${TESTNS}.svc.cluster.local:4000/"
+    ingress.coxswain-labs.dev/ext-auth-backend: "auth-allow:4000"
 spec:
   ingressClassName: coxswain
   rules:
