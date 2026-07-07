@@ -476,21 +476,26 @@ pub(super) fn build_tls(
     tls_shared: &SharedPortTlsStore,
     listener_hostnames_shared: &SharedListenerHostnames,
     skip_cut_over: bool,
-    ingress_https_port: u16,
+    ingress_https_port: Option<u16>,
 ) -> HashMap<ObjectKey, GatewayListenerStatus> {
     let vip_internal = stores.vip_internal;
     // Per-port cert store (#472): the bind port keys each cert so the proxy's
     // per-port SniCertSelector — scoped to the accepted local port — finds it.
+    // `None` means no HTTPS Ingress listener is configured (Ingress serving
+    // disabled, or the dedicated reconciler, which never serves Ingress) —
+    // there is no bind port for an Ingress cert to apply to, so none is keyed.
     let mut tls_builder = PortTlsStoreBuilder::new();
-    for ingress in ingresses {
-        IngressReconciler::reconcile_tls(
-            ingress,
-            stores.secrets,
-            ownership.ingress_classes,
-            ownership.default_ingress_class,
-            &mut tls_builder,
-            ingress_https_port,
-        );
+    if let Some(https_port) = ingress_https_port {
+        for ingress in ingresses {
+            IngressReconciler::reconcile_tls(
+                ingress,
+                stores.secrets,
+                ownership.ingress_classes,
+                ownership.default_ingress_class,
+                &mut tls_builder,
+                https_port,
+            );
+        }
     }
 
     let mut lh_builder = ListenerHostnamesBuilder::new();
@@ -597,9 +602,10 @@ pub(super) fn build_tls(
 /// Two sources are reconciled into a single [`ClientCertStoreBuilder`]:
 ///
 /// 1. **Ingress** `auth-tls-*` annotations (`reconcile_client_certs`) — per-listener CA
-///    sourced from a labeled Secret.
-/// 2. **Gateway** `spec.tls.frontend.default.validation` (GEP-91, #86) — gateway-wide CA
-///    sourced from a ConfigMap, keyed by listener hostname.
+///    sourced from a labeled Secret, keyed under `ingress_https_port`.
+/// 2. **Gateway** `spec.tls.frontend.default.validation` (GEP-91, #86) — per-listener CA
+///    sourced from a ConfigMap, keyed by the listener's **bind port** + hostname so two
+///    Gateways sharing a hostname can never overwrite each other's validation policy.
 ///
 /// The function also annotates `gateway_listener_status` with
 /// [`coxswain_core::listener_status::FrontendValidationStatus`] so the controller can emit
@@ -615,18 +621,24 @@ pub(super) fn build_client_certs(
     client_certs_shared: &SharedClientCertStore,
     gateway_listener_status: &mut HashMap<ObjectKey, GatewayListenerStatus>,
     skip_cut_over: bool,
+    ingress_https_port: Option<u16>,
 ) {
     let mut builder = ClientCertStoreBuilder::new();
 
     // ── Ingress: auth-tls-* annotations ──────────────────────────────────────
-    for ingress in ingresses {
-        IngressReconciler::reconcile_client_certs(
-            ingress,
-            stores.auth_tls_secrets,
-            ownership.ingress_classes,
-            ownership.default_ingress_class,
-            &mut builder,
-        );
+    // `None` = no HTTPS Ingress listener configured; nothing can serve the
+    // mTLS config, so nothing is keyed (mirrors `build_tls`).
+    if let Some(https_port) = ingress_https_port {
+        for ingress in ingresses {
+            IngressReconciler::reconcile_client_certs(
+                ingress,
+                stores.auth_tls_secrets,
+                ownership.ingress_classes,
+                ownership.default_ingress_class,
+                &mut builder,
+                https_port,
+            );
+        }
     }
 
     // ── Gateway: spec.tls.frontend.default.validation (GEP-91) ───────────────
@@ -643,6 +655,17 @@ pub(super) fn build_client_certs(
         let ns = gw.metadata.namespace.clone().unwrap_or_default();
         let name = gw.metadata.name.clone().unwrap_or_default();
         let key = ObjectKey::new(ns, name);
+        // Scope to the owned-Gateway set, not just the owned classes: the
+        // dedicated rebuild narrows `ownership.gateways` to its ONE Gateway
+        // while keeping the full class set, and its identity port map (spec
+        // port = bind port) would otherwise let two same-class Gateways that
+        // share a listener port + hostname overwrite each other's validation
+        // config inside the dedicated snapshot — the exact collision the
+        // per-port store exists to prevent. The shared rebuild passes the full
+        // owned set, so this is a no-op there.
+        if !ownership.gateways.contains(&key) {
+            continue;
+        }
         // Update the health entry that was created by build_tls for this Gateway.
         // If no entry exists yet (race on first rebuild) create a default one.
         let health = gateway_listener_status.entry(key).or_default();

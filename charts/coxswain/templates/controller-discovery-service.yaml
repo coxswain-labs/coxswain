@@ -1,13 +1,25 @@
 {{- if .Values.controller.enabled -}}
 {{/*
-Discovery gRPC Service (#423). Exposes the controller's two gRPC listeners to proxy pods:
+Discovery gRPC Services (#423, #531). Expose the controller's two gRPC
+listeners to proxy pods:
   - stream    (mTLS mandatory): pushes routing snapshots to SVID-bearing proxies
   - bootstrap (server-auth-only): issues SVIDs to fresh proxies via SA token + CSR
-The controller binary hardcodes the endpoint it hands to dedicated proxies as
-`https://coxswain-controller-discovery.<namespace>.svc:<discovery-port>`
-(coxswain-bin/src/lib.rs), so this Service MUST be named literally
-`coxswain-controller-discovery` regardless of release name. The shared proxy
-resolves the same name via the `coxswain.controller.discoveryEndpoint` helper.
+The controller binary hardcodes the endpoints it hands to dedicated proxies
+(coxswain-bin/src/lib.rs), so these Services MUST be named literally
+`coxswain-controller-discovery` / `coxswain-controller-discovery-bootstrap`
+regardless of release name. The shared proxy resolves the same names via the
+`coxswain.controller.discoveryEndpoint` / `...BootstrapEndpoint` helpers.
+
+The two listeners need OPPOSITE selectors, hence two Services (#531):
+  - stream additionally selects the `discovery.coxswain-labs.dev/leader` pod
+    label that the lease holder maintains on itself, so its endpoints are
+    exactly the leader pod — proxy dials deterministically reach the replica
+    whose registry feeds the Programmed readiness gate. During a leaderless
+    window the Service has zero endpoints (immediate connection-refused, the
+    proxy fast-retries); the discovery server's not-leader stream rejection
+    covers any stale-label race.
+  - bootstrap selects ALL controller replicas: SVID issuance is stateless
+    (shared CA Secret) and must keep working through leader churn.
 */}}
 apiVersion: v1
 kind: Service
@@ -20,11 +32,25 @@ spec:
   type: ClusterIP
   selector:
     {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+    discovery.coxswain-labs.dev/leader: "true"
   ports:
     - name: discovery
       port: {{ .Values.discovery.port }}
       targetPort: discovery
       protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: coxswain-controller-discovery-bootstrap
+  namespace: {{ include "coxswain.namespace" . }}
+  labels:
+    {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+  ports:
     - name: bootstrap
       port: {{ .Values.discovery.bootstrapPort }}
       targetPort: bootstrap

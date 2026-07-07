@@ -597,7 +597,17 @@ impl PartialEq for ClientCertConfig {
     }
 }
 
-/// Immutable snapshot of per-host mTLS configuration, keyed by SNI pattern.
+/// Immutable snapshot of mTLS configuration, keyed by **bind port** first and
+/// SNI pattern second.
+///
+/// Port scoping mirrors [`PortTlsStore`] (#472): in shared mode every owned
+/// Gateway's listeners map to distinct internal ports on the one shared proxy
+/// pod, so keying by the accepted local port is what isolates one Gateway's
+/// frontend-validation policy from another's. Without it, two Gateways whose
+/// listeners share a hostname (e.g. the GEP-91 conformance Gateways, which both
+/// declare `second-example.org`) silently overwrite each other's CA/mode —
+/// last writer wins, and an `AllowInsecureFallback` Gateway can neuter a
+/// strict Gateway's mTLS.
 ///
 /// Built once per reconcile cycle and shared read-only with the proxy via
 /// [`SharedClientCertStore`]. Swapped independently of [`SharedTlsStore`] so
@@ -605,6 +615,13 @@ impl PartialEq for ClientCertConfig {
 #[non_exhaustive]
 #[derive(Debug, Default, PartialEq)]
 pub struct ClientCertStore {
+    by_port: HashMap<u16, HostClientCertConfigs>,
+}
+
+/// One bind port's SNI-pattern → mTLS-config map.
+#[non_exhaustive]
+#[derive(Debug, Default, PartialEq)]
+pub struct HostClientCertConfigs {
     exact: HashMap<String, Arc<ClientCertConfigState>>,
     /// Sorted most-specific (longest suffix) first.
     wildcard: Vec<(String, Arc<ClientCertConfigState>)>,
@@ -613,10 +630,32 @@ pub struct ClientCertStore {
 }
 
 impl ClientCertStore {
-    /// Look up the client-cert config for `sni`.
+    /// Look up the client-cert config for `sni` on bind `port`.
     ///
     /// Returns `None` when no pattern matches — mTLS is not required for this
-    /// SNI. Exact match wins over wildcard, wildcard over default, matching the
+    /// SNI on this port. Only the accepted port's map is consulted; a config
+    /// registered for another port never applies.
+    pub fn find_config(&self, port: u16, sni: &str) -> Option<Arc<ClientCertConfigState>> {
+        self.by_port.get(&port).and_then(|m| m.find_config(sni))
+    }
+
+    /// Total number of configured host patterns across all ports.
+    pub fn host_count(&self) -> usize {
+        self.by_port.values().map(HostClientCertConfigs::len).sum()
+    }
+
+    /// Iterate over all per-port pattern maps, in unspecified order.
+    ///
+    /// Used by the discovery wire layer to serialise the client-cert store.
+    pub fn iter_ports(&self) -> impl Iterator<Item = (u16, &HostClientCertConfigs)> {
+        self.by_port.iter().map(|(p, m)| (*p, m))
+    }
+}
+
+impl HostClientCertConfigs {
+    /// Look up the client-cert config for `sni` within this port's map.
+    ///
+    /// Exact match wins over wildcard, wildcard over default, matching the
     /// precedence of [`TlsStore::find_cert`].
     pub fn find_config(&self, sni: &str) -> Option<Arc<ClientCertConfigState>> {
         if let Some(cfg) = self.exact.get(sni) {
@@ -632,9 +671,15 @@ impl ClientCertStore {
         self.default.as_ref().map(Arc::clone)
     }
 
-    /// Total number of configured host patterns (exact + wildcard + default).
-    pub fn host_count(&self) -> usize {
+    /// Number of configured host patterns (exact + wildcard + default).
+    pub fn len(&self) -> usize {
         self.exact.len() + self.wildcard.len() + self.default.is_some() as usize
+    }
+
+    /// True when this port map holds no patterns at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Iterate over all exact-hostname → config mappings, in unspecified order.
@@ -665,6 +710,12 @@ impl ClientCertStore {
 #[non_exhaustive]
 #[derive(Default)]
 pub struct ClientCertStoreBuilder {
+    by_port: HashMap<u16, HostConfigsBuilder>,
+}
+
+/// One bind port's accumulating pattern buckets.
+#[derive(Default)]
+struct HostConfigsBuilder {
     exact: HashMap<String, Arc<ClientCertConfigState>>,
     /// Keyed by suffix (e.g. `"example.com"` for the pattern `"*.example.com"`).
     wildcard: HashMap<String, Arc<ClientCertConfigState>>,
@@ -677,54 +728,75 @@ impl ClientCertStoreBuilder {
         Self::default()
     }
 
-    /// Register client-cert config for `host_pattern`.
+    /// Register client-cert config for `host_pattern` on bind `port`.
     ///
     /// - `*.suffix` → wildcard bucket (suffix stored without the `*.` prefix).
     /// - Exact hostname → exact bucket.
-    /// - `""` or `"*"` → default fallback.
-    /// - Duplicate host → last-writer-wins with a `WARN` log.
+    /// - `""` or `"*"` → default fallback for the port.
+    /// - Duplicate `(port, host)` → last-writer-wins with a `WARN` log.
     ///
     /// Alias of [`Self::add_client_cert`] for use in generic wire-codec callers.
-    pub fn add_config(&mut self, host_pattern: &str, cfg: Arc<ClientCertConfigState>) {
-        self.add_client_cert(host_pattern, cfg);
+    pub fn add_config(&mut self, port: u16, host_pattern: &str, cfg: Arc<ClientCertConfigState>) {
+        self.add_client_cert(port, host_pattern, cfg);
     }
 
-    /// Register client-cert config for `host_pattern`.
+    /// Register client-cert config for `host_pattern` on bind `port`.
     ///
     /// - `*.suffix` → wildcard bucket (suffix stored without the `*.` prefix).
     /// - Exact hostname → exact bucket.
-    /// - `""` or `"*"` → default fallback.
-    /// - Duplicate host → last-writer-wins with a `WARN` log.
-    pub fn add_client_cert(&mut self, host_pattern: &str, cfg: Arc<ClientCertConfigState>) {
+    /// - `""` or `"*"` → default fallback for the port.
+    /// - Duplicate `(port, host)` → last-writer-wins with a `WARN` log. With
+    ///   port scoping this can only happen within one source (two Ingresses
+    ///   claiming the same host on the shared HTTPS port) — distinct Gateways
+    ///   never share a bind port.
+    pub fn add_client_cert(
+        &mut self,
+        port: u16,
+        host_pattern: &str,
+        cfg: Arc<ClientCertConfigState>,
+    ) {
+        let bucket = self.by_port.entry(port).or_default();
         if host_pattern.is_empty() || host_pattern == "*" {
-            self.default = Some(cfg);
+            bucket.default = Some(cfg);
             return;
         }
         if let Some(suffix) = host_pattern.strip_prefix("*.") {
-            if self.wildcard.insert(suffix.to_string(), cfg).is_some() {
+            if bucket.wildcard.insert(suffix.to_string(), cfg).is_some() {
                 tracing::warn!(
+                    port,
                     host = %host_pattern,
-                    "mTLS client-cert config overwritten by a later Ingress"
+                    "mTLS client-cert config overwritten by a later source on the same bind port"
                 );
             }
-        } else if self.exact.insert(host_pattern.to_string(), cfg).is_some() {
+        } else if bucket.exact.insert(host_pattern.to_string(), cfg).is_some() {
             tracing::warn!(
+                port,
                 host = %host_pattern,
-                "mTLS client-cert config overwritten by a later Ingress"
+                "mTLS client-cert config overwritten by a later source on the same bind port"
             );
         }
     }
 
     /// Compile accumulated configs into an immutable [`ClientCertStore`].
     pub fn build(self) -> ClientCertStore {
-        let mut wildcard: Vec<(String, Arc<ClientCertConfigState>)> =
-            self.wildcard.into_iter().collect();
-        wildcard.sort_by_key(|(suffix, _)| Reverse(suffix.len()));
-        ClientCertStore {
-            exact: self.exact,
-            wildcard,
-            default: self.default,
-        }
+        let by_port = self
+            .by_port
+            .into_iter()
+            .map(|(port, b)| {
+                let mut wildcard: Vec<(String, Arc<ClientCertConfigState>)> =
+                    b.wildcard.into_iter().collect();
+                wildcard.sort_by_key(|(suffix, _)| Reverse(suffix.len()));
+                (
+                    port,
+                    HostClientCertConfigs {
+                        exact: b.exact,
+                        wildcard,
+                        default: b.default,
+                    },
+                )
+            })
+            .collect();
+        ClientCertStore { by_port }
     }
 }
 
@@ -1278,29 +1350,29 @@ mod tests {
     #[test]
     fn client_cert_exact_lookup() {
         let mut b = ClientCertStoreBuilder::new();
-        b.add_client_cert("example.com", cfg(b"ca"));
+        b.add_client_cert(443, "example.com", cfg(b"ca"));
         let store = b.build();
-        assert!(store.find_config("example.com").is_some());
-        assert!(store.find_config("other.com").is_none());
+        assert!(store.find_config(443, "example.com").is_some());
+        assert!(store.find_config(443, "other.com").is_none());
     }
 
     #[test]
     fn client_cert_wildcard_lookup() {
         let mut b = ClientCertStoreBuilder::new();
-        b.add_client_cert("*.example.com", cfg(b"ca"));
+        b.add_client_cert(443, "*.example.com", cfg(b"ca"));
         let store = b.build();
-        assert!(store.find_config("api.example.com").is_some());
-        assert!(store.find_config("example.com").is_none());
-        assert!(store.find_config("a.b.example.com").is_none());
+        assert!(store.find_config(443, "api.example.com").is_some());
+        assert!(store.find_config(443, "example.com").is_none());
+        assert!(store.find_config(443, "a.b.example.com").is_none());
     }
 
     #[test]
     fn client_cert_exact_beats_wildcard() {
         let mut b = ClientCertStoreBuilder::new();
-        b.add_client_cert("api.example.com", cfg(b"exact-ca"));
-        b.add_client_cert("*.example.com", cfg(b"wildcard-ca"));
+        b.add_client_cert(443, "api.example.com", cfg(b"exact-ca"));
+        b.add_client_cert(443, "*.example.com", cfg(b"wildcard-ca"));
         let store = b.build();
-        match store.find_config("api.example.com").unwrap().as_ref() {
+        match store.find_config(443, "api.example.com").unwrap().as_ref() {
             ClientCertConfigState::Config(c) => assert_eq!(c.ca_pem, b"exact-ca"),
             _ => panic!("expected Config"),
         }
@@ -1309,24 +1381,27 @@ mod tests {
     #[test]
     fn client_cert_no_match_returns_none() {
         let store = ClientCertStoreBuilder::new().build();
-        assert!(store.find_config("example.com").is_none());
+        assert!(store.find_config(443, "example.com").is_none());
     }
 
     #[test]
     fn client_cert_default_fallback() {
         let mut b = ClientCertStoreBuilder::new();
-        b.add_client_cert("*", cfg(b"default-ca"));
+        b.add_client_cert(443, "*", cfg(b"default-ca"));
         let store = b.build();
-        assert!(store.find_config("anything.example.com").is_some());
+        assert!(store.find_config(443, "anything.example.com").is_some());
     }
 
     #[test]
     fn client_cert_unavailable_variant_stored() {
         let mut b = ClientCertStoreBuilder::new();
-        b.add_client_cert("broken.example.com", unavailable());
+        b.add_client_cert(443, "broken.example.com", unavailable());
         let store = b.build();
         assert!(matches!(
-            store.find_config("broken.example.com").unwrap().as_ref(),
+            store
+                .find_config(443, "broken.example.com")
+                .unwrap()
+                .as_ref(),
             ClientCertConfigState::Unavailable
         ));
     }
@@ -1335,12 +1410,12 @@ mod tests {
     fn client_cert_partial_eq_same_bytes() {
         let s1 = {
             let mut b = ClientCertStoreBuilder::new();
-            b.add_client_cert("example.com", cfg(b"ca"));
+            b.add_client_cert(443, "example.com", cfg(b"ca"));
             b.build()
         };
         let s2 = {
             let mut b = ClientCertStoreBuilder::new();
-            b.add_client_cert("example.com", cfg(b"ca"));
+            b.add_client_cert(443, "example.com", cfg(b"ca"));
             b.build()
         };
         assert_eq!(s1, s2);
@@ -1350,12 +1425,12 @@ mod tests {
     fn client_cert_partial_eq_different_bytes() {
         let s1 = {
             let mut b = ClientCertStoreBuilder::new();
-            b.add_client_cert("example.com", cfg(b"ca-a"));
+            b.add_client_cert(443, "example.com", cfg(b"ca-a"));
             b.build()
         };
         let s2 = {
             let mut b = ClientCertStoreBuilder::new();
-            b.add_client_cert("example.com", cfg(b"ca-b"));
+            b.add_client_cert(443, "example.com", cfg(b"ca-b"));
             b.build()
         };
         assert_ne!(s1, s2);
@@ -1364,14 +1439,18 @@ mod tests {
     #[test]
     fn client_cert_wildcard_sorted_longest_first() {
         let mut b = ClientCertStoreBuilder::new();
-        b.add_client_cert("*.example.com", cfg(b"short"));
-        b.add_client_cert("*.api.example.com", cfg(b"long"));
+        b.add_client_cert(443, "*.example.com", cfg(b"short"));
+        b.add_client_cert(443, "*.api.example.com", cfg(b"long"));
         let store = b.build();
-        match store.find_config("v1.api.example.com").unwrap().as_ref() {
+        match store
+            .find_config(443, "v1.api.example.com")
+            .unwrap()
+            .as_ref()
+        {
             ClientCertConfigState::Config(c) => assert_eq!(c.ca_pem, b"long"),
             _ => panic!("expected Config"),
         }
-        match store.find_config("web.example.com").unwrap().as_ref() {
+        match store.find_config(443, "web.example.com").unwrap().as_ref() {
             ClientCertConfigState::Config(c) => assert_eq!(c.ca_pem, b"short"),
             _ => panic!("expected Config"),
         }
@@ -1380,10 +1459,60 @@ mod tests {
     #[test]
     fn client_cert_host_count() {
         let mut b = ClientCertStoreBuilder::new();
-        b.add_client_cert("a.com", cfg(b"ca"));
-        b.add_client_cert("*.b.com", cfg(b"ca"));
-        b.add_client_cert("*", cfg(b"ca"));
+        b.add_client_cert(443, "a.com", cfg(b"ca"));
+        b.add_client_cert(443, "*.b.com", cfg(b"ca"));
+        b.add_client_cert(443, "*", cfg(b"ca"));
         assert_eq!(b.build().host_count(), 3);
+    }
+
+    /// The GEP-91 conformance collision (#531 fallout): two Gateways declare
+    /// listeners with the SAME hostname but land on different bind ports. Each
+    /// port must resolve its own config — the second registration must not
+    /// overwrite the first.
+    #[test]
+    fn client_cert_same_hostname_isolated_per_port() {
+        let mut b = ClientCertStoreBuilder::new();
+        b.add_client_cert(30001, "second-example.org", cfg(b"strict-ca"));
+        b.add_client_cert(30002, "second-example.org", cfg(b"fallback-ca"));
+        let store = b.build();
+        match store
+            .find_config(30001, "second-example.org")
+            .unwrap()
+            .as_ref()
+        {
+            ClientCertConfigState::Config(c) => assert_eq!(c.ca_pem, b"strict-ca"),
+            _ => panic!("expected Config"),
+        }
+        match store
+            .find_config(30002, "second-example.org")
+            .unwrap()
+            .as_ref()
+        {
+            ClientCertConfigState::Config(c) => assert_eq!(c.ca_pem, b"fallback-ca"),
+            _ => panic!("expected Config"),
+        }
+    }
+
+    /// Hostname-less listeners on different ports get independent per-port
+    /// defaults — the catch-all is port-scoped, never global.
+    #[test]
+    fn client_cert_default_isolated_per_port() {
+        let mut b = ClientCertStoreBuilder::new();
+        b.add_client_cert(30001, "", cfg(b"gw-a-ca"));
+        b.add_client_cert(30002, "", cfg(b"gw-b-ca"));
+        let store = b.build();
+        match store.find_config(30001, "anything.org").unwrap().as_ref() {
+            ClientCertConfigState::Config(c) => assert_eq!(c.ca_pem, b"gw-a-ca"),
+            _ => panic!("expected Config"),
+        }
+        match store.find_config(30002, "anything.org").unwrap().as_ref() {
+            ClientCertConfigState::Config(c) => assert_eq!(c.ca_pem, b"gw-b-ca"),
+            _ => panic!("expected Config"),
+        }
+        assert!(
+            store.find_config(30003, "anything.org").is_none(),
+            "a port with no registered config must not inherit another port's default"
+        );
     }
 
     // ── ListenerHostnames tests ───────────────────────────────────────────────

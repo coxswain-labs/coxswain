@@ -102,6 +102,13 @@ pub struct DiscoveryClientConfig {
     /// When `Some`, the supervisor forces a clean reconnect (and re-reads the
     /// SVID cell) on the next generation tick.
     pub svid_rotated: Option<watch::Receiver<u64>>,
+    /// Receives the proxy acceptor's actually-bound listener-port set (#531).
+    ///
+    /// When `Some`, the supervisor reports the current set to the controller as
+    /// a `NodeStatus` message immediately after `Subscribe` on every stream
+    /// open, and again on every change — feeding the controller's Gateway
+    /// `Programmed` readiness gate. `None` (default) = no reporting.
+    pub bound_ports_rx: Option<watch::Receiver<std::collections::BTreeSet<u16>>>,
 }
 
 impl DiscoveryClientConfig {
@@ -121,6 +128,7 @@ impl DiscoveryClientConfig {
             svid_cell: None,
             expected_server: None,
             svid_rotated: None,
+            bound_ports_rx: None,
         }
     }
 }
@@ -393,10 +401,14 @@ impl DiscoverySupervisor {
 impl Supervisor {
     /// Run the reconnect/backoff loop until the process exits.
     pub async fn run(mut self) {
-        // Pull the rotation receiver out of config so it does not conflict
-        // with the mutable borrow of `self` inside `stream_until_closed`.
+        // Pull the rotation + bound-ports receivers out of config so they do
+        // not conflict with the mutable borrow of `self` inside
+        // `stream_until_closed`.
         let mut svid_rotation_rx: Option<watch::Receiver<u64>> = self.config.svid_rotated.take();
+        let mut bound_ports_rx: Option<watch::Receiver<std::collections::BTreeSet<u16>>> =
+            self.config.bound_ports_rx.take();
         let mut attempt: u32 = 0;
+        let mut consecutive_not_leader: u32 = 0;
 
         // Pending until the first snapshot lands; published so the proxy
         // `/metrics` reflects channel state from process start.
@@ -417,26 +429,34 @@ impl Supervisor {
             // reconnect. A TLS-config failure here (e.g. a rotation that wrote
             // malformed material) is treated like a failed connect — degrade to
             // the last-good snapshot and back off — never a crash.
-            let (applied, svid_rotated) = match build_channel(&self.config) {
+            const FAILED: StreamEnd = StreamEnd {
+                applied: false,
+                not_leader: false,
+            };
+            let (end, svid_rotated) = match build_channel(&self.config) {
                 Ok(channel) => {
                     let mut grpc = TonicClient::new(channel);
                     // `svid_rotated` is an intentional reconnect, not a failure;
                     // track it separately so the backoff exponent is not bumped.
                     if let Some(ref mut rx) = svid_rotation_rx {
                         tokio::select! {
-                            result = self.stream_until_closed(&mut grpc) => (result, false),
+                            result = self.stream_until_closed(&mut grpc, bound_ports_rx.as_mut()) => (result, false),
                             Ok(()) = rx.changed() => {
                                 debug!("discovery client: SVID rotated; forcing reconnect with fresh SVID");
-                                (false, true)
+                                (FAILED, true)
                             }
                         }
                     } else {
-                        (self.stream_until_closed(&mut grpc).await, false)
+                        (
+                            self.stream_until_closed(&mut grpc, bound_ports_rx.as_mut())
+                                .await,
+                            false,
+                        )
                     }
                 }
                 Err(e) => {
                     warn!(error = %e, "discovery client: channel build failed; backing off");
-                    (false, false)
+                    (FAILED, false)
                 }
             };
 
@@ -451,14 +471,43 @@ impl Supervisor {
             // Reset the backoff exponent if the session delivered at least one
             // snapshot, or if this was a rotation-triggered reconnect (not a
             // failure), so kube-proxy propagation lag does not grow the backoff
-            // to the cap before the SVID arrives.
-            if applied || svid_rotated {
+            // to the cap before the SVID arrives. A not-leader rejection is an
+            // expected routing outcome (#531): it neither resets nor bumps the
+            // exponent, and takes the fast-retry band instead of the
+            // exponential delay.
+            if end.applied || svid_rotated {
                 attempt = 0;
-            } else {
+            } else if !end.not_leader {
                 attempt = attempt.saturating_add(1);
             }
+            if end.not_leader {
+                consecutive_not_leader = consecutive_not_leader.saturating_add(1);
+            } else {
+                consecutive_not_leader = 0;
+            }
 
-            let delay = backoff_jitter(attempt, self.config.backoff_base, self.config.backoff_cap);
+            // While serving a last-good snapshot, clamp the exponential
+            // ceiling (#531): after a hard leader kill the leader-selected
+            // Service refuses dials instantly (zero endpoints) until the new
+            // leader labels itself, and those refusals must not escalate the
+            // delay toward the 30 s cap — the new leader's readiness registry
+            // repopulates only when this proxy re-lands. Refused dials are
+            // cheap; a proxy that never connected keeps the full escalation
+            // (a genuinely absent controller should be dialled gently).
+            let effective_attempt = if self.has_snapshot {
+                attempt.min(RECONNECT_ATTEMPT_CLAMP_WITH_SNAPSHOT)
+            } else {
+                attempt
+            };
+            let delay = if end.not_leader {
+                not_leader_retry_delay(consecutive_not_leader)
+            } else {
+                backoff_jitter(
+                    effective_attempt,
+                    self.config.backoff_base,
+                    self.config.backoff_cap,
+                )
+            };
             debug!(
                 delay_ms = delay.as_millis(),
                 "discovery client backing off before reconnect"
@@ -481,9 +530,23 @@ impl Supervisor {
 
     /// Run one stream session until the stream closes or errors.
     ///
-    /// Returns `true` if at least one snapshot was successfully applied this
-    /// session (used to reset the backoff exponent in the supervisor).
-    async fn stream_until_closed(&mut self, grpc: &mut TonicClient<Channel>) -> bool {
+    /// The returned [`StreamEnd`] tells the supervisor whether at least one
+    /// snapshot was applied (resets the backoff exponent) and whether the
+    /// session ended on the leader gate's rejection (fast retry, #531).
+    ///
+    /// When `bound_ports` is `Some`, a `NodeStatus` carrying the current
+    /// bound-port set is queued right after `Subscribe` (so a reconnected
+    /// leader rebuilds its readiness view immediately) and re-sent on every
+    /// change of the watched set for the life of the session (#531).
+    async fn stream_until_closed(
+        &mut self,
+        grpc: &mut TonicClient<Channel>,
+        mut bound_ports: Option<&mut watch::Receiver<std::collections::BTreeSet<u16>>>,
+    ) -> StreamEnd {
+        const CLOSED: StreamEnd = StreamEnd {
+            applied: false,
+            not_leader: false,
+        };
         let (tx, rx) = mpsc::channel::<p::ClientMessage>(4);
 
         // Pre-queue Subscribe *before* opening the stream. The server reads the
@@ -503,30 +566,90 @@ impl Supervisor {
         };
         if tx.send(subscribe).await.is_err() {
             warn!("discovery client: outbound channel closed before stream open");
-            return false;
+            return CLOSED;
+        }
+
+        // Queue the initial bound-port report behind Subscribe (#531). Same
+        // pre-queue rationale: the bounded channel has spare capacity and the
+        // body stream flushes both as soon as the h2 request opens. On a
+        // reconnect after leader failover this is what rebuilds the new
+        // leader's readiness registry without waiting for a bind change.
+        if let Some(rx) = bound_ports.as_mut() {
+            let ports = rx.borrow_and_update().clone();
+            if tx.send(node_status_message(&ports)).await.is_err() {
+                warn!("discovery client: outbound channel closed before stream open");
+                return CLOSED;
+            }
         }
 
         let response = match grpc.stream(ReceiverStream::new(rx)).await {
             Ok(r) => r,
+            Err(e) if is_not_leader(&e) => {
+                debug!(
+                    "discovery client: dialled a standby replica; fast-retrying to reach the leader"
+                );
+                return StreamEnd {
+                    applied: false,
+                    not_leader: true,
+                };
+            }
             Err(e) => {
                 warn!(error = %e, "discovery client: failed to open stream");
-                return false;
+                return CLOSED;
             }
         };
         let mut inbound = response.into_inner();
 
         let mut applied_this_session = false;
+        let mut ended_not_leader = false;
 
         loop {
-            let msg = match inbound.message().await {
-                Ok(Some(m)) => m,
-                Ok(None) => {
-                    debug!("discovery stream closed by server");
-                    break;
-                }
-                Err(e) => {
-                    warn!(error = %e, "discovery stream error");
-                    break;
+            let msg = tokio::select! {
+                result = inbound.message() => match result {
+                    Ok(Some(m)) => m,
+                    Ok(None) => {
+                        debug!("discovery stream closed by server");
+                        break;
+                    }
+                    Err(e) if is_not_leader(&e) => {
+                        // Mid-stream demotion: the (ex-)leader terminated the
+                        // stream so we re-land on the new leader (#531).
+                        debug!("discovery client: server demoted mid-stream; fast-retrying to reach the new leader");
+                        ended_not_leader = true;
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "discovery stream error");
+                        break;
+                    }
+                },
+
+                // Bound-port set changed mid-session — report it (#531). The
+                // arm is inert (`pending`) when no receiver is wired.
+                changed = async {
+                    match bound_ports.as_mut() {
+                        Some(rx) => rx.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match changed {
+                        Ok(()) => {
+                            let Some(rx) = bound_ports.as_mut() else { continue };
+                            let ports = rx.borrow_and_update().clone();
+                            debug!(?ports, "discovery client: bound-port set changed; sending NodeStatus");
+                            if tx.send(node_status_message(&ports)).await.is_err() {
+                                debug!("discovery client: outbound channel closed after NodeStatus");
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            // Acceptor sender dropped (proxy shutting down) —
+                            // stop watching; the stream will close shortly.
+                            debug!("discovery client: bound-port sender dropped; no further NodeStatus reports");
+                            bound_ports = None;
+                        }
+                    }
+                    continue;
                 }
             };
 
@@ -589,7 +712,10 @@ impl Supervisor {
             }
         }
 
-        applied_this_session
+        StreamEnd {
+            applied: applied_this_session,
+            not_leader: ended_not_leader,
+        }
     }
 }
 
@@ -768,6 +894,18 @@ fn build_channel(config: &DiscoveryClientConfig) -> Result<Channel, DiscoveryErr
     }
 }
 
+/// Build the `NodeStatus` client message for a bound-port set (#531).
+///
+/// `BTreeSet` iteration yields the sorted-ascending order the wire contract
+/// documents.
+fn node_status_message(ports: &std::collections::BTreeSet<u16>) -> p::ClientMessage {
+    p::ClientMessage {
+        kind: Some(CKind::NodeStatus(p::NodeStatus {
+            bound_ports: ports.iter().map(|port| u32::from(*port)).collect(),
+        })),
+    }
+}
+
 /// Validate every configured endpoint string parses as a URI, at construction.
 ///
 /// `parse-don't-validate`: proves the URI invariant once at start-up so the
@@ -790,6 +928,81 @@ fn validate_endpoints(endpoints: &[String]) -> Result<(), DiscoveryError> {
     Ok(())
 }
 
+// ── not-leader fast retry (#531) ─────────────────────────────────────────────
+
+/// Fast-retry band for not-leader rejections: `[250 ms, 500 ms]`.
+///
+/// A rejection from a standby replica is an expected, cheap outcome while the
+/// deterministic leader-label Service routing catches up — retrying fast makes
+/// re-pinning to the leader converge in O(replicas) dials. Escalating the
+/// exponential backoff here would stretch a routine leader handover toward the
+/// 30 s cap.
+const NOT_LEADER_RETRY_MIN_MS: u64 = 250;
+const NOT_LEADER_RETRY_MAX_MS: u64 = 500;
+/// After this many consecutive not-leader results (~5–10 s of dialling, i.e.
+/// most of a 15 s lease TTL), assume a persistent leaderless window and widen
+/// the retry band to [`NOT_LEADER_RETRY_SLOW_MIN_MS`, `NOT_LEADER_RETRY_SLOW_MAX_MS`]
+/// so proxies do not hammer standbys indefinitely. Resets on any other outcome.
+const NOT_LEADER_ESCALATE_AFTER: u32 = 20;
+const NOT_LEADER_RETRY_SLOW_MIN_MS: u64 = 500;
+const NOT_LEADER_RETRY_SLOW_MAX_MS: u64 = 2_000;
+
+/// Exponent clamp for reconnect backoff while a last-good snapshot is being
+/// served (#531): ceiling `base * 2^4` = 4 s at the 250 ms default, keeping
+/// post-failover re-landing prompt. Applies only to `has_snapshot` proxies;
+/// cold clients escalate to the full cap.
+const RECONNECT_ATTEMPT_CLAMP_WITH_SNAPSHOT: u32 = 4;
+
+/// Outcome of one stream session, as the supervisor's backoff input (#531).
+struct StreamEnd {
+    /// At least one snapshot was applied this session (resets the exponential
+    /// backoff — the connection was healthy).
+    applied: bool,
+    /// The session ended with the server's not-leader rejection (at accept or
+    /// via mid-stream demotion) — retry fast instead of backing off.
+    not_leader: bool,
+}
+
+/// Whether a stream error is the leader gate's rejection (#531).
+///
+/// `FAILED_PRECONDITION` alone is ambiguous (wire-version mismatch shares the
+/// code), so the message text is matched too, via the same needle constant the
+/// server builds [`crate::server::NOT_LEADER_MSG`] from — a rewording cannot
+/// silently break the classification (though controller and proxy binaries
+/// skew across upgrades, so the needle must stay wire-stable regardless).
+fn is_not_leader(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && status.message().contains(crate::server::NOT_LEADER_NEEDLE)
+}
+
+/// Uniform jittered delay for not-leader retries: the fast band until
+/// [`NOT_LEADER_ESCALATE_AFTER`] consecutive rejections, the slow band after.
+fn not_leader_retry_delay(consecutive: u32) -> Duration {
+    let (min_ms, max_ms) = if consecutive > NOT_LEADER_ESCALATE_AFTER {
+        (NOT_LEADER_RETRY_SLOW_MIN_MS, NOT_LEADER_RETRY_SLOW_MAX_MS)
+    } else {
+        (NOT_LEADER_RETRY_MIN_MS, NOT_LEADER_RETRY_MAX_MS)
+    };
+    let span = max_ms.saturating_sub(min_ms);
+    Duration::from_millis(min_ms + jitter_seed() % (span + 1))
+}
+
+/// Uniform-jitter seed: a monotone counter XOR'd with subsecond nanos, shared
+/// by [`backoff_jitter`] and [`not_leader_retry_delay`]. The counter
+/// guarantees unique seeds for rapid successive calls in the same nanosecond
+/// (correlated delays across a fleet defeat the point of jitter); the nanos
+/// add per-process entropy. Not a security primitive.
+fn jitter_seed() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    splitmix64(seq ^ nanos)
+}
+
 /// Full-jitter exponential backoff delay.
 ///
 /// Returns a duration uniformly drawn from `[0, min(cap, base * 2^attempt)]`.
@@ -802,19 +1015,7 @@ fn backoff_jitter(attempt: u32, base: Duration, cap: Duration) -> Duration {
     if ceiling == 0 {
         return Duration::ZERO;
     }
-    // SplitMix64 seeded with a monotone counter XOR'd with subsecond nanos.
-    // The counter guarantees unique seeds even for rapid successive calls in the
-    // same nanosecond; the nanos component introduces per-process entropy.
-    // Not a security primitive — quality is sufficient for jitter.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64;
-    let ms = splitmix64(seq ^ nanos) % (ceiling + 1);
-    Duration::from_millis(ms)
+    Duration::from_millis(jitter_seed() % (ceiling + 1))
 }
 
 fn splitmix64(mut x: u64) -> u64 {
@@ -984,6 +1185,7 @@ mod tests {
             backoff_base: Duration::from_millis(10),
             backoff_cap: Duration::from_millis(50),
             tls: None,
+            bound_ports_rx: None,
             svid_cell: None,
             expected_server: None,
             svid_rotated: None,
@@ -1106,6 +1308,175 @@ mod tests {
 
         // Both tables reflect the applied snapshot (non-default handle set).
         let _ = client.ingress_routes().load();
+    }
+
+    /// With a bound-ports receiver wired, the client reports its current set as
+    /// a NodeStatus immediately after Subscribe on stream open, and again on
+    /// every change of the watched set (#531).
+    #[tokio::test]
+    async fn reports_node_status_on_stream_open_and_on_bound_set_change() {
+        let (addr, mut connect_rx) = start_server().await;
+
+        let registry = HealthRegistry::new();
+        let handle = registry.register("disc", &["conn"]);
+        let bound_tx = watch::Sender::new(
+            [8080u16]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+        let mut config = test_config(addr);
+        config.bound_ports_rx = Some(bound_tx.subscribe());
+        let (_client, supervisor) =
+            DiscoveryClient::spawn(config, handle, "conn").expect("test endpoints are valid URIs");
+        let _task = tokio::spawn(supervisor.run());
+
+        let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())
+            .await
+            .expect("timed out waiting for client connection")
+            .expect("channel closed");
+
+        let first = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for Subscribe")
+            .expect("channel closed");
+        assert!(
+            matches!(first.kind, Some(CKind::Subscribe(_))),
+            "expected Subscribe as first client message, got: {first:?}"
+        );
+
+        let second = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for initial NodeStatus")
+            .expect("channel closed");
+        assert!(
+            matches!(&second.kind, Some(CKind::NodeStatus(ns)) if ns.bound_ports == vec![8080]),
+            "expected initial NodeStatus [8080] right after Subscribe, got: {second:?}"
+        );
+
+        // Mid-session change → a fresh NodeStatus with the new full set.
+        bound_tx.send_modify(|set| {
+            set.insert(8443);
+        });
+        let third = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for changed NodeStatus")
+            .expect("channel closed");
+        assert!(
+            matches!(&third.kind, Some(CKind::NodeStatus(ns)) if ns.bound_ports == vec![8080, 8443]),
+            "expected NodeStatus [8080, 8443] after the set changed, got: {third:?}"
+        );
+
+        // Keep the server side alive until the assertions are done.
+        drop(srv_tx);
+    }
+
+    // ── not-leader fast retry (#531) ─────────────────────────────────────────
+
+    /// Fake server that rejects the first N `Stream` calls with the leader
+    /// gate's `FAILED_PRECONDITION` before accepting like [`FakeDiscovery`].
+    struct RejectingDiscovery {
+        remaining_rejections: std::sync::atomic::AtomicU32,
+        connect_tx: tpsc::Sender<ConnectPair>,
+    }
+
+    #[async_trait::async_trait]
+    impl Discovery for RejectingDiscovery {
+        type StreamStream = ReceiverStream<Result<ServerMessage, Status>>;
+
+        async fn bootstrap(
+            &self,
+            _req: Request<crate::proto::v1::BootstrapRequest>,
+        ) -> Result<Response<crate::proto::v1::BootstrapResponse>, Status> {
+            Err(Status::unimplemented("test stub"))
+        }
+
+        async fn stream(
+            &self,
+            request: Request<Streaming<ClientMessage>>,
+        ) -> Result<Response<Self::StreamStream>, Status> {
+            use std::sync::atomic::Ordering;
+            let prior = self
+                .remaining_rejections
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .unwrap_or(0);
+            if prior > 0 {
+                return Err(Status::failed_precondition(crate::server::NOT_LEADER_MSG));
+            }
+
+            let (server_tx, server_rx) = tpsc::channel(16);
+            let (client_tx, client_rx) = tpsc::channel(16);
+            let mut inbound = request.into_inner();
+            match inbound.message().await {
+                Ok(Some(msg)) => {
+                    let _ = client_tx.send(msg).await;
+                }
+                _ => return Err(Status::unavailable("client closed before Subscribe")),
+            }
+            tokio::spawn(async move {
+                while let Ok(Some(msg)) = inbound.message().await {
+                    if client_tx.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+            });
+            let connect_tx = self.connect_tx.clone();
+            let _ = connect_tx.send((server_tx, client_rx)).await;
+            Ok(Response::new(ReceiverStream::new(server_rx)))
+        }
+    }
+
+    /// Not-leader rejections take the fast-retry band and bypass the
+    /// exponential backoff entirely: with a prohibitive exponential base the
+    /// client must still chew through the rejections and connect quickly.
+    #[tokio::test]
+    async fn not_leader_rejections_fast_retry_without_backoff_escalation() {
+        const REJECTIONS: u32 = 3;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connect_tx, mut connect_rx) = tpsc::channel(8);
+        let service = RejectingDiscovery {
+            remaining_rejections: std::sync::atomic::AtomicU32::new(REJECTIONS),
+            connect_tx,
+        };
+        tokio::spawn(
+            Server::builder()
+                .add_service(DiscoveryServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+
+        let registry = HealthRegistry::new();
+        let handle = registry.register("disc", &["conn"]);
+        let mut config = test_config(addr);
+        // Prohibitive exponential band: if the not-leader path escalated the
+        // exponential backoff, three retries would take tens of seconds and
+        // the accept below would time out. Fast retries are ≤ 500 ms each.
+        config.backoff_base = Duration::from_secs(30);
+        config.backoff_cap = Duration::from_secs(30);
+        let (_client, supervisor) =
+            DiscoveryClient::spawn(config, handle, "conn").expect("test endpoints are valid URIs");
+        let started = tokio::time::Instant::now();
+        let _task = tokio::spawn(supervisor.run());
+
+        let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(5), connect_rx.recv())
+            .await
+            .expect("client did not reach the accepting server — fast retry not taken")
+            .expect("channel closed");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "three not-leader rejections must retry within the fast band, took {elapsed:?}"
+        );
+
+        let first = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for Subscribe")
+            .expect("channel closed");
+        assert!(
+            matches!(first.kind, Some(CKind::Subscribe(_))),
+            "expected Subscribe after the accepted dial, got: {first:?}"
+        );
+        drop(srv_tx);
     }
 
     /// After the server closes the stream, the client reconnects; routing cells

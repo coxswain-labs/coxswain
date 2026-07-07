@@ -21,6 +21,7 @@ use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRouti
 use coxswain_core::listener_status::{GatewayListenerStatus, SharedGatewayListenerStatus};
 use coxswain_core::node_registry::SharedNodeRegistry;
 use coxswain_core::ownership::ObjectKey;
+use coxswain_core::publish_index::SharedGatewayPublishIndex;
 use coxswain_core::routing::{
     GatewayRoutingTable, SharedGatewayRoutingTable, SharedIngressRoutingTable,
 };
@@ -61,6 +62,7 @@ fn source_with_two_gateways() -> SnapshotSource {
         dedicated: DedicatedRoutingRegistry::new(),
         passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
+        publish: SharedGatewayPublishIndex::new(),
     };
 
     let gw_a_key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());

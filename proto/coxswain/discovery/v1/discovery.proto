@@ -50,7 +50,7 @@ message ClientMessage {
     Subscribe subscribe = 1;
     Ack ack = 2;
     Nack nack = 3;
-    // reserved 4..: NodeStatus (relay telemetry) — DEFERRED
+    NodeStatus node_status = 4; // node telemetry (#531); additive, WIRE_VERSION stays 1
   }
 }
 
@@ -97,6 +97,19 @@ message Nack {
   string version = 1;
   bytes nonce = 2;
   string detail = 3;
+}
+
+// Proxy → controller node telemetry (#531). Sent once immediately after
+// Subscribe and again on every change of the reported state. Not tied to the
+// Ack flow-control cycle: listener binds complete asynchronously after a
+// snapshot is applied, so bind state has its own message.
+message NodeStatus {
+  // Listener ports this node is currently accepting on (successfully bound
+  // listeners only; bind-failed and draining ports excluded). u16 values as
+  // uint32, sorted ascending. Wholesale-replace semantics: this is the node's
+  // complete current set; a transient empty set during listener drain/rebind
+  // is legal (the controller's Programmed gate anti-flaps).
+  repeated uint32 bound_ports = 1;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -630,16 +643,19 @@ enum KeyAlgorithm {
 // 2b  Client-cert (mTLS) store DTO
 // ────────────────────────────────────────────────────────────────────────────
 
-// Mirrors ClientCertStore.  Sorted by host pattern ascending.
+// Mirrors ClientCertStore (port-scoped — GEP-91 same-hostname collision fix):
+// every (bind port, host pattern) → state mapping. Encoding is canonical so
+// equal stores hash to equal snapshot versions: ports ascending, patterns
+// sorted within each port, and the port's default (catch-all) entry — empty
+// host_pattern — appended last. A leading "*." marks a wildcard pattern.
 message ClientCertStore {
-  ClientCertConfigState default = 1;
-  repeated ClientCertEntry exact = 2;
-  repeated ClientCertEntry wildcard = 3;
+  repeated ClientCertEntry entries = 1;
 }
 
 message ClientCertEntry {
   string host_pattern = 1;
   ClientCertConfigState state = 2;
+  uint32 port = 3; // u16 bind port
 }
 
 message ClientCertConfigState {

@@ -190,12 +190,31 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
                 gw.metadata.namespace.as_deref().unwrap_or_default(),
                 gw.metadata.name.as_deref().unwrap_or_default(),
             );
-            let live_ip = services
-                .iter()
-                .find(|s| s.metadata.name.as_deref() == Some(svc_name.as_str()))
-                .and_then(|s| s.spec.as_ref())
-                .and_then(|sp| sp.cluster_ip.as_deref())
-                .and_then(|s| s.parse::<std::net::IpAddr>().ok());
+            // The keep-or-repin decision MUST read the LIVE Service, never the
+            // watch store: the store lags this reconciler's own writes, so a
+            // triggered pass arriving within the lag window would see the
+            // pre-repin clusterIP, delete the just-correctly-pinned Service,
+            // and recreate it — and since every delete/create fires more
+            // Service events (→ more passes), the repin becomes a
+            // self-sustaining delete/create loop. One GET per static-address
+            // Gateway per pass; the dedicated repin has always read live for
+            // the same reason.
+            let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), ctrl_ns);
+            let live_ip = match svc_api.get_opt(&svc_name).await {
+                Ok(svc) => svc
+                    .as_ref()
+                    .and_then(|s| s.spec.as_ref())
+                    .and_then(|sp| sp.cluster_ip.as_deref())
+                    .and_then(|s| s.parse::<std::net::IpAddr>().ok()),
+                Err(e) => {
+                    tracing::warn!(
+                        service = %format!("{ctrl_ns}/{svc_name}"),
+                        error = %e,
+                        "operator: live VIP Service read failed; deferring static bind to next pass"
+                    );
+                    continue;
+                }
+            };
             let failed = bind_static_vip_service(StaticVipBinding {
                 ctx,
                 gw,

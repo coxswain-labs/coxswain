@@ -65,7 +65,7 @@ use std::time::Duration;
 
 use coxswain_e2e::{
     FixtureVars, Harness, NamespaceGuard,
-    fixtures::{self, backends, ingress},
+    fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::wait,
 };
 
@@ -640,7 +640,7 @@ async fn invalid_sa_token_is_rejected_with_event() -> anyhow::Result<()> {
                             { "name": "POD_NAME", "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } } },
                             { "name": "POD_NAMESPACE", "valueFrom": { "fieldRef": { "fieldPath": "metadata.namespace" } } },
                             { "name": "COXSWAIN_DISCOVERY_ENDPOINT", "value": "https://coxswain-controller-discovery.coxswain-system.svc:50051" },
-                            { "name": "COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT", "value": "https://coxswain-controller-discovery.coxswain-system.svc:50052" },
+                            { "name": "COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT", "value": "https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052" },
                             { "name": "COXSWAIN_DISCOVERY_SA_TOKEN_PATH", "value": "/var/run/secrets/coxswain/discovery-token/token" },
                             { "name": "COXSWAIN_DISCOVERY_CA_BUNDLE_PATH", "value": "/var/run/secrets/coxswain/trust-bundle/ca.crt" },
                             { "name": "COXSWAIN_DISCOVERY_TRUST_DOMAIN", "value": "cluster.local" }
@@ -967,4 +967,219 @@ gateways/status.gateway.networking.k8s.io       []   []   [patch update]
         let rows = parse_auth_can_i("");
         assert!(rows.is_empty());
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group 6 — Leader-gated discovery stream (#531)
+//
+// The Stream RPC is served only by the lease holder: the leader labels its own
+// pod (`discovery.coxswain-labs.dev/leader=true`) so the stream Service routes
+// dials to it, and standbys reject stray streams with FAILED_PRECONDITION (the
+// code-level rejection is unit-tested in coxswain-discovery). Readiness reports
+// therefore always land in the status-writing leader's registry.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// The stream Service's endpoints and the per-pod `connected_proxies` gauge
+/// must both single out the lease holder: standbys serve no streams.
+#[tokio::test]
+async fn only_lease_holder_reports_connected_proxy_streams() -> anyhow::Result<()> {
+    use coxswain_e2e::harness::leader;
+    use k8s_openapi::api::core::v1::{Endpoints, Pod};
+
+    let h = Harness::start().await?;
+
+    let leader_pod = leader::leader_pod_name(&h.client).await?;
+
+    // The always-running shared proxy must hold a stream to the leader.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || {
+            let leader_pod = leader_pod.clone();
+            async move {
+                format!(
+                    "leader pod {leader_pod} to report connected_proxies >= 1; observed {:?}",
+                    leader::pod_metric_value(&leader_pod, "coxswain_discovery_connected_proxies")
+                        .await
+                )
+            }
+        },
+        || {
+            let leader_pod = leader_pod.clone();
+            async move {
+                let v =
+                    leader::pod_metric_value(&leader_pod, "coxswain_discovery_connected_proxies")
+                        .await
+                        .ok()??;
+                (v >= 1.0).then_some(())
+            }
+        },
+    )
+    .await?;
+
+    // Every OTHER Ready controller replica must hold zero streams (absent
+    // series reads as 0 — the gauge is touched only when a stream lands).
+    let pods_api: Api<Pod> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    let controller_pods = pods_api
+        .list(&ListParams::default().labels("app.kubernetes.io/component=controller"))
+        .await?;
+    let mut standbys_checked = 0;
+    for pod in &controller_pods {
+        let name = pod.metadata.name.as_deref().unwrap_or_default();
+        if name == leader_pod || name.is_empty() {
+            continue;
+        }
+        let v = leader::pod_metric_value(name, "coxswain_discovery_connected_proxies").await?;
+        assert!(
+            v.unwrap_or(0.0) == 0.0,
+            "standby {name} must serve zero discovery streams, reports {v:?}"
+        );
+        standbys_checked += 1;
+    }
+    assert!(
+        standbys_checked >= 1,
+        "HA default runs >= 2 controller replicas; found none besides the leader — \
+         the standby assertion never ran"
+    );
+
+    // Deterministic routing: the stream Service's endpoints are exactly the
+    // leader pod (the leader label selector at work).
+    let ep_api: Api<Endpoints> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    let ep = ep_api.get("coxswain-controller-discovery").await?;
+    let targets: Vec<String> = ep
+        .subsets
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|s| s.addresses.unwrap_or_default())
+        .filter_map(|a| a.target_ref.and_then(|r| r.name))
+        .collect();
+    assert_eq!(
+        targets,
+        vec![leader_pod.clone()],
+        "the discovery stream Service must route to exactly the leader pod"
+    );
+    Ok(())
+}
+
+/// Kill the live leader while a warm standby holds: the data plane keeps
+/// serving last-good routing at every poll tick, the standby takes the lease
+/// and the proxy's stream re-lands on it, and a Gateway created *after* the
+/// failover still reaches `Programmed=True` — proof the new leader's readiness
+/// registry rebuilt from the reconnecting proxy's NodeStatus, with no
+/// cross-replica state ever synced.
+#[tokio::test]
+async fn proxies_reconnect_to_new_leader_after_leader_pod_kill() -> anyhow::Result<()> {
+    use coxswain_e2e::harness::leader;
+    use k8s_openapi::api::core::v1::Pod;
+
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "disc-leader-kill").await?;
+
+    // Baseline route through the Ingress data plane (Service-level LB to the
+    // proxy pod — independent of which controller replica leads).
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    let host = format!("ingress.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+
+    let old_leader = leader::leader_pod_name(&h.client).await?;
+    let pods_api: Api<Pod> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    pods_api
+        .delete(&old_leader, &Default::default())
+        .await
+        .context("delete the live leader pod")?;
+
+    // Take-over, with per-tick data-plane continuity: the proxy serves its
+    // last-good snapshot throughout the leaderless window.
+    let new_leader = wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || {
+            let client = h.client.clone();
+            let old = old_leader.clone();
+            async move {
+                format!(
+                    "a new Ready leader (not {old}); current holder {:?}",
+                    leader::leader_pod_name(&client).await
+                )
+            }
+        },
+        || {
+            let client = h.client.clone();
+            let old = old_leader.clone();
+            let http = &h.http;
+            let host = host.clone();
+            async move {
+                // Continuity invariant on EVERY tick — a failed probe is a
+                // hard failure, not a retry: routing must never blink.
+                let resp = http
+                    .get(&host, "/a")
+                    .await
+                    .expect("data plane must keep serving during the leaderless window");
+                resp.assert_backend("echo-a");
+
+                let holder = leader::leader_pod_name(&client).await.ok()?;
+                if holder == old {
+                    return None;
+                }
+                let pod = Api::<Pod>::namespaced(client, leader::SYSTEM_NAMESPACE)
+                    .get(&holder)
+                    .await
+                    .ok()?;
+                leader::pod_is_ready(&pod).then_some(holder)
+            }
+        },
+    )
+    .await?;
+
+    // The proxy's stream must re-land on the new leader (fast-retry through
+    // the re-labelled Service), observable as its leadership gauge plus a
+    // connected proxy. Deliberately NO transitions-counter assertion: the
+    // Deployment replaces the killed pod, and the replacement can win the
+    // lease over the warm standby — a fresh pod's initial acquisition is not
+    // a "transition", so the counter is legitimately absent on that path.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || {
+            let new_leader = new_leader.clone();
+            async move {
+                format!(
+                    "new leader {new_leader} to show leader=1 and >=1 connected proxy; \
+                     observed leader={:?} connected={:?}",
+                    leader::pod_metric_value(&new_leader, "coxswain_controller_leader").await,
+                    leader::pod_metric_value(&new_leader, "coxswain_discovery_connected_proxies")
+                        .await,
+                )
+            }
+        },
+        || {
+            let new_leader = new_leader.clone();
+            async move {
+                let leading = leader::pod_metric_value(&new_leader, "coxswain_controller_leader")
+                    .await
+                    .ok()??;
+                let connected =
+                    leader::pod_metric_value(&new_leader, "coxswain_discovery_connected_proxies")
+                        .await
+                        .ok()??;
+                (leading == 1.0 && connected >= 1.0).then_some(())
+            }
+        },
+    )
+    .await?;
+
+    // Registry-rebuild proof: a Gateway created AFTER the failover reaches
+    // Programmed=True — only possible if the reconnected proxy's NodeStatus
+    // repopulated the NEW leader's readiness view.
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_gateway_programmed(
+        &h.client,
+        "coxswain-test",
+        &ns.name,
+        Duration::from_secs(120),
+    )
+    .await?;
+    Ok(())
 }

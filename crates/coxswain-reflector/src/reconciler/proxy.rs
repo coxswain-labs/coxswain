@@ -56,6 +56,7 @@ use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRouti
 use coxswain_core::fleet::{self, SharedFleet};
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
+use coxswain_core::publish_index::SharedGatewayPublishIndex;
 use coxswain_core::routing::{
     BackendClientCert, SharedGatewayRoutingTable, SharedIngressRoutingTable,
     SharedTlsPassthroughTable,
@@ -307,6 +308,9 @@ pub struct SharedProxyReconciler {
     ctp_status: SharedClientTrafficPolicyStatus,
     /// Per-`CoxswainBackendPolicy` ancestor health (#354).
     cbp_status: SharedCoxswainBackendPolicyStatus,
+    /// Per-Gateway publish-sequence stamps for the #531 `Programmed` ack
+    /// gate. Stamped at the end of every rebuild, after all cells above.
+    publish_index: SharedGatewayPublishIndex,
     fleet: SharedFleet,
     owned_gateways: OwnedGateways,
     leader: Arc<AtomicBool>,
@@ -598,6 +602,7 @@ impl SharedProxyReconciler {
             policy_status: SharedBackendTlsPolicyStatus::new(),
             ctp_status: SharedClientTrafficPolicyStatus::new(),
             cbp_status: SharedCoxswainBackendPolicyStatus::new(),
+            publish_index: SharedGatewayPublishIndex::new(),
             fleet: SharedFleet::new(),
             owned_gateways,
             leader,
@@ -622,6 +627,14 @@ impl SharedProxyReconciler {
     /// can subscribe to updates published by this reconciler.
     pub fn route_status(&self) -> SharedRouteStatus {
         self.route_status.clone()
+    }
+
+    /// Returns the per-Gateway publish-sequence index handle (#531): the
+    /// discovery server captures its counter before each snapshot build, and
+    /// both `Programmed` status writers look up stamps from it.
+    #[must_use]
+    pub fn publish_index(&self) -> SharedGatewayPublishIndex {
+        self.publish_index.clone()
     }
 
     /// Returns the shared GRPCRoute status handle so the Controller can subscribe to
@@ -788,6 +801,7 @@ pub(super) struct SharedOutputs<'a> {
     pub(super) cbp_status: &'a SharedCoxswainBackendPolicyStatus,
     pub(super) passthrough_routes: &'a SharedTlsPassthroughTable,
     pub(super) terminate_routes: &'a SharedTlsPassthroughTable,
+    pub(super) publish_index: &'a SharedGatewayPublishIndex,
     pub(super) ingress_event_tx: Option<&'a tokio::sync::mpsc::Sender<IngressEvent>>,
 }
 
@@ -956,6 +970,7 @@ impl BackgroundService for SharedProxyReconciler {
             policy_status: self.policy_status.clone(),
             ctp_status: self.ctp_status.clone(),
             cbp_status: self.cbp_status.clone(),
+            publish_index: self.publish_index.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
             terminate_routes: self.terminate_routes.clone(),
             fleet: self.fleet.clone(),
@@ -1001,6 +1016,8 @@ struct SharedHandles {
     policy_status: SharedBackendTlsPolicyStatus,
     ctp_status: SharedClientTrafficPolicyStatus,
     cbp_status: SharedCoxswainBackendPolicyStatus,
+    /// Per-Gateway publish-sequence stamps for the #531 ack gate.
+    publish_index: SharedGatewayPublishIndex,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
     /// SNI-keyed TLS terminate routing table for TLSRouteModeTerminate (#481).
@@ -1270,6 +1287,7 @@ async fn spawn_tasks(
         policy_status,
         ctp_status,
         cbp_status,
+        publish_index,
         passthrough_routes,
         terminate_routes,
         fleet,
@@ -1627,6 +1645,7 @@ async fn spawn_tasks(
                 policy_status: &policy_status,
                 ctp_status: &ctp_status,
                 cbp_status: &cbp_status,
+                publish_index: &publish_index,
                 passthrough_routes: &passthrough_routes,
                 terminate_routes: &terminate_routes,
                 ingress_event_tx: ingress_event_tx.as_ref(),
@@ -1669,6 +1688,16 @@ fn rebuild(
     leader: bool,
     outputs: &SharedOutputs<'_>,
 ) -> bool {
+    // #531: the generations stamped into the publish index at the END of this
+    // rebuild MUST come from a store snapshot taken BEFORE any routing cell is
+    // built. The live watcher store keeps updating while the cells build; a
+    // generation read afterwards can be newer than the config the cells
+    // actually carry, and stamping it would let the ack gate certify a
+    // generation no proxy has received (the stamp is sticky per generation,
+    // so the over-claim would never self-repair). A start-of-rebuild snapshot
+    // can only under-claim — fail closed — and the store change that caused
+    // the skew triggers the next debounced rebuild, which re-stamps.
+    let stamp_gateways = stores.gateways.state();
     let routes = stores.routes.state();
     let grpc_routes = stores.grpc_routes.state();
     let ingresses = stores.ingresses.state();
@@ -1769,7 +1798,7 @@ fn rebuild(
         outputs.tls,
         outputs.listener_hostnames,
         true,
-        ingress_ports.https.unwrap_or(443),
+        ingress_ports.https,
     );
     build_client_certs(
         stores,
@@ -1778,6 +1807,7 @@ fn rebuild(
         outputs.client_certs,
         &mut gateway_listener_status,
         true,
+        ingress_ports.https,
     );
     merge_backend_client_cert_health(&mut gateway_listener_status, &backend_client_certs.health);
 
@@ -1958,6 +1988,7 @@ fn rebuild(
         .iter()
         .filter_map(|gw| build_dedicated_gateway_snapshot(gw, stores, &dedicated_inputs))
         .collect();
+    let dedicated_keys: HashSet<ObjectKey> = registry_map.keys().cloned().collect();
     outputs.dedicated_registry.store(Arc::new(registry_map));
 
     // Build the SNI-keyed TLS passthrough table from TLSRoutes bound to
@@ -1990,6 +2021,41 @@ fn rebuild(
     outputs
         .tls_route_status
         .store_and_notify(tls_route_status_map);
+
+    // #531 ack gate: stamp the publish index LAST, after every routing cell
+    // above has been stored — the sequence bump is the publication fence the
+    // discovery server's pre-build capture relies on. Covers both worlds:
+    // shared-pool Gateways (config in the shared cells) and cut-over Gateways
+    // (config in the dedicated registry), each at its current generation plus
+    // a fingerprint of its own published listener-status entry: a
+    // same-generation content change (a frontendValidation CA resolving one
+    // rebuild after the spec was first processed, a cert ref flipping, a
+    // route attaching) re-arms the stamp so proxies must apply THAT content
+    // before Programmed flips. Then re-tick the rebuild watch so
+    // subscription loops that woke on the mid-rebuild `store_and_notify`
+    // re-capture a post-stamp sequence — without it a quiet cluster strands
+    // the gate until the next content change.
+    let published_listener_status = outputs.listener_status.load();
+    let stamped = stamp_gateways.iter().filter_map(|g| {
+        let key = ObjectKey::from_meta(&g.metadata)?;
+        (owned_gateways.contains(&key) || dedicated_keys.contains(&key)).then(|| {
+            let fingerprint = {
+                use std::hash::{Hash as _, Hasher as _};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                // Debug-format hashing: the entry's types carry no Hash impl,
+                // but their derived Debug output is a pure function of the
+                // state (readiness enums, resolution outcomes, counts —
+                // no timestamps), which is exactly what the stamp needs.
+                if let Some(entry) = published_listener_status.get(&key) {
+                    format!("{entry:?}").hash(&mut h);
+                }
+                h.finish()
+            };
+            (key, g.metadata.generation.unwrap_or(0), fingerprint)
+        })
+    });
+    outputs.publish_index.stamp_rebuild(stamped);
+    outputs.route_status.notify_rebuilt();
 
     routes_published
 }

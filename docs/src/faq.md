@@ -8,7 +8,7 @@ Not yet. Coxswain is pre-1.0: the API surface and configuration flags may change
 
 ### Why another Ingress controller?
 
-Coxswain separates the controller (the sole Kubernetes reader and writer) from the proxy (a read-only Pingora data plane). The controller compiles routing snapshots from Kubernetes watch events and pushes them to proxies over a mandatory-mTLS gRPC discovery stream; the proxy applies each snapshot via an atomic pointer swap — no locks, no restart. TLS certificates are delivered the same way. Proxies have no leader election, no Kubernetes API access, and scale horizontally with no coordination.
+Coxswain separates the controller (the sole Kubernetes reader and writer) from the proxy (a read-only Pingora data plane). The leader-elected controller compiles routing snapshots from Kubernetes watch events and pushes them to proxies over a mandatory-mTLS gRPC discovery stream; the proxy applies each snapshot via an atomic pointer swap — no locks, no restart — and reports its bound listener ports back on the same stream, so a Gateway's `Programmed=True` means the data plane is actually serving it. TLS certificates are delivered the same way. Proxies have no leader election, no Kubernetes API access, and scale horizontally with no coordination.
 
 See [Comparison](#comparison) for specific differences against other controllers.
 

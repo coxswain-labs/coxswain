@@ -1,12 +1,12 @@
 # Dedicated-mode Gateway scoped to a single ClusterIP Service for the
 # `dedicated_gateway` lifecycle suite.
 #
-# Pins the proxy image to `registry.k8s.io/pause:3.10` so the rendered
-# Deployment's Pod transitions to Ready instantly — the controller-side
-# lifecycle (status conditions, address assignment, GC) is what these
-# tests exercise; traffic flow through the dedicated pod itself is
-# covered separately by `traffic.yaml` plus a host-spawned dedicated
-# proxy subprocess.
+# No `image` override: the operator renders the real coxswain image. The
+# controller-side lifecycle (status conditions, address assignment, GC)
+# is what these tests exercise, but Programmed gates on the dedicated
+# proxy's bound-port report over discovery (#531), so the pod must run a
+# live proxy — a stub container never converges. Traffic flow through
+# the dedicated pod is covered separately by `traffic.yaml`.
 # TESTNS is substituted at runtime.
 ---
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -16,7 +16,6 @@ metadata:
 spec:
   replicas: 1
   serviceType: ClusterIP
-  image: ${PAUSE_IMAGE}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway

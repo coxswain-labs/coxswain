@@ -350,7 +350,7 @@ async fn wait_for_lb_ip(svc_name: &str, namespace: &str) -> anyhow::Result<IpAdd
 ///
 /// Returns an error if `kubectl port-forward` fails to spawn or the tunnel does
 /// not accept connections within 30 s.
-async fn start_port_forward(
+pub(crate) async fn start_port_forward(
     target: &str,
     local_port: u16,
     remote_port: u16,
@@ -399,7 +399,7 @@ async fn start_port_forward(
 /// Allocate a free loopback TCP port by binding and immediately releasing it.
 ///
 /// There is a small race window between release and reuse; acceptable for tests.
-fn free_port() -> anyhow::Result<u16> {
+pub(crate) fn free_port() -> anyhow::Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").context("bind ephemeral port")?;
     Ok(listener.local_addr().context("local_addr")?.port())
 }

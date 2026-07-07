@@ -85,7 +85,7 @@ pub(super) fn reconcile_client_certs_no_default(
     owned: &HashSet<String>,
     b: &mut ClientCertStoreBuilder,
 ) {
-    IngressReconciler::reconcile_client_certs(ing, auth_tls_secrets, owned, None, b);
+    IngressReconciler::reconcile_client_certs(ing, auth_tls_secrets, owned, None, b, 443);
 }
 
 pub(super) fn make_service_with_named_port(

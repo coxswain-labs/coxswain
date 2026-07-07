@@ -35,15 +35,25 @@ pub(super) struct SharedAddressDecision {
     /// is by construction an unsupported kind → `Accepted=False`. Existence of
     /// the ref is the whole signal; no target resolution is needed.
     pub(super) params_ref_unsupported: bool,
-    /// Whether the Gateway is fully converged for its current generation (#533):
-    /// its own VIP address has resolved. `false` holds the top-level
-    /// `Programmed` condition at `False/Pending` with an `observedGeneration`
-    /// below the current generation, so a one-shot "conditions are latest" check
-    /// waits until the address lands and `Programmed=True@N` is published in the
-    /// same patch that carries `status.addresses`. A settled *negative* address
-    /// outcome (`programmed_override`) is unaffected — it is a real result for
-    /// the current generation.
+    /// Whether the Gateway is fully converged for its current generation:
+    /// its own VIP address has resolved (#533) AND every connected shared-pool
+    /// proxy node has bound the VIP's internal ports (#531). `false` holds the
+    /// top-level `Programmed` condition at `False/Pending` with an
+    /// `observedGeneration` below the current generation, so a one-shot
+    /// "conditions are latest" check waits until the address lands, the data
+    /// plane binds, and `Programmed=True@N` is published in the same patch that
+    /// carries `status.addresses`. A settled *negative* address outcome
+    /// (`programmed_override`) is unaffected — it is a real result for the
+    /// current generation.
     pub(super) converged: bool,
+    /// Human-readable cause for a `Programmed=False/Pending` hold beyond the
+    /// generic address wait — the proxy-pool bind gate (#531): which/how many
+    /// connected nodes have not yet bound which internal ports. Message only:
+    /// `gateway_needs_status_patch` compares `(status, reason)` and
+    /// `observedGeneration`, never the message, so detail drift (a node count
+    /// changing) causes zero patch churn. `None` = use the reason's canonical
+    /// message.
+    pub(super) pending_detail: Option<String>,
 }
 
 impl SharedAddressDecision {
@@ -393,7 +403,14 @@ pub(super) fn build_gateway_status_patch(
             GatewayConditionType::Programmed,
             prog_status,
             prog_reason,
-            static_address_message(prog_reason),
+            // #531: while pending on the proxy-pool bind gate, surface the
+            // specific wait (which nodes / which ports) instead of the generic
+            // reason message. Message-only — never compared for patch staleness.
+            decision
+                .pending_detail
+                .as_deref()
+                .filter(|_| decision.programmed_pending())
+                .unwrap_or_else(|| static_address_message(prog_reason)),
             prog_generation,
             now.clone(),
         ),
@@ -544,6 +561,7 @@ mod tests {
             static_outcome: StaticAddressOutcome::not_engaged(),
             params_ref_unsupported: false,
             converged: true,
+            pending_detail: None,
         }
     }
 
@@ -554,6 +572,7 @@ mod tests {
             static_outcome: StaticAddressOutcome::not_engaged(),
             params_ref_unsupported: false,
             converged: true,
+            pending_detail: None,
         }
     }
     use coxswain_reflector::gw_types::v::gateways::{
@@ -918,6 +937,7 @@ mod tests {
             },
             params_ref_unsupported: false,
             converged: true,
+            pending_detail: None,
         }
     }
 
@@ -975,6 +995,7 @@ mod tests {
             },
             params_ref_unsupported: true,
             converged: true,
+            pending_detail: None,
         };
         let patch = build_gateway_status_patch(
             &gw,
@@ -1239,6 +1260,7 @@ mod tests {
             static_outcome: StaticAddressOutcome::not_engaged(),
             params_ref_unsupported: false,
             converged: false,
+            pending_detail: None,
         }
     }
 
@@ -1276,6 +1298,66 @@ mod tests {
             prog["observedGeneration"], 2,
             "Programmed held one generation below current until converged"
         );
+    }
+
+    #[test]
+    fn patch_carries_pool_bind_detail_while_pending() {
+        // #531: while the hold is caused by the proxy-pool bind gate, the
+        // Programmed message names the wait (nodes/ports) instead of the
+        // generic Pending text — message only, never part of staleness.
+        let gw = gateway(3, None, None);
+        let mut decision = not_converged();
+        decision.pending_detail = Some(
+            "waiting for 1/2 connected shared proxy node(s) to bind internal port(s) [30001]"
+                .to_owned(),
+        );
+        let patch = build_gateway_status_patch(
+            &gw,
+            &default_status(),
+            3,
+            &epoch(),
+            &decision,
+            IngressPorts::default(),
+        );
+        let prog = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed")
+            .clone();
+        assert_eq!(prog["status"], "False");
+        assert_eq!(prog["reason"], "Pending");
+        assert_eq!(
+            prog["message"],
+            "waiting for 1/2 connected shared proxy node(s) to bind internal port(s) [30001]"
+        );
+    }
+
+    #[test]
+    fn pending_detail_ignored_once_converged() {
+        // A stale detail on a converged decision must not leak into the
+        // canonical True/Programmed message.
+        let gw = gateway(3, None, None);
+        let mut decision = no_addr(); // converged
+        decision.pending_detail = Some("stale detail".to_owned());
+        let patch = build_gateway_status_patch(
+            &gw,
+            &default_status(),
+            3,
+            &epoch(),
+            &decision,
+            IngressPorts::default(),
+        );
+        let prog = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed")
+            .clone();
+        assert_eq!(prog["status"], "True");
+        assert_ne!(prog["message"], "stale detail");
     }
 
     #[test]

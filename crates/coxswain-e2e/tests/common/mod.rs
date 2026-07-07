@@ -10,3 +10,4 @@
 pub mod dedicated;
 pub mod discovery;
 pub mod grpc_echo;
+pub mod shared_proxy;

@@ -120,9 +120,9 @@ pub(super) fn build_dedicated_gateway_snapshot(
         &tls_cell,
         &listener_hostnames_cell,
         false,
-        // Dedicated proxies never serve Ingress (empty ingress_classes above),
-        // so no Ingress cert is keyed; the port is immaterial here (#472).
-        443,
+        // Dedicated proxies never serve Ingress (empty ingress_classes above):
+        // there is no Ingress HTTPS bind port, so no Ingress cert is keyed.
+        None,
     );
     build_client_certs(
         stores,
@@ -131,6 +131,9 @@ pub(super) fn build_dedicated_gateway_snapshot(
         &client_certs_cell,
         &mut dedicated_listener_health,
         false,
+        // Dedicated proxies never serve Ingress (empty ingress_classes above):
+        // there is no Ingress HTTPS bind port, so no Ingress mTLS config is keyed.
+        None,
     );
     merge_backend_client_cert_health(
         &mut dedicated_listener_health,

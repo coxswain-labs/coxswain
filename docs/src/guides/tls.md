@@ -268,7 +268,7 @@ kubectl get gateway <name> -o jsonpath='{.status.conditions[?(@.type=="InsecureF
 
 | Feature | Status |
 |---------|--------|
-| `perPort` validation overrides | **Supported** — `spec.tls.frontend.perPort[].tls.validation` overrides the gateway `default` for listeners on that port; resolution is keyed by the listener's hostname |
+| `perPort` validation overrides | **Supported** — `spec.tls.frontend.perPort[].tls.validation` overrides the gateway `default` for listeners on that port; the resolved config is keyed by the listener's bind port + hostname, so two Gateways sharing a hostname keep independent validation policies |
 | Cross-namespace CA refs | **Supported** — a CA `ConfigMap` in another namespace requires a `Gateway → ConfigMap` `ReferenceGrant`; without one the listener surfaces `ResolvedRefs=False/RefNotPermitted` |
 | Secret-backed CA refs | Not yet — only `ConfigMap`/`ca.crt` is Core-certified |
 | Multiple `caCertificateRefs` | Planned (Extended support); currently only the first ref is used |

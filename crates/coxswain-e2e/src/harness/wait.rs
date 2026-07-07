@@ -1017,6 +1017,33 @@ fn metric_value(body: &str, name: &str) -> Option<f64> {
     })
 }
 
+/// First sample value for `metric` in a Prometheus text exposition, matching
+/// the bare form (`name <value>`) or a labelled series (`name{...} <value>`).
+/// Returns `None` when the series is absent — for lazily-registered gauges
+/// that reads as 0. The crate-wide exposition parser; do not fork per-module
+/// copies (they drift).
+#[must_use]
+pub fn parse_metric_value(exposition: &str, metric: &str) -> Option<f64> {
+    exposition
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .find(|l| {
+            l.split(&[' ', '{'][..])
+                .next()
+                .is_some_and(|name| name == metric)
+        })
+        .and_then(|l| {
+            // Label values may contain spaces (`result="not leader"`), so the
+            // value is whatever follows the label block — or the first space
+            // in the bare form. A trailing exposition timestamp is ignored.
+            let after = match l.rsplit_once('}') {
+                Some((_, rest)) => rest,
+                None => l.split_once(' ').map(|(_, rest)| rest)?,
+            };
+            after.split_whitespace().next()?.parse().ok()
+        })
+}
+
 /// Sum `coxswain_controller_reconcile_total{...,result="ok"}` across all
 /// `controller` labels. Returns `None` if no `result="ok"` series is present
 /// (the metric `observe_reconcile` labels a successful reconcile `result="ok"`).
@@ -1643,5 +1670,33 @@ async fn backend_tls_policy_state(api: &Api<BackendTlsPolicy>, name: &str) -> St
             format!("ancestors=[{}]", ancestors.join(", "))
         }
         Err(e) => format!("<could not fetch BackendTLSPolicy {name}: {e}>"),
+    }
+}
+
+#[cfg(test)]
+mod exposition_tests {
+    use super::parse_metric_value;
+
+    #[test]
+    fn parse_metric_value_matches_bare_and_labelled() {
+        let body = "# HELP x y
+coxswain_controller_leader 1
+                    coxswain_discovery_streams_total{result=\"not leader\"} 4 1720000000
+";
+        assert_eq!(
+            parse_metric_value(body, "coxswain_controller_leader"),
+            Some(1.0)
+        );
+        assert_eq!(
+            parse_metric_value(body, "coxswain_discovery_streams_total"),
+            Some(4.0),
+            "labelled series with a spaced label value and trailing timestamp"
+        );
+        assert_eq!(
+            parse_metric_value(body, "coxswain_discovery_connected_proxies"),
+            None
+        );
+        // A prefix must not match a longer metric name.
+        assert_eq!(parse_metric_value(body, "coxswain_controller"), None);
     }
 }

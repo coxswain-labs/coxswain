@@ -79,7 +79,7 @@ spec:
             - name: COXSWAIN_DISCOVERY_ENDPOINT
               value: "https://coxswain-controller-discovery.coxswain-system.svc:50051"
             - name: COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT
-              value: "https://coxswain-controller-discovery.coxswain-system.svc:50052"
+              value: "https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052"
             - name: COXSWAIN_DISCOVERY_SA_TOKEN_PATH
               value: "/var/run/secrets/coxswain/discovery-token/token"
             - name: COXSWAIN_DISCOVERY_CA_BUNDLE_PATH

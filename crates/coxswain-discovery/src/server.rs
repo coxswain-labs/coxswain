@@ -18,8 +18,10 @@
 //! # Node registry
 //!
 //! Each stream task calls [`SharedNodeRegistry::connect`] on entry and
-//! [`SharedNodeRegistry::disconnect`] on exit, recording every Ack in between.
-//! The registry is read by the admin UI convergence panel (T8).
+//! [`SharedNodeRegistry::disconnect`] on exit, recording every Ack — and every
+//! `NodeStatus` bound-port report (#531) — in between. The registry is read by
+//! the admin UI convergence panel (T8) and by the controller's Gateway
+//! `Programmed` readiness gate (#531).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
@@ -35,6 +37,7 @@ use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
 use coxswain_core::listener_status::SharedGatewayListenerStatus;
 use coxswain_core::node_registry::{NodeScope, SharedNodeRegistry};
 use coxswain_core::ownership::ObjectKey;
+use coxswain_core::publish_index::SharedGatewayPublishIndex;
 use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
 };
@@ -88,6 +91,12 @@ pub struct SnapshotSource {
     /// Only populated for [`Scope::SharedPool`] subscribers; dedicated proxies
     /// receive an empty table (TLSRoutes are shared-pool only).
     pub terminate_routes: SharedTlsPassthroughTable,
+    /// Per-Gateway publish-sequence index (#531). The server captures its
+    /// counter **before** loading any cell for a snapshot build; a node that
+    /// Acks that snapshot has therefore applied every rebuild stamped at a
+    /// sequence `<=` the captured value — the content-convergence input to
+    /// the `Programmed` ack gate.
+    pub publish: SharedGatewayPublishIndex,
 }
 
 impl Clone for SnapshotSource {
@@ -101,6 +110,7 @@ impl Clone for SnapshotSource {
             dedicated: self.dedicated.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
             terminate_routes: self.terminate_routes.clone(),
+            publish: self.publish.clone(),
         }
     }
 }
@@ -121,7 +131,26 @@ pub struct DiscoveryService {
     source: SnapshotSource,
     registry: SharedNodeRegistry,
     rebuild_rx: watch::Receiver<u64>,
+    /// Leadership gate (#531). `Some(rx)`: streams are accepted only while the
+    /// watched value is `true`, and live streams are terminated on a
+    /// `true → false` flip. `None`: ungated (unit tests; the bin always gates).
+    leader_rx: Option<watch::Receiver<bool>>,
 }
+
+/// Stream-rejection message sent by a non-leader replica (#531).
+///
+/// The discovery client matches on this text (plus `FAILED_PRECONDITION`) to
+/// classify the rejection as an expected fast-retry — `FAILED_PRECONDITION`
+/// alone is ambiguous (wire-version mismatch uses the same code). Keep the
+/// phrase "not the leader" stable; `client::is_not_leader` depends on it.
+pub(crate) const NOT_LEADER_MSG: &str =
+    "discovery: this replica is not the leader; redial to reach the leader";
+
+/// The wire-stable substring `client::is_not_leader` matches on. Must appear
+/// verbatim in [`NOT_LEADER_MSG`] — enforced by a unit test — and must never
+/// change wording: controller and proxy binaries skew across upgrades, so an
+/// old proxy classifies a new controller's rejection by this exact phrase.
+pub(crate) const NOT_LEADER_NEEDLE: &str = "not the leader";
 
 impl DiscoveryService {
     /// Construct a new service handle.
@@ -139,7 +168,24 @@ impl DiscoveryService {
             source,
             registry,
             rebuild_rx,
+            leader_rx: None,
         }
+    }
+
+    /// Gate the `Stream` RPC on a leadership watch (#531).
+    ///
+    /// While the watched value is `false` (standby, or leadership not yet
+    /// established), new streams are rejected at accept with
+    /// `FAILED_PRECONDITION` / [`NOT_LEADER_MSG`], and a demotion terminates
+    /// every live stream with the same status so proxies redial immediately —
+    /// their bound-port Acks must land on the leader that writes status, never
+    /// in a demoted replica's registry. The Bootstrap RPC is deliberately NOT
+    /// gated: SVID issuance is stateless (shared CA Secret) and must work on
+    /// every replica.
+    #[must_use]
+    pub fn with_leader_gate(mut self, rx: watch::Receiver<bool>) -> Self {
+        self.leader_rx = Some(rx);
+        self
     }
 }
 
@@ -167,6 +213,9 @@ fn next_nonce() -> Vec<u8> {
 #[derive(Clone)]
 struct SnapshotContent {
     version: String,
+    /// Publish sequence captured before the cells were read (never on the
+    /// wire): recorded into the node registry when this snapshot is Ack'd.
+    seq: u64,
     ingress_routing: p::RoutingTable,
     gateway_routing: p::RoutingTable,
     tls_store: p::PortTlsStore,
@@ -212,7 +261,12 @@ fn build_snapshot(
     scope: &Scope,
     peer_svid: Option<&PeerSvid>,
 ) -> SnapshotContent {
-    match scope {
+    // Capture the publish sequence BEFORE reading any cell: every rebuild
+    // stamped at a sequence <= this value stored its cells before bumping the
+    // counter, so the content loaded below is at least that new. Capturing
+    // after the loads would claim content the snapshot may not have.
+    let seq = source.publish.current_seq();
+    let mut content = match scope {
         Scope::SharedPool => {
             let ingress = source.ingress.load();
             let gateway = source.gateway.load();
@@ -248,17 +302,26 @@ fn build_snapshot(
                             &snap.expected_proxy_sa,
                         )
                     {
-                        return assemble_snapshot(
-                            p::RoutingTable::default(),
-                            p::RoutingTable::default(),
-                            p::PortTlsStore::default(),
-                            p::ClientCertStore::default(),
-                            p::GatewayListenerStatus::default(),
-                            // Dedicated proxies never serve TLS passthrough routes.
-                            p::TlsPassthroughTable::default(),
-                            // Dedicated proxies never serve TLS terminate routes.
-                            p::TlsPassthroughTable::default(),
-                        );
+                        // seq 0, NOT the captured seq: this snapshot is a
+                        // deliberately-emptied world, so an Ack of it must not
+                        // advance the node's convergence stamp — a real seq
+                        // here would let the #531 ack gate certify content the
+                        // node never received. 0 is a no-op under the
+                        // registry's monotone max.
+                        return SnapshotContent {
+                            seq: 0,
+                            ..assemble_snapshot(
+                                p::RoutingTable::default(),
+                                p::RoutingTable::default(),
+                                p::PortTlsStore::default(),
+                                p::ClientCertStore::default(),
+                                p::GatewayListenerStatus::default(),
+                                // Dedicated proxies never serve TLS passthrough routes.
+                                p::TlsPassthroughTable::default(),
+                                // Dedicated proxies never serve TLS terminate routes.
+                                p::TlsPassthroughTable::default(),
+                            )
+                        };
                     }
                     assemble_snapshot(
                         // A dedicated proxy never serves Ingress resources.
@@ -275,18 +338,28 @@ fn build_snapshot(
                 }
                 // Fail closed: the Gateway is not (yet) cut over, so this proxy
                 // receives an empty world rather than another scope's routes.
-                None => assemble_snapshot(
-                    p::RoutingTable::default(),
-                    p::RoutingTable::default(),
-                    p::PortTlsStore::default(),
-                    p::ClientCertStore::default(),
-                    p::GatewayListenerStatus::default(),
-                    p::TlsPassthroughTable::default(),
-                    p::TlsPassthroughTable::default(),
-                ),
+                // seq 0 for the same reason as the identity-mismatch branch
+                // above: an Ack of a fail-closed empty world must not advance
+                // the node's #531 convergence stamp.
+                None => {
+                    return SnapshotContent {
+                        seq: 0,
+                        ..assemble_snapshot(
+                            p::RoutingTable::default(),
+                            p::RoutingTable::default(),
+                            p::PortTlsStore::default(),
+                            p::ClientCertStore::default(),
+                            p::GatewayListenerStatus::default(),
+                            p::TlsPassthroughTable::default(),
+                            p::TlsPassthroughTable::default(),
+                        )
+                    };
+                }
             }
         }
-    }
+    };
+    content.seq = seq;
+    content
 }
 
 /// Assemble a [`SnapshotContent`] from pre-built wire DTOs.
@@ -329,6 +402,8 @@ fn assemble_snapshot(
 
     SnapshotContent {
         version,
+        // Placeholder — build_snapshot overwrites with the pre-load capture.
+        seq: 0,
         ingress_routing: ingress_dto,
         gateway_routing: gateway_dto,
         tls_store: tls_dto,
@@ -362,6 +437,18 @@ impl Discovery for DiscoveryService {
         &self,
         request: Request<Streaming<p::ClientMessage>>,
     ) -> Result<Response<Self::StreamStream>, Status> {
+        // Leader gate (#531): a standby replica accepts no streams — readiness
+        // reports must land on the status-writing leader's registry. Checked
+        // before reading the subscription so a rejected dial costs one RTT.
+        if let Some(rx) = &self.leader_rx
+            && !*rx.borrow()
+        {
+            crate::metrics::streams_total()
+                .with_label_values(&["rejected_not_leader"])
+                .inc();
+            return Err(Status::failed_precondition(NOT_LEADER_MSG));
+        }
+
         // Extract peer SVID from TLS connection info BEFORE consuming the request.
         // PeerSvid is populated by transport::PeerSvidStream::connect_info() on
         // mTLS connections; absent on plaintext (test/degraded) connections.
@@ -442,6 +529,7 @@ impl Discovery for DiscoveryService {
         let source = self.source.clone();
         let registry = self.registry.clone();
         let rebuild_rx = self.rebuild_rx.clone();
+        let leader_rx = self.leader_rx.clone();
         let (tx, rx) = mpsc::channel::<Result<p::ServerMessage, Status>>(4);
 
         let subscription = StreamSubscription {
@@ -450,7 +538,16 @@ impl Discovery for DiscoveryService {
             peer_svid,
         };
         tokio::spawn(async move {
-            run_stream(subscription, source, registry, rebuild_rx, inbound, tx).await;
+            run_stream(
+                subscription,
+                source,
+                registry,
+                rebuild_rx,
+                leader_rx,
+                inbound,
+                tx,
+            )
+            .await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -537,6 +634,7 @@ async fn run_stream(
     source: SnapshotSource,
     registry: SharedNodeRegistry,
     mut rebuild_rx: watch::Receiver<u64>,
+    mut leader_rx: Option<watch::Receiver<bool>>,
     mut inbound: Streaming<p::ClientMessage>,
     tx: mpsc::Sender<Result<p::ServerMessage, Status>>,
 ) {
@@ -577,6 +675,9 @@ async fn run_stream(
                                     break;
                                 }
                             }
+                            Some(CKind::NodeStatus(ns)) => {
+                                record_node_status(&sub.node_id, &ns, &registry);
+                            }
                             Some(CKind::Subscribe(_)) => {
                                 // Duplicate Subscribe mid-stream; ignore (idempotent).
                                 debug!(node_id = %sub.node_id, "discovery: duplicate Subscribe ignored");
@@ -600,6 +701,17 @@ async fn run_stream(
                 }
             }
 
+            // Leadership lost (#531) — terminate the stream so the proxy
+            // redials and its readiness reports land on the new leader, not in
+            // this demoted replica's registry.
+            () = watch_demotion(&mut leader_rx) => {
+                debug!(node_id = %sub.node_id, "discovery: leadership lost; terminating stream");
+                let _ = tx
+                    .send(Err(Status::failed_precondition(NOT_LEADER_MSG)))
+                    .await;
+                break;
+            }
+
             // Routing world was rebuilt — check for a new snapshot to push.
             _ = rebuild_rx.changed() => {
                 if state.in_flight.is_some() {
@@ -620,6 +732,10 @@ async fn run_stream(
                         node_id = %sub.node_id,
                         "discovery: rebuild produced same version as last Ack — no push needed"
                     );
+                    // Same content as the node's last Ack: advance its
+                    // convergence stamp to the freshly-captured sequence so
+                    // the #531 ack gate converges without a content change.
+                    registry.advance_acked_seq(&sub.node_id, current.seq);
                 }
             }
         }
@@ -645,7 +761,20 @@ async fn handle_ack(
     state: &mut StreamState,
 ) -> Result<(), ()> {
     debug!(node_id = %sub.node_id, version = %ack.version, "discovery: Ack received");
-    registry.record_ack(&sub.node_id, ack.version.clone(), SystemTime::now());
+    // The Ack'd snapshot's publish sequence comes from the retained last-sent
+    // content (Acks echo the version we pushed). A stale Ack for some other
+    // version records sequence 0 — a no-op under the registry's monotone max.
+    let acked_seq = state
+        .last_sent
+        .as_ref()
+        .filter(|sent| sent.version == ack.version)
+        .map_or(0, |sent| sent.seq);
+    registry.record_ack(
+        &sub.node_id,
+        ack.version.clone(),
+        acked_seq,
+        SystemTime::now(),
+    );
     crate::metrics::acks_total().inc();
     state.last_acked = Some(ack.version);
     state.in_flight = None;
@@ -657,6 +786,11 @@ async fn handle_ack(
         state.in_flight = Some(current.version.clone());
         state.last_sent = Some(current.clone());
         send_content(tx, current).await?;
+    } else {
+        // Identical content: the node's applied snapshot is equivalent to the
+        // freshly-captured sequence, so advance its convergence stamp without
+        // a push (#531 ack gate liveness on a quiet cluster).
+        registry.advance_acked_seq(&sub.node_id, current.seq);
     }
     Ok(())
 }
@@ -691,6 +825,49 @@ async fn handle_nack(
             Ok(())
         }
     }
+}
+
+/// Resolve when the watched leadership value is (or becomes) `false` (#531).
+///
+/// Pends forever when ungated (`None`). A dropped sender means the controller
+/// lease loop is gone (process shutdown) — treated as demotion so streams
+/// close promptly rather than lingering on a dying replica.
+async fn watch_demotion(rx: &mut Option<watch::Receiver<bool>>) {
+    let Some(rx) = rx else {
+        return std::future::pending().await;
+    };
+    loop {
+        if !*rx.borrow_and_update() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Record a `NodeStatus` bound-port report into the registry (#531).
+///
+/// Wire carries `u32`; values outside the `u16` port domain are dropped with a
+/// debug log rather than rejecting the whole report — a hostile or buggy client
+/// must not be able to wedge its own row, and dropping oversized values fails
+/// closed (the port reads as not-bound).
+fn record_node_status(node_id: &str, status: &p::NodeStatus, registry: &SharedNodeRegistry) {
+    let mut ports = std::collections::BTreeSet::new();
+    for raw in &status.bound_ports {
+        match u16::try_from(*raw) {
+            Ok(port) => {
+                ports.insert(port);
+            }
+            Err(_) => {
+                debug!(
+                    node_id,
+                    raw, "discovery: NodeStatus port out of u16 range, dropped"
+                );
+            }
+        }
+    }
+    registry.record_bound_ports(node_id, ports);
 }
 
 /// Stamp a fresh nonce on `content`, wrap it in a `ServerMessage`, and send it.
@@ -739,6 +916,7 @@ mod tests {
         addr: SocketAddr,
         registry: SharedNodeRegistry,
         rebuild_tx: watch::Sender<u64>,
+        publish: SharedGatewayPublishIndex,
     }
 
     fn empty_source() -> SnapshotSource {
@@ -751,15 +929,30 @@ mod tests {
             dedicated: DedicatedRoutingRegistry::new(),
             passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
             terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
+            publish: SharedGatewayPublishIndex::new(),
         }
     }
 
     async fn start_harness() -> TestHarness {
+        start_harness_with_gate(None).await
+    }
+
+    /// Start the harness with the leader gate wired to `leader_rx` (#531).
+    async fn start_harness_gated() -> (TestHarness, watch::Sender<bool>) {
+        let (leader_tx, leader_rx) = watch::channel(false);
+        let h = start_harness_with_gate(Some(leader_rx)).await;
+        (h, leader_tx)
+    }
+
+    async fn start_harness_with_gate(leader_rx: Option<watch::Receiver<bool>>) -> TestHarness {
         let source = empty_source();
         let registry = SharedNodeRegistry::new();
         let (rebuild_tx, rebuild_rx) = watch::channel(0u64);
 
-        let svc = DiscoveryService::new(source.clone(), registry.clone(), rebuild_rx);
+        let mut svc = DiscoveryService::new(source.clone(), registry.clone(), rebuild_rx);
+        if let Some(rx) = leader_rx {
+            svc = svc.with_leader_gate(rx);
+        }
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -769,11 +962,13 @@ mod tests {
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
 
+        let publish = source.publish.clone();
         let _ = source; // populated in coxswain-bin; empty for tests
         TestHarness {
             addr,
             registry,
             rebuild_tx,
+            publish,
         }
     }
 
@@ -1136,6 +1331,278 @@ mod tests {
             gw_routing.ports.is_empty(),
             "no dedicated entry → empty gateway snapshot"
         );
+        drop(tx);
+    }
+
+    // ── publish-sequence ack recording (#531) ─────────────────────────────────
+
+    /// Acking a fail-closed EMPTY dedicated snapshot (no registry entry for
+    /// the Gateway) must NOT advance the node's convergence stamp — a real
+    /// sequence there would let the ack gate certify content the node never
+    /// received (the pre-cutover / identity-mismatch worlds are deliberately
+    /// empty).
+    #[tokio::test]
+    async fn ack_of_fail_closed_empty_dedicated_snapshot_does_not_advance_seq() {
+        let h = start_harness().await;
+        // Sequence is non-zero, so a leaked capture would be observable.
+        h.publish.stamp_rebuild(std::iter::empty());
+
+        let (tx, mut inbound) = open_stream_with_subscribe(
+            h.addr,
+            p::Subscribe {
+                node_id: "ded-node".to_owned(),
+                wire_version: WIRE_VERSION,
+                scope: Some(crate::wire::scope_to_wire(
+                    &crate::subscription::Scope::Gateway {
+                        name: "some-gw".to_owned(),
+                        namespace: "prod".to_owned(),
+                    },
+                )),
+            },
+        )
+        .await
+        .expect("gateway scope accepted");
+        let snap = recv_snapshot(&mut inbound).await;
+        send_ack(&tx, &snap).await;
+
+        // The ack lands (version recorded) but the seq stamp stays at 0.
+        let entry = poll_until(|| {
+            let reg = h.registry.load();
+            let e = reg.nodes.get("ded-node")?;
+            e.last_acked_version.is_some().then(|| e.clone())
+        })
+        .await;
+        assert_eq!(
+            entry.last_acked_seq,
+            Some(0),
+            "fail-closed empty snapshot must record seq 0, not the live capture"
+        );
+        drop(tx);
+    }
+
+    /// An Ack records the publish sequence captured before the snapshot was
+    /// built, and a rebuild that produces identical content (no push) still
+    /// advances the node's acked sequence — the quiet-cluster liveness path.
+    #[tokio::test]
+    async fn ack_records_publish_seq_and_no_push_rebuild_advances_it() {
+        let h = start_harness().await;
+        // One stamped rebuild before the client connects: sequence becomes 1.
+        h.publish.stamp_rebuild(std::iter::empty());
+
+        let (tx, mut inbound) = open_stream(h.addr, "node-1").await;
+        let initial = recv_snapshot(&mut inbound).await;
+        send_ack(&tx, &initial).await;
+        poll_until(|| {
+            h.registry
+                .load()
+                .nodes
+                .get("node-1")
+                .and_then(|e| e.last_acked_seq)
+                .filter(|s| *s >= 1)
+        })
+        .await;
+
+        // Advance the sequence with NO content change, then tick the rebuild
+        // watch: the server's no-push branch must advance the acked seq.
+        h.publish.stamp_rebuild(std::iter::empty());
+        h.rebuild_tx.send(1).unwrap();
+        poll_until(|| {
+            h.registry
+                .load()
+                .nodes
+                .get("node-1")
+                .and_then(|e| e.last_acked_seq)
+                .filter(|s| *s >= 2)
+        })
+        .await;
+        drop(tx);
+    }
+
+    // ── NodeStatus bound-port reports (#531) ──────────────────────────────────
+
+    #[tokio::test]
+    async fn node_status_updates_registry_bound_ports() {
+        let h = start_harness().await;
+        let (tx, mut inbound) = open_stream(h.addr, "node-1").await;
+        let _initial = recv_snapshot(&mut inbound).await;
+
+        tx.send(ClientMessage {
+            kind: Some(CKind::NodeStatus(p::NodeStatus {
+                bound_ports: vec![30001, 30002],
+            })),
+        })
+        .await
+        .unwrap();
+
+        let bound = poll_until(|| {
+            h.registry
+                .load()
+                .nodes
+                .get("node-1")
+                .and_then(|e| e.bound_ports.clone())
+        })
+        .await;
+        assert_eq!(bound, [30001u16, 30002].into_iter().collect());
+        assert!(
+            h.registry
+                .load()
+                .all_shared_nodes_bound(&[30001u16].into_iter().collect()),
+            "shared quorum must pass once the only connected node reports a superset"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn node_status_out_of_range_ports_are_dropped_not_fatal() {
+        let h = start_harness().await;
+        let (tx, mut inbound) = open_stream(h.addr, "node-1").await;
+        let _initial = recv_snapshot(&mut inbound).await;
+
+        tx.send(ClientMessage {
+            kind: Some(CKind::NodeStatus(p::NodeStatus {
+                bound_ports: vec![30001, 70000], // 70000 exceeds u16
+            })),
+        })
+        .await
+        .unwrap();
+
+        let bound = poll_until(|| {
+            h.registry
+                .load()
+                .nodes
+                .get("node-1")
+                .and_then(|e| e.bound_ports.clone())
+        })
+        .await;
+        assert_eq!(
+            bound,
+            [30001u16].into_iter().collect(),
+            "the oversized value is dropped; the in-range port still lands"
+        );
+
+        // The stream must remain healthy after the malformed report: a rebuild
+        // still reaches this node.
+        h.rebuild_tx.send(1).unwrap();
+        tx.send(ClientMessage {
+            kind: Some(CKind::Ack(p::Ack {
+                version: "bogus".to_owned(),
+                nonce: vec![],
+            })),
+        })
+        .await
+        .unwrap();
+        let _next = recv_snapshot(&mut inbound).await;
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn disconnect_clears_bound_ports_from_registry() {
+        let h = start_harness().await;
+        let (tx, mut inbound) = open_stream(h.addr, "node-1").await;
+        let _initial = recv_snapshot(&mut inbound).await;
+
+        tx.send(ClientMessage {
+            kind: Some(CKind::NodeStatus(p::NodeStatus {
+                bound_ports: vec![30001],
+            })),
+        })
+        .await
+        .unwrap();
+        poll_until(|| {
+            h.registry
+                .load()
+                .all_shared_nodes_bound(&[30001u16].into_iter().collect())
+                .then_some(())
+        })
+        .await;
+
+        // Close the stream; the registry row must go with it (fail closed).
+        drop(tx);
+        drop(inbound);
+        poll_until(|| h.registry.load().nodes.is_empty().then_some(())).await;
+        assert!(
+            !h.registry
+                .load()
+                .all_shared_nodes_bound(&[30001u16].into_iter().collect()),
+            "an empty registry must fail the quorum closed"
+        );
+    }
+
+    // ── leader-gated Stream RPC (#531) ─────────────────────────────────────────
+
+    #[test]
+    fn not_leader_message_carries_the_client_needle() {
+        assert!(
+            NOT_LEADER_MSG.contains(NOT_LEADER_NEEDLE),
+            "client::is_not_leader matches on the needle; a reworded NOT_LEADER_MSG \
+             that drops it silently breaks fast-retry across the whole proxy fleet"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_rejected_with_failed_precondition_when_not_leader() {
+        // Gate starts `false`: a replica accepts no streams until its first
+        // promotion, so a freshly-started standby can never collect Acks.
+        let (h, leader_tx) = start_harness_gated().await;
+        let err = open_stream_with_subscribe(
+            h.addr,
+            p::Subscribe {
+                node_id: "standby-dialer".to_owned(),
+                wire_version: WIRE_VERSION,
+                scope: Some(crate::wire::scope_to_wire(
+                    &crate::subscription::Scope::SharedPool,
+                )),
+            },
+        )
+        .await
+        .expect_err("a non-leader replica must reject the stream at accept");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition, "got: {err:?}");
+        assert!(
+            err.message().contains("not the leader"),
+            "the rejection must carry the client-matchable phrase, got: {}",
+            err.message()
+        );
+        assert!(
+            h.registry.load().nodes.is_empty(),
+            "a rejected stream must not register a node"
+        );
+        drop(leader_tx);
+    }
+
+    #[tokio::test]
+    async fn stream_accepted_after_promotion_and_terminated_on_demotion() {
+        let (h, leader_tx) = start_harness_gated().await;
+        leader_tx.send(true).unwrap();
+
+        let (tx, mut inbound) = open_stream(h.addr, "node-1").await;
+        let _initial = recv_snapshot(&mut inbound).await;
+        assert!(
+            h.registry.load().nodes.contains_key("node-1"),
+            "leader must accept and register the stream"
+        );
+
+        // Demotion must terminate the live stream with the not-leader status
+        // so the proxy fast-retries toward the new leader…
+        leader_tx.send(false).unwrap();
+        let end = tokio::time::timeout(Duration::from_secs(2), inbound.message())
+            .await
+            .expect("timed out waiting for demotion to terminate the stream");
+        match end {
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+                assert!(
+                    status.message().contains("not the leader"),
+                    "got: {}",
+                    status.message()
+                );
+            }
+            Ok(other) => panic!("expected not-leader stream termination, got: {other:?}"),
+        }
+
+        // …and clear the registry row (readiness fails closed on the demoted
+        // replica).
+        poll_until(|| h.registry.load().nodes.is_empty().then_some(())).await;
         drop(tx);
     }
 

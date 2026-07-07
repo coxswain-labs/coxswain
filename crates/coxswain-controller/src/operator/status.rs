@@ -154,6 +154,14 @@ pub(crate) struct DedicatedGatewayStatusInputs<'a> {
     /// `Ready=True` pod-condition is set. Gates `Programmed=True` (must be
     /// `>= 1`) and the `DedicatedProxyReady` cut-over signal.
     pub(crate) ready_pod_count: usize,
+    /// Whether this Gateway's own connected proxy has reported its effective
+    /// listener ports bound over the discovery stream (#531), OR the Gateway
+    /// is already `Programmed=True` at its current generation (anti-flap
+    /// latch — folded in by the caller). Pod readiness alone races a spec
+    /// change that adds a listener: the pod is Ready long before the new port
+    /// binds. Gates `Programmed=True` below pod readiness in the precedence
+    /// ladder.
+    pub(crate) proxy_bound: bool,
 }
 
 /// Build the JSON merge patch that sets every owned condition,
@@ -179,20 +187,29 @@ pub(crate) fn build_dedicated_gateway_status_patch(
         inputs.ready_pod_count,
         &addresses,
         &static_outcome,
+        inputs.proxy_bound,
     );
     let cut_over = cut_over_outcome(inputs.accepted, inputs.ready_pod_count);
 
-    // #533: the dedicated-proxy Service address (its `clusterIP`, LoadBalancer
-    // ingress, or NodePort node IPs) resolves through the watch-lagged
-    // `services_store`/`nodes` AFTER `metadata.generation` is already visible, so
-    // `AddressNotAssigned` (address genuinely not yet resolved, everything else
-    // on track) must NOT claim generation N is fully processed. Hold that one
-    // Programmed condition's `observedGeneration` one below the current
-    // generation so a one-shot "conditions are latest" check waits until the
-    // address lands and `status.addresses` is published in the same pass. Every
-    // other outcome — `True`, the settled negatives `Invalid`/`AddressNotUsable`,
-    // and the `Pending` (no Ready Pod, #211) transient — stamps normally.
-    let programmed_generation = if programmed.reason == GatewayConditionReason::AddressNotAssigned {
+    // #533/#531: transient convergence holds must NOT claim generation N is
+    // fully processed. Two rungs qualify:
+    //   * `AddressNotAssigned` — the dedicated-proxy Service address resolves
+    //     through the watch-lagged `services_store`/`nodes` AFTER
+    //     `metadata.generation` is already visible.
+    //   * `Pending` — the pod is not Ready yet, or the proxy has not yet
+    //     bound/applied the current generation's listeners (#531 bind+ack
+    //     gate; mirrors the shared writer's held-Pending trailing).
+    // Hold those Programmed conditions' `observedGeneration` one below the
+    // current generation so a one-shot "conditions are latest" check waits
+    // until convergence, and a per-tick trailing invariant never observes
+    // `Programmed` claiming generation N while the data plane lags. The
+    // settled outcomes — `True` and the negatives `Invalid`/`AddressNotUsable`
+    // — stamp normally (conformance requires settled conditions AT the
+    // current generation).
+    let programmed_generation = if matches!(
+        programmed.reason,
+        GatewayConditionReason::AddressNotAssigned | GatewayConditionReason::Pending
+    ) {
         generation.saturating_sub(1)
     } else {
         generation
@@ -307,6 +324,7 @@ pub(crate) fn dedicated_gateway_needs_status_patch(
         inputs.ready_pod_count,
         &desired_addresses,
         &static_outcome,
+        inputs.proxy_bound,
     );
     let cut_over = cut_over_outcome(inputs.accepted, inputs.ready_pod_count);
 
@@ -624,6 +642,7 @@ fn programmed_outcome(
     ready_pod_count: usize,
     addresses: &[StatusAddress],
     static_outcome: &StaticAddressOutcome,
+    proxy_bound: bool,
 ) -> ConditionOutcome {
     // Accepted=False — either an unresolvable parametersRef or an unsupported
     // requested address type (#260) — means the Gateway cannot be programmed.
@@ -656,6 +675,19 @@ fn programmed_outcome(
             status: "False",
             reason: GatewayConditionReason::AddressNotAssigned,
             message: "Service has no assigned addresses",
+        };
+    }
+    // Proxy bind gate (#531): the pod is Ready and addressed, but its proxy
+    // has not yet reported this Gateway's effective listener ports bound over
+    // the discovery stream — declaring Programmed now would race traffic into
+    // an unbound port (visible on spec changes that add a listener to an
+    // already-Ready pod). The caller's anti-flap latch keeps an established
+    // generation immune to pod-replacement churn.
+    if !proxy_bound {
+        return ConditionOutcome {
+            status: "False",
+            reason: GatewayConditionReason::Pending,
+            message: "waiting for the dedicated proxy to bind the Gateway's listener ports",
         };
     }
     ConditionOutcome {
@@ -971,6 +1003,7 @@ mod tests {
             ingress_ports: IngressPorts::new(None, None),
             accepted,
             ready_pod_count: ready_pods,
+            proxy_bound: true,
         }
     }
 
@@ -1381,6 +1414,101 @@ mod tests {
             condition_of(&patch, "Programmed"),
             Some(("True".to_string(), "Programmed".to_string()))
         );
+    }
+
+    #[test]
+    fn programmed_pending_when_proxy_has_not_bound_listener_ports() {
+        // #531: pod Ready + address assigned is NOT enough — the proxy must
+        // have reported the effective listener ports bound. Ranks below pod
+        // readiness and address assignment in the precedence ladder.
+        let gw = gateway(1, vec![("http", 80)], None);
+        let svc = service_clusterip("10.96.7.42");
+        let mut unbound = inputs(
+            &gw,
+            Some(&svc),
+            &[],
+            empty_status(),
+            AcceptedOutcome::Accepted,
+            1,
+        );
+        unbound.proxy_bound = false;
+        let patch = build_dedicated_gateway_status_patch(&unbound, 1, &epoch());
+        assert_eq!(
+            condition_of(&patch, "Programmed"),
+            Some(("False".to_string(), "Pending".to_string())),
+            "unbound proxy must hold Programmed at Pending"
+        );
+        // Accepted is unaffected by the bind gate.
+        assert_eq!(
+            condition_of(&patch, "Accepted"),
+            Some(("True".to_string(), "Accepted".to_string()))
+        );
+    }
+
+    #[test]
+    fn pending_hold_trails_programmed_observed_generation() {
+        // #531: while Programmed is held at Pending (pod not Ready, or the
+        // proxy hasn't bound/applied the current generation), the condition's
+        // observedGeneration must trail at gen-1 — mirroring the shared
+        // writer — so a per-tick trailing invariant never observes Programmed
+        // claiming generation N before the data plane converged.
+        let gw = gateway(3, vec![("http", 80)], None);
+        let svc = service_clusterip("10.96.7.42");
+        let mut held = inputs(
+            &gw,
+            Some(&svc),
+            &[],
+            empty_status(),
+            AcceptedOutcome::Accepted,
+            1,
+        );
+        held.proxy_bound = false;
+        let patch = build_dedicated_gateway_status_patch(&held, 3, &epoch());
+        let conditions = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        let programmed = conditions
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed condition");
+        assert_eq!(programmed["reason"], "Pending");
+        assert_eq!(
+            programmed["observedGeneration"], 2,
+            "held Pending must stamp gen-1"
+        );
+        // Accepted still claims the live generation — only Programmed trails.
+        let accepted = conditions
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("Accepted condition");
+        assert_eq!(accepted["observedGeneration"], 3);
+    }
+
+    #[test]
+    fn bind_gate_ranks_below_pod_readiness() {
+        // With no Ready pod, the pod-readiness rung fires first regardless of
+        // the bind gate (its message names the actual blocker).
+        let gw = gateway(1, vec![("http", 80)], None);
+        let svc = service_clusterip("10.96.7.42");
+        let mut i = inputs(
+            &gw,
+            Some(&svc),
+            &[],
+            empty_status(),
+            AcceptedOutcome::Accepted,
+            0,
+        );
+        i.proxy_bound = false;
+        let patch = build_dedicated_gateway_status_patch(&i, 1, &epoch());
+        let prog = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed")
+            .clone();
+        assert_eq!(prog["reason"], "Pending");
+        assert_eq!(prog["message"], "Awaiting Ready dedicated-proxy Pod");
     }
 
     // ============================================================================

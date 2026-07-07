@@ -191,8 +191,12 @@ impl TlsAccept for SniCertSelector {
         //
         // `find_config` is None when the SNI has no mTLS annotation —
         // the connection proceeds as a standard one-way TLS handshake.
+        // Scoped to this connection's bind port like the server-cert lookup
+        // above (#472): only this port's configs apply, so a sibling Gateway
+        // declaring the same hostname can never supply the CA or the
+        // AllowInsecureFallback mode for this Gateway's handshakes.
         let cc_store = self.client_certs.load();
-        let Some(config_state) = cc_store.find_config(&sni) else {
+        let Some(config_state) = cc_store.find_config(self.port, &sni) else {
             return;
         };
 

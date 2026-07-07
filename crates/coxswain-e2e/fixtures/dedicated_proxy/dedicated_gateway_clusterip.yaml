@@ -1,11 +1,11 @@
 # Dedicated-mode Gateway with `serviceType: ClusterIP` (#211 Scenario A).
 #
-# Mirrors `dedicated_gateway.yaml` (same listener / labels / annotations)
-# but pins `image` to the upstream pause container so the Pod transitions
-# to Ready immediately regardless of which coxswain build is cached. The
-# existing Step-9 / Step-10 fixtures intentionally don't override the
-# image — they never gate on Pod readiness — so the address-resolution
-# test that needs an actual Ready Pod gets its own fixture.
+# Mirrors `dedicated_gateway.yaml` (same listener / labels / annotations).
+# No `image` override: the operator renders the real coxswain image, which
+# the harness preloads into the cluster. Programmed=True requires the
+# dedicated proxy to connect to discovery and report its listener ports
+# bound (#531), so a stub container that merely reaches Ready can never
+# converge — tests gating on Programmed need a live proxy.
 # TESTNS is substituted at runtime.
 ---
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -15,7 +15,6 @@ metadata:
 spec:
   replicas: 1
   serviceType: ClusterIP
-  image: ${PAUSE_IMAGE}
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: Gateway

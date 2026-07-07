@@ -34,7 +34,7 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::server::configuration::{Opt, ServerConf};
 use pingora_core::services::background::background_service;
 use pingora_core::services::listening::Service;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -144,10 +144,24 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
 
     // Discovery gRPC server: capture a rebuild-generation receiver before
     // `route_status` is moved into the Operator. Every controller replica
-    // runs the discovery server independently (no leader gate).
+    // LISTENS, but the Stream RPC is leader-gated (#531): standbys reject
+    // streams so proxy readiness reports land on the status-writing leader.
+    // Bootstrap (SVID issuance) stays un-gated on every replica.
     let discovery_rebuild_rx = route_status.subscribe();
+    // Per-Gateway publish-sequence index (#531): stamped by the reconciler's
+    // rebuild loop, captured by the discovery server before every snapshot
+    // build, and consulted (with the node registry's acked sequences) by both
+    // Programmed status writers as the ack half of the readiness gate.
+    let publish_index = status_writer.reconciler.publish_index();
     let node_registry = coxswain_core::node_registry::SharedNodeRegistry::new();
     let node_registry_for_agg = node_registry.clone();
+    let node_registry_for_controller = node_registry.clone();
+    let node_registry_for_operator = node_registry.clone();
+    // Leadership watch (#531): the lease loop is the single sender; the
+    // discovery server gates streams on it and the operator re-drives on
+    // promotion. Initialized false → discovery starts gated-closed and opens
+    // on first promotion, so startup order is a non-issue.
+    let (leader_watch_tx, leader_watch_rx) = tokio::sync::watch::channel(false);
     // Definitively-failed static-address VIP set (#533): written by the operator's
     // VIP reconciler, read by the status writer so a Gateway still provisioning
     // its VIP is held Pending rather than briefly reporting AddressNotUsable.
@@ -161,12 +175,14 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         dedicated: status_writer.outputs.dedicated_registry.clone(),
         passthrough_routes: status_writer.outputs.passthrough_routes.clone(),
         terminate_routes: status_writer.outputs.terminate_routes.clone(),
+        publish: publish_index.clone(),
     };
     let discovery_service = coxswain_discovery::DiscoveryService::new(
         discovery_source,
         node_registry,
         discovery_rebuild_rx,
-    );
+    )
+    .with_leader_gate(leader_watch_rx.clone());
     let discovery_addr = SocketAddr::new(
         args.common.management_bind_address,
         args.controller.discovery_port,
@@ -195,7 +211,10 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         "controller",
         status_writer
             .controller
-            .with_vip_failures(vip_failures.clone()),
+            .with_vip_failures(vip_failures.clone())
+            .with_leadership_watch(leader_watch_tx)
+            .with_node_registry(node_registry_for_controller)
+            .with_publish_index(publish_index.clone()),
     ));
     server.add_service(background_service("reconciler", status_writer.reconciler));
 
@@ -221,8 +240,11 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
                 "https://coxswain-controller-discovery.{}.svc:{}",
                 args.common.pod_namespace, args.controller.discovery_port
             ),
+            // Bootstrap lives on its own all-replicas Service (#531): the
+            // stream Service is leader-selected, but SVID issuance must keep
+            // working through leader churn.
             discovery_bootstrap_endpoint: format!(
-                "https://coxswain-controller-discovery.{}.svc:{}",
+                "https://coxswain-controller-discovery-bootstrap.{}.svc:{}",
                 args.common.pod_namespace, args.controller.discovery_bootstrap_port
             ),
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token".to_string(),
@@ -232,6 +254,9 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             shared_proxy_selector: args.controller.shared_proxy_selector.clone(),
             shared_vip_service_type: args.controller.shared_vip_service_type,
             vip_failures,
+            leadership_rx: Some(leader_watch_rx),
+            node_registry: Some(node_registry_for_operator),
+            publish_index: Some(publish_index),
         }),
     ));
 
@@ -310,8 +335,10 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
     let health = HealthRegistry::new();
     let proxy_handle = health.register("proxy", &["routing_table_loaded"]);
 
+    // Bound-port telemetry (#531): acceptor → discovery client → controller.
+    let (bound_ports_tx, bound_ports_rx) = watch::channel(BTreeSet::new());
     let (client, supervisor, bootstrap_runner) =
-        build_discovery_client(&args, proxy_handle, Scope::SharedPool)?;
+        build_discovery_client(&args, proxy_handle, Scope::SharedPool, Some(bound_ports_rx))?;
     let listener_status = client.listener_status();
 
     wire_proxy_services(
@@ -320,6 +347,7 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
         &args.proxy,
         &client,
         &listener_status,
+        Some(bound_ports_tx),
     )?;
 
     register_discovery_background_services(&mut server, supervisor, bootstrap_runner);
@@ -384,8 +412,11 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
         name: gateway_name.clone(),
         namespace: gateway_namespace.clone(),
     };
+    // Bound-port telemetry (#531): the dedicated Programmed gate consumes the
+    // same NodeStatus reports as the shared one, scoped to this Gateway.
+    let (bound_ports_tx, bound_ports_rx) = watch::channel(BTreeSet::new());
     let (client, supervisor, bootstrap_runner) =
-        build_discovery_client(&args, proxy_handle, scope)?;
+        build_discovery_client(&args, proxy_handle, scope, Some(bound_ports_rx))?;
     let listener_status = client.listener_status();
 
     wire_gateway_only_proxy_services(
@@ -394,6 +425,7 @@ fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
         &args.proxy,
         &client,
         &listener_status,
+        Some(bound_ports_tx),
     )?;
 
     register_discovery_background_services(&mut server, supervisor, bootstrap_runner);
@@ -458,6 +490,7 @@ fn wire_gateway_only_proxy_services(
     proxy: &ProxyArgs,
     source: &dyn RoutingSource,
     listener_status: &SharedGatewayListenerStatus,
+    bound_ports_tx: Option<watch::Sender<BTreeSet<u16>>>,
 ) -> Result<()> {
     let default_timeouts = RouteTimeouts {
         request: proxy.proxy_default_request_timeout,
@@ -508,21 +541,23 @@ fn wire_gateway_only_proxy_services(
     // ListenerInfo.proxy_protocol → ListenerSpec.proxy_protocol.
     // No global flag: --ingress-* flags only cover Ingress-origin listeners.
     let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
-    server.add_service(
-        ProxyAcceptor::new(
-            gateway_proxy,
-            initial_gw_specs,
-            Some(gw_rx),
-            selector,
-            proxy.proxy_listener_drain_timeout,
-            PassthroughConfig {
-                table: source.passthrough_routes(),
-                terminate_table: source.terminate_routes(),
-                dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
-            },
-        )
-        .context("build dedicated GatewayProxy acceptor")?,
-    );
+    let mut acceptor = ProxyAcceptor::new(
+        gateway_proxy,
+        initial_gw_specs,
+        Some(gw_rx),
+        selector,
+        proxy.proxy_listener_drain_timeout,
+        PassthroughConfig {
+            table: source.passthrough_routes(),
+            terminate_table: source.terminate_routes(),
+            dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+        },
+    )
+    .context("build dedicated GatewayProxy acceptor")?;
+    if let Some(tx) = bound_ports_tx {
+        acceptor = acceptor.with_bound_ports_tx(tx);
+    }
+    server.add_service(acceptor);
 
     server.add_service(background_service(
         "gateway-listener-specs",
@@ -556,7 +591,7 @@ fn access_log_path_mode(proxy: &ProxyArgs) -> AccessLogPathMode {
 }
 
 /// Register both the Ingress and Gateway dynamic proxy acceptors on the
-/// supplied server.  Shared between `run_proxy_shared` and `run_dev`.
+/// supplied server.  Used by `run_proxy_shared`.
 ///
 /// - The **Ingress acceptor** binds a static set of ports from
 ///   `--ingress-http-port` / `--ingress-https-port` that never changes.
@@ -569,6 +604,7 @@ fn wire_proxy_services(
     proxy: &ProxyArgs,
     source: &dyn RoutingSource,
     listener_status: &SharedGatewayListenerStatus,
+    bound_ports_tx: Option<watch::Sender<BTreeSet<u16>>>,
 ) -> Result<()> {
     let default_timeouts = RouteTimeouts {
         request: proxy.proxy_default_request_timeout,
@@ -686,21 +722,26 @@ fn wire_proxy_services(
         ),
     ));
     let selector = SniCertSelector::new(source.tls_store(), source.client_cert_store());
-    server.add_service(
-        ProxyAcceptor::new(
-            p,
-            initial_gw_specs,
-            Some(gw_rx),
-            selector,
-            proxy.proxy_listener_drain_timeout,
-            PassthroughConfig {
-                table: source.passthrough_routes(),
-                terminate_table: source.terminate_routes(),
-                dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
-            },
-        )
-        .context("build GatewayProxy acceptor")?,
-    );
+    // Bound-port telemetry rides on the Gateway acceptor only (#531): the
+    // Programmed gate is keyed on VIP internal ports, which only the Gateway
+    // acceptor binds. Static Ingress ports are deliberately not reported.
+    let mut gw_acceptor = ProxyAcceptor::new(
+        p,
+        initial_gw_specs,
+        Some(gw_rx),
+        selector,
+        proxy.proxy_listener_drain_timeout,
+        PassthroughConfig {
+            table: source.passthrough_routes(),
+            terminate_table: source.terminate_routes(),
+            dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+        },
+    )
+    .context("build GatewayProxy acceptor")?;
+    if let Some(tx) = bound_ports_tx {
+        gw_acceptor = gw_acceptor.with_bound_ports_tx(tx);
+    }
+    server.add_service(gw_acceptor);
 
     server.add_service(background_service(
         "gateway-listener-specs",
@@ -997,12 +1038,17 @@ fn build_discovery_client(
     args: &ProxyRoleArgs,
     proxy_handle: SubsystemHandle,
     scope: Scope,
+    bound_ports_rx: Option<watch::Receiver<BTreeSet<u16>>>,
 ) -> anyhow::Result<(DiscoveryClient, Supervisor, Option<BootstrapRunner>)> {
     let mut config = DiscoveryClientConfig::new(
         args.discovery_endpoint.clone(),
         args.common.pod_name.clone(),
     );
     config.scope = scope;
+    // Bound-port reports (#531): the supervisor forwards the acceptor's
+    // actually-bound set to the controller as NodeStatus messages, feeding the
+    // Gateway Programmed readiness gate.
+    config.bound_ports_rx = bound_ports_rx;
 
     let bootstrap_runner = args.discovery_bootstrap_endpoint.as_ref().map(|endpoint| {
         // The controller's SPIFFE identity lives in the CONTROLLER's namespace,
