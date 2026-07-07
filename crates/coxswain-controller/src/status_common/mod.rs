@@ -134,6 +134,36 @@ impl std::fmt::Display for CoxswainConditionType {
     }
 }
 
+/// A condition `reason` that is either a typed Gateway-API-spec constant or a
+/// dynamic string with no upstream constant — a reflector-computed value, or
+/// a Coxswain-owned reason like `DedicatedProxyReady`'s `Ready`/`Provisioning`.
+///
+/// `make_condition`'s `reason` parameter already accepts `impl Display`; this
+/// type lets a single `(status, reason, message)` outcome mix both
+/// provenances and hand it straight to `make_condition` without an eager
+/// per-arm `.to_string()`. Replaces two independent hand-rolled unifications:
+/// `listener_condition_triplet`'s `.to_string()` fan-out across every arm, and
+/// the dedicated-mode operator's `ConditionOutcome`/`CutOverOutcome` split —
+/// `CutOverOutcome` is gone; `ConditionOutcome.reason` is now
+/// `Reason<GatewayConditionReason>` (see `crate::operator::status`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reason<T> {
+    /// A typed reason constant from `coxswain_reflector::gw_types::constants`.
+    Typed(T),
+    /// A reflector-computed or Coxswain-owned reason with no upstream
+    /// Go-source constant.
+    Raw(&'static str),
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for Reason<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Typed(t) => std::fmt::Display::fmt(t, f),
+            Self::Raw(s) => f.write_str(s),
+        }
+    }
+}
+
 /// Returns `(has_any_invalid, supported_kinds)` for a listener's
 /// `allowedRoutes.kinds`.
 ///
@@ -300,42 +330,43 @@ pub(crate) fn listener_condition_triplet(
     let frontend_msg = frontend_outcome
         .map(FrontendValidationOutcome::message)
         .unwrap_or("");
-    // `resolved_refs_reason` (and the other two reason bindings below) unify to
-    // `String`: most arms are fixed Gateway API reasons (typed via
-    // `ListenerConditionReason`, so a typo or spec drift is a compile error),
-    // but the fallback arm forwards `outcome.reason()` — a reflector-computed
-    // `&'static str` from `coxswain_core::ListenerReadiness`, already
-    // exhaustively matched there (#510 doesn't thread the Go-derived enum
-    // through `coxswain-core`, which stays Gateway-API-agnostic by design).
+    // `resolved_refs_reason` (and the other two reason bindings below) mix
+    // typed Gateway API reasons (via `ListenerConditionReason`, so a typo or
+    // spec drift is a compile error) with a fallback that forwards
+    // `outcome.reason()` — a reflector-computed `&'static str` from
+    // `coxswain_core::ListenerReadiness`, already exhaustively matched there
+    // (#510 doesn't thread the Go-derived enum through `coxswain-core`, which
+    // stays Gateway-API-agnostic by design). `Reason` unifies both without an
+    // eager `.to_string()` per arm.
     let (resolved_refs_status, resolved_refs_reason, resolved_refs_msg) = if frontend_ca_failed {
-        ("False", frontend_reason.to_string(), frontend_msg)
+        ("False", Reason::Raw(frontend_reason), frontend_msg)
     } else if has_invalid_kinds {
         (
             "False",
-            ListenerConditionReason::InvalidRouteKinds.to_string(),
+            Reason::Typed(ListenerConditionReason::InvalidRouteKinds),
             "One or more specified route kinds are not supported by this implementation",
         )
     } else if outcome.is_healthy() {
         (
             "True",
-            ListenerConditionReason::ResolvedRefs.to_string(),
+            Reason::Typed(ListenerConditionReason::ResolvedRefs),
             "",
         )
     } else {
-        ("False", outcome.reason().to_string(), outcome.message())
+        ("False", Reason::Raw(outcome.reason()), outcome.message())
     };
     // Accepted is False when the listener uses an unsupported protocol/mode combination,
     // when the frontend CA failed to resolve, or True/Accepted otherwise.
     let (accepted_status, accepted_reason, accepted_msg) = if frontend_ca_failed {
         (
             "False",
-            ListenerConditionReason::NoValidCACertificate.to_string(),
+            Reason::Typed(ListenerConditionReason::NoValidCACertificate),
             frontend_msg,
         )
     } else if let ListenerReadiness::Unsupported { message } = &outcome {
         (
             "False",
-            ListenerConditionReason::UnsupportedValue.to_string(),
+            Reason::Typed(ListenerConditionReason::UnsupportedValue),
             message.as_str(),
         )
     } else if let ListenerReadiness::UnsupportedProtocol { message } = &outcome {
@@ -343,11 +374,11 @@ pub(crate) fn listener_condition_triplet(
         // not one coxswain routes.
         (
             "False",
-            ListenerConditionReason::UnsupportedProtocol.to_string(),
+            Reason::Typed(ListenerConditionReason::UnsupportedProtocol),
             message.as_str(),
         )
     } else {
-        ("True", ListenerConditionReason::Accepted.to_string(), "")
+        ("True", Reason::Typed(ListenerConditionReason::Accepted), "")
     };
     // Port-conflict detection (#201): a listener whose port is reserved by the
     // Ingress data plane (--proxy-http-port / --proxy-https-port) cannot be bound
@@ -362,19 +393,23 @@ pub(crate) fn listener_condition_triplet(
     let (listener_prog_status, listener_prog_reason, listener_prog_msg) = if port_conflict {
         (
             "False",
-            ListenerConditionReason::PortUnavailable.to_string(),
+            Reason::Typed(ListenerConditionReason::PortUnavailable),
             port_conflict_msg.as_str(),
         )
     } else if frontend_ca_failed {
         (
             "False",
-            ListenerConditionReason::NoValidCACertificate.to_string(),
+            Reason::Typed(ListenerConditionReason::NoValidCACertificate),
             frontend_msg,
         )
     } else if outcome.is_healthy() {
-        ("True", ListenerConditionReason::Programmed.to_string(), "")
+        (
+            "True",
+            Reason::Typed(ListenerConditionReason::Programmed),
+            "",
+        )
     } else {
-        ("False", outcome.reason().to_string(), outcome.message())
+        ("False", Reason::Raw(outcome.reason()), outcome.message())
     };
     tracing::debug!(
         listener = %listener_name,
@@ -448,5 +483,17 @@ mod tests {
         // a cosmetic one.
         assert_eq!(CoxswainConditionType::Programmed.to_string(), "Programmed");
         assert_eq!(CoxswainConditionType::Conflicted.to_string(), "Conflicted");
+    }
+
+    #[test]
+    fn reason_displays_both_typed_and_raw_arms() {
+        // Both arms must round-trip through Display to the exact wire string
+        // `make_condition` writes as `Condition.reason` — that's the whole
+        // point of unifying them behind one type.
+        let typed: Reason<ListenerConditionReason> =
+            Reason::Typed(ListenerConditionReason::Programmed);
+        assert_eq!(typed.to_string(), "Programmed");
+        let raw: Reason<ListenerConditionReason> = Reason::Raw("SomeReflectorReason");
+        assert_eq!(raw.to_string(), "SomeReflectorReason");
     }
 }

@@ -50,7 +50,7 @@ use crate::status_common::addresses::{
     StaticAddressOutcome, SupportedAddressType, TypedAddress, evaluate_static_addresses,
 };
 use crate::status_common::{
-    OPERATOR_OWNED_CONDITION_TYPE_PREFIX, build_listener_status, listener_is_accepted,
+    OPERATOR_OWNED_CONDITION_TYPE_PREFIX, Reason, build_listener_status, listener_is_accepted,
     listener_route_kind_info, make_condition,
 };
 use coxswain_reflector::gw_types::constants::{GatewayConditionReason, GatewayConditionType};
@@ -208,7 +208,8 @@ pub(crate) fn build_dedicated_gateway_status_patch(
     // current generation).
     let programmed_generation = if matches!(
         programmed.reason,
-        GatewayConditionReason::AddressNotAssigned | GatewayConditionReason::Pending
+        Reason::Typed(GatewayConditionReason::AddressNotAssigned)
+            | Reason::Typed(GatewayConditionReason::Pending)
     ) {
         generation.saturating_sub(1)
     } else {
@@ -328,10 +329,9 @@ pub(crate) fn dedicated_gateway_needs_status_patch(
     );
     let cut_over = cut_over_outcome(inputs.accepted, inputs.ready_pod_count);
 
-    // Unify to `String`: `accepted`/`programmed` carry a typed
-    // `GatewayConditionReason`, `cut_over` a plain `&'static str`
-    // (`DedicatedProxyReady` has no Gateway API constant) — see
-    // `ConditionOutcome`/`CutOverOutcome` above.
+    // `accepted`/`programmed`/`cut_over` are all `ConditionOutcome` (`reason:
+    // Reason<GatewayConditionReason>`); `.to_string()` here is just to compare
+    // against `Condition.reason: String` below, not to unify differing types.
     let owned_expected = [
         ("Accepted", accepted.status, accepted.reason.to_string()),
         (
@@ -548,23 +548,15 @@ pub(crate) async fn clear_dedicated_gateway_status(
     Ok(())
 }
 
-/// One `(status, reason, message)` triple for a Gateway-API-canonical
-/// condition (`Accepted`/`Programmed`) — `reason` is the typed Go-derived
-/// enum, not a hand-typed literal. `DedicatedProxyReady` (Coxswain-owned, no
-/// Go-source counterpart) uses [`CutOverOutcome`] instead.
+/// One `(status, reason, message)` triple for a condition this writer emits.
+/// `reason` is the typed Go-derived `GatewayConditionReason` for the two
+/// Gateway-API-canonical conditions (`Accepted`/`Programmed`); the
+/// Coxswain-owned `DedicatedProxyReady` condition (no Go-source counterpart)
+/// uses [`Reason::Raw`] instead — see [`Reason`] in `status_common`.
 #[derive(Debug, Clone, Copy)]
 struct ConditionOutcome {
     status: &'static str,
-    reason: GatewayConditionReason,
-    message: &'static str,
-}
-
-/// One `(status, reason, message)` triple for the Coxswain-owned
-/// `DedicatedProxyReady` condition — `reason` has no Gateway API constant.
-#[derive(Debug, Clone, Copy)]
-struct CutOverOutcome {
-    status: &'static str,
-    reason: &'static str,
+    reason: Reason<GatewayConditionReason>,
     message: &'static str,
 }
 
@@ -603,7 +595,7 @@ fn accepted_outcome(
             if static_outcome.accepted_override.is_some() {
                 return ConditionOutcome {
                     status: "False",
-                    reason: GatewayConditionReason::UnsupportedAddress,
+                    reason: Reason::Typed(GatewayConditionReason::UnsupportedAddress),
                     message: "spec.addresses contains an address type this implementation does not support",
                 };
             }
@@ -614,19 +606,19 @@ fn accepted_outcome(
             if any_unaccepted {
                 return ConditionOutcome {
                     status: if any_accepted { "True" } else { "False" },
-                    reason: GatewayConditionReason::ListenersNotValid,
+                    reason: Reason::Typed(GatewayConditionReason::ListenersNotValid),
                     message: "one or more listeners are not accepted; see the per-listener conditions",
                 };
             }
             ConditionOutcome {
                 status: "True",
-                reason: GatewayConditionReason::Accepted,
+                reason: Reason::Typed(GatewayConditionReason::Accepted),
                 message: "",
             }
         }
         AcceptedOutcome::InvalidParameters => ConditionOutcome {
             status: "False",
-            reason: GatewayConditionReason::InvalidParameters,
+            reason: Reason::Typed(GatewayConditionReason::InvalidParameters),
             message: "parametersRef target CoxswainGatewayParameters object does not exist",
         },
     }
@@ -650,14 +642,14 @@ fn programmed_outcome(
     {
         return ConditionOutcome {
             status: "False",
-            reason: GatewayConditionReason::Invalid,
+            reason: Reason::Typed(GatewayConditionReason::Invalid),
             message: "Gateway spec is invalid; see the Accepted condition for details",
         };
     }
     if ready_pod_count == 0 {
         return ConditionOutcome {
             status: "False",
-            reason: GatewayConditionReason::Pending,
+            reason: Reason::Typed(GatewayConditionReason::Pending),
             message: "Awaiting Ready dedicated-proxy Pod",
         };
     }
@@ -666,14 +658,14 @@ fn programmed_outcome(
     if static_outcome.programmed_override == Some(GatewayConditionReason::AddressNotUsable) {
         return ConditionOutcome {
             status: "False",
-            reason: GatewayConditionReason::AddressNotUsable,
+            reason: Reason::Typed(GatewayConditionReason::AddressNotUsable),
             message: "one or more requested spec.addresses could not be assigned to the Gateway",
         };
     }
     if addresses.is_empty() {
         return ConditionOutcome {
             status: "False",
-            reason: GatewayConditionReason::AddressNotAssigned,
+            reason: Reason::Typed(GatewayConditionReason::AddressNotAssigned),
             message: "Service has no assigned addresses",
         };
     }
@@ -686,28 +678,28 @@ fn programmed_outcome(
     if !proxy_bound {
         return ConditionOutcome {
             status: "False",
-            reason: GatewayConditionReason::Pending,
+            reason: Reason::Typed(GatewayConditionReason::Pending),
             message: "waiting for the dedicated proxy to bind the Gateway's listener ports",
         };
     }
     ConditionOutcome {
         status: "True",
-        reason: GatewayConditionReason::Programmed,
+        reason: Reason::Typed(GatewayConditionReason::Programmed),
         message: "",
     }
 }
 
-fn cut_over_outcome(accepted: AcceptedOutcome, ready_pod_count: usize) -> CutOverOutcome {
+fn cut_over_outcome(accepted: AcceptedOutcome, ready_pod_count: usize) -> ConditionOutcome {
     if accepted == AcceptedOutcome::Accepted && ready_pod_count >= 1 {
-        CutOverOutcome {
+        ConditionOutcome {
             status: "True",
-            reason: REASON_READY,
+            reason: Reason::Raw(REASON_READY),
             message: "Dedicated proxy has at least one Ready pod",
         }
     } else {
-        CutOverOutcome {
+        ConditionOutcome {
             status: "False",
-            reason: REASON_PROVISIONING,
+            reason: Reason::Raw(REASON_PROVISIONING),
             message: "Dedicated proxy has zero Ready pods",
         }
     }
