@@ -1912,6 +1912,13 @@ async fn gateway_jwt_auth_valid_token_admitted() -> anyhow::Result<()> {
     let token = coxswain_e2e::jwt::valid_token();
     let bearer = format!("Bearer {token}");
 
+    // Poll for the fully-reconciled state, not just a 200: the reflector watches
+    // the HTTPRoute and the JwtAuth CR independently, so there is a real window
+    // where the route is already routable before the CR has synced — the
+    // ExtensionRef's deliberate fail-open (#441) means that window serves a
+    // plain 200 with *no* JWT enforcement at all (same status code, no
+    // claimToHeaders forwarding). A predicate keyed on status code alone would
+    // accept that transient state; require the forwarded claim to be correct.
     let resp = wait::poll_until(
         Duration::from_secs(90),
         wait::POLL,
@@ -1921,22 +1928,15 @@ async fn gateway_jwt_auth_valid_token_admitted() -> anyhow::Result<()> {
                 .get_full_with_headers(&host, "/", &[("authorization", &bearer)])
                 .await;
             match result {
-                Ok((200, _, Some(body))) => Some(body),
+                Ok((200, _, Some(body))) if body.header("X-User-Id") == Some("e2e-test-user") => {
+                    Some(body)
+                }
                 _ => None,
             }
         },
     )
     .await?;
     resp.assert_backend("echo-a");
-    let forwarded = resp
-        .headers
-        .get("X-User-Id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    anyhow::ensure!(
-        forwarded == "e2e-test-user",
-        "expected the verified `sub` claim forwarded as x-user-id=e2e-test-user, got '{forwarded}'"
-    );
     Ok(())
 }
 
@@ -1999,6 +1999,9 @@ async fn ingress_jwt_auth_valid_token_admitted() -> anyhow::Result<()> {
     let token = coxswain_e2e::jwt::valid_token();
     let bearer = format!("Bearer {token}");
 
+    // See gateway_jwt_auth_valid_token_admitted: poll for the fully-reconciled
+    // state (claim actually forwarded), not just a 200 — the Ingress and the
+    // JwtAuth CR it names are reconciled from independently-watched stores.
     let resp = wait::poll_until(
         Duration::from_secs(90),
         wait::POLL,
@@ -2009,22 +2012,15 @@ async fn ingress_jwt_auth_valid_token_admitted() -> anyhow::Result<()> {
                 .get_full_with_headers(&host, "/", &[("authorization", &bearer)])
                 .await;
             match result {
-                Ok((200, _, Some(body))) => Some(body),
+                Ok((200, _, Some(body))) if body.header("X-User-Id") == Some("e2e-test-user") => {
+                    Some(body)
+                }
                 _ => None,
             }
         },
     )
     .await?;
     resp.assert_backend("echo-a");
-    let forwarded = resp
-        .headers
-        .get("X-User-Id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    anyhow::ensure!(
-        forwarded == "e2e-test-user",
-        "expected the verified `sub` claim forwarded as x-user-id=e2e-test-user, got '{forwarded}'"
-    );
     Ok(())
 }
 
