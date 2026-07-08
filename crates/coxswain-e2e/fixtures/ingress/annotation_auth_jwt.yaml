@@ -26,7 +26,7 @@ spec:
             kid: e2e-test-key
             alg: ES256
             x: ScOuAzhxBbDIGzXwHlAcn0nHt8tE9OvqRHm3RIGQjk8
-            y: JiMe4KXWaBgWIBD1TTkwQdJNbLkO5AEiRQSdv8dbQyg
+            "y": JiMe4KXWaBgWIBD1TTkwQdJNbLkO5AEiRQSdv8dbQyg
   claimToHeaders:
     - claim: sub
       header: x-user-id
