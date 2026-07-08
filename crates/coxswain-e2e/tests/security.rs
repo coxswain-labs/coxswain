@@ -1251,22 +1251,23 @@ async fn grpc_route_jwt_auth_rejects_missing_or_invalid_token() -> anyhow::Resul
     Ok(())
 }
 
-// ── External auth (ext_authz HTTP) ───────────────────────────────────────────
+// ── External auth (ext-auth CoxswainExternalAuth reference, #549) ────────────
 
-/// `auth-url` allow path: the auth stub returns 200 → proxy forwards the request
-/// to the upstream backend (#24 happy path).
+/// `ext-auth` allow path: the annotation names a `CoxswainExternalAuth` CR
+/// (HTTP transport) pointed at the auth-allow stub, which returns 200 → proxy
+/// forwards the request to the upstream backend (#549 happy path).
 #[tokio::test]
-async fn request_allowed_when_ext_authz_returns_2xx() -> anyhow::Result<()> {
+async fn ingress_ext_auth_valid_when_authz_allows() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "auth-ok").await?;
+    let ns = NamespaceGuard::create(&h.client, "ext-auth-ok").await?;
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
     fixtures::apply_fixture(
-        ingress::ANNOTATION_AUTH_EXT_ALLOW,
+        ingress::ANNOTATION_EXT_AUTH_ALLOW,
         FixtureVars::new(&ns.name),
     )
     .await?;
-    let host = format!("authextallow.{}.local", ns.name);
+    let host = format!("extauthallow.{}.local", ns.name);
 
     // Poll until the route is live with a 200: both the route and auth-allow Pod
     // must be ready. auth-allow returns 200 → proxy allows → echo-a responds.
@@ -1275,303 +1276,27 @@ async fn request_allowed_when_ext_authz_returns_2xx() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `auth-url` deny path: the auth stub returns 403 → proxy returns 403 to the
-/// client, backend never reached (#24 sad path).
+/// `ext-auth` deny path: the annotation names a `CoxswainExternalAuth` CR
+/// (HTTP transport) pointed at the auth-deny stub, which returns 403 → proxy
+/// returns 403 to the client, backend never reached (#549 sad path).
 #[tokio::test]
-async fn request_rejected_with_auth_status_when_ext_authz_denies() -> anyhow::Result<()> {
+async fn ingress_ext_auth_rejected_when_authz_denies() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "auth-deny").await?;
+    let ns = NamespaceGuard::create(&h.client, "ext-auth-deny").await?;
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
     fixtures::apply_fixture(
-        ingress::ANNOTATION_AUTH_EXT_DENY,
+        ingress::ANNOTATION_EXT_AUTH_DENY,
         FixtureVars::new(&ns.name),
     )
     .await?;
-    let host = format!("authextdeny.{}.local", ns.name);
+    let host = format!("extauthdeny.{}.local", ns.name);
 
     // Poll until we see 403: route programmed and auth-deny Pod ready.
     // 404 = not yet programmed; 503 = auth-deny Pod not ready yet; keep polling.
     // The busybox nc stub is one-shot per invocation so we rely on poll success
     // as the assertion — a single 403 proves the proxy forwarded the deny status.
     wait::wait_for_route_status(&h.http, &host, "/", 403, Duration::from_secs(90)).await?;
-    Ok(())
-}
-
-/// `auth-timeout`: when the auth sub-request exceeds `auth-timeout`, the proxy
-/// returns 503 and never reaches the upstream backend (#24 sad path).
-#[tokio::test]
-async fn request_rejected_when_ext_authz_times_out() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "auth-timeout").await?;
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_TIMEOUT, FixtureVars::new(&ns.name)).await?;
-    let host = format!("authtimeout.{}.local", ns.name);
-
-    // Each poll attempt takes ≥500ms (auth-timeout fires), so the 90s deadline
-    // gives ample room for slow-echo to start and the route to be installed.
-    // 404 = not yet programmed; 200 would be wrong (auth must timeout); target is 503.
-    wait::wait_for_route_status(&h.http, &host, "/", 503, Duration::from_secs(90)).await?;
-    Ok(())
-}
-
-/// `ext-auth-fail-closed: "false"`: when the auth service is unreachable (times
-/// out), the proxy fails **open** and forwards the request to the upstream
-/// unauthorized instead of returning 503 (#23 happy path — the fail-open
-/// opt-in). Mirror of `request_rejected_when_ext_authz_times_out`, which fails
-/// closed by default.
-#[tokio::test]
-async fn request_allowed_when_ext_auth_times_out_and_fail_open() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "auth-fail-open").await?;
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_AUTH_FAIL_OPEN,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-    let host = format!("authfailopen.{}.local", ns.name);
-
-    // The auth check to slow-echo times out at 500ms; fail-closed=false means the
-    // request then proceeds to echo-a rather than 503. Assert it reaches the backend.
-    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(90)).await?;
-    resp.assert_backend("echo-a");
-    Ok(())
-}
-
-/// `ext-auth-protocol: grpc` allow path (#23): the Ingress ext-auth check speaks
-/// the Envoy `envoy.service.auth.v3` proto; a request with `x-ext-authz: allow`
-/// is allowed to the backend. This is the e2e effect test for the
-/// `ext-auth-protocol` annotation.
-#[tokio::test]
-async fn request_allowed_when_ext_authz_grpc_allows() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "auth-grpc-ok").await?;
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
-    let host = format!("authgrpc.{}.local", ns.name);
-
-    wait::poll_until(
-        Duration::from_secs(120),
-        wait::POLL,
-        || async { format!("Ingress gRPC ext_authz to allow x-ext-authz:allow at {host}") },
-        || async {
-            match h
-                .http
-                .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
-                .await
-            {
-                Ok((200, _, Some(body))) => Some(body),
-                _ => None,
-            }
-        },
-    )
-    .await?
-    .assert_backend("echo-a");
-    Ok(())
-}
-
-/// `ext-auth-protocol: grpc` deny path (#23): a request WITHOUT `x-ext-authz:
-/// allow` is denied by the gRPC auth service → 403, backend never reached.
-#[tokio::test]
-async fn request_denied_when_ext_authz_grpc_denies() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "auth-grpc-deny").await?;
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
-    let host = format!("authgrpc.{}.local", ns.name);
-
-    wait::wait_for_route_status(&h.http, &host, "/", 403, Duration::from_secs(120)).await?;
-    Ok(())
-}
-
-/// gRPC ext_authz channel pooling (#544 happy path): once the pooled channel to
-/// `ext-authz-grpc` is warm, many sequential checks all succeed. Before pooling,
-/// each check dialled a fresh TCP+HTTP/2 connection per request; a regression
-/// that leaks/corrupts the pooled channel after first use would surface here as
-/// a later request timing out or failing to connect.
-#[tokio::test]
-async fn request_allowed_when_ext_authz_grpc_channel_reused_across_requests() -> anyhow::Result<()>
-{
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "auth-grpc-reuse").await?;
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
-    let host = format!("authgrpc.{}.local", ns.name);
-
-    // Establish the route first — the pool's cold-start (first dial) is not
-    // what this test targets; the reuse path after that is.
-    wait::poll_until(
-        Duration::from_secs(120),
-        wait::POLL,
-        || async { format!("Ingress gRPC ext_authz to allow x-ext-authz:allow at {host}") },
-        || async {
-            match h
-                .http
-                .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
-                .await
-            {
-                Ok((200, _, Some(body))) => Some(body),
-                _ => None,
-            }
-        },
-    )
-    .await?
-    .assert_backend("echo-a");
-
-    for i in 0..30u32 {
-        let (status, _, body) = h
-            .http
-            .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
-            .await?;
-        anyhow::ensure!(status == 200, "request {i}: expected 200, got {status}");
-        body.ok_or_else(|| anyhow::anyhow!("request {i}: 200 with no parseable body"))?
-            .assert_backend("echo-a");
-    }
-    Ok(())
-}
-
-/// gRPC ext_authz channel pooling (#544 sad path): `kubectl rollout restart`
-/// replaces `ext-authz-grpc` with a new pod at a new `SocketAddr` (endpoint
-/// churn, not a same-address reconnect — pod IPs are not reused). Reconcile
-/// updates `ExtAuthConfig.endpoints`, so the round-robin picker must move on to
-/// the new address; the pool's `SocketAddr`-keyed design means the old, now-dead
-/// entry is simply never selected again (no explicit invalidation exists or is
-/// needed — see `crate::policy::grpc_channel`'s module doc). A regression that
-/// left the picker or the cache pinned to the stale endpoint would fail every
-/// check closed (`failClosed` defaults true) instead of recovering.
-#[tokio::test]
-async fn request_recovers_after_ext_authz_grpc_pod_restart() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "auth-grpc-restart").await?;
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
-    let host = format!("authgrpc.{}.local", ns.name);
-
-    wait::poll_until(
-        Duration::from_secs(120),
-        wait::POLL,
-        || async { format!("Ingress gRPC ext_authz to allow x-ext-authz:allow at {host}") },
-        || async {
-            match h
-                .http
-                .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
-                .await
-            {
-                Ok((200, _, Some(body))) => Some(body),
-                _ => None,
-            }
-        },
-    )
-    .await?
-    .assert_backend("echo-a");
-
-    // Fixture Deployment is namespace-scoped and owned exclusively by this
-    // test's namespace — safe in the parallel pass (see common::rollout).
-    common::rollout::rollout_restart_deployment(&ns.name, "ext-authz-grpc").await?;
-
-    // Allow still allows (reconnect to the replacement pod), and deny still
-    // denies — the pool did not wedge open or leave a stale allow/deny cached.
-    wait::poll_until(
-        Duration::from_secs(120),
-        wait::POLL,
-        || async { format!("gRPC ext_authz to recover after auth-pod restart at {host}") },
-        || async {
-            match h
-                .http
-                .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
-                .await
-            {
-                Ok((200, _, Some(body))) => Some(body),
-                _ => None,
-            }
-        },
-    )
-    .await?
-    .assert_backend("echo-a");
-
-    wait::wait_for_route_status(&h.http, &host, "/", 403, Duration::from_secs(90)).await?;
-    Ok(())
-}
-
-/// `auth-response-headers`: when auth allows (2xx), the named response headers
-/// from the auth service are forwarded to the upstream on the request (#24).
-#[tokio::test]
-async fn upstream_receives_auth_response_headers_when_configured() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "auth-hdrs").await?;
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_AUTH_RESPONSE_HEADERS,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-    let host = format!("authhdr.{}.local", ns.name);
-
-    // auth-allow returns X-Auth-User: testuser; the Ingress annotation lists it in
-    // auth-response-headers; the proxy injects it into the upstream request.
-    // echo-a reflects all request headers in the JSON body.
-    let resp = wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(90)).await?;
-    let auth_user = resp
-        .headers
-        .get("X-Auth-User")
-        .and_then(|v| v[0].as_str())
-        .unwrap_or("");
-    anyhow::ensure!(
-        auth_user == "testuser",
-        "expected upstream to receive X-Auth-User: testuser from auth response, got: {auth_user:?}"
-    );
-    Ok(())
-}
-
-/// `auth-always-set-cookie`: when auth denies and `auth-always-set-cookie: "true"`,
-/// the proxy forwards `Set-Cookie` from the auth deny response to the client (#24).
-#[tokio::test]
-async fn set_cookie_forwarded_on_deny_when_auth_always_set_cookie() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "auth-cookie").await?;
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_AUTH_ALWAYS_SET_COOKIE,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-    let host = format!("authcookie.{}.local", ns.name);
-
-    // Poll until the route returns 403 AND Set-Cookie: session=test123 is present.
-    // auth-deny returns one response per nc invocation, then nc restarts (small gap).
-    // Polling the combined condition avoids a second serial request hitting the
-    // restart window when the cluster is under load.
-    wait::poll_until(
-        Duration::from_secs(90),
-        wait::POLL,
-        || async { format!("route {host}/ to return 403 with Set-Cookie: session=test123") },
-        || async {
-            match h.http.get_full(&host, "/").await {
-                Ok((403, hdrs, _)) => {
-                    let cookie = hdrs
-                        .get(reqwest::header::SET_COOKIE)
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or("");
-                    if cookie.contains("session=test123") {
-                        Some(())
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            }
-        },
-    )
-    .await?;
     Ok(())
 }
 
@@ -2200,6 +1925,119 @@ async fn gateway_external_auth_grpc_denies_without_header() -> anyhow::Result<()
     // No `x-ext-authz` header → the gRPC auth service denies → 403 (404 while the
     // route is not yet programmed; 503 while the auth Pod is not ready — keep polling).
     wait::wait_for_route_status(&gw, &host, "/", 403, Duration::from_secs(120)).await?;
+    Ok(())
+}
+
+/// gRPC ext_authz channel pooling (#544 happy path): once the pooled channel to
+/// `ext-authz-grpc` is warm, many sequential checks all succeed. Before pooling,
+/// each check dialled a fresh TCP+HTTP/2 connection per request; a regression
+/// that leaks/corrupts the pooled channel after first use would surface here as
+/// a later request timing out or failing to connect. The pool is proxy-internal
+/// and transport-agnostic to the auth surface, so this rides the Gateway API
+/// `ExtensionRef` fixture rather than an Ingress annotation (#549 moved the
+/// Ingress `ext-auth-protocol` annotation this test used to depend on).
+#[tokio::test]
+async fn gateway_external_auth_grpc_channel_reused_across_requests() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-grpc-reuse").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::EXTERNAL_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwextauthgrpc.{}.local", ns.name);
+
+    // Establish the route first — the pool's cold-start (first dial) is not
+    // what this test targets; the reuse path after that is.
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async { format!("gRPC ext_authz to allow x-ext-authz:allow at {host}") },
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+
+    for i in 0..30u32 {
+        let (status, _, body) = gw
+            .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
+            .await?;
+        anyhow::ensure!(status == 200, "request {i}: expected 200, got {status}");
+        body.ok_or_else(|| anyhow::anyhow!("request {i}: 200 with no parseable body"))?
+            .assert_backend("echo-a");
+    }
+    Ok(())
+}
+
+/// gRPC ext_authz channel pooling (#544 sad path): `kubectl rollout restart`
+/// replaces `ext-authz-grpc` with a new pod at a new `SocketAddr` (endpoint
+/// churn, not a same-address reconnect — pod IPs are not reused). Reconcile
+/// updates `ExtAuthConfig.endpoints`, so the round-robin picker must move on to
+/// the new address; the pool's `SocketAddr`-keyed design means the old, now-dead
+/// entry is simply never selected again (no explicit invalidation exists or is
+/// needed — see `crate::policy::grpc_channel`'s module doc). A regression that
+/// left the picker or the cache pinned to the stale endpoint would fail every
+/// check closed (`failClosed` defaults true) instead of recovering. Rides the
+/// Gateway API `ExtensionRef` fixture for the same reason as the reuse test
+/// above.
+#[tokio::test]
+async fn gateway_external_auth_grpc_recovers_after_pod_restart() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-grpc-restart").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::EXTERNAL_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwextauthgrpc.{}.local", ns.name);
+
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async { format!("gRPC ext_authz to allow x-ext-authz:allow at {host}") },
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+
+    // Fixture Deployment is namespace-scoped and owned exclusively by this
+    // test's namespace — safe in the parallel pass (see common::rollout).
+    common::rollout::rollout_restart_deployment(&ns.name, "ext-authz-grpc").await?;
+
+    // Allow still allows (reconnect to the replacement pod), and deny still
+    // denies — the pool did not wedge open or leave a stale allow/deny cached.
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async { format!("gRPC ext_authz to recover after auth-pod restart at {host}") },
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+
+    wait::wait_for_route_status(&gw, &host, "/", 403, Duration::from_secs(90)).await?;
     Ok(())
 }
 

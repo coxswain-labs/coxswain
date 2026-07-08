@@ -153,36 +153,18 @@ pub const ANNOTATION_RATE_LIMIT_BY_HEADER_WITH_AUTH: &str =
 /// Used to verify that an invalid annotation value is ignored (warn + fail-open) and
 /// traffic flows unthrottled.
 pub const ANNOTATION_RATE_LIMIT_INVALID: &str = fixture!("annotation_rate_limit_invalid.yaml");
-/// Ingress with `ingress.coxswain-labs.dev/auth-url` pointing at the `auth-allow` stub (200)
-/// (#24 happy path). Used to verify the proxy allows the request and forwards it to echo-a.
-/// Depends on `backends::AUTH_STUB` being applied first.
-pub const ANNOTATION_AUTH_EXT_ALLOW: &str = fixture!("annotation_auth_ext_allow.yaml");
-/// Ingress with `ingress.coxswain-labs.dev/auth-url` pointing at the `auth-deny` stub (403)
-/// (#24 sad path). Used to verify the proxy returns 403 and never reaches echo-a.
-/// Depends on `backends::AUTH_STUB` being applied first.
-pub const ANNOTATION_AUTH_EXT_DENY: &str = fixture!("annotation_auth_ext_deny.yaml");
-/// Ingress with `ingress.coxswain-labs.dev/auth-url` pointing at `slow-echo` (never responds)
-/// and `auth-timeout: 500ms` (#24 sad path — timeout). Used to verify the proxy returns 503
-/// when the auth sub-request exceeds its timeout. Depends on `backends::SLOW_ECHO`.
-pub const ANNOTATION_AUTH_TIMEOUT: &str = fixture!("annotation_auth_timeout.yaml");
-/// ext-auth fail-open (#23): auth times out but `ext-auth-fail-closed: "false"`
-/// lets the request through to the backend instead of 503.
-pub const ANNOTATION_AUTH_FAIL_OPEN: &str = fixture!("annotation_auth_fail_open.yaml");
-/// ext-auth gRPC transport (#23): `ext-auth-backend: ext-authz-grpc:9000` +
-/// `ext-auth-protocol: grpc`. Allowed with `x-ext-authz: allow`, denied (403)
-/// otherwise. The e2e effect test for the `ext-auth-protocol` annotation. Depends
-/// on `backends::EXT_AUTHZ_GRPC`.
-pub const ANNOTATION_AUTH_GRPC: &str = fixture!("annotation_auth_grpc.yaml");
-/// Ingress with `auth-url` (auth-allow) and `auth-response-headers: X-Auth-User` (#24).
-/// Used to verify the proxy copies the named header from the auth response onto the upstream
-/// request; echo-a reflects it back in its JSON body. Depends on `backends::AUTH_STUB`.
-pub const ANNOTATION_AUTH_RESPONSE_HEADERS: &str =
-    fixture!("annotation_auth_response_headers.yaml");
-/// Ingress with `auth-url` (auth-deny) and `auth-always-set-cookie: "true"` (#24).
-/// Used to verify the proxy forwards `Set-Cookie` from the auth deny response to the client.
-/// Depends on `backends::AUTH_STUB`.
-pub const ANNOTATION_AUTH_ALWAYS_SET_COOKIE: &str =
-    fixture!("annotation_auth_always_set_cookie.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/ext-auth` naming a `CoxswainExternalAuth`
+/// CR (HTTP transport, `backendRef: auth-allow:4000`) — Ingress parity with
+/// `gateway_api::EXTERNAL_AUTH_ROUTE_ALLOW` (#549 happy path). Used to verify the
+/// proxy allows the request and forwards it to echo-a. Depends on
+/// `backends::AUTH_STUB` being applied first.
+pub const ANNOTATION_EXT_AUTH_ALLOW: &str = fixture!("annotation_ext_auth_allow.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/ext-auth` naming a `CoxswainExternalAuth`
+/// CR (HTTP transport, `backendRef: auth-deny:4001`) — Ingress parity with
+/// `gateway_api::EXTERNAL_AUTH_ROUTE_DENY` (#549 sad path). Used to verify the
+/// proxy returns 403 and never reaches echo-a. Depends on `backends::AUTH_STUB`
+/// being applied first.
+pub const ANNOTATION_EXT_AUTH_DENY: &str = fixture!("annotation_ext_auth_deny.yaml");
 /// Labeled htpasswd Secret for basic-auth e2e tests (#24).
 /// Carries `ingress.coxswain-labs.dev/auth-basic: "true"` so the reflector picks it up.
 /// Contains: `alice` (bcrypt, password `secret`) + `bob` (SHA1, password `secret`).

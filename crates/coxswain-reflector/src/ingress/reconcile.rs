@@ -6,11 +6,12 @@ use super::backend::resolve_backend_port;
 use super::class::{ResolvedClassParams, claimed_ingress_class};
 use super::ports::IngressPorts;
 use super::reconcile_helpers::{
-    build_ingress_backend_group, prepend_ssl_redirect, resolve_auth_config, resolve_host_builder,
-    resolve_jwt_auth_config, resolve_mirror_filter,
+    build_ingress_backend_group, prepend_ssl_redirect, resolve_basic_auth_config,
+    resolve_ext_auth_config, resolve_host_builder, resolve_jwt_auth_config, resolve_mirror_filter,
 };
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
+use coxswain_core::crd::CoxswainExternalAuth;
 use coxswain_core::routing::{
     BackendGroup, FilterAction, IngressAuthConfig, IngressRoutingTableBuilder, PathModifier,
     RouteEntry, compile_path_regex,
@@ -55,14 +56,19 @@ impl<'a> IngressClassContext<'a> {
 
 /// The auth-related stores threaded into [`IngressReconciler::reconcile`].
 ///
-/// Groups the label-scoped htpasswd Secret store (`auth-basic-secret`) with the
-/// `JwtAuth` CR store and JWKS cache (`auth-jwt`, #441) so `reconcile` stays
-/// under the workspace argument-count limit.
+/// Groups the label-scoped htpasswd Secret store (`auth-basic-secret`) with
+/// the `CoxswainExternalAuth` CR store (`ext-auth`, #549), the `JwtAuth` CR
+/// store and JWKS cache (`auth-jwt`, #441), and the backend `ReferenceGrant`
+/// set (needed to resolve a `CoxswainExternalAuth` CR's cross-namespace
+/// `backendRef`) so `reconcile` stays under the workspace argument-count
+/// limit.
 #[non_exhaustive]
 pub struct IngressAuthStores<'a> {
     pub(crate) auth_secrets: &'a reflector::Store<Secret>,
+    pub(crate) external_auths: &'a reflector::Store<CoxswainExternalAuth>,
     pub(crate) jwt_auths: &'a reflector::Store<coxswain_core::crd::JwtAuth>,
     pub(crate) jwks_cache: &'a crate::jwks::SharedJwksCache,
+    pub(crate) backend_grants: &'a crate::reference_grants::GrantSet,
 }
 
 impl<'a> IngressAuthStores<'a> {
@@ -70,13 +76,17 @@ impl<'a> IngressAuthStores<'a> {
     #[must_use]
     pub fn new(
         auth_secrets: &'a reflector::Store<Secret>,
+        external_auths: &'a reflector::Store<CoxswainExternalAuth>,
         jwt_auths: &'a reflector::Store<coxswain_core::crd::JwtAuth>,
         jwks_cache: &'a crate::jwks::SharedJwksCache,
+        backend_grants: &'a crate::reference_grants::GrantSet,
     ) -> Self {
         Self {
             auth_secrets,
+            external_auths,
             jwt_auths,
             jwks_cache,
+            backend_grants,
         }
     }
 }
@@ -217,17 +227,23 @@ impl IngressReconciler {
         // entry of this Ingress — same refcount-bump sharing pattern as above.
         let rate_limit = ann.rate_limit.clone().map(Arc::new);
         // Resolve auth annotations once per Ingress; share one Arc chain across
-        // every path. `auth-jwt` (#441) is independent of (additive with)
-        // `ext-auth-backend`/`auth-basic-secret` — every configured check must
-        // pass, mirroring the HTTPRoute ExtensionRef chain (#23).
-        let ext_or_basic_auth = resolve_auth_config(
-            ann.auth.as_ref(),
+        // every path. `ext-auth` (#549), `auth-basic-secret` (#24), and
+        // `auth-jwt` (#441) are independently additive — every configured
+        // check must pass, mirroring the HTTPRoute ExtensionRef chain (#23).
+        let basic_auth = resolve_basic_auth_config(
+            ann.auth_basic.as_ref(),
             auth_stores.auth_secrets,
-            services,
-            slices,
             &route_id,
             ns,
             &mut annotation_issues,
+        );
+        let ext_auth = resolve_ext_auth_config(
+            ann.auth_ext.as_ref(),
+            auth_stores.external_auths,
+            services,
+            slices,
+            auth_stores.backend_grants,
+            &route_id,
         );
         let jwt_auth = resolve_jwt_auth_config(
             ann.auth_jwt.as_ref(),
@@ -235,7 +251,7 @@ impl IngressReconciler {
             auth_stores.jwks_cache,
             &route_id,
         );
-        let auth: Arc<[Arc<IngressAuthConfig>]> = [ext_or_basic_auth, jwt_auth]
+        let auth: Arc<[Arc<IngressAuthConfig>]> = [basic_auth, ext_auth, jwt_auth]
             .into_iter()
             .flatten()
             .map(Arc::new)
@@ -1643,8 +1659,10 @@ mod tests {
             &mut builder,
             &IngressAuthStores::new(
                 &empty_secret_store(),
+                &empty_external_auth_store(),
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
+                &empty_backend_grants(),
             ),
         );
         assert!(
@@ -1681,8 +1699,10 @@ mod tests {
             &mut builder,
             &IngressAuthStores::new(
                 &empty_secret_store(),
+                &empty_external_auth_store(),
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
+                &empty_backend_grants(),
             ),
         );
         assert!(
@@ -2232,8 +2252,10 @@ mod tests {
             &mut builder,
             &IngressAuthStores::new(
                 &empty_secret_store(),
+                &empty_external_auth_store(),
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
+                &empty_backend_grants(),
             ),
         );
         let table = builder.build().unwrap();

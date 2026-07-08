@@ -39,7 +39,6 @@ pub use routing::*;
 pub use session::*;
 pub use traffic_policy::*;
 
-use auth::AuthAnnotation;
 use coxswain_core::routing::{
     CircuitBreakerConfig, CompressionConfig, FilterAction, ForwardedForConfig, HeaderMod,
     LoadBalance, NormalizeLevel, PathModifier, RateLimitConfig, RetryPolicyConfig, RouteTimeouts,
@@ -147,19 +146,31 @@ pub(super) struct IngressAnnotations {
     /// `None` (the default, or when `rate-limit-rps` is absent/invalid) disables
     /// rate limiting for the route (fail-open).
     pub rate_limit: Option<RateLimitConfig>,
-    /// Auth configuration from the `auth-*` annotations (#24), in intermediate
-    /// (pre-resolved) form.  `None` when neither `auth-url` nor
-    /// `auth-basic-secret` is present.  The reconciler resolves `Basic(SecretRef)`
-    /// into [`IngressAuthConfig`][coxswain_core::routing::IngressAuthConfig] by
-    /// looking up the labeled htpasswd Secret.
-    pub auth: Option<AuthAnnotation>,
+    /// `Secret` reference from `auth-basic-secret` (#24), in intermediate
+    /// (pre-resolved) `namespace/name` form. `None` when the annotation is
+    /// absent or malformed (WARN emitted). The reconciler resolves this into
+    /// [`IngressAuthConfig::Basic`][coxswain_core::routing::IngressAuthConfig::Basic]
+    /// by looking up the labeled htpasswd Secret. Independent of (additive
+    /// with) [`Self::auth_ext`] / [`Self::auth_jwt`] — every configured check
+    /// must pass.
+    pub auth_basic: Option<auth::SecretRef>,
+    /// `CoxswainExternalAuth` CR reference from `ext-auth` (#549), in
+    /// intermediate (pre-resolved) `namespace/name` form. `None` when the
+    /// annotation is absent or malformed (WARN emitted). Independent of
+    /// (additive with) [`Self::auth_basic`] / [`Self::auth_jwt`] — the
+    /// reconciler resolves this into the same
+    /// [`IngressAuthConfig::External`][coxswain_core::routing::IngressAuthConfig::External]
+    /// the HTTPRoute `ExtensionRef` filter produces, and every configured
+    /// check must pass.
+    pub auth_ext: Option<auth::SecretRef>,
     /// `JwtAuth` CR reference from `auth-jwt` (#441), in intermediate
     /// (pre-resolved) `namespace/name` form. `None` when the annotation is
     /// absent or malformed (WARN emitted). Independent of (additive with)
-    /// [`Self::auth`] — the reconciler resolves this into the same
+    /// [`Self::auth_basic`] / [`Self::auth_ext`] — the reconciler resolves
+    /// this into the same
     /// [`IngressAuthConfig::Jwt`][coxswain_core::routing::IngressAuthConfig::Jwt]
-    /// the HTTPRoute `ExtensionRef` filter produces, and both checks (when
-    /// present) must pass.
+    /// the HTTPRoute `ExtensionRef` filter produces, and every configured
+    /// check must pass.
     pub auth_jwt: Option<auth::SecretRef>,
     /// Fire-and-forget mirror backend ref from `mirror-target` (#283), in
     /// intermediate (pre-resolved) form.  `None` when the annotation is absent or
@@ -425,8 +436,7 @@ impl IngressAnnotations {
         let session_affinity = parse_session_affinity(ann, route_id, &mut diag);
 
         // ── Rate limiting (#25) ───────────────────────────────────────────────
-        let has_auth =
-            get(ann, EXT_AUTH_BACKEND).is_some() || get(ann, AUTH_BASIC_SECRET).is_some();
+        let has_auth = get(ann, auth::EXT_AUTH).is_some() || get(ann, AUTH_BASIC_SECRET).is_some();
         let rate_limit = parse_rate_limit(
             get(ann, RATE_LIMIT_RPS),
             get(ann, RATE_LIMIT_BURST),
@@ -436,8 +446,29 @@ impl IngressAnnotations {
             &mut diag,
         );
 
-        // ── External / basic auth (#24) ───────────────────────────────────────
-        let auth = auth::parse_auth(ann, route_id, &mut diag);
+        // ── Basic auth Secret reference (#24) ─────────────────────────────────
+        let auth_basic = get(ann, AUTH_BASIC_SECRET).and_then(|v| {
+            let r = auth::parse_secret_ref(v);
+            if r.is_none() {
+                issue!(
+                    AUTH_BASIC_SECRET,
+                    "invalid auth-basic-secret — expected \"namespace/name\" format; auth disabled"
+                );
+            }
+            r
+        });
+
+        // ── External auth CR reference (#549) ─────────────────────────────────
+        let auth_ext = get(ann, auth::EXT_AUTH).and_then(|v| {
+            let r = auth::parse_secret_ref(v);
+            if r.is_none() {
+                issue!(
+                    auth::EXT_AUTH,
+                    "invalid ext-auth — expected \"namespace/name\"; external auth disabled"
+                );
+            }
+            r
+        });
 
         // ── JWT auth CR reference (#441) ──────────────────────────────────────
         let auth_jwt = get(ann, auth::AUTH_JWT).and_then(|v| {
@@ -543,7 +574,8 @@ impl IngressAnnotations {
                 deny_source_range,
                 session_affinity,
                 rate_limit,
-                auth,
+                auth_basic,
+                auth_ext,
                 auth_jwt,
                 mirror_target,
                 keepalive_timeout,
