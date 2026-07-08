@@ -195,6 +195,16 @@ pub struct ProxyCtx {
     /// at the auth-response parsing step so `upstream_request_filter` can use a
     /// case-insensitive comparison without per-request allocation.
     pub auth_response_headers: Option<Vec<(Box<str>, Box<str>)>>,
+    /// Request header names to strip before forwarding upstream (#441).
+    ///
+    /// Populated by [`crate::policy::auth::enforce`] with the bearer-token
+    /// header name(s) when a `JwtAuth` check succeeds and its `forward` field
+    /// is `false` (Envoy `JwtProvider.forward` default) — the raw token must
+    /// not reach the upstream. Applied in `upstream_request_filter` before
+    /// [`Self::auth_response_headers`] is applied, so a `claimToHeaders` entry
+    /// can never be immediately stripped by a same-named removal. `None` (the
+    /// common case: no JWT filter, or `forward: true`) incurs no cost.
+    pub strip_upstream_headers: Option<Vec<Box<str>>>,
     /// Bounded mpsc senders feeding in-flight mirror tasks (#360).
     ///
     /// Populated in `request_filter` when the route carries one or more
@@ -311,4 +321,6 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 192);
 //   mirror_body: Vec<Bytes> (24B) replaced by mirror_txs: Vec<mpsc::Sender<Bytes>> (24B);
 //   the two staging fields collapse into one sender vec (560→536).
 // ProxyCtx: +0 for is_h2: bool absorbed into existing alignment padding (#509).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 536);
+// ProxyCtx: +24 for strip_upstream_headers: Option<Vec<Box<str>>> (niche-opt on
+// Vec's ptr; 24 bytes) (#441) (536→560).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 560);

@@ -82,6 +82,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             affinity_pin: None,
             affinity_set_cookie: false,
             auth_response_headers: None,
+            strip_upstream_headers: None,
             mirror_txs: Vec::new(),
             compression_encoder: None,
             client_cert_pem: None,
@@ -344,9 +345,11 @@ pub(crate) async fn request_filter<K>(
         if crate::policy::auth::enforce(
             &cfg.auth_client,
             &cfg.grpc_auth_channels,
+            &cfg.jwks_keys,
             auth,
             session,
             &mut ctx.auth_response_headers,
+            &mut ctx.strip_upstream_headers,
         )
         .await?
         {
@@ -829,6 +832,18 @@ pub(crate) async fn upstream_request_filter(
             original_path,
             ctx,
         )?;
+    }
+
+    // Strip the bearer-token header(s) a successful JwtAuth check consumed,
+    // when the CRD's `forward` is `false` (#441). Applied before the
+    // auth-response-headers block below so a `claimToHeaders` entry can never
+    // be immediately stripped by a same-named removal.
+    if let Some(names) = ctx.strip_upstream_headers.take() {
+        for name in names {
+            if let Ok(hn) = http::HeaderName::from_bytes(name.as_bytes()) {
+                upstream_request.remove_header(&hn);
+            }
+        }
     }
 
     // Auth-response headers injected by an ext_authz `allowed_upstream_headers`

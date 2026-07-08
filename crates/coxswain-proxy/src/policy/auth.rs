@@ -15,6 +15,16 @@
 //!   time comparison.  Missing/invalid credentials → 401 + `WWW-Authenticate`.
 //!   An `Unavailable` config (missing/unlabeled secret) → 503.
 //!
+//! - **JWT auth** (`JwtAuth`, #441): extracts a bearer token from a configured
+//!   request header, verifies its signature against the resolved JWKS (pushed
+//!   by the controller — this crate never fetches JWKS itself, see
+//!   [`coxswain_core::routing::JwtConfig`]'s module doc), and checks `iss`/`aud`.
+//!   Verified claims are copied onto upstream headers per `claimToHeaders`; the
+//!   raw token is stripped from the upstream request unless `forward: true`.
+//!   Missing/invalid token → 401 + `WWW-Authenticate: Bearer`. An unresolved
+//!   JWKS (`Unavailable`) → 503. Signature verification is fast (no KDF like
+//!   bcrypt) so it runs inline, not in `spawn_blocking`.
+//!
 //! ## Security notes
 //!
 //! The decoded `user:pass` plaintext is held in a [`zeroize::Zeroizing`] buffer
@@ -23,7 +33,7 @@
 //! dropped at reconcile time (via `ZeroizeOnDrop` on `BasicCredential` /
 //! `PasswordHash`).
 
-use coxswain_core::routing::{ExtAuthTransport, IngressAuthConfig, PasswordHash};
+use coxswain_core::routing::{ExtAuthTransport, IngressAuthConfig, JwtConfig, PasswordHash};
 use pingora_core::Result;
 use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
@@ -73,9 +83,13 @@ pub(crate) const HOP_BY_HOP: &[&str] = &[
 ///   **not** be forwarded to the upstream backend.
 /// - `Err(…)` — a hard Pingora error (only on internal write failures).
 ///
-/// `auth_response_headers` is populated when the auth service returns 2xx and the
-/// route's `auth-response-headers` list is non-empty; the caller stores it on
-/// `ctx` for [`crate::hooks::upstream_request_filter`] to apply.
+/// `auth_response_headers` is populated when the auth service returns 2xx (or a
+/// JWT check succeeds with `claimToHeaders`/`forwardPayloadHeader` configured)
+/// and the route's `auth-response-headers` list is non-empty; the caller
+/// stores it on `ctx` for [`crate::hooks::upstream_request_filter`] to apply.
+/// `strip_upstream_headers` is populated by a successful JWT check when the
+/// CRD's `forward` is `false` — applied by the same caller, before
+/// `auth_response_headers`.
 ///
 /// # Errors
 ///
@@ -83,15 +97,27 @@ pub(crate) const HOP_BY_HOP: &[&str] = &[
 pub(crate) async fn enforce(
     client: &reqwest::Client,
     grpc_channels: &crate::policy::grpc_channel::GrpcAuthChannelCache,
+    jwks_keys: &JwksKeyCache,
     auth: &IngressAuthConfig,
     session: &mut Session,
     auth_response_headers: &mut Option<Vec<(Box<str>, Box<str>)>>,
+    strip_upstream_headers: &mut Option<Vec<Box<str>>>,
 ) -> Result<bool> {
     match auth {
         IngressAuthConfig::External(cfg) => {
             enforce_ext_authz(client, grpc_channels, cfg, session, auth_response_headers).await
         }
         IngressAuthConfig::Basic(creds) => enforce_basic(creds, session).await,
+        IngressAuthConfig::Jwt(cfg) => {
+            enforce_jwt(
+                jwks_keys,
+                cfg,
+                session,
+                auth_response_headers,
+                strip_upstream_headers,
+            )
+            .await
+        }
         IngressAuthConfig::Unavailable => {
             // Secret was absent or unlabeled at reconcile time — fail closed.
             tracing::warn!("auth config unavailable — refusing request (503)");
@@ -233,7 +259,9 @@ async fn enforce_ext_authz_http(
                 }
             }
             if !headers_to_forward.is_empty() {
-                *auth_response_headers_out = Some(headers_to_forward);
+                auth_response_headers_out
+                    .get_or_insert_with(Vec::new)
+                    .extend(headers_to_forward);
             }
         }
         return Ok(false);
@@ -444,6 +472,743 @@ async fn write_simple(session: &mut Session, status: u16) -> Result<()> {
     Ok(())
 }
 
+/// Writes a `WWW-Authenticate: Bearer` challenge and returns `Ok(true)`
+/// (request handled, do not forward to upstream).
+async fn challenge_401_bearer(session: &mut Session) -> Result<bool> {
+    let mut resp = ResponseHeader::build(401, Some(1))?;
+    resp.insert_header(http::header::WWW_AUTHENTICATE, "Bearer")?;
+    session
+        .write_response_header(Box::new(resp), true)
+        .await
+        .unwrap_or_else(|e| tracing::error!("failed to write 401 challenge: {e}"));
+    Ok(true)
+}
+
+// ── JWT auth (JWKS bearer-token validation, #441) ─────────────────────────────
+
+/// Process-wide cache of parsed JWKS text → decoded key sets.
+///
+/// Keyed by the resolved [`JwtConfig::jwks`] `Arc<str>` itself: `Arc<str>`'s
+/// `Hash`/`Eq` delegate to the string *content*, so two routes (or two
+/// reconcile snapshots) carrying byte-identical JWKS text share one cache
+/// entry without a separate content-hash step. Parsing a JWKS is the only
+/// non-trivial CPU cost in the JWT path — signature verification itself is
+/// fast — so this cache keeps it off the hot path after the first request.
+///
+/// No eviction: bounded by the number of distinct JWKS texts referenced by
+/// live `JwtAuth` CRs (operator-authored config), not by request volume —
+/// unlike the gRPC ext_authz channel cache, which is bounded by resolved pod
+/// `SocketAddr`s and can grow with pod churn.
+#[non_exhaustive]
+#[derive(Clone, Default)]
+pub struct JwksKeyCache {
+    parsed: Arc<dashmap::DashMap<Arc<str>, Arc<jsonwebtoken::jwk::JwkSet>>>,
+}
+
+impl JwksKeyCache {
+    /// Construct an empty cache. Call once at process startup.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Parse `jwks` (or reuse a cached parse) into a [`jsonwebtoken::jwk::JwkSet`].
+    ///
+    /// `None` when the text is not valid JSON / not a valid JWK Set — the
+    /// caller fails the request closed (503); a malformed JWKS is a
+    /// reconcile-time or upstream-IdP problem, never a per-request one.
+    fn get_or_parse(&self, jwks: &Arc<str>) -> Option<Arc<jsonwebtoken::jwk::JwkSet>> {
+        if let Some(existing) = self.parsed.get(jwks) {
+            return Some(Arc::clone(&existing));
+        }
+        let parsed: jsonwebtoken::jwk::JwkSet = serde_json::from_str(jwks).ok()?;
+        let parsed = Arc::new(parsed);
+        self.parsed.insert(Arc::clone(jwks), Arc::clone(&parsed));
+        Some(parsed)
+    }
+}
+
+/// Extract the bearer token from the first matching [`JwtConfig::from_headers`]
+/// location present on the request. `from_headers` is never empty (the
+/// reconciler defaults to `Authorization`/`"Bearer "` when the CRD's
+/// `fromHeaders` is absent).
+fn extract_bearer_token(cfg: &JwtConfig, session: &Session) -> Option<Box<str>> {
+    let req = session.req_header();
+    for loc in cfg.from_headers.iter() {
+        let Some(value) = req.headers.get(loc.name.as_ref()) else {
+            continue;
+        };
+        let Ok(value) = value.to_str() else {
+            continue;
+        };
+        if loc.value_prefix.is_empty() {
+            return Some(Box::from(value));
+        }
+        if let Some(token) = value.strip_prefix(loc.value_prefix.as_ref()) {
+            return Some(Box::from(token));
+        }
+        // This location's prefix didn't match — keep scanning the remaining
+        // configured locations rather than failing on the first miss.
+    }
+    None
+}
+
+/// A JSON scalar rendered as a header-safe string; arrays/objects/null are
+/// skipped (not meaningful as a single header value).
+fn claim_scalar_to_string(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// Copy `cfg.claim_to_headers` matches and the optional base64url-encoded full
+/// payload from verified `claims` into `auth_response_headers_out`.
+fn apply_verified_claims(
+    cfg: &JwtConfig,
+    claims: &serde_json::Value,
+    auth_response_headers_out: &mut Option<Vec<(Box<str>, Box<str>)>>,
+) {
+    let mut headers: Vec<(Box<str>, Box<str>)> = Vec::with_capacity(
+        cfg.claim_to_headers.len() + usize::from(cfg.forward_payload_header.is_some()),
+    );
+    for (claim, header) in cfg.claim_to_headers.iter() {
+        if let Some(value) = claims.get(claim.as_ref())
+            && let Some(rendered) = claim_scalar_to_string(value)
+        {
+            headers.push((header.clone(), rendered.into_boxed_str()));
+        }
+    }
+    if let Some(header) = &cfg.forward_payload_header
+        && let Ok(bytes) = serde_json::to_vec(claims)
+    {
+        let encoded = base64::engine::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            bytes,
+        );
+        headers.push((header.clone(), encoded.into_boxed_str()));
+    }
+    if !headers.is_empty() {
+        auth_response_headers_out
+            .get_or_insert_with(Vec::new)
+            .extend(headers);
+    }
+}
+
+/// Header names to strip from the upstream request on a successful JWT check.
+///
+/// Always includes every `claimToHeaders`/`forwardPayloadHeader` destination
+/// name — `apply_verified_claims` only overwrites a name it actually renders a
+/// value for (claim absent, or present but non-scalar, silently skips it), so
+/// without an unconditional strip an attacker-supplied header of the same
+/// name would reach the upstream untouched, indistinguishable from a
+/// proxy-verified claim. Also includes the token's own source header(s) when
+/// `cfg.forward_token` is `false`.
+fn strip_header_names(cfg: &JwtConfig) -> Vec<Box<str>> {
+    let mut strip: Vec<Box<str>> = cfg
+        .claim_to_headers
+        .iter()
+        .map(|(_, header)| header.clone())
+        .collect();
+    strip.extend(cfg.forward_payload_header.clone());
+    if !cfg.forward_token {
+        strip.extend(cfg.from_headers.iter().map(|loc| loc.name.clone()));
+    }
+    strip
+}
+
+/// Outcome of [`verify_jwt`] — a pure, `Session`-free function so the
+/// signature-verification and claims-matching logic is unit-testable without
+/// constructing a Pingora `Session` (this file's established testing
+/// boundary — see the `grpc` submodule's tests, which exercise response
+/// mapping directly rather than through a real `Session`).
+#[derive(Debug)]
+enum JwtVerifyOutcome {
+    /// Signature verified and `iss`/`aud`/`exp` all check out.
+    Valid(serde_json::Value),
+    /// The JWKS text is unparseable or has no keys — fail closed (503).
+    JwksUnavailable,
+    /// No candidate key verified the token (bad signature, wrong issuer,
+    /// wrong audience, expired, malformed) — fail closed (401).
+    Invalid,
+}
+
+/// Verify `token` against the JWKS resolved by `cfg`, checking `iss`/`aud`.
+///
+/// The token header's `kid` narrows the candidate key when present; otherwise
+/// every key in the JWKS is tried (bounded by operator-authored config, not
+/// request input). The algorithm used for verification comes from **the JWK's
+/// own declared `alg`**, never the token header's `alg` — trusting the
+/// attacker-controlled token header would allow an algorithm-confusion attack.
+fn verify_jwt(jwks_keys: &JwksKeyCache, cfg: &JwtConfig, token: &str) -> JwtVerifyOutcome {
+    let Some(jwk_set) = jwks_keys.get_or_parse(&cfg.jwks) else {
+        tracing::warn!("JWT auth: JWKS unparseable — refusing request (503)");
+        return JwtVerifyOutcome::JwksUnavailable;
+    };
+    if jwk_set.keys.is_empty() {
+        tracing::warn!("JWT auth: JWKS has no keys — refusing request (503)");
+        return JwtVerifyOutcome::JwksUnavailable;
+    }
+
+    let Ok(header) = jsonwebtoken::decode_header(token.as_bytes()) else {
+        return JwtVerifyOutcome::Invalid;
+    };
+    let candidates: Vec<&jsonwebtoken::jwk::Jwk> = match &header.kid {
+        Some(kid) => jwk_set.find(kid).into_iter().collect(),
+        None => jwk_set.keys.iter().collect(),
+    };
+
+    for jwk in candidates {
+        // `JwtAuth` is documented as JWKS-only, i.e. asymmetric algorithms —
+        // reject a symmetric `oct` key outright rather than letting it flow
+        // into `DecodingKey::from_jwk` (which happily builds an HMAC key from
+        // one): an HMAC secret is forgeable bearer-token material, unlike
+        // every other value this type carries, and the CRD is not designed to
+        // protect it as a secret (no redaction, no zeroization).
+        if matches!(
+            jwk.algorithm,
+            jsonwebtoken::jwk::AlgorithmParameters::OctetKey(_)
+        ) {
+            continue;
+        }
+        // `KeyAlgorithm::to_algorithm` is private upstream; its body is just
+        // `Algorithm::from_str(&self.to_string())` (both `Display`/`FromStr`
+        // round-trip the JWA name, e.g. "RS256") — replicated here.
+        let Some(alg) = jwk
+            .common
+            .key_algorithm
+            .and_then(|ka| ka.to_string().parse::<jsonwebtoken::Algorithm>().ok())
+        else {
+            continue; // key doesn't declare a supported alg — skip, don't trust the token
+        };
+        let Ok(decoding_key) = jsonwebtoken::DecodingKey::from_jwk(jwk) else {
+            continue;
+        };
+        let mut validation = jsonwebtoken::Validation::new(alg);
+        validation.set_issuer(&[cfg.issuer.as_ref()]);
+        // jsonwebtoken only enforces `iss`/`aud` when the claim is *present* in
+        // the token ("Validation only happens if the claim is present" per its
+        // `Validation::iss`/`aud` docs) — a validly-signed token that simply
+        // omits `iss` would otherwise sail through unchecked. Adding both to
+        // `required_spec_claims` makes their *absence* a hard failure too, so
+        // the issuer/audience restriction can't be bypassed by omission.
+        validation.required_spec_claims.insert("iss".to_string());
+        if cfg.audiences.is_empty() {
+            validation.validate_aud = false;
+        } else {
+            let auds: Vec<&str> = cfg.audiences.iter().map(AsRef::as_ref).collect();
+            validation.set_audience(&auds);
+            validation.required_spec_claims.insert("aud".to_string());
+        }
+
+        // Verification is CPU-bound but fast (unlike bcrypt's deliberate KDF
+        // cost) — runs inline, no `spawn_blocking`.
+        if let Ok(data) =
+            jsonwebtoken::decode::<serde_json::Value>(token.as_bytes(), &decoding_key, &validation)
+        {
+            return JwtVerifyOutcome::Valid(data.claims);
+        }
+    }
+
+    JwtVerifyOutcome::Invalid
+}
+
+/// Enforce a [`JwtConfig`] check: extract a bearer token and verify it via
+/// [`verify_jwt`].
+///
+/// - Missing bearer token, or [`JwtVerifyOutcome::Invalid`] → `401` +
+///   `WWW-Authenticate: Bearer`.
+/// - [`JwtVerifyOutcome::JwksUnavailable`] → `503` (fail-closed; an operator
+///   who attached this filter expects enforcement).
+/// - [`JwtVerifyOutcome::Valid`] → copies `claimToHeaders`/
+///   `forwardPayloadHeader` into `auth_response_headers_out`, and — when
+///   `cfg.forward_token` is `false` (the default) — lists the token's source
+///   header(s) in `strip_upstream_headers_out` so
+///   [`crate::hooks::upstream_request_filter`] removes them before forwarding.
+async fn enforce_jwt(
+    jwks_keys: &JwksKeyCache,
+    cfg: &JwtConfig,
+    session: &mut Session,
+    auth_response_headers_out: &mut Option<Vec<(Box<str>, Box<str>)>>,
+    strip_upstream_headers_out: &mut Option<Vec<Box<str>>>,
+) -> Result<bool> {
+    let Some(token) = extract_bearer_token(cfg, session) else {
+        return challenge_401_bearer(session).await;
+    };
+
+    match verify_jwt(jwks_keys, cfg, &token) {
+        JwtVerifyOutcome::Valid(claims) => {
+            apply_verified_claims(cfg, &claims, auth_response_headers_out);
+            let strip = strip_header_names(cfg);
+            if !strip.is_empty() {
+                strip_upstream_headers_out
+                    .get_or_insert_with(Vec::new)
+                    .extend(strip);
+            }
+            Ok(false)
+        }
+        JwtVerifyOutcome::JwksUnavailable => {
+            write_simple(session, 503).await?;
+            Ok(true)
+        }
+        JwtVerifyOutcome::Invalid => challenge_401_bearer(session).await,
+    }
+}
+
+#[cfg(test)]
+mod jwt_tests {
+    use super::*;
+    use coxswain_core::routing::JwtHeaderLoc;
+
+    /// Static P-256 PKCS8 DER test key (generated once via `openssl ecparam
+    /// -genkey -name prime256v1 | openssl pkcs8 -topk8 -nocrypt -outform
+    /// DER`), matching the fixture-key precedent in jsonwebtoken's own test
+    /// suite (`tests/ecdsa/private_ecdsa_key.pk8`). Test-only; never used to
+    /// sign anything outside this module.
+    const TEST_EC_PRIVATE_KEY_DER: &[u8] = &[
+        0x30, 0x81, 0x87, 0x02, 0x01, 0x00, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+        0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, 0x04, 0x6d, 0x30,
+        0x6b, 0x02, 0x01, 0x01, 0x04, 0x20, 0x8d, 0xf7, 0xc0, 0x49, 0x22, 0x7e, 0x09, 0x3d, 0x4f,
+        0x49, 0x33, 0xbd, 0xde, 0xe1, 0x2f, 0xf2, 0xb4, 0x45, 0x05, 0x3d, 0x3d, 0x48, 0xb7, 0x18,
+        0x17, 0xf3, 0x51, 0x9e, 0x58, 0xee, 0x1a, 0x86, 0xa1, 0x44, 0x03, 0x42, 0x00, 0x04, 0xc3,
+        0xca, 0xa8, 0x2b, 0xde, 0xa7, 0xd5, 0x25, 0x7d, 0x2c, 0x23, 0xda, 0x92, 0xb6, 0x19, 0xfb,
+        0x9c, 0x9c, 0xb0, 0x9a, 0xe8, 0x05, 0x19, 0x73, 0x59, 0xae, 0x42, 0xe3, 0xce, 0xac, 0x2d,
+        0x5c, 0xa8, 0x92, 0x3f, 0xdb, 0xf3, 0x43, 0x72, 0xf9, 0x87, 0x0d, 0x6d, 0xb2, 0x29, 0x91,
+        0x87, 0xf0, 0xde, 0x80, 0x33, 0x7c, 0xbe, 0x38, 0x31, 0x68, 0xcc, 0x08, 0x97, 0x41, 0x3c,
+        0x9d, 0xf8, 0x0d,
+    ];
+
+    const TEST_KID: &str = "test-key-1";
+
+    /// A JWKS text carrying the public half of [`TEST_EC_PRIVATE_KEY_DER`],
+    /// tagged with [`TEST_KID`]. `Jwk::from_encoding_key` derives the public
+    /// EC point directly from the private key via the `rust_crypto` backend —
+    /// no separately-embedded public key needed.
+    fn test_jwks() -> Arc<str> {
+        let encoding_key = jsonwebtoken::EncodingKey::from_ec_der(TEST_EC_PRIVATE_KEY_DER);
+        let mut jwk = jsonwebtoken::jwk::Jwk::from_encoding_key(
+            &encoding_key,
+            jsonwebtoken::Algorithm::ES256,
+        )
+        .expect("derive JWK from test EC key");
+        jwk.common.key_id = Some(TEST_KID.to_string());
+        let set = jsonwebtoken::jwk::JwkSet { keys: vec![jwk] };
+        Arc::from(serde_json::to_string(&set).expect("serialize test JWKS"))
+    }
+
+    /// Sign a test token with `TEST_EC_PRIVATE_KEY_DER`, tagged with
+    /// [`TEST_KID`] so `verify_jwt`'s `kid`-narrowing path is exercised.
+    fn sign_test_token(claims: &serde_json::Value) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some(TEST_KID.to_string());
+        let encoding_key = jsonwebtoken::EncodingKey::from_ec_der(TEST_EC_PRIVATE_KEY_DER);
+        jsonwebtoken::encode(&header, claims, &encoding_key).expect("sign test token")
+    }
+
+    fn test_cfg(issuer: &str, audiences: &[&str]) -> JwtConfig {
+        JwtConfig::new(
+            Arc::from(issuer),
+            audiences.iter().map(|a| Box::from(*a)).collect(),
+            test_jwks(),
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            None,
+            Arc::from([]),
+            false,
+        )
+    }
+
+    fn claims(issuer: &str, audience: Option<&str>, exp_offset_secs: i64) -> serde_json::Value {
+        let exp = jsonwebtoken::get_current_timestamp() as i64 + exp_offset_secs;
+        let mut obj = serde_json::json!({ "iss": issuer, "exp": exp, "sub": "alice" });
+        if let Some(aud) = audience {
+            obj["aud"] = serde_json::Value::from(aud);
+        }
+        obj
+    }
+
+    #[test]
+    fn valid_token_verifies() {
+        let cfg = test_cfg("https://issuer.example.com", &[]);
+        let token = sign_test_token(&claims("https://issuer.example.com", None, 3600));
+        let jwks_keys = JwksKeyCache::new();
+        match verify_jwt(&jwks_keys, &cfg, &token) {
+            JwtVerifyOutcome::Valid(c) => assert_eq!(c["sub"], "alice"),
+            other => panic!("expected Valid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wrong_issuer_is_invalid() {
+        let cfg = test_cfg("https://issuer.example.com", &[]);
+        let token = sign_test_token(&claims("https://someone-else.example.com", None, 3600));
+        let jwks_keys = JwksKeyCache::new();
+        assert!(matches!(
+            verify_jwt(&jwks_keys, &cfg, &token),
+            JwtVerifyOutcome::Invalid
+        ));
+    }
+
+    #[test]
+    fn oct_key_in_jwks_is_never_used_for_verification() {
+        // The classic RS/ES→HS "algorithm confusion" attack, cast as: even a
+        // JWKS entry that legitimately declares itself a symmetric `oct` key
+        // (e.g. an operator or upstream IdP mistake — `JwtAuth` is documented
+        // JWKS-only/asymmetric) must never be used to verify a token, however
+        // the attacker obtained a token HMAC-signed with its `k` value.
+        let secret = b"attacker-known-or-guessed-hmac-secret";
+        let jwk = jsonwebtoken::jwk::Jwk {
+            common: jsonwebtoken::jwk::CommonParameters {
+                key_id: Some(TEST_KID.to_string()),
+                // Declares `alg: "HS256"` — without the `oct`-rejection guard
+                // this is exactly what lets the candidate loop pick an
+                // algorithm and proceed to `DecodingKey::from_jwk`.
+                key_algorithm: Some(jsonwebtoken::jwk::KeyAlgorithm::HS256),
+                ..Default::default()
+            },
+            algorithm: jsonwebtoken::jwk::AlgorithmParameters::OctetKey(
+                jsonwebtoken::jwk::OctetKeyParameters {
+                    key_type: jsonwebtoken::jwk::OctetKeyType::Octet,
+                    value: base64::engine::Engine::encode(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+                        secret,
+                    ),
+                },
+            ),
+        };
+        let set = jsonwebtoken::jwk::JwkSet { keys: vec![jwk] };
+        let jwks_text: Arc<str> =
+            Arc::from(serde_json::to_string(&set).expect("serialize test JWKS"));
+        let cfg = JwtConfig::new(
+            Arc::from("https://issuer.example.com"),
+            Arc::from([]),
+            jwks_text,
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            None,
+            Arc::from([]),
+            false,
+        );
+
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        header.kid = Some(TEST_KID.to_string());
+        let encoding_key = jsonwebtoken::EncodingKey::from_secret(secret);
+        let token = jsonwebtoken::encode(
+            &header,
+            &claims("https://issuer.example.com", None, 3600),
+            &encoding_key,
+        )
+        .expect("sign HS256 token");
+
+        let jwks_keys = JwksKeyCache::new();
+        assert!(matches!(
+            verify_jwt(&jwks_keys, &cfg, &token),
+            JwtVerifyOutcome::Invalid
+        ));
+    }
+
+    #[test]
+    fn missing_iss_claim_is_invalid_even_with_valid_signature() {
+        // A validly-signed token that simply omits `iss` must not bypass the
+        // issuer restriction — jsonwebtoken only checks `iss` when present,
+        // so this only fails if `iss` is in `required_spec_claims`.
+        let cfg = test_cfg("https://issuer.example.com", &[]);
+        let exp = jsonwebtoken::get_current_timestamp() as i64 + 3600;
+        let claims = serde_json::json!({ "exp": exp, "sub": "alice" });
+        let token = sign_test_token(&claims);
+        let jwks_keys = JwksKeyCache::new();
+        assert!(matches!(
+            verify_jwt(&jwks_keys, &cfg, &token),
+            JwtVerifyOutcome::Invalid
+        ));
+    }
+
+    #[test]
+    fn missing_aud_claim_is_invalid_when_audiences_configured() {
+        let cfg = test_cfg("https://issuer.example.com", &["my-api"]);
+        let token = sign_test_token(&claims("https://issuer.example.com", None, 3600));
+        let jwks_keys = JwksKeyCache::new();
+        assert!(matches!(
+            verify_jwt(&jwks_keys, &cfg, &token),
+            JwtVerifyOutcome::Invalid
+        ));
+    }
+
+    #[test]
+    fn expired_token_is_invalid() {
+        let cfg = test_cfg("https://issuer.example.com", &[]);
+        let token = sign_test_token(&claims("https://issuer.example.com", None, -3600));
+        let jwks_keys = JwksKeyCache::new();
+        assert!(matches!(
+            verify_jwt(&jwks_keys, &cfg, &token),
+            JwtVerifyOutcome::Invalid
+        ));
+    }
+
+    #[test]
+    fn wrong_audience_is_invalid_when_configured() {
+        let cfg = test_cfg("https://issuer.example.com", &["my-api"]);
+        let token = sign_test_token(&claims(
+            "https://issuer.example.com",
+            Some("someone-elses-api"),
+            3600,
+        ));
+        let jwks_keys = JwksKeyCache::new();
+        assert!(matches!(
+            verify_jwt(&jwks_keys, &cfg, &token),
+            JwtVerifyOutcome::Invalid
+        ));
+    }
+
+    #[test]
+    fn matching_audience_verifies_when_configured() {
+        let cfg = test_cfg("https://issuer.example.com", &["my-api"]);
+        let token = sign_test_token(&claims("https://issuer.example.com", Some("my-api"), 3600));
+        let jwks_keys = JwksKeyCache::new();
+        assert!(matches!(
+            verify_jwt(&jwks_keys, &cfg, &token),
+            JwtVerifyOutcome::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn absent_audience_check_ignores_token_aud() {
+        // `cfg.audiences` empty → aud is never checked, even if the token
+        // carries one that doesn't match anything configured.
+        let cfg = test_cfg("https://issuer.example.com", &[]);
+        let token = sign_test_token(&claims(
+            "https://issuer.example.com",
+            Some("whatever"),
+            3600,
+        ));
+        let jwks_keys = JwksKeyCache::new();
+        assert!(matches!(
+            verify_jwt(&jwks_keys, &cfg, &token),
+            JwtVerifyOutcome::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn tampered_signature_is_invalid() {
+        let cfg = test_cfg("https://issuer.example.com", &[]);
+        let mut token = sign_test_token(&claims("https://issuer.example.com", None, 3600));
+        // Flip the last character of the signature segment.
+        let last = token.pop().expect("token has a signature segment");
+        token.push(if last == 'A' { 'B' } else { 'A' });
+        let jwks_keys = JwksKeyCache::new();
+        assert!(matches!(
+            verify_jwt(&jwks_keys, &cfg, &token),
+            JwtVerifyOutcome::Invalid
+        ));
+    }
+
+    #[test]
+    fn malformed_token_is_invalid() {
+        let cfg = test_cfg("https://issuer.example.com", &[]);
+        let jwks_keys = JwksKeyCache::new();
+        assert!(matches!(
+            verify_jwt(&jwks_keys, &cfg, "not-a-jwt"),
+            JwtVerifyOutcome::Invalid
+        ));
+    }
+
+    #[test]
+    fn empty_jwks_is_unavailable() {
+        let cfg = JwtConfig::new(
+            Arc::from("https://issuer.example.com"),
+            Arc::from([]),
+            Arc::from(r#"{"keys":[]}"#),
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            None,
+            Arc::from([]),
+            false,
+        );
+        let token = sign_test_token(&claims("https://issuer.example.com", None, 3600));
+        let jwks_keys = JwksKeyCache::new();
+        assert!(matches!(
+            verify_jwt(&jwks_keys, &cfg, &token),
+            JwtVerifyOutcome::JwksUnavailable
+        ));
+    }
+
+    #[test]
+    fn unparseable_jwks_is_unavailable() {
+        let cfg = JwtConfig::new(
+            Arc::from("https://issuer.example.com"),
+            Arc::from([]),
+            Arc::from("not json"),
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            None,
+            Arc::from([]),
+            false,
+        );
+        let token = sign_test_token(&claims("https://issuer.example.com", None, 3600));
+        let jwks_keys = JwksKeyCache::new();
+        assert!(matches!(
+            verify_jwt(&jwks_keys, &cfg, &token),
+            JwtVerifyOutcome::JwksUnavailable
+        ));
+    }
+
+    #[test]
+    fn jwks_key_cache_reuses_parsed_entry_for_identical_content() {
+        let jwks = test_jwks();
+        let cache = JwksKeyCache::new();
+        let first = cache.get_or_parse(&jwks).expect("parse succeeds");
+        let second = cache.get_or_parse(&jwks).expect("parse succeeds");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "second lookup must reuse the cached parse, not re-parse"
+        );
+    }
+
+    // ── apply_verified_claims ────────────────────────────────────────────────
+
+    #[test]
+    fn claim_to_headers_copies_matching_scalar_claims() {
+        let cfg = JwtConfig::new(
+            Arc::from("https://issuer.example.com"),
+            Arc::from([]),
+            Arc::from(r#"{"keys":[]}"#),
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            None,
+            Arc::from([
+                (Box::from("sub"), Box::from("x-user-id")),
+                (Box::from("missing"), Box::from("x-missing")),
+            ]),
+            false,
+        );
+        let claims = serde_json::json!({ "sub": "alice", "roles": ["a", "b"] });
+        let mut out = None;
+        apply_verified_claims(&cfg, &claims, &mut out);
+        let headers = out.expect("headers set");
+        assert_eq!(headers.len(), 1, "non-scalar/missing claims are skipped");
+        assert_eq!(&*headers[0].0, "x-user-id");
+        assert_eq!(&*headers[0].1, "alice");
+    }
+
+    #[test]
+    fn forward_payload_header_carries_base64url_claims() {
+        let cfg = JwtConfig::new(
+            Arc::from("https://issuer.example.com"),
+            Arc::from([]),
+            Arc::from(r#"{"keys":[]}"#),
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            Some(Box::from("x-jwt-payload")),
+            Arc::from([]),
+            false,
+        );
+        let claims = serde_json::json!({ "sub": "alice" });
+        let mut out = None;
+        apply_verified_claims(&cfg, &claims, &mut out);
+        let headers = out.expect("headers set");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(&*headers[0].0, "x-jwt-payload");
+        let decoded = base64::engine::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            headers[0].1.as_ref(),
+        )
+        .expect("valid base64url");
+        let round_tripped: serde_json::Value =
+            serde_json::from_slice(&decoded).expect("valid JSON");
+        assert_eq!(round_tripped, claims);
+    }
+
+    #[test]
+    fn no_claim_config_leaves_response_headers_unset() {
+        let cfg = JwtConfig::new(
+            Arc::from("https://issuer.example.com"),
+            Arc::from([]),
+            Arc::from(r#"{"keys":[]}"#),
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            None,
+            Arc::from([]),
+            false,
+        );
+        let claims = serde_json::json!({ "sub": "alice" });
+        let mut out = None;
+        apply_verified_claims(&cfg, &claims, &mut out);
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn apply_verified_claims_appends_to_existing_response_headers() {
+        // The additive auth chain (a Gateway-mandated ext_authz check ahead of
+        // a route-level JwtAuth check, or two JwtAuth-style checks) shares one
+        // `auth_response_headers` slot across every `enforce()` call — a
+        // second populate must APPEND, never clobber the first's headers.
+        let cfg = JwtConfig::new(
+            Arc::from("https://issuer.example.com"),
+            Arc::from([]),
+            Arc::from(r#"{"keys":[]}"#),
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            None,
+            Arc::from([(Box::from("sub"), Box::from("x-user-id"))]),
+            false,
+        );
+        let claims = serde_json::json!({ "sub": "alice" });
+        let mut out = Some(vec![(Box::from("x-from-ext-authz"), Box::from("upstream"))]);
+        apply_verified_claims(&cfg, &claims, &mut out);
+        let headers = out.expect("headers set");
+        assert_eq!(
+            headers.len(),
+            2,
+            "must retain the pre-existing entry and append the new one"
+        );
+        assert_eq!(&*headers[0].0, "x-from-ext-authz");
+        assert_eq!(&*headers[1].0, "x-user-id");
+    }
+
+    #[test]
+    fn strip_header_names_always_covers_claim_to_headers_destinations() {
+        // A claim that's absent or non-scalar makes `apply_verified_claims`
+        // skip its destination header entirely — `strip_header_names` must
+        // list it regardless, so a same-named client-supplied header can
+        // never survive untouched and masquerade as a verified claim.
+        let cfg = JwtConfig::new(
+            Arc::from("https://issuer.example.com"),
+            Arc::from([]),
+            Arc::from(r#"{"keys":[]}"#),
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            None,
+            Arc::from([(Box::from("role"), Box::from("x-user-role"))]),
+            true, // forward_token: true — from_headers must NOT appear in strip
+        );
+        let names = strip_header_names(&cfg);
+        assert_eq!(&*names, [Box::<str>::from("x-user-role")]);
+    }
+
+    #[test]
+    fn strip_header_names_covers_forward_payload_header() {
+        let cfg = JwtConfig::new(
+            Arc::from("https://issuer.example.com"),
+            Arc::from([]),
+            Arc::from(r#"{"keys":[]}"#),
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            Some(Box::from("x-jwt-payload")),
+            Arc::from([]),
+            true,
+        );
+        let names = strip_header_names(&cfg);
+        assert_eq!(&*names, [Box::<str>::from("x-jwt-payload")]);
+    }
+
+    #[test]
+    fn strip_header_names_includes_source_headers_when_not_forwarding_token() {
+        let cfg = JwtConfig::new(
+            Arc::from("https://issuer.example.com"),
+            Arc::from([]),
+            Arc::from(r#"{"keys":[]}"#),
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            None,
+            Arc::from([]),
+            false,
+        );
+        let names = strip_header_names(&cfg);
+        assert_eq!(&*names, [Box::<str>::from("Authorization")]);
+    }
+}
+
 // ── External auth (ext_authz gRPC — Envoy envoy.service.auth.v3, #23) ─────────
 
 /// gRPC ext_authz: speaks the Envoy `Authorization/Check` proto to the resolved
@@ -591,7 +1356,9 @@ mod grpc {
                     }
                 }
                 if !forward.is_empty() {
-                    *auth_response_headers_out = Some(forward);
+                    auth_response_headers_out
+                        .get_or_insert_with(Vec::new)
+                        .extend(forward);
                 }
             }
             return Ok(false);
