@@ -25,6 +25,7 @@ resources:
   - crds/coxswainbackendpolicies.yaml
   - crds/coxswainexternalauths.yaml
   - crds/ratelimits.yaml
+  - crds/retrypolicies.yaml
   - crds/pathrewriteregexes.yaml
   - crds/ipaccesscontrols.yaml
   - crds/basicauths.yaml

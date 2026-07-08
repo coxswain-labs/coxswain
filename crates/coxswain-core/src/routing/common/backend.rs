@@ -9,7 +9,7 @@
 //! the sibling [`super::entry`] module.
 
 use super::filters::FilterAction;
-use super::retry::RetryPolicy;
+use super::retry::RetryPolicyConfig;
 use super::upstream_tls::{BackendProtocol, UpstreamTls};
 use http::HeaderName;
 use std::net::SocketAddr;
@@ -361,9 +361,9 @@ pub struct BackendGroup {
     /// TLS configuration from an attached `BackendTLSPolicy`.
     /// When `Some`, the proxy uses these settings instead of `protocol`-derived defaults.
     tls: Option<Arc<UpstreamTls>>,
-    /// Upstream retry policy from the Ingress `max-retries` / `retry-on` annotations.
-    /// Default (disabled) for Gateway API routes and Ingresses without the annotations.
-    retry: RetryPolicy,
+    /// Upstream retry policy from a `RetryPolicy` `ExtensionRef` (Gateway API) or
+    /// the Ingress `retry-*` annotations. Default (disabled) when neither is present.
+    retry: RetryPolicyConfig,
     /// Per-backend request filters from `HTTPRoute.spec.rules[].backendRefs[].filters`.
     /// Index-aligned with `backends`. `None` for the common case where no backend
     /// declares per-backend filters; when `Some`, each slot is `None` for backends
@@ -454,7 +454,7 @@ impl BackendGroup {
             addrs_snapshot,
             protocol: BackendProtocol::default(),
             tls: None,
-            retry: RetryPolicy::default(),
+            retry: RetryPolicyConfig::default(),
             per_backend_filters: None,
             session_affinity: None,
             affinity_endpoints: None,
@@ -517,7 +517,7 @@ impl BackendGroup {
             addrs_snapshot,
             protocol: BackendProtocol::default(),
             tls: None,
-            retry: RetryPolicy::default(),
+            retry: RetryPolicyConfig::default(),
             per_backend_filters: None,
             session_affinity: None,
             affinity_endpoints: None,
@@ -540,7 +540,7 @@ impl BackendGroup {
             addrs_snapshot: Box::new([]),
             protocol: BackendProtocol::default(),
             tls: None,
-            retry: RetryPolicy::default(),
+            retry: RetryPolicyConfig::default(),
             per_backend_filters: None,
             session_affinity: None,
             affinity_endpoints: None,
@@ -570,11 +570,11 @@ impl BackendGroup {
 
     /// Attach an upstream retry policy (builder-style).
     ///
-    /// Parsed from the Ingress `ingress.coxswain-labs.dev/max-retries` and
-    /// `ingress.coxswain-labs.dev/retry-on` annotations. Gateway API routes and
-    /// Ingresses without the annotations leave this as the default (disabled) policy.
+    /// Resolved from a `RetryPolicy` `ExtensionRef` (Gateway API) or the Ingress
+    /// `retry-*` annotations. Routes with neither leave this as the default
+    /// (disabled) policy.
     #[must_use]
-    pub fn with_retries(mut self, retry: RetryPolicy) -> Self {
+    pub fn with_retries(mut self, retry: RetryPolicyConfig) -> Self {
         self.retry = retry;
         self
     }
@@ -818,11 +818,12 @@ impl BackendGroup {
 
     /// Upstream retry policy for this backend group.
     ///
-    /// Returns the default (disabled) policy for Gateway API routes and
-    /// Ingresses that do not carry the `ingress.coxswain-labs.dev/max-retries` /
-    /// `retry-on` annotations.
-    pub fn retry_policy(&self) -> RetryPolicy {
-        self.retry
+    /// Returns the default (disabled) policy for routes that do not attach a
+    /// `RetryPolicy` `ExtensionRef` (Gateway API) or carry the
+    /// `ingress.coxswain-labs.dev/retry-*` annotations (Ingress). Borrowed rather
+    /// than copied so the two `Arc<[u16]>` code lists stay off the request hot path.
+    pub fn retry_policy(&self) -> &RetryPolicyConfig {
+        &self.retry
     }
 
     /// Upstream keepalive idle timeout from the

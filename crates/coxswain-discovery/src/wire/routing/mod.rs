@@ -418,6 +418,36 @@ mod tests {
     }
 
     #[test]
+    fn retry_policy_round_trips() {
+        use coxswain_core::routing::RetryPolicyConfig;
+        let retry = RetryPolicyConfig::for_grpc(
+            2,
+            Some(std::time::Duration::from_millis(100)),
+            Some(vec![503, 500]),
+            Some(vec![14]),
+        );
+        let bg = Arc::new(
+            BackendGroup::new("ns/svc".to_string(), vec![addr("10.0.0.1:80")]).with_retries(retry),
+        );
+        let entry = Arc::new(simple_entry(bg));
+
+        let mut b = IngressRoutingTableBuilder::new();
+        b.for_port(80)
+            .exact_host("example.com")
+            .add_exact_route("/", entry);
+        let table = rt_ingress(b);
+
+        let group = table
+            .route(80, "example.com", "/", &ctx())
+            .expect("route present after round-trip");
+        let p = group.retry_policy();
+        assert_eq!(p.attempts, 2);
+        assert_eq!(p.backoff, Some(std::time::Duration::from_millis(100)));
+        assert_eq!(&*p.http_codes, &[500, 503]);
+        assert_eq!(&*p.grpc_codes, &[14]);
+    }
+
+    #[test]
     fn zero_rps_from_wire_returns_error() {
         let rl_dto = p::RateLimitConfig {
             requests_per_second: 0, // invalid

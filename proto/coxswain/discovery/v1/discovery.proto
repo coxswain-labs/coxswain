@@ -337,12 +337,17 @@ message UpstreamTls {
   repeated SubjectAltName subject_alt_names = 8;
 }
 
-// Mirrors RetryPolicy.
+// Mirrors RetryPolicyConfig (GEP-1731-shaped: attempts / backoff / codes).
+// Reshaped in v0.5: connection/timeout retries are implicit when attempts>=1;
+// http_codes/grpc_codes replace the old on_* condition bits.
 message RetryPolicy {
-  uint32 max_retries = 1;
-  bool on_connect_failure = 2;
-  bool on_timeout = 3;
-  bool on_http_5xx = 4;
+  uint32 attempts = 1;
+  // Minimum delay before a retried attempt, in milliseconds. 0 = no backoff.
+  uint32 backoff_ms = 2;
+  // HTTP response status codes that trigger a retry.
+  repeated uint32 http_codes = 3;
+  // grpc-status codes that trigger a retry on a trailers-only gRPC response.
+  repeated uint32 grpc_codes = 4;
 }
 
 // Mirrors LoadBalance + HashSource.
