@@ -510,23 +510,6 @@ impl RouteEntry {
         self
     }
 
-    /// Set a single authentication check for this route (builder-style).
-    ///
-    /// `None` (the default) disables authentication; `Some(cfg)` installs a
-    /// one-element [`auth`](Self::auth) chain. Used by the Ingress reconciler
-    /// and the route-level `CoxswainExternalAuth` `extensionRef`, which each
-    /// contribute at most one check. Callers needing an additive multi-check
-    /// chain (a Gateway-attached policy plus a route check) use
-    /// [`with_auth_chain`](Self::with_auth_chain).
-    #[must_use]
-    pub fn with_auth(mut self, auth: Option<Arc<IngressAuthConfig>>) -> Self {
-        self.auth = match auth {
-            Some(a) => Arc::from([a]),
-            None => empty_auth_chain(),
-        };
-        self
-    }
-
     /// Set the full additive authentication chain for this route (builder-style).
     ///
     /// Every check runs in order; the first hard-deny wins (#23). An empty

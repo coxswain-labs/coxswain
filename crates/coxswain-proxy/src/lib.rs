@@ -35,6 +35,7 @@ pub use edge::tls::SniCertSelector;
 pub use edge::upstream_ca::UpstreamCaCache;
 pub use gateway::{GatewayEngine, GatewayProxy};
 pub use ingress::{IngressEngine, IngressProxy};
+pub use policy::auth::JwksKeyCache;
 pub use policy::grpc_channel::GrpcAuthChannelCache;
 pub use policy::rate_limit::RateLimiterRegistry;
 pub use routing::engine::RoutingEngine;

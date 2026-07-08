@@ -259,6 +259,90 @@ mod tests {
         );
     }
 
+    // ── JWT auth (#441) ────────────────────────────────────────────────────────
+
+    /// A route whose auth chain carries a resolved `JwtAuth` check must survive
+    /// the wire round-trip with every field intact: issuer, audiences, the
+    /// resolved JWKS text, header-extraction locations, the payload-forwarding
+    /// header, claim-to-header pairs, and the forward-token flag.
+    #[test]
+    fn jwt_auth_config_round_trips() {
+        use coxswain_core::routing::{IngressAuthConfig, JwtConfig, JwtHeaderLoc};
+
+        let auth = Arc::new(IngressAuthConfig::Jwt(JwtConfig::new(
+            Arc::from("https://issuer.example.com"),
+            Arc::from([Box::from("my-api"), Box::from("my-other-api")]),
+            Arc::from(r#"{"keys":[{"kty":"RSA","kid":"1"}]}"#),
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            Some(Box::from("x-jwt-payload")),
+            Arc::from([(Box::from("sub"), Box::from("x-user-id"))]),
+            true,
+        )));
+        let bg = simple_bg("ns/svc", &[addr("10.0.0.1:8080")]);
+        let entry = Arc::new(simple_entry(bg).with_auth_chain(Arc::from([auth])));
+
+        let mut b = IngressRoutingTableBuilder::new();
+        b.for_port(80)
+            .exact_host("example.com")
+            .add_exact_route("/", entry);
+
+        let rt = rt_ingress(b);
+        let RouteOutcome::Found(m) = rt.find(80, "example.com", "/", &ctx()) else {
+            panic!("JWT-auth route must survive the wire round-trip");
+        };
+        assert_eq!(m.auth.len(), 1, "auth chain must carry exactly one entry");
+        let IngressAuthConfig::Jwt(jwt) = m.auth[0].as_ref() else {
+            panic!("expected IngressAuthConfig::Jwt, got {:?}", m.auth[0]);
+        };
+        assert_eq!(&*jwt.issuer, "https://issuer.example.com");
+        assert_eq!(jwt.audiences.len(), 2);
+        assert_eq!(&*jwt.audiences[0], "my-api");
+        assert_eq!(&*jwt.jwks, r#"{"keys":[{"kty":"RSA","kid":"1"}]}"#);
+        assert_eq!(jwt.from_headers.len(), 1);
+        assert_eq!(&*jwt.from_headers[0].name, "Authorization");
+        assert_eq!(&*jwt.from_headers[0].value_prefix, "Bearer ");
+        assert_eq!(jwt.forward_payload_header.as_deref(), Some("x-jwt-payload"));
+        assert_eq!(jwt.claim_to_headers.len(), 1);
+        assert_eq!(&*jwt.claim_to_headers[0].0, "sub");
+        assert_eq!(&*jwt.claim_to_headers[0].1, "x-user-id");
+        assert!(jwt.forward_token);
+    }
+
+    /// An unresolved JWKS (empty `jwks` string — the controller hasn't fetched
+    /// the remote `jwksUri` yet) must decode to `Unavailable` (fail-closed),
+    /// never a `Jwt` config with an empty key set.
+    #[test]
+    fn jwt_auth_config_with_empty_jwks_decodes_unavailable() {
+        use coxswain_core::routing::{IngressAuthConfig, JwtConfig, JwtHeaderLoc};
+
+        let auth = Arc::new(IngressAuthConfig::Jwt(JwtConfig::new(
+            Arc::from("https://issuer.example.com"),
+            Arc::from([]),
+            Arc::from(""),
+            Arc::from([JwtHeaderLoc::new("Authorization", "Bearer ")]),
+            None,
+            Arc::from([]),
+            false,
+        )));
+        let bg = simple_bg("ns/svc", &[addr("10.0.0.1:8080")]);
+        let entry = Arc::new(simple_entry(bg).with_auth_chain(Arc::from([auth])));
+
+        let mut b = IngressRoutingTableBuilder::new();
+        b.for_port(80)
+            .exact_host("example.com")
+            .add_exact_route("/", entry);
+
+        let rt = rt_ingress(b);
+        let RouteOutcome::Found(m) = rt.find(80, "example.com", "/", &ctx()) else {
+            panic!("route must survive the wire round-trip even with an unresolved JWKS");
+        };
+        assert!(
+            matches!(m.auth[0].as_ref(), IngressAuthConfig::Unavailable),
+            "empty JWKS must decode to Unavailable (fail-closed), got {:?}",
+            m.auth[0]
+        );
+    }
+
     // ── 2. Ingress prefix routes ──────────────────────────────────────────────
 
     #[test]

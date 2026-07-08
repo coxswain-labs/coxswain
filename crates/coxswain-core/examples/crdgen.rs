@@ -71,6 +71,12 @@
 //!     > deploy/manifests/crds/retrypolicies.yaml
 //! cp deploy/manifests/crds/retrypolicies.yaml \
 //!     charts/coxswain/crds/retrypolicies.yaml
+//!
+//! # JwtAuth
+//! cargo run -p coxswain-core --example crdgen -- JwtAuth \
+//!     > deploy/manifests/crds/jwtauths.yaml
+//! cp deploy/manifests/crds/jwtauths.yaml \
+//!     charts/coxswain/crds/jwtauths.yaml
 //! ```
 //!
 //! The snapshot tests in `coxswain-core` fail on drift between this generator
@@ -78,8 +84,8 @@
 
 use coxswain_core::crd::{
     BasicAuth, ClientTrafficPolicy, Compression, CoxswainBackendPolicy, CoxswainExternalAuth,
-    CoxswainGatewayParameters, CoxswainIngressClassParameters, IpAccessControl, PathRewriteRegex,
-    RateLimit, RequestSizeLimit, RetryPolicy,
+    CoxswainGatewayParameters, CoxswainIngressClassParameters, IpAccessControl, JwtAuth,
+    PathRewriteRegex, RateLimit, RequestSizeLimit, RetryPolicy,
 };
 use kube::CustomResourceExt;
 
@@ -105,6 +111,7 @@ fn main() -> Result<(), serde_yaml::Error> {
         "RequestSizeLimit" => serde_yaml::to_writer(std::io::stdout(), &RequestSizeLimit::crd()),
         "Compression" => serde_yaml::to_writer(std::io::stdout(), &Compression::crd()),
         "RetryPolicy" => serde_yaml::to_writer(std::io::stdout(), &RetryPolicy::crd()),
+        "JwtAuth" => serde_yaml::to_writer(std::io::stdout(), &JwtAuth::crd()),
         // No arg or "GatewayParameters" → gateway (backward-compatible default).
         _ => serde_yaml::to_writer(std::io::stdout(), &CoxswainGatewayParameters::crd()),
     }

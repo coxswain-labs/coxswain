@@ -20,8 +20,8 @@ use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
 use crate::status::{GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerStatusKey};
 use coxswain_core::crd::{
-    BasicAuth, Compression, CoxswainExternalAuth, IpAccessControl, PathRewriteRegex, RateLimit,
-    RequestSizeLimit, RetryPolicy,
+    BasicAuth, Compression, CoxswainExternalAuth, IpAccessControl, JwtAuth, PathRewriteRegex,
+    RateLimit, RequestSizeLimit, RetryPolicy,
 };
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
@@ -86,6 +86,13 @@ pub struct RouteResolution<'a> {
     /// the mandate **prepended** to every rule's auth chain — additive precedence:
     /// a route filter can add checks but cannot remove the Gateway-level one.
     pub external_auth_gateway_index: &'a super::ExternalAuthGatewayIndex,
+    /// `JwtAuth` CR store for resolving `ExtensionRef` filters on `HTTPRouteRule`s
+    /// into per-route JWT (JWKS bearer-token) validation config (#441).
+    pub jwt_auths: &'a reflector::Store<JwtAuth>,
+    /// Controller-fetched remote-JWKS cache, read synchronously when resolving a
+    /// `JwtAuth` CR that names a `jwks.remote` (#441). Never populated by the
+    /// proxy — see [`crate::jwks`].
+    pub jwks_cache: &'a crate::jwks::SharedJwksCache,
     /// Label-scoped htpasswd Secrets (`ingress.coxswain-labs.dev/auth-basic=true`)
     /// consumed by a resolved `BasicAuth` CR's `secretRef` (#442). The same store
     /// the Ingress `auth-basic-secret` annotation reads — no duplicate watcher.
@@ -147,6 +154,8 @@ impl GatewayApiReconciler {
             basic_auths,
             external_auths,
             external_auth_gateway_index,
+            jwt_auths,
+            jwks_cache,
             auth_secrets,
             basic_auth_secret_grants,
             request_size_limits,
@@ -440,14 +449,17 @@ impl GatewayApiReconciler {
                 slices,
                 grants,
             );
-            // Additive chain (#23): Gateway-attached mandate(s) first, then the
-            // route-level BasicAuth and ExternalAuth `ExtensionRef`s. Every check
-            // runs in order and the first hard-deny wins at the proxy — a route
-            // cannot weaken a Gateway-level auth mandate (GEP-713 override posture).
+            let jwt_auth =
+                super::filters::resolve_jwt_auth(rule_filters, route_ns, jwt_auths, jwks_cache);
+            // Additive chain (#23, #441): Gateway-attached mandate(s) first, then
+            // the route-level BasicAuth, ExternalAuth, and JwtAuth `ExtensionRef`s.
+            // Every check runs in order and the first hard-deny wins at the proxy —
+            // a route cannot weaken a Gateway-level auth mandate (GEP-713 override
+            // posture).
             let auth: Arc<[Arc<IngressAuthConfig>]> = gateway_auths
                 .iter()
                 .cloned()
-                .chain([basic_auth, ext_auth].into_iter().flatten())
+                .chain([basic_auth, ext_auth, jwt_auth].into_iter().flatten())
                 .collect();
             let max_body_size = super::filters::resolve_request_size_limit(
                 rule_filters,
@@ -1307,6 +1319,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1355,6 +1369,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1403,6 +1419,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1443,6 +1461,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1482,6 +1502,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1560,6 +1582,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1614,6 +1638,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1693,6 +1719,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1783,6 +1811,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1848,6 +1878,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1946,6 +1978,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -2001,6 +2035,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -2048,6 +2084,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -2097,6 +2135,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -2138,6 +2178,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -2202,6 +2244,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -2271,6 +2315,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),

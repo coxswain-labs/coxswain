@@ -548,6 +548,29 @@ fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfig {
                     .collect(),
             })
         }
+        IngressAuthConfig::Jwt(jwt) => p::ingress_auth_config::Auth::Jwt(p::JwtAuthConfig {
+            issuer: jwt.issuer.to_string(),
+            audiences: jwt.audiences.iter().map(|s| s.to_string()).collect(),
+            jwks: jwt.jwks.to_string(),
+            from_headers: jwt
+                .from_headers
+                .iter()
+                .map(|h| p::JwtHeaderLocation {
+                    name: h.name.to_string(),
+                    value_prefix: h.value_prefix.to_string(),
+                })
+                .collect(),
+            forward_payload_header: jwt.forward_payload_header.as_ref().map(|s| s.to_string()),
+            claim_to_headers: jwt
+                .claim_to_headers
+                .iter()
+                .map(|(claim, header)| p::ClaimToHeader {
+                    claim: claim.to_string(),
+                    header: header.to_string(),
+                })
+                .collect(),
+            forward_token: jwt.forward_token,
+        }),
         IngressAuthConfig::Unavailable => {
             p::ingress_auth_config::Auth::Unavailable(true)
         }

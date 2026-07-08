@@ -5,6 +5,7 @@
 //! independent of the bin crate so the proxy crate remains self-contained.
 
 use crate::edge::upstream_ca::{BackendClientCertCache, SanCheckHookCache, UpstreamCaCache};
+use crate::policy::auth::JwksKeyCache;
 use crate::policy::circuit_breaker::CircuitBreakerRegistry;
 use crate::policy::grpc_channel::GrpcAuthChannelCache;
 use crate::policy::rate_limit::RateLimiterRegistry;
@@ -49,6 +50,8 @@ pub struct SharedProxyConfig {
     /// Pooled tonic channels for the gRPC ext_authz transport (#544) — the
     /// gRPC-transport peer of [`Self::auth_client`]'s HTTP connection pool.
     pub grpc_auth_channels: GrpcAuthChannelCache,
+    /// Parse cache for resolved JWKS text → decoded key sets (#441).
+    pub jwks_keys: JwksKeyCache,
     /// Per-Ingress client-certificate mTLS config store (#267).
     ///
     /// Looked up per-host in `request_filter` to enforce the mTLS handshake
@@ -111,6 +114,7 @@ impl SharedProxyConfig {
             rate_limiter,
             auth_client,
             grpc_auth_channels: GrpcAuthChannelCache::new(),
+            jwks_keys: JwksKeyCache::new(),
             client_certs: SharedClientCertStore::new(),
             listener_hostnames: SharedListenerHostnames::new(),
             advertised_ports: Shared::new(),

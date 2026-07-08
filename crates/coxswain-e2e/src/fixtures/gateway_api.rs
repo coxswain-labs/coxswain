@@ -217,6 +217,12 @@ pub const GRPC_IP_ACCESS_RESTRICTED: &str = fixture!("grpc_ip_access_restricted.
 /// Gateway + GRPCRoute + `RateLimit` (rps=1) via `ExtensionRef` (#25 gRPC
 /// parity). The first call is served; rapid follow-ups are rejected.
 pub const GRPC_RATE_LIMIT: &str = fixture!("grpc_rate_limit.yaml");
+/// Gateway + GRPCRoute + `JwtAuth` (inline JWKS, ES256 test key) via
+/// `ExtensionRef` (#441 gRPC parity). A valid bearer token in the
+/// "authorization" gRPC metadata key admits the call; missing/invalid tokens
+/// are rejected (401 → gRPC `Unauthenticated`). Sign matching tokens via
+/// [`crate::jwt`].
+pub const GRPC_JWT_AUTH: &str = fixture!("grpc_jwt_auth.yaml");
 /// Gateway + `RetryPolicy` CR (attempts=2, codes=[503], backoff=200ms) + HTTPRoute
 /// `ExtensionRef` (#445 HTTP happy path). Routes to go-httpbin `/status/503`; the
 /// proxy fires two retries (observable via the retry metric) with backoff before the
@@ -238,6 +244,12 @@ pub const RETRY_GRPC_NON_RETRIABLE: &str = fixture!("retry_grpc_non_retriable.ya
 /// HTTPRoute with `ExtensionRef` (#442). Valid `Authorization: Basic`
 /// credentials are admitted; missing/invalid credentials get 401.
 pub const BASIC_AUTH_EXTENSIONREF: &str = fixture!("basic_auth_extensionref.yaml");
+/// Gateway + `JwtAuth` (inline JWKS, ES256 test key) + HTTPRoute with an
+/// `ExtensionRef` filter (#441). A valid, signed, unexpired, correct-issuer
+/// bearer token is admitted (verified `sub` claim forwarded as `x-user-id`);
+/// missing/invalid/expired/wrong-issuer tokens get 401. Sign matching tokens
+/// via [`crate::jwt`].
+pub const JWT_AUTH_EXTENSIONREF: &str = fixture!("jwt_auth_extensionref.yaml");
 /// Gateway + `CoxswainExternalAuth` (HTTP, auth-allow:4000) + HTTPRoute with an
 /// `ExtensionRef` filter (#23 happy path). The ext_authz check allows → echo-a.
 pub const EXTERNAL_AUTH_ROUTE_ALLOW: &str = fixture!("external_auth_route_allow.yaml");

@@ -203,6 +203,11 @@ pub const ANNOTATION_AUTH_BASIC: &str = fixture!("annotation_auth_basic.yaml");
 /// Ingress with `auth-basic-secret` pointing at the UNLABELED Secret (#24 fail-closed).
 /// Used to verify the proxy returns 503 when the Secret is not opt-in labeled.
 pub const ANNOTATION_AUTH_BASIC_UNLABELED: &str = fixture!("annotation_auth_basic_unlabeled.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/auth-jwt` naming a `JwtAuth` CR
+/// (inline JWKS, ES256 test key) — Ingress parity with
+/// `gateway_api::JWT_AUTH_EXTENSIONREF` (#441). Sign matching tokens via
+/// [`crate::jwt`].
+pub const ANNOTATION_AUTH_JWT: &str = fixture!("annotation_auth_jwt.yaml");
 /// Per-class annotation defaults via `IngressClass.spec.parameters` (#190): a
 /// `CoxswainIngressClassParameters` CR sets a default `rewrite-target`, one
 /// Ingress inherits it and a second overrides it per-key. The IngressClass is

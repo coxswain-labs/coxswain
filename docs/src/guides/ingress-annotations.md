@@ -51,6 +51,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/ext-auth-response-headers` | csv | _none_ | `"X-Auth-User"` |
 | `ingress.coxswain-labs.dev/ext-auth-always-set-cookie` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/auth-basic-secret` | `namespace/name` | _none_ | `"my-ns/my-htpasswd"` |
+| `ingress.coxswain-labs.dev/auth-jwt` | `namespace/name` | _none_ | `"my-ns/my-jwt"` |
 | `ingress.coxswain-labs.dev/compression-gzip` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/compression-brotli` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/compression-level` | integer 1–9 | `6` | `"5"` |
@@ -830,6 +831,51 @@ Requests without credentials receive **401** with a `WWW-Authenticate: Basic rea
     Always generate credentials with `htpasswd -B` (bcrypt). Avoid `htpasswd -s` (`{SHA}`) — SHA1 is unsalted and can be cracked offline in seconds with commodity hardware.
 
     Credential hashes are zeroed from memory when the credential list is replaced at reconcile time (`zeroize`). The Helm chart already ships `seccompProfile: RuntimeDefault`, `readOnlyRootFilesystem: true`, and `capabilities.drop: ALL` by default. For the remaining defense-in-depth, configure nodes with `vm.swappiness=0` so hashes can't be paged to disk — this is a node-level kernel parameter that Kubernetes cannot enforce per-pod.
+
+### `auth-jwt`
+
+Enables **JWT (JWKS bearer-token) validation** — the Ingress surface for the [`JwtAuth` CRD](gateway-api.md#jwt-authentication), same idiom as `auth-basic-secret`. Value is `namespace/name` of a `JwtAuth` resource; both surfaces resolve the same CR to the same runtime config, so one `JwtAuth` can back an Ingress and an HTTPRoute identically.
+
+```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: JwtAuth
+metadata:
+  name: my-jwt
+  namespace: my-app
+spec:
+  issuer: https://issuer.example.com
+  audiences:
+    - my-api
+  jwks:
+    remote:
+      uri: https://issuer.example.com/.well-known/jwks.json
+  claimToHeaders:
+    - claim: sub
+      header: x-user-id
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  namespace: my-app
+  annotations:
+    ingress.coxswain-labs.dev/auth-jwt: "my-app/my-jwt"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-api
+                port:
+                  number: 8080
+```
+
+A valid, signed, unexpired, correct-issuer bearer token is admitted; the verified `sub` claim is forwarded as `x-user-id`. A missing/invalid/expired/wrong-issuer/wrong-audience token receives **401** with `WWW-Authenticate: Bearer`. A missing `JwtAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`auth-url`: an operator who set `auth-jwt` intends the route to require a bearer token, so a stale or typo'd reference must not silently disable authentication. An unresolved JWKS also fails **closed** (**503**). See the [`JwtAuth` CRD reference](gateway-api.md#jwt-authentication) for the full spec (remote vs. inline JWKS, `fromHeaders`, `forwardPayloadHeader`, `forward`).
 
 ## Client certificate mTLS
 

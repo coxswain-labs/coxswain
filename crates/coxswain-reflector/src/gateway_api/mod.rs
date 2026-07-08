@@ -12,6 +12,7 @@ pub(crate) mod frontend_tls;
 mod grpc_reconcile;
 mod grpc_status;
 mod hostnames;
+pub(crate) mod jwt_auth;
 mod reconcile;
 mod reconcile_tls;
 mod route_status;
@@ -35,7 +36,7 @@ pub(crate) use route_status::RouteLike;
 
 /// API group for the coxswain-proprietary `ExtensionRef` CRDs (`RateLimit`,
 /// `IpAccessControl`, `BasicAuth`, `RequestSizeLimit`, `Compression`,
-/// `PathRewriteRegex`). Single source of truth for the `ExtensionRef.group`
+/// `PathRewriteRegex`, `JwtAuth`). Single source of truth for the `ExtensionRef.group`
 /// dispatch — a stray literal that misspells this silently disables a filter.
 /// `pub(crate)` so [`crate::reference_grants`] (BasicAuth secret grants, same
 /// group) shares this one definition rather than keeping its own copy.

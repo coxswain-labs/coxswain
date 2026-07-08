@@ -261,7 +261,7 @@ pub(super) fn build_filters(
                     (
                         super::COXSWAIN_GROUP,
                         "RateLimit" | "IpAccessControl" | "BasicAuth" | "RequestSizeLimit"
-                        | "Compression" | "ExternalAuth" | "RetryPolicy",
+                        | "Compression" | "ExternalAuth" | "RetryPolicy" | "JwtAuth",
                     ) => {}
                     _ => tracing::warn!(
                         group = %ext.group,
@@ -977,6 +977,41 @@ pub(super) fn resolve_external_auth<F: ExtRefFilter>(
     })
 }
 
+/// Resolve the first `JwtAuth` `ExtensionRef` on the rule into an
+/// [`IngressAuthConfig`] (#441).
+///
+/// Returns `None` when no `JwtAuth` ref is present (no JWT auth on the route)
+/// or the referenced CR is missing (fail-open — matches the other
+/// `ExtensionRef` resolvers). A present-but-unresolved JWKS (broken
+/// `jwksUri`, or neither `remote`/`inline` set) fails **closed** via
+/// [`IngressAuthConfig::Unavailable`], resolved in
+/// [`super::jwt_auth::resolve_spec`].
+pub(super) fn resolve_jwt_auth<F: ExtRefFilter>(
+    filters: &[F],
+    route_ns: &str,
+    jwt_auths: &reflector::Store<coxswain_core::crd::JwtAuth>,
+    jwks_cache: &crate::jwks::SharedJwksCache,
+) -> Option<Arc<IngressAuthConfig>> {
+    ext_refs(filters).find_map(|(g, k, n)| {
+        if g != super::COXSWAIN_GROUP || k != "JwtAuth" {
+            return None;
+        }
+        let obj_ref = reflector::ObjectRef::<coxswain_core::crd::JwtAuth>::new(n).within(route_ns);
+        let Some(cr) = jwt_auths.get(&obj_ref) else {
+            tracing::warn!(
+                ns = route_ns,
+                name = n,
+                "JwtAuth CR not found — JWT auth skipped (fail-open)"
+            );
+            return None;
+        };
+        let route_id = format!("{route_ns}/{n}");
+        Some(Arc::new(super::jwt_auth::resolve_spec(
+            &cr.spec, jwks_cache, &route_id,
+        )))
+    })
+}
+
 /// Resolve a single `ExtensionRef` (by `group`/`kind`/`name`) into an
 /// [`IngressAuthConfig`], if it targets a `BasicAuth` CR.
 ///
@@ -1322,6 +1357,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1383,6 +1420,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1442,6 +1481,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1507,6 +1548,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -1579,6 +1622,8 @@ mod tests {
                 basic_auths: &empty_basic_auth_store(),
                 external_auths: &empty_external_auth_store(),
                 external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
                 basic_auth_secret_grants: &std::collections::HashSet::new(),
                 request_size_limits: &empty_request_size_limit_store(),
@@ -2154,5 +2199,63 @@ mod tests {
         // A route with an unrelated ExtensionRef (or none) gets the disabled default.
         let p = resolve_retry_policy(&[ip_access_ext_ref("x")], "default", &store, false);
         assert!(p.is_disabled());
+    }
+
+    // ── JwtAuth (#441) ───────────────────────────────────────────────────────────
+
+    fn jwt_auth_ext_ref(name: &str) -> HttpRouteRulesFilters {
+        HttpRouteRulesFilters {
+            r#type: HttpRouteRulesFiltersType::ExtensionRef,
+            extension_ref: Some(HttpRouteRulesFiltersExtensionRef {
+                group: "gateway.coxswain-labs.dev".to_string(),
+                kind: "JwtAuth".to_string(),
+                name: name.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    // `JwtAuthSpec` is `#[non_exhaustive]` — deserialize a CR instead.
+    fn jwt_auth_cr(ns: &str, name: &str) -> coxswain_core::crd::JwtAuth {
+        let yaml = format!(
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: JwtAuth\n\
+             metadata:\n  name: {name}\n  namespace: {ns}\n\
+             spec:\n  issuer: https://issuer.example.com\n  jwks:\n    inline:\n      jwks:\n        keys: []\n",
+        );
+        serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("valid JwtAuth: {e}\n{yaml}"))
+    }
+
+    #[test]
+    fn resolve_jwt_auth_no_ext_ref_is_none() {
+        let jwt_auths = empty_jwt_auth_store();
+        let cache = empty_jwks_cache();
+        assert!(
+            resolve_jwt_auth::<HttpRouteRulesFilters>(&[], "default", &jwt_auths, &cache).is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_jwt_auth_missing_cr_fails_open() {
+        let jwt_auths = empty_jwt_auth_store();
+        let cache = empty_jwks_cache();
+        assert!(
+            resolve_jwt_auth(&[jwt_auth_ext_ref("absent")], "default", &jwt_auths, &cache)
+                .is_none(),
+            "missing JwtAuth CR must fail open (no auth on the route)"
+        );
+    }
+
+    #[test]
+    fn resolve_jwt_auth_present_cr_resolves() {
+        let jwt_auths = make_jwt_auth_store(vec![jwt_auth_cr("default", "my-jwt")]);
+        let cache = empty_jwks_cache();
+        let resolved =
+            resolve_jwt_auth(&[jwt_auth_ext_ref("my-jwt")], "default", &jwt_auths, &cache)
+                .expect("present JwtAuth CR must resolve");
+        assert!(matches!(
+            resolved.as_ref(),
+            coxswain_core::routing::IngressAuthConfig::Jwt(_)
+        ));
     }
 }

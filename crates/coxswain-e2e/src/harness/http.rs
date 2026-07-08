@@ -46,6 +46,19 @@ impl EchoResponse {
             "expected upstream protocol '{expected}', got '{proto}'"
         );
     }
+
+    /// First value of a request header as the echo server observed it.
+    ///
+    /// `echo-basic` (Go's `net/http`) serializes `Request.Header` — a
+    /// `map[string][]string` — so each entry in [`Self::headers`] is a JSON
+    /// array, never a bare string; `serde_json::Value::as_str` on the array
+    /// itself always returns `None`. Look up by Go's canonicalized MIME header
+    /// form (`X-User-Id`, not `x-user-id`) — see
+    /// `client_injected_forwarding_headers_are_stripped` for the precedent.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name)?.get(0)?.as_str()
+    }
 }
 
 /// HTTP test client pre-configured to send requests to the coxswain proxy.

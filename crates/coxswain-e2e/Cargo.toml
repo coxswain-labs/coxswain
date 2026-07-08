@@ -21,6 +21,8 @@ flate2 = { workspace = true }
 futures = { workspace = true }
 base64 = { workspace = true }
 gateway-api-types = { workspace = true }
+# Mints signed test JWTs against a fixture-embedded JWKS keypair (#441).
+jsonwebtoken = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 rcgen = { workspace = true }

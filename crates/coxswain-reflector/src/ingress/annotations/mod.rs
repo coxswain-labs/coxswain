@@ -153,6 +153,14 @@ pub(super) struct IngressAnnotations {
     /// into [`IngressAuthConfig`][coxswain_core::routing::IngressAuthConfig] by
     /// looking up the labeled htpasswd Secret.
     pub auth: Option<AuthAnnotation>,
+    /// `JwtAuth` CR reference from `auth-jwt` (#441), in intermediate
+    /// (pre-resolved) `namespace/name` form. `None` when the annotation is
+    /// absent or malformed (WARN emitted). Independent of (additive with)
+    /// [`Self::auth`] — the reconciler resolves this into the same
+    /// [`IngressAuthConfig::Jwt`][coxswain_core::routing::IngressAuthConfig::Jwt]
+    /// the HTTPRoute `ExtensionRef` filter produces, and both checks (when
+    /// present) must pass.
+    pub auth_jwt: Option<auth::SecretRef>,
     /// Fire-and-forget mirror backend ref from `mirror-target` (#283), in
     /// intermediate (pre-resolved) form.  `None` when the annotation is absent or
     /// unparseable (WARN emitted; mirror disabled).  The reconciler resolves this
@@ -431,6 +439,18 @@ impl IngressAnnotations {
         // ── External / basic auth (#24) ───────────────────────────────────────
         let auth = auth::parse_auth(ann, route_id, &mut diag);
 
+        // ── JWT auth CR reference (#441) ──────────────────────────────────────
+        let auth_jwt = get(ann, auth::AUTH_JWT).and_then(|v| {
+            let r = auth::parse_secret_ref(v);
+            if r.is_none() {
+                issue!(
+                    auth::AUTH_JWT,
+                    "invalid auth-jwt — expected \"namespace/name\"; JWT auth disabled"
+                );
+            }
+            r
+        });
+
         // ── Mirror target (#283) ──────────────────────────────────────────────
         let mirror_target = get(ann, MIRROR_TARGET).and_then(|v| {
             let r = traffic_policy::parse_mirror_target(v);
@@ -524,6 +544,7 @@ impl IngressAnnotations {
                 session_affinity,
                 rate_limit,
                 auth,
+                auth_jwt,
                 mirror_target,
                 keepalive_timeout,
                 compression,
@@ -1118,5 +1139,33 @@ mod tests {
         // Unknown value → explicit Base (not absent)
         assert_eq!(a.path_normalize, Some(NormalizeLevel::Base));
         assert!(logs_contain("unknown path-normalize value"));
+    }
+
+    // ── auth-jwt (#441) ──────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_auth_jwt_valid_ref() {
+        let m = ann(&[(auth::AUTH_JWT, "auth-ns/my-jwt")]);
+        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
+        let r = a.auth_jwt.expect("auth_jwt must parse");
+        assert_eq!(r.namespace, "auth-ns");
+        assert_eq!(r.name, "my-jwt");
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn parse_auth_jwt_absent_is_none() {
+        let (a, diag) = IngressAnnotations::parse(None, "default/test");
+        assert!(a.auth_jwt.is_none());
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn parse_auth_jwt_malformed_warns_and_disables() {
+        let m = ann(&[(auth::AUTH_JWT, "no-slash-here")]);
+        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
+        assert!(a.auth_jwt.is_none());
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, auth::AUTH_JWT);
     }
 }

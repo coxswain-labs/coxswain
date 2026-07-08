@@ -38,6 +38,7 @@ pub mod endpoints;
 pub mod gateway_api;
 pub mod gw_types;
 pub mod ingress;
+pub mod jwks;
 pub mod k8s_utils;
 pub mod keys;
 pub mod metrics;
@@ -54,6 +55,7 @@ pub use cluster::{ClusterSummaryInputs, build_cluster_summary};
 pub use coxswain_core::fleet::SharedFleet;
 pub use crds::gateway_api_crds_present;
 pub use ingress::IngressPorts;
+pub use jwks::SharedJwksCache;
 pub use metrics::{MetricsPrefix, ReflectorMetrics};
 pub use reconciler::listener_merge::{EffectiveListenerPort, effective_listener_ports};
 pub use reconciler::{

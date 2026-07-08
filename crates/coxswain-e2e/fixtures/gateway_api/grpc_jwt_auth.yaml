@@ -1,0 +1,66 @@
+# GRPCRoute + JwtAuth (#441 gRPC parity) — apply backends::GRPC_ECHO first.
+#
+# Same inline JWKS (ES256 test key, kid=e2e-test-key) as
+# jwt_auth_extensionref.yaml — proves the ExtensionRef is accepted on
+# GRPCRoute and enforced on gRPC (HTTP/2) traffic. A valid bearer token
+# (as the "authorization" gRPC metadata key) admits the call; a
+# missing/invalid token is rejected (401 → gRPC Unauthenticated).
+#
+# The matching PRIVATE key lives only in the Rust test code
+# (crates/coxswain-e2e/src/jwt.rs).
+#
+# Gateway: coxswain-grpc-jwtauth on GATEWAY_HTTP_PORT.
+# Route host: grpc-jwtauth.TESTNS.local, GrpcEcho/Echo -> grpc-echo:50051.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-jwtauth
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: JwtAuth
+metadata:
+  name: grpc-jwtauth
+spec:
+  issuer: https://issuer.e2e.coxswain-labs.dev
+  jwks:
+    inline:
+      jwks:
+        keys:
+          - kty: EC
+            crv: P-256
+            kid: e2e-test-key
+            alg: ES256
+            x: ScOuAzhxBbDIGzXwHlAcn0nHt8tE9OvqRHm3RIGQjk8
+            "y": JiMe4KXWaBgWIBD1TTkwQdJNbLkO5AEiRQSdv8dbQyg
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-jwtauth-route
+spec:
+  hostnames:
+    - "grpc-jwtauth.${TESTNS}.local"
+  parentRefs:
+    - name: coxswain-grpc-jwtauth
+  rules:
+    - matches:
+        - method:
+            type: Exact
+            service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+            method: Echo
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: JwtAuth
+            name: grpc-jwtauth
+      backendRefs:
+        - name: grpc-echo
+          port: 50051

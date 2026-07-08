@@ -1,0 +1,153 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: jwtauths.gateway.coxswain-labs.dev
+spec:
+  group: gateway.coxswain-labs.dev
+  names:
+    categories: []
+    kind: JwtAuth
+    plural: jwtauths
+    shortNames: []
+    singular: jwtauth
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for JwtAuthSpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              JWT (JWKS bearer-token) validation policy for a route rule.
+
+              Reference this CR from a rule's `filters` entry with `type: ExtensionRef`
+              pointing at `group: gateway.coxswain-labs.dev`, `kind: JwtAuth`, or from an
+              Ingress via `ingress.coxswain-labs.dev/auth-jwt: "namespace/name"`. The
+              proxy validates the bearer token's signature against the resolved JWKS,
+              `iss` against [`issuer`](Self::issuer), and `aud` against
+              [`audiences`](Self::audiences) (when non-empty); a missing/invalid token
+              responds `401` with `WWW-Authenticate: Bearer`. An unresolved JWKS (broken
+              `jwksUri`) fails closed with `503`. Only asymmetric signing algorithms are
+              supported (RS/PS/ES/EdDSA) — JWKS is inherently asymmetric.
+            properties:
+              audiences:
+                description: |-
+                  Expected token `aud` (audience) claims. A token is accepted if any of its
+                  audiences matches any entry here. Empty (the default) skips the audience
+                  check entirely — Envoy `JwtProvider.audiences`.
+                items:
+                  type: string
+                type: array
+              claimToHeaders:
+                description: |-
+                  Verified claims copied onto upstream request headers. A named claim that
+                  is absent or non-scalar on the token is skipped (no header written).
+                  Envoy `JwtProvider.claim_to_headers`.
+                items:
+                  description: |-
+                    Copies one verified claim onto an upstream request header — Envoy
+                    `JwtProvider.claim_to_headers` entry.
+                  properties:
+                    claim:
+                      description: Top-level claim name to read from the verified token payload.
+                      type: string
+                    header:
+                      description: Upstream request header name to write the claim value to.
+                      type: string
+                  required:
+                  - claim
+                  - header
+                  type: object
+                type: array
+              forward:
+                description: |-
+                  Whether to keep the original token header(s) on the upstream request
+                  after verification. Absent or `false` (the default and Envoy's default)
+                  strips it — Envoy `JwtProvider.forward`.
+                nullable: true
+                type: boolean
+              forwardPayloadHeader:
+                description: |-
+                  When set, the base64url-encoded verified claims payload is forwarded to
+                  the upstream in this header — Envoy `JwtProvider.forward_payload_header`.
+                nullable: true
+                type: string
+              fromHeaders:
+                description: |-
+                  Request locations to extract the token from. Absent (the default) looks
+                  for `Authorization: Bearer <token>` — Envoy `JwtProvider.from_headers`.
+                items:
+                  description: |-
+                    One request location to look for the bearer token in — Envoy
+                    `JwtProvider.from_headers` entry.
+                  properties:
+                    name:
+                      description: Header name to read the token from.
+                      type: string
+                    valuePrefix:
+                      description: |-
+                        Prefix stripped from the header value before parsing the token (e.g.
+                        `"Bearer "`). Absent means the header value *is* the token verbatim.
+                      nullable: true
+                      type: string
+                  required:
+                  - name
+                  type: object
+                type: array
+              issuer:
+                description: Expected token `iss` (issuer) claim. Required — Envoy `JwtProvider.issuer`.
+                type: string
+              jwks:
+                description: |-
+                  Where the verification keys come from — a remote JWKS endpoint (resolved
+                  and cached by the controller) or an inline key set.
+                properties:
+                  inline:
+                    description: A JWKS provided directly in the spec — no controller-side fetch.
+                    nullable: true
+                    properties:
+                      jwks:
+                        description: |-
+                          A JSON Web Key Set object (RFC 7517 `{"keys": [...]}`), verbatim.
+                          Schema-free (any JSON) — an unparseable or empty key set is caught at
+                          reconcile time and fails the route closed, never an apiserver rejection.
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    required:
+                    - jwks
+                    type: object
+                  remote:
+                    description: |-
+                      Fetch the JWKS from a remote HTTPS endpoint. Resolved and refreshed by
+                      the controller (never the proxy) — the proxy only ever verifies against
+                      keys already pushed to it.
+                    nullable: true
+                    properties:
+                      refreshInterval:
+                        description: |-
+                          How often to refetch, as a Gateway API Duration (e.g. `"5m"`). Absent or
+                          unparseable → **5 minutes** (WARN + default at the reflector, never an
+                          apiserver rejection). The response's `Cache-Control` header is not
+                          consulted — this is the only refresh signal.
+                        nullable: true
+                        type: string
+                      uri:
+                        description: 'HTTPS URL serving a JSON Web Key Set (RFC 7517 `{"keys": [...]}`).'
+                        type: string
+                    required:
+                    - uri
+                    type: object
+                type: object
+            required:
+            - issuer
+            - jwks
+            type: object
+        required:
+        - spec
+        title: JwtAuth
+        type: object
+    served: true
+    storage: true
+    subresources: {}

@@ -50,9 +50,21 @@ pub const EXT_AUTH_FAIL_CLOSED: &str = "ingress.coxswain-labs.dev/ext-auth-fail-
 /// Mutually exclusive with `ext-auth-backend`.
 pub const AUTH_BASIC_SECRET: &str = "ingress.coxswain-labs.dev/auth-basic-secret";
 
+/// Reference to a `JwtAuth` CR in `namespace/name` form, e.g. `"default/my-jwt"`
+/// (#441). Independent of (additive with) `ext-auth-backend` / `auth-basic-secret`
+/// — a route can require JWT auth alongside external or basic auth; every check
+/// in the chain must pass. Resolves to the same
+/// [`IngressAuthConfig::Jwt`][coxswain_core::routing::IngressAuthConfig::Jwt]
+/// the HTTPRoute `ExtensionRef` filter produces (Gateway API parity). A missing
+/// CR fails open (WARN, no JWT check); a present-but-unresolved JWKS fails
+/// closed (503).
+pub const AUTH_JWT: &str = "ingress.coxswain-labs.dev/auth-jwt";
+
 // ── Intermediate annotation representation (pre-reconcile) ──────────────────
 
-/// A reference to a Kubernetes Secret in `namespace/name` form.
+/// A reference to a Kubernetes object in `namespace/name` form. Despite the
+/// name, this is reused for any coordinate of that shape — not just Secrets:
+/// [`AUTH_JWT`] parses to this same struct to reference a `JwtAuth` CR.
 pub(crate) struct SecretRef {
     pub namespace: String,
     pub name: String,

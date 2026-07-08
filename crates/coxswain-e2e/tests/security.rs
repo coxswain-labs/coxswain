@@ -1015,6 +1015,46 @@ async fn grpc_echo_call(
         .map(tonic::Response::into_inner)
 }
 
+/// Like [`grpc_echo_call`] but attaches `authorization: Bearer <token>` as gRPC
+/// metadata when `token` is `Some` — the gRPC equivalent of an HTTP
+/// `Authorization` header, exercised by the `JwtAuth` ExtensionRef tests (#441).
+async fn grpc_echo_call_with_bearer(
+    gw_addr: std::net::SocketAddr,
+    host: &str,
+    token: Option<&str>,
+) -> Result<grpcecho::EchoResponse, tonic::Status> {
+    let origin: tonic::transport::Uri = format!("http://{host}:{}", gw_addr.port())
+        .parse()
+        .map_err(|e| tonic::Status::unavailable(format!("uri: {e}")))?;
+    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))
+        .map_err(|e| tonic::Status::unavailable(format!("endpoint: {e}")))?
+        .origin(origin);
+    let channel = endpoint
+        .connect()
+        .await
+        .map_err(|e| tonic::Status::unavailable(format!("connect: {e}")))?;
+    let mut client = tonic::client::Grpc::new(channel);
+    client
+        .ready()
+        .await
+        .map_err(|e| tonic::Status::unavailable(format!("ready: {e}")))?;
+    let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo"
+        .parse::<tonic::codegen::http::uri::PathAndQuery>()
+        .map_err(|e| tonic::Status::unavailable(format!("path: {e}")))?;
+    let codec = tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+    let mut request = tonic::Request::new(grpcecho::EchoRequest {});
+    if let Some(token) = token {
+        let value = format!("Bearer {token}")
+            .parse()
+            .map_err(|e| tonic::Status::unavailable(format!("metadata value: {e}")))?;
+        request.metadata_mut().insert("authorization", value);
+    }
+    client
+        .unary(request, path, codec)
+        .await
+        .map(tonic::Response::into_inner)
+}
+
 /// `IpAccessControl` on a GRPCRoute: an allow-list covering all sources admits the
 /// client and the gRPC call reaches the backend (#479 gRPC happy path — also proves
 /// the ExtensionRef is accepted on GRPCRoute).
@@ -1125,6 +1165,89 @@ async fn grpc_route_rate_limited_via_extensionref() -> anyhow::Result<()> {
         rate_limited,
         "expected at least one gRPC call to be rate-limited (RateLimit rps=1, 429 → Unavailable) on rapid-fire"
     );
+    Ok(())
+}
+
+// ── JwtAuth on GRPCRoute (#441 gRPC parity) ───────────────────────────────────
+
+/// `JwtAuth` on a GRPCRoute: a call carrying a valid, signed, unexpired,
+/// correct-issuer bearer token (as the "authorization" gRPC metadata key) is
+/// admitted and reaches grpc-echo (#441 gRPC happy path — also proves the
+/// ExtensionRef is accepted on GRPCRoute).
+#[tokio::test]
+async fn grpc_route_jwt_auth_admits_valid_token() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "grpc-jwtauth-ok").await?;
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_JWT_AUTH, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("grpc-jwtauth.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+    let token = coxswain_e2e::jwt::valid_token();
+
+    let resp = wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("gRPC Echo via {host} to admit a valid bearer token") },
+        || async {
+            grpc_echo_call_with_bearer(gw_addr, &host, Some(&token))
+                .await
+                .ok()
+        },
+    )
+    .await?;
+
+    let pod = resp
+        .assertions
+        .and_then(|a| a.context)
+        .map(|c| c.pod)
+        .unwrap_or_default();
+    assert!(
+        pod.starts_with("grpc-echo-"),
+        "response must come from grpc-echo-* pod, got {pod:?}"
+    );
+    Ok(())
+}
+
+/// `JwtAuth` on a GRPCRoute: a call with no bearer token, or one signed by the
+/// right key but with the wrong issuer, is rejected — the proxy's 401 surfaces
+/// as gRPC `Unauthenticated` (#441 gRPC sad path). The backend must never be
+/// reached.
+#[tokio::test]
+async fn grpc_route_jwt_auth_rejects_missing_or_invalid_token() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "grpc-jwtauth-bad").await?;
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_JWT_AUTH, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("grpc-jwtauth.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+
+    // Poll until the call is rejected with Unauthenticated (401). Unimplemented
+    // (404, route not yet live) does not match, so this waits for the route to
+    // be live AND the JWT check to fire.
+    wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("gRPC Echo via {host} with no token to be Unauthenticated") },
+        || async {
+            match grpc_echo_call_with_bearer(gw_addr, &host, None).await {
+                Err(s) if s.code() == tonic::Code::Unauthenticated => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    // A wrong-issuer token must also be rejected — proves the check inspects
+    // the token, not merely its presence.
+    let wrong_issuer = coxswain_e2e::jwt::wrong_issuer_token();
+    match grpc_echo_call_with_bearer(gw_addr, &host, Some(&wrong_issuer)).await {
+        Err(s) if s.code() == tonic::Code::Unauthenticated => {}
+        other => anyhow::bail!("expected Unauthenticated for a wrong-issuer token, got {other:?}"),
+    }
     Ok(())
 }
 
@@ -1768,6 +1891,177 @@ async fn gateway_basic_auth_cross_namespace_requires_reference_grant() -> anyhow
     )
     .await?;
 
+    Ok(())
+}
+
+// ── JwtAuth ExtensionRef (Gateway API, #441) ──────────────────────────────────
+
+/// `JwtAuth` CR via `ExtensionRef`: a request carrying a valid, signed,
+/// unexpired, correct-issuer bearer token is admitted (200), and the verified
+/// `sub` claim is forwarded to the backend as `x-user-id` (#441 happy path —
+/// also proves the ExtensionRef is accepted on HTTPRoute and claim forwarding
+/// works end to end).
+#[tokio::test]
+async fn gateway_jwt_auth_valid_token_admitted() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-jwtauth-ok").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::JWT_AUTH_EXTENSIONREF, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwjwtauth.{}.local", ns.name);
+    let token = coxswain_e2e::jwt::valid_token();
+    let bearer = format!("Bearer {token}");
+
+    // Poll for the fully-reconciled state, not just a 200: the reflector watches
+    // the HTTPRoute and the JwtAuth CR independently, so there is a real window
+    // where the route is already routable before the CR has synced — the
+    // ExtensionRef's deliberate fail-open (#441) means that window serves a
+    // plain 200 with *no* JWT enforcement at all (same status code, no
+    // claimToHeaders forwarding). A predicate keyed on status code alone would
+    // accept that transient state; require the forwarded claim to be correct.
+    let resp = wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("gateway JwtAuth route to admit a valid token at {host}") },
+        || async {
+            let result = gw
+                .get_full_with_headers(&host, "/", &[("authorization", &bearer)])
+                .await;
+            match result {
+                Ok((200, _, Some(body))) if body.header("X-User-Id") == Some("e2e-test-user") => {
+                    Some(body)
+                }
+                _ => None,
+            }
+        },
+    )
+    .await?;
+    resp.assert_backend("echo-a");
+    Ok(())
+}
+
+/// `JwtAuth` CR via `ExtensionRef`: a request with no bearer token is rejected
+/// with 401 + `WWW-Authenticate: Bearer` (#441 sad path — missing credential).
+/// The backend must never be reached.
+#[tokio::test]
+async fn gateway_jwt_auth_missing_token_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-jwtauth-missing").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::JWT_AUTH_EXTENSIONREF, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwjwtauth.{}.local", ns.name);
+
+    // Wait until the route is live and enforcing: no token → 401 (not 404).
+    wait::wait_for_route_status(&gw, &host, "/", 401, Duration::from_secs(90)).await?;
+
+    let (status, resp_hdrs, _) = gw.get_full(&host, "/").await?;
+    anyhow::ensure!(
+        status == 401,
+        "expected 401 for a missing token, got {status}"
+    );
+    anyhow::ensure!(
+        resp_hdrs.contains_key(reqwest::header::WWW_AUTHENTICATE),
+        "expected WWW-Authenticate header in 401 response; got: {resp_hdrs:?}"
+    );
+
+    // A wrong-issuer token and an expired token must also be rejected — proves
+    // the check inspects the token, not merely its presence.
+    for (label, token) in [
+        ("wrong issuer", coxswain_e2e::jwt::wrong_issuer_token()),
+        ("expired", coxswain_e2e::jwt::expired_token()),
+    ] {
+        let bearer = format!("Bearer {token}");
+        let (status, _, _) = gw
+            .get_full_with_headers(&host, "/", &[("authorization", &bearer)])
+            .await?;
+        anyhow::ensure!(
+            status == 401,
+            "expected 401 for a {label} token, got {status}"
+        );
+    }
+    Ok(())
+}
+
+// ── auth-jwt annotation (Ingress, #441) ───────────────────────────────────────
+
+/// `ingress.coxswain-labs.dev/auth-jwt` naming a `JwtAuth` CR: a request
+/// carrying a valid, signed, unexpired, correct-issuer bearer token is
+/// admitted (200), with the verified `sub` claim forwarded as `x-user-id`
+/// (#441 happy path — Ingress parity with the HTTPRoute ExtensionRef).
+#[tokio::test]
+async fn ingress_jwt_auth_valid_token_admitted() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-jwtauth-ok").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_JWT, FixtureVars::new(&ns.name)).await?;
+    let host = format!("authjwt.{}.local", ns.name);
+    let token = coxswain_e2e::jwt::valid_token();
+    let bearer = format!("Bearer {token}");
+
+    // See gateway_jwt_auth_valid_token_admitted: poll for the fully-reconciled
+    // state (claim actually forwarded), not just a 200 — the Ingress and the
+    // JwtAuth CR it names are reconciled from independently-watched stores.
+    let resp = wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("Ingress auth-jwt route to admit a valid token at {host}") },
+        || async {
+            let result = h
+                .http
+                .get_full_with_headers(&host, "/", &[("authorization", &bearer)])
+                .await;
+            match result {
+                Ok((200, _, Some(body))) if body.header("X-User-Id") == Some("e2e-test-user") => {
+                    Some(body)
+                }
+                _ => None,
+            }
+        },
+    )
+    .await?;
+    resp.assert_backend("echo-a");
+    Ok(())
+}
+
+/// `auth-jwt`: a request with no bearer token is rejected with 401 +
+/// `WWW-Authenticate: Bearer`; a wrong-issuer or expired token is rejected the
+/// same way (#441 sad path). The backend must never be reached.
+#[tokio::test]
+async fn ingress_jwt_auth_invalid_token_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-jwtauth-bad").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_JWT, FixtureVars::new(&ns.name)).await?;
+    let host = format!("authjwt.{}.local", ns.name);
+
+    // Wait until the route is live and enforcing: no token → 401 (not 404).
+    wait::wait_for_route_status(&h.http, &host, "/", 401, Duration::from_secs(90)).await?;
+
+    let (status, resp_hdrs, _) = h.http.get_full(&host, "/").await?;
+    anyhow::ensure!(
+        status == 401,
+        "expected 401 for a missing token, got {status}"
+    );
+    anyhow::ensure!(
+        resp_hdrs.contains_key(reqwest::header::WWW_AUTHENTICATE),
+        "expected WWW-Authenticate header in 401 response; got: {resp_hdrs:?}"
+    );
+
+    for (label, token) in [
+        ("wrong issuer", coxswain_e2e::jwt::wrong_issuer_token()),
+        ("expired", coxswain_e2e::jwt::expired_token()),
+    ] {
+        let bearer = format!("Bearer {token}");
+        let (status, _, _) = h
+            .http
+            .get_full_with_headers(&host, "/", &[("authorization", &bearer)])
+            .await?;
+        anyhow::ensure!(
+            status == 401,
+            "expected 401 for a {label} token, got {status}"
+        );
+    }
     Ok(())
 }
 

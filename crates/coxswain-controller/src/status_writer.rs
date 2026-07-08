@@ -138,6 +138,10 @@ pub fn spawn_status_writer(
     // was made always-on regardless of `enable_ingress`. Registering it only
     // when Ingress is enabled left it spawned-but-unregistered with Ingress
     // disabled, panicking the first time the reflector reached `InitDone`.
+    // `jwt_auth` is the same fix on the opposite axis: the Ingress `auth-jwt`
+    // annotation (#441) consumes the same `JwtAuth` CR store as the
+    // Gateway-API `JwtAuth` ExtensionRef, so its reflector is always-on
+    // regardless of `enable_gateway_api`.
     const ALWAYS_ON_CHECKS: &[&str] = &[
         "endpoint_slice",
         "secret",
@@ -145,6 +149,7 @@ pub fn spawn_status_writer(
         "pod",
         "routing_table_built",
         "auth_secret",
+        "jwt_auth",
     ];
     // Per-surface checks registered only when the surface is enabled;
     // disabled surfaces never mark a check ready so registering them would
@@ -242,6 +247,9 @@ pub fn spawn_status_writer(
             opts.ingress_event_tx = Some(ingress_event_tx);
             opts.enable_gateway_api = enable_gateway_api;
             opts.enable_ingress = enable_ingress;
+            // Controller role only (#441) — the read-only proxy must never
+            // egress to a JWKS identity provider; see `coxswain_reflector::jwks`.
+            opts.fetch_remote_jwks = true;
             opts
         },
     );

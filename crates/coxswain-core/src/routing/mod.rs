@@ -16,7 +16,7 @@ mod tests;
 
 pub use common::auth::{
     BasicCredential, ExtAuthConfig, ExtAuthTransport, GrpcExtAuthConfig, HttpExtAuthConfig,
-    IngressAuthConfig, PasswordHash,
+    IngressAuthConfig, JwtConfig, JwtHeaderLoc, PasswordHash,
 };
 pub use common::backend::{
     BackendGroup, BackendGroupSpec, HashSource, LoadBalance, LoadBalanceParseError, Selected,

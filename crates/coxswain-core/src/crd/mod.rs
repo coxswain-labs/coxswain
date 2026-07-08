@@ -13,6 +13,7 @@ pub mod coxswain_external_auth;
 pub mod gateway_parameters;
 pub mod ingress_parameters;
 pub mod ip_access_control;
+pub mod jwt_auth;
 pub mod path_rewrite_regex;
 pub mod rate_limit;
 pub mod request_size_limit;
@@ -38,6 +39,9 @@ pub use gateway_parameters::{
 };
 pub use ingress_parameters::{CoxswainIngressClassParameters, CoxswainIngressClassParametersSpec};
 pub use ip_access_control::{IpAccessControl, IpAccessControlSpec};
+pub use jwt_auth::{
+    ClaimToHeader, InlineJwks, JwksSource, JwtAuth, JwtAuthSpec, JwtHeaderLocation, RemoteJwks,
+};
 pub use path_rewrite_regex::{PathRewriteRegex, PathRewriteRegexSpec};
 pub use rate_limit::{RateLimit, RateLimitSpec};
 pub use request_size_limit::{RequestSizeLimit, RequestSizeLimitSpec};

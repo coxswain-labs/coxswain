@@ -25,11 +25,16 @@ tonic = { workspace = true }
 http = { workspace = true }
 ipnet = { workspace = true }
 itoa = { workspace = true }
+# JWT verification (#441) — parses the resolved JWKS (pushed by the controller,
+# never fetched here) and verifies bearer-token signatures. The sole
+# JWT/crypto-parsing boundary in the crate.
+jsonwebtoken = { workspace = true }
 parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
 tokio-stream = { workspace = true }
+serde_json = { workspace = true }
 sha1 = { workspace = true }
 zeroize = { workspace = true }
 coxswain-core = { workspace = true }

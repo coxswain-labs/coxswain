@@ -51,6 +51,7 @@
 
 pub mod fixtures;
 pub mod harness;
+pub mod jwt;
 
 pub use fixtures::FixtureVars;
 pub use harness::{
