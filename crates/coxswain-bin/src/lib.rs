@@ -23,9 +23,9 @@ use coxswain_discovery::{
     SpiffeMatcher, Supervisor, serve_discovery_with_tls,
 };
 use coxswain_proxy::{
-    GatewayProxy, IngressProxy, ListenerProtocol, ListenerSpec, PassthroughConfig, ProxyAcceptor,
-    RateLimiterRegistry, RoutingEngine, RoutingSource, SharedProxyConfig, SniCertSelector,
-    UpstreamCaCache,
+    GatewayProxy, GrpcAuthChannelCache, IngressProxy, ListenerProtocol, ListenerSpec,
+    PassthroughConfig, ProxyAcceptor, RateLimiterRegistry, RoutingEngine, RoutingSource,
+    SharedProxyConfig, SniCertSelector, UpstreamCaCache,
 };
 use coxswain_reflector::{GatewayListenerStatus, ListenerReadiness};
 use pingora_core::apps::HttpServerOptions;
@@ -517,6 +517,9 @@ fn wire_gateway_only_proxy_services(
     // Handle to the advertised-port map (#472), captured before `cfg` is moved
     // into the proxy; the listener-specs adapter republishes it on every tick.
     let advertised_ports = cfg.advertised_ports.clone();
+    // Handle to the gRPC ext_authz channel pool (#544), captured before `cfg`
+    // moves into the proxy; the GC service below sweeps it periodically.
+    let grpc_auth_channels = cfg.grpc_auth_channels.clone();
 
     let gateway_proxy = Arc::new(make_http_proxy(
         &server.configuration,
@@ -572,6 +575,13 @@ fn wire_gateway_only_proxy_services(
         "rate-limit-gc",
         RateLimiterGcService {
             registry: rate_limiter,
+        },
+    ));
+
+    server.add_service(background_service(
+        "grpc-auth-channel-gc",
+        GrpcAuthChannelGcService {
+            cache: grpc_auth_channels,
         },
     ));
 
@@ -655,6 +665,10 @@ fn wire_proxy_services(
     // proxies, so its handle stays valid here.
     let advertised_ports = shared_cfg.advertised_ports.clone();
     advertised_ports.store(Arc::new(derive_advertised_ports(&listener_status.load())));
+    // Handle to the gRPC ext_authz channel pool (#544), captured before
+    // `shared_cfg` moves into the Gateway proxy below; the GC service sweeps it
+    // periodically.
+    let grpc_auth_channels = shared_cfg.grpc_auth_channels.clone();
 
     // Build the per-Ingress PROXY config from the --ingress-* flags.
     // Ingress-origin listeners carry this on their ListenerSpec.proxy_protocol.
@@ -756,6 +770,13 @@ fn wire_proxy_services(
         "rate-limit-gc",
         RateLimiterGcService {
             registry: rate_limiter,
+        },
+    ));
+
+    server.add_service(background_service(
+        "grpc-auth-channel-gc",
+        GrpcAuthChannelGcService {
+            cache: grpc_auth_channels,
         },
     ));
 
@@ -1154,6 +1175,35 @@ impl pingora_core::services::background::BackgroundService for RateLimiterGcServ
                 biased;
                 _ = shutdown.changed() => break,
                 _ = interval.tick() => self.registry.sweep(),
+            }
+        }
+    }
+}
+
+// ── gRPC ext_authz channel-pool GC service (#544) ─────────────────────────────
+
+/// Background service that periodically evicts idle pooled gRPC ext_authz
+/// channels.
+///
+/// Calls [`GrpcAuthChannelCache::sweep`] every 60 seconds. The sweep applies
+/// second-chance eviction: a channel used since the previous sweep survives,
+/// an untouched one is dropped. An auth-service endpoint removed by reconcile
+/// (pod scale-down/replacement) simply stops being selected by the round-robin
+/// picker, goes idle, and is reclaimed on the next sweep — bounding the pool to
+/// the live endpoint set without explicit invalidation.
+struct GrpcAuthChannelGcService {
+    cache: GrpcAuthChannelCache,
+}
+
+#[async_trait]
+impl pingora_core::services::background::BackgroundService for GrpcAuthChannelGcService {
+    async fn start(&self, mut shutdown: ShutdownWatch) {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        loop {
+            tokio::select! {
+                biased;
+                _ = shutdown.changed() => break,
+                _ = interval.tick() => self.cache.sweep(),
             }
         }
     }

@@ -82,13 +82,14 @@ pub(crate) const HOP_BY_HOP: &[&str] = &[
 /// Propagates Pingora `write_response_header` errors.
 pub(crate) async fn enforce(
     client: &reqwest::Client,
+    grpc_channels: &crate::policy::grpc_channel::GrpcAuthChannelCache,
     auth: &IngressAuthConfig,
     session: &mut Session,
     auth_response_headers: &mut Option<Vec<(Box<str>, Box<str>)>>,
 ) -> Result<bool> {
     match auth {
         IngressAuthConfig::External(cfg) => {
-            enforce_ext_authz(client, cfg, session, auth_response_headers).await
+            enforce_ext_authz(client, grpc_channels, cfg, session, auth_response_headers).await
         }
         IngressAuthConfig::Basic(creds) => enforce_basic(creds, session).await,
         IngressAuthConfig::Unavailable => {
@@ -110,6 +111,7 @@ pub(crate) async fn enforce(
 
 async fn enforce_ext_authz(
     client: &reqwest::Client,
+    grpc_channels: &crate::policy::grpc_channel::GrpcAuthChannelCache,
     cfg: &coxswain_core::routing::ExtAuthConfig,
     session: &mut Session,
     auth_response_headers_out: &mut Option<Vec<(Box<str>, Box<str>)>>,
@@ -119,7 +121,14 @@ async fn enforce_ext_authz(
             enforce_ext_authz_http(client, cfg, http_cfg, session, auth_response_headers_out).await
         }
         ExtAuthTransport::Grpc(grpc_cfg) => {
-            grpc::enforce_ext_authz_grpc(cfg, grpc_cfg, session, auth_response_headers_out).await
+            grpc::enforce_ext_authz_grpc(
+                grpc_channels,
+                cfg,
+                grpc_cfg,
+                session,
+                auth_response_headers_out,
+            )
+            .await
         }
         // `ExtAuthTransport` is #[non_exhaustive]: a transport not yet wired on the
         // data plane must fail closed (503), never open. Reachable the moment a new
@@ -459,6 +468,7 @@ mod grpc {
     /// Enforce a gRPC ext_authz check. Contract mirrors the HTTP transport:
     /// `Ok(false)` allow, `Ok(true)` denied (response written), `Err` internal.
     pub(super) async fn enforce_ext_authz_grpc(
+        grpc_channels: &crate::policy::grpc_channel::GrpcAuthChannelCache,
         cfg: &coxswain_core::routing::ExtAuthConfig,
         grpc_cfg: &coxswain_core::routing::GrpcExtAuthConfig,
         session: &mut Session,
@@ -474,20 +484,15 @@ mod grpc {
         // before any mutable use of `session` below.
         let check = build_check_request(session);
 
-        // Dial the auth pod cleartext (h2c). connect + per-call timeout both bounded
-        // by cfg.timeout so a hung auth service cannot stall the request.
-        //
-        // Perf follow-up (#544): this opens a fresh channel per check (no pooling),
-        // unlike the HTTP transport's shared `reqwest::Client`. Correct and fail-safe,
-        // but a per-request TCP+H2 setup; a channel cache keyed by resolved endpoint on
-        // `SharedProxyConfig` is a tracked optimization.
-        let endpoint = match tonic::transport::Endpoint::from_shared(format!("http://{addr}")) {
-            Ok(e) => e.connect_timeout(cfg.timeout).timeout(cfg.timeout),
-            Err(e) => return fail(session, cfg.fail_closed, &format!("endpoint: {e}")).await,
-        };
-        let channel = match endpoint.connect().await {
+        // Reuse (or lazily build) a pooled channel to the auth pod, cleartext
+        // (h2c, #544 — see `crate::policy::grpc_channel`). The channel's own
+        // connect_timeout is a fixed pool-internal constant, not cfg.timeout:
+        // the per-call deadline below is what actually bounds this request
+        // (connect included), regardless of whether the channel was already
+        // warm or another route's config built this pooled entry first.
+        let channel = match grpc_channels.get_or_connect(addr) {
             Ok(ch) => ch,
-            Err(e) => return fail(session, cfg.fail_closed, &format!("connect: {e}")).await,
+            Err(e) => return fail(session, cfg.fail_closed, &format!("endpoint: {e}")).await,
         };
 
         let mut client = AuthorizationClient::new(channel);

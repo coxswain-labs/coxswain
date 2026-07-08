@@ -26,6 +26,8 @@ use coxswain_e2e::{
 use std::time::Duration;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+mod common;
+
 // Minimal `grpcecho` proto (hand-derived from grpcecho.proto to avoid a
 // prost-build dependency) for the GRPCRoute ExtensionRef parity tests (#479, #25).
 // Service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
@@ -1261,6 +1263,117 @@ async fn request_denied_when_ext_authz_grpc_denies() -> anyhow::Result<()> {
     let host = format!("authgrpc.{}.local", ns.name);
 
     wait::wait_for_route_status(&h.http, &host, "/", 403, Duration::from_secs(120)).await?;
+    Ok(())
+}
+
+/// gRPC ext_authz channel pooling (#544 happy path): once the pooled channel to
+/// `ext-authz-grpc` is warm, many sequential checks all succeed. Before pooling,
+/// each check dialled a fresh TCP+HTTP/2 connection per request; a regression
+/// that leaks/corrupts the pooled channel after first use would surface here as
+/// a later request timing out or failing to connect.
+#[tokio::test]
+async fn request_allowed_when_ext_authz_grpc_channel_reused_across_requests() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-grpc-reuse").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
+    let host = format!("authgrpc.{}.local", ns.name);
+
+    // Establish the route first — the pool's cold-start (first dial) is not
+    // what this test targets; the reuse path after that is.
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async { format!("Ingress gRPC ext_authz to allow x-ext-authz:allow at {host}") },
+        || async {
+            match h
+                .http
+                .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+
+    for i in 0..30u32 {
+        let (status, _, body) = h
+            .http
+            .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
+            .await?;
+        anyhow::ensure!(status == 200, "request {i}: expected 200, got {status}");
+        body.ok_or_else(|| anyhow::anyhow!("request {i}: 200 with no parseable body"))?
+            .assert_backend("echo-a");
+    }
+    Ok(())
+}
+
+/// gRPC ext_authz channel pooling (#544 sad path): `kubectl rollout restart`
+/// replaces `ext-authz-grpc` with a new pod at a new `SocketAddr` (endpoint
+/// churn, not a same-address reconnect — pod IPs are not reused). Reconcile
+/// updates `ExtAuthConfig.endpoints`, so the round-robin picker must move on to
+/// the new address; the pool's `SocketAddr`-keyed design means the old, now-dead
+/// entry is simply never selected again (no explicit invalidation exists or is
+/// needed — see `crate::policy::grpc_channel`'s module doc). A regression that
+/// left the picker or the cache pinned to the stale endpoint would fail every
+/// check closed (`failClosed` defaults true) instead of recovering.
+#[tokio::test]
+async fn request_recovers_after_ext_authz_grpc_pod_restart() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-grpc-restart").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
+    let host = format!("authgrpc.{}.local", ns.name);
+
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async { format!("Ingress gRPC ext_authz to allow x-ext-authz:allow at {host}") },
+        || async {
+            match h
+                .http
+                .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+
+    // Fixture Deployment is namespace-scoped and owned exclusively by this
+    // test's namespace — safe in the parallel pass (see common::rollout).
+    common::rollout::rollout_restart_deployment(&ns.name, "ext-authz-grpc").await?;
+
+    // Allow still allows (reconnect to the replacement pod), and deny still
+    // denies — the pool did not wedge open or leave a stale allow/deny cached.
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async { format!("gRPC ext_authz to recover after auth-pod restart at {host}") },
+        || async {
+            match h
+                .http
+                .get_full_with_headers(&host, "/", &[("x-ext-authz", "allow")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+
+    wait::wait_for_route_status(&h.http, &host, "/", 403, Duration::from_secs(90)).await?;
     Ok(())
 }
 
