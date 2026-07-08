@@ -1930,7 +1930,7 @@ async fn gateway_jwt_auth_valid_token_admitted() -> anyhow::Result<()> {
     resp.assert_backend("echo-a");
     let forwarded = resp
         .headers
-        .get("x-user-id")
+        .get("X-User-Id")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     anyhow::ensure!(
@@ -2018,7 +2018,7 @@ async fn ingress_jwt_auth_valid_token_admitted() -> anyhow::Result<()> {
     resp.assert_backend("echo-a");
     let forwarded = resp
         .headers
-        .get("x-user-id")
+        .get("X-User-Id")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     anyhow::ensure!(
