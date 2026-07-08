@@ -42,7 +42,7 @@ pub use traffic_policy::*;
 use auth::AuthAnnotation;
 use coxswain_core::routing::{
     CircuitBreakerConfig, CompressionConfig, FilterAction, ForwardedForConfig, HeaderMod,
-    LoadBalance, NormalizeLevel, PathModifier, RateLimitConfig, RetryPolicy, RouteTimeouts,
+    LoadBalance, NormalizeLevel, PathModifier, RateLimitConfig, RetryPolicyConfig, RouteTimeouts,
     SessionAffinity,
 };
 use std::collections::BTreeMap;
@@ -107,7 +107,7 @@ pub(super) struct IngressAnnotations {
     /// `request` and `backend_request` stay `None` (those come from HTTPRoute/GW API only).
     pub timeouts: RouteTimeouts,
     /// Retry policy from `max-retries` + `retry-on`.
-    pub retries: RetryPolicy,
+    pub retries: RetryPolicyConfig,
     /// Path rewrite from `rewrite-target` — emitted as a `FilterAction::UrlRewrite`.
     /// Holds the literal [`PathModifier::ReplaceFullPath`]; on a regex path the
     /// reconciler rebuilds it as [`PathModifier::RegexReplace`] against that path's
@@ -244,43 +244,31 @@ impl IngressAnnotations {
             d
         });
 
-        // ── Retries ───────────────────────────────────────────────────────────
-        let max_retries = get(ann, MAX_RETRIES).and_then(|v| {
-            let n = parse_u32(v);
-            if n.is_none() {
-                issue!(MAX_RETRIES, "invalid integer — using default (no retries)");
-            }
-            n
-        });
-        let retry_on = get(ann, RETRY_ON).map(parse_retry_on);
-        let retries = match (max_retries, retry_on) {
-            (Some(n), Some(on)) => RetryPolicy::new(n, on),
-            (Some(n), None) => {
-                tracing::warn!(
-                    ingress = %route_id,
-                    max_retries = n,
-                    "max-retries set but retry-on is absent — retries disabled"
-                );
-                issue!(
-                    MAX_RETRIES,
-                    format!(
-                        "max-retries set but retry-on is absent — retries disabled (max-retries={n})"
-                    )
-                );
-                RetryPolicy::default()
-            }
-            (None, Some(_)) => {
-                tracing::warn!(
-                    ingress = %route_id,
-                    "retry-on set but max-retries is absent — retries disabled"
-                );
-                issue!(
-                    RETRY_ON,
-                    "retry-on set but max-retries is absent — retries disabled"
-                );
-                RetryPolicy::default()
-            }
-            (None, None) => RetryPolicy::default(),
+        // ── Retries (GEP-1731-shaped: attempts / codes / backoff) ─────────────
+        // `retry-attempts` is the gate: absent ⇒ retries disabled. When set,
+        // connection/timeout retries apply implicitly and `retry-codes` selects which
+        // responses retry (absent ⇒ the safe [502,503,504] default). Ingress is
+        // HTTP-only, so there is no gRPC-code surface here.
+        let retries = match get(ann, RETRY_ATTEMPTS) {
+            None => RetryPolicyConfig::default(),
+            Some(v) => match parse_u32(v) {
+                None => {
+                    issue!(RETRY_ATTEMPTS, "invalid integer — retries disabled");
+                    RetryPolicyConfig::default()
+                }
+                Some(0) => RetryPolicyConfig::default(),
+                Some(attempts) => {
+                    let codes = get(ann, RETRY_CODES).map(parse_retry_codes);
+                    let backoff = get(ann, RETRY_BACKOFF).and_then(|v| {
+                        let d = parse_duration(v);
+                        if d.is_none() {
+                            issue!(RETRY_BACKOFF, "invalid duration — no backoff");
+                        }
+                        d
+                    });
+                    RetryPolicyConfig::for_http(attempts, backoff, codes)
+                }
+            },
         };
 
         // ── Path rewrite ──────────────────────────────────────────────────────
@@ -713,31 +701,45 @@ mod tests {
 
     #[test]
     fn parse_retries_full() {
-        use coxswain_core::routing::RetryOn;
-        let m = ann(&[(MAX_RETRIES, "3"), (RETRY_ON, "connect-failure,timeout")]);
+        let m = ann(&[
+            (RETRY_ATTEMPTS, "3"),
+            (RETRY_CODES, "500,503"),
+            (RETRY_BACKOFF, "100ms"),
+        ]);
         let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert_eq!(a.retries.max_retries, 3);
-        assert!(a.retries.on.contains(RetryOn::CONNECT_FAILURE));
-        assert!(a.retries.on.contains(RetryOn::TIMEOUT));
-        assert!(!a.retries.on.contains(RetryOn::HTTP_5XX));
+        assert_eq!(a.retries.attempts, 3);
+        assert_eq!(&*a.retries.http_codes, &[500, 503]);
+        assert_eq!(
+            a.retries.backoff,
+            Some(std::time::Duration::from_millis(100))
+        );
+        // Ingress is HTTP-only: no gRPC codes.
+        assert!(a.retries.grpc_codes.is_empty());
     }
 
     #[test]
-    #[tracing_test::traced_test]
-    fn parse_retries_max_without_on_warns_and_disables() {
-        let m = ann(&[(MAX_RETRIES, "3")]);
+    fn parse_retries_attempts_only_defaults_codes() {
+        let m = ann(&[(RETRY_ATTEMPTS, "2")]);
         let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert!(a.retries.is_disabled());
-        assert!(logs_contain("retry-on is absent"));
+        assert_eq!(a.retries.attempts, 2);
+        // Omitted codes ⇒ the safe [502,503,504] default.
+        assert_eq!(&*a.retries.http_codes, &[502, 503, 504]);
+        assert!(a.retries.backoff.is_none());
     }
 
     #[test]
-    #[tracing_test::traced_test]
-    fn parse_retries_on_without_max_warns_and_disables() {
-        let m = ann(&[(RETRY_ON, "5xx")]);
+    fn parse_retries_absent_attempts_disables() {
+        // codes/backoff without attempts ⇒ disabled (attempts is the gate).
+        let m = ann(&[(RETRY_CODES, "503"), (RETRY_BACKOFF, "1s")]);
         let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
         assert!(a.retries.is_disabled());
-        assert!(logs_contain("max-retries is absent"));
+    }
+
+    #[test]
+    fn parse_retries_zero_attempts_disables() {
+        let m = ann(&[(RETRY_ATTEMPTS, "0"), (RETRY_CODES, "503")]);
+        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        assert!(a.retries.is_disabled());
     }
 
     #[test]

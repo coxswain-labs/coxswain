@@ -1,8 +1,9 @@
 //! Per-request and per-connection context types for the Pingora proxy.
 
+use crate::retry::RetryTrigger;
 use bytes::Bytes;
 use coxswain_core::routing::{
-    BackendGroup, CircuitBreakerConfig, CompressionConfig, FilterAction, RetryOn, RouteTimeouts,
+    BackendGroup, CircuitBreakerConfig, CompressionConfig, FilterAction, RouteTimeouts,
 };
 use http::Method;
 use pingora_core::protocols::http::compression::Encode;
@@ -146,16 +147,16 @@ pub struct ProxyCtx {
     /// Number of upstream attempts already made for this request (excluding the initial).
     ///
     /// Incremented by `fail_to_connect` and `upstream_response_filter` before marking an
-    /// error as retryable.  Compared against `RetryPolicy::max_retries` from the matched
+    /// error as retryable.  Compared against `RetryPolicyConfig::attempts` from the matched
     /// `BackendGroup` to enforce the per-route retry budget.
     pub retries_used: u32,
-    /// The last retry condition that triggered a retry, for use in `error_while_proxy`.
+    /// What triggered the last retry, for use in `error_while_proxy`.
     ///
-    /// Set to the relevant [`RetryOn`] flag before marking an error retryable so that
-    /// `error_while_proxy` can distinguish a 5xx-response retry (which must NOT be
-    /// gated on `client_reused`) from a connection-error retry (which can check the
+    /// Set before marking an error retryable so that `error_while_proxy` can distinguish a
+    /// response-code retry ([`RetryTrigger::HttpCode`]/[`RetryTrigger::GrpcCode`], which must
+    /// NOT be gated on `client_reused`) from a connection-error retry (which can check the
     /// retry buffer).
-    pub last_retry_condition: Option<RetryOn>,
+    pub last_retry_trigger: Option<RetryTrigger>,
     /// Per-route request body size limit in bytes, from the matched route's
     /// `ingress.coxswain-labs.dev/max-body-size` annotation. `None` = unlimited.
     /// Set in `request_filter`; read by the up-front `Content-Length` check and the

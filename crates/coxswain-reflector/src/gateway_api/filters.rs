@@ -9,12 +9,13 @@ use crate::gw_types::v::httproutes::{
 };
 use coxswain_core::crd::{
     BasicAuth, Compression, CoxswainExternalAuth, IpAccessControl, RateLimit, RequestSizeLimit,
+    RetryPolicy,
 };
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, CompressionConfig, CorsConfig, CorsOrigin, FilterAction, HeaderMod,
     HeaderPredicate, IngressAuthConfig, MatchPredicates, MirrorFraction, PathModifier,
-    QueryPredicate, RateLimitConfig, RateLimitKey, ValueMatch, compile_bounded,
+    QueryPredicate, RateLimitConfig, RateLimitKey, RetryPolicyConfig, ValueMatch, compile_bounded,
 };
 use http::{HeaderName, Method};
 use k8s_openapi::api::core::v1::{Secret, Service};
@@ -260,7 +261,7 @@ pub(super) fn build_filters(
                     (
                         super::COXSWAIN_GROUP,
                         "RateLimit" | "IpAccessControl" | "BasicAuth" | "RequestSizeLimit"
-                        | "Compression" | "ExternalAuth",
+                        | "Compression" | "ExternalAuth" | "RetryPolicy",
                     ) => {}
                     _ => tracing::warn!(
                         group = %ext.group,
@@ -734,6 +735,77 @@ pub(super) fn resolve_rate_limit_ref(
         None => RateLimitKey::ClientIp,
     };
     RefResolution::Resolved(Arc::new(RateLimitConfig::new(rps, cr.spec.burst, key)))
+}
+
+/// Scans `filters` for an `ExtensionRef` pointing at a `RetryPolicy` CR and resolves
+/// it into the runtime [`RetryPolicyConfig`] the backend group carries.
+///
+/// Protocol-agnostic via [`ExtRefFilter`]: `is_grpc` selects the code defaulting
+/// (`GRPCRoute` also honours `grpcCodes` and defaults it to `[14]`; `HTTPRoute`
+/// ignores gRPC codes). Only the first matching `ExtensionRef` is used. A missing CR
+/// is fail-open (the default, disabled policy — the route simply does not retry).
+/// Returns the default policy when no `RetryPolicy` ref is present.
+pub(super) fn resolve_retry_policy<F: ExtRefFilter>(
+    filters: &[F],
+    route_ns: &str,
+    retry_policies: &reflector::Store<RetryPolicy>,
+    is_grpc: bool,
+) -> RetryPolicyConfig {
+    ext_refs(filters)
+        .find_map(|(g, k, n)| {
+            match resolve_retry_policy_ref(g, k, n, route_ns, retry_policies, is_grpc) {
+                RefResolution::NotMine => None,
+                RefResolution::Resolved(cfg) => Some(cfg),
+                RefResolution::FailOpen => Some(RetryPolicyConfig::default()),
+            }
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve a single `ExtensionRef` into a [`RetryPolicyConfig`], if it targets a
+/// `RetryPolicy` CR. [`RefResolution::NotMine`] keeps the caller scanning;
+/// [`RefResolution::FailOpen`] (missing CR) yields the default disabled policy.
+fn resolve_retry_policy_ref(
+    ext_group: &str,
+    ext_kind: &str,
+    ext_name: &str,
+    route_ns: &str,
+    retry_policies: &reflector::Store<RetryPolicy>,
+    is_grpc: bool,
+) -> RefResolution<RetryPolicyConfig> {
+    if ext_group != super::COXSWAIN_GROUP || ext_kind != "RetryPolicy" {
+        return RefResolution::NotMine;
+    }
+    let obj_ref = reflector::ObjectRef::<RetryPolicy>::new(ext_name).within(route_ns);
+    let Some(cr) = retry_policies.get(&obj_ref) else {
+        tracing::warn!(
+            ns = route_ns,
+            name = ext_name,
+            "RetryPolicy CR not found — retries disabled (fail-open)"
+        );
+        return RefResolution::FailOpen;
+    };
+    // Absent `attempts` defaults to 1; an explicit 0 disables (handled by the config).
+    let attempts = cr.spec.attempts.unwrap_or(1);
+    let backoff = cr.spec.backoff.as_deref().and_then(|s| {
+        let d = crate::duration::parse_duration(s);
+        if d.is_none() {
+            tracing::warn!(
+                ns = route_ns,
+                name = ext_name,
+                value = s,
+                "RetryPolicy backoff is not a valid duration — no backoff applied"
+            );
+        }
+        d
+    });
+    let http_codes = cr.spec.codes.clone();
+    let cfg = if is_grpc {
+        RetryPolicyConfig::for_grpc(attempts, backoff, http_codes, cr.spec.grpc_codes.clone())
+    } else {
+        RetryPolicyConfig::for_http(attempts, backoff, http_codes)
+    };
+    RefResolution::Resolved(cfg)
 }
 
 /// Scans `filters` for an `ExtensionRef` pointing at an `IpAccessControl` CR
@@ -1244,6 +1316,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1304,6 +1377,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1362,6 +1436,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1426,6 +1501,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1497,6 +1573,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1977,5 +2054,105 @@ mod tests {
         let cfg = resolve_compression(&[compression_ext_ref("absent")], "default", &store);
         assert!(cfg.is_none());
         assert!(logs_contain("Compression CR not found"));
+    }
+
+    // ── resolve_retry_policy (#445) ───────────────────────────────────────────
+
+    use crate::tests::fixtures::{empty_retry_policy_store, make_retry_policy_store};
+    use coxswain_core::crd::RetryPolicy;
+
+    fn retry_ext_ref(name: &str) -> HttpRouteRulesFilters {
+        HttpRouteRulesFilters {
+            r#type: HttpRouteRulesFiltersType::ExtensionRef,
+            extension_ref: Some(HttpRouteRulesFiltersExtensionRef {
+                group: "gateway.coxswain-labs.dev".to_string(),
+                kind: "RetryPolicy".to_string(),
+                name: name.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    // `RetryPolicySpec` is `#[non_exhaustive]` — deserialize a CR instead.
+    fn retry_cr(ns: &str, name: &str, spec_body: &str) -> RetryPolicy {
+        let indented = spec_body.replace('\n', "\n  ");
+        let yaml = format!(
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: RetryPolicy\n\
+             metadata:\n  name: {name}\n  namespace: {ns}\n\
+             spec:\n  {indented}\n",
+        );
+        serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("valid RetryPolicy: {e}\n{yaml}"))
+    }
+
+    #[test]
+    fn resolve_retry_http_defaults_codes_when_omitted() {
+        let store = make_retry_policy_store(vec![retry_cr("default", "r", "attempts: 3")]);
+        let p = resolve_retry_policy(&[retry_ext_ref("r")], "default", &store, false);
+        assert_eq!(p.attempts, 3);
+        assert_eq!(&*p.http_codes, &[502, 503, 504]);
+        // HTTPRoute ignores gRPC codes entirely.
+        assert!(p.grpc_codes.is_empty());
+        assert!(p.backoff.is_none());
+    }
+
+    #[test]
+    fn resolve_retry_http_explicit_codes_and_backoff() {
+        let store = make_retry_policy_store(vec![retry_cr(
+            "default",
+            "r",
+            "attempts: 2\nbackoff: 100ms\ncodes: [503, 503, 500]",
+        )]);
+        let p = resolve_retry_policy(&[retry_ext_ref("r")], "default", &store, false);
+        // Sorted + deduped.
+        assert_eq!(&*p.http_codes, &[500, 503]);
+        assert_eq!(p.backoff, Some(std::time::Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn resolve_retry_grpc_defaults_grpc_codes() {
+        let store = make_retry_policy_store(vec![retry_cr("default", "r", "attempts: 1")]);
+        let p = resolve_retry_policy(&[retry_ext_ref("r")], "default", &store, true);
+        // GRPCRoute: grpcCodes defaults to [14], and HTTP codes still default too.
+        assert_eq!(&*p.grpc_codes, &[14]);
+        assert_eq!(&*p.http_codes, &[502, 503, 504]);
+    }
+
+    #[test]
+    fn resolve_retry_explicit_empty_codes_opts_out() {
+        let store = make_retry_policy_store(vec![retry_cr(
+            "default",
+            "r",
+            "attempts: 2\ncodes: []\ngrpcCodes: []",
+        )]);
+        let p = resolve_retry_policy(&[retry_ext_ref("r")], "default", &store, true);
+        // Explicit empty ⇒ no response-code retries, but still enabled (connection retries).
+        assert!(p.http_codes.is_empty());
+        assert!(p.grpc_codes.is_empty());
+        assert!(!p.is_disabled());
+    }
+
+    #[test]
+    fn resolve_retry_absent_attempts_defaults_to_one() {
+        let store = make_retry_policy_store(vec![retry_cr("default", "r", "codes: [503]")]);
+        let p = resolve_retry_policy(&[retry_ext_ref("r")], "default", &store, false);
+        assert_eq!(p.attempts, 1);
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn resolve_retry_missing_cr_fails_open_disabled() {
+        let store = empty_retry_policy_store();
+        let p = resolve_retry_policy(&[retry_ext_ref("absent")], "default", &store, false);
+        assert!(p.is_disabled());
+        assert!(logs_contain("RetryPolicy CR not found"));
+    }
+
+    #[test]
+    fn resolve_retry_no_ref_returns_default() {
+        let store = empty_retry_policy_store();
+        // A route with an unrelated ExtensionRef (or none) gets the disabled default.
+        let p = resolve_retry_policy(&[ip_access_ext_ref("x")], "default", &store, false);
+        assert!(p.is_disabled());
     }
 }

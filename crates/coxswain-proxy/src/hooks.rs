@@ -41,12 +41,12 @@ use crate::filters::cors::try_cors_preflight;
 use crate::filters::redirect::{extract_host, try_redirect};
 use crate::policy::access_control::{ip_allowed, ip_denied, resolve_client_ip};
 use crate::policy::affinity;
+use crate::retry::RetryTrigger;
 use crate::routing::engine::RoutingEngine;
 use crate::routing::outcome::{merge_timeouts, resolve_outcome};
 use bytes::Bytes;
 use coxswain_core::routing::{
-    HashSource, RateLimitKey, RequestContext, RetryOn, SessionAffinity, affinity_hash,
-    affinity_hash_parts,
+    HashSource, RateLimitKey, RequestContext, SessionAffinity, affinity_hash, affinity_hash_parts,
 };
 use coxswain_core::tls::ClientCertConfigState;
 use http::header;
@@ -75,7 +75,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             start: None,
             upstream_addr: None,
             retries_used: 0,
-            last_retry_condition: None,
+            last_retry_trigger: None,
             max_body_size: None,
             body_bytes_seen: 0,
             is_h2: false,
@@ -599,6 +599,15 @@ pub(crate) async fn upstream_peer(
         ));
     }
 
+    // Retry backoff (#445): on a retried attempt only, wait the `RetryPolicy` minimum
+    // delay before re-connecting. Guarded on `retries_used > 0` so the initial attempt
+    // never sleeps (keeps the zero-retry hot path allocation- and await-free here).
+    if ctx.retries_used > 0
+        && let Some(delay) = resolved.backend_group.retry_policy().backoff
+    {
+        tokio::time::sleep(delay).await;
+    }
+
     // Session affinity: honor a pin resolved in `request_filter` (a live cookie/header
     // match), recovering that endpoint's per-backend filters; otherwise apply the
     // per-route load-balancing algorithm via `select_upstream`. A stale pin never
@@ -900,22 +909,40 @@ pub(crate) fn connected_to_upstream(
     Ok(())
 }
 
+/// Extract the `grpc-status` code from a **trailers-only** gRPC response.
+///
+/// Returns `Some(code)` only when the response is gRPC (`content-type:
+/// application/grpc*`) AND carries a `grpc-status` header directly — a trailers-only
+/// response (HEADERS frame with END_STREAM), the sole case where nothing has been
+/// streamed to the client yet and a retry is safe. A `grpc-status` arriving as a real
+/// trailer after a message body is not visible here (and is not retriable), matching
+/// Envoy's gRPC retry limitation.
+fn grpc_trailers_only_status(resp: &ResponseHeader) -> Option<u16> {
+    let ct = resp.headers.get(header::CONTENT_TYPE)?;
+    if !ct.as_bytes().starts_with(b"application/grpc") {
+        return None;
+    }
+    let gs = resp.headers.get("grpc-status")?;
+    std::str::from_utf8(gs.as_bytes()).ok()?.trim().parse().ok()
+}
+
 /// Pingora `upstream_response_filter` body: apply rule-level response filters and
-/// trigger a retry when the upstream returns a 5xx status and the route allows it.
+/// trigger a retry when the upstream returns a retriable response and the route allows it.
 ///
-/// ## 5xx-response retries
+/// ## Response-code retries (#445)
 ///
-/// When `retry-on` includes `5xx` and `max-retries` budget remains, this function
-/// returns a retryable `Err` so Pingora re-enters the retry loop and calls
-/// `upstream_peer` again.  On the **final** attempt (budget exhausted) the 5xx
-/// passes through to the client unmodified.
+/// When the response status is in the route's `RetryPolicy.http_codes` (HTTP) or a
+/// trailers-only `grpc-status` is in `grpc_codes` (gRPC) and the `attempts` budget
+/// remains, this function returns a retryable `Err` so Pingora re-enters the retry loop
+/// and calls `upstream_peer` again. On the **final** attempt (budget exhausted) the
+/// response passes through to the client unmodified.
 ///
 /// **Replay guard**: retries are suppressed when `session.retry_buffer_truncated()`
 /// is true — large or streaming request bodies cannot be replayed safely.
 ///
 /// # Errors
 /// Propagates header-mutation errors from [`TrafficFilter::apply_response_filters`]
-/// and returns a retryable upstream error when a 5xx retry is triggered.
+/// and returns a retryable upstream error when a response-code retry is triggered.
 pub(crate) async fn upstream_response_filter(
     session: &mut Session,
     upstream_response: &mut ResponseHeader,
@@ -945,33 +972,44 @@ pub(crate) async fn upstream_response_filter(
     let status = upstream_response.status.as_u16();
     if status >= 500 {
         crate::retry::inc_upstream_error(ctx, "5xx");
+    }
 
-        // 5xx-response retry: check policy, budget, and replay safety.
-        let retry_allowed = ctx.resolved.as_ref().is_some_and(|r| {
-            r.backend_group
-                .retry_policy()
-                .on
-                .contains(RetryOn::HTTP_5XX)
-        });
-        let budget_ok = ctx
-            .resolved
-            .as_ref()
-            .is_some_and(|r| ctx.retries_used < r.backend_group.retry_policy().max_retries);
-        if retry_allowed && budget_ok && !session.as_ref().retry_buffer_truncated() {
-            ctx.retries_used += 1;
-            ctx.last_retry_condition = Some(RetryOn::HTTP_5XX);
-            crate::retry::inc_upstream_retry(ctx, "5xx");
-            let mut e = Error::explain(
-                HTTPStatus(status),
-                format!(
-                    "upstream returned {status}; retrying (attempt {})",
-                    ctx.retries_used
-                ),
-            );
-            e.retry = true.into();
-            e.as_up();
-            return Err(e);
+    // Response-code retry (#445). Decide without holding a borrow of `ctx` across the
+    // mutation below. Two mutually exclusive paths:
+    //  - gRPC: a trailers-only response (status usually 200) whose `grpc-status` is in
+    //    `RetryPolicy.grpc_codes`. Only trailers-only is retriable — nothing streamed yet.
+    //  - HTTP: response status is in `RetryPolicy.http_codes`.
+    let grpc_status = grpc_trailers_only_status(upstream_response);
+    let decision: Option<(RetryTrigger, &'static str)> = ctx.resolved.as_ref().and_then(|r| {
+        let policy = r.backend_group.retry_policy();
+        if ctx.retries_used >= policy.attempts {
+            return None;
         }
+        match grpc_status {
+            // gRPC application outcome: HTTP `codes` do not apply (status is 200).
+            Some(code) if policy.retries_grpc(code) => Some((RetryTrigger::GrpcCode, "grpc-code")),
+            Some(_) => None,
+            None if policy.retries_http(status) => Some((RetryTrigger::HttpCode, "http-code")),
+            None => None,
+        }
+    });
+
+    if let Some((trigger, condition)) = decision
+        && !session.as_ref().retry_buffer_truncated()
+    {
+        ctx.retries_used += 1;
+        ctx.last_retry_trigger = Some(trigger);
+        crate::retry::inc_upstream_retry(ctx, condition);
+        let mut e = Error::explain(
+            HTTPStatus(status),
+            format!(
+                "upstream returned a retriable response ({condition}); retrying (attempt {})",
+                ctx.retries_used
+            ),
+        );
+        e.retry = true.into();
+        e.as_up();
+        return Err(e);
     }
 
     // Response compression (#270): set up a streaming encoder when the route has

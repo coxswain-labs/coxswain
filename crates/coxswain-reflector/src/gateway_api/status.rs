@@ -50,7 +50,8 @@ impl RouteLike for HttpRoute {
                     return ext.group != super::COXSWAIN_GROUP
                         || (ext.kind != "RateLimit"
                             && ext.kind != "PathRewriteRegex"
-                            && ext.kind != "IpAccessControl");
+                            && ext.kind != "IpAccessControl"
+                            && ext.kind != "RetryPolicy");
                 }
                 false
             })

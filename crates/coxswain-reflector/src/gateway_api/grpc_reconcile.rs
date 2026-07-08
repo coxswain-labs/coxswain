@@ -19,7 +19,7 @@ use crate::gw_types::{
 };
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
-use coxswain_core::crd::{IpAccessControl, RateLimit};
+use coxswain_core::crd::{IpAccessControl, RateLimit, RetryPolicy};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
@@ -57,6 +57,10 @@ pub struct GrpcRouteResolution<'a> {
     /// `RateLimit` CR store for resolving `ExtensionRef` filters into per-route
     /// rate-limiting config (#25). A missing CR fails open (route not limited).
     pub rate_limits: &'a reflector::Store<RateLimit>,
+    /// `RetryPolicy` CR store for resolving `ExtensionRef` filters into the per-route
+    /// retry policy (#445). A missing CR fails open (no retries). `GRPCRoute` also
+    /// honours `grpcCodes` (trailers-only retry on retriable `grpc-status`).
+    pub retry_policies: &'a reflector::Store<RetryPolicy>,
     /// `IpAccessControl` CR store for resolving `ExtensionRef` filters into per-route
     /// source-IP allow/deny CIDR sets (#479). A missing CR fails open (no filtering).
     pub ip_access: &'a reflector::Store<IpAccessControl>,
@@ -88,6 +92,7 @@ pub(super) fn reconcile(
         policy_index,
         backend_policy_index,
         rate_limits,
+        retry_policies,
         ip_access,
     } = resolution;
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
@@ -226,6 +231,11 @@ pub(super) fn reconcile(
                 group = group.with_load_balance(lb.clone());
             }
         }
+        // RetryPolicy ExtensionRef (#445): GRPCRoute ⇒ `is_grpc=true`, so `grpcCodes`
+        // (trailers-only retry) is honoured and defaults to `[14]` (UNAVAILABLE).
+        let retry =
+            super::filters::resolve_retry_policy(rule_filters, route_ns, retry_policies, true);
+        group = group.with_retries(retry);
         let circuit_breaker = bp.and_then(|bp| bp.circuit_breaker.clone());
         let group = Arc::new(group);
 
@@ -555,7 +565,10 @@ fn build_filters(filters: &[GrpcRouteRulesFilters]) -> Vec<FilterAction> {
                 // the client under pingora; gRPC is limited by the backend instead).
                 let supported = f.extension_ref.as_ref().is_some_and(|ext| {
                     ext.group == super::COXSWAIN_GROUP
-                        && (ext.kind == "RateLimit" || ext.kind == "IpAccessControl")
+                        && matches!(
+                            ext.kind.as_str(),
+                            "RateLimit" | "IpAccessControl" | "RetryPolicy"
+                        )
                 });
                 if !supported {
                     tracing::warn!(
@@ -1227,7 +1240,8 @@ mod tests {
     fn reconcile_grpc_route_only(route: &GrpcRoute) -> coxswain_core::routing::GatewayRoutingTable {
         use crate::gateway_api::tests::{default_owned, make_listener_info};
         use crate::tests::fixtures::{
-            empty_ip_access_store, empty_rate_limit_store, empty_svc_store,
+            empty_ip_access_store, empty_rate_limit_store, empty_retry_policy_store,
+            empty_svc_store,
         };
         let listener_info = make_listener_info("default", "gw", &[("l1", "", 80)]);
         let mut builder = GatewayRoutingTableBuilder::new();
@@ -1242,6 +1256,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 ip_access: &empty_ip_access_store(),
             },
             &mut builder,

@@ -51,7 +51,7 @@ use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
 use coxswain_core::crd::coxswain_backend_policy::CoxswainBackendPolicy;
 use coxswain_core::crd::{
     BasicAuth, Compression, CoxswainExternalAuth, CoxswainIngressClassParameters, IpAccessControl,
-    PathRewriteRegex, RateLimit, RequestSizeLimit,
+    PathRewriteRegex, RateLimit, RequestSizeLimit, RetryPolicy,
 };
 use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 use coxswain_core::fleet::{self, SharedFleet};
@@ -787,6 +787,9 @@ pub(super) struct ReflectorStores<'a> {
     /// `RateLimit` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters during Gateway API reconciliation.
     pub(super) rate_limits: &'a reflector::Store<RateLimit>,
+    /// `RetryPolicy` CRs in scope — resolved from `HTTPRouteRule`/`GRPCRouteRule`
+    /// `ExtensionRef` filters into the per-route retry policy (#445).
+    pub(super) retry_policies: &'a reflector::Store<RetryPolicy>,
     /// `PathRewriteRegex` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters during Gateway API reconciliation.
     pub(super) path_rewrites: &'a reflector::Store<PathRewriteRegex>,
@@ -1099,6 +1102,7 @@ struct GatewayApiStoreWriters {
     policies: reflector::store::Writer<BackendTlsPolicy>,
     configmaps: reflector::store::Writer<ConfigMap>,
     rate_limits: reflector::store::Writer<RateLimit>,
+    retry_policies: reflector::store::Writer<RetryPolicy>,
     path_rewrites: reflector::store::Writer<PathRewriteRegex>,
     ip_access: reflector::store::Writer<IpAccessControl>,
     basic_auths: reflector::store::Writer<BasicAuth>,
@@ -1135,6 +1139,7 @@ fn add_gateway_api_reflectors(
         policies,
         configmaps,
         rate_limits,
+        retry_policies,
         path_rewrites,
         ip_access,
         basic_auths,
@@ -1220,6 +1225,14 @@ fn add_gateway_api_reflectors(
         watcher::Config::default(),
         ReflectorEffects::new(notify, health, "rate_limit", metrics),
         "RateLimit",
+    );
+    spawn_reflector(
+        set,
+        retry_policies,
+        scoped_api::<RetryPolicy>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "retry_policy", metrics),
+        "RetryPolicy",
     );
     spawn_reflector(
         set,
@@ -1377,6 +1390,7 @@ async fn spawn_tasks(
     let (policy_reader, policy_writer) = reader_writer::<BackendTlsPolicy>(pre.policies);
     let (configmap_reader, configmap_writer) = reflector::store::<ConfigMap>();
     let (rate_limit_reader, rate_limit_writer) = reflector::store::<RateLimit>();
+    let (retry_policy_reader, retry_policy_writer) = reflector::store::<RetryPolicy>();
     let (path_rewrite_reader, path_rewrite_writer) = reflector::store::<PathRewriteRegex>();
     let (ip_access_reader, ip_access_writer) = reflector::store::<IpAccessControl>();
     let (basic_auth_reader, basic_auth_writer) = reflector::store::<BasicAuth>();
@@ -1524,6 +1538,7 @@ async fn spawn_tasks(
             policies: policy_writer,
             configmaps: configmap_writer,
             rate_limits: rate_limit_writer,
+            retry_policies: retry_policy_writer,
             path_rewrites: path_rewrite_writer,
             ip_access: ip_access_writer,
             basic_auths: basic_auth_writer,
@@ -1677,6 +1692,7 @@ async fn spawn_tasks(
                 policies: &policy_reader,
                 configmaps: &configmap_reader,
                 rate_limits: &rate_limit_reader,
+                retry_policies: &retry_policy_reader,
                 path_rewrites: &path_rewrite_reader,
                 ip_access: &ip_access_reader,
                 basic_auths: &basic_auth_reader,

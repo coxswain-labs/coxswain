@@ -8,7 +8,6 @@
 
 use crate::ctx::ProxyCtx;
 use bytes::Bytes;
-use coxswain_core::routing::RetryOn;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{
     ConnectTimedout, ConnectionClosed, ErrorSource, HTTPStatus, ReadError, ReadTimedout,
@@ -16,15 +15,33 @@ use pingora_core::{
 };
 use pingora_proxy::{FailToProxy, Session};
 
+/// Why the last retry was triggered.
+///
+/// Drives [`error_while_proxy`]: a response-based retry (`HttpCode`/`GrpcCode`, set in
+/// `upstream_response_filter` after the connection already delivered a response) must be
+/// preserved unconditionally, whereas a connection-error retry re-runs Pingora's reuse
+/// check.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetryTrigger {
+    /// Upstream TCP/TLS connection failure on a fresh connection — always replay-safe.
+    ConnectError,
+    /// Upstream connect timeout.
+    Timeout,
+    /// Retriable HTTP response status matched against `RetryPolicy.http_codes`.
+    HttpCode,
+    /// Retriable trailers-only gRPC `grpc-status` matched against `RetryPolicy.grpc_codes`.
+    GrpcCode,
+}
+
 /// Pingora `fail_to_connect` body: retry upstream connection failures when the
 /// route's `RetryPolicy` permits.
 ///
 /// Called when establishing the TCP/TLS connection to the upstream fails **before**
-/// any request bytes are sent, so replaying the request is always safe.
-/// Marks the error retryable when:
-/// - `retry-on` includes `connect-failure` (for `ErrorSource::Upstream` non-timeout
-///   errors) or `timeout` (for `ConnectTimedout`); and
-/// - the `max-retries` budget is not exhausted.
+/// any request bytes are sent, so replaying the request is always safe. Under the
+/// exact-native-mirror model, connection failures and connect-timeouts are retried
+/// whenever `attempts >= 1` and the budget is not exhausted — there is no per-condition
+/// opt-in (GEP-1731 has no connection-error field; it is implicit).
 pub(crate) fn fail_to_connect(
     _session: &mut Session,
     _peer: &HttpPeer,
@@ -35,26 +52,23 @@ pub(crate) fn fail_to_connect(
         return e;
     };
     let policy = resolved.backend_group.retry_policy();
-    if policy.is_disabled() || ctx.retries_used >= policy.max_retries {
+    if policy.is_disabled() || ctx.retries_used >= policy.attempts {
         return e;
     }
     let is_timeout = matches!(e.etype(), ConnectTimedout);
-    let condition = if is_timeout {
-        RetryOn::TIMEOUT
+    ctx.retries_used += 1;
+    ctx.last_retry_trigger = Some(if is_timeout {
+        RetryTrigger::Timeout
     } else {
-        RetryOn::CONNECT_FAILURE
+        RetryTrigger::ConnectError
+    });
+    e.retry = true.into();
+    let condition_label = if is_timeout {
+        "timeout"
+    } else {
+        "connect-failure"
     };
-    if policy.on.contains(condition) {
-        ctx.retries_used += 1;
-        ctx.last_retry_condition = Some(condition);
-        e.retry = true.into();
-        let condition_label = if is_timeout {
-            "timeout"
-        } else {
-            "connect-failure"
-        };
-        inc_upstream_retry(ctx, condition_label);
-    }
+    inc_upstream_retry(ctx, condition_label);
     e
 }
 
@@ -63,8 +77,8 @@ pub(crate) fn fail_to_connect(
 ///
 /// Pingora's default implementation gates retries on `client_reused &&
 /// !retry_buffer_truncated()`.  We override it to:
-/// - Keep the `retry = true` set by `fail_to_connect` (connect-failure path) or
-///   `upstream_response_filter` (5xx-response path) unconditionally when those
+/// - Keep the `retry = true` set by `fail_to_connect` (connection path) or
+///   `upstream_response_filter` (response-code path) unconditionally when those
 ///   hooks already bumped `retries_used`.
 /// - Fall back to Pingora's default reuse-check for errors not triggered by our
 ///   own retry logic (e.g. mid-response I/O errors).
@@ -75,9 +89,12 @@ pub(crate) fn error_while_proxy(
     ctx: &mut ProxyCtx,
     client_reused: bool,
 ) -> Box<pingora_core::Error> {
-    if ctx.last_retry_condition == Some(RetryOn::HTTP_5XX) {
-        // 5xx-response retry was already set in upstream_response_filter; preserve it.
-        // (Do NOT gate on client_reused — the connection held the response, not a reuse.)
+    if matches!(
+        ctx.last_retry_trigger,
+        Some(RetryTrigger::HttpCode | RetryTrigger::GrpcCode)
+    ) {
+        // A response-code retry was already decided in upstream_response_filter; preserve
+        // it. (Do NOT gate on client_reused — the connection held the response, not a reuse.)
         e.retry = true.into();
         return e;
     }
