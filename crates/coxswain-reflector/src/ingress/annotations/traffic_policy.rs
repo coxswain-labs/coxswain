@@ -5,7 +5,7 @@
 //! empty default) so the affected annotation is treated as absent — the Ingress
 //! keeps serving.
 
-use coxswain_core::routing::{CompressionConfig, LoadBalance, LoadBalanceParseError, RetryOn};
+use coxswain_core::routing::{CompressionConfig, LoadBalance, LoadBalanceParseError};
 
 // ── Timeout annotation keys ───────────────────────────────────────────────────
 
@@ -17,11 +17,21 @@ pub const READ_TIMEOUT: &str = "ingress.coxswain-labs.dev/read-timeout";
 pub const SEND_TIMEOUT: &str = "ingress.coxswain-labs.dev/send-timeout";
 
 // ── Retry annotation keys ─────────────────────────────────────────────────────
+//
+// GEP-1731-shaped (`attempts` / `backoff` / `codes`) so the vocabulary matches the
+// Gateway API `RetryPolicy` CRD and the future native `HTTPRoute.spec.rules[].retry`
+// field. `retry-attempts` is the gate: when absent, retries are disabled regardless
+// of the other keys. Connection failures and connect-timeouts are retried implicitly
+// whenever `retry-attempts >= 1` (the exact-native-mirror model).
 
 /// Maximum number of retries after the initial attempt — unsigned decimal integer.
-pub const MAX_RETRIES: &str = "ingress.coxswain-labs.dev/max-retries";
-/// Comma-separated retry conditions: `connect-failure`, `timeout`, `5xx`.
-pub const RETRY_ON: &str = "ingress.coxswain-labs.dev/retry-on";
+/// The gate: absent ⇒ retries disabled; `0` ⇒ disabled.
+pub const RETRY_ATTEMPTS: &str = "ingress.coxswain-labs.dev/retry-attempts";
+/// Comma-separated HTTP status codes to retry on (e.g. `"502,503,504"`).
+/// Absent (with `retry-attempts` set) defaults to `502,503,504`.
+pub const RETRY_CODES: &str = "ingress.coxswain-labs.dev/retry-codes";
+/// Minimum delay before a retried attempt — Go `time.ParseDuration` string, e.g. `"100ms"`.
+pub const RETRY_BACKOFF: &str = "ingress.coxswain-labs.dev/retry-backoff";
 
 // ── Max-body-size annotation key ─────────────────────────────────────────────
 
@@ -134,23 +144,23 @@ pub fn parse_u32(s: &str) -> Option<u32> {
     })
 }
 
-/// Parse the `retry-on` annotation — a comma-separated list of condition names.
+/// Parse the `retry-codes` annotation — a comma-separated list of HTTP status codes.
 ///
-/// Valid tokens: `connect-failure`, `timeout`, `5xx`.
-/// Unknown tokens emit a `WARN` and are ignored; the rest are applied.
-/// Returns the empty [`RetryOn`] set when `s` is blank or all tokens are unknown.
+/// Non-numeric or out-of-range (`> u16::MAX`) tokens emit a `WARN` and are ignored;
+/// the rest are collected in input order (the resolver sorts/dedupes). An entirely
+/// blank value yields an empty list (explicit opt-out of response-code retries).
 #[must_use]
-pub fn parse_retry_on(s: &str) -> RetryOn {
-    let mut set = RetryOn::empty();
-    for token in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-        match token {
-            "connect-failure" => set.insert(RetryOn::CONNECT_FAILURE),
-            "timeout" => set.insert(RetryOn::TIMEOUT),
-            "5xx" => set.insert(RetryOn::HTTP_5XX),
-            _ => tracing::warn!(token, "unknown retry-on condition — ignoring"),
-        }
-    }
-    set
+pub fn parse_retry_codes(s: &str) -> Vec<u16> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .filter_map(|token| {
+            token.parse::<u16>().ok().or_else(|| {
+                tracing::warn!(token, "invalid retry-codes status code — ignoring");
+                None
+            })
+        })
+        .collect()
 }
 
 /// Parse a byte-size annotation value: a bare byte count (`"10485760"`) or a value
@@ -694,39 +704,35 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_on_all_conditions() {
+    fn parse_retry_codes_multiple() {
         // References CONNECT_TIMEOUT via test constants to satisfy annotation-coverage gate.
         let _ = CONNECT_TIMEOUT;
         let _ = READ_TIMEOUT;
         let _ = SEND_TIMEOUT;
-        let _ = MAX_RETRIES;
+        let _ = RETRY_ATTEMPTS;
+        let _ = RETRY_BACKOFF;
 
-        let r = parse_retry_on("connect-failure,timeout,5xx");
-        assert!(r.contains(RetryOn::CONNECT_FAILURE));
-        assert!(r.contains(RetryOn::TIMEOUT));
-        assert!(r.contains(RetryOn::HTTP_5XX));
+        assert_eq!(parse_retry_codes("502,503,504"), vec![502, 503, 504]);
     }
 
     #[test]
-    fn parse_retry_on_partial() {
-        let _ = RETRY_ON;
-        let r = parse_retry_on("5xx");
-        assert!(!r.contains(RetryOn::CONNECT_FAILURE));
-        assert!(r.contains(RetryOn::HTTP_5XX));
+    fn parse_retry_codes_trims_and_skips_blanks() {
+        let _ = RETRY_CODES;
+        assert_eq!(parse_retry_codes(" 503 , 504 "), vec![503, 504]);
     }
 
     #[test]
-    fn parse_retry_on_empty() {
-        assert!(parse_retry_on("").is_empty());
-        assert!(parse_retry_on("   ").is_empty());
+    fn parse_retry_codes_empty() {
+        assert!(parse_retry_codes("").is_empty());
+        assert!(parse_retry_codes("   ").is_empty());
     }
 
     #[test]
     #[tracing_test::traced_test]
-    fn parse_retry_on_unknown_token_warns() {
-        let r = parse_retry_on("connect-failure,bogus");
-        assert!(r.contains(RetryOn::CONNECT_FAILURE));
-        assert!(logs_contain("unknown retry-on condition"));
+    fn parse_retry_codes_invalid_token_warns() {
+        let r = parse_retry_codes("503,bogus");
+        assert_eq!(r, vec![503]);
+        assert!(logs_contain("invalid retry-codes status code"));
     }
 
     #[test]

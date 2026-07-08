@@ -1883,8 +1883,7 @@ mod tests {
 
     #[test]
     fn annotation_retries_stored_on_backend_group() {
-        use crate::ingress::annotations::{MAX_RETRIES, RETRY_ON};
-        use coxswain_core::routing::RetryOn;
+        use crate::ingress::annotations::{RETRY_ATTEMPTS, RETRY_BACKOFF, RETRY_CODES};
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
@@ -1892,8 +1891,9 @@ mod tests {
             "/",
             "svc",
             &[
-                (MAX_RETRIES, "3"),
-                (RETRY_ON, "connect-failure,timeout,5xx"),
+                (RETRY_ATTEMPTS, "3"),
+                (RETRY_CODES, "502,503"),
+                (RETRY_BACKOFF, "100ms"),
             ],
         );
         let svcs = empty_svc_store();
@@ -1905,10 +1905,9 @@ mod tests {
             .route(80, "example.com", "/", &ctx)
             .expect("route not found");
         let policy = group.retry_policy();
-        assert_eq!(policy.max_retries, 3);
-        assert!(policy.on.contains(RetryOn::CONNECT_FAILURE));
-        assert!(policy.on.contains(RetryOn::TIMEOUT));
-        assert!(policy.on.contains(RetryOn::HTTP_5XX));
+        assert_eq!(policy.attempts, 3);
+        assert_eq!(&*policy.http_codes, &[502, 503]);
+        assert_eq!(policy.backoff, Some(std::time::Duration::from_millis(100)));
     }
 
     #[test]

@@ -170,6 +170,7 @@ pub fn spawn_status_writer(
         "coxswain_backend_policy",
         "config_map",
         "rate_limit",
+        "retry_policy",
         "path_rewrite_regex",
         "ip_access_control",
         "basic_auth",

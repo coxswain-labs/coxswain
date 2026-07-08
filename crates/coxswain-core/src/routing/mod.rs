@@ -40,7 +40,7 @@ pub use common::predicate::{
     HeaderPredicate, MatchPredicates, QueryPredicate, RequestContext, ValueMatch,
 };
 pub use common::rate_limit::{RateLimitConfig, RateLimitKey};
-pub use common::retry::{RetryOn, RetryPolicy};
+pub use common::retry::RetryPolicyConfig;
 pub use common::table::{RouteOutcome, RouterError, RoutingTable, RoutingTableBuilder};
 pub use common::upstream_tls::{
     BackendClientCert, BackendProtocol, SubjectAltName, UpstreamCa, UpstreamTls,

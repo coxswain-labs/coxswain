@@ -21,7 +21,7 @@ use crate::keys::ListenerKey;
 use crate::status::{GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerStatusKey};
 use coxswain_core::crd::{
     BasicAuth, Compression, CoxswainExternalAuth, IpAccessControl, PathRewriteRegex, RateLimit,
-    RequestSizeLimit,
+    RequestSizeLimit, RetryPolicy,
 };
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
@@ -62,6 +62,10 @@ pub struct RouteResolution<'a> {
     /// `HTTPRouteRule`s. Looked up by `(namespace, name)` from the filter;
     /// missing CRs produce a WARN and fail-open (route is not limited).
     pub rate_limits: &'a reflector::Store<RateLimit>,
+    /// `RetryPolicy` CR store for resolving `ExtensionRef` filters on `HTTPRouteRule`s
+    /// (#445). The resolved policy is attached to the rule's `BackendGroup`s; a missing
+    /// CR fails open (no retries). Protocol-agnostic — GRPCRoute uses the same store.
+    pub retry_policies: &'a reflector::Store<RetryPolicy>,
     /// `PathRewriteRegex` CR store for resolving `ExtensionRef` filters on
     /// `HTTPRouteRule`s.
     pub path_rewrites: &'a reflector::Store<PathRewriteRegex>,
@@ -137,6 +141,7 @@ impl GatewayApiReconciler {
             policy_index,
             backend_policy_index,
             rate_limits,
+            retry_policies,
             path_rewrites,
             ip_access,
             basic_auths,
@@ -377,6 +382,16 @@ impl GatewayApiReconciler {
                         group = group.with_load_balance(lb.clone());
                     }
                 }
+                // RetryPolicy ExtensionRef (#445): attach the resolved retry policy to the
+                // group (upstream retrying is a backend concern). Default (disabled) when no
+                // RetryPolicy ref is present or the CR is missing. HTTPRoute ⇒ `is_grpc=false`.
+                let retry = super::filters::resolve_retry_policy(
+                    rule_filters,
+                    route_ns,
+                    retry_policies,
+                    false,
+                );
+                group = group.with_retries(retry);
                 let circuit_breaker = bp.and_then(|bp| bp.circuit_breaker.clone());
                 let group = Arc::new(group);
                 if invalid_policy || client_cert_fail_closed {
@@ -1286,6 +1301,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1333,6 +1349,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1380,6 +1397,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1419,6 +1437,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1457,6 +1476,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1534,6 +1554,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1587,6 +1608,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1665,6 +1687,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1754,6 +1777,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1818,6 +1842,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1915,6 +1940,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -1969,6 +1995,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -2015,6 +2042,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -2063,6 +2091,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -2103,6 +2132,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -2166,6 +2196,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),
@@ -2234,6 +2265,7 @@ mod tests {
                 policy_index: &HashMap::new(),
                 backend_policy_index: &HashMap::new(),
                 rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
                 path_rewrites: &empty_path_rewrite_store(),
                 ip_access: &empty_ip_access_store(),
                 basic_auths: &empty_basic_auth_store(),

@@ -33,7 +33,7 @@ pub(super) fn build_ingress_backend_group(
 ) -> BackendGroup {
     BackendGroup::new(format!("{ns}/{svc_name}"), addrs)
         .with_protocol(protocol)
-        .with_retries(ann.retries)
+        .with_retries(ann.retries.clone())
         .with_session_affinity(ann.session_affinity.clone())
         .with_keepalive_timeout(ann.keepalive_timeout)
         .with_load_balance(ann.load_balance.clone())

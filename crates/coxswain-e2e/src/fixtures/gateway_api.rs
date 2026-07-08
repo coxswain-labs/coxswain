@@ -217,6 +217,23 @@ pub const GRPC_IP_ACCESS_RESTRICTED: &str = fixture!("grpc_ip_access_restricted.
 /// Gateway + GRPCRoute + `RateLimit` (rps=1) via `ExtensionRef` (#25 gRPC
 /// parity). The first call is served; rapid follow-ups are rejected.
 pub const GRPC_RATE_LIMIT: &str = fixture!("grpc_rate_limit.yaml");
+/// Gateway + `RetryPolicy` CR (attempts=2, codes=[503], backoff=200ms) + HTTPRoute
+/// `ExtensionRef` (#445 HTTP happy path). Routes to go-httpbin `/status/503`; the
+/// proxy fires two retries (observable via the retry metric) with backoff before the
+/// final 503. Apply `backends::GO_HTTPBIN` first.
+pub const RETRY_HTTP: &str = fixture!("retry_http.yaml");
+/// Gateway + `RetryPolicy` CR (codes=[500]) + HTTPRoute `ExtensionRef` (#445 HTTP sad
+/// path). Backend returns 503, which is not in the code set, so no retry fires. Apply
+/// `backends::GO_HTTPBIN` first.
+pub const RETRY_HTTP_NON_RETRIABLE: &str = fixture!("retry_http_non_retriable.yaml");
+/// Gateway + `RetryPolicy` CR (attempts=2, grpcCodes=[12]) + GRPCRoute `ExtensionRef`
+/// (#445 gRPC happy path). A call to a non-existent method yields trailers-only
+/// UNIMPLEMENTED, which the proxy retries (grpc-aware). Apply `backends::GRPC_ECHO` first.
+pub const RETRY_GRPC: &str = fixture!("retry_grpc.yaml");
+/// Gateway + `RetryPolicy` CR (grpcCodes=[14]) + GRPCRoute `ExtensionRef` (#445 gRPC
+/// sad path). UNIMPLEMENTED (12) is not in the set, so no retry fires. Apply
+/// `backends::GRPC_ECHO` first.
+pub const RETRY_GRPC_NON_RETRIABLE: &str = fixture!("retry_grpc_non_retriable.yaml");
 /// Gateway + `BasicAuth` CR (labeled htpasswd Secret, alice:secret bcrypt) +
 /// HTTPRoute with `ExtensionRef` (#442). Valid `Authorization: Basic`
 /// credentials are admitted; missing/invalid credentials get 401.

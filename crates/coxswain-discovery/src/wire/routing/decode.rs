@@ -357,19 +357,22 @@ pub(crate) fn upstream_tls_from_wire(dto: &p::UpstreamTls) -> Result<UpstreamTls
     Ok(tls)
 }
 
-fn retry_from_wire(dto: &p::RetryPolicy) -> coxswain_core::routing::RetryPolicy {
-    use coxswain_core::routing::{RetryOn, RetryPolicy};
-    let mut on = RetryOn::empty();
-    if dto.on_connect_failure {
-        on.insert(RetryOn::CONNECT_FAILURE);
-    }
-    if dto.on_timeout {
-        on.insert(RetryOn::TIMEOUT);
-    }
-    if dto.on_http_5xx {
-        on.insert(RetryOn::HTTP_5XX);
-    }
-    RetryPolicy::new(dto.max_retries, on)
+fn retry_from_wire(dto: &p::RetryPolicy) -> coxswain_core::routing::RetryPolicyConfig {
+    use coxswain_core::routing::RetryPolicyConfig;
+    let backoff = (dto.backoff_ms > 0).then(|| Duration::from_millis(u64::from(dto.backoff_ms)));
+    // Wire carries codes as u32 (proto3 has no u16); drop any that don't fit a status
+    // code — they can only arise from a corrupt/incompatible peer.
+    let http_codes = dto
+        .http_codes
+        .iter()
+        .filter_map(|&c| u16::try_from(c).ok())
+        .collect();
+    let grpc_codes = dto
+        .grpc_codes
+        .iter()
+        .filter_map(|&c| u16::try_from(c).ok())
+        .collect();
+    RetryPolicyConfig::new(dto.attempts, backoff, http_codes, grpc_codes)
 }
 
 fn load_balance_from_wire(dto: &p::LoadBalance) -> Result<LoadBalance, WireError> {

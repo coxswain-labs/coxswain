@@ -16,6 +16,7 @@ pub mod ip_access_control;
 pub mod path_rewrite_regex;
 pub mod rate_limit;
 pub mod request_size_limit;
+pub mod retry_policy;
 
 pub use basic_auth::{BasicAuth, BasicAuthSecretRef, BasicAuthSpec};
 pub use client_traffic_policy::{
@@ -40,3 +41,7 @@ pub use ip_access_control::{IpAccessControl, IpAccessControlSpec};
 pub use path_rewrite_regex::{PathRewriteRegex, PathRewriteRegexSpec};
 pub use rate_limit::{RateLimit, RateLimitSpec};
 pub use request_size_limit::{RequestSizeLimit, RequestSizeLimitSpec};
+// `RetryPolicy` is the CRD kind; its runtime counterpart is
+// `routing::RetryPolicyConfig` (mirroring the `RateLimit` / `RateLimitConfig` split),
+// so there is no short-name clash.
+pub use retry_policy::{RetryPolicy, RetryPolicySpec};

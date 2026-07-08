@@ -1,5 +1,6 @@
 use coxswain_core::crd::{
     BasicAuth, Compression, IpAccessControl, PathRewriteRegex, RateLimit, RequestSizeLimit,
+    RetryPolicy,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
@@ -67,6 +68,18 @@ pub(crate) fn empty_svc_store() -> reflector::Store<Service> {
 
 pub(crate) fn empty_rate_limit_store() -> reflector::Store<RateLimit> {
     reflector::store::Writer::<RateLimit>::default().as_reader()
+}
+
+pub(crate) fn empty_retry_policy_store() -> reflector::Store<RetryPolicy> {
+    reflector::store::Writer::<RetryPolicy>::default().as_reader()
+}
+
+pub(crate) fn make_retry_policy_store(crs: Vec<RetryPolicy>) -> reflector::Store<RetryPolicy> {
+    let mut writer = reflector::store::Writer::<RetryPolicy>::default();
+    for cr in crs {
+        writer.apply_watcher_event(&watcher::Event::Apply(cr));
+    }
+    writer.as_reader()
 }
 
 pub(crate) fn empty_path_rewrite_store() -> reflector::Store<PathRewriteRegex> {

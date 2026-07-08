@@ -8,10 +8,11 @@
 //! target*. This file is the home for the v0.3 traffic-policy annotation/knob
 //! effect tests — compression, response buffering, upstream keepalive,
 //! circuit-breaker, load-balance algorithm, upstream-hash, max-body-size,
-//! limit-connections, mirror-target, drain-timeout
-//! (#263/#266/#270/#274/#275/#276/#277/#281/#282/#283/#360) — each landing with its
-//! feature. Seeded here today: the connect-retry annotation (`max-retries`,
-//! `retry-on`). Routing-shape behavior lives in `routing.rs`; TLS in `tls.rs`.
+//! limit-connections, mirror-target, drain-timeout, retries
+//! (#263/#266/#270/#274/#275/#276/#277/#281/#282/#283/#360/#445) — each landing with
+//! its feature. Retries: the `retry-attempts`/`retry-codes`/`retry-backoff` Ingress
+//! annotations and the `RetryPolicy` ExtensionRef (HTTP + gRPC). Routing-shape
+//! behavior lives in `routing.rs`; TLS in `tls.rs`.
 
 use coxswain_e2e::{
     FixtureVars, Harness, IngressClassGuard, NamespaceGuard,
@@ -90,6 +91,57 @@ async fn annotation_connect_retry_retries_failed_connect() -> anyhow::Result<()>
     assert!(
         metrics.contains("coxswain_proxy_upstream_errors_total{"),
         "proxy /metrics must expose coxswain_proxy_upstream_errors_total after a connect failure"
+    );
+
+    Ok(())
+}
+
+/// Ingress `retry-codes` + `retry-backoff` effect (#445): with `retry-attempts: 2`,
+/// `retry-codes: 503`, `retry-backoff: 200ms`, the always-503 go-httpbin backend is
+/// retried. The client sees the final 503 (budget exhausted), but the retry loop
+/// fired (retry metric) and each retried attempt waited the backoff (elapsed time).
+#[tokio::test]
+async fn annotation_retry_codes_retries_retriable_status_with_backoff() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-retry-codes").await?;
+
+    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
+    fixtures::apply_fixture(ingress::ANNOTATION_RETRY_CODES, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("ingretry.{}.local", ns.name);
+    // The shared proxy serves Ingress on its default HTTP listener. Use `raw_status`
+    // (plain reqwest, no JSON parse) — the shared `HttpClient` deserializes 2xx bodies
+    // as `EchoResponse`, which fails on go-httpbin's non-echo `/status/:code` body.
+    let proxy = h.http.proxy_addr;
+
+    // Readiness: /status/200 is not retriable, so a 200 confirms the route is live.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("{host} route live (go-httpbin 200)") },
+        || async { (raw_status(proxy, &host, "/status/200").await == 200).then_some(()) },
+    )
+    .await?;
+
+    let before = retry_count(&h, &ns.name, "http-code").await;
+    let start = std::time::Instant::now();
+    let status = raw_status(proxy, &host, "/status/503").await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        status, 503,
+        "budget-exhausted retry returns the upstream 503"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "each retried attempt must wait the 200ms backoff (elapsed {elapsed:?})"
+    );
+    let after = retry_count(&h, &ns.name, "http-code").await;
+    assert!(
+        after > before,
+        "retry-codes:503 must retry the 503 \
+         (upstream_retries_total{{condition=http-code}}: {before} -> {after})"
     );
 
     Ok(())
@@ -810,6 +862,45 @@ async fn grpc_echo_call_inner<Req: prost::Message + Default + 'static>(
         .map(tonic::Response::into_inner)
 }
 
+/// Issue a unary call to an arbitrary `method_path` (full `/service/method`) on the
+/// `GrpcEcho` backend. Used to drive a non-existent method, which yields a
+/// trailers-only `UNIMPLEMENTED` — the retriable outcome exercised by the gRPC retry
+/// tests. Returns the resulting [`tonic::Status`] (`Ok` is folded to an `Ok` status so
+/// callers can match uniformly on the code).
+async fn grpc_call_to(gw_addr: SocketAddr, host: &str, method_path: &str) -> tonic::Status {
+    let attempt = async {
+        let origin: tonic::transport::Uri = format!("http://{host}:{}", gw_addr.port())
+            .parse()
+            .map_err(|e| tonic::Status::unavailable(format!("uri: {e}")))?;
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))
+            .map_err(|e| tonic::Status::unavailable(format!("endpoint: {e}")))?
+            .origin(origin);
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| tonic::Status::unavailable(format!("connect: {e}")))?;
+        let mut client = tonic::client::Grpc::new(channel);
+        client
+            .ready()
+            .await
+            .map_err(|e| tonic::Status::unavailable(format!("ready: {e}")))?;
+        let path = method_path
+            .parse::<tonic::codegen::http::uri::PathAndQuery>()
+            .map_err(|e| tonic::Status::unavailable(format!("path: {e}")))?;
+        let codec =
+            tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+        client
+            .unary(tonic::Request::new(grpcecho::EchoRequest {}), path, codec)
+            .await
+            .map(|_| tonic::Status::ok(""))
+    };
+    match tokio::time::timeout(Duration::from_secs(20), attempt).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(status)) => status,
+        Err(_) => tonic::Status::deadline_exceeded("grpc_call_to did not complete within 20s"),
+    }
+}
+
 /// `RequestSizeLimit` is deliberately **not enforced** on GRPCRoute (#443 scope
 /// decision, coxswain-labs/coxswain#509). A mid-stream body cap over HTTP/2 deadlocks
 /// the client under pingora (its h2 proxy loop swallows a `request_body_filter`
@@ -863,6 +954,209 @@ async fn gateway_request_size_limit_not_enforced_on_grpcroute() -> anyhow::Resul
             "over-cap gRPC call must succeed (RequestSizeLimit is not enforced on gRPC), got {s:?}"
         )
     })?;
+
+    Ok(())
+}
+
+// ── RetryPolicy ExtensionRef (#445) ─────────────────────────────────────────────
+//
+// Retrying is black-box: e2e cannot observe individual attempts except through the
+// per-condition metric `coxswain_proxy_upstream_retries_total{condition=...}`, which
+// the proxy increments once per retry. Each test drives an always-failing upstream
+// (go-httpbin /status/503, or an unimplemented gRPC method) and asserts on that metric,
+// scoped to the test's own namespace (which appears in the route/upstream labels on the
+// shared proxy). The happy path proves the retry loop fires; the sad path proves the
+// code-list gates it.
+
+/// Sum `coxswain_proxy_upstream_retries_total` series for `condition` whose labels
+/// mention `ns_marker` (the test namespace, present in the `route`/`upstream` labels).
+async fn retry_count(h: &Harness, ns_marker: &str, condition: &str) -> u64 {
+    let Ok(resp) = reqwest::get(h.admin_url("/metrics")).await else {
+        return 0;
+    };
+    let Ok(body) = resp.text().await else {
+        return 0;
+    };
+    body.lines()
+        .filter(|l| l.starts_with("coxswain_proxy_upstream_retries_total{"))
+        .filter(|l| l.contains(&format!("condition=\"{condition}\"")))
+        .filter(|l| l.contains(ns_marker))
+        .filter_map(|l| l.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()))
+        .map(|v| v as u64)
+        .sum()
+}
+
+/// HTTP happy path: a `RetryPolicy` with `codes: [503]` retries the always-503
+/// go-httpbin backend. The client sees the final 503 (budget exhausted), but the retry
+/// loop fired — proven by the retry metric — and the `200ms` backoff delayed each
+/// retried attempt (proven by elapsed time).
+#[tokio::test]
+async fn retry_fires_on_retriable_http_status_and_applies_backoff() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-retry-http").await?;
+    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
+    fixtures::apply_fixture(gwa::RETRY_HTTP, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("gwretry.{}.local", ns.name);
+    let proxy = h.gateway_http_addr(&ns.name).await?;
+
+    // Readiness: /status/200 is not in the retry code set, so a 200 confirms the route
+    // is live without firing retries.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("{host} route live (go-httpbin 200)") },
+        || async { (raw_status(proxy, &host, "/status/200").await == 200).then_some(()) },
+    )
+    .await?;
+
+    let before = retry_count(&h, &ns.name, "http-code").await;
+    let start = std::time::Instant::now();
+    let status = raw_status(proxy, &host, "/status/503").await;
+    let elapsed = start.elapsed();
+
+    assert_eq!(
+        status, 503,
+        "with the retry budget exhausted the upstream 503 reaches the client"
+    );
+    // attempts=2 ⇒ two retried attempts, each preceded by the 200ms backoff (>= 400ms);
+    // allow slack for scheduling/clock granularity.
+    assert!(
+        elapsed >= Duration::from_millis(300),
+        "each retried attempt must wait the 200ms backoff (elapsed {elapsed:?})"
+    );
+    let after = retry_count(&h, &ns.name, "http-code").await;
+    assert!(
+        after > before,
+        "the retry loop must fire for a 503 in codes=[503] \
+         (upstream_retries_total{{condition=http-code}}: {before} -> {after})"
+    );
+
+    Ok(())
+}
+
+/// HTTP sad path: a `RetryPolicy` with `codes: [500]` must NOT retry the go-httpbin
+/// 503 — 503 is outside the code set, so it passes straight through and the retry
+/// metric never increments.
+#[tokio::test]
+async fn retry_not_attempted_for_non_retriable_http_status() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-retry-http-nr").await?;
+    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
+    fixtures::apply_fixture(gwa::RETRY_HTTP_NON_RETRIABLE, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("gwretrynr.{}.local", ns.name);
+    let proxy = h.gateway_http_addr(&ns.name).await?;
+
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("{host} route live (go-httpbin 200)") },
+        || async { (raw_status(proxy, &host, "/status/200").await == 200).then_some(()) },
+    )
+    .await?;
+
+    let before = retry_count(&h, &ns.name, "http-code").await;
+    let status = raw_status(proxy, &host, "/status/503").await;
+    assert_eq!(
+        status, 503,
+        "503 is not in codes=[500]; it must pass through without a retry"
+    );
+    let after = retry_count(&h, &ns.name, "http-code").await;
+    assert_eq!(
+        after, before,
+        "no retry may fire for a status outside the configured code set"
+    );
+
+    Ok(())
+}
+
+/// gRPC happy path: a `RetryPolicy` with `grpcCodes: [12]` retries a trailers-only
+/// `UNIMPLEMENTED` from a non-existent method. The RPC still fails `UNIMPLEMENTED`
+/// (budget exhausted), but the gRPC-aware retry loop fired — proven by the metric.
+#[tokio::test]
+async fn grpc_retry_fires_on_retriable_grpc_status() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-retry-grpc").await?;
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::RETRY_GRPC, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("grpc-retry.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+
+    // Readiness via a real Echo call (matches all methods on this route), which
+    // succeeds and does not fire retries.
+    wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("gRPC Echo via {host} to succeed") },
+        || async {
+            grpc_echo_call(gw_addr, &host, grpcecho::EchoRequest {})
+                .await
+                .ok()
+        },
+    )
+    .await?;
+
+    let before = retry_count(&h, &ns.name, "grpc-code").await;
+    let method = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/DoesNotExist";
+    let st = grpc_call_to(gw_addr, &host, method).await;
+    assert_eq!(
+        st.code(),
+        tonic::Code::Unimplemented,
+        "a non-existent method must yield UNIMPLEMENTED, got {st:?}"
+    );
+    let after = retry_count(&h, &ns.name, "grpc-code").await;
+    assert!(
+        after > before,
+        "the retry loop must fire for grpc-status 12 in grpcCodes=[12] \
+         (upstream_retries_total{{condition=grpc-code}}: {before} -> {after})"
+    );
+
+    Ok(())
+}
+
+/// gRPC sad path: a `RetryPolicy` with `grpcCodes: [14]` must NOT retry an
+/// `UNIMPLEMENTED` (12) — it is outside the set, so no retry fires.
+#[tokio::test]
+async fn grpc_retry_not_attempted_for_non_retriable_grpc_status() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-retry-grpc-nr").await?;
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::RETRY_GRPC_NON_RETRIABLE, FixtureVars::new(&ns.name)).await?;
+
+    let host = format!("grpc-retrynr.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+
+    wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("gRPC Echo via {host} to succeed") },
+        || async {
+            grpc_echo_call(gw_addr, &host, grpcecho::EchoRequest {})
+                .await
+                .ok()
+        },
+    )
+    .await?;
+
+    let before = retry_count(&h, &ns.name, "grpc-code").await;
+    let method = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/DoesNotExist";
+    let st = grpc_call_to(gw_addr, &host, method).await;
+    assert_eq!(
+        st.code(),
+        tonic::Code::Unimplemented,
+        "a non-existent method must yield UNIMPLEMENTED, got {st:?}"
+    );
+    let after = retry_count(&h, &ns.name, "grpc-code").await;
+    assert_eq!(
+        after, before,
+        "no retry may fire for grpc-status 12 when grpcCodes=[14]"
+    );
 
     Ok(())
 }

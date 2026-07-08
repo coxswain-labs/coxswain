@@ -58,7 +58,7 @@ impl RouteLike for GrpcRoute {
                     return ext.group != super::COXSWAIN_GROUP
                         || !matches!(
                             ext.kind.as_str(),
-                            "RateLimit" | "IpAccessControl" | "RequestSizeLimit"
+                            "RateLimit" | "IpAccessControl" | "RequestSizeLimit" | "RetryPolicy"
                         );
                 }
                 false

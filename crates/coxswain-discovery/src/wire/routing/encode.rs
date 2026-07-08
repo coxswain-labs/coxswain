@@ -189,7 +189,7 @@ fn backend_group_to_wire(bg: &BackendGroup, depth: usize) -> p::BackendGroup {
         weighted,
         protocol: protocol_to_wire(bg.protocol()) as i32,
         tls: bg.upstream_tls().map(|t| upstream_tls_to_wire(t)),
-        retry: Some(retry_to_wire(&bg.retry_policy())),
+        retry: Some(retry_to_wire(bg.retry_policy())),
         keepalive_millis,
         connect_millis,
         per_backend_filters,
@@ -244,13 +244,16 @@ pub(crate) fn upstream_tls_to_wire(tls: &UpstreamTls) -> p::UpstreamTls {
     }
 }
 
-fn retry_to_wire(retry: &coxswain_core::routing::RetryPolicy) -> p::RetryPolicy {
-    use coxswain_core::routing::RetryOn;
+fn retry_to_wire(retry: &coxswain_core::routing::RetryPolicyConfig) -> p::RetryPolicy {
     p::RetryPolicy {
-        max_retries: retry.max_retries,
-        on_connect_failure: retry.on.contains(RetryOn::CONNECT_FAILURE),
-        on_timeout: retry.on.contains(RetryOn::TIMEOUT),
-        on_http_5xx: retry.on.contains(RetryOn::HTTP_5XX),
+        attempts: retry.attempts,
+        // Duration millis are bounded by realistic backoff config; the cast is lossless
+        // for any sane value and saturates rather than wrapping on an absurd one.
+        backoff_ms: retry
+            .backoff
+            .map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
+        http_codes: retry.http_codes.iter().map(|&c| u32::from(c)).collect(),
+        grpc_codes: retry.grpc_codes.iter().map(|&c| u32::from(c)).collect(),
     }
 }
 

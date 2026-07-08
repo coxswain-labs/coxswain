@@ -1,0 +1,55 @@
+# RetryPolicy sad path on HTTPRoute (#445) — apply backends::GO_HTTPBIN first.
+#
+# The RetryPolicy retries only on HTTP 500 (codes=[500]); the backend returns 503.
+# Because 503 is not in the code set, the proxy must NOT retry — the 503 passes
+# straight through and coxswain_proxy_upstream_retries_total{condition="http-code"}
+# never increments for this route. Proves the code-list gating.
+#
+# Gateway: coxswain-test on GATEWAY_HTTP_PORT.
+# Route host: gwretrynr.TESTNS.local, path / -> go-httpbin:3000.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RetryPolicy
+metadata:
+  name: retry-500-only
+spec:
+  attempts: 2
+  codes: [500]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: retry-nr-route
+spec:
+  parentRefs:
+    - name: coxswain-test
+  hostnames:
+    - "gwretrynr.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: RetryPolicy
+            name: retry-500-only
+      backendRefs:
+        - name: go-httpbin
+          port: 3000
