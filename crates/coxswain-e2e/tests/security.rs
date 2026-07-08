@@ -1279,7 +1279,7 @@ async fn request_allowed_when_ext_authz_grpc_channel_reused_across_requests() ->
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
     fixtures::apply_fixture(ingress::ANNOTATION_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
-    let host = format!("authgrpcreuse.{}.local", ns.name);
+    let host = format!("authgrpc.{}.local", ns.name);
 
     // Establish the route first — the pool's cold-start (first dial) is not
     // what this test targets; the reuse path after that is.
@@ -1329,7 +1329,7 @@ async fn request_recovers_after_ext_authz_grpc_pod_restart() -> anyhow::Result<(
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
     fixtures::apply_fixture(ingress::ANNOTATION_AUTH_GRPC, FixtureVars::new(&ns.name)).await?;
-    let host = format!("authgrpcrestart.{}.local", ns.name);
+    let host = format!("authgrpc.{}.local", ns.name);
 
     wait::poll_until(
         Duration::from_secs(120),
