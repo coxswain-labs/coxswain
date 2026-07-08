@@ -1,0 +1,52 @@
+# auth-jwt fixture (#441): the annotation names a JwtAuth CR by
+# "namespace/name" — Ingress parity with the Gateway API ExtensionRef path
+# (crates/coxswain-e2e/fixtures/gateway_api/jwt_auth_extensionref.yaml), same
+# inline JWKS (ES256 test key, kid=e2e-test-key), same private key held only
+# in the Rust test code.
+#
+# Requests with a valid, signed, unexpired, correct-issuer bearer token reach
+# echo-a (200) with the verified `sub` claim forwarded as `x-user-id`.
+# Requests with a missing/invalid/expired/wrong-issuer token receive 401 +
+# WWW-Authenticate: Bearer.
+#
+# Host: authjwt.TESTNS.local / -> echo-a:3000 (reached on allow).
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: JwtAuth
+metadata:
+  name: jwtauth
+spec:
+  issuer: https://issuer.e2e.coxswain-labs.dev
+  jwks:
+    inline:
+      jwks:
+        keys:
+          - kty: EC
+            crv: P-256
+            kid: e2e-test-key
+            alg: ES256
+            x: ScOuAzhxBbDIGzXwHlAcn0nHt8tE9OvqRHm3RIGQjk8
+            y: JiMe4KXWaBgWIBD1TTkwQdJNbLkO5AEiRQSdv8dbQyg
+  claimToHeaders:
+    - claim: sub
+      header: x-user-id
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-jwt-ingress
+  annotations:
+    ingress.coxswain-labs.dev/auth-jwt: "${TESTNS}/jwtauth"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: authjwt.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
