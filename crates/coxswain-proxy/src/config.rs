@@ -6,6 +6,7 @@
 
 use crate::edge::upstream_ca::{BackendClientCertCache, SanCheckHookCache, UpstreamCaCache};
 use crate::policy::circuit_breaker::CircuitBreakerRegistry;
+use crate::policy::grpc_channel::GrpcAuthChannelCache;
 use crate::policy::rate_limit::RateLimiterRegistry;
 use coxswain_core::routing::RouteTimeouts;
 use coxswain_core::shared::Shared;
@@ -45,6 +46,9 @@ pub struct SharedProxyConfig {
     pub rate_limiter: RateLimiterRegistry,
     /// Shared HTTP client for ext_authz sub-requests (#24).
     pub auth_client: reqwest::Client,
+    /// Pooled tonic channels for the gRPC ext_authz transport (#544) — the
+    /// gRPC-transport peer of [`Self::auth_client`]'s HTTP connection pool.
+    pub grpc_auth_channels: GrpcAuthChannelCache,
     /// Per-Ingress client-certificate mTLS config store (#267).
     ///
     /// Looked up per-host in `request_filter` to enforce the mTLS handshake
@@ -106,6 +110,7 @@ impl SharedProxyConfig {
             access_log_path_mode,
             rate_limiter,
             auth_client,
+            grpc_auth_channels: GrpcAuthChannelCache::new(),
             client_certs: SharedClientCertStore::new(),
             listener_hostnames: SharedListenerHostnames::new(),
             advertised_ports: Shared::new(),

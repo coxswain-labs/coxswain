@@ -343,6 +343,7 @@ pub(crate) async fn request_filter<K>(
     for auth in m.auth.iter() {
         if crate::policy::auth::enforce(
             &cfg.auth_client,
+            &cfg.grpc_auth_channels,
             auth,
             session,
             &mut ctx.auth_response_headers,
