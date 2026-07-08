@@ -103,11 +103,12 @@ rules:
   # timeouts, status.ancestors[] patched per targeted Service.
   # Read the route-scoped ExtensionRef filter CRs — RateLimit (#25),
   # PathRewriteRegex (#77), IpAccessControl (#479), BasicAuth (#442),
-  # RequestSizeLimit (#443), Compression (#446) — so HTTPRouteRule/GRPCRouteRule
-  # ExtensionRef filters resolve into per-route config. Read-only.
+  # RequestSizeLimit (#443), Compression (#446), JwtAuth (#441) — so
+  # HTTPRouteRule/GRPCRouteRule ExtensionRef filters resolve into per-route
+  # config. Read-only; JwtAuth has no status subresource.
   - apiGroups: ["gateway.coxswain-labs.dev"]
     resources:
-      ["coxswaingatewayparameters", "clienttrafficpolicies", "coxswainbackendpolicies", "coxswainexternalauths", "ratelimits", "retrypolicies", "pathrewriteregexes", "ipaccesscontrols", "basicauths", "requestsizelimits", "compressions"]
+      ["coxswaingatewayparameters", "clienttrafficpolicies", "coxswainbackendpolicies", "coxswainexternalauths", "ratelimits", "retrypolicies", "pathrewriteregexes", "ipaccesscontrols", "basicauths", "requestsizelimits", "compressions", "jwtauths"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.coxswain-labs.dev"]
     resources: ["clienttrafficpolicies/status", "coxswainbackendpolicies/status", "coxswainexternalauths/status"]
