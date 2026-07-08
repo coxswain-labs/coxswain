@@ -275,7 +275,7 @@ spec:
 | `URLRewrite` | Supported (hostname and path rewrite) |
 | `RequestRedirect` | Supported (scheme, hostname, port, path, status code) |
 | `RequestMirror` | Supported — GEP-3171 fire-and-forget shadow traffic with optional `percent` or `fraction` sampling; multiple filters per rule for multiple mirrors |
-| `ExtensionRef` | Supported (for `RateLimit`, `PathRewriteRegex`, `IpAccessControl`, `BasicAuth`, `ExternalAuth`, `RequestSizeLimit`, and `Compression` Coxswain extensions) |
+| `ExtensionRef` | Supported (for `RateLimit`, `PathRewriteRegex`, `IpAccessControl`, `BasicAuth`, `ExternalAuth`, `RequestSizeLimit`, `Compression`, and `JwtAuth` Coxswain extensions) |
 | `CORS` | Supported — GEP-1767 preflight short-circuit and response-header injection |
 
 ### Attaching to a Gateway
@@ -575,6 +575,51 @@ spec:
       kind: Secret
 ```
 
+### JWT authentication
+
+`JwtAuth` (`gateway.coxswain-labs.dev/v1alpha1`) validates a bearer token's signature against a JSON Web Key Set (JWKS) — the Coxswain implementation of Envoy's `envoy.filters.http.jwt_authn` `JwtProvider` / Istio's `RequestAuthentication.jwtRules`. Attach it to an `HTTPRouteRule` or `GRPCRouteRule` with an `ExtensionRef` filter — the Gateway API surface for the [Ingress `auth-jwt` annotation](ingress-annotations.md). No Gateway API standard exists for in-proxy JWT validation (GEP-1494 covers *delegated* ext_authz, a different model). Unlike `BasicAuth` (an HTTP/browser idiom), bearer/JWT auth is a common gRPC pattern, so `JwtAuth` is supported on both route kinds.
+
+```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: JwtAuth
+metadata:
+  name: my-api
+spec:
+  issuer: https://issuer.example.com
+  audiences:
+    - my-api
+  jwks:
+    remote:
+      uri: https://issuer.example.com/.well-known/jwks.json
+      refreshInterval: 5m
+  claimToHeaders:
+    - claim: sub
+      header: x-user-id
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+# ...
+    filters:
+      - type: ExtensionRef
+        extensionRef:
+          group: gateway.coxswain-labs.dev
+          kind: JwtAuth
+          name: my-api
+```
+
+Semantics:
+
+- `spec.jwks` is exactly one of:
+  - `remote.uri` — a JWKS endpoint. **Resolved by the controller, never the proxy** (the Istio model, not Envoy's default proxy-side fetch): the read-only data plane never egresses to an identity provider. `remote.refreshInterval` (default `5m`) bounds the refetch cadence; a shorter upstream `Cache-Control: max-age` is honored instead.
+  - `inline.jwks` — a JWKS object given directly in the spec (no controller fetch).
+- The bearer token is read from `Authorization: Bearer <token>` by default, or from `fromHeaders` when set.
+- Signature verification uses **the key's own declared `alg`**, never the token header's `alg` (prevents algorithm-confusion attacks). Only asymmetric algorithms are supported (RS/PS/ES/EdDSA) — JWKS is inherently asymmetric.
+- `iss` must match `spec.issuer`. `aud` is checked against `spec.audiences` only when `audiences` is non-empty.
+- On success, `claimToHeaders` copies named claims onto upstream request headers, and `forwardPayloadHeader` (if set) carries the base64url-encoded full claims payload. The original token is stripped from the upstream request unless `forward: true`.
+- Missing/invalid/expired/wrong-issuer/wrong-audience tokens get `401` with `WWW-Authenticate: Bearer`.
+- An unresolved JWKS (fetch not yet complete, fetch failing, or unparseable/empty) fails **closed** with `503` — an operator who attached this filter expects enforcement.
+- A missing `JwtAuth` CR fails **open** (no auth enforced), matching the other `ExtensionRef` auth resolvers.
+
 ### External authorization (ext_authz)
 
 `CoxswainExternalAuth` (`gateway.coxswain-labs.dev/v1alpha1`) delegates an allow/deny decision to an external authorization service before a request reaches its upstream — the Coxswain implementation of [GEP-1494] and the Envoy / Istio / kgateway `ext_authz` model. The auth service is named by a **`backendRef`** (a `Service` + port), resolved to pod endpoints and load-balanced like any other backend; there is no URL form.
@@ -799,11 +844,11 @@ Header matching uses the same `Exact` and `RegularExpression` semantics as `HTTP
 | `spec.hostnames` | Full (including wildcards) |
 | `spec.rules[].matches[].method` | `Exact` and `RegularExpression` |
 | `spec.rules[].matches[].headers` | Full |
-| `spec.rules[].filters` | `RequestHeaderModifier`, `ResponseHeaderModifier`, `ExtensionRef` (`RateLimit`, `IpAccessControl`) |
+| `spec.rules[].filters` | `RequestHeaderModifier`, `ResponseHeaderModifier`, `ExtensionRef` (`RateLimit`, `IpAccessControl`, `JwtAuth`) |
 | `spec.rules[].backendRefs` | Service backends only |
 | `spec.rules[].backendRefs[].weight` | Full |
 
-GRPCRoute supports the protocol-agnostic `ExtensionRef` filters — [`RateLimit`](rate-limiting.md) and [`IpAccessControl`](#ip-access-control) — which apply identically to gRPC (HTTP/2) traffic. `PathRewriteRegex` is not supported: for gRPC the request path *is* the `/{service}/{method}` RPC address, so rewriting it is meaningless. `BasicAuth` and `Compression` are HTTP-only idioms and are not supported either — gRPC clients authenticate with bearer tokens or mTLS, and gRPC compresses per-message at the framing layer rather than via HTTP `Content-Encoding`. `RequestSizeLimit` is also not enforced on gRPC — a mid-stream body cap over HTTP/2 deadlocks the client under pingora ([#509](https://github.com/coxswain-labs/coxswain/issues/509)), so gRPC message sizes are left to the backend's `max_recv_msg_size` ([details](#request-size-limit-is-not-enforced-on-grpcroute)). Any other `ExtensionRef` (and `RequestMirror`) is skipped with a WARN log line.
+GRPCRoute supports the protocol-agnostic `ExtensionRef` filters — [`RateLimit`](rate-limiting.md), [`IpAccessControl`](#ip-access-control), and [`JwtAuth`](#jwt-authentication) (bearer/JWT auth is a common gRPC pattern, unlike `BasicAuth`) — which apply identically to gRPC (HTTP/2) traffic. `PathRewriteRegex` is not supported: for gRPC the request path *is* the `/{service}/{method}` RPC address, so rewriting it is meaningless. `BasicAuth` and `Compression` are HTTP-only idioms and are not supported either — gRPC clients authenticate with bearer tokens or mTLS, and gRPC compresses per-message at the framing layer rather than via HTTP `Content-Encoding`. `RequestSizeLimit` is also not enforced on gRPC — a mid-stream body cap over HTTP/2 deadlocks the client under pingora ([#509](https://github.com/coxswain-labs/coxswain/issues/509)), so gRPC message sizes are left to the backend's `max_recv_msg_size` ([details](#request-size-limit-is-not-enforced-on-grpcroute)). Any other `ExtensionRef` (and `RequestMirror`) is skipped with a WARN log line.
 
 ### Status conditions
 
