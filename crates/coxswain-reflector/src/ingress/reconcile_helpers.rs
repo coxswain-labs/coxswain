@@ -245,6 +245,42 @@ pub(super) fn resolve_auth_config(
     }
 }
 
+/// Resolve the `auth-jwt` annotation's `JwtAuth` CR reference into a concrete
+/// [`IngressAuthConfig`] — the Ingress-parity counterpart to the HTTPRoute
+/// `ExtensionRef` filter (#441). Delegates to
+/// [`crate::gateway_api::jwt_auth::resolve_spec`] so both surfaces resolve the
+/// same CR to byte-identical runtime config.
+///
+/// `annotation: None` (absent/malformed `auth-jwt`) returns `None` — no JWT
+/// check on the route. A present-but-missing CR fails **closed**
+/// (`Unavailable`, 503) — matching every other Ingress auth annotation
+/// resolver in this file (`auth-basic-secret`, `auth-url`): an operator who
+/// set `auth-jwt` intends the route to require a bearer token, so a stale or
+/// typo'd reference must not silently disable authentication. A present CR
+/// with an unresolved JWKS also fails **closed** inside `resolve_spec`.
+pub(super) fn resolve_jwt_auth_config(
+    annotation: Option<&super::annotations::auth::SecretRef>,
+    jwt_auths: &reflector::Store<coxswain_core::crd::JwtAuth>,
+    jwks_cache: &crate::jwks::SharedJwksCache,
+    route_id: &str,
+) -> Option<IngressAuthConfig> {
+    let r = annotation?;
+    let obj_ref =
+        reflector::ObjectRef::<coxswain_core::crd::JwtAuth>::new(&r.name).within(&r.namespace);
+    let Some(cr) = jwt_auths.get(&obj_ref) else {
+        tracing::warn!(
+            ingress = %route_id,
+            namespace = %r.namespace,
+            name = %r.name,
+            "JwtAuth CR not found — failing closed (503)"
+        );
+        return Some(IngressAuthConfig::Unavailable);
+    };
+    Some(crate::gateway_api::jwt_auth::resolve_spec(
+        &cr.spec, jwks_cache, route_id,
+    ))
+}
+
 /// Prepend an HTTPS `RequestRedirect` to `base`, returning the combined filter list.
 ///
 /// The HTTP-listener entry of an `ssl-redirect` route carries this leading
@@ -285,4 +321,33 @@ pub(super) fn resolve_host_builder<'b>(
         host_builder.set_path_normalize(level);
     }
     host_builder
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::fixtures::{empty_jwks_cache, empty_jwt_auth_store};
+
+    #[test]
+    fn resolve_jwt_auth_config_absent_annotation_is_none() {
+        let store = empty_jwt_auth_store();
+        let cache = empty_jwks_cache();
+        assert!(resolve_jwt_auth_config(None, &store, &cache, "default/ing").is_none());
+    }
+
+    #[test]
+    fn resolve_jwt_auth_config_missing_cr_fails_closed() {
+        // Every other Ingress auth annotation resolver in this file fails
+        // closed on a missing referenced resource; `auth-jwt` must match, not
+        // silently disable the auth check an operator asked for.
+        let r = super::super::annotations::auth::SecretRef {
+            namespace: "default".to_string(),
+            name: "absent".to_string(),
+        };
+        let store = empty_jwt_auth_store();
+        let cache = empty_jwks_cache();
+        let resolved = resolve_jwt_auth_config(Some(&r), &store, &cache, "default/ing")
+            .expect("missing CR must still install a check (fail closed)");
+        assert!(matches!(resolved, IngressAuthConfig::Unavailable));
+    }
 }

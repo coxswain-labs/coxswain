@@ -7,13 +7,13 @@ use super::class::{ResolvedClassParams, claimed_ingress_class};
 use super::ports::IngressPorts;
 use super::reconcile_helpers::{
     build_ingress_backend_group, prepend_ssl_redirect, resolve_auth_config, resolve_host_builder,
-    resolve_mirror_filter,
+    resolve_jwt_auth_config, resolve_mirror_filter,
 };
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
 use coxswain_core::routing::{
-    BackendGroup, FilterAction, IngressRoutingTableBuilder, PathModifier, RouteEntry,
-    compile_path_regex,
+    BackendGroup, FilterAction, IngressAuthConfig, IngressRoutingTableBuilder, PathModifier,
+    RouteEntry, compile_path_regex,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -53,6 +53,34 @@ impl<'a> IngressClassContext<'a> {
     }
 }
 
+/// The auth-related stores threaded into [`IngressReconciler::reconcile`].
+///
+/// Groups the label-scoped htpasswd Secret store (`auth-basic-secret`) with the
+/// `JwtAuth` CR store and JWKS cache (`auth-jwt`, #441) so `reconcile` stays
+/// under the workspace argument-count limit.
+#[non_exhaustive]
+pub struct IngressAuthStores<'a> {
+    pub(crate) auth_secrets: &'a reflector::Store<Secret>,
+    pub(crate) jwt_auths: &'a reflector::Store<coxswain_core::crd::JwtAuth>,
+    pub(crate) jwks_cache: &'a crate::jwks::SharedJwksCache,
+}
+
+impl<'a> IngressAuthStores<'a> {
+    /// Bundle the auth-related stores for a single reconcile pass.
+    #[must_use]
+    pub fn new(
+        auth_secrets: &'a reflector::Store<Secret>,
+        jwt_auths: &'a reflector::Store<coxswain_core::crd::JwtAuth>,
+        jwks_cache: &'a crate::jwks::SharedJwksCache,
+    ) -> Self {
+        Self {
+            auth_secrets,
+            jwt_auths,
+            jwks_cache,
+        }
+    }
+}
+
 impl IngressReconciler {
     /// Skips the Ingress when it does not reference an owned IngressClass.
     /// When `owned_default_class` is `Some`, an Ingress with neither
@@ -62,9 +90,10 @@ impl IngressReconciler {
     /// Routes are inserted on `http_port` and `https_port` (whichever are `Some`).
     /// When both are `None` the Ingress is skipped with a warning.
     ///
-    /// `auth_secrets` is the label-scoped Secret store
-    /// (`ingress.coxswain-labs.dev/auth-basic=true`).  It is used to resolve
-    /// the `auth-basic-secret` annotation into an htpasswd credential list.
+    /// `auth` bundles the label-scoped Secret store
+    /// (`ingress.coxswain-labs.dev/auth-basic=true`, used to resolve
+    /// `auth-basic-secret` into an htpasswd credential list) with the `JwtAuth`
+    /// CR store and JWKS cache (used to resolve `auth-jwt`, #441).
     /// Returns the annotation diagnostics collected during parsing so the caller
     /// can forward them as Kubernetes Warning Events on the Ingress object.
     /// An empty vec means all annotations were valid (or no annotations were set).
@@ -76,7 +105,7 @@ impl IngressReconciler {
         classes: &IngressClassContext<'_>,
         ports: IngressPorts,
         builder: &mut IngressRoutingTableBuilder,
-        auth_secrets: &reflector::Store<Secret>,
+        auth_stores: &IngressAuthStores<'_>,
     ) -> Vec<AnnotationIssue> {
         let claimed_class = claimed_ingress_class(ingress);
 
@@ -187,17 +216,30 @@ impl IngressReconciler {
         // Build the rate-limit config once and share one Arc across every route
         // entry of this Ingress — same refcount-bump sharing pattern as above.
         let rate_limit = ann.rate_limit.clone().map(Arc::new);
-        // Resolve auth annotation once per Ingress; share one Arc across every path.
-        let auth = resolve_auth_config(
+        // Resolve auth annotations once per Ingress; share one Arc chain across
+        // every path. `auth-jwt` (#441) is independent of (additive with)
+        // `ext-auth-backend`/`auth-basic-secret` — every configured check must
+        // pass, mirroring the HTTPRoute ExtensionRef chain (#23).
+        let ext_or_basic_auth = resolve_auth_config(
             ann.auth.as_ref(),
-            auth_secrets,
+            auth_stores.auth_secrets,
             services,
             slices,
             &route_id,
             ns,
             &mut annotation_issues,
-        )
-        .map(Arc::new);
+        );
+        let jwt_auth = resolve_jwt_auth_config(
+            ann.auth_jwt.as_ref(),
+            auth_stores.jwt_auths,
+            auth_stores.jwks_cache,
+            &route_id,
+        );
+        let auth: Arc<[Arc<IngressAuthConfig>]> = [ext_or_basic_auth, jwt_auth]
+            .into_iter()
+            .flatten()
+            .map(Arc::new)
+            .collect();
         // Build the compression config once and share one Arc across every route entry.
         let compression = ann.compression.clone().map(Arc::new);
         // Build the trusted-proxy forwarded-IP config once and share one Arc across every path.
@@ -225,7 +267,7 @@ impl IngressReconciler {
                 .with_deny_source_range(deny_source_range.clone())
                 .with_access_log_enabled(class_access_log_enabled)
                 .with_rate_limit(rate_limit.clone())
-                .with_auth(auth.clone())
+                .with_auth_chain(auth.clone())
                 .with_compression(compression.clone())
                 .with_forwarded_for(forwarded_for.clone())
                 .with_circuit_breaker(circuit_breaker.clone())
@@ -1599,7 +1641,11 @@ mod tests {
             &IngressClassContext::new(&owned(&["coxswain"]), Some("coxswain"), &no_class_defaults),
             IngressPorts::new(Some(80), None),
             &mut builder,
-            &empty_secret_store(),
+            &IngressAuthStores::new(
+                &empty_secret_store(),
+                &empty_jwt_auth_store(),
+                &empty_jwks_cache(),
+            ),
         );
         assert!(
             builder
@@ -1633,7 +1679,11 @@ mod tests {
             &IngressClassContext::new(&owned(&["coxswain"]), None, &no_class_defaults),
             IngressPorts::new(Some(80), None),
             &mut builder,
-            &empty_secret_store(),
+            &IngressAuthStores::new(
+                &empty_secret_store(),
+                &empty_jwt_auth_store(),
+                &empty_jwks_cache(),
+            ),
         );
         assert!(
             builder
@@ -2180,7 +2230,11 @@ mod tests {
             &IngressClassContext::new(&owned(&["coxswain"]), None, &no_class_defaults),
             IngressPorts::new(Some(80), Some(443)),
             &mut builder,
-            &empty_secret_store(),
+            &IngressAuthStores::new(
+                &empty_secret_store(),
+                &empty_jwt_auth_store(),
+                &empty_jwks_cache(),
+            ),
         );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();

@@ -51,7 +51,7 @@ use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
 use coxswain_core::crd::coxswain_backend_policy::CoxswainBackendPolicy;
 use coxswain_core::crd::{
     BasicAuth, Compression, CoxswainExternalAuth, CoxswainIngressClassParameters, IpAccessControl,
-    PathRewriteRegex, RateLimit, RequestSizeLimit, RetryPolicy,
+    JwtAuth, PathRewriteRegex, RateLimit, RequestSizeLimit, RetryPolicy,
 };
 use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 use coxswain_core::fleet::{self, SharedFleet};
@@ -222,6 +222,12 @@ pub struct ReconcilerOptions {
     /// `IngressClass`, `CoxswainIngressClassParameters`) and register their
     /// readiness checks. When `false`, all Ingress watches are skipped.
     pub enable_ingress: bool,
+    /// When `true`, spawn the background task that fetches and refreshes
+    /// remote JWKS endpoints named by `JwtAuth` CRs (#441). Must only be set
+    /// to `true` for the controller role — the read-only data plane must never
+    /// egress to an identity provider (the Istio model, not Envoy's default
+    /// proxy-side fetch); see [`crate::jwks`].
+    pub fetch_remote_jwks: bool,
 }
 
 impl Default for ReconcilerOptions {
@@ -235,6 +241,7 @@ impl Default for ReconcilerOptions {
             status_subscriptions: false,
             ingress_event_tx: None,
             enable_gateway_api: true,
+            fetch_remote_jwks: false,
             enable_ingress: true,
         }
     }
@@ -737,6 +744,8 @@ struct ReconcilerConfig {
     enable_gateway_api: bool,
     /// See [`ReconcilerOptions::enable_ingress`].
     enable_ingress: bool,
+    /// See [`ReconcilerOptions::fetch_remote_jwks`].
+    fetch_remote_jwks: bool,
 }
 
 pub(super) struct ReflectorStores<'a> {
@@ -803,6 +812,17 @@ pub(super) struct ReflectorStores<'a> {
     /// `ExternalAuth` `ExtensionRef` filters (and, later, Gateway policies) into
     /// per-route ext_authz config, HTTPRoute-only (#23).
     pub(super) external_auths: &'a reflector::Store<CoxswainExternalAuth>,
+    /// `JwtAuth` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
+    /// filters into per-route JWT (JWKS bearer-token) validation config (#441).
+    /// No status subresource (unlike `CoxswainExternalAuth`) — `JwtAuth` has no
+    /// `targetRefs`/Gateway-attachment surface, so a plain (non-status-relevant)
+    /// store is enough; diagnosability is WARN logs + the route's fail-closed 503.
+    pub(super) jwt_auths: &'a reflector::Store<JwtAuth>,
+    /// Controller-fetched remote-JWKS cache (#441), read synchronously when
+    /// resolving a `JwtAuth` CR that names a `jwks.remote`. Grouped alongside
+    /// `jwt_auths` here (rather than `Ownership`) so `rebuild()` stays within
+    /// the workspace `clippy::too_many_arguments` threshold. See [`crate::jwks`].
+    pub(super) jwks_cache: &'a crate::jwks::SharedJwksCache,
     /// `RequestSizeLimit` CRs in scope — resolved from `HTTPRouteRule`/`GRPCRouteRule`
     /// `ExtensionRef` filters into a per-route body-size cap (#443).
     pub(super) request_size_limits: &'a reflector::Store<RequestSizeLimit>,
@@ -992,6 +1012,7 @@ impl BackgroundService for SharedProxyReconciler {
             ingress_event_tx: self.opts.ingress_event_tx.clone(),
             enable_gateway_api: self.opts.enable_gateway_api,
             enable_ingress: self.opts.enable_ingress,
+            fetch_remote_jwks: self.opts.fetch_remote_jwks,
         };
         let handles = SharedHandles {
             ingress_routes: self.ingress_routes.clone(),
@@ -1367,6 +1388,7 @@ async fn spawn_tasks(
         ingress_event_tx,
         enable_gateway_api,
         enable_ingress,
+        fetch_remote_jwks,
     } = config;
     // Status-relevant stores reuse the shared writers pre-created in `new` (so
     // the status-writer's subscriptions observe the same synced stores); the
@@ -1394,6 +1416,10 @@ async fn spawn_tasks(
     let (path_rewrite_reader, path_rewrite_writer) = reflector::store::<PathRewriteRegex>();
     let (ip_access_reader, ip_access_writer) = reflector::store::<IpAccessControl>();
     let (basic_auth_reader, basic_auth_writer) = reflector::store::<BasicAuth>();
+    // JwtAuth has no status subresource (#441) — a plain, non-shared store is
+    // enough; unlike CoxswainExternalAuth it has no targetRefs/Gateway-attachment
+    // surface for the controller's status-writer to react to.
+    let (jwt_auth_reader, jwt_auth_writer) = reflector::store::<JwtAuth>();
     // CoxswainExternalAuth is a status-relevant store: the controller role
     // subscribes to it via `StatusSubscriptions.coxswain_external_auths` (#23) to
     // write `status.ancestors[]`, and the data-plane reader resolves both the
@@ -1466,6 +1492,20 @@ async fn spawn_tasks(
         watcher::Config::default().labels("ingress.coxswain-labs.dev/auth-basic=true"),
         ReflectorEffects::new(&notify, &controller_health, "auth_secret", metrics),
         "AuthSecret",
+    );
+    // Always-on (not gated by `enable_gateway_api`): the Ingress `auth-jwt`
+    // annotation (#441) consumes the same `JwtAuth` CR store as the
+    // Gateway-API `JwtAuth` ExtensionRef — gating this behind
+    // `enable_gateway_api` would leave `auth-jwt` permanently unresolvable
+    // (fail-open, no auth enforced) on an Ingress-only install. Mirrors the
+    // `auth_secret` fix above for the identical cross-surface-store mistake.
+    spawn_reflector(
+        &mut set,
+        jwt_auth_writer,
+        scoped_api::<JwtAuth>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(&notify, &controller_health, "jwt_auth", metrics),
+        "JwtAuth",
     );
 
     // --- Ingress reflectors (gated by --disable-ingress) ---
@@ -1653,6 +1693,41 @@ async fn spawn_tasks(
         });
     }
 
+    // --- JWKS fetch/refresh (controller role only, #441) ---
+    //
+    // Fetches and refreshes remote JWKS endpoints named by `JwtAuth` CRs,
+    // publishing resolved keys into `jwks_cache`. Gated by `fetch_remote_jwks`
+    // so the read-only proxy role never egresses to an identity provider (the
+    // Istio model, not Envoy's default proxy-side fetch) — see [`crate::jwks`].
+    let jwks_cache = crate::jwks::SharedJwksCache::new();
+    if fetch_remote_jwks {
+        let cache = jwks_cache.clone();
+        let jwt_auths_for_fetch = jwt_auth_reader.clone();
+        // Single connection-pooling client for JWKS fetches — mirrors the
+        // ext_authz sub-request client (bin/lib.rs); rustls backend, no
+        // native-tls dep. `run()` installs the crypto provider before any
+        // reconciler role starts, so this construction cannot fail at runtime.
+        let jwks_client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .build()
+            .unwrap_or_else(|e| {
+                panic!("invariant: reqwest::Client construction must succeed: {e}")
+            });
+        set.spawn(async move {
+            crate::jwks::run(cache, jwt_auths_for_fetch, jwks_client).await;
+        });
+        // Forward cache-change notifications into the shared rebuild-trigger
+        // `Notify` so a JWKS resolving, rotating, or starting to fail re-drives
+        // the debounced rebuild below — the same mechanism every watched CR uses.
+        let mut jwks_changed = jwks_cache.subscribe();
+        let rebuild_notify = Arc::clone(&notify);
+        set.spawn(async move {
+            while jwks_changed.changed().await.is_ok() {
+                rebuild_notify.notify_waiters();
+            }
+        });
+    }
+
     // --- Trailing-edge debounce + rebuild ---
     //
     // Waits for the first notification, then races subsequent notifications
@@ -1697,6 +1772,8 @@ async fn spawn_tasks(
                 ip_access: &ip_access_reader,
                 basic_auths: &basic_auth_reader,
                 external_auths: &external_auth_reader,
+                jwt_auths: &jwt_auth_reader,
+                jwks_cache: &jwks_cache,
                 request_size_limits: &request_size_limit_reader,
                 compressions: &compression_reader,
                 client_traffic_policies: &ctp_reader,

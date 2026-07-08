@@ -19,13 +19,13 @@ use crate::gw_types::{
 };
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
-use coxswain_core::crd::{IpAccessControl, RateLimit, RetryPolicy};
+use coxswain_core::crd::{IpAccessControl, JwtAuth, RateLimit, RetryPolicy};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, FilterAction, GatewayRoutingTableBuilder, HeaderMod,
-    HeaderPredicate, HostRouterBuilder, MatchPredicates, RouteEntry, RouteTimeouts, UpstreamTls,
-    ValueMatch, WildcardKind, compile_bounded,
+    HeaderPredicate, HostRouterBuilder, IngressAuthConfig, MatchPredicates, RouteEntry,
+    RouteTimeouts, UpstreamTls, ValueMatch, WildcardKind, compile_bounded,
 };
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -38,13 +38,14 @@ use std::time::SystemTime;
 /// Precomputed context for GRPCRoute reconciliation.
 ///
 /// Slimmer than [`super::reconcile::RouteResolution`]: GRPCRoute supports the
-/// protocol-agnostic ExtensionRef filters — `RateLimit` (#25) and `IpAccessControl`
-/// (#479) — but not `PathRewriteRegex` (for gRPC the path *is* the
-/// `/{service}/{method}` RPC address, so rewriting it is meaningless), nor
-/// `BasicAuth`/`Compression` (HTTP-only idioms, #442/#446), nor `RequestSizeLimit`
-/// (#443): a mid-stream body-size cap on HTTP/2 deadlocks the client under pingora
-/// (#509), and gRPC never sends `Content-Length` for the up-front check to use — so
-/// gRPC messages are size-limited by the backend's own `max_recv_msg_size` until
+/// protocol-agnostic ExtensionRef filters — `RateLimit` (#25), `IpAccessControl`
+/// (#479), and `JwtAuth` (#441, bearer/JWT auth is a common gRPC pattern) — but
+/// not `PathRewriteRegex` (for gRPC the path *is* the `/{service}/{method}` RPC
+/// address, so rewriting it is meaningless), nor `BasicAuth`/`Compression`
+/// (HTTP-only idioms, #442/#446), nor `RequestSizeLimit` (#443): a mid-stream
+/// body-size cap on HTTP/2 deadlocks the client under pingora (#509), and gRPC
+/// never sends `Content-Length` for the up-front check to use — so gRPC
+/// messages are size-limited by the backend's own `max_recv_msg_size` until
 /// pingora supports request-body buffering (pingora #816/#780).
 #[non_exhaustive]
 pub struct GrpcRouteResolution<'a> {
@@ -64,6 +65,13 @@ pub struct GrpcRouteResolution<'a> {
     /// `IpAccessControl` CR store for resolving `ExtensionRef` filters into per-route
     /// source-IP allow/deny CIDR sets (#479). A missing CR fails open (no filtering).
     pub ip_access: &'a reflector::Store<IpAccessControl>,
+    /// `JwtAuth` CR store for resolving `ExtensionRef` filters into per-route JWT
+    /// (JWKS bearer-token) validation config (#441). A missing CR fails open (no
+    /// JWT check); a present-but-unresolved JWKS fails closed (`Unavailable`, 503).
+    pub jwt_auths: &'a reflector::Store<JwtAuth>,
+    /// Controller-fetched remote-JWKS cache (#441), read synchronously when
+    /// resolving a `JwtAuth` CR that names a `jwks.remote`. See [`crate::jwks`].
+    pub jwks_cache: &'a crate::jwks::SharedJwksCache,
 }
 
 /// Result of looking up a `BackendTLSPolicy` for a rule's backend refs.
@@ -94,6 +102,8 @@ pub(super) fn reconcile(
         rate_limits,
         retry_policies,
         ip_access,
+        jwt_auths,
+        jwks_cache,
     } = resolution;
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     let route_name = route.metadata.name.as_deref().unwrap_or("unknown");
@@ -263,6 +273,9 @@ pub(super) fn reconcile(
         let (allow_source_range, deny_source_range) =
             super::filters::resolve_ip_access(rule_filters, route_ns, ip_access);
         let rate_limit = super::filters::resolve_rate_limit(rule_filters, route_ns, rate_limits);
+        let jwt_auth =
+            super::filters::resolve_jwt_auth(rule_filters, route_ns, jwt_auths, jwks_cache);
+        let auth: Arc<[Arc<IngressAuthConfig>]> = jwt_auth.into_iter().collect();
         let ctx = GrpcRuleContext {
             filters: rule_filters,
             error_status,
@@ -273,6 +286,7 @@ pub(super) fn reconcile(
             rate_limit,
             allow_source_range,
             deny_source_range,
+            auth,
         };
         for (hostname_opt, port) in &bindings {
             let pb = builder.for_port(*port);
@@ -304,6 +318,11 @@ struct GrpcRuleContext<'a> {
     /// Source-IP deny-list resolved from the same `IpAccessControl`. Enforced before
     /// `allow_source_range` in the proxy.
     deny_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    /// Auth chain resolved from the rule's `JwtAuth` `ExtensionRef` (#441).
+    /// `GRPCRoute` carries no Gateway-attached auth mandate today (unlike
+    /// HTTPRoute's `CoxswainExternalAuth` `targetRefs`), so this is just the
+    /// route-level check(s), if any. Shared across every entry the rule installs.
+    auth: Arc<[Arc<IngressAuthConfig>]>,
 }
 
 /// Installs one GRPCRoute rule (all its matches) into a `HostRouterBuilder`.
@@ -341,6 +360,7 @@ fn apply_grpc_rule(
             .with_allow_source_range(ctx.allow_source_range.clone())
             .with_deny_source_range(ctx.deny_source_range.clone())
             .with_circuit_breaker(ctx.circuit_breaker.clone())
+            .with_auth_chain(ctx.auth.clone())
     };
 
     match rule.matches.as_deref() {
@@ -557,9 +577,10 @@ fn build_filters(filters: &[GrpcRouteRulesFilters]) -> Vec<FilterAction> {
                 }
             }
             GrpcRouteRulesFiltersType::ExtensionRef => {
-                // RateLimit (#25) and IpAccessControl (#479) ExtensionRefs are
-                // resolved separately (into the route's rate-limit config and
-                // source-IP allow/deny sets); any other ExtensionRef is unsupported
+                // RateLimit (#25), IpAccessControl (#479), RetryPolicy (#445), and
+                // JwtAuth (#441) ExtensionRefs are resolved separately (into the
+                // route's rate-limit config, source-IP allow/deny sets, retry
+                // policy, and auth chain); any other ExtensionRef is unsupported
                 // on GRPCRoute — notably BasicAuth (#442), Compression (#446), and
                 // RequestSizeLimit (#443, see #509: a mid-stream h2 body cap deadlocks
                 // the client under pingora; gRPC is limited by the backend instead).
@@ -567,7 +588,7 @@ fn build_filters(filters: &[GrpcRouteRulesFilters]) -> Vec<FilterAction> {
                     ext.group == super::COXSWAIN_GROUP
                         && matches!(
                             ext.kind.as_str(),
-                            "RateLimit" | "IpAccessControl" | "RetryPolicy"
+                            "RateLimit" | "IpAccessControl" | "RetryPolicy" | "JwtAuth"
                         )
                 });
                 if !supported {
@@ -1207,6 +1228,82 @@ mod tests {
         );
     }
 
+    // ── JwtAuth on GRPCRoute via shared resolve_jwt_auth (#441) ───────────────
+
+    fn grpc_jwt_auth_filter(name: &str) -> GrpcRouteRulesFilters {
+        use crate::gw_types::v::grpcroutes::GrpcRouteRulesFiltersExtensionRef;
+        GrpcRouteRulesFilters {
+            r#type: GrpcRouteRulesFiltersType::ExtensionRef,
+            extension_ref: Some(GrpcRouteRulesFiltersExtensionRef {
+                group: "gateway.coxswain-labs.dev".to_string(),
+                kind: "JwtAuth".to_string(),
+                name: name.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    // `JwtAuthSpec` is `#[non_exhaustive]` — deserialize a CR instead.
+    fn grpc_jwt_auth_cr(ns: &str, name: &str) -> JwtAuth {
+        let yaml = format!(
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: JwtAuth\n\
+             metadata:\n  name: {name}\n  namespace: {ns}\n\
+             spec:\n  issuer: https://issuer.example.com\n  jwks:\n    inline:\n      jwks:\n        keys: []\n",
+        );
+        serde_yaml::from_str(&yaml).expect("valid JwtAuth")
+    }
+
+    #[test]
+    fn grpc_jwt_auth_resolves() {
+        let store = crate::tests::fixtures::make_jwt_auth_store(vec![grpc_jwt_auth_cr(
+            "default", "jwtauth",
+        )]);
+        let cache = crate::tests::fixtures::empty_jwks_cache();
+        let resolved = super::super::filters::resolve_jwt_auth(
+            &[grpc_jwt_auth_filter("jwtauth")],
+            "default",
+            &store,
+            &cache,
+        )
+        .expect("JwtAuth resolved");
+        assert!(matches!(
+            resolved.as_ref(),
+            coxswain_core::routing::IngressAuthConfig::Jwt(_)
+        ));
+    }
+
+    #[test]
+    fn grpc_jwt_auth_no_ext_ref_is_none() {
+        let store = crate::tests::fixtures::empty_jwt_auth_store();
+        let cache = crate::tests::fixtures::empty_jwks_cache();
+        assert!(
+            super::super::filters::resolve_jwt_auth::<GrpcRouteRulesFilters>(
+                &[],
+                "default",
+                &store,
+                &cache
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn grpc_jwt_auth_missing_cr_fails_open() {
+        let store = crate::tests::fixtures::empty_jwt_auth_store();
+        let cache = crate::tests::fixtures::empty_jwks_cache();
+        assert!(
+            super::super::filters::resolve_jwt_auth(
+                &[grpc_jwt_auth_filter("absent")],
+                "default",
+                &store,
+                &cache
+            )
+            .is_none(),
+            "missing CR must fail open (no JWT check)"
+        );
+    }
+
     /// A GRPCRoute attached to owned Gateway `default/gw` whose single rule
     /// (matching every method) carries the given `backend_refs` verbatim.
     fn grpc_route_with_backend_refs(
@@ -1240,8 +1337,8 @@ mod tests {
     fn reconcile_grpc_route_only(route: &GrpcRoute) -> coxswain_core::routing::GatewayRoutingTable {
         use crate::gateway_api::tests::{default_owned, make_listener_info};
         use crate::tests::fixtures::{
-            empty_ip_access_store, empty_rate_limit_store, empty_retry_policy_store,
-            empty_svc_store,
+            empty_ip_access_store, empty_jwks_cache, empty_jwt_auth_store, empty_rate_limit_store,
+            empty_retry_policy_store, empty_svc_store,
         };
         let listener_info = make_listener_info("default", "gw", &[("l1", "", 80)]);
         let mut builder = GatewayRoutingTableBuilder::new();
@@ -1258,6 +1355,8 @@ mod tests {
                 rate_limits: &empty_rate_limit_store(),
                 retry_policies: &empty_retry_policy_store(),
                 ip_access: &empty_ip_access_store(),
+                jwt_auths: &empty_jwt_auth_store(),
+                jwks_cache: &empty_jwks_cache(),
             },
             &mut builder,
         );

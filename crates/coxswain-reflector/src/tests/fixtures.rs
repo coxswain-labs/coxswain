@@ -168,3 +168,23 @@ pub(crate) fn make_svc_store(services: Vec<Service>) -> reflector::Store<Service
     }
     writer.as_reader()
 }
+
+pub(crate) fn empty_jwt_auth_store() -> reflector::Store<coxswain_core::crd::JwtAuth> {
+    reflector::store::Writer::<coxswain_core::crd::JwtAuth>::default().as_reader()
+}
+
+pub(crate) fn make_jwt_auth_store(
+    crs: Vec<coxswain_core::crd::JwtAuth>,
+) -> reflector::Store<coxswain_core::crd::JwtAuth> {
+    let mut writer = reflector::store::Writer::<coxswain_core::crd::JwtAuth>::default();
+    for cr in crs {
+        writer.apply_watcher_event(&watcher::Event::Apply(cr));
+    }
+    writer.as_reader()
+}
+
+/// Empty JWKS cache — every `JwtAuth` resolving a remote JWKS fails closed
+/// (`Unavailable`), matching production behaviour before the first fetch lands.
+pub(crate) fn empty_jwks_cache() -> crate::jwks::SharedJwksCache {
+    crate::jwks::SharedJwksCache::new()
+}

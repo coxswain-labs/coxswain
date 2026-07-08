@@ -231,6 +231,8 @@ pub(super) fn build_gateway_routes(
                 basic_auths: stores.basic_auths,
                 external_auths: stores.external_auths,
                 external_auth_gateway_index: ownership.external_auth_gateway_index,
+                jwt_auths: stores.jwt_auths,
+                jwks_cache: stores.jwks_cache,
                 auth_secrets: stores.auth_secrets,
                 basic_auth_secret_grants: ownership.basic_auth_secret_grants,
                 request_size_limits: stores.request_size_limits,
@@ -257,6 +259,8 @@ pub(super) fn build_gateway_routes(
                 rate_limits: stores.rate_limits,
                 retry_policies: stores.retry_policies,
                 ip_access: stores.ip_access,
+                jwt_auths: stores.jwt_auths,
+                jwks_cache: stores.jwks_cache,
             },
             &mut builder,
         );
@@ -301,6 +305,11 @@ fn build_ingress_routes(
     );
 
     let mut builder = IngressRoutingTableBuilder::new();
+    let auth_stores = crate::ingress::IngressAuthStores::new(
+        stores.auth_secrets,
+        stores.jwt_auths,
+        stores.jwks_cache,
+    );
     let mut pending_annotation_events: Vec<(String, String, Vec<AnnotationIssue>)> = Vec::new();
     for ingress in ingresses {
         let issues = IngressReconciler::reconcile(
@@ -310,7 +319,7 @@ fn build_ingress_routes(
             &class_ctx,
             ingress_ports,
             &mut builder,
-            stores.auth_secrets,
+            &auth_stores,
         );
         if !issues.is_empty() && event_tx.is_some() {
             let ns = ingress
