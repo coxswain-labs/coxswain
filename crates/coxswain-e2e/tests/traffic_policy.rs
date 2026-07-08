@@ -110,19 +110,23 @@ async fn annotation_retry_codes_retries_retriable_status_with_backoff() -> anyho
     fixtures::apply_fixture(ingress::ANNOTATION_RETRY_CODES, FixtureVars::new(&ns.name)).await?;
 
     let host = format!("ingretry.{}.local", ns.name);
+    // The shared proxy serves Ingress on its default HTTP listener. Use `raw_status`
+    // (plain reqwest, no JSON parse) — the shared `HttpClient` deserializes 2xx bodies
+    // as `EchoResponse`, which fails on go-httpbin's non-echo `/status/:code` body.
+    let proxy = h.http.proxy_addr;
 
     // Readiness: /status/200 is not retriable, so a 200 confirms the route is live.
     wait::poll_until(
         Duration::from_secs(60),
         wait::POLL,
         || async { format!("{host} route live (go-httpbin 200)") },
-        || async { matches!(h.http.get_status(&host, "/status/200").await, Ok(200)).then_some(()) },
+        || async { (raw_status(proxy, &host, "/status/200").await == 200).then_some(()) },
     )
     .await?;
 
     let before = retry_count(&h, &ns.name, "http-code").await;
     let start = std::time::Instant::now();
-    let status = h.http.get_status(&host, "/status/503").await?;
+    let status = raw_status(proxy, &host, "/status/503").await;
     let elapsed = start.elapsed();
 
     assert_eq!(
