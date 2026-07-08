@@ -113,6 +113,8 @@ spec:
                           A JSON Web Key Set object (RFC 7517 `{"keys": [...]}`), verbatim.
                           Schema-free (any JSON) — an unparseable or empty key set is caught at
                           reconcile time and fails the route closed, never an apiserver rejection.
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
                     required:
                     - jwks
                     type: object

@@ -28,7 +28,7 @@
 //! is generated from it by `examples/crdgen.rs` and pinned by a snapshot test.
 
 use kube::CustomResource;
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator};
 use serde::{Deserialize, Serialize};
 
 /// JWT (JWKS bearer-token) validation policy for a route rule.
@@ -137,7 +137,16 @@ pub struct InlineJwks {
     /// A JSON Web Key Set object (RFC 7517 `{"keys": [...]}`), verbatim.
     /// Schema-free (any JSON) — an unparseable or empty key set is caught at
     /// reconcile time and fails the route closed, never an apiserver rejection.
+    #[schemars(schema_with = "preserve_unknown_fields_schema")]
     pub jwks: serde_json::Value,
+}
+
+fn preserve_unknown_fields_schema(_: &mut SchemaGenerator) -> Schema {
+    serde_json::from_value(serde_json::json!({
+        "type": "object",
+        "x-kubernetes-preserve-unknown-fields": true,
+    }))
+    .unwrap_or_else(|e| panic!("invariant: preserve-unknown-fields schema is a valid Schema: {e}"))
 }
 
 /// One request location to look for the bearer token in — Envoy
