@@ -1,0 +1,39 @@
+# ext-auth fixture (#549): the annotation names a CoxswainExternalAuth CR by
+# "namespace/name" — Ingress parity with the Gateway API ExtensionRef path
+# (crates/coxswain-e2e/fixtures/gateway_api/external_auth_route_allow.yaml).
+#
+# The CoxswainExternalAuth (HTTP transport) points at auth-allow:4000, which
+# returns 200 + X-Auth-User header. The proxy allows the request and forwards
+# it to echo-a.
+#
+# Host: extauthallow.TESTNS.local / -> echo-a:3000 (reached on allow).
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
+metadata:
+  name: extauth-allow
+spec:
+  protocol: HTTP
+  backendRef:
+    name: auth-allow
+    port: 4000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ext-auth-allow-ingress
+  annotations:
+    ingress.coxswain-labs.dev/ext-auth: "${TESTNS}/extauth-allow"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: extauthallow.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

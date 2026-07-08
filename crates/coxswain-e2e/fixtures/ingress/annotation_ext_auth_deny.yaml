@@ -1,0 +1,39 @@
+# ext-auth fixture (#549): the annotation names a CoxswainExternalAuth CR by
+# "namespace/name" — Ingress parity with the Gateway API ExtensionRef path
+# (crates/coxswain-e2e/fixtures/gateway_api/external_auth_route_deny.yaml).
+#
+# The CoxswainExternalAuth (HTTP transport) points at auth-deny:4001, which
+# returns 403 + Set-Cookie. The proxy denies the request and never reaches
+# echo-a.
+#
+# Host: extauthdeny.TESTNS.local / -> echo-a:3000 (never reached).
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
+metadata:
+  name: extauth-deny
+spec:
+  protocol: HTTP
+  backendRef:
+    name: auth-deny
+    port: 4001
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ext-auth-deny-ingress
+  annotations:
+    ingress.coxswain-labs.dev/ext-auth: "${TESTNS}/extauth-deny"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: extauthdeny.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

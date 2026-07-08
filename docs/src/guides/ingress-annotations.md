@@ -44,12 +44,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/rate-limit-rps` | integer | _none_ (disabled) | `"100"` |
 | `ingress.coxswain-labs.dev/rate-limit-burst` | integer | `0` | `"50"` |
 | `ingress.coxswain-labs.dev/rate-limit-by` | `ip` or `header:Name` | `"ip"` | `"header:X-Api-Key"` |
-| `ingress.coxswain-labs.dev/ext-auth-backend` | `[ns/]service:port` | _none_ | `"oauth2-proxy:4180"` |
-| `ingress.coxswain-labs.dev/ext-auth-protocol` | `http` or `grpc` | `"http"` | `"grpc"` |
-| `ingress.coxswain-labs.dev/ext-auth-timeout` | duration | `"2s"` | `"500ms"` |
-| `ingress.coxswain-labs.dev/ext-auth-fail-closed` | boolean | `true` | `"false"` |
-| `ingress.coxswain-labs.dev/ext-auth-response-headers` | csv | _none_ | `"X-Auth-User"` |
-| `ingress.coxswain-labs.dev/ext-auth-always-set-cookie` | boolean | `false` | `"true"` |
+| `ingress.coxswain-labs.dev/ext-auth` | `namespace/name` | _none_ | `"my-ns/my-extauth"` |
 | `ingress.coxswain-labs.dev/auth-basic-secret` | `namespace/name` | _none_ | `"my-ns/my-htpasswd"` |
 | `ingress.coxswain-labs.dev/auth-jwt` | `namespace/name` | _none_ | `"my-ns/my-jwt"` |
 | `ingress.coxswain-labs.dev/compression-gzip` | boolean | `false` | `"true"` |
@@ -718,65 +713,58 @@ An unrecognised `rate-limit-by` value emits a controller warning and falls back 
 
     Mitigate by:
 
-    - combining with `auth-url` or `auth-basic-secret` so the header value is authenticated before being trusted as a rate-limit key, or
+    - combining with `ext-auth` or `auth-basic-secret` so the header value is authenticated before being trusted as a rate-limit key, or
     - using `rate-limit-by: ip` as the primary limit and treating header keying as an optional secondary signal only.
 
     The controller emits a `Warning` Event on the Ingress when `header:*` keying is configured without an auth annotation, so operators are notified at reconcile time.
 
 ## Authentication
 
-Coxswain supports two authentication modes on Ingresses: **external authorization** (`ext_authz`, delegated to an auth service) and **basic auth** (htpasswd Secret). Both are enforced at the proxy before any upstream connection; a failure never reaches the backend.
+Coxswain supports three independently additive authentication checks on Ingresses: **external authorization** (`ext_authz`, delegated to an auth service, `ext-auth`), **basic auth** (htpasswd Secret, `auth-basic-secret`), and **JWT** (JWKS bearer-token, `auth-jwt`). All are enforced at the proxy before any upstream connection; a failure never reaches the backend. A route can combine any subset of the three — every configured check must pass.
 
-`ext-auth-backend` and `auth-basic-secret` are mutually exclusive. If both are present, `ext-auth-backend` wins and a controller warning is emitted.
+### `ext-auth`
 
-> **Migration from `auth-url` (breaking).** Earlier releases used a single `auth-url: "http://svc/path"` string (an nginx-ism). External auth is now modelled the Gateway-API / Envoy way — a **`backendRef`** (Service + port) resolved to pod endpoints — so it gains endpoint load-balancing, in-cluster addressing (no DNS), and a choice of transport. Replace:
->
-> | Old | New |
-> |---|---|
-> | `auth-url: "http://oauth2-proxy.oauth.svc:4180/auth"` | `ext-auth-backend: "oauth/oauth2-proxy:4180"` |
-> | `auth-timeout: "500ms"` | `ext-auth-timeout: "500ms"` |
-> | `auth-response-headers: "X-Auth-User"` | `ext-auth-response-headers: "X-Auth-User"` |
-> | `auth-always-set-cookie: "true"` | `ext-auth-always-set-cookie: "true"` |
->
-> There is **no** URL-based transport any more; `auth-url` is silently ignored.
-
-### `ext-auth-backend`
-
-The auth service, as `[namespace/]service:port`. The namespace defaults to the Ingress's own namespace; a cross-namespace reference is resolved directly (Ingress is single-tenant by namespace, so no ReferenceGrant is required — unlike the Gateway API surface). The Service is resolved to its ready pod endpoints and the check is load-balanced across them, exactly like any other backend.
-
-The transport is chosen by [`ext-auth-protocol`](#ext-auth-protocol). On a network error or timeout (see [`ext-auth-timeout`](#ext-auth-timeout)) the proxy returns **503** and blocks the request unless [`ext-auth-fail-closed`](#ext-auth-fail-closed) is `"false"`.
+Enables **external authorization** (`ext_authz`) — the Ingress surface for the [`CoxswainExternalAuth` CRD](gateway-api.md#external-authorization-ext_authz), same idiom as `auth-jwt`. Value is `namespace/name` of a `CoxswainExternalAuth` resource; both surfaces resolve the same CR to the same runtime config, so one `CoxswainExternalAuth` can back an Ingress and an HTTPRoute `ExtensionRef` filter identically.
 
 ```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
 metadata:
+  name: oauth2
+  namespace: my-app
+spec:
+  protocol: HTTP          # or GRPC
+  backendRef:
+    name: oauth2-proxy
+    port: 4180
+  timeout: 250ms
+  failClosed: true        # deny (503) on auth-service error/timeout (default)
+  allowedResponseHeaders: # copied onto the upstream request on allow
+    - x-auth-user
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  namespace: my-app
   annotations:
-    ingress.coxswain-labs.dev/ext-auth-backend: "oauth/oauth2-proxy:4180"
-    ingress.coxswain-labs.dev/ext-auth-timeout: "2s"
-    ingress.coxswain-labs.dev/ext-auth-response-headers: "X-Auth-User,X-Auth-Groups"
-    ingress.coxswain-labs.dev/ext-auth-always-set-cookie: "true"
+    ingress.coxswain-labs.dev/ext-auth: "my-app/oauth2"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-api
+                port:
+                  number: 8080
 ```
 
-### `ext-auth-protocol`
-
-Selects the transport spoken to the auth service:
-
-- **`http`** (default) — forward-auth (Envoy `ext_authz`-HTTP semantics). The proxy replays the original method, Host, and path to the auth service with the client's headers (no body). **2xx** allows; any other status is returned to the client verbatim (body + controlled headers) and the upstream is never hit.
-- **`grpc`** — the Envoy `envoy.service.auth.v3.Authorization/Check` proto. The proxy sends the request context (method, path, host, headers) and maps the `CheckResponse`: an `OK` status allows (copying the OK response's `allowed_upstream_headers` — see [`ext-auth-response-headers`](#ext-auth-response-headers) — onto the upstream request); any other status denies with the response's HTTP status (default **403**), headers, and body.
-
-### `ext-auth-timeout`
-
-Maximum time to wait for the auth check to respond. Accepts any duration string (e.g. `"500ms"`, `"5s"`). Default: `2s`. On timeout the proxy fails closed (**503**) unless `ext-auth-fail-closed: "false"`.
-
-### `ext-auth-fail-closed`
-
-When the auth service is unreachable, errors, or times out: `"true"` (the default and only safe posture) **denies** the request with **503**; `"false"` **fails open**, letting the request proceed to the upstream unauthorized. Only set this to `"false"` when the auth service is advisory.
-
-### `ext-auth-response-headers`
-
-Comma-separated list of header names to copy from an **allow** response onto the **upstream request** (so the backend sees e.g. `X-Auth-User`). For the HTTP transport these come from the 2xx response headers; for gRPC, from the `OkHttpResponse` headers. The echo backend reflects them back in its JSON body, making this assertion testable end-to-end.
-
-### `ext-auth-always-set-cookie`
-
-*(HTTP transport only.)* When `"true"`, any `Set-Cookie` header present in the auth **deny response** is forwarded to the client. This enables login-redirect flows where the IdP sets a session cookie on the 302 response. Default: `false`.
+A **2xx** (HTTP transport) or `OK` (gRPC transport) response from the auth service allows the request; any other status is returned to the client verbatim and the upstream is never hit. A missing `CoxswainExternalAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`auth-jwt`: an operator who set `ext-auth` intends the route to require the check, so a stale or typo'd reference must not silently disable it. A present CR whose `backendRef` has no ready endpoints, whose cross-namespace `backendRef` lacks a `ReferenceGrant`, or whose protocol is unsupported also fails **closed**. See the [`CoxswainExternalAuth` CRD reference](gateway-api.md#external-authorization-ext_authz) for the full spec (transport, timeout, fail-closed posture, response-header forwarding).
 
 ### `auth-basic-secret`
 
@@ -875,7 +863,7 @@ spec:
                   number: 8080
 ```
 
-A valid, signed, unexpired, correct-issuer bearer token is admitted; the verified `sub` claim is forwarded as `x-user-id`. A missing/invalid/expired/wrong-issuer/wrong-audience token receives **401** with `WWW-Authenticate: Bearer`. A missing `JwtAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`auth-url`: an operator who set `auth-jwt` intends the route to require a bearer token, so a stale or typo'd reference must not silently disable authentication. An unresolved JWKS also fails **closed** (**503**). See the [`JwtAuth` CRD reference](gateway-api.md#jwt-authentication) for the full spec (remote vs. inline JWKS, `fromHeaders`, `forwardPayloadHeader`, `forward`).
+A valid, signed, unexpired, correct-issuer bearer token is admitted; the verified `sub` claim is forwarded as `x-user-id`. A missing/invalid/expired/wrong-issuer/wrong-audience token receives **401** with `WWW-Authenticate: Bearer`. A missing `JwtAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`ext-auth`: an operator who set `auth-jwt` intends the route to require a bearer token, so a stale or typo'd reference must not silently disable authentication. An unresolved JWKS also fails **closed** (**503**). See the [`JwtAuth` CRD reference](gateway-api.md#jwt-authentication) for the full spec (remote vs. inline JWKS, `fromHeaders`, `forwardPayloadHeader`, `forward`).
 
 ## Client certificate mTLS
 

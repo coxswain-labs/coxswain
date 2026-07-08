@@ -1127,7 +1127,6 @@ struct GatewayApiStoreWriters {
     path_rewrites: reflector::store::Writer<PathRewriteRegex>,
     ip_access: reflector::store::Writer<IpAccessControl>,
     basic_auths: reflector::store::Writer<BasicAuth>,
-    external_auths: reflector::store::Writer<CoxswainExternalAuth>,
     request_size_limits: reflector::store::Writer<RequestSizeLimit>,
     compressions: reflector::store::Writer<Compression>,
     listener_sets: reflector::store::Writer<ListenerSet>,
@@ -1164,7 +1163,6 @@ fn add_gateway_api_reflectors(
         path_rewrites,
         ip_access,
         basic_auths,
-        external_auths,
         request_size_limits,
         compressions,
         listener_sets,
@@ -1278,14 +1276,6 @@ fn add_gateway_api_reflectors(
         watcher::Config::default(),
         ReflectorEffects::new(notify, health, "basic_auth", metrics),
         "BasicAuth",
-    );
-    spawn_reflector(
-        set,
-        external_auths,
-        scoped_api::<CoxswainExternalAuth>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "coxswain_external_auth", metrics),
-        "CoxswainExternalAuth",
     );
     spawn_reflector(
         set,
@@ -1507,6 +1497,28 @@ async fn spawn_tasks(
         ReflectorEffects::new(&notify, &controller_health, "jwt_auth", metrics),
         "JwtAuth",
     );
+    // Always-on (not gated by `enable_gateway_api`): the Ingress `ext-auth`
+    // annotation (#549) consumes the same `CoxswainExternalAuth` CR store as
+    // the Gateway-API `ExternalAuth` ExtensionRef and `targetRefs` policy
+    // surfaces. `CoxswainExternalAuth` is coxswain's own CRD (not upstream
+    // Gateway API), so unlike HTTPRoute/Gateway/etc it needs no CRD-presence
+    // probe — gating this behind `enable_gateway_api` would leave `ext-auth`
+    // permanently unresolvable (fail-closed 503 on every route) on an
+    // Ingress-only install. Mirrors the `jwt_auth` fix above for the
+    // identical cross-surface-store mistake.
+    spawn_reflector(
+        &mut set,
+        external_auth_writer,
+        scoped_api::<CoxswainExternalAuth>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(
+            &notify,
+            &controller_health,
+            "coxswain_external_auth",
+            metrics,
+        ),
+        "CoxswainExternalAuth",
+    );
 
     // --- Ingress reflectors (gated by --disable-ingress) ---
     //
@@ -1582,7 +1594,6 @@ async fn spawn_tasks(
             path_rewrites: path_rewrite_writer,
             ip_access: ip_access_writer,
             basic_auths: basic_auth_writer,
-            external_auths: external_auth_writer,
             request_size_limits: request_size_limit_writer,
             compressions: compression_writer,
             listener_sets: listener_set_writer,

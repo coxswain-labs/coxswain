@@ -6,7 +6,7 @@ mod backend_policy;
 mod backend_tls;
 mod bindings;
 mod client_traffic_policy;
-mod external_auth;
+pub(crate) mod external_auth;
 mod filters;
 pub(crate) mod frontend_tls;
 mod grpc_reconcile;

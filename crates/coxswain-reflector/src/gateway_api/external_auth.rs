@@ -1,7 +1,7 @@
 //! `CoxswainExternalAuth` resolution (#23): shared spec→config translation and
-//! `backendRef` endpoint resolution used by both the route-level `ExtensionRef`
-//! filter (in [`super::filters`]) and — later — the Gateway-attached policy
-//! index.
+//! `backendRef` endpoint resolution used by the route-level `ExtensionRef`
+//! filter (in [`super::filters`]), the Gateway-attached policy index, and the
+//! Ingress `ext-auth` annotation (`crate::ingress`, #549).
 //!
 //! The auth-service `backendRef` is resolved to pod endpoints exactly like any
 //! other backend ([`crate::endpoints::resolve`]); a cross-namespace ref is gated
@@ -38,7 +38,16 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 /// `ReferenceGrant`, or the requested protocol is not yet supported. An
 /// operator who attached ext-auth expects enforcement, so a broken backend must
 /// never silently open the route.
-pub(super) fn resolve_spec(
+///
+/// `pub(crate)` (not `pub(super)` like most Gateway API spec resolvers) —
+/// reused directly by [`crate::ingress::reconcile_helpers`] so the Ingress
+/// `ext-auth` annotation resolves to the identical [`IngressAuthConfig`] the
+/// HTTPRoute `ExtensionRef` filter produces (Gateway API parity, #549).
+/// `policy_ns` is the namespace of the `CoxswainExternalAuth` CR itself —
+/// callers pass the route's namespace when the ref is same-namespace-only
+/// (the `ExtensionRef` filter), or the referenced CR's own namespace when the
+/// ref can cross namespaces (the Ingress annotation).
+pub(crate) fn resolve_spec(
     spec: &CoxswainExternalAuthSpec,
     policy_ns: &str,
     services: &reflector::Store<Service>,

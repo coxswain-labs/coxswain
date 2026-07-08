@@ -23,9 +23,16 @@ pub(super) use kube::runtime::reflector;
 pub(super) use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub(super) use crate::tests::fixtures::{
-    empty_jwks_cache, empty_jwt_auth_store, empty_secret_store, empty_svc_store, make_slice,
-    make_svc_store, slice_store,
+    empty_external_auth_store, empty_jwks_cache, empty_jwt_auth_store, empty_secret_store,
+    empty_svc_store, make_slice, make_svc_store, slice_store,
 };
+
+/// Empty `ReferenceGrant` set — every cross-namespace `CoxswainExternalAuth`
+/// `backendRef` fails closed, matching production behaviour with no grants
+/// applied.
+pub(super) fn empty_backend_grants() -> crate::reference_grants::GrantSet {
+    crate::reference_grants::GrantSet::default()
+}
 
 pub(super) fn owned(names: &[&str]) -> HashSet<String> {
     names.iter().map(|s| s.to_string()).collect()
@@ -48,8 +55,10 @@ pub(super) fn reconcile_no_default(
         b,
         &crate::ingress::IngressAuthStores::new(
             &empty_secret_store(),
+            &empty_external_auth_store(),
             &empty_jwt_auth_store(),
             &empty_jwks_cache(),
+            &empty_backend_grants(),
         ),
     );
 }
@@ -73,8 +82,10 @@ pub(super) fn reconcile_with_class_defaults(
         b,
         &crate::ingress::IngressAuthStores::new(
             &empty_secret_store(),
+            &empty_external_auth_store(),
             &empty_jwt_auth_store(),
             &empty_jwks_cache(),
+            &empty_backend_grants(),
         ),
     );
 }
