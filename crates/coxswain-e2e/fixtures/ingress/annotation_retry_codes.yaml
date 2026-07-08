@@ -1,0 +1,30 @@
+# Ingress retry annotations (#445) — apply backends::GO_HTTPBIN first.
+#
+# retry-attempts:2 + retry-codes:503 + retry-backoff:200ms against go-httpbin, whose
+# /status/503 always returns 503. The proxy fires two retries (each after the 200ms
+# backoff) before the final 503 — observable via the retry metric and elapsed time.
+# TESTNS is substituted with the test namespace.
+#
+# Route: ingretry.TESTNS.local / -> go-httpbin:3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: retry-codes-ingress
+  annotations:
+    ingress.coxswain-labs.dev/retry-attempts: "2"
+    ingress.coxswain-labs.dev/retry-codes: "503"
+    ingress.coxswain-labs.dev/retry-backoff: "200ms"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: ingretry.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: go-httpbin
+                port:
+                  number: 3000

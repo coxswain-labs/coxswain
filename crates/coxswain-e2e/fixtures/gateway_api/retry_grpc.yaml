@@ -1,0 +1,50 @@
+# RetryPolicy ExtensionRef on GRPCRoute (#445) — apply backends::GRPC_ECHO first.
+#
+# The RetryPolicy retries on grpc-status 12 (UNIMPLEMENTED) with attempts=2. A call
+# to a non-existent method on grpc-echo yields a trailers-only UNIMPLEMENTED, which
+# the proxy retries (grpc-aware retry, not HTTP 5xx). The RPC ultimately fails with
+# UNIMPLEMENTED (budget exhausted), but the retry is observable via
+# coxswain_proxy_upstream_retries_total{condition="grpc-code"}. Proves the gRPC
+# trailers-only retry path.
+#
+# Gateway: coxswain-grpc-retry on GATEWAY_HTTP_PORT.
+# Route host: grpc-retry.TESTNS.local, GrpcEcho service -> grpc-echo:50051.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-retry
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RetryPolicy
+metadata:
+  name: retry-unimplemented
+spec:
+  attempts: 2
+  grpcCodes: [12]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-retry-route
+spec:
+  hostnames:
+    - "grpc-retry.${TESTNS}.local"
+  parentRefs:
+    - name: coxswain-grpc-retry
+  rules:
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: RetryPolicy
+            name: retry-unimplemented
+      backendRefs:
+        - name: grpc-echo
+          port: 50051

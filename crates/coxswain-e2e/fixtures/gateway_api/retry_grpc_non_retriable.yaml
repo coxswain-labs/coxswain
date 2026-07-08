@@ -1,0 +1,48 @@
+# RetryPolicy sad path on GRPCRoute (#445) — apply backends::GRPC_ECHO first.
+#
+# The RetryPolicy retries only on grpc-status 14 (UNAVAILABLE). A call to a
+# non-existent method yields UNIMPLEMENTED (12), which is not in the set, so the
+# proxy must NOT retry — coxswain_proxy_upstream_retries_total{condition="grpc-code"}
+# never increments for this route. Proves gRPC code-list gating.
+#
+# Gateway: coxswain-grpc-retry-nr on GATEWAY_HTTP_PORT.
+# Route host: grpc-retrynr.TESTNS.local, GrpcEcho service -> grpc-echo:50051.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-retry-nr
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RetryPolicy
+metadata:
+  name: retry-unavailable-only
+spec:
+  attempts: 2
+  grpcCodes: [14]
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-retry-nr-route
+spec:
+  hostnames:
+    - "grpc-retrynr.${TESTNS}.local"
+  parentRefs:
+    - name: coxswain-grpc-retry-nr
+  rules:
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: RetryPolicy
+            name: retry-unavailable-only
+      backendRefs:
+        - name: grpc-echo
+          port: 50051
