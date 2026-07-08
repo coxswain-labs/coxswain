@@ -545,6 +545,7 @@ message IngressAuthConfig {
     ExtAuthConfig external = 1;
     BasicCredList basic = 2; // wrapped in a message to allow repeated inside oneof
     bool unavailable = 3;
+    JwtAuthConfig jwt = 4; // JwtAuth CRD / auth-jwt annotation (#441)
   }
 }
 
@@ -586,6 +587,31 @@ enum PasswordHash {
   PASSWORD_HASH_UNSPECIFIED = 0;
   PASSWORD_HASH_BCRYPT = 1;
   PASSWORD_HASH_SHA1 = 2;
+}
+
+// Mirrors JwtConfig. `jwks` is the resolved JSON Web Key Set as verbatim JSON
+// text — inline CRD JWKS and a controller-fetched remote JWKS both collapse
+// to this same representation; the proxy never fetches keys itself.
+message JwtAuthConfig {
+  string issuer = 1;
+  repeated string audiences = 2;
+  string jwks = 3; // resolved JWK Set JSON text (RFC 7517 `{"keys": [...]}`)
+  repeated JwtHeaderLocation from_headers = 4;
+  optional string forward_payload_header = 5;
+  repeated ClaimToHeader claim_to_headers = 6;
+  bool forward_token = 7;
+}
+
+// Mirrors JwtHeaderLoc.
+message JwtHeaderLocation {
+  string name = 1;
+  string value_prefix = 2;
+}
+
+// Mirrors the (claim, header) pairs in JwtConfig.claim_to_headers.
+message ClaimToHeader {
+  string claim = 1;
+  string header = 2;
 }
 
 // Mirrors CompressionConfig.

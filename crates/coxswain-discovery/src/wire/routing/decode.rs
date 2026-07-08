@@ -15,10 +15,10 @@ use coxswain_core::routing::{
     CompressionConfig, CorsConfig, CorsOrigin, ExtAuthConfig, ExtAuthTransport, FilterAction,
     ForwardedForConfig, GatewayRoutingTable, GrpcExtAuthConfig, HashSource, HeaderMod,
     HeaderPredicate, HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable,
-    LoadBalance, MatchPredicates, MirrorFraction, NormalizeLevel, PasswordHash, PathModifier,
-    QueryPredicate, RateLimitConfig, RateLimitKey, RouteEntry, RouteKind, RouteTimeouts,
-    RouterError, SessionAffinity, SubjectAltName, TlsPassthroughTable, TlsPassthroughTableBuilder,
-    UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
+    JwtConfig, JwtHeaderLoc, LoadBalance, MatchPredicates, MirrorFraction, NormalizeLevel,
+    PasswordHash, PathModifier, QueryPredicate, RateLimitConfig, RateLimitKey, RouteEntry,
+    RouteKind, RouteTimeouts, RouterError, SessionAffinity, SubjectAltName, TlsPassthroughTable,
+    TlsPassthroughTableBuilder, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
 };
 
 use super::MAX_MIRROR_DEPTH;
@@ -719,6 +719,37 @@ fn auth_from_wire(dto: &p::IngressAuthConfig) -> Result<IngressAuthConfig, WireE
                 })
                 .collect::<Result<_, _>>()?;
             Ok(IngressAuthConfig::Basic(creds))
+        }
+        p::ingress_auth_config::Auth::Jwt(jwt) => {
+            // An unresolved JWKS (controller hasn't fetched the remote `jwksUri`
+            // yet, or the wire payload is malformed) encodes as an empty string —
+            // fail that route's auth closed rather than handing the proxy an
+            // empty key set to "verify" against.
+            if jwt.jwks.is_empty() {
+                return Ok(IngressAuthConfig::Unavailable);
+            }
+            let from_headers: Arc<[JwtHeaderLoc]> = jwt
+                .from_headers
+                .iter()
+                .map(|h| JwtHeaderLoc::new(h.name.as_str(), h.value_prefix.as_str()))
+                .collect();
+            let claim_to_headers: Arc<[(Box<str>, Box<str>)]> = jwt
+                .claim_to_headers
+                .iter()
+                .map(|c| (Box::from(c.claim.as_str()), Box::from(c.header.as_str())))
+                .collect();
+            Ok(IngressAuthConfig::Jwt(JwtConfig::new(
+                Arc::from(jwt.issuer.as_str()),
+                jwt.audiences
+                    .iter()
+                    .map(|s| Box::from(s.as_str()))
+                    .collect(),
+                Arc::from(jwt.jwks.as_str()),
+                from_headers,
+                jwt.forward_payload_header.as_deref().map(Box::from),
+                claim_to_headers,
+                jwt.forward_token,
+            )))
         }
         p::ingress_auth_config::Auth::Unavailable(_) => Ok(IngressAuthConfig::Unavailable),
     }
