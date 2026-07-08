@@ -32,6 +32,9 @@ pub enum IngressAuthConfig {
     /// empty slice — the proxy treats that identically to `Unavailable`
     /// (fail-closed: 503).
     Basic(Arc<[BasicCredential]>),
+    /// Validate a bearer token's signature against a resolved JWKS
+    /// (`JwtAuth` CRD, #441).
+    Jwt(JwtConfig),
     /// The referenced htpasswd Secret was absent, unlabeled, or had no
     /// parseable entries.  The proxy responds with 503 (fail-closed) and
     /// logs a loud `WARN` naming the missing label or secret.
@@ -163,6 +166,87 @@ impl GrpcExtAuthConfig {
     #[must_use]
     pub fn new(response_headers: Arc<[Box<str>]>) -> Self {
         Self { response_headers }
+    }
+}
+
+/// Resolved JWT (JWKS bearer-token) validation configuration — the `JwtAuth`
+/// CRD (#441) translated to ready-to-verify data.
+///
+/// Deliberately **crypto-free**, matching the module-level invariant: `jwks`
+/// is the resolved JWK Set as opaque JSON text (never parsed here), whether it
+/// came from the CRD's inline `jwks` field or a remote `jwksUri` fetched and
+/// cached by the controller. `coxswain-proxy` parses it into verification keys
+/// (via `jsonwebtoken`) and caches the parse result keyed by content, so the
+/// same JWKS is parsed once regardless of how many routes reference it.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct JwtConfig {
+    /// Expected token `iss` claim.
+    pub issuer: Arc<str>,
+    /// Expected token `aud` claims; empty skips the audience check.
+    pub audiences: Arc<[Box<str>]>,
+    /// Resolved JSON Web Key Set, verbatim JSON text (RFC 7517 `{"keys": [...]}`).
+    pub jwks: Arc<str>,
+    /// Request locations to extract the bearer token from. Never empty — the
+    /// reconciler defaults to a single `Authorization` / `"Bearer "` entry when
+    /// the CRD's `fromHeaders` is absent.
+    pub from_headers: Arc<[JwtHeaderLoc]>,
+    /// Upstream header to carry the base64url-encoded verified claims payload,
+    /// when configured.
+    pub forward_payload_header: Option<Box<str>>,
+    /// Verified claim → upstream header name pairs to copy onto the upstream
+    /// request.
+    pub claim_to_headers: Arc<[(Box<str>, Box<str>)]>,
+    /// Whether to keep the original token header(s) on the upstream request
+    /// after verification. Defaults to `false` (Envoy `JwtProvider.forward`
+    /// semantics) when the CRD leaves it unset.
+    pub forward_token: bool,
+}
+
+impl JwtConfig {
+    /// Construct a [`JwtConfig`] from reconcile-resolved fields.
+    #[must_use]
+    pub fn new(
+        issuer: Arc<str>,
+        audiences: Arc<[Box<str>]>,
+        jwks: Arc<str>,
+        from_headers: Arc<[JwtHeaderLoc]>,
+        forward_payload_header: Option<Box<str>>,
+        claim_to_headers: Arc<[(Box<str>, Box<str>)]>,
+        forward_token: bool,
+    ) -> Self {
+        Self {
+            issuer,
+            audiences,
+            jwks,
+            from_headers,
+            forward_payload_header,
+            claim_to_headers,
+            forward_token,
+        }
+    }
+}
+
+/// One request location to look for the bearer token in — mirrors the CRD's
+/// `JwtHeaderLoc`.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JwtHeaderLoc {
+    /// Header name to read the token from.
+    pub name: Box<str>,
+    /// Prefix stripped from the header value before parsing the token (e.g.
+    /// `"Bearer "`). Empty means the header value *is* the token verbatim.
+    pub value_prefix: Box<str>,
+}
+
+impl JwtHeaderLoc {
+    /// Construct a [`JwtHeaderLoc`] from a resolved header name and prefix.
+    #[must_use]
+    pub fn new(name: impl Into<Box<str>>, value_prefix: impl Into<Box<str>>) -> Self {
+        Self {
+            name: name.into(),
+            value_prefix: value_prefix.into(),
+        }
     }
 }
 

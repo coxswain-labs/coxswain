@@ -72,6 +72,14 @@ humantime          = { version = "2" }
 ipnet              = { version = "2" }
 itoa               = { version = "1" }
 dashmap            = { version = "6.2.1" }
+# JWKS/JWT verification (#441) — the de-facto Rust JWT crate; `jwk::JwkSet` +
+# `DecodingKey::from_jwk` cover RS/PS/ES/EdDSA. No bespoke crypto code: this is
+# the sole JWT-parsing/signature-verification boundary in the workspace.
+# `rust_crypto` (not the default `use_pem`, not `aws_lc_rs`): pure-Rust
+# signature verification (ed25519-dalek/p256/p384/rsa/sha2), avoiding a second
+# C/assembly crypto engine alongside rustls's `ring`. `use_pem` is dropped —
+# JWKS is consumed as JSON, never PEM.
+jsonwebtoken       = { version = "10", default-features = false, features = ["rust_crypto"] }
 # Pinned to v1_36 (Kubernetes 1.36 types). The compiled API version is decoupled
 # from the minimum supported cluster — our floor is 1.30+ (VAP GA). See
 # docs/src/installation/index.md.
