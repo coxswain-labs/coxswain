@@ -27,7 +27,7 @@ use std::sync::Arc;
 /// A resolved source-IP CIDR set attached to a route (allow or deny list), or
 /// `None` when the set is absent (no filtering on that side). Matches the shape
 /// of `RouteEntry::{allow,deny}_source_range`.
-pub(super) type CidrSet = Option<Arc<Vec<ipnet::IpNet>>>;
+pub(super) use super::ip_access_control::CidrSet;
 
 /// Store references needed to resolve `backendRef` targets in filters (e.g.
 /// `RequestMirror`).
@@ -789,8 +789,8 @@ fn resolve_retry_policy_ref(
 /// (`group: gateway.coxswain-labs.dev`, `kind: IpAccessControl`) and, if found, resolves
 /// the named CR from `ip_access` and parses its `allow` / `deny` CIDR sets into
 /// the `(allow_source_range, deny_source_range)` lists the proxy enforces (deny
-/// evaluated first — the same fields the Ingress `allow-source-range` /
-/// `deny-source-range` annotations feed).
+/// evaluated first — the same fields the Ingress `ip-access-control`
+/// annotation feeds, #553).
 ///
 /// Only the first matching `ExtensionRef` is used; other extension refs (and
 /// non-`IpAccessControl` kinds) are ignored here — `build_filters` owns the
@@ -842,49 +842,9 @@ pub(super) fn resolve_ip_access_ref(
         );
         return RefResolution::FailOpen;
     };
-    let deny = parse_cidr_set(&cr.spec.deny, route_ns, ext_name, "deny");
-    let allow = parse_cidr_set(&cr.spec.allow, route_ns, ext_name, "allow");
-    RefResolution::Resolved((allow, deny))
-}
-
-/// Parse an `IpAccessControl` CIDR list into an `Arc<Vec<IpNet>>`, promoting bare
-/// IPs to host routes and skipping invalid tokens with a WARN.
-///
-/// Returns `None` when the list is empty or every token is unparseable, so the
-/// caller treats the set as absent rather than as an empty (all-blocking /
-/// nothing-matching) list. `field` names the offending set (`"allow"` / `"deny"`)
-/// in skipped-token WARNs.
-fn parse_cidr_set(
-    tokens: &[String],
-    route_ns: &str,
-    cr_name: &str,
-    field: &'static str,
-) -> CidrSet {
-    let nets: Vec<ipnet::IpNet> = tokens
-        .iter()
-        .map(|t| t.trim())
-        .filter(|t| !t.is_empty())
-        .filter_map(|token| {
-            match crate::ingress::annotations::edge_access::parse_cidr_or_host(token) {
-                Some(net) => Some(net),
-                None => {
-                    tracing::warn!(
-                        ns = route_ns,
-                        name = cr_name,
-                        field,
-                        token,
-                        "IpAccessControl has an invalid CIDR — skipping token"
-                    );
-                    None
-                }
-            }
-        })
-        .collect();
-    if nets.is_empty() {
-        None
-    } else {
-        Some(Arc::new(nets))
-    }
+    RefResolution::Resolved(super::ip_access_control::resolve_spec(
+        &cr.spec, route_ns, ext_name,
+    ))
 }
 
 /// Scans `filters` for an `ExtensionRef` pointing at a `BasicAuth` CR
