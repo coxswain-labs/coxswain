@@ -31,8 +31,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/ssl-redirect-code` | integer | `308` | `"301"` |
 | `ingress.coxswain-labs.dev/max-body-size` | size | _none_ | `"8m"` |
 | `ingress.coxswain-labs.dev/mirror-target` | `svc.ns[:port]` | _none_ | `"echo-b.default.svc:3000"` |
-| `ingress.coxswain-labs.dev/allow-source-range` | cidr-list | _none_ | `"10.0.0.0/8,192.168.1.0/24"` |
-| `ingress.coxswain-labs.dev/deny-source-range` | cidr-list | _none_ | `"1.2.3.0/24,5.6.7.8/32"` |
+| `ingress.coxswain-labs.dev/ip-access-control` | `namespace/name` | _none_ | `"my-ns/my-policy"` |
 | `ingress.coxswain-labs.dev/trust-forwarded-for` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/forwarded-for-header` | string | `X-Forwarded-For` | `"CF-Connecting-IP"` |
 | `ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs` | cidr-list | _none_ (unconditional) | `"10.0.0.0/8"` |
@@ -227,7 +226,7 @@ Normalisation runs **before** the routing lookup; the canonical path is used for
 Each level includes all transformations of the levels before it.
 
 !!! warning "Migration: `none` was removed"
-    The `none` value (which disabled normalization entirely) was dropped because it re-opened route-match bypass and path-traversal attacks — a request could dodge a path-based route or `allow-source-range` rule with `..`, `%2e%2e`, or duplicate slashes. An Ingress that still sets `path-normalize: none` is **not rejected**: the controller logs a `WARN`, emits a `Warning` Event, and silently upgrades the level to `base`. If you previously relied on raw-path passthrough, expect normalized paths upstream now and remove any dependency on the un-normalized form.
+    The `none` value (which disabled normalization entirely) was dropped because it re-opened route-match bypass and path-traversal attacks — a request could dodge a path-based route or `ip-access-control` rule with `..`, `%2e%2e`, or duplicate slashes. An Ingress that still sets `path-normalize: none` is **not rejected**: the controller logs a `WARN`, emits a `Warning` Event, and silently upgrades the level to `base`. If you previously relied on raw-path passthrough, expect normalized paths upstream now and remove any dependency on the un-normalized form.
 
 ```yaml
 metadata:
@@ -461,58 +460,49 @@ A mirror timeout of 5 s is applied per sub-request; the primary never waits for 
 
 `Authorization`, `Cookie`, and `Proxy-Authorization` headers are **always stripped** from mirror sub-requests. The mirror backend is a shadow endpoint whose trustworthiness is not guaranteed; forwarding user credentials to it would make it a credential-harvesting surface.
 
-## `allow-source-range`
+## `ip-access-control`
 
-Restricts the Ingress to a set of client source IPs. A request whose client IP falls outside **every** listed range is rejected with **403 Forbidden** before any upstream connection is opened — the equivalent of nginx-ingress's `whitelist-source-range`.
+The Ingress surface for the [`IpAccessControl` CRD](gateway-api.md#ip-access-control), same idiom as `ext-auth`/`auth-jwt`/`compression`/`retry`/`rate-limit`. Value is `namespace/name` of an `IpAccessControl` resource; both surfaces resolve the same CR to the same runtime config, so one `IpAccessControl` can back an Ingress and an HTTPRoute/GRPCRoute `ExtensionRef` filter identically. A request whose client IP falls inside `deny`, or outside every `allow` range when `allow` is non-empty, is rejected with **403 Forbidden** before any upstream connection is opened.
 
 ```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: IpAccessControl
+metadata:
+  name: office-only
+spec:
+  deny:                       # evaluated FIRST
+    - 203.0.113.5/32
+  allow:                      # then the allow-list
+    - 203.0.113.0/24
+    - 2001:db8::/32
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
 metadata:
   annotations:
-    ingress.coxswain-labs.dev/allow-source-range: "10.0.0.0/8,192.168.1.0/24"
+    ingress.coxswain-labs.dev/ip-access-control: "my-app/office-only"
 ```
 
-The value is a comma-separated list of IPv4/IPv6 CIDR blocks. A bare address without a prefix (`10.0.0.1`, `2001:db8::1`) is accepted as a host route (`/32` / `/128`). Whitespace around entries is trimmed.
+The `allow` / `deny` values are lists of IPv4/IPv6 CIDR blocks. A bare address without a prefix (`10.0.0.1`, `2001:db8::1`) is accepted as a host route (`/32` / `/128`).
 
 **Which IP is matched.** When the proxy sits behind a load balancer speaking the [PROXY protocol](../reference/configuration.md) (`--proxy-accept-proxy-protocol`), the match uses the **real client IP** carried in the PROXY header. Otherwise it uses the L4 peer address of the connection. Deploy behind a PROXY-protocol-aware load balancer (or set `externalTrafficPolicy: Local`) so the proxy observes real client IPs rather than the LB's address. When `trust-forwarded-for` is also set, see the [Trusted proxy headers](#trust-forwarded-for) section — the effective client IP may come from a forwarded header instead.
 
 **Matching is strict.** CIDR membership is exact per address family — an IPv4-mapped IPv6 client (`::ffff:10.0.0.1`) does **not** match an IPv4 CIDR. List both families if your clients can arrive over either.
 
-**Failure handling:**
+**Evaluation order.** `deny` is evaluated **before** `allow`. A client IP that falls inside the deny list is rejected with 403 even if the allow-list would have admitted it. An empty `allow` list imposes no allow-list restriction (only `deny` applies); empty `allow` **and** empty `deny` performs no filtering.
 
-- An invalid CIDR token emits a controller warning and is **skipped**; the remaining valid ranges still apply.
-- If **every** token is invalid (or the annotation is absent/empty), the allow-list is treated as absent — **all** source IPs are admitted (**fail-open** at parse time, so a typo never locks out all traffic).
-- Once an allow-list is in effect, a request whose source IP cannot be determined is **denied** (**fail-closed** at request time) — an un-attributable client must not pass a security control.
+**Unattributable client IP.** A client whose IP cannot be determined is **denied** against a non-empty `allow` list (**fail-closed** — an un-attributable client must not pass a security control), but is **not** blocked by `deny` alone (a block list only acts on IPs it can positively attribute to a listed range).
 
-## `deny-source-range`
+A missing `IpAccessControl` CR fails **open** (no IP filtering) — unlike the auth annotations (`ext-auth`/`auth-basic-secret`/`auth-jwt`), which fail closed with **503**. A broken or stale `ip-access-control` reference degrades the route to unfiltered rather than blocking traffic. Invalid CIDR tokens are logged and skipped rather than rejecting the whole policy.
 
-Blocks a set of client source IPs. A request whose client IP falls inside **any** listed range is rejected with **403 Forbidden** before any upstream connection is opened. All other clients are admitted (unless an `allow-source-range` annotation is also set — see below).
-
-```yaml
-metadata:
-  annotations:
-    ingress.coxswain-labs.dev/deny-source-range: "1.2.3.0/24,5.6.7.8/32"
-```
-
-The value is a comma-separated list of IPv4/IPv6 CIDR blocks. A bare address without a prefix (`10.0.0.1`, `2001:db8::1`) is accepted as a host route (`/32` / `/128`). Whitespace around entries is trimmed.
-
-**Which IP is matched.** Same as `allow-source-range`: the real client IP from the PROXY protocol when available, otherwise the L4 peer address. When `trust-forwarded-for` is also set, the effective client IP may come from a forwarded header — see [Trusted proxy headers](#trust-forwarded-for).
-
-**Matching is strict.** CIDR membership is exact per address family — an IPv4-mapped IPv6 client (`::ffff:10.0.0.1`) does **not** match an IPv4 CIDR.
-
-**Evaluation order.** `deny-source-range` is evaluated **before** `allow-source-range`. When both annotations are set, a client IP that falls inside the deny list is rejected with 403 even if the allow-list would have admitted it.
-
-**Unattributable client IP.** If the client's IP cannot be determined, the deny-list does **not** block the request — a block list only acts on IPs it can positively attribute to a listed range. (This is the inverse of `allow-source-range`'s fail-closed behaviour.)
-
-**Failure handling:**
-
-- An invalid CIDR token emits a controller warning and is **skipped**; the remaining valid ranges still apply.
-- If **every** token is invalid (or the annotation is absent/empty), the block list is treated as absent — **no** source IPs are blocked (**fail-open** at parse time, so a typo never silently blocks all traffic).
+!!! note "Migration from the inline allow-source-range/deny-source-range annotations (breaking)"
+    Earlier releases exposed two inline annotations — `allow-source-range`, `deny-source-range` — duplicating the `IpAccessControl` CRD schema. These are removed; move each Ingress's values into an `IpAccessControl` CR and point `ip-access-control` at it.
 
 ## `trust-forwarded-for`
 
 Lets the proxy extract the **real client IP** from a forwarded-for header — necessary when Coxswain sits behind a cloud LB or CDN that terminates the connection and puts the original client IP in a header like `X-Forwarded-For` or `CF-Connecting-IP`.
 
-Without this annotation, IP-based features (`allow-source-range`, `deny-source-range`, IP-keyed `rate-limit`) always see the **L4 peer address** (the LB's IP), making per-client controls ineffective behind a proxy.
+Without this annotation, IP-based features (`ip-access-control`, IP-keyed `rate-limit`) always see the **L4 peer address** (the LB's IP), making per-client controls ineffective behind a proxy.
 
 **Master switch — disabled by default** to prevent header injection by untrusted peers:
 
@@ -531,7 +521,7 @@ When `trust-forwarded-for: "true"` is set, the proxy resolves the effective clie
 3. **CIDR gate (fail-closed)** — the forwarded header is honored **only** when the L4 base IP is inside one of the `forwarded-for-trusted-cidrs`. If the list is empty, or the L4 peer is not in it, the header is ignored (anti-spoofing) and the L4 base IP is used. An empty list trusts **no** peer — you must configure your load balancer's CIDR to enable header trust.
 4. **Rightmost-untrusted parse** — parse the configured header (default `X-Forwarded-For`) and scan the comma-separated list **right-to-left**, skipping addresses that are themselves trusted-proxy hops (in `forwarded-for-trusted-cidrs`) or private/reserved. The first address that is neither is the effective client IP. Everything to its left is client-controlled and ignored, so a forged leftmost token cannot spoof the client IP. If no untrusted address is found, fall back to the L4 base IP.
 
-All addresses are canonicalized before matching, so an IPv4-mapped IPv6 form (`::ffff:a.b.c.d`) is treated as its IPv4 address — it cannot slip past an IPv4 `allow-`/`deny-source-range`.
+All addresses are canonicalized before matching, so an IPv4-mapped IPv6 form (`::ffff:a.b.c.d`) is treated as its IPv4 address — it cannot slip past an IPv4 `ip-access-control` allow/deny CIDR.
 
 "Private/reserved" means RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), loopback (`127/8`, `::1`), link-local (`169.254/16`, `fe80::/10`), ULA (`fc00::/7`), and unspecified.
 
@@ -559,7 +549,7 @@ metadata:
     ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs: "10.0.0.0/8,172.16.0.0/12"
 ```
 
-The value is a comma-separated list of IPv4/IPv6 CIDR blocks (same format as `allow-source-range`). Whitespace is trimmed.
+The value is a comma-separated list of IPv4/IPv6 CIDR blocks (same format as `forwarded-for-trusted-cidrs` itself — a bare address is accepted as a host route). Whitespace is trimmed.
 
 **When absent or empty**, the forwarded header is trusted unconditionally for **every** L4 peer — only do this when the deployment topology guarantees that only a trusted proxy can reach Coxswain directly.
 
