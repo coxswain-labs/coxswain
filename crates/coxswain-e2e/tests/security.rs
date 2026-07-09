@@ -621,8 +621,8 @@ async fn wait_for_proxy_v1_status(
 
 // ── Rate limiting (Ingress annotations) ──────────────────────────────────────
 
-/// `rate-limit-rps`: a single request within the 1-req/s quota is served
-/// normally (#25 happy path — IP-keyed).
+/// `rate-limit` naming a `RateLimit` CR (1 req/s): a single request within
+/// quota is served normally (#552, #25 happy path — IP-keyed).
 #[tokio::test]
 async fn requests_allowed_when_under_rate_limit() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -641,8 +641,9 @@ async fn requests_allowed_when_under_rate_limit() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `rate-limit-rps`: rapid-fire requests at rps=1 (no burst) cause the proxy to
-/// return 429 + `Retry-After` once the per-client budget is exhausted (#25 sad path).
+/// `rate-limit` naming a `RateLimit` CR (rps=1, no burst): rapid-fire requests
+/// cause the proxy to return 429 + `Retry-After` once the per-client budget is
+/// exhausted (#552, #25 sad path).
 #[tokio::test]
 async fn requests_rejected_with_429_when_rate_limit_exceeded() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -675,8 +676,9 @@ async fn requests_rejected_with_429_when_rate_limit_exceeded() -> anyhow::Result
     Ok(())
 }
 
-/// `rate-limit-burst`: an initial spike up to burst+rps is absorbed; requests
-/// beyond the burst capacity are rejected with 429 (#25 sad path — burst field).
+/// `rate-limit` naming a `RateLimit` CR (`burst: 5`): an initial spike up to
+/// burst+rps is absorbed; requests beyond the burst capacity are rejected
+/// with 429 (#552, #25 sad path — burst field).
 #[tokio::test]
 async fn burst_absorbs_spike_then_limits() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -706,9 +708,9 @@ async fn burst_absorbs_spike_then_limits() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `rate-limit-by: header:X-Rate-Key`: when the keying header is absent the
-/// rate limiter is bypassed (fail-open) — all requests are admitted (#25 sad
-/// path — missing key header).
+/// `rate-limit` naming a `RateLimit` CR (`byHeader: X-Rate-Key`): when the
+/// keying header is absent the rate limiter is bypassed (fail-open) — all
+/// requests are admitted (#552, #25 sad path — missing key header).
 #[tokio::test]
 async fn rate_limit_not_applied_when_keying_header_absent() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -737,23 +739,33 @@ async fn rate_limit_not_applied_when_keying_header_absent() -> anyhow::Result<()
     Ok(())
 }
 
-/// `rate-limit-rps: notanumber`: the VAP rejects the Ingress at admission time
-/// (#25 sad path — invalid annotation, #29 VAP).
-///
-/// Fail-open proxy semantics (warn + serve unthrottled) remain the backstop for
-/// VAP-disabled installs, covered by the `parse_rate_limit_rps_invalid` unit test.
+/// `rate-limit` naming a `RateLimit` CR that does not exist: the reflector
+/// warns and fails-open — all requests are admitted (#552 sad path, mirrors
+/// the compression/retry CR-reference convergence).
 #[tokio::test]
-async fn invalid_rate_limit_annotation_rejected_by_vap() -> anyhow::Result<()> {
+async fn ingress_rate_limit_passthrough_when_cr_missing() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "rl-invalid").await?;
-    let msg = fixtures::apply_fixture_expect_rejected(
-        ingress::ANNOTATION_RATE_LIMIT_INVALID,
+    let ns = NamespaceGuard::create(&h.client, "rl-missing").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_RATE_LIMIT_MISSING,
         FixtureVars::new(&ns.name),
     )
     .await?;
+    let host = format!("ratelimitmissing.{}.local", ns.name);
+
+    // Route must be live; missing CR → fail-open → all requests admitted.
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    // 10 rapid requests — no rate limiter was installed, so all must be 200.
+    let mut statuses: Vec<u16> = Vec::new();
+    for _ in 0..10 {
+        let (status, _, _) = h.http.get_full(&host, "/").await?;
+        statuses.push(status);
+    }
     anyhow::ensure!(
-        msg.contains("rate-limit-rps"),
-        "VAP rejection message must name the offending annotation, got: {msg}"
+        statuses.iter().all(|&s| s == 200),
+        "missing RateLimit CR must be fail-open (all 200), got: {statuses:?}"
     );
     Ok(())
 }

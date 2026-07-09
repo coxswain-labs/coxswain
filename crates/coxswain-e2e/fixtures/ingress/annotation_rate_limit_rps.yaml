@@ -1,17 +1,26 @@
-# rate-limit-rps annotation fixture (apply backends::ECHO first).
+# rate-limit fixture (#552): the annotation names a RateLimit CR by
+# "namespace/name" — Ingress parity with the Gateway API ExtensionRef path.
 #
-# The Ingress caps requests to 1 req/s per client IP with no burst.
-# The proxy must:
-#   * serve a single request within quota (200, reach backend), and
+# 1 req/s, no burst. The proxy must:
+#   * serve the first request within quota (200, reach backend), and
 #   * reject subsequent rapid-fire requests with 429 + Retry-After.
 #
 # Host: ratelimit.TESTNS.local -> echo-a:3000.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RateLimit
+metadata:
+  name: one-rps
+spec:
+  requestsPerSecond: 1
+  burst: 0
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: rate-limit-rps-ingress
   annotations:
-    ingress.coxswain-labs.dev/rate-limit-rps: "1"
+    ingress.coxswain-labs.dev/rate-limit: "${TESTNS}/one-rps"
 spec:
   ingressClassName: coxswain
   rules:

@@ -1679,18 +1679,22 @@ async fn vap_rejects_invalid_size_string_annotation() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// VAP rejects a positive-integer annotation with an invalid value (`rate-limit-rps: "notanumber"`) (#29).
+/// VAP rejects a positive-integer annotation with an invalid value
+/// (`circuit-breaker-threshold: "notanumber"`) (#29). Retargeted from
+/// `rate-limit-rps` after #552 converged `rate-limit` to a CR reference with
+/// no VAP rule of its own — this test exercises the general ">= 1 positive
+/// integer" VAP rule shape, not `rate-limit` specifically.
 #[tokio::test]
 async fn vap_rejects_invalid_positive_integer_annotation() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "vap-int").await?;
     let msg = fixtures::apply_fixture_expect_rejected(
-        ingress::ANNOTATION_RATE_LIMIT_INVALID,
+        ingress::ANNOTATION_CIRCUIT_BREAKER_THRESHOLD_INVALID,
         FixtureVars::new(&ns.name),
     )
     .await?;
     anyhow::ensure!(
-        msg.contains("rate-limit-rps"),
+        msg.contains("circuit-breaker-threshold"),
         "VAP rejection message must name the offending annotation, got: {msg}"
     );
     Ok(())
