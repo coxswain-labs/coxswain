@@ -795,6 +795,28 @@ async fn gateway_api_disabled_skips_gateway_reconcile() -> anyhow::Result<()> {
     )
     .await?;
 
+    // Regression guard for #550 (and the identical prior fixes for `auth-jwt`/
+    // `ext-auth`): the `Compression` CR reflector must be spawned always-on,
+    // not only inside the gateway-api-gated reflector set — otherwise the
+    // Ingress `compression` annotation is permanently unresolvable on an
+    // Ingress-only install. Apply a `compression`-referencing Ingress here,
+    // under `--disable-gateway-api`, and prove it still resolves and compresses.
+    fixtures::apply_fixture(ing::ANNOTATION_COMPRESSION_GZIP, FixtureVars::new(&ns.name)).await?;
+    let compression_host = format!("compression-gzip.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &compression_host, "/", Duration::from_secs(60)).await?;
+    let (_, resp_headers, _) = h
+        .http
+        .get_full_raw(&compression_host, "/", &[("Accept-Encoding", "gzip")])
+        .await?;
+    assert_eq!(
+        resp_headers
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip"),
+        "compression annotation must resolve and apply even with gateway-api disabled \
+         (Compression CR store must be spawned always-on, not gateway-api-gated)"
+    );
+
     // Negative assertion: the Gateway must NOT be reconciled by coxswain.
     // The Gateway API admission webhook injects Accepted=Unknown / Programmed=Unknown
     // conditions with observedGeneration=None at object creation time ("Waiting for

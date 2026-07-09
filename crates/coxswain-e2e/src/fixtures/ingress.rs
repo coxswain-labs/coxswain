@@ -229,24 +229,29 @@ pub const ANNOTATION_MIRROR_TARGET_UNREACHABLE: &str =
 /// appears even when `max-body-size` is absent.
 pub const ANNOTATION_MIRROR_TARGET_NO_MAX_BODY: &str =
     fixture!("annotation_mirror_target_no_max_body.yaml");
-/// Ingress with `ingress.coxswain-labs.dev/compression-gzip: "true"`,
-/// `compression-level: "6"`, `compression-types: "application/json,..."` and
-/// `compression-min-size: "1"` (#270). Used to verify the proxy compresses
-/// `application/json` echo responses with gzip when the client advertises
-/// `Accept-Encoding: gzip`.
+/// Ingress with `ingress.coxswain-labs.dev/compression: "TESTNS/compression-gzip"`
+/// referencing a `Compression` CR (`gzip: true`, `level: 6`,
+/// `types: [application/json,...]`, `minSize: 1`) (#550, formerly #270's inline
+/// `compression-gzip`/`compression-level`/`compression-types`/`compression-min-size`
+/// cluster). Used to verify the proxy compresses `application/json` echo
+/// responses with gzip when the client advertises `Accept-Encoding: gzip`.
 pub const ANNOTATION_COMPRESSION_GZIP: &str = fixture!("annotation_compression_gzip.yaml");
-/// Ingress with both `compression-gzip: "true"` and `compression-brotli: "true"` and
-/// `compression-min-size: "1"` (#270). Used to verify brotli is preferred when the
-/// client advertises both `br` and `gzip` in `Accept-Encoding`.
+/// Ingress referencing a `Compression` CR with both `gzip: true` and `brotli: true`
+/// and `minSize: 1` (#550). Used to verify brotli is preferred when the client
+/// advertises both `br` and `gzip` in `Accept-Encoding`.
 pub const ANNOTATION_COMPRESSION_BROTLI: &str = fixture!("annotation_compression_brotli.yaml");
-/// Ingress with `compression-gzip: "true"` and `compression-min-size: "1048576"` (#270
-/// sad path). Used to verify the proxy passes the echo response through uncompressed
-/// when `Content-Length` is below `min-size`.
+/// Ingress referencing a `Compression` CR with `gzip: true` and `minSize: 1048576`
+/// (#550 sad path). Used to verify the proxy passes the echo response through
+/// uncompressed when `Content-Length` is below `minSize`.
 pub const ANNOTATION_COMPRESSION_MIN_SIZE: &str = fixture!("annotation_compression_min_size.yaml");
-/// Ingress with `compression-gzip: "true"` and `compression-types: "text/plain"` (#270
-/// sad path). Used to verify the proxy passes the `application/json` echo response through
-/// uncompressed when its `Content-Type` is not in the allow-list.
+/// Ingress referencing a `Compression` CR with `gzip: true` and `types: [text/plain]`
+/// (#550 sad path). Used to verify the proxy passes the `application/json` echo
+/// response through uncompressed when its `Content-Type` is not in the allow-list.
 pub const ANNOTATION_COMPRESSION_TYPES: &str = fixture!("annotation_compression_types.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/compression` pointing at a non-existent
+/// `Compression` CR (#550 sad path). Used to verify the reference fails **open** —
+/// the route still serves 200 with no `Content-Encoding`, not a 503.
+pub const ANNOTATION_COMPRESSION_MISSING: &str = fixture!("annotation_compression_missing.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/upstream-keepalive-timeout: 60s` (#266).
 /// Used to verify that sequential requests to the same upstream reuse pooled
 /// connections — `coxswain_proxy_upstream_connections_total{state="reused"}` must

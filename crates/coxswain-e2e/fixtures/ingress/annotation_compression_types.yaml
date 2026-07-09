@@ -1,11 +1,29 @@
+# compression fixture (#550 sad path): the annotation names a Compression CR
+# by "namespace/name" — Ingress parity with the Gateway API ExtensionRef path
+# (crates/coxswain-e2e/fixtures/gateway_api/compression_extensionref.yaml).
+#
+# The Compression CR enables gzip with a types allow-list of text/plain only
+# — the echo backend's application/json response is not in the allow-list,
+# so the proxy must pass it through uncompressed.
+#
+# Host: compression-types.TESTNS.local / -> echo-a:3000.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: Compression
+metadata:
+  name: compression-types
+spec:
+  gzip: true
+  minSize: 1
+  types:
+    - text/plain
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: compression-types-ingress
   annotations:
-    ingress.coxswain-labs.dev/compression-gzip: "true"
-    ingress.coxswain-labs.dev/compression-types: "text/plain"
-    ingress.coxswain-labs.dev/compression-min-size: "1"
+    ingress.coxswain-labs.dev/compression: "${TESTNS}/compression-types"
 spec:
   ingressClassName: coxswain
   rules:

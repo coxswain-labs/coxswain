@@ -5,7 +5,7 @@
 //! empty default) so the affected annotation is treated as absent — the Ingress
 //! keeps serving.
 
-use coxswain_core::routing::{CompressionConfig, LoadBalance, LoadBalanceParseError};
+use coxswain_core::routing::{LoadBalance, LoadBalanceParseError};
 
 // ── Timeout annotation keys ───────────────────────────────────────────────────
 
@@ -47,25 +47,19 @@ pub const MAX_BODY_SIZE: &str = "ingress.coxswain-labs.dev/max-body-size";
 /// stay in the LRU pool until capacity pressure forces eviction).
 pub const UPSTREAM_KEEPALIVE_TIMEOUT: &str = "ingress.coxswain-labs.dev/upstream-keepalive-timeout";
 
-// ── Compression annotation keys ───────────────────────────────────────────────
+// ── Compression annotation key ────────────────────────────────────────────────
 
-/// Enable gzip response compression — `"true"` / `"false"` (default `"false"`).
-pub const COMPRESSION_GZIP: &str = "ingress.coxswain-labs.dev/compression-gzip";
-/// Enable brotli response compression — `"true"` / `"false"` (default `"false"`).
-///
-/// Brotli is preferred over gzip when both are enabled and the client advertises `br`.
-pub const COMPRESSION_BROTLI: &str = "ingress.coxswain-labs.dev/compression-brotli";
-/// Compression level `1`–`9` (default `6`). Applies to both gzip and brotli.
-pub const COMPRESSION_LEVEL: &str = "ingress.coxswain-labs.dev/compression-level";
-/// Comma-separated MIME types eligible for compression (media type before `;`, case-insensitive).
-///
-/// Default: `text/html,text/plain,text/css,application/json,application/javascript`.
-pub const COMPRESSION_TYPES: &str = "ingress.coxswain-labs.dev/compression-types";
-/// Minimum response body size in bytes for compression to kick in (default `1024`).
-///
-/// Compared against `Content-Length` when present; chunked responses (no
-/// `Content-Length`) are always compressed regardless of this limit.
-pub const COMPRESSION_MIN_SIZE: &str = "ingress.coxswain-labs.dev/compression-min-size";
+/// Reference to a `Compression` CR in `namespace/name` form, e.g.
+/// `"default/my-compression"` (#550). Resolves to the same
+/// [`CompressionConfig`][coxswain_core::routing::CompressionConfig] the
+/// HTTPRoute `ExtensionRef` filter produces (Gateway API parity). Replaces
+/// the former inline `compression-gzip` / `compression-brotli` /
+/// `compression-level` / `compression-types` / `compression-min-size`
+/// annotation cluster, whose knobs now live on the `Compression` CRD spec. A
+/// missing CR fails **open** (no compression) — unlike the auth annotation
+/// family, a broken compression reference degrades gracefully rather than
+/// blocking traffic.
+pub const COMPRESSION: &str = "ingress.coxswain-labs.dev/compression";
 
 // ── Circuit-breaker annotation keys ──────────────────────────────────────────
 
@@ -189,171 +183,6 @@ pub fn parse_byte_size(s: &str) -> Option<u64> {
             tracing::warn!(value = s, "invalid max-body-size annotation value");
             None
         })
-}
-
-// ── Compression parser ────────────────────────────────────────────────────────
-
-/// The default MIME-type allow-list for compression, lower-cased.
-const DEFAULT_COMPRESSION_TYPES: &[&str] = &[
-    "text/html",
-    "text/plain",
-    "text/css",
-    "application/json",
-    "application/javascript",
-];
-
-/// Default compression level when the annotation is absent or invalid.
-const DEFAULT_COMPRESSION_LEVEL: u32 = 6;
-/// Default minimum body size in bytes for compression eligibility.
-const DEFAULT_COMPRESSION_MIN_SIZE: u64 = 1024;
-
-/// Parse the five `compression-*` annotations into a [`CompressionConfig`].
-///
-/// Returns `None` when neither `compression-gzip` nor `compression-brotli` is
-/// `"true"` — the proxy never constructs an encoder in that case. Invalid field
-/// values emit a structured `WARN` and fall back to the documented default; the
-/// Ingress is never rejected.
-#[must_use]
-pub(crate) fn parse_compression(
-    ann: &std::collections::BTreeMap<String, String>,
-    route_id: &str,
-    diag: &mut Vec<AnnotationIssue>,
-) -> Option<CompressionConfig> {
-    use super::{get, parse_bool};
-
-    let gzip = get(ann, COMPRESSION_GZIP)
-        .and_then(|v| {
-            let b = parse_bool(v);
-            if b.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = COMPRESSION_GZIP,
-                    value = v,
-                    "invalid boolean — treating compression-gzip as false"
-                );
-                diag.push(AnnotationIssue {
-                    annotation: COMPRESSION_GZIP,
-                    message: "invalid boolean — treating compression-gzip as false".into(),
-                });
-            }
-            b
-        })
-        .unwrap_or(false);
-
-    let brotli = get(ann, COMPRESSION_BROTLI)
-        .and_then(|v| {
-            let b = parse_bool(v);
-            if b.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = COMPRESSION_BROTLI,
-                    value = v,
-                    "invalid boolean — treating compression-brotli as false"
-                );
-                diag.push(AnnotationIssue {
-                    annotation: COMPRESSION_BROTLI,
-                    message: "invalid boolean — treating compression-brotli as false".into(),
-                });
-            }
-            b
-        })
-        .unwrap_or(false);
-
-    // Both disabled → no config, compression path never entered.
-    if !gzip && !brotli {
-        return None;
-    }
-
-    let level = get(ann, COMPRESSION_LEVEL)
-        .and_then(|v| {
-            let n = parse_u32(v);
-            match n {
-                Some(l) if (1..=9).contains(&l) => Some(l),
-                Some(l) => {
-                    tracing::warn!(
-                        ingress = %route_id,
-                        annotation = COMPRESSION_LEVEL,
-                        value = v,
-                        level = l,
-                        "compression-level must be 1–9 — using default 6"
-                    );
-                    diag.push(AnnotationIssue {
-                        annotation: COMPRESSION_LEVEL,
-                        message: "compression-level must be 1–9 — using default 6".into(),
-                    });
-                    None
-                }
-                None => {
-                    tracing::warn!(
-                        ingress = %route_id,
-                        annotation = COMPRESSION_LEVEL,
-                        value = v,
-                        "invalid compression-level — using default 6"
-                    );
-                    diag.push(AnnotationIssue {
-                        annotation: COMPRESSION_LEVEL,
-                        message: "invalid compression-level — using default 6".into(),
-                    });
-                    None
-                }
-            }
-        })
-        .unwrap_or(DEFAULT_COMPRESSION_LEVEL);
-
-    let min_size = get(ann, COMPRESSION_MIN_SIZE)
-        .and_then(|v| {
-            let n = parse_byte_size(v);
-            if n.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = COMPRESSION_MIN_SIZE,
-                    value = v,
-                    "invalid compression-min-size — using default 1024"
-                );
-                diag.push(AnnotationIssue {
-                    annotation: COMPRESSION_MIN_SIZE,
-                    message: "invalid compression-min-size — using default 1024".into(),
-                });
-            }
-            n
-        })
-        .unwrap_or(DEFAULT_COMPRESSION_MIN_SIZE);
-
-    let types: Box<[Box<str>]> = get(ann, COMPRESSION_TYPES)
-        .map(|v| {
-            let parsed: Vec<Box<str>> = v
-                .split(',')
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                .map(|t| t.to_lowercase().into_boxed_str())
-                .collect();
-            if parsed.is_empty() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = COMPRESSION_TYPES,
-                    value = v,
-                    "compression-types parsed to empty list — using defaults"
-                );
-                diag.push(AnnotationIssue {
-                    annotation: COMPRESSION_TYPES,
-                    message: "compression-types parsed to empty list — using defaults".into(),
-                });
-                default_compression_types()
-            } else {
-                parsed.into_boxed_slice()
-            }
-        })
-        .unwrap_or_else(default_compression_types);
-
-    Some(CompressionConfig::new(gzip, brotli, level, min_size, types))
-}
-
-pub(crate) fn default_compression_types() -> Box<[Box<str>]> {
-    DEFAULT_COMPRESSION_TYPES
-        .iter()
-        .map(|s| (*s).into())
-        .collect::<Vec<Box<str>>>()
-        .into_boxed_slice()
 }
 
 // ── Load-balance annotation key and parser ────────────────────────────────────
@@ -956,8 +785,6 @@ mod tests {
         assert!(logs_contain("unknown load-balance value"));
     }
 
-    // ── parse_compression ─────────────────────────────────────────────────────
-
     fn ann(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
         pairs
             .iter()
@@ -965,98 +792,16 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn parse_compression_both_disabled_returns_none() {
-        // References constants to satisfy the annotation-coverage gate.
-        let _ = COMPRESSION_GZIP;
-        let _ = COMPRESSION_BROTLI;
-        let _ = COMPRESSION_LEVEL;
-        let _ = COMPRESSION_TYPES;
-        let _ = COMPRESSION_MIN_SIZE;
-        let a = ann(&[(COMPRESSION_GZIP, "false"), (COMPRESSION_BROTLI, "false")]);
-        assert!(parse_compression(&a, "test", &mut vec![]).is_none());
-    }
+    // ── COMPRESSION const reference (#550) ────────────────────────────────────
+    //
+    // Actual `namespace/name` resolution is exercised in
+    // `annotations::mod::tests` (parse) and `reconcile_helpers::tests`
+    // (resolve, via `resolve_compression_config`) — the const has no
+    // standalone parser left in this file.
 
     #[test]
-    fn parse_compression_absent_returns_none() {
-        assert!(parse_compression(&ann(&[]), "test", &mut vec![]).is_none());
-    }
-
-    #[test]
-    fn parse_compression_gzip_only_defaults() {
-        let a = ann(&[(COMPRESSION_GZIP, "true")]);
-        let cfg = parse_compression(&a, "test", &mut vec![]).expect("Some when gzip enabled");
-        assert!(cfg.gzip);
-        assert!(!cfg.brotli);
-        assert_eq!(cfg.level, 6);
-        assert_eq!(cfg.min_size, 1024);
-        assert!(cfg.types.iter().any(|t| t.as_ref() == "text/html"));
-        assert!(cfg.types.iter().any(|t| t.as_ref() == "application/json"));
-    }
-
-    #[test]
-    fn parse_compression_brotli_only() {
-        let a = ann(&[(COMPRESSION_BROTLI, "true")]);
-        let cfg = parse_compression(&a, "test", &mut vec![]).expect("Some when brotli enabled");
-        assert!(!cfg.gzip);
-        assert!(cfg.brotli);
-    }
-
-    #[test]
-    fn parse_compression_custom_level() {
-        let a = ann(&[(COMPRESSION_GZIP, "true"), (COMPRESSION_LEVEL, "3")]);
-        let cfg = parse_compression(&a, "test", &mut vec![]).unwrap();
-        assert_eq!(cfg.level, 3);
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_compression_level_out_of_range_warns_and_defaults() {
-        let a = ann(&[(COMPRESSION_GZIP, "true"), (COMPRESSION_LEVEL, "0")]);
-        let cfg = parse_compression(&a, "test", &mut vec![]).unwrap();
-        assert_eq!(cfg.level, 6, "should fall back to default");
-        assert!(logs_contain("compression-level must be 1–9"));
-    }
-
-    #[test]
-    fn parse_compression_custom_min_size() {
-        let a = ann(&[(COMPRESSION_GZIP, "true"), (COMPRESSION_MIN_SIZE, "512")]);
-        let cfg = parse_compression(&a, "test", &mut vec![]).unwrap();
-        assert_eq!(cfg.min_size, 512);
-    }
-
-    #[test]
-    fn parse_compression_custom_types() {
-        let a = ann(&[
-            (COMPRESSION_GZIP, "true"),
-            (COMPRESSION_TYPES, "text/plain,application/json"),
-        ]);
-        let cfg = parse_compression(&a, "test", &mut vec![]).unwrap();
-        assert_eq!(cfg.types.len(), 2);
-        assert!(cfg.types.iter().any(|t| t.as_ref() == "text/plain"));
-        assert!(cfg.types.iter().any(|t| t.as_ref() == "application/json"));
-        assert!(!cfg.types.iter().any(|t| t.as_ref() == "text/html"));
-    }
-
-    #[test]
-    fn parse_compression_types_are_lowercased() {
-        let a = ann(&[
-            (COMPRESSION_GZIP, "true"),
-            (COMPRESSION_TYPES, "Text/HTML,Application/JSON"),
-        ]);
-        let cfg = parse_compression(&a, "test", &mut vec![]).unwrap();
-        assert!(cfg.types.iter().any(|t| t.as_ref() == "text/html"));
-        assert!(cfg.types.iter().any(|t| t.as_ref() == "application/json"));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_compression_empty_types_warns_and_defaults() {
-        let a = ann(&[(COMPRESSION_GZIP, "true"), (COMPRESSION_TYPES, ",,,")]);
-        let cfg = parse_compression(&a, "test", &mut vec![]).unwrap();
-        assert!(logs_contain("compression-types parsed to empty list"));
-        // Falls back to the five-type default.
-        assert_eq!(cfg.types.len(), 5);
+    fn compression_const_referenced() {
+        let _ = COMPRESSION;
     }
 
     // ── parse_circuit_breaker (#282) ──────────────────────────────────────────

@@ -1187,9 +1187,10 @@ pub(super) fn resolve_request_size_limit_ref(
 ///
 /// Only the first matching `ExtensionRef` is used. A missing CR logs a WARN
 /// and returns `None` (fail-open: no compression). When both `gzip` and
-/// `brotli` are `false` the CR is a no-op and `None` is returned, mirroring
-/// `parse_compression`'s Ingress-annotation behaviour — the proxy never
-/// constructs an encoder for a route with nothing to compress.
+/// `brotli` are `false` the CR is a no-op and `None` is returned — the same
+/// [`super::compression::resolve_spec`] the Ingress `compression` annotation
+/// (#550) resolves through — the proxy never constructs an encoder for a
+/// route with nothing to compress.
 pub(super) fn resolve_compression<F: ExtRefFilter>(
     filters: &[F],
     route_ns: &str,
@@ -1232,28 +1233,10 @@ pub(super) fn resolve_compression_ref(
         );
         return RefResolution::FailOpen;
     };
-    if !cr.spec.gzip && !cr.spec.brotli {
-        return RefResolution::FailOpen;
+    match super::compression::resolve_spec(&cr.spec) {
+        Some(cfg) => RefResolution::Resolved(cfg),
+        None => RefResolution::FailOpen,
     }
-    let level = cr.spec.level.filter(|l| (1..=9).contains(l)).unwrap_or(6);
-    let min_size = cr.spec.min_size.unwrap_or(1024);
-    let types: Box<[Box<str>]> = if cr.spec.types.is_empty() {
-        crate::ingress::annotations::default_compression_types()
-    } else {
-        cr.spec
-            .types
-            .iter()
-            .map(|t| t.to_lowercase().into_boxed_str())
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
-    };
-    RefResolution::Resolved(Arc::new(CompressionConfig::new(
-        cr.spec.gzip,
-        cr.spec.brotli,
-        level,
-        min_size,
-        types,
-    )))
 }
 
 #[cfg(test)]

@@ -1684,11 +1684,15 @@ async fn upstream_keepalive_reuses_connections() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Compression (#270) ──────────────────────────────────────────────────────
+// ── Compression (#270, converged to a CR reference in #550) ──────────────────
 
-/// Happy path (#270): a route annotated with `compression-gzip: "true"` and
-/// `compression-min-size: "1"` returns a gzip-compressed body when the client
-/// sends `Accept-Encoding: gzip`.
+/// Happy path (#270, #550): a route annotated with
+/// `compression: "ns/name"` referencing a `Compression` CR (`gzip: true`,
+/// `minSize: 1`) returns a gzip-compressed body when the client sends
+/// `Accept-Encoding: gzip`. Both the Ingress annotation and the HTTPRoute
+/// `ExtensionRef` filter (see the `gateway_compression_*` tests below)
+/// resolve the same CR through the identical spec→config translation, so
+/// this also proves cross-surface parity.
 ///
 /// Asserts:
 /// - Status 200.
@@ -1757,9 +1761,9 @@ async fn compression_gzip_compresses_eligible_response() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Behaviour test (#270): when both `compression-gzip` and `compression-brotli`
-/// are enabled, brotli is preferred when the client advertises `br` in
-/// `Accept-Encoding`.
+/// Behaviour test (#270, #550): when a `compression`-referenced `Compression`
+/// CR enables both `gzip` and `brotli`, brotli is preferred when the client
+/// advertises `br` in `Accept-Encoding`.
 ///
 /// Asserts `Content-Encoding: br` when the client sends `Accept-Encoding: br, gzip`.
 #[tokio::test]
@@ -1798,8 +1802,9 @@ async fn compression_prefers_brotli_when_client_supports_br() -> anyhow::Result<
     Ok(())
 }
 
-/// Sad path (#270): the proxy passes a response through uncompressed when its
-/// `Content-Length` is below the `compression-min-size` threshold (1 MiB here).
+/// Sad path (#270, #550): the proxy passes a response through uncompressed
+/// when its `Content-Length` is below the referenced CR's `minSize`
+/// threshold (1 MiB here).
 ///
 /// The echo backend's JSON response is always well under 1 MiB, so the proxy
 /// must skip compression entirely. Asserts no `Content-Encoding` header.
@@ -1836,8 +1841,8 @@ async fn compression_skips_response_below_min_size() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Sad path (#270): the proxy passes a response through uncompressed when its
-/// `Content-Type` is not in the `compression-types` allow-list.
+/// Sad path (#270, #550): the proxy passes a response through uncompressed
+/// when its `Content-Type` is not in the referenced CR's `types` allow-list.
 ///
 /// The fixture allows only `text/plain`; the echo backend responds with
 /// `application/json`. Asserts no `Content-Encoding` header.
@@ -1869,6 +1874,43 @@ async fn compression_skips_disallowed_content_type() -> anyhow::Result<()> {
     assert!(
         resp_headers.get("content-encoding").is_none(),
         "proxy must NOT compress application/json when only text/plain is in compression-types"
+    );
+
+    Ok(())
+}
+
+/// Sad path (#550): `compression` references a `Compression` CR that does not
+/// exist. Unlike the auth annotation family (`ext-auth`/`auth-basic-secret`/
+/// `auth-jwt`), which fails **closed** (503) on a missing CR, compression
+/// fails **open** — the route still serves 200, uncompressed.
+#[tokio::test]
+async fn ingress_compression_passthrough_when_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "comp-missing").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_COMPRESSION_MISSING,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("compression-missing.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let (status, resp_headers, _) = h
+        .http
+        .get_full_raw(&host, "/", &[("Accept-Encoding", "gzip")])
+        .await?;
+
+    assert_eq!(
+        status, 200,
+        "route must still return 200 when the Compression CR reference is missing (fail-open)"
+    );
+    assert!(
+        resp_headers.get("content-encoding").is_none(),
+        "proxy must NOT compress when the referenced Compression CR does not exist"
     );
 
     Ok(())

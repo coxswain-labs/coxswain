@@ -23,8 +23,8 @@ pub(super) use kube::runtime::reflector;
 pub(super) use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub(super) use crate::tests::fixtures::{
-    empty_external_auth_store, empty_jwks_cache, empty_jwt_auth_store, empty_secret_store,
-    empty_svc_store, make_slice, make_svc_store, slice_store,
+    empty_compression_store, empty_external_auth_store, empty_jwks_cache, empty_jwt_auth_store,
+    empty_secret_store, empty_svc_store, make_slice, make_svc_store, slice_store,
 };
 
 /// Empty `ReferenceGrant` set — every cross-namespace `CoxswainExternalAuth`
@@ -53,12 +53,13 @@ pub(super) fn reconcile_no_default(
         &IngressClassContext::new(owned, None, &no_class_defaults),
         IngressPorts::new(Some(80), None),
         b,
-        &crate::ingress::IngressAuthStores::new(
+        &crate::ingress::IngressExtensionStores::new(
             &empty_secret_store(),
             &empty_external_auth_store(),
             &empty_jwt_auth_store(),
             &empty_jwks_cache(),
             &empty_backend_grants(),
+            &empty_compression_store(),
         ),
     );
 }
@@ -80,12 +81,13 @@ pub(super) fn reconcile_with_class_defaults(
         &IngressClassContext::new(owned, None, defaults),
         IngressPorts::new(Some(80), None),
         b,
-        &crate::ingress::IngressAuthStores::new(
+        &crate::ingress::IngressExtensionStores::new(
             &empty_secret_store(),
             &empty_external_auth_store(),
             &empty_jwt_auth_store(),
             &empty_jwks_cache(),
             &empty_backend_grants(),
+            &empty_compression_store(),
         ),
     );
 }

@@ -305,12 +305,13 @@ fn build_ingress_routes(
     );
 
     let mut builder = IngressRoutingTableBuilder::new();
-    let auth_stores = crate::ingress::IngressAuthStores::new(
+    let auth_stores = crate::ingress::IngressExtensionStores::new(
         stores.auth_secrets,
         stores.external_auths,
         stores.jwt_auths,
         stores.jwks_cache,
         ownership.backend_grants,
+        stores.compressions,
     );
     let mut pending_annotation_events: Vec<(String, String, Vec<AnnotationIssue>)> = Vec::new();
     for ingress in ingresses {

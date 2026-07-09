@@ -6,10 +6,10 @@
 use super::annotations::AnnotationIssue;
 use super::annotations::auth::{SecretRef, parse_htpasswd};
 use crate::endpoints;
-use coxswain_core::crd::CoxswainExternalAuth;
+use coxswain_core::crd::{Compression, CoxswainExternalAuth};
 use coxswain_core::routing::{
-    BackendGroup, BackendProtocol, BasicCredential, FilterAction, HostRouterBuilder,
-    IngressAuthConfig, IngressRoutingTableBuilder, NormalizeLevel, WildcardKind,
+    BackendGroup, BackendProtocol, BasicCredential, CompressionConfig, FilterAction,
+    HostRouterBuilder, IngressAuthConfig, IngressRoutingTableBuilder, NormalizeLevel, WildcardKind,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -269,6 +269,39 @@ pub(super) fn resolve_jwt_auth_config(
     ))
 }
 
+// ── Compression resolution ──────────────────────────────────────────────────────
+
+/// Resolve the `compression` annotation's `Compression` CR reference into a
+/// concrete [`CompressionConfig`] — the Ingress-parity counterpart to the
+/// HTTPRoute `ExtensionRef` filter (#550). Delegates to
+/// [`crate::gateway_api::compression::resolve_spec`] so both surfaces resolve
+/// the same CR to byte-identical runtime config.
+///
+/// `annotation: None` (absent/malformed `compression`) returns `None` — no
+/// compression on the route. Unlike every auth resolver in this file, a
+/// present-but-missing CR (or one with both `gzip`/`brotli` disabled) fails
+/// **open** — `None`, no compression — matching the HTTPRoute `ExtensionRef`
+/// path's fail-open posture: a broken compression reference degrades to
+/// uncompressed responses, not a 503.
+pub(super) fn resolve_compression_config(
+    annotation: Option<&SecretRef>,
+    compressions: &reflector::Store<Compression>,
+    route_id: &str,
+) -> Option<Arc<CompressionConfig>> {
+    let r = annotation?;
+    let obj_ref = reflector::ObjectRef::<Compression>::new(&r.name).within(&r.namespace);
+    let Some(cr) = compressions.get(&obj_ref) else {
+        tracing::warn!(
+            ingress = %route_id,
+            namespace = %r.namespace,
+            name = %r.name,
+            "Compression CR not found — compression skipped (fail-open)"
+        );
+        return None;
+    };
+    crate::gateway_api::compression::resolve_spec(&cr.spec)
+}
+
 /// Prepend an HTTPS `RequestRedirect` to `base`, returning the combined filter list.
 ///
 /// The HTTP-listener entry of an `ssl-redirect` route carries this leading
@@ -315,8 +348,8 @@ pub(super) fn resolve_host_builder<'b>(
 mod tests {
     use super::*;
     use crate::tests::fixtures::{
-        empty_external_auth_store, empty_jwks_cache, empty_jwt_auth_store, empty_secret_store,
-        empty_svc_store, slice_store,
+        empty_compression_store, empty_external_auth_store, empty_jwks_cache, empty_jwt_auth_store,
+        empty_secret_store, empty_svc_store, slice_store,
     };
 
     fn secret_ref(namespace: &str, name: &str) -> SecretRef {
@@ -391,5 +424,24 @@ mod tests {
         let resolved = resolve_jwt_auth_config(Some(&r), &store, &cache, "default/ing")
             .expect("missing CR must still install a check (fail closed)");
         assert!(matches!(resolved, IngressAuthConfig::Unavailable));
+    }
+
+    #[test]
+    fn resolve_compression_config_absent_annotation_is_none() {
+        let store = empty_compression_store();
+        assert!(resolve_compression_config(None, &store, "default/ing").is_none());
+    }
+
+    #[test]
+    fn resolve_compression_config_missing_cr_fails_open() {
+        // Unlike every auth resolver above, a missing Compression reference
+        // must NOT install a fail-closed check — compression degrades to
+        // "no compression", matching the HTTPRoute ExtensionRef path. The
+        // "resolved" and "both-disabled" cases are covered by
+        // `gateway_api::compression::resolve_spec`'s own test module, which
+        // this function delegates to.
+        let r = secret_ref("default", "absent");
+        let store = empty_compression_store();
+        assert!(resolve_compression_config(Some(&r), &store, "default/ing").is_none());
     }
 }

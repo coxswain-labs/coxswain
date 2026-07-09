@@ -827,7 +827,9 @@ pub(super) struct ReflectorStores<'a> {
     /// `ExtensionRef` filters into a per-route body-size cap (#443).
     pub(super) request_size_limits: &'a reflector::Store<RequestSizeLimit>,
     /// `Compression` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
-    /// filters, HTTPRoute-only (#446).
+    /// filters (HTTPRoute-only, #446) and the Ingress `compression` annotation
+    /// (#550); both surfaces resolve the same store through
+    /// [`crate::gateway_api::compression::resolve_spec`].
     pub(super) compressions: &'a reflector::Store<Compression>,
     /// `ClientTrafficPolicy` CRs in scope — resolved per Gateway/listener to set
     /// `ListenerInfo.proxy_protocol` during rebuild (#327).
@@ -1128,7 +1130,6 @@ struct GatewayApiStoreWriters {
     ip_access: reflector::store::Writer<IpAccessControl>,
     basic_auths: reflector::store::Writer<BasicAuth>,
     request_size_limits: reflector::store::Writer<RequestSizeLimit>,
-    compressions: reflector::store::Writer<Compression>,
     listener_sets: reflector::store::Writer<ListenerSet>,
     namespaces: reflector::store::Writer<Namespace>,
     client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
@@ -1164,7 +1165,6 @@ fn add_gateway_api_reflectors(
         ip_access,
         basic_auths,
         request_size_limits,
-        compressions,
         listener_sets,
         namespaces,
         client_traffic_policies,
@@ -1284,14 +1284,6 @@ fn add_gateway_api_reflectors(
         watcher::Config::default(),
         ReflectorEffects::new(notify, health, "request_size_limit", metrics),
         "RequestSizeLimit",
-    );
-    spawn_reflector(
-        set,
-        compressions,
-        scoped_api::<Compression>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "compression", metrics),
-        "Compression",
     );
     // GEP-1713: ListenerSets are namespaced and merged into their parent Gateway's
     // effective listener set during rebuild.
@@ -1519,6 +1511,22 @@ async fn spawn_tasks(
         ),
         "CoxswainExternalAuth",
     );
+    // Always-on (not gated by `enable_gateway_api`): the Ingress `compression`
+    // annotation (#550) consumes the same `Compression` CR store as the
+    // Gateway-API `Compression` ExtensionRef. `Compression` is coxswain's own
+    // CRD (not upstream Gateway API), so unlike HTTPRoute/Gateway/etc it needs
+    // no CRD-presence probe — gating this behind `enable_gateway_api` would
+    // leave `compression` permanently fail-open (silently no compression) on
+    // an Ingress-only install. Mirrors the `jwt_auth`/`external_auth` fixes
+    // above for the identical cross-surface-store mistake.
+    spawn_reflector(
+        &mut set,
+        compression_writer,
+        scoped_api::<Compression>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(&notify, &controller_health, "compression", metrics),
+        "Compression",
+    );
 
     // --- Ingress reflectors (gated by --disable-ingress) ---
     //
@@ -1595,7 +1603,6 @@ async fn spawn_tasks(
             ip_access: ip_access_writer,
             basic_auths: basic_auth_writer,
             request_size_limits: request_size_limit_writer,
-            compressions: compression_writer,
             listener_sets: listener_set_writer,
             namespaces: namespace_writer,
             client_traffic_policies: ctp_writer,

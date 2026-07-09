@@ -7,11 +7,12 @@ use super::class::{ResolvedClassParams, claimed_ingress_class};
 use super::ports::IngressPorts;
 use super::reconcile_helpers::{
     build_ingress_backend_group, prepend_ssl_redirect, resolve_basic_auth_config,
-    resolve_ext_auth_config, resolve_host_builder, resolve_jwt_auth_config, resolve_mirror_filter,
+    resolve_compression_config, resolve_ext_auth_config, resolve_host_builder,
+    resolve_jwt_auth_config, resolve_mirror_filter,
 };
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
-use coxswain_core::crd::CoxswainExternalAuth;
+use coxswain_core::crd::{Compression, CoxswainExternalAuth};
 use coxswain_core::routing::{
     BackendGroup, FilterAction, IngressAuthConfig, IngressRoutingTableBuilder, PathModifier,
     RouteEntry, compile_path_regex,
@@ -54,25 +55,30 @@ impl<'a> IngressClassContext<'a> {
     }
 }
 
-/// The auth-related stores threaded into [`IngressReconciler::reconcile`].
+/// The extension-CRD stores threaded into [`IngressReconciler::reconcile`].
 ///
 /// Groups the label-scoped htpasswd Secret store (`auth-basic-secret`) with
 /// the `CoxswainExternalAuth` CR store (`ext-auth`, #549), the `JwtAuth` CR
-/// store and JWKS cache (`auth-jwt`, #441), and the backend `ReferenceGrant`
-/// set (needed to resolve a `CoxswainExternalAuth` CR's cross-namespace
-/// `backendRef`) so `reconcile` stays under the workspace argument-count
-/// limit.
+/// store and JWKS cache (`auth-jwt`, #441), the backend `ReferenceGrant` set
+/// (needed to resolve a `CoxswainExternalAuth` CR's cross-namespace
+/// `backendRef`), and the `Compression` CR store (`compression`, #550) so
+/// `reconcile` stays under the workspace argument-count limit. Not
+/// auth-specific despite the auth-heavy history — every Ingress annotation
+/// that converges to a `namespace/name` CRD reference (#548) lands here;
+/// future workstreams (retry #551, rate-limit #552, ip-access-control #553,
+/// backend-policy #554) extend this struct rather than `reconcile`'s arity.
 #[non_exhaustive]
-pub struct IngressAuthStores<'a> {
+pub struct IngressExtensionStores<'a> {
     pub(crate) auth_secrets: &'a reflector::Store<Secret>,
     pub(crate) external_auths: &'a reflector::Store<CoxswainExternalAuth>,
     pub(crate) jwt_auths: &'a reflector::Store<coxswain_core::crd::JwtAuth>,
     pub(crate) jwks_cache: &'a crate::jwks::SharedJwksCache,
     pub(crate) backend_grants: &'a crate::reference_grants::GrantSet,
+    pub(crate) compressions: &'a reflector::Store<Compression>,
 }
 
-impl<'a> IngressAuthStores<'a> {
-    /// Bundle the auth-related stores for a single reconcile pass.
+impl<'a> IngressExtensionStores<'a> {
+    /// Bundle the extension-CRD stores for a single reconcile pass.
     #[must_use]
     pub fn new(
         auth_secrets: &'a reflector::Store<Secret>,
@@ -80,6 +86,7 @@ impl<'a> IngressAuthStores<'a> {
         jwt_auths: &'a reflector::Store<coxswain_core::crd::JwtAuth>,
         jwks_cache: &'a crate::jwks::SharedJwksCache,
         backend_grants: &'a crate::reference_grants::GrantSet,
+        compressions: &'a reflector::Store<Compression>,
     ) -> Self {
         Self {
             auth_secrets,
@@ -87,6 +94,7 @@ impl<'a> IngressAuthStores<'a> {
             jwt_auths,
             jwks_cache,
             backend_grants,
+            compressions,
         }
     }
 }
@@ -115,7 +123,7 @@ impl IngressReconciler {
         classes: &IngressClassContext<'_>,
         ports: IngressPorts,
         builder: &mut IngressRoutingTableBuilder,
-        auth_stores: &IngressAuthStores<'_>,
+        auth_stores: &IngressExtensionStores<'_>,
     ) -> Vec<AnnotationIssue> {
         let claimed_class = claimed_ingress_class(ingress);
 
@@ -257,7 +265,14 @@ impl IngressReconciler {
             .map(Arc::new)
             .collect();
         // Build the compression config once and share one Arc across every route entry.
-        let compression = ann.compression.clone().map(Arc::new);
+        // Resolved via the same `resolve_spec` the HTTPRoute ExtensionRef path uses
+        // (#550); a missing/no-op Compression CR fails open (no compression), unlike
+        // the auth resolvers above.
+        let compression = resolve_compression_config(
+            ann.compression.as_ref(),
+            auth_stores.compressions,
+            &route_id,
+        );
         // Build the trusted-proxy forwarded-IP config once and share one Arc across every path.
         let forwarded_for = ann.forwarded_for.clone().map(Arc::new);
         // Build the circuit-breaker config once and share one Arc across every route entry.
@@ -1657,12 +1672,13 @@ mod tests {
             &IngressClassContext::new(&owned(&["coxswain"]), Some("coxswain"), &no_class_defaults),
             IngressPorts::new(Some(80), None),
             &mut builder,
-            &IngressAuthStores::new(
+            &IngressExtensionStores::new(
                 &empty_secret_store(),
                 &empty_external_auth_store(),
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
                 &empty_backend_grants(),
+                &empty_compression_store(),
             ),
         );
         assert!(
@@ -1697,12 +1713,13 @@ mod tests {
             &IngressClassContext::new(&owned(&["coxswain"]), None, &no_class_defaults),
             IngressPorts::new(Some(80), None),
             &mut builder,
-            &IngressAuthStores::new(
+            &IngressExtensionStores::new(
                 &empty_secret_store(),
                 &empty_external_auth_store(),
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
                 &empty_backend_grants(),
+                &empty_compression_store(),
             ),
         );
         assert!(
@@ -2250,12 +2267,13 @@ mod tests {
             &IngressClassContext::new(&owned(&["coxswain"]), None, &no_class_defaults),
             IngressPorts::new(Some(80), Some(443)),
             &mut builder,
-            &IngressAuthStores::new(
+            &IngressExtensionStores::new(
                 &empty_secret_store(),
                 &empty_external_auth_store(),
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
                 &empty_backend_grants(),
+                &empty_compression_store(),
             ),
         );
         let table = builder.build().unwrap();

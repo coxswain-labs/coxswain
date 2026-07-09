@@ -727,7 +727,7 @@ The reason is a `pingora-proxy` limitation: a `request_body_filter` rejection ov
 
 ### Response compression
 
-`Compression` (`gateway.coxswain-labs.dev/v1alpha1`) enables gzip/brotli response compression for a route. Attach it to an `HTTPRouteRule` with an `ExtensionRef` filter — the Gateway API surface for the Ingress `compression-*` annotations. gRPC compresses per-message at the gRPC framing layer (`grpc-encoding`), not via HTTP `Content-Encoding`, so this filter is **not** supported on `GRPCRoute`; the proxy also refuses to compress any response whose `Content-Type` starts with `application/grpc`, even on an HTTPRoute (a gRPC-over-HTTPRoute edge case), regardless of the CR's `types` allow-list.
+`Compression` (`gateway.coxswain-labs.dev/v1alpha1`) enables gzip/brotli response compression for a route. Attach it to an `HTTPRouteRule` with an `ExtensionRef` filter — the same CRD the Ingress `compression` annotation references (see [Ingress annotations](ingress-annotations.md#compression)). gRPC compresses per-message at the gRPC framing layer (`grpc-encoding`), not via HTTP `Content-Encoding`, so this filter is **not** supported on `GRPCRoute`; the proxy also refuses to compress any response whose `Content-Type` starts with `application/grpc`, even on an HTTPRoute (a gRPC-over-HTTPRoute edge case), regardless of the CR's `types` allow-list.
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -761,7 +761,7 @@ Semantics:
 
 - At least one of `gzip` / `brotli` must be `true` for the CR to have any effect; when both are `false` (the default) it is a no-op.
 - Brotli is preferred over gzip when both are enabled and the client advertises `br` in `Accept-Encoding`.
-- `level` (1–9, default `6`), `minSize` (bytes, default `1024`), and `types` (default: `text/html`, `text/plain`, `text/css`, `application/json`, `application/javascript`) mirror the Ingress `compression-*` annotation defaults.
+- `level` (1–9, default `6`), `minSize` (bytes, default `1024`), and `types` (default: `text/html`, `text/plain`, `text/css`, `application/json`, `application/javascript`) are the same defaults applied when the Ingress `compression` annotation resolves this CR.
 - A missing `Compression` CR fails open (no compression).
 
 ### Status conditions

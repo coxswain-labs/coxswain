@@ -52,8 +52,8 @@ impl CompressionConfig {
     /// Construct a [`CompressionConfig`].
     ///
     /// Invariant: at least one of `gzip` / `brotli` must be `true`. The
-    /// reflector enforces this — it returns `None` from `parse_compression`
-    /// when both are disabled and never constructs this config.
+    /// reflector enforces this — `gateway_api::compression::resolve_spec`
+    /// returns `None` when both are disabled and never constructs this config.
     pub fn new(
         gzip: bool,
         brotli: bool,
