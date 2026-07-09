@@ -59,7 +59,7 @@ pub struct RateLimitSpec {
     ///
     /// When absent (the default), buckets are keyed by real client IP address
     /// (PROXY-protocol peer if present, else L4 downstream peer — the same
-    /// resolution used by the allow-source-range filter).
+    /// resolution used by the `IpAccessControl` filter).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by_header: Option<String>,
 }

@@ -150,17 +150,18 @@ pub struct RouteEntry {
     /// chunked bodies. `None` (the default, and the value for all Gateway-API routes)
     /// imposes no limit.
     pub max_body_size: Option<u64>,
-    /// IP allow-list (CIDR ranges) from the
-    /// `ingress.coxswain-labs.dev/allow-source-range` annotation.
+    /// IP allow-list (CIDR ranges), from the Ingress
+    /// `ingress.coxswain-labs.dev/ip-access-control` annotation or an
+    /// `IpAccessControl` CRD `ExtensionRef` filter (#553).
     ///
     /// `Some(nets)` restricts the rule to requests whose real client IP matches at
     /// least one CIDR; clients outside every range are rejected with 403 Forbidden.
-    /// `None` (the default, and the value for all Gateway-API routes) admits all
-    /// source IPs. Shared as an `Arc` so cloning into the lookup result is a
-    /// refcount bump, not a heap copy, on the hot path.
+    /// `None` (the default) admits all source IPs. Shared as an `Arc` so cloning
+    /// into the lookup result is a refcount bump, not a heap copy, on the hot path.
     pub allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
-    /// Source-IP block list from the
-    /// `ingress.coxswain-labs.dev/deny-source-range` annotation.
+    /// Source-IP block list, from the same `ip-access-control` annotation or
+    /// `IpAccessControl` CRD `ExtensionRef` filter as
+    /// [`Self::allow_source_range`] (#553).
     ///
     /// `Some(nets)` rejects any request whose real client IP falls inside any
     /// listed CIDR with 403 Forbidden, **regardless of `allow_source_range`**
@@ -453,10 +454,12 @@ impl RouteEntry {
 
     /// Set the source-IP allow-list for this route (builder-style).
     ///
-    /// Used by the Ingress reconciler to attach the CIDR set parsed from the
-    /// `ingress.coxswain-labs.dev/allow-source-range` annotation. `None` admits
-    /// all source IPs (the default). The reconciler shares one `Arc` across every
-    /// path of an Ingress, so cloning it onto each entry is a refcount bump.
+    /// Used by the Ingress reconciler to attach the CIDR set resolved from the
+    /// `ingress.coxswain-labs.dev/ip-access-control` `IpAccessControl` CR
+    /// reference (#553), and by the Gateway API reconciler for `IpAccessControl`
+    /// `ExtensionRef` filters. `None` admits all source IPs (the default). The
+    /// reconciler shares one `Arc` across every path of an Ingress, so cloning
+    /// it onto each entry is a refcount bump.
     #[must_use]
     pub fn with_allow_source_range(
         mut self,
@@ -468,11 +471,13 @@ impl RouteEntry {
 
     /// Set the source-IP block list for this route (builder-style).
     ///
-    /// Used by the Ingress reconciler to attach the CIDR set parsed from the
-    /// `ingress.coxswain-labs.dev/deny-source-range` annotation. `None` (the
-    /// default) blocks nothing. The reconciler shares one `Arc` across every path
-    /// of an Ingress, so cloning it onto each entry is a refcount bump.
-    /// Deny is enforced before `allow_source_range` in the proxy.
+    /// Used by the Ingress reconciler to attach the CIDR set resolved from the
+    /// `ingress.coxswain-labs.dev/ip-access-control` `IpAccessControl` CR
+    /// reference (#553), and by the Gateway API reconciler for `IpAccessControl`
+    /// `ExtensionRef` filters. `None` (the default) blocks nothing. The
+    /// reconciler shares one `Arc` across every path of an Ingress, so cloning
+    /// it onto each entry is a refcount bump. Deny is enforced before
+    /// `allow_source_range` in the proxy.
     #[must_use]
     pub fn with_deny_source_range(
         mut self,

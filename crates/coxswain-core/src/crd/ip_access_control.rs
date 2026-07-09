@@ -1,17 +1,20 @@
-//! `IpAccessControl` CRD — per-route source-IP allow/deny policy for
-//! Gateway-API routes.
+//! `IpAccessControl` CRD — per-route source-IP allow/deny policy shared by
+//! Gateway-API routes and Ingress.
 //!
 //! Attached to an `HTTPRouteRule` via an `ExtensionRef` filter (group
-//! `gateway.coxswain-labs.dev`, kind `IpAccessControl`). The reflector resolves the
-//! named CR, parses its `allow`/`deny` CIDR sets into `ipnet::IpNet` lists, and
-//! stores them on the route's `allow_source_range` / `deny_source_range` fields
-//! in `coxswain-core::routing` — the same enforcement path the Ingress
-//! `allow-source-range` / `deny-source-range` annotations feed. The proxy
-//! evaluates deny before allow.
+//! `gateway.coxswain-labs.dev`, kind `IpAccessControl`), or referenced by an
+//! Ingress's `ingress.coxswain-labs.dev/ip-access-control: "namespace/name"`
+//! annotation (#553). Both surfaces resolve the named CR through
+//! `gateway_api::ip_access_control::resolve_spec`, parse its `allow`/`deny`
+//! CIDR sets into `ipnet::IpNet` lists, and store them on the route's
+//! `allow_source_range` / `deny_source_range` fields in
+//! `coxswain-core::routing`. The proxy evaluates deny before allow.
 //!
-//! This is the Gateway-API surface for the Ingress annotations added in
-//! #264 / #268. It has no upstream Gateway-API standard; its merit anchor is
-//! Envoy's `rbac` CIDR-principal filter / Istio `AuthorizationPolicy`
+//! Originally an Ingress-only feature (#264 / #268), then given a Gateway-API
+//! `ExtensionRef` surface (#479), then the Ingress annotations converged onto
+//! this CR reference (#553) so both surfaces resolve to byte-identical
+//! runtime config. It has no upstream Gateway-API standard; its merit anchor
+//! is Envoy's `rbac` CIDR-principal filter / Istio `AuthorizationPolicy`
 //! `ipBlocks`/`notIpBlocks`.
 //!
 //! Source of truth is the Rust type below; the on-disk CRD YAML
