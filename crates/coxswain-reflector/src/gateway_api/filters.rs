@@ -15,14 +15,13 @@ use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendGroup, CompressionConfig, CorsConfig, CorsOrigin, FilterAction, HeaderMod,
     HeaderPredicate, IngressAuthConfig, MatchPredicates, MirrorFraction, PathModifier,
-    QueryPredicate, RateLimitConfig, RateLimitKey, RetryPolicyConfig, ValueMatch, compile_bounded,
+    QueryPredicate, RateLimitConfig, RetryPolicyConfig, ValueMatch, compile_bounded,
 };
 use http::{HeaderName, Method};
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use std::collections::HashSet;
-use std::num::NonZeroU32;
 use std::sync::Arc;
 
 /// A resolved source-IP CIDR set attached to a route (allow or deny list), or
@@ -722,19 +721,17 @@ pub(super) fn resolve_rate_limit_ref(
         );
         return RefResolution::FailOpen;
     };
-    let Some(rps) = NonZeroU32::new(cr.spec.requests_per_second) else {
-        tracing::warn!(
-            ns = route_ns,
-            name = ext_name,
-            "RateLimit CR has requestsPerSecond=0 — rate limiting skipped (fail-open)"
-        );
-        return RefResolution::FailOpen;
-    };
-    let key = match &cr.spec.by_header {
-        Some(h) => RateLimitKey::Header(Arc::from(h.to_ascii_lowercase().as_str())),
-        None => RateLimitKey::ClientIp,
-    };
-    RefResolution::Resolved(Arc::new(RateLimitConfig::new(rps, cr.spec.burst, key)))
+    match super::rate_limit::resolve_spec(&cr.spec) {
+        Some(cfg) => RefResolution::Resolved(cfg),
+        None => {
+            tracing::warn!(
+                ns = route_ns,
+                name = ext_name,
+                "RateLimit CR has requestsPerSecond=0 — rate limiting skipped (fail-open)"
+            );
+            RefResolution::FailOpen
+        }
+    }
 }
 
 /// Scans `filters` for an `ExtensionRef` pointing at a `RetryPolicy` CR and resolves
