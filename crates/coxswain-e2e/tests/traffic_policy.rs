@@ -9,10 +9,11 @@
 //! effect tests — compression, response buffering, upstream keepalive,
 //! circuit-breaker, load-balance algorithm, upstream-hash, max-body-size,
 //! limit-connections, mirror-target, drain-timeout, retries
-//! (#263/#266/#270/#274/#275/#276/#277/#281/#282/#283/#360/#445) — each landing with
-//! its feature. Retries: the `retry-attempts`/`retry-codes`/`retry-backoff` Ingress
-//! annotations and the `RetryPolicy` ExtensionRef (HTTP + gRPC). Routing-shape
-//! behavior lives in `routing.rs`; TLS in `tls.rs`.
+//! (#263/#266/#270/#274/#275/#276/#277/#281/#282/#283/#360/#445/#551) — each landing
+//! with its feature. Retries: the Ingress `retry` annotation (a `RetryPolicy` CR
+//! reference, #551, converged from the former inline `retry-attempts`/
+//! `retry-codes`/`retry-backoff` cluster) and the `RetryPolicy` ExtensionRef
+//! (HTTP + gRPC). Routing-shape behavior lives in `routing.rs`; TLS in `tls.rs`.
 
 use coxswain_e2e::{
     FixtureVars, Harness, IngressClassGuard, NamespaceGuard,
@@ -54,15 +55,15 @@ async fn raw_status(proxy_addr: SocketAddr, host: &str, path: &str) -> u16 {
 
 mod common;
 
-/// Verifies that `ingress.coxswain-labs.dev/max-retries` and `retry-on:
-/// connect-failure` annotations are parsed and stored on the route:
+/// Verifies that `ingress.coxswain-labs.dev/retry` (a `RetryPolicy` CR
+/// reference, #551, `attempts: 2`) is resolved and stored on the route:
 /// - A backend whose endpoints all refuse connections (wrong port on real pods)
 ///   should produce a 502 (not a 503 dead-route) when retries are exhausted.
 /// - 502 vs 503 distinguishes "tried to connect and failed" from "no endpoints
 ///   were ever resolved" — the `error_status: 503` dead-route short-circuit is
 ///   bypassed when endpoints are present regardless of retry settings.
 ///
-/// Note: the exact retry count (3 attempts for max-retries=2) is deterministic
+/// Note: the exact retry count (3 attempts for attempts=2) is deterministic
 /// and covered by the unit tests in `coxswain-proxy::common::hooks`; e2e
 /// cannot observe individual retry attempts without a dedicated metric.
 #[tokio::test]
@@ -96,10 +97,11 @@ async fn annotation_connect_retry_retries_failed_connect() -> anyhow::Result<()>
     Ok(())
 }
 
-/// Ingress `retry-codes` + `retry-backoff` effect (#445): with `retry-attempts: 2`,
-/// `retry-codes: 503`, `retry-backoff: 200ms`, the always-503 go-httpbin backend is
-/// retried. The client sees the final 503 (budget exhausted), but the retry loop
-/// fired (retry metric) and each retried attempt waited the backoff (elapsed time).
+/// Ingress `retry` effect (#551, formerly #445's inline `retry-codes` +
+/// `retry-backoff`): with a `RetryPolicy` CR (`attempts: 2`, `codes: [503]`,
+/// `backoff: 200ms`), the always-503 go-httpbin backend is retried. The client
+/// sees the final 503 (budget exhausted), but the retry loop fired (retry
+/// metric) and each retried attempt waited the backoff (elapsed time).
 #[tokio::test]
 async fn annotation_retry_codes_retries_retriable_status_with_backoff() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -141,6 +143,53 @@ async fn annotation_retry_codes_retries_retriable_status_with_backoff() -> anyho
     assert!(
         after > before,
         "retry-codes:503 must retry the 503 \
+         (upstream_retries_total{{condition=http-code}}: {before} -> {after})"
+    );
+
+    Ok(())
+}
+
+/// Sad path (#551): `retry` references a `RetryPolicy` CR that does not exist.
+/// Unlike the auth annotation family (`ext-auth`/`auth-basic-secret`/`auth-jwt`),
+/// which fails **closed** (503) on a missing CR, retry fails **open** — the
+/// route still passes the upstream's 503 straight through, and the retry
+/// metric must not increment (no retry loop fired).
+#[tokio::test]
+async fn ingress_retry_passthrough_when_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-retry-missing").await?;
+
+    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_RETRY_MISSING,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("retry-missing.{}.local", ns.name);
+    let proxy = h.http.proxy_addr;
+
+    // Readiness: /status/200 confirms the route is live before probing /status/503.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("{host} route live (go-httpbin 200)") },
+        || async { (raw_status(proxy, &host, "/status/200").await == 200).then_some(()) },
+    )
+    .await?;
+
+    let before = retry_count(&h, &ns.name, "http-code").await;
+    let status = raw_status(proxy, &host, "/status/503").await;
+    let after = retry_count(&h, &ns.name, "http-code").await;
+
+    assert_eq!(
+        status, 503,
+        "the upstream 503 must pass through when the RetryPolicy reference is missing"
+    );
+    assert_eq!(
+        after, before,
+        "a missing RetryPolicy CR must fail open (no retries), not retry \
          (upstream_retries_total{{condition=http-code}}: {before} -> {after})"
     );
 

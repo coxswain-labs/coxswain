@@ -1,0 +1,27 @@
+# retry fixture (#551 sad path) — apply backends::GO_HTTPBIN first. The
+# annotation references a RetryPolicy CR that does not exist. Unlike the auth
+# annotation family (ext-auth/auth-basic-secret/auth-jwt), a missing
+# RetryPolicy CR must fail **open** — the always-503 go-httpbin response
+# passes straight through, never retried.
+#
+# Route: retry-missing.TESTNS.local / -> go-httpbin:3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: retry-missing-ingress
+  annotations:
+    ingress.coxswain-labs.dev/retry: "${TESTNS}/does-not-exist"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: retry-missing.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: go-httpbin
+                port:
+                  number: 3000

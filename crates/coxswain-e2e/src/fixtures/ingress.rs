@@ -42,16 +42,23 @@ pub const ANNOTATION_REWRITE_TARGET: &str = fixture!("annotation_rewrite_target.
 /// invalid pattern that skips only its own path, and an Ingress without the opt-in
 /// whose `ImplementationSpecific` path stays a literal Prefix.
 pub const USE_REGEX: &str = fixture!("regex_path.yaml");
-/// Ingress with `retry-attempts: 2`, backed by a Service whose endpoints refuse
-/// connections (wrong port on real pods). Under the exact-native-mirror model,
-/// connection failures retry implicitly whenever `retry-attempts >= 1`; the route
-/// returns 502.
+/// Ingress with `ingress.coxswain-labs.dev/retry: "TESTNS/connect-retry"`
+/// referencing a `RetryPolicy` CR (`attempts: 2`) (#551, formerly #445's inline
+/// `retry-attempts`), backed by a Service whose endpoints refuse connections
+/// (wrong port on real pods). Under the exact-native-mirror model, connection
+/// failures retry implicitly whenever `attempts >= 1`; the route returns 502.
 pub const ANNOTATION_CONNECT_RETRY: &str = fixture!("annotation_connect_retry.yaml");
-/// Ingress with `retry-attempts: 2` + `retry-codes: 503` + `retry-backoff: 200ms`
-/// (#445), routed to go-httpbin `/status/503`. Verifies the GEP-1731-shaped retry
-/// annotations retry a retriable HTTP status with backoff. Apply `backends::GO_HTTPBIN`
-/// first.
+/// Ingress referencing a `RetryPolicy` CR (`attempts: 2`, `codes: [503]`,
+/// `backoff: 200ms`) (#551, formerly #445's inline `retry-attempts`/
+/// `retry-codes`/`retry-backoff` cluster), routed to go-httpbin `/status/503`.
+/// Verifies the GEP-1731-shaped retry policy retries a retriable HTTP status
+/// with backoff. Apply `backends::GO_HTTPBIN` first.
 pub const ANNOTATION_RETRY_CODES: &str = fixture!("annotation_retry_codes.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/retry` pointing at a non-existent
+/// `RetryPolicy` CR (#551 sad path), routed to go-httpbin `/status/503`. Used
+/// to verify the reference fails **open** — the 503 passes straight through,
+/// never retried. Apply `backends::GO_HTTPBIN` first.
+pub const ANNOTATION_RETRY_MISSING: &str = fixture!("annotation_retry_missing.yaml");
 /// Ingress with `connect-timeout: 500ms`, backed by a Service whose single
 /// EndpointSlice address (`192.0.2.1`, RFC 5737) black-holes the TCP connect.
 /// Used to verify the annotation shortens the connect deadline (prompt 502).

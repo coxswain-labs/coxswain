@@ -6,10 +6,11 @@
 use super::annotations::AnnotationIssue;
 use super::annotations::auth::{SecretRef, parse_htpasswd};
 use crate::endpoints;
-use coxswain_core::crd::{Compression, CoxswainExternalAuth};
+use coxswain_core::crd::{Compression, CoxswainExternalAuth, RetryPolicy};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, BasicCredential, CompressionConfig, FilterAction,
-    HostRouterBuilder, IngressAuthConfig, IngressRoutingTableBuilder, NormalizeLevel, WildcardKind,
+    HostRouterBuilder, IngressAuthConfig, IngressRoutingTableBuilder, NormalizeLevel,
+    RetryPolicyConfig, WildcardKind,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -24,16 +25,23 @@ use std::sync::Arc;
 ///
 /// Used by both the per-rule path loop and `spec.defaultBackend` — centralises the
 /// builder chain so annotation knobs are applied uniformly to every backend.
+///
+/// `retries` is passed in already resolved (via [`resolve_retry_config`]) rather
+/// than read off `ann` directly — unlike the other knobs here, the `retry`
+/// annotation is a CR reference that needs a store lookup, so the caller
+/// resolves it once per Ingress and shares the result across every backend
+/// group (#551).
 pub(super) fn build_ingress_backend_group(
     ns: &str,
     svc_name: &str,
     addrs: Vec<SocketAddr>,
     protocol: BackendProtocol,
     ann: &super::annotations::IngressAnnotations,
+    retries: &RetryPolicyConfig,
 ) -> BackendGroup {
     BackendGroup::new(format!("{ns}/{svc_name}"), addrs)
         .with_protocol(protocol)
-        .with_retries(ann.retries.clone())
+        .with_retries(retries.clone())
         .with_session_affinity(ann.session_affinity.clone())
         .with_keepalive_timeout(ann.keepalive_timeout)
         .with_load_balance(ann.load_balance.clone())
@@ -302,6 +310,41 @@ pub(super) fn resolve_compression_config(
     crate::gateway_api::compression::resolve_spec(&cr.spec)
 }
 
+// ── Retry resolution ─────────────────────────────────────────────────────────
+
+/// Resolve the `retry` annotation's `RetryPolicy` CR reference into a concrete
+/// [`RetryPolicyConfig`] — the Ingress-parity counterpart to the HTTPRoute
+/// `ExtensionRef` filter (#551). Delegates to
+/// [`crate::gateway_api::retry::resolve_spec`] so both surfaces resolve the
+/// same CR to byte-identical runtime config. Ingress is HTTP-only, so
+/// `is_grpc` is always `false`.
+///
+/// `annotation: None` (absent/malformed `retry`) returns
+/// [`RetryPolicyConfig::default()`] — no retries. Unlike every auth resolver
+/// in this file, a present-but-missing CR fails **open** — the default
+/// disabled policy — matching the HTTPRoute `ExtensionRef` path's fail-open
+/// posture: a broken retry reference degrades to no retries, not a 503.
+pub(super) fn resolve_retry_config(
+    annotation: Option<&SecretRef>,
+    retry_policies: &reflector::Store<RetryPolicy>,
+    route_id: &str,
+) -> RetryPolicyConfig {
+    let Some(r) = annotation else {
+        return RetryPolicyConfig::default();
+    };
+    let obj_ref = reflector::ObjectRef::<RetryPolicy>::new(&r.name).within(&r.namespace);
+    let Some(cr) = retry_policies.get(&obj_ref) else {
+        tracing::warn!(
+            ingress = %route_id,
+            namespace = %r.namespace,
+            name = %r.name,
+            "RetryPolicy CR not found — retries disabled (fail-open)"
+        );
+        return RetryPolicyConfig::default();
+    };
+    crate::gateway_api::retry::resolve_spec(&cr.spec, false, route_id)
+}
+
 /// Prepend an HTTPS `RequestRedirect` to `base`, returning the combined filter list.
 ///
 /// The HTTP-listener entry of an `ssl-redirect` route carries this leading
@@ -349,7 +392,7 @@ mod tests {
     use super::*;
     use crate::tests::fixtures::{
         empty_compression_store, empty_external_auth_store, empty_jwks_cache, empty_jwt_auth_store,
-        empty_secret_store, empty_svc_store, slice_store,
+        empty_retry_policy_store, empty_secret_store, empty_svc_store, slice_store,
     };
 
     fn secret_ref(namespace: &str, name: &str) -> SecretRef {
@@ -443,5 +486,23 @@ mod tests {
         let r = secret_ref("default", "absent");
         let store = empty_compression_store();
         assert!(resolve_compression_config(Some(&r), &store, "default/ing").is_none());
+    }
+
+    #[test]
+    fn resolve_retry_config_absent_annotation_is_disabled_default() {
+        let store = empty_retry_policy_store();
+        assert!(resolve_retry_config(None, &store, "default/ing").is_disabled());
+    }
+
+    #[test]
+    fn resolve_retry_config_missing_cr_fails_open() {
+        // Unlike every auth resolver above, a missing RetryPolicy reference
+        // must NOT install a fail-closed check — retries degrade to "disabled",
+        // matching the HTTPRoute ExtensionRef path. The "resolved" case is
+        // covered by `gateway_api::retry::resolve_spec`'s own test module,
+        // which this function delegates to.
+        let r = secret_ref("default", "absent");
+        let store = empty_retry_policy_store();
+        assert!(resolve_retry_config(Some(&r), &store, "default/ing").is_disabled());
     }
 }

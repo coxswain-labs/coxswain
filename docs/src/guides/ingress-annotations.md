@@ -13,9 +13,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/connect-timeout` | duration | _none_ | `"5s"` |
 | `ingress.coxswain-labs.dev/read-timeout` | duration | _none_ | `"60s"` |
 | `ingress.coxswain-labs.dev/send-timeout` | duration | _none_ | `"60s"` |
-| `ingress.coxswain-labs.dev/retry-attempts` | integer | `0` | `"3"` |
-| `ingress.coxswain-labs.dev/retry-codes` | csv | `502,503,504` | `"503,504"` |
-| `ingress.coxswain-labs.dev/retry-backoff` | duration | _none_ | `"100ms"` |
+| `ingress.coxswain-labs.dev/retry` | `namespace/name` | _none_ | `"my-ns/my-retry"` |
 | `ingress.coxswain-labs.dev/rewrite-target` | string | _none_ | `"/v2"` |
 | `ingress.coxswain-labs.dev/use-regex` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/request-header-set` | newline-list | _none_ | `"X-Via: coxswain"` |
@@ -65,8 +63,7 @@ metadata:
   annotations:
     ingress.coxswain-labs.dev/connect-timeout: "5s"
     ingress.coxswain-labs.dev/read-timeout: "60s"
-    ingress.coxswain-labs.dev/retry-attempts: "2"
-    ingress.coxswain-labs.dev/retry-codes: "503,504"
+    ingress.coxswain-labs.dev/retry: "my-ns/my-retry"
     ingress.coxswain-labs.dev/rewrite-target: "/v2"
 ```
 
@@ -86,28 +83,54 @@ Maximum time for the upstream to send the first response byte after the full req
 
 Maximum time to write the full request to the upstream. Corresponds to Pingora's `write_timeout`.
 
-## Retries
+## `retry`
 
-The retry annotations follow the Gateway API [GEP-1731](https://gateway-api.sigs.k8s.io/geps/gep-1731/) shape (`attempts` / `codes` / `backoff`) so they match the `RetryPolicy` custom resource used on Gateway API routes. See the [Retries guide](retries.md) for the full model, including gRPC. Ingress is HTTP-only.
+The Ingress surface for the [`RetryPolicy` CRD](retries.md), same idiom as `ext-auth`/`auth-jwt`/`compression`. Value is `namespace/name` of a `RetryPolicy` resource; both surfaces resolve the same CR to the same runtime policy, so one `RetryPolicy` can back an Ingress and an HTTPRoute/GRPCRoute `ExtensionRef` filter identically. The field shape follows the Gateway API [GEP-1731](https://gateway-api.sigs.k8s.io/geps/gep-1731/) (`attempts` / `codes` / `backoff`). See the [Retries guide](retries.md) for the full model, including gRPC. Ingress is HTTP-only, so a referenced CR's `grpcCodes` field is ignored.
 
-### `retry-attempts`
+```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RetryPolicy
+metadata:
+  name: default-retry
+  namespace: my-app
+spec:
+  attempts: 2
+  codes: [502, 503, 504]
+  backoff: 100ms
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  namespace: my-app
+  annotations:
+    ingress.coxswain-labs.dev/retry: "my-app/default-retry"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-api
+                port:
+                  number: 8080
+```
 
-Maximum number of _additional_ attempts after the first (not counting the initial attempt) — this is the gate. With `retry-attempts: 2`, Coxswain makes up to 3 total attempts. **When absent (or `0`), retrying is disabled** regardless of the other retry annotations. Retries are tried against randomly selected endpoints in the same backend group; there is no per-endpoint pinning.
-
-When `retry-attempts` is set, **connection failures and connect-timeouts are always retried** (they are safe — no request bytes were sent). `retry-codes` additionally selects which upstream _responses_ trigger a retry.
+`attempts` is the gate: absent or `0` disables retrying entirely, regardless of `codes`/`backoff`. With `attempts: 2`, Coxswain makes up to 3 total attempts, tried against randomly selected endpoints in the same backend group (no per-endpoint pinning). When `attempts >= 1`, **connection failures and connect-timeouts are always retried** (they are safe — no request bytes were sent); `codes` additionally selects which upstream _responses_ trigger a retry — omitted defaults to `[502, 503, 504]` (`500` is excluded: the application ran, and a retry risks double execution), an explicit empty list opts out of response-code retries. `backoff` is a minimum delay before each retried attempt; absent means immediate retry.
 
 Each retry attempt (not counting the final failing attempt) increments `coxswain_proxy_upstream_retries_total{condition=...}`. Use this to confirm retries are firing and to alert on unexpectedly high retry rates that indicate a flapping backend.
-
-### `retry-codes`
-
-Comma-separated list of HTTP status codes that trigger a retry (whitespace around commas is ignored). When **absent**, defaults to `502,503,504` — the "gateway could not obtain a processed response" codes, where the request almost certainly did not execute. `500` is excluded by default because the application ran and a retry risks double execution. An **explicit empty value** opts out of response-code retries entirely (connection/timeout retries still apply).
 
 !!! note
     Response-code retries require the full request body to be buffered. Requests whose bodies are too large or were only partially received cannot be retried and pass through to the client as-is.
 
-### `retry-backoff`
+A missing `RetryPolicy` CR fails **open** (no retries) — unlike the auth annotations (`ext-auth`/`auth-basic-secret`/`auth-jwt`), which fail closed with **503**. A broken or stale `retry` reference degrades the route to no retries rather than blocking traffic.
 
-Minimum delay before each retried attempt, as a Go `time.ParseDuration` string (e.g. `"100ms"`). Absent means retries are attempted immediately. Coxswain applies this as a fixed minimum delay; exponential backoff and jitter are not yet applied.
+!!! note "Migration from the inline retry-attempts/retry-codes/retry-backoff annotations (breaking)"
+    Earlier releases exposed three inline annotations — `retry-attempts`, `retry-codes`, `retry-backoff` — duplicating the `RetryPolicy` CRD schema. These are removed; move each Ingress's values into a `RetryPolicy` CR and point `retry` at it.
 
 ## `rewrite-target`
 
@@ -1102,8 +1125,7 @@ metadata:
 spec:
   defaultAnnotations:
     ingress.coxswain-labs.dev/connect-timeout: "10s"
-    ingress.coxswain-labs.dev/retry-attempts: "2"
-    ingress.coxswain-labs.dev/retry-codes: "503,504"
+    ingress.coxswain-labs.dev/retry: "coxswain-system/default-retry"
 ---
 apiVersion: networking.k8s.io/v1
 kind: IngressClass
@@ -1125,7 +1147,7 @@ spec:
 2. The class default from `spec.defaultAnnotations`.
 3. The built-in Coxswain default.
 
-The merge is per-key: an Ingress that sets only `connect-timeout` still inherits the class's `retry-attempts` and `retry-codes`. The keys and value formats in `defaultAnnotations` are exactly the per-Ingress ones; an invalid value emits a warning and falls back to the built-in default, the same as if it were set directly on an Ingress (an empty string `""` is **not** an "unset" override — it parses, warns, and falls back).
+The merge is per-key: an Ingress that sets only `connect-timeout` still inherits the class's `retry` reference. The keys and value formats in `defaultAnnotations` are exactly the per-Ingress ones — including `namespace/name` CR references like `retry`/`compression`, which resolve identically whether set directly on an Ingress or inherited from a class default; an invalid value emits a warning and falls back to the built-in default, the same as if it were set directly on an Ingress (an empty string `""` is **not** an "unset" override — it parses, warns, and falls back).
 
 ### `spec.accessLog` — per-class access-log control
 

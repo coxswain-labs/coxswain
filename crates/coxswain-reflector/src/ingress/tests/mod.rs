@@ -24,7 +24,8 @@ pub(super) use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub(super) use crate::tests::fixtures::{
     empty_compression_store, empty_external_auth_store, empty_jwks_cache, empty_jwt_auth_store,
-    empty_secret_store, empty_svc_store, make_slice, make_svc_store, slice_store,
+    empty_retry_policy_store, empty_secret_store, empty_svc_store, make_retry_policy_store,
+    make_slice, make_svc_store, slice_store,
 };
 
 /// Empty `ReferenceGrant` set — every cross-namespace `CoxswainExternalAuth`
@@ -60,6 +61,7 @@ pub(super) fn reconcile_no_default(
             &empty_jwks_cache(),
             &empty_backend_grants(),
             &empty_compression_store(),
+            &empty_retry_policy_store(),
         ),
     );
 }
@@ -88,6 +90,7 @@ pub(super) fn reconcile_with_class_defaults(
             &empty_jwks_cache(),
             &empty_backend_grants(),
             &empty_compression_store(),
+            &empty_retry_policy_store(),
         ),
     );
 }

@@ -785,27 +785,7 @@ fn resolve_retry_policy_ref(
         );
         return RefResolution::FailOpen;
     };
-    // Absent `attempts` defaults to 1; an explicit 0 disables (handled by the config).
-    let attempts = cr.spec.attempts.unwrap_or(1);
-    let backoff = cr.spec.backoff.as_deref().and_then(|s| {
-        let d = crate::duration::parse_duration(s);
-        if d.is_none() {
-            tracing::warn!(
-                ns = route_ns,
-                name = ext_name,
-                value = s,
-                "RetryPolicy backoff is not a valid duration — no backoff applied"
-            );
-        }
-        d
-    });
-    let http_codes = cr.spec.codes.clone();
-    let cfg = if is_grpc {
-        RetryPolicyConfig::for_grpc(attempts, backoff, http_codes, cr.spec.grpc_codes.clone())
-    } else {
-        RetryPolicyConfig::for_http(attempts, backoff, http_codes)
-    };
-    RefResolution::Resolved(cfg)
+    RefResolution::Resolved(super::retry::resolve_spec(&cr.spec, is_grpc, route_ns))
 }
 
 /// Scans `filters` for an `ExtensionRef` pointing at an `IpAccessControl` CR

@@ -33,6 +33,7 @@ use k8s_openapi::api::core::v1::{Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
+use std::net::SocketAddr;
 use std::time::Duration;
 
 mod common;
@@ -738,6 +739,47 @@ async fn lifecycle_gateway_deletion_cascades_resources() -> anyhow::Result<()> {
 // control to confirm the controller ran. Then assert the disabled-surface
 // resource was left untouched.
 
+/// Make a raw HTTP GET to the proxy and return the status code only.
+///
+/// Does not attempt JSON body parsing — safe to call with go-httpbin backends
+/// whose `/status/:code` endpoints return plain-text or empty bodies. Mirrors
+/// `traffic_policy.rs`'s helper of the same shape (kept local per-file since
+/// each `tests/*.rs` file compiles as its own binary).
+async fn raw_status(proxy_addr: SocketAddr, host: &str, path: &str) -> u16 {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    let c = CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_else(|e| panic!("build reqwest client: {e}"))
+    });
+    let url = format!("http://{proxy_addr}{path}");
+    c.get(&url)
+        .header("Host", host)
+        .send()
+        .await
+        .map(|r| r.status().as_u16())
+        .unwrap_or(0)
+}
+
+/// Sum `coxswain_proxy_upstream_retries_total` series for `condition` whose labels
+/// mention `ns_marker` (the test namespace). Mirrors `traffic_policy.rs`'s helper.
+async fn retry_count(h: &Harness, ns_marker: &str, condition: &str) -> u64 {
+    let Ok(resp) = reqwest::get(h.admin_url("/metrics")).await else {
+        return 0;
+    };
+    let Ok(body) = resp.text().await else {
+        return 0;
+    };
+    body.lines()
+        .filter(|l| l.starts_with("coxswain_proxy_upstream_retries_total{"))
+        .filter(|l| l.contains(&format!("condition=\"{condition}\"")))
+        .filter(|l| l.contains(ns_marker))
+        .filter_map(|l| l.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()))
+        .map(|v| v as u64)
+        .sum()
+}
+
 /// (#492 sad) Gateway API disabled: a Gateway applied while the surface is off
 /// receives no status conditions, proving coxswain does not reconcile Gateway
 /// API resources when `--disable-gateway-api` is set.
@@ -830,6 +872,47 @@ async fn gateway_api_disabled_skips_gateway_reconcile() -> anyhow::Result<()> {
                 .and_then(|v| v.to_str().ok())
                 == Some("gzip"))
             .then_some(())
+        },
+    )
+    .await?;
+
+    // Regression guard for #551 (identical fix, same rationale, for `RetryPolicy`):
+    // the CR reflector must be spawned always-on, not only inside the
+    // gateway-api-gated reflector set — otherwise the Ingress `retry` annotation
+    // is permanently unresolvable (and its health check permanently unregistered,
+    // crash-looping the controller) on an Ingress-only install. Apply a
+    // `retry`-referencing Ingress over go-httpbin here, under
+    // `--disable-gateway-api`, and prove the retry loop actually fires.
+    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
+    fixtures::apply_fixture(ing::ANNOTATION_RETRY_CODES, FixtureVars::new(&ns.name)).await?;
+    let retry_host = format!("ingretry.{}.local", ns.name);
+    let proxy = h.http.proxy_addr;
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("{retry_host} route live (go-httpbin 200)") },
+        || async { (raw_status(proxy, &retry_host, "/status/200").await == 200).then_some(()) },
+    )
+    .await?;
+    let before = retry_count(&h, &ns.name, "http-code").await;
+    // The route can become routable (via the Ingress reflector) slightly before
+    // the just-restarted controller's RetryPolicy reflector finishes its initial
+    // sync, so re-drive the always-503 request inside the poll rather than
+    // asserting on a single attempt right after the route goes live.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!(
+                "retry annotation to resolve and retry at {retry_host} even with \
+                 gateway-api disabled (RetryPolicy CR store must be spawned \
+                 always-on, not gateway-api-gated)"
+            )
+        },
+        || async {
+            let _ = raw_status(proxy, &retry_host, "/status/503").await;
+            (retry_count(&h, &ns.name, "http-code").await > before).then_some(())
         },
     )
     .await?;

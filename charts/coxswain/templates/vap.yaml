@@ -283,18 +283,6 @@ spec:
         variables.ann['ingress.coxswain-labs.dev/load-balance'] +
         '" — must be one of: round_robin, least_conn, ewma, ip_hash, hash:uri, hash:source-ip, hash:header=<name>, hash:cookie=<name>'
 
-    - expression: >-
-        !('ingress.coxswain-labs.dev/retry-on' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/retry-on'].split(',').all(tok,
-          tok.trim() == '' ||
-          tok.trim() == 'connect-failure' ||
-          tok.trim() == 'timeout' ||
-          tok.trim() == '5xx')
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/retry-on: "' +
-        variables.ann['ingress.coxswain-labs.dev/retry-on'] +
-        '" — must be a comma-separated list of: connect-failure, timeout, 5xx'
-
     # ── URL annotation ────────────────────────────────────────────────────────
 
     - expression: >-

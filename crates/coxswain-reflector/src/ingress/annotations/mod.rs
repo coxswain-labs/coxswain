@@ -41,7 +41,7 @@ pub use traffic_policy::*;
 
 use coxswain_core::routing::{
     CircuitBreakerConfig, FilterAction, ForwardedForConfig, HeaderMod, LoadBalance, NormalizeLevel,
-    PathModifier, RateLimitConfig, RetryPolicyConfig, RouteTimeouts, SessionAffinity,
+    PathModifier, RateLimitConfig, RouteTimeouts, SessionAffinity,
 };
 use std::collections::BTreeMap;
 
@@ -104,8 +104,15 @@ pub(super) struct IngressAnnotations {
     /// Partial timeout overrides: the connect/read/send fields come from annotations;
     /// `request` and `backend_request` stay `None` (those come from HTTPRoute/GW API only).
     pub timeouts: RouteTimeouts,
-    /// Retry policy from `max-retries` + `retry-on`.
-    pub retries: RetryPolicyConfig,
+    /// `RetryPolicy` CR reference from `retry` (#551), in intermediate
+    /// (pre-resolved) `namespace/name` form. `None` when the annotation is
+    /// absent or malformed (WARN emitted). The reconciler resolves this into
+    /// the same
+    /// [`RetryPolicyConfig`][coxswain_core::routing::RetryPolicyConfig] the
+    /// HTTPRoute `ExtensionRef` filter produces (Gateway API parity, #551).
+    /// A missing CR fails **open** (no retries) — unlike the auth
+    /// annotations, a broken reference degrades gracefully.
+    pub retry: Option<auth::SecretRef>,
     /// Path rewrite from `rewrite-target` — emitted as a `FilterAction::UrlRewrite`.
     /// Holds the literal [`PathModifier::ReplaceFullPath`]; on a regex path the
     /// reconciler rebuilds it as [`PathModifier::RegexReplace`] against that path's
@@ -268,32 +275,17 @@ impl IngressAnnotations {
             d
         });
 
-        // ── Retries (GEP-1731-shaped: attempts / codes / backoff) ─────────────
-        // `retry-attempts` is the gate: absent ⇒ retries disabled. When set,
-        // connection/timeout retries apply implicitly and `retry-codes` selects which
-        // responses retry (absent ⇒ the safe [502,503,504] default). Ingress is
-        // HTTP-only, so there is no gRPC-code surface here.
-        let retries = match get(ann, RETRY_ATTEMPTS) {
-            None => RetryPolicyConfig::default(),
-            Some(v) => match parse_u32(v) {
-                None => {
-                    issue!(RETRY_ATTEMPTS, "invalid integer — retries disabled");
-                    RetryPolicyConfig::default()
-                }
-                Some(0) => RetryPolicyConfig::default(),
-                Some(attempts) => {
-                    let codes = get(ann, RETRY_CODES).map(parse_retry_codes);
-                    let backoff = get(ann, RETRY_BACKOFF).and_then(|v| {
-                        let d = parse_duration(v);
-                        if d.is_none() {
-                            issue!(RETRY_BACKOFF, "invalid duration — no backoff");
-                        }
-                        d
-                    });
-                    RetryPolicyConfig::for_http(attempts, backoff, codes)
-                }
-            },
-        };
+        // ── Retry CR reference (#551) ──────────────────────────────────────────
+        let retry = get(ann, traffic_policy::RETRY).and_then(|v| {
+            let r = auth::parse_secret_ref(v);
+            if r.is_none() {
+                issue!(
+                    traffic_policy::RETRY,
+                    "invalid retry — expected \"namespace/name\"; retries disabled"
+                );
+            }
+            r
+        });
 
         // ── Path rewrite ──────────────────────────────────────────────────────
         let rewrite =
@@ -575,7 +567,7 @@ impl IngressAnnotations {
                     read,
                     send,
                 },
-                retries,
+                retry,
                 rewrite,
                 use_regex,
                 request_headers,
@@ -738,7 +730,7 @@ mod tests {
     fn parse_returns_defaults_when_no_annotations() {
         let (a, _) = IngressAnnotations::parse(None, "default/test");
         assert!(a.timeouts.connect.is_none());
-        assert!(a.retries.is_disabled());
+        assert!(a.retry.is_none());
         assert!(a.rewrite.is_none());
     }
 
@@ -767,46 +759,29 @@ mod tests {
     }
 
     #[test]
-    fn parse_retries_full() {
-        let m = ann(&[
-            (RETRY_ATTEMPTS, "3"),
-            (RETRY_CODES, "500,503"),
-            (RETRY_BACKOFF, "100ms"),
-        ]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert_eq!(a.retries.attempts, 3);
-        assert_eq!(&*a.retries.http_codes, &[500, 503]);
-        assert_eq!(
-            a.retries.backoff,
-            Some(std::time::Duration::from_millis(100))
-        );
-        // Ingress is HTTP-only: no gRPC codes.
-        assert!(a.retries.grpc_codes.is_empty());
+    fn parse_retry_valid_ref() {
+        let m = ann(&[(traffic_policy::RETRY, "retry-ns/my-retry")]);
+        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
+        let r = a.retry.expect("retry must parse");
+        assert_eq!(r.namespace, "retry-ns");
+        assert_eq!(r.name, "my-retry");
+        assert!(diag.is_empty());
     }
 
     #[test]
-    fn parse_retries_attempts_only_defaults_codes() {
-        let m = ann(&[(RETRY_ATTEMPTS, "2")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert_eq!(a.retries.attempts, 2);
-        // Omitted codes ⇒ the safe [502,503,504] default.
-        assert_eq!(&*a.retries.http_codes, &[502, 503, 504]);
-        assert!(a.retries.backoff.is_none());
+    fn parse_retry_absent_is_none() {
+        let (a, diag) = IngressAnnotations::parse(None, "default/test");
+        assert!(a.retry.is_none());
+        assert!(diag.is_empty());
     }
 
     #[test]
-    fn parse_retries_absent_attempts_disables() {
-        // codes/backoff without attempts ⇒ disabled (attempts is the gate).
-        let m = ann(&[(RETRY_CODES, "503"), (RETRY_BACKOFF, "1s")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert!(a.retries.is_disabled());
-    }
-
-    #[test]
-    fn parse_retries_zero_attempts_disables() {
-        let m = ann(&[(RETRY_ATTEMPTS, "0"), (RETRY_CODES, "503")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert!(a.retries.is_disabled());
+    fn parse_retry_malformed_warns_and_disables() {
+        let m = ann(&[(traffic_policy::RETRY, "no-slash-here")]);
+        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
+        assert!(a.retry.is_none());
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, traffic_policy::RETRY);
     }
 
     #[test]

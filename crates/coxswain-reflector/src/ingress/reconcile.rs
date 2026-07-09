@@ -8,11 +8,11 @@ use super::ports::IngressPorts;
 use super::reconcile_helpers::{
     build_ingress_backend_group, prepend_ssl_redirect, resolve_basic_auth_config,
     resolve_compression_config, resolve_ext_auth_config, resolve_host_builder,
-    resolve_jwt_auth_config, resolve_mirror_filter,
+    resolve_jwt_auth_config, resolve_mirror_filter, resolve_retry_config,
 };
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
-use coxswain_core::crd::{Compression, CoxswainExternalAuth};
+use coxswain_core::crd::{Compression, CoxswainExternalAuth, RetryPolicy};
 use coxswain_core::routing::{
     BackendGroup, FilterAction, IngressAuthConfig, IngressRoutingTableBuilder, PathModifier,
     RouteEntry, compile_path_regex,
@@ -61,12 +61,13 @@ impl<'a> IngressClassContext<'a> {
 /// the `CoxswainExternalAuth` CR store (`ext-auth`, #549), the `JwtAuth` CR
 /// store and JWKS cache (`auth-jwt`, #441), the backend `ReferenceGrant` set
 /// (needed to resolve a `CoxswainExternalAuth` CR's cross-namespace
-/// `backendRef`), and the `Compression` CR store (`compression`, #550) so
-/// `reconcile` stays under the workspace argument-count limit. Not
-/// auth-specific despite the auth-heavy history — every Ingress annotation
-/// that converges to a `namespace/name` CRD reference (#548) lands here;
-/// future workstreams (retry #551, rate-limit #552, ip-access-control #553,
-/// backend-policy #554) extend this struct rather than `reconcile`'s arity.
+/// `backendRef`), the `Compression` CR store (`compression`, #550), and the
+/// `RetryPolicy` CR store (`retry`, #551) so `reconcile` stays under the
+/// workspace argument-count limit. Not auth-specific despite the auth-heavy
+/// history — every Ingress annotation that converges to a `namespace/name`
+/// CRD reference (#548) lands here; future workstreams (rate-limit #552,
+/// ip-access-control #553, backend-policy #554) extend this struct rather
+/// than `reconcile`'s arity.
 #[non_exhaustive]
 pub struct IngressExtensionStores<'a> {
     pub(crate) auth_secrets: &'a reflector::Store<Secret>,
@@ -75,6 +76,7 @@ pub struct IngressExtensionStores<'a> {
     pub(crate) jwks_cache: &'a crate::jwks::SharedJwksCache,
     pub(crate) backend_grants: &'a crate::reference_grants::GrantSet,
     pub(crate) compressions: &'a reflector::Store<Compression>,
+    pub(crate) retry_policies: &'a reflector::Store<RetryPolicy>,
 }
 
 impl<'a> IngressExtensionStores<'a> {
@@ -87,6 +89,7 @@ impl<'a> IngressExtensionStores<'a> {
         jwks_cache: &'a crate::jwks::SharedJwksCache,
         backend_grants: &'a crate::reference_grants::GrantSet,
         compressions: &'a reflector::Store<Compression>,
+        retry_policies: &'a reflector::Store<RetryPolicy>,
     ) -> Self {
         Self {
             auth_secrets,
@@ -95,6 +98,7 @@ impl<'a> IngressExtensionStores<'a> {
             jwks_cache,
             backend_grants,
             compressions,
+            retry_policies,
         }
     }
 }
@@ -273,6 +277,12 @@ impl IngressReconciler {
             auth_stores.compressions,
             &route_id,
         );
+        // Build the retry policy once and share it across every backend group.
+        // Resolved via the same `resolve_spec` the HTTPRoute ExtensionRef path uses
+        // (#551); a missing RetryPolicy CR fails open (no retries), unlike the auth
+        // resolvers above.
+        let retries =
+            resolve_retry_config(ann.retry.as_ref(), auth_stores.retry_policies, &route_id);
         // Build the trusted-proxy forwarded-IP config once and share one Arc across every path.
         let forwarded_for = ann.forwarded_for.clone().map(Arc::new);
         // Build the circuit-breaker config once and share one Arc across every route entry.
@@ -360,6 +370,7 @@ impl IngressReconciler {
                     resolved.addrs,
                     resolved.app_protocol,
                     &ann,
+                    &retries,
                 ));
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
@@ -520,6 +531,7 @@ impl IngressReconciler {
                             resolved.addrs,
                             resolved.app_protocol,
                             &ann,
+                            &retries,
                         ));
                         let default_metric_route_id: Arc<str> =
                             Arc::from(format!("ingress/{ns}/{ingress_name}:default"));
@@ -1679,6 +1691,7 @@ mod tests {
                 &empty_jwks_cache(),
                 &empty_backend_grants(),
                 &empty_compression_store(),
+                &empty_retry_policy_store(),
             ),
         );
         assert!(
@@ -1720,6 +1733,7 @@ mod tests {
                 &empty_jwks_cache(),
                 &empty_backend_grants(),
                 &empty_compression_store(),
+                &empty_retry_policy_store(),
             ),
         );
         assert!(
@@ -1969,23 +1983,46 @@ mod tests {
     }
 
     #[test]
-    fn annotation_retries_stored_on_backend_group() {
-        use crate::ingress::annotations::{RETRY_ATTEMPTS, RETRY_BACKOFF, RETRY_CODES};
+    fn annotation_retry_ref_resolves_to_backend_group_policy() {
+        use crate::ingress::annotations::traffic_policy::RETRY;
+        use coxswain_core::crd::RetryPolicy;
+
+        let yaml = "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: RetryPolicy\n\
+             metadata:\n  name: r\n  namespace: default\n\
+             spec:\n  attempts: 3\n  codes: [502, 503]\n  backoff: 100ms\n";
+        let cr: RetryPolicy =
+            serde_yaml::from_str(yaml).unwrap_or_else(|e| panic!("valid RetryPolicy: {e}"));
+        let retry_policies = make_retry_policy_store(vec![cr]);
+
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
             "/",
             "svc",
-            &[
-                (RETRY_ATTEMPTS, "3"),
-                (RETRY_CODES, "502,503"),
-                (RETRY_BACKOFF, "100ms"),
-            ],
+            &[(RETRY, "default/r")],
         );
         let svcs = empty_svc_store();
         let mut builder = IngressRoutingTableBuilder::new();
-        reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
+        let no_class_defaults = HashMap::new();
+        let _ = IngressReconciler::reconcile(
+            &ing,
+            &store,
+            &svcs,
+            &IngressClassContext::new(&owned(&["coxswain"]), None, &no_class_defaults),
+            IngressPorts::new(Some(80), None),
+            &mut builder,
+            &IngressExtensionStores::new(
+                &empty_secret_store(),
+                &empty_external_auth_store(),
+                &empty_jwt_auth_store(),
+                &empty_jwks_cache(),
+                &empty_backend_grants(),
+                &empty_compression_store(),
+                &retry_policies,
+            ),
+        );
         let table = builder.build().unwrap();
         let ctx = RequestContext::default();
         let group = table
@@ -2274,6 +2311,7 @@ mod tests {
                 &empty_jwks_cache(),
                 &empty_backend_grants(),
                 &empty_compression_store(),
+                &empty_retry_policy_store(),
             ),
         );
         let table = builder.build().unwrap();

@@ -1125,7 +1125,6 @@ struct GatewayApiStoreWriters {
     policies: reflector::store::Writer<BackendTlsPolicy>,
     configmaps: reflector::store::Writer<ConfigMap>,
     rate_limits: reflector::store::Writer<RateLimit>,
-    retry_policies: reflector::store::Writer<RetryPolicy>,
     path_rewrites: reflector::store::Writer<PathRewriteRegex>,
     ip_access: reflector::store::Writer<IpAccessControl>,
     basic_auths: reflector::store::Writer<BasicAuth>,
@@ -1160,7 +1159,6 @@ fn add_gateway_api_reflectors(
         policies,
         configmaps,
         rate_limits,
-        retry_policies,
         path_rewrites,
         ip_access,
         basic_auths,
@@ -1244,14 +1242,6 @@ fn add_gateway_api_reflectors(
         watcher::Config::default(),
         ReflectorEffects::new(notify, health, "rate_limit", metrics),
         "RateLimit",
-    );
-    spawn_reflector(
-        set,
-        retry_policies,
-        scoped_api::<RetryPolicy>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "retry_policy", metrics),
-        "RetryPolicy",
     );
     spawn_reflector(
         set,
@@ -1527,6 +1517,16 @@ async fn spawn_tasks(
         ReflectorEffects::new(&notify, &controller_health, "compression", metrics),
         "Compression",
     );
+    // Always-on (not gated by `enable_gateway_api`): same fix, same rationale,
+    // for the Ingress `retry` annotation (#551) and the `RetryPolicy` CR store.
+    spawn_reflector(
+        &mut set,
+        retry_policy_writer,
+        scoped_api::<RetryPolicy>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(&notify, &controller_health, "retry_policy", metrics),
+        "RetryPolicy",
+    );
 
     // --- Ingress reflectors (gated by --disable-ingress) ---
     //
@@ -1598,7 +1598,6 @@ async fn spawn_tasks(
             policies: policy_writer,
             configmaps: configmap_writer,
             rate_limits: rate_limit_writer,
-            retry_policies: retry_policy_writer,
             path_rewrites: path_rewrite_writer,
             ip_access: ip_access_writer,
             basic_auths: basic_auth_writer,

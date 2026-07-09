@@ -2,12 +2,12 @@
 
 Coxswain retries failed upstream attempts against another endpoint in the same backend group. Retrying protects clients from transient upstream failures — a refused connection, a connect timeout, or a retriable response from one pod — without surfacing the error.
 
-Two bindings are supported:
+Both bindings reference the same `RetryPolicy` custom resource, resolved through the identical spec→config translation — parity between the two surfaces is guaranteed by construction, not by convention:
 
 | Binding | When to use |
 |---------|-------------|
-| [Ingress annotations](#ingress-annotations) | Per-Ingress (HTTP only), attached to existing annotation-based config |
-| [Gateway API `ExtensionRef`](#gateway-api-extensionref) | Per-`HTTPRoute` / `GRPCRoute` rule, via a `RetryPolicy` custom resource |
+| [Ingress annotation](#ingress-annotation) | Per-Ingress (HTTP only): `ingress.coxswain-labs.dev/retry: "namespace/name"` |
+| [Gateway API `ExtensionRef`](#gateway-api-extensionref) | Per-`HTTPRoute` / `GRPCRoute` rule, via the same `RetryPolicy` custom resource |
 
 The configuration model mirrors Gateway API [GEP-1731](https://gateway-api.sigs.k8s.io/geps/gep-1731/) (`attempts` / `backoff` / `codes`) so that, once GEP-1731 graduates to the Standard channel, the HTTP surface can be moved to the native `HTTPRoute.spec.rules[].retry` field with no behavioural change. gRPC retry has no GEP-1731 equivalent and stays on the `RetryPolicy` CR permanently.
 
@@ -32,19 +32,35 @@ Retries fire when the upstream response status is in the code set. When omitted,
 
 When omitted, `grpcCodes` defaults to **`[14]`** (`UNAVAILABLE`). A trailers-only `UNAVAILABLE` implies the RPC never executed, so retrying is safe even without idempotency metadata. `DEADLINE_EXCEEDED` (4) and `RESOURCE_EXHAUSTED` (8) are excluded from the default — retrying them compounds latency or worsens overload. An explicit empty set opts out.
 
-## Ingress annotations
+## Ingress annotation
 
-Ingress is HTTP-only. Attach retries to every path rule of an Ingress:
+Ingress is HTTP-only. Reference a `RetryPolicy` CR — the same one an `HTTPRoute` `ExtensionRef` filter would point at — from the `retry` annotation:
 
 ```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RetryPolicy
 metadata:
+  name: resilient
+  namespace: shop
+spec:
+  attempts: 2
+  codes: [503, 504]   # optional; default [502, 503, 504]
+  backoff: 100ms      # optional
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  namespace: shop
   annotations:
-    ingress.coxswain-labs.dev/retry-attempts: "2"
-    ingress.coxswain-labs.dev/retry-codes: "503,504"   # optional; default 502,503,504
-    ingress.coxswain-labs.dev/retry-backoff: "100ms"   # optional
+    ingress.coxswain-labs.dev/retry: "shop/resilient"
 ```
 
-See the [Ingress annotations reference](ingress-annotations.md#retries) for the full annotation semantics.
+**Fail-open**: if the referenced `RetryPolicy` CR is missing, the route serves with retrying disabled (a WARN is logged) rather than failing the route — the same posture as the Gateway API binding below.
+
+!!! note "Migration from the inline retry-attempts/retry-codes/retry-backoff annotations (breaking)"
+    Earlier releases exposed three inline annotations — `retry-attempts`, `retry-codes`, `retry-backoff` — duplicating the `RetryPolicy` CRD schema. These are removed; move each Ingress's values into a `RetryPolicy` CR and point `retry` at it.
+
+See the [Ingress annotations reference](ingress-annotations.md#retry) for the full annotation semantics.
 
 ## Gateway API `ExtensionRef`
 

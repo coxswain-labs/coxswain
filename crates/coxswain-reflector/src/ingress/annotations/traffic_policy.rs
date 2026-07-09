@@ -1,9 +1,9 @@
 //! Traffic-policy annotation constants and low-level parse helpers.
 //!
-//! Covers: connection/read/send timeouts and retry budget + conditions. All
-//! helpers emit a structured `WARN` on invalid input and return `None` (or the
-//! empty default) so the affected annotation is treated as absent — the Ingress
-//! keeps serving.
+//! Covers: connection/read/send timeouts, the `retry` `RetryPolicy` reference,
+//! and the `compression` `Compression` reference. All helpers emit a structured
+//! `WARN` on invalid input and return `None` (or the empty default) so the
+//! affected annotation is treated as absent — the Ingress keeps serving.
 
 use coxswain_core::routing::{LoadBalance, LoadBalanceParseError};
 
@@ -16,22 +16,19 @@ pub const READ_TIMEOUT: &str = "ingress.coxswain-labs.dev/read-timeout";
 /// Upstream write (request send) timeout — Go `time.ParseDuration` string, e.g. `"60s"`.
 pub const SEND_TIMEOUT: &str = "ingress.coxswain-labs.dev/send-timeout";
 
-// ── Retry annotation keys ─────────────────────────────────────────────────────
-//
-// GEP-1731-shaped (`attempts` / `backoff` / `codes`) so the vocabulary matches the
-// Gateway API `RetryPolicy` CRD and the future native `HTTPRoute.spec.rules[].retry`
-// field. `retry-attempts` is the gate: when absent, retries are disabled regardless
-// of the other keys. Connection failures and connect-timeouts are retried implicitly
-// whenever `retry-attempts >= 1` (the exact-native-mirror model).
+// ── Retry annotation key ──────────────────────────────────────────────────────
 
-/// Maximum number of retries after the initial attempt — unsigned decimal integer.
-/// The gate: absent ⇒ retries disabled; `0` ⇒ disabled.
-pub const RETRY_ATTEMPTS: &str = "ingress.coxswain-labs.dev/retry-attempts";
-/// Comma-separated HTTP status codes to retry on (e.g. `"502,503,504"`).
-/// Absent (with `retry-attempts` set) defaults to `502,503,504`.
-pub const RETRY_CODES: &str = "ingress.coxswain-labs.dev/retry-codes";
-/// Minimum delay before a retried attempt — Go `time.ParseDuration` string, e.g. `"100ms"`.
-pub const RETRY_BACKOFF: &str = "ingress.coxswain-labs.dev/retry-backoff";
+/// Reference to a `RetryPolicy` CR in `namespace/name` form, e.g.
+/// `"default/my-retry"` (#551). Resolves to the same
+/// [`RetryPolicyConfig`][coxswain_core::routing::RetryPolicyConfig] the
+/// HTTPRoute `ExtensionRef` filter produces (Gateway API parity). Replaces
+/// the former inline `retry-attempts` / `retry-codes` / `retry-backoff`
+/// annotation cluster, whose knobs now live on the `RetryPolicy` CRD spec. A
+/// missing CR fails **open** (no retries) — unlike the auth annotation
+/// family, a broken retry reference degrades gracefully rather than blocking
+/// traffic. Ingress is HTTP-only, so `grpcCodes` on the referenced CR is
+/// ignored (meaningful only on `GRPCRoute`).
+pub const RETRY: &str = "ingress.coxswain-labs.dev/retry";
 
 // ── Max-body-size annotation key ─────────────────────────────────────────────
 
@@ -136,25 +133,6 @@ pub fn parse_u32(s: &str) -> Option<u32> {
         tracing::warn!(value = s, "invalid integer annotation value");
         None
     })
-}
-
-/// Parse the `retry-codes` annotation — a comma-separated list of HTTP status codes.
-///
-/// Non-numeric or out-of-range (`> u16::MAX`) tokens emit a `WARN` and are ignored;
-/// the rest are collected in input order (the resolver sorts/dedupes). An entirely
-/// blank value yields an empty list (explicit opt-out of response-code retries).
-#[must_use]
-pub fn parse_retry_codes(s: &str) -> Vec<u16> {
-    s.split(',')
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .filter_map(|token| {
-            token.parse::<u16>().ok().or_else(|| {
-                tracing::warn!(token, "invalid retry-codes status code — ignoring");
-                None
-            })
-        })
-        .collect()
 }
 
 /// Parse a byte-size annotation value: a bare byte count (`"10485760"`) or a value
@@ -533,35 +511,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_retry_codes_multiple() {
-        // References CONNECT_TIMEOUT via test constants to satisfy annotation-coverage gate.
+    fn retry_const_referenced() {
+        // References CONNECT_TIMEOUT/READ_TIMEOUT/SEND_TIMEOUT/RETRY via test
+        // constants to satisfy the annotation-coverage gate. Actual `namespace/name`
+        // resolution is exercised in `annotations::mod::tests` (parse) and
+        // `reconcile_helpers::tests` (resolve, via `resolve_retry_config`) — the
+        // const has no standalone parser left in this file.
         let _ = CONNECT_TIMEOUT;
         let _ = READ_TIMEOUT;
         let _ = SEND_TIMEOUT;
-        let _ = RETRY_ATTEMPTS;
-        let _ = RETRY_BACKOFF;
-
-        assert_eq!(parse_retry_codes("502,503,504"), vec![502, 503, 504]);
-    }
-
-    #[test]
-    fn parse_retry_codes_trims_and_skips_blanks() {
-        let _ = RETRY_CODES;
-        assert_eq!(parse_retry_codes(" 503 , 504 "), vec![503, 504]);
-    }
-
-    #[test]
-    fn parse_retry_codes_empty() {
-        assert!(parse_retry_codes("").is_empty());
-        assert!(parse_retry_codes("   ").is_empty());
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_retry_codes_invalid_token_warns() {
-        let r = parse_retry_codes("503,bogus");
-        assert_eq!(r, vec![503]);
-        assert!(logs_contain("invalid retry-codes status code"));
+        let _ = RETRY;
     }
 
     #[test]
