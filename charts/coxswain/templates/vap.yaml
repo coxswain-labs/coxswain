@@ -121,22 +121,6 @@ spec:
         '" — must be "true" or "false"'
 
     - expression: >-
-        !('ingress.coxswain-labs.dev/compression-gzip' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/compression-gzip'].matches('^(?i)(true|false)$')
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/compression-gzip: "' +
-        variables.ann['ingress.coxswain-labs.dev/compression-gzip'] +
-        '" — must be "true" or "false"'
-
-    - expression: >-
-        !('ingress.coxswain-labs.dev/compression-brotli' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/compression-brotli'].matches('^(?i)(true|false)$')
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/compression-brotli: "' +
-        variables.ann['ingress.coxswain-labs.dev/compression-brotli'] +
-        '" — must be "true" or "false"'
-
-    - expression: >-
         !('ingress.coxswain-labs.dev/trust-forwarded-for' in variables.ann) ||
         variables.ann['ingress.coxswain-labs.dev/trust-forwarded-for'].matches(
           '^(?i)(true|false)$')
@@ -212,16 +196,6 @@ spec:
         '" — must be a positive integer >= 1 (e.g. "10")'
 
     - expression: >-
-        !('ingress.coxswain-labs.dev/compression-level' in variables.ann) ||
-        (variables.ann['ingress.coxswain-labs.dev/compression-level'].matches('^[0-9]+$') &&
-         int(variables.ann['ingress.coxswain-labs.dev/compression-level']) >= 1 &&
-         int(variables.ann['ingress.coxswain-labs.dev/compression-level']) <= 9)
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/compression-level: "' +
-        variables.ann['ingress.coxswain-labs.dev/compression-level'] +
-        '" — must be an integer in 1-9'
-
-    - expression: >-
         !('ingress.coxswain-labs.dev/auth-tls-verify-depth' in variables.ann) ||
         (variables.ann['ingress.coxswain-labs.dev/auth-tls-verify-depth'].matches('^[0-9]+$') &&
          int(variables.ann['ingress.coxswain-labs.dev/auth-tls-verify-depth']) >= 1)
@@ -249,15 +223,6 @@ spec:
         'ingress.coxswain-labs.dev/max-body-size: "' +
         variables.ann['ingress.coxswain-labs.dev/max-body-size'] +
         '" — must be a byte count or size string (e.g. "8m", "512k", "10485760")'
-
-    - expression: >-
-        !('ingress.coxswain-labs.dev/compression-min-size' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/compression-min-size'].matches(
-          '^[0-9]+[kmgKMG]?$')
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/compression-min-size: "' +
-        variables.ann['ingress.coxswain-labs.dev/compression-min-size'] +
-        '" — must be a byte count or size string (e.g. "1024", "4k")'
 
     # ── Enum annotations ──────────────────────────────────────────────────────
 

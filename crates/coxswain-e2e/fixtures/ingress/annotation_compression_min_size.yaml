@@ -1,10 +1,27 @@
+# compression fixture (#550 sad path): the annotation names a Compression CR
+# by "namespace/name" — Ingress parity with the Gateway API ExtensionRef path
+# (crates/coxswain-e2e/fixtures/gateway_api/compression_extensionref.yaml).
+#
+# The Compression CR enables gzip with a 1 MiB minSize threshold — well above
+# the small echo JSON body, so the proxy must pass the response through
+# uncompressed.
+#
+# Host: compression-minsize.TESTNS.local / -> echo-a:3000.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: Compression
+metadata:
+  name: compression-min-size
+spec:
+  gzip: true
+  minSize: 1048576
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: compression-min-size-ingress
   annotations:
-    ingress.coxswain-labs.dev/compression-gzip: "true"
-    ingress.coxswain-labs.dev/compression-min-size: "1048576"
+    ingress.coxswain-labs.dev/compression: "${TESTNS}/compression-min-size"
 spec:
   ingressClassName: coxswain
   rules:

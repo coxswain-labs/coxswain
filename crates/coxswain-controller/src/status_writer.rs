@@ -138,10 +138,13 @@ pub fn spawn_status_writer(
     // was made always-on regardless of `enable_ingress`. Registering it only
     // when Ingress is enabled left it spawned-but-unregistered with Ingress
     // disabled, panicking the first time the reflector reached `InitDone`.
-    // `jwt_auth` is the same fix on the opposite axis: the Ingress `auth-jwt`
-    // annotation (#441) consumes the same `JwtAuth` CR store as the
-    // Gateway-API `JwtAuth` ExtensionRef, so its reflector is always-on
-    // regardless of `enable_gateway_api`.
+    // `jwt_auth`, `coxswain_external_auth`, and `compression` are the same fix
+    // on the opposite axis: the Ingress `auth-jwt` (#441), `ext-auth` (#549),
+    // and `compression` (#550) annotations each consume the same CR store as
+    // their Gateway-API `ExtensionRef` counterpart, so those reflectors are
+    // always-on regardless of `enable_gateway_api` — their check names must
+    // live here too, or `SubsystemHandle::set` panics the first time the
+    // reflector reaches `InitDone` with Gateway API disabled.
     const ALWAYS_ON_CHECKS: &[&str] = &[
         "endpoint_slice",
         "secret",
@@ -150,6 +153,8 @@ pub fn spawn_status_writer(
         "routing_table_built",
         "auth_secret",
         "jwt_auth",
+        "coxswain_external_auth",
+        "compression",
     ];
     // Per-surface checks registered only when the surface is enabled;
     // disabled surfaces never mark a check ready so registering them would
@@ -179,9 +184,7 @@ pub fn spawn_status_writer(
         "path_rewrite_regex",
         "ip_access_control",
         "basic_auth",
-        "coxswain_external_auth",
         "request_size_limit",
-        "compression",
     ];
 
     let mut controller_checks: Vec<&str> = ALWAYS_ON_CHECKS.to_vec();

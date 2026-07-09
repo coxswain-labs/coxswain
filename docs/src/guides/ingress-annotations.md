@@ -47,11 +47,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/ext-auth` | `namespace/name` | _none_ | `"my-ns/my-extauth"` |
 | `ingress.coxswain-labs.dev/auth-basic-secret` | `namespace/name` | _none_ | `"my-ns/my-htpasswd"` |
 | `ingress.coxswain-labs.dev/auth-jwt` | `namespace/name` | _none_ | `"my-ns/my-jwt"` |
-| `ingress.coxswain-labs.dev/compression-gzip` | boolean | `false` | `"true"` |
-| `ingress.coxswain-labs.dev/compression-brotli` | boolean | `false` | `"true"` |
-| `ingress.coxswain-labs.dev/compression-level` | integer 1–9 | `6` | `"5"` |
-| `ingress.coxswain-labs.dev/compression-types` | csv of MIME types | see below | `"text/html,application/json"` |
-| `ingress.coxswain-labs.dev/compression-min-size` | size | `1024` | `"4k"` |
+| `ingress.coxswain-labs.dev/compression` | `namespace/name` | _none_ | `"my-ns/my-compression"` |
 | `ingress.coxswain-labs.dev/auth-tls-secret` | `namespace/name` | _none_ | `"my-ns/my-ca"` |
 | `ingress.coxswain-labs.dev/auth-tls-verify-depth` | integer | `1` | `"2"` |
 | `ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream` | boolean | `false` | `"true"` |
@@ -958,76 +954,80 @@ metadata:
 
 **Global pool size**: the total number of idle upstream connections across all routes is bounded by `--proxy-upstream-keepalive-pool-size` (default: 128). Set it via the Helm value `proxy.shared.upstreamKeepalivePoolSize` or the env var `COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE`. Raise it for deployments with many distinct upstream hosts/ports; lower it to reduce file-descriptor usage.
 
-## `compression-*`
+## `compression`
 
-Opt-in, per-Ingress on-the-fly response compression. The proxy compresses upstream responses before
-forwarding them to the client, negotiated against the client's `Accept-Encoding` header. Nothing is
-compressed unless at least one codec is explicitly enabled.
+Opt-in, per-Ingress on-the-fly response compression — the Ingress surface for the
+[`Compression` CRD](gateway-api.md#response-compression), same idiom as `ext-auth`/`auth-jwt`. Value
+is `namespace/name` of a `Compression` resource; both surfaces resolve the same CR to the same
+runtime config, so one `Compression` can back an Ingress and an HTTPRoute `ExtensionRef` filter
+identically.
 
 ```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: Compression
 metadata:
+  name: default-compression
+  namespace: my-app
+spec:
+  gzip: true
+  brotli: true
+  level: 6
+  minSize: 1024
+  types:
+    - text/html
+    - text/plain
+    - text/css
+    - application/json
+    - application/javascript
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  namespace: my-app
   annotations:
-    ingress.coxswain-labs.dev/compression-gzip: "true"
-    ingress.coxswain-labs.dev/compression-brotli: "true"
-    ingress.coxswain-labs.dev/compression-level: "6"
-    ingress.coxswain-labs.dev/compression-types: "text/html,text/plain,text/css,application/json,application/javascript"
-    ingress.coxswain-labs.dev/compression-min-size: "1024"
+    ingress.coxswain-labs.dev/compression: "my-app/default-compression"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-api
+                port:
+                  number: 8080
 ```
 
-| Annotation | Type | Default |
-|---|---|---|
-| `compression-gzip` | boolean | `false` |
-| `compression-brotli` | boolean | `false` |
-| `compression-level` | integer, 1–9 | `6` |
-| `compression-types` | CSV of MIME types | `text/html,text/plain,text/css,application/json,application/javascript` |
-| `compression-min-size` | byte count (suffixes `k`/`m`/`g` accepted) | `1024` |
+At least one of `gzip` / `brotli` must be `true` for the CR to have any effect; when both are `false`
+(the default) it is a no-op. Brotli is preferred over gzip when both are enabled and the client
+advertises `br` in `Accept-Encoding`. `level` (1–9, default `6`), `minSize` (bytes, default `1024`),
+and `types` (default: `text/html`, `text/plain`, `text/css`, `application/json`,
+`application/javascript`) are documented on the [`Compression` CRD reference](gateway-api.md#response-compression).
 
-### `compression-gzip` / `compression-brotli`
+A missing `Compression` CR fails **open** (no compression) — unlike the auth annotations
+(`ext-auth`/`auth-basic-secret`/`auth-jwt`), which fail closed with **503**. A broken or stale
+`compression` reference degrades the route to uncompressed responses rather than blocking traffic.
 
-Enable the respective codec. Both are `false` by default — no compression is applied to any Ingress
-unless at least one is set to `"true"`. Setting both to `"true"` enables dual-codec support: brotli
-is preferred when the client advertises `br` in `Accept-Encoding`; gzip is used otherwise.
-
-### `compression-level`
-
-Compression effort on a 1–9 scale (1 = fastest/least compression, 9 = slowest/best compression).
-The same level is applied to both gzip and brotli. Values outside the 1–9 range emit a warning and
-fall back to `6`. The default of `6` is a good balance for most workloads.
-
-### `compression-types`
-
-Comma-separated list of MIME types to compress. Only responses whose `Content-Type` header matches
-an entry in this list (the media type before any `;parameters`) are compressed. Matching is
-case-insensitive. The default list covers the most common compressible types:
-
-```
-text/html, text/plain, text/css, application/json, application/javascript
-```
-
-An empty or entirely-invalid list falls back to the default. Responses with binary types such as
-`image/png`, `video/mp4`, or `application/octet-stream` are passed through unmodified regardless of
-this setting.
-
-### `compression-min-size`
-
-Minimum response body size, in bytes, before compression is attempted. Responses whose
-`Content-Length` is present and smaller than this threshold are passed through without compression.
-When `Content-Length` is absent (chunked transfer encoding), the response is always eligible —
-the proxy cannot know the full size without buffering.
-
-The default is `1024` bytes (1 KiB). The value accepts the `k`/`m`/`g` suffix for convenience
-(`"4k"` = 4096, `"1m"` = 1048576). Invalid values warn and fall back to `1024`.
+!!! note "Migration from the inline `compression-*` annotations (breaking)"
+    Earlier releases exposed five inline annotations — `compression-gzip`, `compression-brotli`,
+    `compression-level`, `compression-types`, `compression-min-size` — duplicating the `Compression`
+    CRD schema. These are removed; move each Ingress's values into a `Compression` CR and point
+    `compression` at it.
 
 ### Behaviour
 
 Compression is applied only when **all** of the following hold:
 
-1. At least one codec (`compression-gzip` or `compression-brotli`) is enabled.
+1. At least one codec (`gzip` or `brotli`) is enabled on the referenced CR.
 2. The client advertises the codec in `Accept-Encoding`.
 3. The upstream response does not already have a `Content-Encoding` header — pre-compressed
    responses (e.g. assets served pre-compressed by the upstream) are forwarded unchanged.
-4. The response `Content-Type` (before `;`) matches an entry in `compression-types`.
-5. Either `Content-Length` is absent, or its value is ≥ `compression-min-size`.
+4. The response `Content-Type` (before `;`) matches an entry in the CR's `types`.
+5. Either `Content-Length` is absent, or its value is ≥ the CR's `minSize`.
 6. The response status is a normal body-bearing code (1xx, 204, and 304 responses are passed through).
 
 When compression fires, the proxy:

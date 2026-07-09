@@ -1,11 +1,27 @@
+# compression fixture (#550): the annotation names a Compression CR by
+# "namespace/name" — Ingress parity with the Gateway API ExtensionRef path
+# (crates/coxswain-e2e/fixtures/gateway_api/compression_extensionref.yaml).
+#
+# The Compression CR enables both gzip and brotli, minSize: 1. Used to
+# verify brotli is preferred when the client advertises both codecs.
+#
+# Host: compression-brotli.TESTNS.local / -> echo-a:3000.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: Compression
+metadata:
+  name: compression-brotli
+spec:
+  gzip: true
+  brotli: true
+  minSize: 1
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: compression-brotli-ingress
   annotations:
-    ingress.coxswain-labs.dev/compression-gzip: "true"
-    ingress.coxswain-labs.dev/compression-brotli: "true"
-    ingress.coxswain-labs.dev/compression-min-size: "1"
+    ingress.coxswain-labs.dev/compression: "${TESTNS}/compression-brotli"
 spec:
   ingressClassName: coxswain
   rules:

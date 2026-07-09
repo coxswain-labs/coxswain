@@ -40,9 +40,8 @@ pub use session::*;
 pub use traffic_policy::*;
 
 use coxswain_core::routing::{
-    CircuitBreakerConfig, CompressionConfig, FilterAction, ForwardedForConfig, HeaderMod,
-    LoadBalance, NormalizeLevel, PathModifier, RateLimitConfig, RetryPolicyConfig, RouteTimeouts,
-    SessionAffinity,
+    CircuitBreakerConfig, FilterAction, ForwardedForConfig, HeaderMod, LoadBalance, NormalizeLevel,
+    PathModifier, RateLimitConfig, RetryPolicyConfig, RouteTimeouts, SessionAffinity,
 };
 use std::collections::BTreeMap;
 
@@ -183,9 +182,15 @@ pub(super) struct IngressAnnotations {
     /// Pingora's built-in behaviour. Applied in the proxy via
     /// `HttpPeer.options.idle_timeout`.
     pub keepalive_timeout: Option<std::time::Duration>,
-    /// Response compression config from the `compression-*` annotations (#270).
-    /// `None` when neither `compression-gzip` nor `compression-brotli` is `"true"`.
-    pub compression: Option<CompressionConfig>,
+    /// `Compression` CR reference from `compression` (#550), in intermediate
+    /// (pre-resolved) `namespace/name` form. `None` when the annotation is
+    /// absent or malformed (WARN emitted). The reconciler resolves this into
+    /// the same
+    /// [`CompressionConfig`][coxswain_core::routing::CompressionConfig] the
+    /// HTTPRoute `ExtensionRef` filter produces (Gateway API parity, #550).
+    /// A missing CR fails **open** (no compression) — unlike the auth
+    /// annotations, a broken reference degrades gracefully.
+    pub compression: Option<auth::SecretRef>,
     /// Trusted-proxy forwarded-IP config from the `trust-forwarded-for` family (#271).
     /// `None` when `trust-forwarded-for` is absent or `"false"`.
     pub forwarded_for: Option<ForwardedForConfig>,
@@ -503,8 +508,17 @@ impl IngressAnnotations {
             d
         });
 
-        // ── Response compression (#270) ───────────────────────────────────────
-        let compression = traffic_policy::parse_compression(ann, route_id, &mut diag);
+        // ── Compression CR reference (#550) ───────────────────────────────────
+        let compression = get(ann, traffic_policy::COMPRESSION).and_then(|v| {
+            let r = auth::parse_secret_ref(v);
+            if r.is_none() {
+                issue!(
+                    traffic_policy::COMPRESSION,
+                    "invalid compression — expected \"namespace/name\"; compression disabled"
+                );
+            }
+            r
+        });
 
         // ── Trusted-proxy forwarded-IP headers (#271) ─────────────────────────
         let forwarded_for = edge_access::parse_forwarded_for(ann, route_id, &mut diag);
@@ -1199,5 +1213,33 @@ mod tests {
         assert!(a.auth_jwt.is_none());
         assert_eq!(diag.len(), 1);
         assert_eq!(diag[0].annotation, auth::AUTH_JWT);
+    }
+
+    // ── compression (#550) ────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_compression_valid_ref() {
+        let m = ann(&[(traffic_policy::COMPRESSION, "compress-ns/my-compression")]);
+        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
+        let r = a.compression.expect("compression must parse");
+        assert_eq!(r.namespace, "compress-ns");
+        assert_eq!(r.name, "my-compression");
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn parse_compression_absent_is_none() {
+        let (a, diag) = IngressAnnotations::parse(None, "default/test");
+        assert!(a.compression.is_none());
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn parse_compression_malformed_warns_and_disables() {
+        let m = ann(&[(traffic_policy::COMPRESSION, "no-slash-here")]);
+        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
+        assert!(a.compression.is_none());
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, traffic_policy::COMPRESSION);
     }
 }
