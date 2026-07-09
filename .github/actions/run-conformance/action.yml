@@ -126,20 +126,37 @@ runs:
         kubectl get lease coxswain-leader-lock -n coxswain-system -o yaml
         exit 1
 
-    # GatewayStaticAddresses (#260): the test needs a "usable" address coxswain
-    # can bind. coxswain provisions a static-IP Gateway's VIP as a ClusterIP, so
-    # the usable address must be a free in-CIDR clusterIP — we probe one by
-    # creating a throwaway ClusterIP Service, reading its assigned clusterIP, and
-    # deleting it. The "unusable" address is TEST-NET-1, outside any Service CIDR.
-    - name: Probe a free clusterIP for GatewayStaticAddresses
+    # GatewayStaticAddresses (#260, #558): the test needs a "usable" address
+    # coxswain can bind. coxswain provisions a static-IP Gateway's VIP as a
+    # ClusterIP, so the usable address must be a free in-CIDR clusterIP. It must
+    # come from the CIDR's *static lower band* (ServiceIPStaticSubrange): random
+    # allocation draws from the upper band only, so a lower-band IP cannot be
+    # stolen by the Services the suite's base manifests create after this step.
+    # Candidates are validated by creating a Service pinned to each, starting at
+    # kubernetes-Service-IP + 1 (skips fixed IPs like kube-dns automatically —
+    # their creation just fails and we try the next). The "unusable" address is
+    # TEST-NET-1, outside any Service CIDR.
+    - name: Select a free static-band clusterIP for GatewayStaticAddresses
       id: static-addr
       shell: bash
       run: |
-        kubectl -n coxswain-system create service clusterip \
-          coxswain-static-addr-probe --tcp=80:80 >/dev/null
-        USABLE=$(kubectl -n coxswain-system get svc coxswain-static-addr-probe \
-          -o jsonpath='{.spec.clusterIP}')
-        kubectl -n coxswain-system delete service coxswain-static-addr-probe >/dev/null
+        K8S_SVC_IP=$(kubectl -n default get svc kubernetes -o jsonpath='{.spec.clusterIP}')
+        BASE_PREFIX="${K8S_SVC_IP%.*}"
+        BASE_LAST="${K8S_SVC_IP##*.}"
+        USABLE=""
+        for off in $(seq 1 14); do
+          CAND="$BASE_PREFIX.$((BASE_LAST + off))"
+          if kubectl -n coxswain-system create service clusterip \
+               coxswain-static-addr-probe --tcp=80:80 --clusterip="$CAND" >/dev/null 2>&1; then
+            kubectl -n coxswain-system delete service coxswain-static-addr-probe >/dev/null
+            USABLE="$CAND"
+            break
+          fi
+        done
+        if [ -z "$USABLE" ]; then
+          echo "no free static-band clusterIP found near $K8S_SVC_IP" >&2
+          exit 1
+        fi
         echo "usable=${USABLE}" >> "$GITHUB_OUTPUT"
         echo "GatewayStaticAddresses usable=${USABLE} unusable=192.0.2.1"
 

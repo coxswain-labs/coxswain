@@ -83,6 +83,13 @@ pub(crate) struct StaticAddressOutcome {
     /// static address. When false the caller keeps its legacy auto-address
     /// behaviour (`GatewayAddressEmpty`) untouched.
     pub(crate) feature_engaged: bool,
+    /// True iff at least one requested entry is a concrete `IPAddress` that
+    /// parses as an IP — the exact set the VIP reconciler will try to pin as a
+    /// clusterIP (mirrors `operator::render_shared::requested_static_cluster_ips`).
+    /// When false (e.g. a Hostname-only request) the reconciler takes the auto
+    /// path and can never adjudicate the request, so an `AddressNotUsable` must
+    /// settle rather than wait for a `vip_failures` verdict that cannot come.
+    pub(crate) requests_pinnable_ip: bool,
 }
 
 impl StaticAddressOutcome {
@@ -95,6 +102,7 @@ impl StaticAddressOutcome {
             programmed_override: None,
             status_addresses: Vec::new(),
             feature_engaged: false,
+            requests_pinnable_ip: false,
         }
     }
 
@@ -113,11 +121,46 @@ impl StaticAddressOutcome {
     /// `Programmed` override and any gated addresses so the shared status writer's
     /// convergence gate holds `Programmed` at `gen-1` (`Pending`) instead of
     /// stamping a settled negative while the VIP is still being provisioned. Only
-    /// applied while the VIP is unresolved AND the operator has not recorded a
-    /// definitive provisioning failure for the Gateway.
+    /// applied when [`Self::should_hold_pending`] says the negative is unconfirmed.
     pub(crate) fn hold_pending_address(&mut self) {
         self.programmed_override = None;
         self.status_addresses.clear();
+    }
+
+    /// Whether an `AddressNotUsable` outcome is *unconfirmed* and must be held at
+    /// `Pending` rather than settled at the current generation.
+    ///
+    /// A settled negative is trustworthy only when one of two authorities backs
+    /// it: the VIP reconciler recorded a definitive provisioning failure
+    /// (`vip_confirmed_failed` — every requested clusterIP permanently rejected),
+    /// or the resolved VIP satisfies at least one requested address
+    /// (`status_addresses` non-empty — the request was honored as far as a
+    /// single-address VIP can; the remaining mismatch is real, e.g. the
+    /// conformance `[unusable, usable]` phase). Otherwise the mismatch is
+    /// indistinguishable from a VIP mid-provisioning or mid-repin (the operator
+    /// deletes + defer-recreates the Service to repin a clusterIP, so the writer
+    /// can observe a *resolved-but-stale* address with zero requested matches) —
+    /// settling there strands `AddressNotUsable` until an unrelated Gateway
+    /// event, because the VIP reconciler fires none (#558).
+    ///
+    /// The zero-match hold applies only while a `vip_failures` verdict can still
+    /// arrive: per-Gateway VIP addressing must be on (`vip_addressing_enabled` —
+    /// legacy mode never runs the VIP reconciler) and the request must contain a
+    /// pinnable IP ([`Self::requests_pinnable_ip`] — a Hostname-only request is
+    /// never adjudicated). A non-adjudicable negative settles immediately; the
+    /// caller's slow requeue on settled negatives still self-heals it if a
+    /// coincidental match (e.g. an LB-assigned hostname) shows up later.
+    #[must_use]
+    pub(crate) fn should_hold_pending(
+        &self,
+        awaiting_own_vip: bool,
+        vip_confirmed_failed: bool,
+        vip_addressing_enabled: bool,
+    ) -> bool {
+        let adjudicable = vip_addressing_enabled && self.requests_pinnable_ip;
+        self.is_address_not_usable()
+            && !vip_confirmed_failed
+            && (awaiting_own_vip || (adjudicable && self.status_addresses.is_empty()))
     }
 }
 
@@ -191,6 +234,7 @@ pub(crate) fn evaluate_static_addresses(
                     programmed_override: Some(GatewayConditionReason::Invalid),
                     status_addresses: Vec::new(),
                     feature_engaged: true,
+                    requests_pinnable_ip: false,
                 };
             }
         }
@@ -224,11 +268,21 @@ pub(crate) fn evaluate_static_addresses(
         .cloned()
         .collect();
 
+    // Mirrors `operator::render_shared::requested_static_cluster_ips`: the
+    // entries the VIP reconciler will actually try to pin as a clusterIP.
+    let requests_pinnable_ip = classified.iter().any(|r| {
+        r.type_ == SupportedAddressType::IpAddress
+            && r.value
+                .as_deref()
+                .is_some_and(|v| v.parse::<std::net::IpAddr>().is_ok())
+    });
+
     StaticAddressOutcome {
         accepted_override: None,
         programmed_override: (!all_usable).then_some(GatewayConditionReason::AddressNotUsable),
         status_addresses,
         feature_engaged: true,
+        requests_pinnable_ip,
     }
 }
 
@@ -312,6 +366,73 @@ mod tests {
         assert!(!out.is_address_not_usable());
         assert!(out.programmed_override.is_none());
         assert!(out.status_addresses.is_empty());
+    }
+
+    #[test]
+    fn hold_pending_matrix() {
+        // The #558 discriminator: an AddressNotUsable is held at Pending unless
+        // a definitive vip_failures entry or a partial match settles it — and
+        // the zero-match hold requires the VIP reconciler to be able to
+        // adjudicate (addressing on + a pinnable IP requested).
+
+        // VIP unresolved (nothing bound), no confirmed failure → hold.
+        let awaiting =
+            evaluate_static_addresses(&[req(Some("IPAddress"), Some("10.96.0.10"))], &[]);
+        assert!(awaiting.should_hold_pending(true, false, true));
+
+        // VIP resolved to a stale/wrong address (mid-repin window): zero
+        // requested matches, no confirmed failure → hold, not settle.
+        let repin_window = evaluate_static_addresses(
+            &[req(Some("IPAddress"), Some("10.96.0.10"))],
+            &[ip("10.96.0.99")],
+        );
+        assert!(repin_window.is_address_not_usable());
+        assert!(repin_window.requests_pinnable_ip);
+        assert!(repin_window.should_hold_pending(false, false, true));
+
+        // Definitive vip_failures entry → settle even with zero matches.
+        assert!(!repin_window.should_hold_pending(false, true, true));
+        assert!(!awaiting.should_hold_pending(true, true, true));
+
+        // Legacy mode (per-Gateway VIP addressing off): the VIP reconciler
+        // never runs, no verdict can arrive → settle, never hold.
+        assert!(!repin_window.should_hold_pending(false, false, false));
+
+        // Hostname-only request: the VIP reconciler pins only IPs, so it never
+        // adjudicates this request → settle once the VIP is resolved…
+        let hostname_only = evaluate_static_addresses(
+            &[req(Some("Hostname"), Some("gw.example.com"))],
+            &[ip("10.96.0.99")],
+        );
+        assert!(hostname_only.is_address_not_usable());
+        assert!(!hostname_only.requests_pinnable_ip);
+        assert!(!hostname_only.should_hold_pending(false, false, true));
+        // …but still hold while the VIP itself is unresolved (an LB hostname
+        // may yet arrive and match).
+        assert!(hostname_only.should_hold_pending(true, false, true));
+
+        // Partial match ([unusable, usable] with the usable one bound): the VIP
+        // reconciler honored the request as far as it can → settle.
+        let partial = evaluate_static_addresses(
+            &[
+                req(Some("IPAddress"), Some("192.0.2.1")),
+                req(Some("IPAddress"), Some("10.96.0.10")),
+            ],
+            &[ip("10.96.0.10")],
+        );
+        assert!(partial.is_address_not_usable());
+        assert!(!partial.should_hold_pending(false, false, true));
+
+        // Fully usable → nothing to hold.
+        let usable = evaluate_static_addresses(
+            &[req(Some("IPAddress"), Some("10.96.0.10"))],
+            &[ip("10.96.0.10")],
+        );
+        assert!(!usable.should_hold_pending(false, false, true));
+
+        // Deterministic Invalid (unsupported type) is never held.
+        let invalid = evaluate_static_addresses(&[req(Some("test/fake"), Some("x"))], &[]);
+        assert!(!invalid.should_hold_pending(true, false, true));
     }
 
     #[test]

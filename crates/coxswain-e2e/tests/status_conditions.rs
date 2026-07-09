@@ -1073,6 +1073,50 @@ async fn gateway_address_empty_allocates_dynamically() -> anyhow::Result<()> {
 
 // ── GatewayStaticAddresses (#260) ────────────────────────────────────────────
 
+/// Probe `n` known-free in-CIDR clusterIPs: the apiserver assigns one to each
+/// throwaway ClusterIP Service; deleting them frees those exact IPs for coxswain
+/// to re-request. clusterIPs are cluster-global, so a test-namespace probe
+/// yields service-CIDR addresses. All probes are created before any is deleted,
+/// so the returned IPs are guaranteed pairwise distinct — deleting between
+/// probes would let the allocator hand the same IP out twice.
+async fn probe_free_cluster_ips(
+    svc_api: &Api<Service>,
+    prefix: &str,
+    n: usize,
+) -> anyhow::Result<Vec<String>> {
+    let mut ips = Vec::with_capacity(n);
+    for i in 0..n {
+        let probe = Service {
+            metadata: kube::api::ObjectMeta {
+                name: Some(format!("{prefix}-{i}")),
+                ..Default::default()
+            },
+            spec: Some(ServiceSpec {
+                type_: Some("ClusterIP".to_string()),
+                ports: Some(vec![ServicePort {
+                    port: 80,
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let created = svc_api.create(&Default::default(), &probe).await?;
+        let ip = created
+            .spec
+            .and_then(|s| s.cluster_ip)
+            .filter(|ip| !ip.is_empty() && ip != "None")
+            .ok_or_else(|| anyhow::anyhow!("probe Service {prefix}-{i} got no clusterIP"))?;
+        ips.push(ip);
+    }
+    for i in 0..n {
+        svc_api
+            .delete(&format!("{prefix}-{i}"), &Default::default())
+            .await?;
+    }
+    Ok(ips)
+}
+
 /// Sad path: a Gateway requesting an address of an unsupported `type`
 /// (`test/fake-invalid-type`) is rejected with
 /// `Accepted=False/UnsupportedAddress`. VIP-type-agnostic.
@@ -1205,35 +1249,10 @@ async fn programmed_true_and_address_written_when_usable_clusterip_requested() -
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "sc-static-usable").await?;
 
-    // Probe a known-free in-CIDR clusterIP: the apiserver assigns one to a
-    // throwaway ClusterIP Service; deleting it frees that exact IP for coxswain
-    // to re-request. clusterIPs are cluster-global, so a test-namespace probe
-    // yields a service-CIDR address.
     let svc_api: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
-    let probe = Service {
-        metadata: kube::api::ObjectMeta {
-            name: Some("static-addr-probe".to_string()),
-            ..Default::default()
-        },
-        spec: Some(ServiceSpec {
-            type_: Some("ClusterIP".to_string()),
-            ports: Some(vec![ServicePort {
-                port: 80,
-                ..Default::default()
-            }]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let created = svc_api.create(&Default::default(), &probe).await?;
-    let usable_ip = created
-        .spec
-        .and_then(|s| s.cluster_ip)
-        .filter(|ip| !ip.is_empty() && ip != "None")
-        .ok_or_else(|| anyhow::anyhow!("probe Service got no clusterIP"))?;
-    svc_api
-        .delete("static-addr-probe", &Default::default())
-        .await?;
+    let usable_ip = probe_free_cluster_ips(&svc_api, "static-addr-probe", 1)
+        .await?
+        .remove(0);
 
     fixtures::apply_fixture(
         gwa::STATIC_ADDRESS,
@@ -1271,6 +1290,97 @@ async fn programmed_true_and_address_written_when_usable_clusterip_requested() -
     Ok(())
 }
 
+/// #558 regression: repinning a static address (patching `spec.addresses` from
+/// one free clusterIP to another) must converge to `Programmed=True` carrying
+/// the NEW address at the new generation. The repin forces the operator to
+/// delete + recreate the VIP Service (`spec.clusterIP` is immutable), a window
+/// where the shared status writer can observe a resolved-but-stale address with
+/// zero requested matches; before #558 that settled `AddressNotUsable` and went
+/// quiet (`await_change`) — no Gateway event ever healed it, the
+/// `GatewayStaticAddresses` conformance flake.
+#[tokio::test]
+async fn programmed_recovers_with_new_address_after_static_address_repin() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-static-repin").await?;
+
+    let svc_api: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let mut probed = probe_free_cluster_ips(&svc_api, "repin-probe", 2).await?;
+    let second_ip = probed.remove(1);
+    let first_ip = probed.remove(0);
+
+    fixtures::apply_fixture(
+        gwa::STATIC_ADDRESS,
+        FixtureVars::new(&ns.name)
+            .with("ADDR_TYPE", "IPAddress")
+            .with("ADDR_VALUE", &first_ip),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let first_for_assert = first_ip.clone();
+    wait::poll_until(
+        Duration::from_secs(120),
+        Duration::from_secs(1),
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok();
+            let prog = gw.as_ref().and_then(|g| gateway_condition(g, "Programmed"));
+            let addrs = gw.as_ref().map(gateway_addresses).unwrap_or_default();
+            format!(
+                "Programmed=True with first IP {first_ip} in addresses; \
+                 observed Programmed={prog:?} addresses={addrs:?}"
+            )
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let programmed = gateway_condition(&gw, "Programmed")?;
+            let has_addr = gateway_addresses(&gw)
+                .iter()
+                .any(|(t, v)| t == "IPAddress" && v == &first_for_assert);
+            (programmed == ("True".to_string(), "Programmed".to_string()) && has_addr).then_some(())
+        },
+    )
+    .await?;
+
+    // Repin: same fixture, new address → generation bump + immutable-clusterIP
+    // Service delete/recreate on the operator side.
+    fixtures::apply_fixture(
+        gwa::STATIC_ADDRESS,
+        FixtureVars::new(&ns.name)
+            .with("ADDR_TYPE", "IPAddress")
+            .with("ADDR_VALUE", &second_ip),
+    )
+    .await?;
+
+    let second_for_assert = second_ip.clone();
+    let first_for_negative = first_ip.clone();
+    wait::poll_until(
+        Duration::from_secs(120),
+        Duration::from_secs(1),
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok();
+            let addrs = gw.as_ref().map(gateway_addresses).unwrap_or_default();
+            format!(
+                "Programmed=True at the new generation carrying only {second_ip}; \
+                 observed Programmed={:?} addresses={addrs:?}",
+                gw.as_ref().and_then(programmed_full)
+            )
+        },
+        || async {
+            let gw = gw_api.get("coxswain-test").await.ok()?;
+            let generation = gw.metadata.generation.unwrap_or(0);
+            let (status, _reason, observed) = programmed_full(&gw)?;
+            let addrs = gateway_addresses(&gw);
+            let has_new = addrs
+                .iter()
+                .any(|(t, v)| t == "IPAddress" && v == &second_for_assert);
+            let has_old = addrs.iter().any(|(_, v)| v == &first_for_negative);
+            (status == "True" && observed == generation && has_new && !has_old).then_some(())
+        },
+    )
+    .await?;
+    Ok(())
+}
+
 // ── observedGeneration-vs-address convergence (#533) ─────────────────────────
 
 /// The `(status, reason, observedGeneration)` of a Gateway's top-level
@@ -1302,33 +1412,10 @@ async fn shared_gateway_generation_trails_address_until_resolved() -> anyhow::Re
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "sc-gw-gen-trails-addr").await?;
 
-    // Probe a known-free in-CIDR clusterIP the Gateway can then request (same
-    // technique as `programmed_true_and_address_written_when_usable_clusterip_requested`).
     let svc_api: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
-    let probe = Service {
-        metadata: kube::api::ObjectMeta {
-            name: Some("gen-trails-probe".to_string()),
-            ..Default::default()
-        },
-        spec: Some(ServiceSpec {
-            type_: Some("ClusterIP".to_string()),
-            ports: Some(vec![ServicePort {
-                port: 80,
-                ..Default::default()
-            }]),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    let created = svc_api.create(&Default::default(), &probe).await?;
-    let usable_ip = created
-        .spec
-        .and_then(|s| s.cluster_ip)
-        .filter(|ip| !ip.is_empty() && ip != "None")
-        .ok_or_else(|| anyhow::anyhow!("probe Service got no clusterIP"))?;
-    svc_api
-        .delete("gen-trails-probe", &Default::default())
-        .await?;
+    let usable_ip = probe_free_cluster_ips(&svc_api, "gen-trails-probe", 1)
+        .await?
+        .remove(0);
 
     fixtures::apply_fixture(
         gwa::STATIC_ADDRESS,
