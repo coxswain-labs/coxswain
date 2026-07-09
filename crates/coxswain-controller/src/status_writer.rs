@@ -138,13 +138,14 @@ pub fn spawn_status_writer(
     // was made always-on regardless of `enable_ingress`. Registering it only
     // when Ingress is enabled left it spawned-but-unregistered with Ingress
     // disabled, panicking the first time the reflector reached `InitDone`.
-    // `jwt_auth`, `coxswain_external_auth`, and `compression` are the same fix
-    // on the opposite axis: the Ingress `auth-jwt` (#441), `ext-auth` (#549),
-    // and `compression` (#550) annotations each consume the same CR store as
-    // their Gateway-API `ExtensionRef` counterpart, so those reflectors are
-    // always-on regardless of `enable_gateway_api` — their check names must
-    // live here too, or `SubsystemHandle::set` panics the first time the
-    // reflector reaches `InitDone` with Gateway API disabled.
+    // `jwt_auth`, `coxswain_external_auth`, `compression`, and `retry_policy`
+    // are the same fix on the opposite axis: the Ingress `auth-jwt` (#441),
+    // `ext-auth` (#549), `compression` (#550), and `retry` (#551) annotations
+    // each consume the same CR store as their Gateway-API `ExtensionRef`
+    // counterpart, so those reflectors are always-on regardless of
+    // `enable_gateway_api` — their check names must live here too, or
+    // `SubsystemHandle::set` panics the first time the reflector reaches
+    // `InitDone` with Gateway API disabled.
     const ALWAYS_ON_CHECKS: &[&str] = &[
         "endpoint_slice",
         "secret",
@@ -155,6 +156,7 @@ pub fn spawn_status_writer(
         "jwt_auth",
         "coxswain_external_auth",
         "compression",
+        "retry_policy",
     ];
     // Per-surface checks registered only when the surface is enabled;
     // disabled surfaces never mark a check ready so registering them would
@@ -180,7 +182,6 @@ pub fn spawn_status_writer(
         "coxswain_backend_policy",
         "config_map",
         "rate_limit",
-        "retry_policy",
         "path_rewrite_regex",
         "ip_access_control",
         "basic_auth",

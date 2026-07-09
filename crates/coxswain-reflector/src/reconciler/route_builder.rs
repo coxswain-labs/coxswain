@@ -312,6 +312,7 @@ fn build_ingress_routes(
         stores.jwks_cache,
         ownership.backend_grants,
         stores.compressions,
+        stores.retry_policies,
     );
     let mut pending_annotation_events: Vec<(String, String, Vec<AnnotationIssue>)> = Vec::new();
     for ingress in ingresses {
