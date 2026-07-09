@@ -1,0 +1,34 @@
+# CoxswainBackendPolicy loadBalancer.algorithm: ip_hash fixture (#554), routing
+# to the two-replica echo Service. A fixed client IP (the test runner) must
+# consistently hash to the same endpoint, so all sequential requests land on
+# the same pod. Apply backends::ECHO_TWO_REPLICAS before this fixture.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lb-iphash
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: lb.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-two-replicas
+                port:
+                  number: 3000
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: echo-two-replicas-iphash-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-two-replicas
+  loadBalancer:
+    algorithm: ip_hash

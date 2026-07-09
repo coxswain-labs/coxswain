@@ -43,7 +43,7 @@ The following listener-lifecycle metrics are also exposed: `coxswain_proxy_liste
 
 `coxswain_proxy_listener_lifecycle_total` carries an `event` label ∈ `{added, removed, drain_completed, drain_exceeded, bind_failed}`. **`bind_failed`** counts a listener whose socket `bind()` failed — that local port serves no traffic until a later reconcile retries the bind. A sustained non-zero rate is a data-plane outage signal worth alerting on (a port conflict, or a stale process still holding the port); it should otherwise stay flat at zero.
 
-The `listener` label is the **local port the proxy accepted the connection on**. For Ingress and dedicated-mode Gateway traffic this is the advertised port (e.g. `80`/`443`). For shared-mode Gateway listeners it is the **internal accept port** the controller allocates per Gateway (in the `30000–32767` range), *not* the advertised port: a per-Gateway VIP Service maps the advertised port onto that internal port, and the proxy keys routing, TLS, and metrics on the port it accepts on so cross-Gateway hostname namespaces stay isolated (see [Architecture → per-Gateway addressing](../architecture.md)). To slice a shared-mode Gateway's series by its advertised port, join on the VIP Service rather than reading it from the `listener` label.
+The `listener` label is the **local port the proxy accepted the connection on**. For Ingress and dedicated-mode Gateway traffic this is the advertised port (e.g. `80`/`443`). For shared-mode Gateway listeners it is the **internal accept port** the controller allocates per Gateway (in the `30000–32767` range), *not* the advertised port: a per-Gateway VIP Service maps the advertised port onto that internal port, and the proxy keys routing, TLS, and metrics on the port it accepts on so cross-Gateway hostname namespaces stay isolated (see [Deployment models → per-Gateway addressing](../architecture/deployment-models.md#shared)). To slice a shared-mode Gateway's series by its advertised port, join on the VIP Service rather than reading it from the `listener` label.
 
 ### Controller-pod metrics (`coxswain_controller_*`)
 
@@ -264,7 +264,7 @@ serve traffic from its valid rules.
 ```
 Type     Reason             Age   From                 Message
 ----     ------             ---   ----                 -------
-Warning  InvalidAnnotation  5s    coxswain-controller  ingress.coxswain-labs.dev/connect-timeout: invalid duration — using default
+Warning  InvalidAnnotation  5s    coxswain-controller  ingress.coxswain-labs.dev/read-timeout: invalid duration — using default
 ```
 
 ### InternalPortRemapped (shared-mode Gateway)

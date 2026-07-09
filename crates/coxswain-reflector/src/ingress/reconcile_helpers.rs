@@ -7,6 +7,7 @@ use super::annotations::AnnotationIssue;
 use super::annotations::auth::{SecretRef, parse_htpasswd};
 use super::annotations::traffic_policy;
 use crate::endpoints;
+use crate::gateway_api::ResolvedBackendPolicy;
 use coxswain_core::crd::{
     Compression, CoxswainExternalAuth, IpAccessControl, RateLimit, RetryPolicy,
 };
@@ -23,31 +24,41 @@ use std::sync::Arc;
 
 // ── Backend group construction ────────────────────────────────────────────────
 
-/// Build a [`BackendGroup`] from resolved endpoints and Ingress-wide traffic-policy
-/// annotations.
+/// Build a [`BackendGroup`] from resolved endpoints and the `CoxswainBackendPolicy`
+/// attached to the backend `Service` (#554).
 ///
 /// Used by both the per-rule path loop and `spec.defaultBackend` — centralises the
-/// builder chain so annotation knobs are applied uniformly to every backend.
+/// builder chain so the resolved policy is applied uniformly to every backend.
+/// `policy` is looked up per-backend-Service by the caller (a single Ingress can
+/// route different paths to different Services, each with its own policy);
+/// `None` (no attached policy, or none of its knobs resolved) leaves every knob
+/// at its connection-level default.
 ///
 /// `retries` is passed in already resolved (via [`resolve_retry_config`]) rather
-/// than read off `ann` directly — unlike the other knobs here, the `retry`
-/// annotation is a CR reference that needs a store lookup, so the caller
-/// resolves it once per Ingress and shares the result across every backend
-/// group (#551).
+/// than looked up here — unlike `policy`, the `retry` annotation is a CR
+/// reference the caller resolves once per Ingress and shares across every
+/// backend group (#551).
 pub(super) fn build_ingress_backend_group(
     ns: &str,
     svc_name: &str,
     addrs: Vec<SocketAddr>,
     protocol: BackendProtocol,
-    ann: &super::annotations::IngressAnnotations,
+    policy: Option<&ResolvedBackendPolicy>,
     retries: &RetryPolicyConfig,
 ) -> BackendGroup {
-    BackendGroup::new(format!("{ns}/{svc_name}"), addrs)
+    let mut group = BackendGroup::new(format!("{ns}/{svc_name}"), addrs)
         .with_protocol(protocol)
-        .with_retries(retries.clone())
-        .with_session_affinity(ann.session_affinity.clone())
-        .with_keepalive_timeout(ann.keepalive_timeout)
-        .with_load_balance(ann.load_balance.clone())
+        .with_retries(retries.clone());
+    if let Some(bp) = policy {
+        group = group
+            .with_connect_timeout(bp.connect)
+            .with_keepalive_timeout(bp.idle)
+            .with_session_affinity(bp.session_affinity.clone());
+        if let Some(lb) = &bp.load_balance {
+            group = group.with_load_balance(lb.clone());
+        }
+    }
+    group
 }
 
 // ── Mirror filter resolution ──────────────────────────────────────────────────

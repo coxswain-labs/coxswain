@@ -23,8 +23,10 @@ spec:
               Per-backend connection policy attached to one or more `Service` objects.
 
               A `CoxswainBackendPolicy` in namespace `ns` targets the `Service` objects in
-              `targetRefs` (each in the same namespace). Its `timeouts` apply to every
-              Gateway API route whose backend resolves to a targeted Service.
+              `targetRefs` (each in the same namespace). Its settings apply to every
+              route whose backend resolves to a targeted Service — Gateway API
+              (`HTTPRoute`, `GRPCRoute`) and Ingress alike (#554) — automatically; no
+              route needs to reference the policy by name.
 
               When two policies target the same Service, the older one (by
               `creationTimestamp`, ties broken by name) wins and the loser receives
@@ -33,8 +35,9 @@ spec:
               circuitBreaker:
                 description: |-
                   Upstream circuit-breaker for routes backed by the targeted Service
-                  (#478). Gateway-API parity for the Ingress
-                  `ingress.coxswain-labs.dev/circuit-breaker-*` annotation family. When
+                  (#478). Deliberately proprietary — anchored to Istio
+                  `DestinationRule.trafficPolicy.outlierDetection` / Envoy outlier
+                  detection, not a Gateway API standard (see the module docs). When
                   `None` the breaker is disabled (the default).
                 nullable: true
                 properties:
@@ -74,9 +77,9 @@ spec:
               loadBalancer:
                 description: |-
                   Upstream load-balancing algorithm for routes backed by the targeted
-                  Service (#389). Gateway-API parity for the Ingress
-                  `ingress.coxswain-labs.dev/load-balance` annotation. When `None` the
-                  route keeps the default weighted round-robin.
+                  Service (#389). Deliberately proprietary — anchored to Envoy's native LB
+                  policies, not a Gateway API standard (see the module docs). When `None`
+                  the route keeps the default weighted round-robin.
                 nullable: true
                 properties:
                   algorithm:
@@ -84,6 +87,32 @@ spec:
                     type: string
                 required:
                 - algorithm
+                type: object
+              sessionPersistence:
+                description: |-
+                  Session persistence for routes backed by the targeted Service (#554).
+                  Mirrors Gateway API's experimental `SessionPersistence` shape as
+                  closely as our stateless affinity machinery supports. When `None`, no
+                  session persistence is applied (the default).
+                nullable: true
+                properties:
+                  sessionName:
+                    description: |-
+                      Cookie name (`Cookie` mode, default `__coxswain_session` when unset) or
+                      header name (`Header` mode, required — absent or invalid disables
+                      persistence).
+                    nullable: true
+                    type: string
+                  type:
+                    description: |-
+                      Persistence mechanism: `Cookie` (the proxy injects a sticky cookie) or
+                      `Header` (a request header is rendezvous-hashed to select the
+                      endpoint). Free-form and **not** schema-enum-validated: an
+                      unrecognised value reaches the reflector, which WARNs and disables
+                      persistence (matching [`BackendLoadBalancer::algorithm`]).
+                    type: string
+                required:
+                - type
                 type: object
               targetRefs:
                 description: |-
@@ -129,8 +158,7 @@ spec:
                       Upstream TCP-connect timeout. Bounds how long the proxy waits to establish
                       a connection to a backend endpoint before failing the request (`502`).
 
-                      When unset or unparseable, the proxy falls back to the per-route connect
-                      timeout (Ingress `connect-timeout` annotation) or the Gateway API
+                      When unset or unparseable, the proxy falls back to the Gateway API
                       `backendRequest` budget.
                     nullable: true
                     type: string

@@ -1,6 +1,8 @@
-# Header-mode session affinity (#15): one Service with three pods. The value of
-# X-Session-Id is rendezvous-hashed over the live endpoints to consistently pick
-# one pod; no cookie is ever set. A request without the header round-robins.
+# Baseline (#15, #554): one Service with three pods and NO attached
+# CoxswainBackendPolicy. Proves an Ingress backend with no policy keeps plain
+# weighted round-robin, never has session affinity leak into the default
+# path, and (more generally) that CoxswainBackendPolicy consumption is
+# opt-in — an unattached Service's connection behaviour is untouched.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -46,10 +48,7 @@ spec:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: affinity-header
-  annotations:
-    ingress.coxswain-labs.dev/session-affinity: "header"
-    ingress.coxswain-labs.dev/session-header: "X-Session-Id"
+  name: affinity-none
 spec:
   ingressClassName: coxswain
   rules:

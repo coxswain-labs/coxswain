@@ -10,7 +10,6 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 
 | Annotation | Type | Default | Example |
 |------------|------|---------|---------|
-| `ingress.coxswain-labs.dev/connect-timeout` | duration | _none_ | `"5s"` |
 | `ingress.coxswain-labs.dev/read-timeout` | duration | _none_ | `"60s"` |
 | `ingress.coxswain-labs.dev/send-timeout` | duration | _none_ | `"60s"` |
 | `ingress.coxswain-labs.dev/retry` | `namespace/name` | _none_ | `"my-ns/my-retry"` |
@@ -35,9 +34,6 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/trust-forwarded-for` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/forwarded-for-header` | string | `X-Forwarded-For` | `"CF-Connecting-IP"` |
 | `ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs` | cidr-list | _none_ (unconditional) | `"10.0.0.0/8"` |
-| `ingress.coxswain-labs.dev/session-affinity` | `cookie` or `header` | _none_ | `"cookie"` |
-| `ingress.coxswain-labs.dev/session-cookie-name` | string | `__coxswain_session` | `"SESSIONID"` |
-| `ingress.coxswain-labs.dev/session-header` | string | _none_ | `"X-Session-Id"` |
 | `ingress.coxswain-labs.dev/rate-limit` | `namespace/name` | _none_ | `"my-ns/my-limit"` |
 | `ingress.coxswain-labs.dev/ext-auth` | `namespace/name` | _none_ | `"my-ns/my-extauth"` |
 | `ingress.coxswain-labs.dev/auth-basic-secret` | `namespace/name` | _none_ | `"my-ns/my-htpasswd"` |
@@ -46,31 +42,33 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/auth-tls-secret` | `namespace/name` | _none_ | `"my-ns/my-ca"` |
 | `ingress.coxswain-labs.dev/auth-tls-verify-depth` | integer | `1` | `"2"` |
 | `ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream` | boolean | `false` | `"true"` |
-| `ingress.coxswain-labs.dev/load-balance` | `round_robin`, `least_conn`, `ewma`, `ip_hash`, `hash:uri`, `hash:source-ip`, `hash:header=<name>`, `hash:cookie=<name>` | `round_robin` | `"hash:uri"` |
 | `ingress.coxswain-labs.dev/path-normalize` | `base`, `merge-slashes`, `decode-and-merge-slashes` | `base` | `"merge-slashes"` |
-| `ingress.coxswain-labs.dev/circuit-breaker-threshold` | integer 1–100 | _none_ (disabled) | `"50"` |
-| `ingress.coxswain-labs.dev/circuit-breaker-window` | duration | `10s` | `"30s"` |
-| `ingress.coxswain-labs.dev/circuit-breaker-open-duration` | duration | `5s` | `"10s"` |
-| `ingress.coxswain-labs.dev/circuit-breaker-min-requests` | integer | `10` | `"5"` |
-| `ingress.coxswain-labs.dev/circuit-breaker-max-open-duration` | duration | _none_ (constant) | `"60s"` |
-| `ingress.coxswain-labs.dev/upstream-keepalive-timeout` | duration | _none_ (LRU eviction) | `"60s"` |
 
 ```yaml
 metadata:
   annotations:
-    ingress.coxswain-labs.dev/connect-timeout: "5s"
     ingress.coxswain-labs.dev/read-timeout: "60s"
     ingress.coxswain-labs.dev/retry: "my-ns/my-retry"
     ingress.coxswain-labs.dev/rewrite-target: "/v2"
 ```
 
+## Backend connection settings are not annotations
+
+If you're looking for `connect-timeout`, `upstream-keepalive-timeout`, `load-balance`, `circuit-breaker-*`, or `session-affinity` and don't see them in the table above: these five settings moved out of the annotation namespace entirely. They now live on a separate Kubernetes resource, [`CoxswainBackendPolicy`](gateway-api.md#coxswainbackendpolicy), which you attach to the **backend `Service`** rather than the Ingress.
+
+Why the different shape? These five settings all describe the *connection to the upstream pod* — not anything about routing or the request itself — so they belong to the Service the Ingress points at, not to the Ingress. That also means:
+
+- You write no annotation on the Ingress at all for these. You create a `CoxswainBackendPolicy` naming the Service, and it applies automatically.
+- The same policy applies identically whether the Service is reached via an Ingress, an `HTTPRoute`, or a `GRPCRoute` — one place to configure it, no matter how traffic gets there.
+- If two Ingresses (or an Ingress and an HTTPRoute) point at the same Service, they share the same connection policy. That's intentional — connection pooling, load-balancing, and circuit-breaking happen per-Service, not per-route.
+
+See the [Gateway API guide's `CoxswainBackendPolicy` section](gateway-api.md#coxswainbackendpolicy) for the full field list, a copy-pasteable example, and how each setting behaves.
+
 ## Timeouts
 
 **Duration format** — All timeout annotations accept Go `time.ParseDuration` strings: one or more `<number><unit>` pairs without spaces. Supported units: `ns`, `us` (`µs`), `ms`, `s`, `m`, `h`. Examples: `"5s"`, `"500ms"`, `"1m30s"`. Zero values (`"0"`, `"0s"`) are treated as absent.
 
-### `connect-timeout`
-
-Maximum time to establish a TCP connection to the upstream pod. Overrides any controller-wide default. Corresponds to Pingora's `connection_timeout`.
+These are per-*request* timeouts. Upstream connect timeout is per-backend connection policy — see [`CoxswainBackendPolicy`](gateway-api.md#coxswainbackendpolicy).
 
 ### `read-timeout`
 
@@ -410,7 +408,7 @@ Units are **binary** (`k` = 1024, `m` = 1024², `g` = 1024³), matching nginx-in
 Enforcement is two-layered and never buffers the whole body:
 
 - When the request declares a `Content-Length` larger than the limit, it is rejected up front — before any upstream connection is opened. This applies to both HTTP/1.x and HTTP/2.
-- For chunked or streaming uploads with no `Content-Length`, the proxy counts bytes as they arrive and aborts with 413 the moment the running total crosses the limit **on HTTP/1.x only**. A streaming **HTTP/2** upload without `Content-Length` is not capped mid-stream (it fails open) — returning a rejection mid-body over HTTP/2 deadlocks the client under `pingora-proxy` ([#509](https://github.com/coxswain-labs/coxswain/issues/509)); faithful HTTP/2 enforcement awaits pingora request-body buffering.
+- For chunked or streaming uploads with no `Content-Length`, the proxy counts bytes as they arrive and aborts with 413 the moment the running total crosses the limit **on HTTP/1.x only**. A streaming **HTTP/2** upload without `Content-Length` is not capped mid-stream (it fails open) — returning a rejection mid-body over HTTP/2 deadlocks the client under `pingora-proxy`; faithful HTTP/2 enforcement awaits pingora request-body buffering.
 
 Omitting the annotation imposes no limit. An unparseable value (e.g. `"8mb"`, `"lots"`) emits a controller warning and is treated as absent — the route serves with no body cap rather than being rejected (**fail-open**).
 
@@ -560,113 +558,9 @@ The value is a comma-separated list of IPv4/IPv6 CIDR blocks (same format as `fo
 - An invalid CIDR token emits a controller warning and is skipped.
 - If every token is invalid, the CIDR list is treated as absent (unconditional trust) and a controller warning is emitted.
 
-## Session affinity (sticky sessions)
+## Session affinity, circuit breaker, and load balancing
 
-Pins each client to the same backend pod, so stateful workloads (in-memory sessions, WebSocket connections) keep reaching the endpoint that holds their state. A backend without these annotations stays on the default weighted round-robin.
-
-Affinity is **stateless** — there is no server-side session table. The pin is carried entirely in the request, so it works the same across proxy replicas and needs no coordination. Two modes:
-
-### `session-affinity: cookie`
-
-The proxy injects a cookie on the first response identifying the chosen pod, and routes subsequent requests bearing that cookie back to it.
-
-```yaml
-metadata:
-  annotations:
-    ingress.coxswain-labs.dev/session-affinity: "cookie"
-    ingress.coxswain-labs.dev/session-cookie-name: "SESSIONID"   # optional
-```
-
-- The first request (no cookie) is load-balanced normally, then pinned: the response carries `Set-Cookie: <name>=<token>; Path=/; HttpOnly`. The token encodes the endpoint; no raw pod IP is exposed.
-- `session-cookie-name` sets the cookie name (default `__coxswain_session`). A name that is not a valid cookie token warns and falls back to the default.
-- The cookie is a **session cookie** (no `Max-Age`); it lives for the browser session.
-
-### `session-affinity: header`
-
-The value of a request header is hashed to consistently select a pod — no cookie is issued. Use this when the client already carries a stable identifier (a session token, an API key).
-
-```yaml
-metadata:
-  annotations:
-    ingress.coxswain-labs.dev/session-affinity: "header"
-    ingress.coxswain-labs.dev/session-header: "X-Session-Id"
-```
-
-- `session-header` is **required** in header mode; if it is missing or not a valid header name, affinity is disabled (warning) and the route round-robins.
-- Selection uses **rendezvous (HRW) hashing** over the live endpoints, so a header value keeps its pod as long as that pod exists, and only the keys of a removed pod are redistributed.
-- A request that does not carry the header round-robins (and never receives a cookie).
-
-### Recovery and limits
-
-- If a pinned pod is **removed or scaled away**, the next request from that client no longer resolves to a live endpoint: it falls back to round-robin and (in cookie mode) re-establishes affinity with a fresh cookie.
-- An unknown `session-affinity` value (anything other than `cookie`/`header`) warns and disables affinity — the Ingress still serves.
-
-!!! note
-    The Gateway API binding for session persistence is not yet implemented: the only Gateway API surface for session persistence in the pinned crate is experimental-only (which Coxswain never compiles into release images), and the `BackendLBPolicy` resource originally proposed is not an upstream Gateway API type. Today the `session-*` annotations are the Ingress-only entry point.
-
-## Circuit breaker
-
-The per-upstream-endpoint circuit breaker trips when a backend pod's **error rate** exceeds a threshold, returning fail-fast **503** responses to clients until the pod shows signs of recovery. This is the Ingress equivalent of Envoy/Istio **outlier detection**: a single degraded pod trips only its own breaker; healthy pods serving the same Ingress keep accepting traffic.
-
-The breaker is implemented with [failsafe](https://docs.rs/failsafe)'s EWMA (exponentially weighted moving average) success-rate policy. Breaker state is tracked per `(route, endpoint-IP:port)` pair — one state machine per upstream pod, per route.
-
-**State machine:**
-
-1. **Closed** (initial) — requests flow normally; errors accumulate against the EWMA window.
-2. **Open** — error rate exceeded `threshold` after `min-requests` samples; requests fail-fast 503 without reaching the upstream. The breaker stays Open for `open-duration` (or exponentially longer, up to `max-open-duration`, on repeated trips).
-3. **HalfOpen** — after `open-duration` one probe request is let through. If it succeeds, the breaker closes; if it fails, it re-opens for another `open-duration`.
-
-**Observability** — three Prometheus series on the proxy admin `/metrics` endpoint:
-
-- `coxswain_proxy_circuit_breaker_state{route, upstream}` — `0` = closed, `1` = open, `2` = half-open.
-- `coxswain_proxy_circuit_breaker_rejected_total{route, upstream}` — count of fail-fast 503s issued while the breaker was open.
-- `coxswain_proxy_circuit_breaker_transitions_total{route, upstream, to}` — cumulative state transitions; `to` is `"open"`, `"half_open"`, or `"closed"`.
-
-### `circuit-breaker-threshold`
-
-**Required.** Error-rate percentage (1–100) that trips the breaker. Absent or invalid → breaker disabled (fail-open).
-
-Maps to `failsafe`'s `required_success_rate = 1 - threshold/100`. A value of `50` trips the breaker when fewer than 50% of requests succeed.
-
-```yaml
-metadata:
-  annotations:
-    ingress.coxswain-labs.dev/circuit-breaker-threshold: "50"
-```
-
-### `circuit-breaker-window`
-
-EWMA sliding window over which the success rate is measured. Duration string (e.g. `"10s"`). Default: `10s`.
-
-### `circuit-breaker-open-duration`
-
-How long the breaker stays Open before allowing a half-open probe. Duration string. Default: `5s`.
-
-When `circuit-breaker-max-open-duration` is absent this is a **constant** backoff (every trip stays Open for exactly this duration). When `max-open-duration` is set this is the **initial** duration and the window grows exponentially across repeated trips.
-
-### `circuit-breaker-min-requests`
-
-Minimum number of requests that must have been observed in the current window before the policy evaluates and can trip the breaker. Prevents a single early failure on a low-traffic route from opening the breaker. Integer ≥ 1. Default: `10`.
-
-### `circuit-breaker-max-open-duration`
-
-**Optional.** Upper bound for exponential backoff. When set, each successive trip doubles the open-duration (starting from `circuit-breaker-open-duration`) up to this cap. Absent → constant backoff (each trip uses the same `open-duration`).
-
-### Example
-
-```yaml
-metadata:
-  annotations:
-    ingress.coxswain-labs.dev/circuit-breaker-threshold: "50"
-    ingress.coxswain-labs.dev/circuit-breaker-window: "10s"
-    ingress.coxswain-labs.dev/circuit-breaker-open-duration: "5s"
-    ingress.coxswain-labs.dev/circuit-breaker-min-requests: "10"
-    ingress.coxswain-labs.dev/circuit-breaker-max-open-duration: "60s"
-```
-
-**Fail-fast behaviour:** when the breaker is Open, the proxy returns 503 immediately without connecting to the upstream. The client sees 503; other healthy pods serving the same route continue accepting traffic via load-balancing.
-
-**Invalid values** (zero threshold, unparseable duration, non-integer min-requests) emit a controller warning and disable the breaker for that route (**fail-open**) — a misconfigured annotation never blocks all traffic.
+Session affinity (sticky sessions), the per-upstream-endpoint circuit breaker, and the load-balancing algorithm are **not** Ingress annotations — they are configured by attaching a [`CoxswainBackendPolicy`](gateway-api.md#coxswainbackendpolicy) to the backend `Service`, identically for Ingress and Gateway API routes. See the [Gateway API guide](gateway-api.md#coxswainbackendpolicy) for the full field set, the circuit breaker's state machine and Prometheus series, and worked examples.
 
 ---
 
@@ -948,17 +842,9 @@ The header value is the raw PEM of the client leaf certificate, percent-encoded 
 !!! note "v1 limitation"
     `auth-tls-*` annotations are read directly off `Ingress.metadata.annotations`. They do not inherit class-level defaults from a `CoxswainIngressClassParameters` resource. Per-class mTLS defaults are tracked for a future release.
 
-## `upstream-keepalive-timeout`
+## Upstream keepalive idle timeout
 
-Controls how long Pingora keeps an idle upstream connection in its keepalive pool before evicting it.
-
-```yaml
-metadata:
-  annotations:
-    ingress.coxswain-labs.dev/upstream-keepalive-timeout: "60s"
-```
-
-**Format**: a Go `time.ParseDuration` string, e.g. `"30s"`, `"2m"`, `"90s"`. Absent or invalid values warn and fall back to Pingora's default (connections are evicted by LRU capacity pressure, not by age).
+How long Pingora keeps an idle upstream connection in its keepalive pool before evicting it is **not** an Ingress annotation — it is `timeouts.idle` on a [`CoxswainBackendPolicy`](gateway-api.md#coxswainbackendpolicy) attached to the backend `Service`. Absent or invalid values warn and fall back to Pingora's default (connections are evicted by LRU capacity pressure, not by age).
 
 **Observability**: the `coxswain_proxy_upstream_connections_total{state="reused"}` counter increments every time a request reuses a pooled connection. Compare it with `{state="new"}` to gauge keepalive efficiency for a route.
 
@@ -1052,52 +938,11 @@ When compression fires, the proxy:
     select it. This matches Pingora's own behaviour. When both codecs are enabled and the client
     sends both `br` and `gzip`, brotli always wins regardless of q-values.
 
-## `load-balance`
+## Load-balancing algorithm
 
-Selects the algorithm used to pick an upstream endpoint for each request within the backend group of a route.
+The algorithm used to pick an upstream endpoint for each request is **not** an Ingress annotation — it is `loadBalancer.algorithm` on a [`CoxswainBackendPolicy`](gateway-api.md#coxswainbackendpolicy) attached to the backend `Service`. See the Gateway API guide for the full value table (`round_robin`, `least_conn`, `ewma`, the `hash:*` consistent-hash forms), the Istio/Envoy equivalence mapping, and performance notes.
 
-```yaml
-metadata:
-  annotations:
-    ingress.coxswain-labs.dev/load-balance: "least_conn"
-```
-
-| Value | Description |
-|-------|-------------|
-| `round_robin` | _(default)_ Weighted round-robin using the GCD-reduced slot array. Zero per-request overhead. |
-| `least_conn` | Routes to the endpoint with the fewest in-flight requests. Maintains an atomic in-flight counter per endpoint; the counter is incremented on selection and decremented when the response completes (or when a retry selects a different endpoint). |
-| `ewma` | Routes to the endpoint with the lowest exponentially-weighted moving-average response latency (α = 1/8). Unsampled endpoints (active=0) are probed first. Latency is folded in at end-of-request. |
-| `ip_hash` | Alias for `hash:source-ip` (backward-compatible). |
-| `hash:uri` | Consistent hash on the full request URI (path + query string). Requests to the same URI always land on the same endpoint. Falls back to round-robin if the path is empty. |
-| `hash:source-ip` | Consistent hash on the resolved client IP (see [`trust-forwarded-for`](#trust-forwarded-for) for how the IP is resolved). Requests from the same IP always land on the same endpoint; unlike cookie affinity, no state is injected into the response. Falls back to round-robin if the client IP is unavailable. |
-| `hash:header=<name>` | Consistent hash on the value of the named request header (e.g. `hash:header=x-user-id`). An empty or absent header falls back to round-robin. |
-| `hash:cookie=<name>` | Consistent hash on the value of the named cookie (e.g. `hash:cookie=session`). An absent or empty cookie falls back to round-robin. |
-
-All `hash:*` values (and `ip_hash`) use **rendezvous (HRW) hashing**: when an endpoint is removed, only its keys are redistributed; all other keys remain on their existing endpoints. This is strictly better than modulo hashing, which reshuffles nearly every key on a membership change.
-
-Unknown values warn and fall back to `round_robin`; routing is never interrupted.
-
-### Mapping to Gateway API / Istio
-
-`load-balance` maps to `DestinationRule.trafficPolicy.loadBalancer` in Istio:
-
-| Coxswain value | Istio / Envoy equivalent |
-|----------------|--------------------------|
-| `round_robin` | `ROUND_ROBIN` |
-| `least_conn` | `LEAST_REQUEST` |
-| `ewma` | `LEAST_REQUEST` with latency-weighted selection |
-| `ip_hash` / `hash:source-ip` | `CONSISTENT_HASH` (`useSourceIp: true`) |
-| `hash:uri` | `CONSISTENT_HASH` (HTTP URI — closest analogue) |
-| `hash:header=<name>` | `CONSISTENT_HASH` (`httpHeaderName: <name>`) |
-| `hash:cookie=<name>` | `CONSISTENT_HASH` (`httpCookie.name: <name>`) |
-
-### `hash:source-ip` and forwarded-for
-
-When [`trust-forwarded-for`](#trust-forwarded-for) is enabled, `hash:source-ip` (and its alias `ip_hash`) uses the resolved client IP (the first non-private address from the forwarded header, gated by [`forwarded-for-trusted-cidrs`](#forwarded-for-trusted-cidrs) if set). This means a load balancer that rewrites the source IP still produces consistent upstream pinning based on the real client address.
-
-### Performance
-
-All algorithms run on the hot path without locks. `round_robin` allocates nothing per request. `least_conn` and `ewma` perform a linear scan over the endpoint list (typically 1–10 pods per Service) using relaxed atomics, which is negligible compared to I/O. `hash:*` values extract and hash the relevant request attribute with FNV-1a, then perform a linear rendezvous scan — negligible. The `hash:uri` path allocates a single joined `path?query` string only when a query string is present; all other hash sources are allocation-free on the hot path.
+`hash:source-ip` (and its alias `ip_hash`) interacts with [`trust-forwarded-for`](#trust-forwarded-for): when enabled, it hashes the resolved client IP (the first non-private address from the forwarded header, gated by [`forwarded-for-trusted-cidrs`](#forwarded-for-trusted-cidrs) if set) rather than the TCP peer address.
 
 ## Class-level defaults
 
@@ -1111,7 +956,7 @@ metadata:
   namespace: coxswain-system
 spec:
   defaultAnnotations:
-    ingress.coxswain-labs.dev/connect-timeout: "10s"
+    ingress.coxswain-labs.dev/read-timeout: "10s"
     ingress.coxswain-labs.dev/retry: "coxswain-system/default-retry"
 ---
 apiVersion: networking.k8s.io/v1
@@ -1134,7 +979,7 @@ spec:
 2. The class default from `spec.defaultAnnotations`.
 3. The built-in Coxswain default.
 
-The merge is per-key: an Ingress that sets only `connect-timeout` still inherits the class's `retry` reference. The keys and value formats in `defaultAnnotations` are exactly the per-Ingress ones — including `namespace/name` CR references like `retry`/`compression`, which resolve identically whether set directly on an Ingress or inherited from a class default; an invalid value emits a warning and falls back to the built-in default, the same as if it were set directly on an Ingress (an empty string `""` is **not** an "unset" override — it parses, warns, and falls back).
+The merge is per-key: an Ingress that sets only `read-timeout` still inherits the class's `retry` reference. The keys and value formats in `defaultAnnotations` are exactly the per-Ingress ones — including `namespace/name` CR references like `retry`/`compression`, which resolve identically whether set directly on an Ingress or inherited from a class default; an invalid value emits a warning and falls back to the built-in default, the same as if it were set directly on an Ingress (an empty string `""` is **not** an "unset" override — it parses, warns, and falls back).
 
 ### `spec.accessLog` — per-class access-log control
 

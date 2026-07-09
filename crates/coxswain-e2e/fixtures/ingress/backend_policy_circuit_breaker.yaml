@@ -1,0 +1,45 @@
+# CoxswainBackendPolicy circuit-breaker consumption on the Ingress surface (#554).
+#
+# A CoxswainBackendPolicy attached to the go-httpbin Service sets spec.circuitBreaker
+# with the same knobs as the Gateway-API fixture: threshold=50%, minRequests=4,
+# window=500ms, openDuration=2s.
+#
+# window=500ms is sub-second on purpose: failsafe's EWMA time gate
+# (elapsed_millis >= window.as_secs()*1000) is always satisfied because
+# 500ms.as_secs()*1000 == 0, so the breaker can trip as soon as minRequests is met
+# without sleeping in the test body. go-httpbin's /status/:code drives upstream codes.
+#
+# Route: backend-policy-breaker.TESTNS.local / -> go-httpbin:3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: backend-policy-breaker
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: backend-policy-breaker.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: go-httpbin
+                port:
+                  number: 3000
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: go-httpbin-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: go-httpbin
+  circuitBreaker:
+    threshold: 50
+    window: "500ms"
+    openDuration: "2s"
+    minRequests: 4

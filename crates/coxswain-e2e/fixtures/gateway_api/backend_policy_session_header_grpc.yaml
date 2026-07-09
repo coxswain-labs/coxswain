@@ -1,0 +1,88 @@
+# CoxswainBackendPolicy sessionPersistence: Header fixture on GRPCRoute (#554)
+# — new capability: GRPCRoute never had a session persistence binding before
+# #554. Three grpc-echo replicas so a fixed metadata value can be observed
+# pinning to one pod (via the echo response's assertions.context.pod field).
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grpc-echo-aff
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: grpc-echo-aff
+  template:
+    metadata:
+      labels:
+        app: grpc-echo-aff
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: grpc-echo
+          image: ${ECHO_IMAGE}
+          ports:
+            - containerPort: 50051
+          env:
+            - name: GRPC_ECHO_SERVER
+              value: "1"
+            - name: HTTP_PORT
+              value: "50051"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grpc-echo-aff
+spec:
+  selector:
+    app: grpc-echo-aff
+  ports:
+    - port: 50051
+      targetPort: 50051
+      appProtocol: kubernetes.io/h2c
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-session
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-session-header-route
+spec:
+  hostnames:
+    - "grpc-session-header.${TESTNS}.local"
+  parentRefs:
+    - name: coxswain-grpc-session
+  rules:
+    - backendRefs:
+        - name: grpc-echo-aff
+          port: 50051
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: grpc-echo-aff-header-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: grpc-echo-aff
+  sessionPersistence:
+    type: Header
+    sessionName: x-session-id

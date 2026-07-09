@@ -1,16 +1,18 @@
-# connect-timeout annotation fixture.
+# CoxswainBackendPolicy consumption on the Ingress surface (#554).
+#
 # A Service with NO selector, backed by a hand-written EndpointSlice whose single
 # address is 192.0.2.1 (RFC 5737 TEST-NET-1 — guaranteed never routable). A TCP
 # connect to it black-holes: the SYN is dropped, so connect() hangs until a timeout
 # fires (never ECONNREFUSED, which would be instant and bypass the connect phase).
 #
-# With connect-timeout: 500ms the proxy gives up the TCP-connect after 500ms and
-# returns 502 (ConnectTimedout, backend_request_timeout_active). Without the
-# annotation the connect would hang until the test client's own 5s timeout, so the
-# route would never return a clean 502 and the test would fail — i.e. the 502 IS the
-# proof the annotation shortened the connect deadline.
+# A CoxswainBackendPolicy attached to the Service sets spec.timeouts.connect: 500ms.
+# With it, the proxy abandons the TCP-connect after 500ms and returns 502
+# (ConnectTimedout). Without it the connect would hang past the test client's budget
+# and no clean 502 would ever return — so the prompt 502 IS the proof the policy
+# reached the Ingress path (previously the Ingress reconciler never consulted
+# CoxswainBackendPolicy at all).
 #
-# Route: connect-timeout.TESTNS.local / → blackhole:80 (192.0.2.1, SYN black-holed)
+# Route: backend-policy-connect.TESTNS.local / -> blackhole:80 (192.0.2.1, black-holed)
 ---
 apiVersion: v1
 kind: Service
@@ -39,13 +41,11 @@ endpoints:
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: connect-timeout-ingress
-  annotations:
-    ingress.coxswain-labs.dev/connect-timeout: "500ms"
+  name: backend-policy-connect
 spec:
   ingressClassName: coxswain
   rules:
-    - host: connect-timeout.${TESTNS}.local
+    - host: backend-policy-connect.${TESTNS}.local
       http:
         paths:
           - path: /
@@ -55,3 +55,19 @@ spec:
                 name: blackhole
                 port:
                   number: 80
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: blackhole-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: blackhole
+  timeouts:
+    connect: "500ms"
+  loadBalancer:
+    algorithm: least_conn
+  circuitBreaker:
+    threshold: 50

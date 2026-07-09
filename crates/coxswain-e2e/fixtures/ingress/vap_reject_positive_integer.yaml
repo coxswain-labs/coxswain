@@ -1,0 +1,27 @@
+# VAP rejection fixture: invalid positive-integer annotation value (#29).
+#
+# `auth-tls-verify-depth: "notanumber"` is not a valid positive integer. The
+# VAP rejects the Ingress at admission time — exercises the general ">= 1
+# positive integer" VAP rule shape (retargeted from `circuit-breaker-threshold`
+# after #554 converged it to `CoxswainBackendPolicy`, which is not
+# VAP-validated by design; itself previously retargeted from `rate-limit-rps`
+# after #552 converged rate-limit to a CR reference with no VAP rule).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vap-reject-positive-integer
+  annotations:
+    ingress.coxswain-labs.dev/auth-tls-verify-depth: "notanumber"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: vap-posint.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

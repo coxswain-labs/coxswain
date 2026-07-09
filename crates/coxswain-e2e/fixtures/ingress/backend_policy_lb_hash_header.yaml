@@ -1,0 +1,35 @@
+# CoxswainBackendPolicy loadBalancer.algorithm: hash:header=x-hash-key fixture
+# (#554), routing to the two-replica echo Service. Requests carrying the same
+# X-Hash-Key value must consistently hash to the same endpoint; requests
+# without the header fall back to round-robin. Apply backends::ECHO_TWO_REPLICAS
+# before this fixture.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lb-hash-header
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: lb.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-two-replicas
+                port:
+                  number: 3000
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: echo-two-replicas-hash-header-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-two-replicas
+  loadBalancer:
+    algorithm: "hash:header=x-hash-key"

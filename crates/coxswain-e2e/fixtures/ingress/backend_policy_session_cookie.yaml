@@ -1,6 +1,9 @@
-# Cookie-mode session affinity (#15): one Service with three pods so weighted
-# round-robin spreads across pods and the affinity cookie pins to exactly one.
-# A custom cookie name (SESSIONID) exercises the session-cookie-name annotation.
+# CoxswainBackendPolicy sessionPersistence: Cookie fixture (#554, converged from
+# the former session-affinity/session-cookie-name Ingress annotations).
+#
+# One Service with three pods so weighted round-robin spreads across pods and
+# the affinity cookie pins to exactly one. A custom cookie name (SESSIONID)
+# exercises `sessionPersistence.sessionName`.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -47,9 +50,6 @@ apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: affinity-cookie
-  annotations:
-    ingress.coxswain-labs.dev/session-affinity: "cookie"
-    ingress.coxswain-labs.dev/session-cookie-name: "SESSIONID"
 spec:
   ingressClassName: coxswain
   rules:
@@ -63,3 +63,16 @@ spec:
                 name: echo-aff
                 port:
                   number: 3000
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: echo-aff-cookie-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-aff
+  sessionPersistence:
+    type: Cookie
+    sessionName: SESSIONID

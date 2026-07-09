@@ -317,6 +317,7 @@ fn build_ingress_routes(
             stores.rate_limits,
             stores.ip_access,
         ),
+        ownership.backend_policy_index,
     );
     let mut pending_annotation_events: Vec<(String, String, Vec<AnnotationIssue>)> = Vec::new();
     for ingress in ingresses {

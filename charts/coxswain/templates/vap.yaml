@@ -31,15 +31,6 @@ spec:
     # (no spaces), where unit ∈ {ns, us, ms, s, m, h}. Examples: "5s", "1m30s".
 
     - expression: >-
-        !('ingress.coxswain-labs.dev/connect-timeout' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/connect-timeout'].matches(
-          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/connect-timeout: "' +
-        variables.ann['ingress.coxswain-labs.dev/connect-timeout'] +
-        '" — must be a Go duration string (e.g. "5s", "1m30s", "500ms")'
-
-    - expression: >-
         !('ingress.coxswain-labs.dev/read-timeout' in variables.ann) ||
         variables.ann['ingress.coxswain-labs.dev/read-timeout'].matches(
           '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
@@ -58,15 +49,6 @@ spec:
         '" — must be a Go duration string (e.g. "60s", "1m")'
 
     - expression: >-
-        !('ingress.coxswain-labs.dev/upstream-keepalive-timeout' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/upstream-keepalive-timeout'].matches(
-          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/upstream-keepalive-timeout: "' +
-        variables.ann['ingress.coxswain-labs.dev/upstream-keepalive-timeout'] +
-        '" — must be a Go duration string (e.g. "60s", "5m")'
-
-    - expression: >-
         !('ingress.coxswain-labs.dev/auth-timeout' in variables.ann) ||
         variables.ann['ingress.coxswain-labs.dev/auth-timeout'].matches(
           '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
@@ -74,33 +56,6 @@ spec:
         'ingress.coxswain-labs.dev/auth-timeout: "' +
         variables.ann['ingress.coxswain-labs.dev/auth-timeout'] +
         '" — must be a Go duration string (e.g. "500ms", "2s")'
-
-    - expression: >-
-        !('ingress.coxswain-labs.dev/circuit-breaker-window' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-window'].matches(
-          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/circuit-breaker-window: "' +
-        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-window'] +
-        '" — must be a Go duration string (e.g. "10s", "1m")'
-
-    - expression: >-
-        !('ingress.coxswain-labs.dev/circuit-breaker-open-duration' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-open-duration'].matches(
-          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/circuit-breaker-open-duration: "' +
-        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-open-duration'] +
-        '" — must be a Go duration string (e.g. "5s", "30s")'
-
-    - expression: >-
-        !('ingress.coxswain-labs.dev/circuit-breaker-max-open-duration' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-max-open-duration'].matches(
-          '^[0-9]+([.][0-9]+)?(ns|us|ms|s|m|h)([0-9]+([.][0-9]+)?(ns|us|ms|s|m|h))*$')
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/circuit-breaker-max-open-duration: "' +
-        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-max-open-duration'] +
-        '" — must be a Go duration string (e.g. "60s", "5m")'
 
     # ── Boolean annotations ───────────────────────────────────────────────────
 
@@ -158,27 +113,6 @@ spec:
         '" — must be a non-negative integer (e.g. "3")'
 
     - expression: >-
-        !('ingress.coxswain-labs.dev/circuit-breaker-threshold' in variables.ann) ||
-        (variables.ann['ingress.coxswain-labs.dev/circuit-breaker-threshold'].matches(
-           '^[0-9]+$') &&
-         int(variables.ann['ingress.coxswain-labs.dev/circuit-breaker-threshold']) >= 1 &&
-         int(variables.ann['ingress.coxswain-labs.dev/circuit-breaker-threshold']) <= 100)
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/circuit-breaker-threshold: "' +
-        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-threshold'] +
-        '" — must be an integer in 1-100 (error-rate percentage)'
-
-    - expression: >-
-        !('ingress.coxswain-labs.dev/circuit-breaker-min-requests' in variables.ann) ||
-        (variables.ann['ingress.coxswain-labs.dev/circuit-breaker-min-requests'].matches(
-           '^[0-9]+$') &&
-         int(variables.ann['ingress.coxswain-labs.dev/circuit-breaker-min-requests']) >= 1)
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/circuit-breaker-min-requests: "' +
-        variables.ann['ingress.coxswain-labs.dev/circuit-breaker-min-requests'] +
-        '" — must be a positive integer >= 1 (e.g. "10")'
-
-    - expression: >-
         !('ingress.coxswain-labs.dev/auth-tls-verify-depth' in variables.ann) ||
         (variables.ann['ingress.coxswain-labs.dev/auth-tls-verify-depth'].matches('^[0-9]+$') &&
          int(variables.ann['ingress.coxswain-labs.dev/auth-tls-verify-depth']) >= 1)
@@ -208,15 +142,6 @@ spec:
         '" — must be a byte count or size string (e.g. "8m", "512k", "10485760")'
 
     # ── Enum annotations ──────────────────────────────────────────────────────
-
-    - expression: >-
-        !('ingress.coxswain-labs.dev/session-affinity' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/session-affinity'].lowerAscii() in
-          ['cookie', 'header']
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/session-affinity: "' +
-        variables.ann['ingress.coxswain-labs.dev/session-affinity'] +
-        '" — must be one of: cookie, header (case-insensitive)'
 
     - expression: >-
         !('ingress.coxswain-labs.dev/path-normalize' in variables.ann) ||
@@ -252,19 +177,6 @@ spec:
         'ingress.coxswain-labs.dev/ssl-redirect-code: "' +
         variables.ann['ingress.coxswain-labs.dev/ssl-redirect-code'] +
         '" — must be one of: 301, 302, 307, 308'
-
-    - expression: >-
-        !('ingress.coxswain-labs.dev/load-balance' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/load-balance'] in
-          ['round_robin', 'least_conn', 'ewma', 'ip_hash', 'hash:uri', 'hash:source-ip'] ||
-        (variables.ann['ingress.coxswain-labs.dev/load-balance'].startsWith('hash:header=') &&
-         variables.ann['ingress.coxswain-labs.dev/load-balance'].size() > 12) ||
-        (variables.ann['ingress.coxswain-labs.dev/load-balance'].startsWith('hash:cookie=') &&
-         variables.ann['ingress.coxswain-labs.dev/load-balance'].size() > 12)
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/load-balance: "' +
-        variables.ann['ingress.coxswain-labs.dev/load-balance'] +
-        '" — must be one of: round_robin, least_conn, ewma, ip_hash, hash:uri, hash:source-ip, hash:header=<name>, hash:cookie=<name>'
 
     # ── URL annotation ────────────────────────────────────────────────────────
 

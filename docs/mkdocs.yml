@@ -98,6 +98,9 @@ nav:
     - Configuration: reference/configuration.md
     - Observability: reference/observability.md
     - Conformance: reference/conformance.md
-  - Architecture: architecture.md
+  - Architecture:
+    - Overview: architecture.md
+    - Deployment models: architecture/deployment-models.md
+    - Discovery protocol: architecture/discovery-protocol.md
   - FAQ: faq.md
 

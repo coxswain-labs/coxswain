@@ -181,6 +181,31 @@ pub const BACKEND_POLICY_CIRCUIT_BREAKER: &str = fixture!("backend_policy_circui
 pub const BACKEND_POLICY_INVALID_CIRCUIT_BREAKER: &str =
     fixture!("backend_policy_invalid_circuit_breaker.yaml");
 
+/// CoxswainBackendPolicy `sessionPersistence: {type: Cookie, sessionName:
+/// SESSIONID}` on an HTTPRoute (#554) — new capability, HTTPRoute never had a
+/// session-persistence binding before #554. Self-contained (own `echo-aff`
+/// Deployment/Service, 3 replicas, own Gateway/HTTPRoute).
+pub const BACKEND_POLICY_SESSION_COOKIE: &str = fixture!("backend_policy_session_cookie.yaml");
+
+/// CoxswainBackendPolicy sessionPersistence sad path on HTTPRoute (#554):
+/// `type: Header` with no `sessionName` — WARNs and disables persistence
+/// (fail-open), the route still serves round-robin.
+pub const BACKEND_POLICY_SESSION_HEADER_MISSING_NAME: &str =
+    fixture!("backend_policy_session_header_missing_name.yaml");
+
+/// CoxswainBackendPolicy `sessionPersistence: {type: Header, sessionName:
+/// x-session-id}` on a GRPCRoute (#554) — new capability, GRPCRoute never had
+/// a session-persistence binding before #554. Self-contained (own 3-replica
+/// `grpc-echo-aff` Deployment/Service, own Gateway/GRPCRoute).
+pub const BACKEND_POLICY_SESSION_HEADER_GRPC: &str =
+    fixture!("backend_policy_session_header_grpc.yaml");
+
+/// CoxswainBackendPolicy sessionPersistence sad path on GRPCRoute (#554):
+/// `type: Header` with no `sessionName` — WARNs and disables persistence
+/// (fail-open), the route still serves round-robin.
+pub const BACKEND_POLICY_SESSION_HEADER_MISSING_NAME_GRPC: &str =
+    fixture!("backend_policy_session_header_missing_name_grpc.yaml");
+
 /// Minimal single-listener Gateway used by the listener-drain traffic tests (#231).
 /// Declares one HTTP listener on `GATEWAY_HTTP_PORT`.
 pub const LISTENER_DRAIN: &str = fixture!("listener_drain.yaml");

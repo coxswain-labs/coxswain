@@ -2,14 +2,18 @@
 //!
 //! The module is split into domain submodules re-exported here:
 //!
-//! - [`traffic_policy`] — timeout and retry annotations.
+//! - [`traffic_policy`] — per-request timeout, retry, compression, and rate-limit annotations.
 //! - [`routing`] — path rewrite and regex opt-in annotations.
 //! - [`filters`] — request/response header modifiers, redirect, and ssl-redirect annotations.
 //! - [`edge_access`] — `ip-access-control` CR reference, forwarded-for trust.
 //! - [`auth`] — request authentication (`auth-*`, #24).
 //! - [`client_cert`] — per-host client-certificate mTLS (`auth-tls-*`, #267).
 //! - [`caching`] — RFC 7234 response-cache opt-in.
-//! - [`session`] — sticky-session (session-affinity) binding.
+//!
+//! Per-backend connection policy — connect timeout, upstream keepalive, LB
+//! algorithm, circuit breaker, session persistence — is **not** an annotation
+//! family here: it converged onto `CoxswainBackendPolicy`, attached to the
+//! backend `Service` (#554). See `crate::gateway_api::backend_policy`.
 //!
 //! The top-level [`IngressAnnotations::parse`] function is called once per Ingress in
 //! [`super::reconcile`] and threads the results into every rule/path entry.
@@ -28,7 +32,6 @@ pub(crate) mod client_cert;
 pub(crate) mod edge_access;
 mod filters;
 mod routing;
-mod session;
 pub(crate) mod traffic_policy;
 
 pub use auth::*;
@@ -36,12 +39,10 @@ pub use client_cert::*;
 pub use edge_access::*;
 pub use filters::*;
 pub use routing::*;
-pub use session::*;
 pub use traffic_policy::*;
 
 use coxswain_core::routing::{
-    CircuitBreakerConfig, FilterAction, ForwardedForConfig, HeaderMod, LoadBalance, NormalizeLevel,
-    PathModifier, RouteTimeouts, SessionAffinity,
+    FilterAction, ForwardedForConfig, HeaderMod, NormalizeLevel, PathModifier, RouteTimeouts,
 };
 use std::collections::BTreeMap;
 
@@ -101,8 +102,10 @@ pub fn parse_bool(s: &str) -> Option<bool> {
 /// generated from that Ingress (both rule-path entries and the `spec.defaultBackend`).
 #[derive(Default)]
 pub(super) struct IngressAnnotations {
-    /// Partial timeout overrides: the connect/read/send fields come from annotations;
-    /// `request` and `backend_request` stay `None` (those come from HTTPRoute/GW API only).
+    /// Partial timeout overrides: the read/send fields come from annotations;
+    /// `connect` stays `None` (it converged onto `CoxswainBackendPolicy`, #554)
+    /// and `request`/`backend_request` stay `None` (those come from
+    /// HTTPRoute/GW API only).
     pub timeouts: RouteTimeouts,
     /// `RetryPolicy` CR reference from `retry` (#551), in intermediate
     /// (pre-resolved) `namespace/name` form. `None` when the annotation is
@@ -147,9 +150,6 @@ pub(super) struct IngressAnnotations {
     /// (Gateway API parity, #553). A missing CR fails **open** (no IP
     /// filtering) — matching the `ExtensionRef` path's fail-open behaviour.
     pub ip_access_control: Option<auth::SecretRef>,
-    /// Sticky-session binding from the `session-*` annotations (#15).
-    /// `None` (the default, or an invalid/incomplete value) keeps round-robin.
-    pub session_affinity: Option<SessionAffinity>,
     /// `RateLimit` CR reference from `rate-limit` (#552), in intermediate
     /// (pre-resolved) `namespace/name` form. `None` when the annotation is
     /// absent or malformed (WARN emitted). The reconciler resolves this into
@@ -190,12 +190,6 @@ pub(super) struct IngressAnnotations {
     /// unparseable (WARN emitted; mirror disabled).  The reconciler resolves this
     /// into a `FilterAction::Mirror` by looking up the Service endpoints.
     pub mirror_target: Option<traffic_policy::MirrorTargetRef>,
-    /// Upstream keepalive idle timeout from
-    /// `ingress.coxswain-labs.dev/upstream-keepalive-timeout` (#266).
-    /// `None` (the default, or an absent/invalid value — WARN emitted) defers to
-    /// Pingora's built-in behaviour. Applied in the proxy via
-    /// `HttpPeer.options.idle_timeout`.
-    pub keepalive_timeout: Option<std::time::Duration>,
     /// `Compression` CR reference from `compression` (#550), in intermediate
     /// (pre-resolved) `namespace/name` form. `None` when the annotation is
     /// absent or malformed (WARN emitted). The reconciler resolves this into
@@ -208,23 +202,12 @@ pub(super) struct IngressAnnotations {
     /// Trusted-proxy forwarded-IP config from the `trust-forwarded-for` family (#271).
     /// `None` when `trust-forwarded-for` is absent or `"false"`.
     pub forwarded_for: Option<ForwardedForConfig>,
-    /// Per-route upstream load-balancing algorithm from `load-balance` (#275, #276).
-    /// Defaults to `RoundRobin` when the annotation is absent or carries an unknown value.
-    /// The `hash:*` forms carry their consistent-hash attribute inline via
-    /// [`LoadBalance::Hash`] (#397).
-    pub load_balance: LoadBalance,
     /// Envoy/Istio-style path normalization level from `path-normalize` (#280).
     ///
     /// `None` when the annotation is absent (the host builder uses its default,
     /// `NormalizeLevel::Base`).  Unrecognized values — and the dropped `"none"`
     /// value (#483) — emit `WARN` and fall back to `Base`.
     pub path_normalize: Option<NormalizeLevel>,
-    /// Per-route circuit-breaker config from `circuit-breaker-*` annotations (#282).
-    ///
-    /// `None` (the default) when `circuit-breaker-threshold` is absent or invalid,
-    /// disabling the circuit breaker for this route. Gateway-API routes always see
-    /// `None` — the circuit breaker is Ingress-only.
-    pub circuit_breaker: Option<CircuitBreakerConfig>,
 }
 
 impl IngressAnnotations {
@@ -257,14 +240,8 @@ impl IngressAnnotations {
         }
 
         // ── Timeouts ──────────────────────────────────────────────────────────
-        let connect = get(ann, CONNECT_TIMEOUT).and_then(|v| {
-            let d = parse_duration(v);
-            if d.is_none() {
-                tracing::warn!(ingress = %route_id, annotation = CONNECT_TIMEOUT, value = v, "invalid duration — using default");
-                issue!(CONNECT_TIMEOUT, "invalid duration — using default");
-            }
-            d
-        });
+        // `connect` converged onto `CoxswainBackendPolicy.timeouts.connect` (#554);
+        // resolved per backend Service by the reconciler, not parsed here.
         let read = get(ann, READ_TIMEOUT).and_then(|v| {
             let d = parse_duration(v);
             if d.is_none() {
@@ -440,8 +417,8 @@ impl IngressAnnotations {
             r
         });
 
-        // ── Session affinity (#15) ────────────────────────────────────────────
-        let session_affinity = parse_session_affinity(ann, route_id, &mut diag);
+        // Session affinity converged onto `CoxswainBackendPolicy.sessionPersistence`
+        // (#554); resolved per backend Service by the reconciler, not parsed here.
 
         // ── RateLimit CR reference (#552) ─────────────────────────────────────
         let rate_limit = get(ann, traffic_policy::RATE_LIMIT).and_then(|v| {
@@ -500,17 +477,9 @@ impl IngressAnnotations {
             r
         });
 
-        // ── Upstream keepalive timeout (#266) ─────────────────────────────────
-        let keepalive_timeout = get(ann, UPSTREAM_KEEPALIVE_TIMEOUT).and_then(|v| {
-            let d = parse_duration(v);
-            if d.is_none() {
-                issue!(
-                    UPSTREAM_KEEPALIVE_TIMEOUT,
-                    "invalid duration — using Pingora default keepalive timeout"
-                );
-            }
-            d
-        });
+        // Upstream keepalive timeout converged onto
+        // `CoxswainBackendPolicy.timeouts.idle` (#554); resolved per backend
+        // Service by the reconciler, not parsed here.
 
         // ── Compression CR reference (#550) ───────────────────────────────────
         let compression = get(ann, traffic_policy::COMPRESSION).and_then(|v| {
@@ -527,10 +496,9 @@ impl IngressAnnotations {
         // ── Trusted-proxy forwarded-IP headers (#271) ─────────────────────────
         let forwarded_for = edge_access::parse_forwarded_for(ann, route_id, &mut diag);
 
-        // ── Load-balance algorithm (#275, #276) ───────────────────────────────
-        let load_balance = get(ann, LOAD_BALANCE)
-            .map(|s| traffic_policy::parse_load_balance(s, route_id, &mut diag))
-            .unwrap_or_default();
+        // Load-balance algorithm converged onto
+        // `CoxswainBackendPolicy.loadBalancer.algorithm` (#554); resolved per
+        // backend Service by the reconciler, not parsed here.
 
         // ── Path normalization level (#280, hardened #483) ────────────────────
         let path_normalize = get(ann, PATH_NORMALIZE).map(|v| {
@@ -567,15 +535,15 @@ impl IngressAnnotations {
             })
         });
 
-        // ── Circuit breaker (#282) ────────────────────────────────────────────
-        let circuit_breaker = traffic_policy::parse_circuit_breaker(ann, route_id, &mut diag);
+        // Circuit breaker converged onto `CoxswainBackendPolicy.circuitBreaker`
+        // (#554); resolved per backend Service by the reconciler, not parsed here.
 
         (
             Self {
                 timeouts: RouteTimeouts {
                     request: None,
                     backend_request: None,
-                    connect,
+                    connect: None,
                     read,
                     send,
                 },
@@ -589,18 +557,14 @@ impl IngressAnnotations {
                 ssl_redirect_code,
                 max_body_size,
                 ip_access_control,
-                session_affinity,
                 rate_limit,
                 auth_basic,
                 auth_ext,
                 auth_jwt,
                 mirror_target,
-                keepalive_timeout,
                 compression,
                 forwarded_for,
-                load_balance,
                 path_normalize,
-                circuit_breaker,
             },
             diag,
         )
@@ -708,14 +672,14 @@ mod tests {
 
     #[test]
     fn get_returns_value_when_present() {
-        let m = ann(&[(CONNECT_TIMEOUT, "5s")]);
-        assert_eq!(get(&m, CONNECT_TIMEOUT), Some("5s"));
+        let m = ann(&[(READ_TIMEOUT, "5s")]);
+        assert_eq!(get(&m, READ_TIMEOUT), Some("5s"));
     }
 
     #[test]
     fn get_returns_none_when_absent() {
         let m = BTreeMap::new();
-        assert_eq!(get(&m, CONNECT_TIMEOUT), None);
+        assert_eq!(get(&m, READ_TIMEOUT), None);
     }
 
     // ── parse_bool() ──────────────────────────────────────────────────────────
@@ -747,13 +711,11 @@ mod tests {
 
     #[test]
     fn parse_timeout_annotations() {
-        let m = ann(&[
-            (CONNECT_TIMEOUT, "5s"),
-            (READ_TIMEOUT, "30s"),
-            (SEND_TIMEOUT, "10s"),
-        ]);
+        let m = ann(&[(READ_TIMEOUT, "30s"), (SEND_TIMEOUT, "10s")]);
         let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert_eq!(a.timeouts.connect, Some(Duration::from_secs(5)));
+        // `connect` has no annotation source — it converged onto
+        // `CoxswainBackendPolicy.timeouts.connect` (#554).
+        assert!(a.timeouts.connect.is_none());
         assert_eq!(a.timeouts.read, Some(Duration::from_secs(30)));
         assert_eq!(a.timeouts.send, Some(Duration::from_secs(10)));
         assert!(a.timeouts.request.is_none());
@@ -763,9 +725,9 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn parse_invalid_timeout_warns_and_uses_default() {
-        let m = ann(&[(CONNECT_TIMEOUT, "not-a-duration")]);
+        let m = ann(&[(READ_TIMEOUT, "not-a-duration")]);
         let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert!(a.timeouts.connect.is_none());
+        assert!(a.timeouts.read.is_none());
         assert!(logs_contain("invalid duration — using default"));
     }
 

@@ -138,20 +138,34 @@ pub const ANNOTATION_TRUST_FORWARDED_FOR: &str = fixture!("annotation_trust_forw
 /// ignore the header and use the L4 IP.
 pub const ANNOTATION_TRUST_FORWARDED_FOR_CIDRS: &str =
     fixture!("annotation_trust_forwarded_for_cidrs.yaml");
-/// Cookie-mode session affinity (#15): a 3-pod `echo-aff` Service plus an Ingress
-/// carrying `session-affinity: cookie` and a custom `session-cookie-name`
-/// (`SESSIONID`). The proxy injects the cookie on the first response and pins
-/// subsequent requests bearing it to the same pod; a stale cookie re-establishes.
-pub const ANNOTATION_SESSION_AFFINITY_COOKIE: &str =
-    fixture!("annotation_session_affinity_cookie.yaml");
-/// Header-mode session affinity (#15): a 3-pod `echo-aff` Service plus an Ingress
-/// carrying `session-affinity: header` and `session-header: X-Session-Id`. The
-/// header value is rendezvous-hashed to one pod; an absent header round-robins.
-pub const ANNOTATION_SESSION_AFFINITY_HEADER: &str =
-    fixture!("annotation_session_affinity_header.yaml");
-/// Baseline for #15: the same 3-pod `echo-aff` Service with NO session-affinity
-/// annotation — proves the default path stays plain round-robin.
-pub const SESSION_AFFINITY_NONE: &str = fixture!("session_affinity_none.yaml");
+/// Cookie-mode session persistence (#15, #554): a 3-pod `echo-aff` Service
+/// plus a `CoxswainBackendPolicy` setting `sessionPersistence.type: Cookie`
+/// and a custom `sessionName` (`SESSIONID`). The proxy injects the cookie on
+/// the first response and pins subsequent requests bearing it to the same
+/// pod; a stale cookie re-establishes.
+pub const BACKEND_POLICY_SESSION_COOKIE: &str = fixture!("backend_policy_session_cookie.yaml");
+/// Header-mode session persistence (#15, #554): a 3-pod `echo-aff` Service
+/// plus a `CoxswainBackendPolicy` setting `sessionPersistence.type: Header`
+/// and `sessionName: X-Session-Id`. The header value is rendezvous-hashed to
+/// one pod; an absent header round-robins.
+pub const BACKEND_POLICY_SESSION_HEADER: &str = fixture!("backend_policy_session_header.yaml");
+/// Baseline for #15, #554: the same 3-pod `echo-aff` Service with NO attached
+/// `CoxswainBackendPolicy` — proves the default path stays plain round-robin.
+pub const BACKEND_POLICY_NONE: &str = fixture!("backend_policy_none.yaml");
+/// Ingress consumption of `CoxswainBackendPolicy` (#554): a black-holed backend
+/// (`192.0.2.1`, RFC 5737) with a policy setting `timeouts.connect: 500ms`,
+/// `loadBalancer.algorithm: least_conn`, and `circuitBreaker.threshold: 50`.
+/// The prompt 502 (connect abandoned at 500ms) is the proof the policy reached
+/// the Ingress path — before #554 the Ingress reconciler never consulted
+/// `CoxswainBackendPolicy` at all.
+pub const BACKEND_POLICY_CONNECT_TIMEOUT: &str = fixture!("backend_policy_connect_timeout.yaml");
+/// Ingress consumption of `CoxswainBackendPolicy.circuitBreaker` (#554): the
+/// same knobs as the Gateway-API fixture (threshold=50%, minRequests=4,
+/// window=500ms, openDuration=2s) applied via a policy targeting `go-httpbin`,
+/// routed to by an Ingress. Proves the `RouteEntry::with_circuit_breaker` wiring
+/// works on the Ingress path specifically (a distinct code path from the
+/// `BackendGroup` fields `timeouts`/`loadBalancer` share).
+pub const BACKEND_POLICY_CIRCUIT_BREAKER: &str = fixture!("backend_policy_circuit_breaker.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/rate-limit` naming a `RateLimit` CR
 /// (`requestsPerSecond: 1, burst: 0`) — Ingress parity with the Gateway API
 /// `ExtensionRef` path (#552). Used to verify the proxy admits a single request
@@ -275,16 +289,14 @@ pub const ANNOTATION_COMPRESSION_TYPES: &str = fixture!("annotation_compression_
 /// `Compression` CR (#550 sad path). Used to verify the reference fails **open** —
 /// the route still serves 200 with no `Content-Encoding`, not a 503.
 pub const ANNOTATION_COMPRESSION_MISSING: &str = fixture!("annotation_compression_missing.yaml");
-/// Ingress with `ingress.coxswain-labs.dev/upstream-keepalive-timeout: 60s` (#266).
-/// Used to verify that sequential requests to the same upstream reuse pooled
-/// connections — `coxswain_proxy_upstream_connections_total{state="reused"}` must
-/// increment above zero.
-pub const ANNOTATION_KEEPALIVE_TIMEOUT: &str = fixture!("annotation_keepalive_timeout.yaml");
-/// Ingress with an unparseable `ingress.coxswain-labs.dev/upstream-keepalive-timeout`
-/// value (#266 sad path). The proxy must serve requests normally (fail-open) and not
-/// reject traffic due to the invalid annotation.
-pub const ANNOTATION_KEEPALIVE_TIMEOUT_INVALID: &str =
-    fixture!("annotation_keepalive_timeout_invalid.yaml");
+/// Ingress backend Service with a `CoxswainBackendPolicy` setting `timeouts.idle:
+/// 60s` (#554 — converged from the former `upstream-keepalive-timeout`
+/// annotation). Used to verify that sequential requests to the same upstream
+/// reuse pooled connections —
+/// `coxswain_proxy_upstream_connections_total{state="reused"}` must increment
+/// above zero.
+pub const BACKEND_POLICY_KEEPALIVE_TIMEOUT: &str =
+    fixture!("backend_policy_keepalive_timeout.yaml");
 /// Labeled CA Secret for per-Ingress client-certificate mTLS tests (#267).
 /// Carries `ingress.coxswain-labs.dev/auth-tls: "true"` so the reflector's
 /// label-scoped watcher picks it up; without the label the proxy fails closed for
@@ -299,44 +311,29 @@ pub const AUTH_TLS_CA_SECRET: &str = fixture!("auth_tls_ca_secret.yaml");
 /// `mtls.TESTNS.local`. Apply `AUTH_TLS_CA_SECRET` first.
 pub const ANNOTATION_AUTH_TLS: &str = fixture!("annotation_auth_tls.yaml");
 
-// ── load-balance (#275) ───────────────────────────────────────────────────────
+// ── load-balance (#275, #276, converged to CoxswainBackendPolicy in #554) ────
 
-/// Ingress with `ingress.coxswain-labs.dev/load-balance: "least_conn"` (#275),
-/// routing to the shared `lb-pool` Service (two endpoints: `lb-fast` echo-basic +
-/// `lb-slow` go-httpbin). Under `least_conn`, concurrent requests accumulate higher
-/// in-flight counts on `lb-slow`, so subsequent selections favour `lb-fast`.
-/// Apply `backends::LB_MIXED` first.
-pub const ANNOTATION_LOAD_BALANCE_LEAST_CONN: &str =
-    fixture!("annotation_load_balance_least_conn.yaml");
+/// Ingress backend Service with a `CoxswainBackendPolicy` setting
+/// `loadBalancer.algorithm: "ip_hash"` (#554), routing to the
+/// `echo-two-replicas` Service (2 pods). A fixed client IP hashes to the same
+/// endpoint, so every sequential request from the test runner lands on the
+/// same pod. Apply `backends::ECHO_TWO_REPLICAS` first.
+pub const BACKEND_POLICY_LB_IP_HASH: &str = fixture!("backend_policy_lb_ip_hash.yaml");
 
-/// Ingress with `ingress.coxswain-labs.dev/load-balance: "ip_hash"` (#275),
-/// routing to the `echo-two-replicas` Service (2 pods). A fixed client IP hashes
-/// to the same endpoint, so every sequential request from the test runner lands on
-/// the same pod.
-/// Apply `backends::ECHO_TWO_REPLICAS` first.
-pub const ANNOTATION_LOAD_BALANCE_IP_HASH: &str = fixture!("annotation_load_balance_ip_hash.yaml");
+/// Ingress backend Service with a `CoxswainBackendPolicy` setting
+/// `loadBalancer.algorithm: "hash:uri"` (#554), routing to the
+/// `echo-two-replicas` Service (2 pods). Every request to the same URI
+/// consistently hashes (HRW) to the same endpoint. Apply
+/// `backends::ECHO_TWO_REPLICAS` first.
+pub const BACKEND_POLICY_LB_HASH_URI: &str = fixture!("backend_policy_lb_hash_uri.yaml");
 
-/// Ingress with an unknown `load-balance` value (`"bogus"`) (#275 sad path),
-/// routing to the `echo-two-replicas` Service. An unknown value warns and falls
-/// back to `round_robin`; all requests must succeed (200) and both pods must be
-/// reachable, proving the invalid annotation never blocks routing.
-/// Apply `backends::ECHO_TWO_REPLICAS` first.
-pub const ANNOTATION_LOAD_BALANCE_UNKNOWN: &str = fixture!("annotation_load_balance_unknown.yaml");
-
-/// Ingress with `ingress.coxswain-labs.dev/load-balance: "hash:uri"` (#276),
-/// routing to the `echo-two-replicas` Service (2 pods). Every request to the same
-/// URI consistently hashes (HRW) to the same endpoint.
-/// Apply `backends::ECHO_TWO_REPLICAS` first.
-pub const ANNOTATION_LOAD_BALANCE_HASH_URI: &str =
-    fixture!("annotation_load_balance_hash_uri.yaml");
-
-/// Ingress with `ingress.coxswain-labs.dev/load-balance: "hash:header=x-hash-key"` (#276),
-/// routing to the `echo-two-replicas` Service (2 pods). Requests carrying the same
-/// `X-Hash-Key` value consistently hash (HRW) to the same endpoint; requests omitting
-/// the header fall back to round-robin.
-/// Apply `backends::ECHO_TWO_REPLICAS` first.
-pub const ANNOTATION_LOAD_BALANCE_HASH_HEADER: &str =
-    fixture!("annotation_load_balance_hash_header.yaml");
+/// Ingress backend Service with a `CoxswainBackendPolicy` setting
+/// `loadBalancer.algorithm: "hash:header=x-hash-key"` (#554), routing to the
+/// `echo-two-replicas` Service (2 pods). Requests carrying the same
+/// `X-Hash-Key` value consistently hash (HRW) to the same endpoint; requests
+/// omitting the header fall back to round-robin. Apply
+/// `backends::ECHO_TWO_REPLICAS` first.
+pub const BACKEND_POLICY_LB_HASH_HEADER: &str = fixture!("backend_policy_lb_hash_header.yaml");
 
 // ── path-normalize (#280) ─────────────────────────────────────────────────────
 
@@ -370,30 +367,29 @@ pub const ANNOTATION_PATH_NORMALIZE_NONE_FALLS_BACK: &str =
 /// terminating endpoint after it enters the `terminating=true` state.
 pub const DRAIN_INGRESS: &str = fixture!("drain_ingress.yaml");
 
-// ── circuit breaker (#282) ───────────────────────────────────────────────────
-
-/// Ingress with `circuit-breaker-threshold: "50"`, `circuit-breaker-window: "10s"`,
-/// `circuit-breaker-open-duration: "2s"`, and `circuit-breaker-min-requests: "4"` (#282).
-///
-/// Routes `breaker.<namespace>.local → go-httpbin:3000`. The short `open-duration`
-/// is intentional: it allows the half-open probe to fire within seconds so the
-/// recovery test completes promptly without a bare sleep.
-///
-/// Apply [`backends::GO_HTTPBIN`] first.
-pub const ANNOTATION_CIRCUIT_BREAKER: &str = fixture!("annotation_circuit_breaker.yaml");
-/// Ingress with an unparseable `circuit-breaker-threshold: "notanumber"` value (#29).
-/// Used to verify the VAP's general ">= 1 positive integer" rule shape rejects the
-/// Ingress at admission time (retargeted from `rate-limit-rps` after #552 converged
-/// `rate-limit` to a CR reference with no VAP rule).
-pub const ANNOTATION_CIRCUIT_BREAKER_THRESHOLD_INVALID: &str =
-    fixture!("annotation_circuit_breaker_threshold_invalid.yaml");
-
 // ── ValidatingAdmissionPolicy (#29) ─────────────────────────────────────────
 
 /// Ingress with `use-regex: "yep"` — invalid boolean value rejected by the VAP.
 pub const VAP_REJECT_BOOLEAN: &str = fixture!("vap_reject_boolean.yaml");
 
-/// Ingress with `session-affinity: "invalid"` — invalid enum value rejected by the VAP.
+/// Ingress with an unparseable `read-timeout: "notaduration"` value (#29).
+/// Used to verify the VAP's general Go-duration-string rule shape rejects the
+/// Ingress at admission time (retargeted from `upstream-keepalive-timeout`
+/// after #554 converged it to `CoxswainBackendPolicy`, which is not
+/// VAP-validated by design).
+pub const VAP_REJECT_DURATION: &str = fixture!("vap_reject_duration.yaml");
+
+/// Ingress with an unparseable `auth-tls-verify-depth: "notanumber"` value (#29).
+/// Used to verify the VAP's general ">= 1 positive integer" rule shape rejects
+/// the Ingress at admission time (retargeted from `circuit-breaker-threshold`
+/// after #554 converged it to `CoxswainBackendPolicy`, which is not
+/// VAP-validated by design; itself previously retargeted from `rate-limit-rps`
+/// after #552).
+pub const VAP_REJECT_POSITIVE_INTEGER: &str = fixture!("vap_reject_positive_integer.yaml");
+
+/// Ingress with `path-normalize: "invalid"` — invalid enum value rejected by
+/// the VAP (retargeted from `session-affinity` after #554 converged it to
+/// `CoxswainBackendPolicy`, which is not VAP-validated by design).
 pub const VAP_REJECT_ENUM: &str = fixture!("vap_reject_enum.yaml");
 
 /// Ingress with `forwarded-for-trusted-cidrs: "not-a-cidr"` — invalid CIDR
@@ -408,14 +404,6 @@ pub const VAP_REJECT_PORT: &str = fixture!("vap_reject_port.yaml");
 
 /// Ingress with one valid annotation per validated format category — accepted by the VAP.
 pub const VAP_VALID_ANNOTATIONS: &str = fixture!("vap_valid_annotations.yaml");
-
-/// Ingress with `session-affinity: cookie` and an invalid `session-cookie-name: "bad;name"`
-/// (semicolon is not a valid RFC 6265 cookie token; not in the VAP so the apply succeeds).
-/// Used to verify that the controller emits a `Warning InvalidAnnotation` Kubernetes Event
-/// on the Ingress while still serving traffic on the route (fail-open fallback to default
-/// cookie name). Requires `backends::ECHO` (#401).
-pub const ANNOTATION_SESSION_COOKIE_NAME_INVALID: &str =
-    fixture!("annotation_session_cookie_name_invalid.yaml");
 
 // ── ACME HTTP-01 challenge passthrough (#184) ────────────────────────────────
 

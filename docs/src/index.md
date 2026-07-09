@@ -16,7 +16,7 @@ A Kubernetes Ingress and Gateway API controller written in Rust, backed by [Ping
 - Controller/proxy split with a strict security boundary — proxy pods hold zero Kubernetes API access
 - Rich `ingress.coxswain-labs.dev/*` annotation surface with admission-time validation via `ValidatingAdmissionPolicy`
 
-See [Architecture](architecture.md) for the deployment models and security boundary.
+See [Architecture](architecture.md) for how the controller and proxy roles fit together, and [Deployment models](architecture/deployment-models.md) for Shared vs Dedicated.
 
 ## Quick install
 

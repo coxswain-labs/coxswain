@@ -22,7 +22,7 @@ Yes. Both `Ingress` and `HTTPRoute` objects contribute to the same routing table
 
 Embedding status writes in the proxy would force leader election into the data plane: only one replica could write at a time, and horizontal scaling would require electing more leaders. Making the controller the sole Kubernetes reader and writer keeps proxy pods stateless, eliminates inter-replica coordination, and gives the proxy **zero Kubernetes API access** — a compromised proxy pod cannot read from or write to the API server at all. The invariant is enforced by shipping no RBAC for the proxy SA, not by convention.
 
-See [Architecture](architecture.md#deployment-models) for the two macro deployment models (Shared and Dedicated).
+See [Deployment models](architecture/deployment-models.md) for the two macro deployment models (Shared and Dedicated).
 
 ### How does Ingress fit?
 

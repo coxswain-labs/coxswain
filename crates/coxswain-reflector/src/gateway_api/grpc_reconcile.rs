@@ -226,9 +226,10 @@ pub(super) fn reconcile(
         if let Some(tls) = policy_tls {
             group = group.with_tls(tls);
         }
-        // CoxswainBackendPolicy: per-backend connect/idle timeouts (#354) and LB
-        // algorithm (#389) on the BackendGroup; the circuit breaker (#478) is
-        // RouteEntry-level and carried out to the GrpcRuleContext below.
+        // CoxswainBackendPolicy: per-backend connect/idle timeouts (#354), LB
+        // algorithm (#389), and session persistence (#554) on the BackendGroup;
+        // the circuit breaker (#478) is RouteEntry-level and carried out to the
+        // GrpcRuleContext below.
         let bp = pick_backend_policy(backend_refs, route_ns, backend_policy_index);
         if let Some(bp) = bp {
             if bp.connect.is_some() {
@@ -239,6 +240,9 @@ pub(super) fn reconcile(
             }
             if let Some(lb) = &bp.load_balance {
                 group = group.with_load_balance(lb.clone());
+            }
+            if bp.session_affinity.is_some() {
+                group = group.with_session_affinity(bp.session_affinity.clone());
             }
         }
         // RetryPolicy ExtensionRef (#445): GRPCRoute ⇒ `is_grpc=true`, so `grpcCodes`
