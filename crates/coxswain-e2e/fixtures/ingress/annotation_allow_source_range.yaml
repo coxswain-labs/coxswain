@@ -1,6 +1,8 @@
-# allow-source-range annotation fixture (apply backends::ECHO first).
+# ip-access-control fixture (#553): the annotation names an IpAccessControl CR
+# by "namespace/name" — Ingress parity with the Gateway API ExtensionRef path
+# (apply backends::ECHO first).
 #
-# The Ingress restricts access to clients in 203.0.113.0/24. The proxy must:
+# The CR restricts access to clients in 203.0.113.0/24. The proxy must:
 #   * serve a request whose real client IP is in-range (echo backend identity, 200), and
 #   * reject a request whose real client IP is out-of-range with 403.
 #
@@ -9,12 +11,21 @@
 # trusted-sources CIDR.
 #
 # Host: allowrange.TESTNS.local -> echo-a:3000.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: IpAccessControl
+metadata:
+  name: allow-range
+spec:
+  allow:
+    - 203.0.113.0/24
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: allow-source-range-ingress
   annotations:
-    ingress.coxswain-labs.dev/allow-source-range: "203.0.113.0/24"
+    ingress.coxswain-labs.dev/ip-access-control: "${TESTNS}/allow-range"
 spec:
   ingressClassName: coxswain
   rules:

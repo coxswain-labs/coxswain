@@ -1,7 +1,7 @@
 #![allow(missing_docs)]
 //! Security data-plane: edge access control.
 //!
-//! Plane: **data-plane**. Execution: the `allow-source-range` tests need the
+//! Plane: **data-plane**. Execution: the `ip-access-control` tests need the
 //! shared controller running with `--proxy-accept-proxy-protocol` (the only way
 //! to drive a real client IP through the in-cluster LB, which NATs the L4 peer),
 //! so they reconfigure the shared control plane and run in the **serial** pass
@@ -9,9 +9,9 @@
 //!
 //! Classification rule: a test belongs to the plane of its *primary assertion
 //! target*. This file is the home for the v0.3 edge-security feature effect
-//! tests as they land: IP allow/deny source-range (#264), client-cert mTLS
-//! (#267), `satisfy` any/all (#268), external authorization (#273), and
-//! per-client rate limiting (#24/#25). Upstream TLS verification
+//! tests as they land: IP allow/deny via `IpAccessControl` (#264, #268, #553),
+//! client-cert mTLS (#267), `satisfy` any/all (#268), external authorization
+//! (#273), and per-client rate limiting (#24/#25). Upstream TLS verification
 //! (`BackendTLSPolicy`, mTLS to the backend) lives in `tls.rs`.
 
 use coxswain_e2e::{
@@ -54,8 +54,9 @@ mod grpcecho {
     }
 }
 
-/// `allow-source-range`: a request whose **real client IP** (carried in the PROXY
-/// header) is inside the allow-listed CIDR is served normally (#264 happy path).
+/// `ip-access-control` allow-list: a request whose **real client IP** (carried in
+/// the PROXY header) is inside the allow-listed CIDR is served normally (#264,
+/// #553 happy path).
 #[tokio::test]
 async fn allow_source_range_in_range_allowed() -> anyhow::Result<()> {
     bootstrap().await?;
@@ -102,8 +103,9 @@ async fn allow_source_range_in_range_allowed() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `allow-source-range`: a request whose real client IP is outside every allow-listed
-/// CIDR is rejected with 403 before reaching any backend (#264 sad path).
+/// `ip-access-control` allow-list: a request whose real client IP is outside every
+/// allow-listed CIDR is rejected with 403 before reaching any backend (#264,
+/// #553 sad path).
 #[tokio::test]
 async fn allow_source_range_out_of_range_rejected() -> anyhow::Result<()> {
     bootstrap().await?;
@@ -145,9 +147,9 @@ async fn allow_source_range_out_of_range_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `deny-source-range`: a request whose **real client IP** (carried in the PROXY header)
-/// is inside the deny-listed CIDR is rejected with 403 before reaching any backend
-/// (#268 happy path — block in effect).
+/// `ip-access-control` deny-list: a request whose **real client IP** (carried in the
+/// PROXY header) is inside the deny-listed CIDR is rejected with 403 before reaching
+/// any backend (#268, #553 happy path — block in effect).
 #[tokio::test]
 async fn deny_source_range_blocks_listed_client() -> anyhow::Result<()> {
     bootstrap().await?;
@@ -190,8 +192,9 @@ async fn deny_source_range_blocks_listed_client() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `deny-source-range`: a request whose real client IP is **outside** the deny-listed
-/// CIDR is served normally (#268 negative path — block list does not over-block).
+/// `ip-access-control` deny-list: a request whose real client IP is **outside** the
+/// deny-listed CIDR is served normally (#268, #553 negative path — block list does
+/// not over-block).
 #[tokio::test]
 async fn deny_source_range_allows_unlisted_client() -> anyhow::Result<()> {
     bootstrap().await?;
@@ -235,8 +238,8 @@ async fn deny_source_range_allows_unlisted_client() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `deny-source-range` + `allow-source-range`: when both are set, deny is evaluated
-/// first — a client matching both lists is rejected with 403 (#268 precedence test).
+/// `ip-access-control` with both `deny` and `allow` set: deny is evaluated first —
+/// a client matching both lists is rejected with 403 (#268, #553 precedence test).
 /// A client in the allow range but not the deny range is admitted normally.
 #[tokio::test]
 async fn deny_takes_precedence_over_allow_when_both_match() -> anyhow::Result<()> {
@@ -290,6 +293,36 @@ async fn deny_takes_precedence_over_allow_when_both_match() -> anyhow::Result<()
     let echo: EchoResponse = serde_json::from_str(&body)
         .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
     echo.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// `ip-access-control` naming an `IpAccessControl` CR that does not exist: the
+/// reflector warns and fails-open — all requests are admitted regardless of
+/// client IP (#553 sad path, mirrors the rate-limit/compression/retry
+/// CR-reference convergence).
+#[tokio::test]
+async fn ip_access_control_missing_cr_fails_open() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "iac-missing").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_IP_ACCESS_CONTROL_MISSING,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let host = format!("iacmissing.{}.local", ns.name);
+
+    // Route must be live; missing CR → fail-open → all requests admitted.
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
+
+    let (status, _, body) = h.http.get_full(&host, "/").await?;
+    anyhow::ensure!(
+        status == 200,
+        "missing IpAccessControl CR must be fail-open (200), got: {status}"
+    );
+    body.ok_or_else(|| anyhow::anyhow!("expected echo JSON body on 200"))?
+        .assert_backend("echo-a");
 
     Ok(())
 }

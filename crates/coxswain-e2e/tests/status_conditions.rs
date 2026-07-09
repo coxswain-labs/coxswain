@@ -1594,7 +1594,10 @@ async fn vap_rejects_invalid_enum_annotation() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// VAP rejects a CIDR-list annotation with an invalid token (`allow-source-range: "not-a-cidr"`) (#29).
+/// VAP rejects a CIDR-list annotation with an invalid token
+/// (`forwarded-for-trusted-cidrs: "not-a-cidr"`) (#29). Retargeted from
+/// `allow-source-range` after #553 converged `ip-access-control` to a CR
+/// reference with no VAP rule.
 #[tokio::test]
 async fn vap_rejects_invalid_cidr_annotation() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -1605,7 +1608,7 @@ async fn vap_rejects_invalid_cidr_annotation() -> anyhow::Result<()> {
     )
     .await?;
     anyhow::ensure!(
-        msg.contains("allow-source-range"),
+        msg.contains("forwarded-for-trusted-cidrs"),
         "VAP rejection message must name the offending annotation, got: {msg}"
     );
     Ok(())

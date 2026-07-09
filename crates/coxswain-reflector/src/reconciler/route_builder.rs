@@ -315,6 +315,7 @@ fn build_ingress_routes(
             stores.compressions,
             stores.retry_policies,
             stores.rate_limits,
+            stores.ip_access,
         ),
     );
     let mut pending_annotation_events: Vec<(String, String, Vec<AnnotationIssue>)> = Vec::new();

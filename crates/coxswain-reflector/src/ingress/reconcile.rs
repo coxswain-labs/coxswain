@@ -8,12 +8,14 @@ use super::ports::IngressPorts;
 use super::reconcile_helpers::{
     build_ingress_backend_group, prepend_ssl_redirect, resolve_basic_auth_config,
     resolve_compression_config, resolve_ext_auth_config, resolve_host_builder,
-    resolve_jwt_auth_config, resolve_mirror_filter, resolve_rate_limit_config,
-    resolve_retry_config,
+    resolve_ip_access_control_config, resolve_jwt_auth_config, resolve_mirror_filter,
+    resolve_rate_limit_config, resolve_retry_config,
 };
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
-use coxswain_core::crd::{Compression, CoxswainExternalAuth, RateLimit, RetryPolicy};
+use coxswain_core::crd::{
+    Compression, CoxswainExternalAuth, IpAccessControl, RateLimit, RetryPolicy,
+};
 use coxswain_core::routing::{
     BackendGroup, FilterAction, IngressAuthConfig, IngressRoutingTableBuilder, PathModifier,
     RouteEntry, compile_path_regex,
@@ -58,15 +60,16 @@ impl<'a> IngressClassContext<'a> {
 
 /// The `namespace/name`-CRD-reference stores for the annotation family that
 /// converges to a CR reference (#548): `Compression` (#550), `RetryPolicy`
-/// (#551), and `RateLimit` (#552). Grouped into its own struct — rather than
-/// three more parameters on [`IngressExtensionStores::new`] — precisely
-/// because more of the same shape are coming: future workstreams
-/// (ip-access-control #553, backend-policy #554) extend *this* struct.
+/// (#551), `RateLimit` (#552), and `IpAccessControl` (#553). Grouped into its
+/// own struct — rather than four more parameters on
+/// [`IngressExtensionStores::new`] — precisely because more of the same shape
+/// are coming: future workstreams (backend-policy #554) extend *this* struct.
 #[non_exhaustive]
 pub struct IngressCrRefStores<'a> {
     pub(crate) compressions: &'a reflector::Store<Compression>,
     pub(crate) retry_policies: &'a reflector::Store<RetryPolicy>,
     pub(crate) rate_limits: &'a reflector::Store<RateLimit>,
+    pub(crate) ip_access_controls: &'a reflector::Store<IpAccessControl>,
 }
 
 impl<'a> IngressCrRefStores<'a> {
@@ -76,11 +79,13 @@ impl<'a> IngressCrRefStores<'a> {
         compressions: &'a reflector::Store<Compression>,
         retry_policies: &'a reflector::Store<RetryPolicy>,
         rate_limits: &'a reflector::Store<RateLimit>,
+        ip_access_controls: &'a reflector::Store<IpAccessControl>,
     ) -> Self {
         Self {
             compressions,
             retry_policies,
             rate_limits,
+            ip_access_controls,
         }
     }
 }
@@ -106,6 +111,7 @@ pub struct IngressExtensionStores<'a> {
     pub(crate) compressions: &'a reflector::Store<Compression>,
     pub(crate) retry_policies: &'a reflector::Store<RetryPolicy>,
     pub(crate) rate_limits: &'a reflector::Store<RateLimit>,
+    pub(crate) ip_access_controls: &'a reflector::Store<IpAccessControl>,
 }
 
 impl<'a> IngressExtensionStores<'a> {
@@ -128,6 +134,7 @@ impl<'a> IngressExtensionStores<'a> {
             compressions: cr_refs.compressions,
             retry_policies: cr_refs.retry_policies,
             rate_limits: cr_refs.rate_limits,
+            ip_access_controls: cr_refs.ip_access_controls,
         }
     }
 }
@@ -259,11 +266,16 @@ impl IngressReconciler {
         // redirect-* annotation is already present (redirect-* takes precedence).
         let needs_ssl_redirect = ann.ssl_redirect && ann.redirect.is_none();
 
-        // Build the source-IP allow-list once and share one Arc across every route
-        // entry of this Ingress — cloning it onto each path is then a refcount bump.
-        let allow_source_range = ann.allow_source_range.clone().map(Arc::new);
-        // Build the source-IP block list (deny-source-range) the same way.
-        let deny_source_range = ann.deny_source_range.clone().map(Arc::new);
+        // Build the source-IP allow/deny lists once and share the same Arcs across
+        // every route entry of this Ingress — cloning them onto each path is then a
+        // refcount bump. Resolved via the same `resolve_spec` the HTTPRoute/GRPCRoute
+        // ExtensionRef path uses (#553); a missing IpAccessControl CR fails open (no
+        // filtering), unlike the auth resolvers below.
+        let (allow_source_range, deny_source_range) = resolve_ip_access_control_config(
+            ann.ip_access_control.as_ref(),
+            auth_stores.ip_access_controls,
+            &route_id,
+        );
         // Resolve auth annotations once per Ingress; share one Arc chain across
         // every path. `ext-auth` (#549), `auth-basic-secret` (#24), and
         // `auth-jwt` (#441) are independently additive — every configured
@@ -1734,6 +1746,7 @@ mod tests {
                     &empty_compression_store(),
                     &empty_retry_policy_store(),
                     &empty_rate_limit_store(),
+                    &empty_ip_access_store(),
                 ),
             ),
         );
@@ -1779,6 +1792,7 @@ mod tests {
                     &empty_compression_store(),
                     &empty_retry_policy_store(),
                     &empty_rate_limit_store(),
+                    &empty_ip_access_store(),
                 ),
             ),
         );
@@ -2069,6 +2083,7 @@ mod tests {
                     &empty_compression_store(),
                     &retry_policies,
                     &empty_rate_limit_store(),
+                    &empty_ip_access_store(),
                 ),
             ),
         );
@@ -2363,6 +2378,7 @@ mod tests {
                     &empty_compression_store(),
                     &empty_retry_policy_store(),
                     &empty_rate_limit_store(),
+                    &empty_ip_access_store(),
                 ),
             ),
         );

@@ -13,6 +13,7 @@ pub(crate) mod frontend_tls;
 mod grpc_reconcile;
 mod grpc_status;
 mod hostnames;
+pub(crate) mod ip_access_control;
 pub(crate) mod jwt_auth;
 pub(crate) mod rate_limit;
 mod reconcile;

@@ -7,7 +7,9 @@ use super::annotations::AnnotationIssue;
 use super::annotations::auth::{SecretRef, parse_htpasswd};
 use super::annotations::traffic_policy;
 use crate::endpoints;
-use coxswain_core::crd::{Compression, CoxswainExternalAuth, RateLimit, RetryPolicy};
+use coxswain_core::crd::{
+    Compression, CoxswainExternalAuth, IpAccessControl, RateLimit, RetryPolicy,
+};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, BasicCredential, CompressionConfig, FilterAction,
     HostRouterBuilder, IngressAuthConfig, IngressRoutingTableBuilder, NormalizeLevel,
@@ -398,6 +400,41 @@ pub(super) fn resolve_rate_limit_config(
     crate::gateway_api::rate_limit::resolve_spec(&cr.spec)
 }
 
+// ── IP-access-control resolution ────────────────────────────────────────────
+
+/// Resolve the `ip-access-control` annotation's `IpAccessControl` CR reference
+/// into the `(allow, deny)` CIDR sets — the Ingress-parity counterpart to the
+/// HTTPRoute/GRPCRoute `ExtensionRef` filter (#553). Delegates to
+/// [`crate::gateway_api::ip_access_control::resolve_spec`] so both surfaces
+/// resolve the same CR to byte-identical CIDR sets.
+///
+/// A missing CR fails **open** (`(None, None)`, no IP filtering) — matching
+/// the `ExtensionRef` path's fail-open posture: a broken reference degrades to
+/// unfiltered traffic rather than blocking every request.
+pub(super) fn resolve_ip_access_control_config(
+    annotation: Option<&SecretRef>,
+    ip_access_controls: &reflector::Store<IpAccessControl>,
+    route_id: &str,
+) -> (
+    crate::gateway_api::ip_access_control::CidrSet,
+    crate::gateway_api::ip_access_control::CidrSet,
+) {
+    let Some(r) = annotation else {
+        return (None, None);
+    };
+    let obj_ref = reflector::ObjectRef::<IpAccessControl>::new(&r.name).within(&r.namespace);
+    let Some(cr) = ip_access_controls.get(&obj_ref) else {
+        tracing::warn!(
+            ingress = %route_id,
+            namespace = %r.namespace,
+            name = %r.name,
+            "IpAccessControl CR not found — IP access control skipped (fail-open)"
+        );
+        return (None, None);
+    };
+    crate::gateway_api::ip_access_control::resolve_spec(&cr.spec, &r.namespace, &r.name)
+}
+
 /// Prepend an HTTPS `RequestRedirect` to `base`, returning the combined filter list.
 ///
 /// The HTTP-listener entry of an `ssl-redirect` route carries this leading
@@ -444,12 +481,27 @@ pub(super) fn resolve_host_builder<'b>(
 mod tests {
     use super::*;
     use crate::tests::fixtures::{
-        empty_compression_store, empty_external_auth_store, empty_jwks_cache, empty_jwt_auth_store,
-        empty_rate_limit_store, empty_retry_policy_store, empty_secret_store, empty_svc_store,
-        make_rate_limit_store, slice_store,
+        empty_compression_store, empty_external_auth_store, empty_ip_access_store,
+        empty_jwks_cache, empty_jwt_auth_store, empty_rate_limit_store, empty_retry_policy_store,
+        empty_secret_store, empty_svc_store, make_ip_access_store, make_rate_limit_store,
+        slice_store,
     };
-    use coxswain_core::crd::RateLimit;
+    use coxswain_core::crd::{IpAccessControl, RateLimit};
     use coxswain_core::routing::RateLimitKey;
+
+    // `IpAccessControlSpec` is `#[non_exhaustive]` — deserialize a CR instead.
+    fn ip_access_cr(ns: &str, name: &str, allow: &[&str], deny: &[&str]) -> IpAccessControl {
+        let fmt_list = |xs: &[&str]| xs.iter().map(|x| format!("\n  - {x}")).collect::<String>();
+        let yaml = format!(
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: IpAccessControl\n\
+             metadata:\n  name: {name}\n  namespace: {ns}\n\
+             spec:\n  allow:{}\n  deny:{}\n",
+            fmt_list(allow),
+            fmt_list(deny),
+        );
+        serde_yaml::from_str(&yaml).expect("valid IpAccessControl")
+    }
 
     // `RateLimitSpec` is `#[non_exhaustive]` — deserialize a CR instead.
     fn rate_limit_cr(ns: &str, name: &str, by_header: Option<&str>) -> RateLimit {
@@ -640,5 +692,48 @@ mod tests {
             resolve_rate_limit_config(Some(&r), &store, "default/ing", false, &mut diag).is_some()
         );
         assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn resolve_ip_access_control_config_absent_annotation_is_none() {
+        let store = empty_ip_access_store();
+        let (allow, deny) = resolve_ip_access_control_config(None, &store, "default/ing");
+        assert!(allow.is_none());
+        assert!(deny.is_none());
+    }
+
+    #[test]
+    fn resolve_ip_access_control_config_missing_cr_fails_open() {
+        // Unlike every auth resolver above, a missing IpAccessControl reference
+        // must NOT install a fail-closed check — IP filtering degrades to "no
+        // filtering", matching the HTTPRoute/GRPCRoute ExtensionRef path. The
+        // "resolved" case is covered by
+        // `gateway_api::ip_access_control::resolve_spec`'s own test module,
+        // which this function delegates to.
+        let r = secret_ref("default", "absent");
+        let store = empty_ip_access_store();
+        let (allow, deny) = resolve_ip_access_control_config(Some(&r), &store, "default/ing");
+        assert!(allow.is_none());
+        assert!(deny.is_none());
+    }
+
+    #[test]
+    fn resolve_ip_access_control_config_present_cr_resolves_allow_and_deny() {
+        let r = secret_ref("default", "policy");
+        let store = make_ip_access_store(vec![ip_access_cr(
+            "default",
+            "policy",
+            &["203.0.113.0/24"],
+            &["10.0.0.0/8"],
+        )]);
+        let (allow, deny) = resolve_ip_access_control_config(Some(&r), &store, "default/ing");
+        assert_eq!(
+            *allow.expect("allow set"),
+            vec!["203.0.113.0/24".parse::<ipnet::IpNet>().expect("valid")]
+        );
+        assert_eq!(
+            *deny.expect("deny set"),
+            vec!["10.0.0.0/8".parse::<ipnet::IpNet>().expect("valid")]
+        );
     }
 }

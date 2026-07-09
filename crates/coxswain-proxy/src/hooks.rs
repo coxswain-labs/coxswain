@@ -257,7 +257,8 @@ pub(crate) async fn request_filter<K>(
         }
     }
 
-    // Per-route source-IP block list (ingress.coxswain-labs.dev/deny-source-range).
+    // Per-route source-IP block list, from an `IpAccessControl` reference —
+    // Ingress `ip-access-control` annotation or Gateway API `ExtensionRef` (#553).
     // Evaluated BEFORE the allow-list: a denied IP is blocked even when the allow-list
     // would admit it. A None client IP is fail-open (not denied) — a block list only
     // acts on IPs it can positively attribute to a listed range.
@@ -280,7 +281,8 @@ pub(crate) async fn request_filter<K>(
         }
     }
 
-    // Per-route source-IP allow-list (ingress.coxswain-labs.dev/allow-source-range).
+    // Per-route source-IP allow-list, from the same `IpAccessControl` reference
+    // as the deny-list above (#553).
     // Access control runs ahead of redirect and body handling — so a denied client
     // never receives a redirect (which would leak the canonical host/URL) nor has
     // its body read. The real client IP is resolved once by resolve_client_ip (above)

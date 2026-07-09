@@ -5,7 +5,7 @@
 //! - [`traffic_policy`] — timeout and retry annotations.
 //! - [`routing`] — path rewrite and regex opt-in annotations.
 //! - [`filters`] — request/response header modifiers, redirect, and ssl-redirect annotations.
-//! - [`edge_access`] — source-IP allow/deny, forwarded-for trust.
+//! - [`edge_access`] — `ip-access-control` CR reference, forwarded-for trust.
 //! - [`auth`] — request authentication (`auth-*`, #24).
 //! - [`client_cert`] — per-host client-certificate mTLS (`auth-tls-*`, #267).
 //! - [`caching`] — RFC 7234 response-cache opt-in.
@@ -139,12 +139,14 @@ pub(super) struct IngressAnnotations {
     /// Per-route request body size limit in bytes from `max-body-size` (#263).
     /// `None` (the default, or an unparseable value) imposes no limit.
     pub max_body_size: Option<u64>,
-    /// Source-IP allow-list (CIDR set) from `allow-source-range` (#264).
-    /// `None` (the default, or an all-invalid/absent value) admits all source IPs.
-    pub allow_source_range: Option<Vec<ipnet::IpNet>>,
-    /// Source-IP block list (CIDR set) from `deny-source-range` (#268).
-    /// `None` (the default, or an all-invalid/absent value) blocks nothing.
-    pub deny_source_range: Option<Vec<ipnet::IpNet>>,
+    /// `IpAccessControl` CR reference from `ip-access-control` (#553), in
+    /// intermediate (pre-resolved) `namespace/name` form. `None` when the
+    /// annotation is absent or malformed (WARN emitted). The reconciler
+    /// resolves this into the same `(allow_source_range, deny_source_range)`
+    /// CIDR sets the HTTPRoute/GRPCRoute `ExtensionRef` filter produces
+    /// (Gateway API parity, #553). A missing CR fails **open** (no IP
+    /// filtering) — matching the `ExtensionRef` path's fail-open behaviour.
+    pub ip_access_control: Option<auth::SecretRef>,
     /// Sticky-session binding from the `session-*` annotations (#15).
     /// `None` (the default, or an invalid/incomplete value) keeps round-robin.
     pub session_affinity: Option<SessionAffinity>,
@@ -426,13 +428,17 @@ impl IngressAnnotations {
             n
         });
 
-        // ── Allow-source-range (#264) ─────────────────────────────────────────
-        let allow_source_range = get(ann, ALLOW_SOURCE_RANGE)
-            .and_then(|s| parse_allow_source_range(s, route_id, &mut diag));
-
-        // ── Deny-source-range (#268) ──────────────────────────────────────────
-        let deny_source_range = get(ann, DENY_SOURCE_RANGE)
-            .and_then(|s| parse_deny_source_range(s, route_id, &mut diag));
+        // ── IpAccessControl CR reference (#553) ───────────────────────────────
+        let ip_access_control = get(ann, IP_ACCESS_CONTROL).and_then(|v| {
+            let r = auth::parse_secret_ref(v);
+            if r.is_none() {
+                issue!(
+                    IP_ACCESS_CONTROL,
+                    "invalid ip-access-control — expected \"namespace/name\"; IP filtering disabled"
+                );
+            }
+            r
+        });
 
         // ── Session affinity (#15) ────────────────────────────────────────────
         let session_affinity = parse_session_affinity(ann, route_id, &mut diag);
@@ -582,8 +588,7 @@ impl IngressAnnotations {
                 ssl_redirect,
                 ssl_redirect_code,
                 max_body_size,
-                allow_source_range,
-                deny_source_range,
+                ip_access_control,
                 session_affinity,
                 rate_limit,
                 auth_basic,
@@ -814,6 +819,32 @@ mod tests {
         assert!(a.rate_limit.is_none());
         assert_eq!(diag.len(), 1);
         assert_eq!(diag[0].annotation, traffic_policy::RATE_LIMIT);
+    }
+
+    #[test]
+    fn parse_ip_access_control_valid_ref() {
+        let m = ann(&[(IP_ACCESS_CONTROL, "iac-ns/my-policy")]);
+        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
+        let r = a.ip_access_control.expect("ip_access_control must parse");
+        assert_eq!(r.namespace, "iac-ns");
+        assert_eq!(r.name, "my-policy");
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn parse_ip_access_control_absent_is_none() {
+        let (a, diag) = IngressAnnotations::parse(None, "default/test");
+        assert!(a.ip_access_control.is_none());
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn parse_ip_access_control_malformed_warns_and_disables() {
+        let m = ann(&[(IP_ACCESS_CONTROL, "no-slash-here")]);
+        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
+        assert!(a.ip_access_control.is_none());
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, IP_ACCESS_CONTROL);
     }
 
     #[test]

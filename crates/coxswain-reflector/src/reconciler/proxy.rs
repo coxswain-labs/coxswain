@@ -1125,7 +1125,6 @@ struct GatewayApiStoreWriters {
     policies: reflector::store::Writer<BackendTlsPolicy>,
     configmaps: reflector::store::Writer<ConfigMap>,
     path_rewrites: reflector::store::Writer<PathRewriteRegex>,
-    ip_access: reflector::store::Writer<IpAccessControl>,
     basic_auths: reflector::store::Writer<BasicAuth>,
     request_size_limits: reflector::store::Writer<RequestSizeLimit>,
     listener_sets: reflector::store::Writer<ListenerSet>,
@@ -1158,7 +1157,6 @@ fn add_gateway_api_reflectors(
         policies,
         configmaps,
         path_rewrites,
-        ip_access,
         basic_auths,
         request_size_limits,
         listener_sets,
@@ -1240,14 +1238,6 @@ fn add_gateway_api_reflectors(
         watcher::Config::default(),
         ReflectorEffects::new(notify, health, "path_rewrite_regex", metrics),
         "PathRewriteRegex",
-    );
-    spawn_reflector(
-        set,
-        ip_access,
-        scoped_api::<IpAccessControl>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "ip_access_control", metrics),
-        "IpAccessControl",
     );
     spawn_reflector(
         set,
@@ -1527,6 +1517,17 @@ async fn spawn_tasks(
         ReflectorEffects::new(&notify, &controller_health, "rate_limit", metrics),
         "RateLimit",
     );
+    // Always-on (not gated by `enable_gateway_api`): same fix, same rationale,
+    // for the Ingress `ip-access-control` annotation (#553) and the
+    // `IpAccessControl` CR store.
+    spawn_reflector(
+        &mut set,
+        ip_access_writer,
+        scoped_api::<IpAccessControl>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(&notify, &controller_health, "ip_access_control", metrics),
+        "IpAccessControl",
+    );
 
     // --- Ingress reflectors (gated by --disable-ingress) ---
     //
@@ -1598,7 +1599,6 @@ async fn spawn_tasks(
             policies: policy_writer,
             configmaps: configmap_writer,
             path_rewrites: path_rewrite_writer,
-            ip_access: ip_access_writer,
             basic_auths: basic_auth_writer,
             request_size_limits: request_size_limit_writer,
             listener_sets: listener_set_writer,

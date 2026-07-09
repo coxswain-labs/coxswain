@@ -1,13 +1,15 @@
 # VAP rejection fixture: invalid CIDR list annotation value.
 #
-# `allow-source-range: "not-a-cidr"` fails the per-token CIDR check. The VAP
-# must reject this Ingress at admission time.
+# `forwarded-for-trusted-cidrs: "not-a-cidr"` fails the per-token CIDR check
+# (retargeted from `allow-source-range` after #553 converged
+# `ip-access-control` to a CR reference with no VAP rule). The VAP must
+# reject this Ingress at admission time.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: vap-reject-cidr
   annotations:
-    ingress.coxswain-labs.dev/allow-source-range: "not-a-cidr"
+    ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs: "not-a-cidr"
 spec:
   ingressClassName: coxswain
   rules:

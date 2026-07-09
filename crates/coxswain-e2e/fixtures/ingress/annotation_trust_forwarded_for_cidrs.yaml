@@ -2,10 +2,20 @@
 #
 # The Ingress trusts X-Real-IP only when the L4 peer is 10.0.0.1/32; requests
 # from other peers must be treated as untrusted (the forwarded header is ignored).
-# allow-source-range restricts access to 203.0.113.0/24 so the test can observe
-# which IP the proxy used as the effective client.
+# ip-access-control restricts access to 10.0.0.1/32,203.0.113.0/24 so the test can
+# observe which IP the proxy used as the effective client.
 #
 # Host: trustfwdcidr.TESTNS.local -> echo-a:3000.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: IpAccessControl
+metadata:
+  name: trustfwdcidr-allow
+spec:
+  allow:
+    - 10.0.0.1/32
+    - 203.0.113.0/24
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -14,7 +24,7 @@ metadata:
     ingress.coxswain-labs.dev/trust-forwarded-for: "true"
     ingress.coxswain-labs.dev/forwarded-for-header: "X-Real-IP"
     ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs: "10.0.0.1/32"
-    ingress.coxswain-labs.dev/allow-source-range: "10.0.0.1/32,203.0.113.0/24"
+    ingress.coxswain-labs.dev/ip-access-control: "${TESTNS}/trustfwdcidr-allow"
 spec:
   ingressClassName: coxswain
   rules:

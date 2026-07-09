@@ -3,7 +3,7 @@
 #
 # trust-forwarded-for is enabled but no trusted proxy CIDRs are configured, so the
 # proxy is fail-closed: it trusts NO peer and ignores the forwarded header entirely,
-# using the L4 peer address as the effective client IP for allow-source-range. This
+# using the L4 peer address as the effective client IP for ip-access-control. This
 # fixture exercises that fail-closed behaviour; the trusted-cidrs happy path lives in
 # annotation_trust_forwarded_for_cidrs.yaml.
 #
@@ -11,13 +11,22 @@
 # and the forwarded header independently.
 #
 # Host: trustfwd.TESTNS.local -> echo-a:3000.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: IpAccessControl
+metadata:
+  name: trustfwd-allow
+spec:
+  allow:
+    - 203.0.113.0/24
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: trust-forwarded-for-ingress
   annotations:
     ingress.coxswain-labs.dev/trust-forwarded-for: "true"
-    ingress.coxswain-labs.dev/allow-source-range: "203.0.113.0/24"
+    ingress.coxswain-labs.dev/ip-access-control: "${TESTNS}/trustfwd-allow"
 spec:
   ingressClassName: coxswain
   rules:

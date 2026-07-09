@@ -492,7 +492,7 @@ Mirror traffic is visible in the proxy access log (`mirror: true` field) and cou
 
 ### IP access control
 
-`IpAccessControl` (`gateway.coxswain-labs.dev/v1alpha1`) restricts a route to a set of source-IP CIDR ranges. Attach it to an `HTTPRouteRule` with an `ExtensionRef` filter — the Gateway API surface for the Ingress `allow-source-range` / `deny-source-range` annotations. It has no Gateway API standard equivalent; its merit anchor is Envoy's `rbac` CIDR-principal filter / Istio `AuthorizationPolicy` `ipBlocks`/`notIpBlocks`.
+`IpAccessControl` (`gateway.coxswain-labs.dev/v1alpha1`) restricts a route to a set of source-IP CIDR ranges. Attach it to an `HTTPRouteRule` with an `ExtensionRef` filter — the Gateway API surface for the Ingress [`ip-access-control`](ingress-annotations.md#ip-access-control) annotation. It has no Gateway API standard equivalent; its merit anchor is Envoy's `rbac` CIDR-principal filter / Istio `AuthorizationPolicy` `ipBlocks`/`notIpBlocks`.
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
