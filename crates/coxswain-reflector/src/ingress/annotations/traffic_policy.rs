@@ -1,7 +1,8 @@
 //! Traffic-policy annotation constants and low-level parse helpers.
 //!
 //! Covers: connection/read/send timeouts, the `retry` `RetryPolicy` reference,
-//! and the `compression` `Compression` reference. All helpers emit a structured
+//! the `compression` `Compression` reference, and the `rate-limit` `RateLimit`
+//! reference. All helpers emit a structured
 //! `WARN` on invalid input and return `None` (or the empty default) so the
 //! affected annotation is treated as absent — the Ingress keeps serving.
 
@@ -57,6 +58,19 @@ pub const UPSTREAM_KEEPALIVE_TIMEOUT: &str = "ingress.coxswain-labs.dev/upstream
 /// family, a broken compression reference degrades gracefully rather than
 /// blocking traffic.
 pub const COMPRESSION: &str = "ingress.coxswain-labs.dev/compression";
+
+// ── Rate-limit annotation key ─────────────────────────────────────────────────
+
+/// Reference to a `RateLimit` CR in `namespace/name` form, e.g.
+/// `"default/my-limit"` (#552). Resolves to the same
+/// [`RateLimitConfig`][coxswain_core::routing::RateLimitConfig] the
+/// HTTPRoute/GRPCRoute `ExtensionRef` filter produces (Gateway API parity).
+/// Replaces the former inline `rate-limit-rps` / `rate-limit-burst` /
+/// `rate-limit-by` annotation cluster, whose knobs now live on the
+/// `RateLimit` CRD spec. A missing CR fails **open** (no rate limiting) —
+/// unlike the auth annotation family, a broken rate-limit reference degrades
+/// gracefully rather than blocking traffic.
+pub const RATE_LIMIT: &str = "ingress.coxswain-labs.dev/rate-limit";
 
 // ── Circuit-breaker annotation keys ──────────────────────────────────────────
 

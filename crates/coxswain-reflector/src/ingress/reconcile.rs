@@ -8,11 +8,12 @@ use super::ports::IngressPorts;
 use super::reconcile_helpers::{
     build_ingress_backend_group, prepend_ssl_redirect, resolve_basic_auth_config,
     resolve_compression_config, resolve_ext_auth_config, resolve_host_builder,
-    resolve_jwt_auth_config, resolve_mirror_filter, resolve_retry_config,
+    resolve_jwt_auth_config, resolve_mirror_filter, resolve_rate_limit_config,
+    resolve_retry_config,
 };
 use crate::endpoints;
 use crate::k8s_utils::metadata_created_at;
-use coxswain_core::crd::{Compression, CoxswainExternalAuth, RetryPolicy};
+use coxswain_core::crd::{Compression, CoxswainExternalAuth, RateLimit, RetryPolicy};
 use coxswain_core::routing::{
     BackendGroup, FilterAction, IngressAuthConfig, IngressRoutingTableBuilder, PathModifier,
     RouteEntry, compile_path_regex,
@@ -55,19 +56,46 @@ impl<'a> IngressClassContext<'a> {
     }
 }
 
+/// The `namespace/name`-CRD-reference stores for the annotation family that
+/// converges to a CR reference (#548): `Compression` (#550), `RetryPolicy`
+/// (#551), and `RateLimit` (#552). Grouped into its own struct — rather than
+/// three more parameters on [`IngressExtensionStores::new`] — precisely
+/// because more of the same shape are coming: future workstreams
+/// (ip-access-control #553, backend-policy #554) extend *this* struct.
+#[non_exhaustive]
+pub struct IngressCrRefStores<'a> {
+    pub(crate) compressions: &'a reflector::Store<Compression>,
+    pub(crate) retry_policies: &'a reflector::Store<RetryPolicy>,
+    pub(crate) rate_limits: &'a reflector::Store<RateLimit>,
+}
+
+impl<'a> IngressCrRefStores<'a> {
+    /// Bundle the converged-CR-reference stores for a single reconcile pass.
+    #[must_use]
+    pub fn new(
+        compressions: &'a reflector::Store<Compression>,
+        retry_policies: &'a reflector::Store<RetryPolicy>,
+        rate_limits: &'a reflector::Store<RateLimit>,
+    ) -> Self {
+        Self {
+            compressions,
+            retry_policies,
+            rate_limits,
+        }
+    }
+}
+
 /// The extension-CRD stores threaded into [`IngressReconciler::reconcile`].
 ///
 /// Groups the label-scoped htpasswd Secret store (`auth-basic-secret`) with
 /// the `CoxswainExternalAuth` CR store (`ext-auth`, #549), the `JwtAuth` CR
 /// store and JWKS cache (`auth-jwt`, #441), the backend `ReferenceGrant` set
 /// (needed to resolve a `CoxswainExternalAuth` CR's cross-namespace
-/// `backendRef`), the `Compression` CR store (`compression`, #550), and the
-/// `RetryPolicy` CR store (`retry`, #551) so `reconcile` stays under the
-/// workspace argument-count limit. Not auth-specific despite the auth-heavy
-/// history — every Ingress annotation that converges to a `namespace/name`
-/// CRD reference (#548) lands here; future workstreams (rate-limit #552,
-/// ip-access-control #553, backend-policy #554) extend this struct rather
-/// than `reconcile`'s arity.
+/// `backendRef`), and the converged-CR-reference stores
+/// ([`IngressCrRefStores`]) so `reconcile` stays under the workspace
+/// argument-count limit. Not auth-specific despite the auth-heavy history —
+/// every Ingress annotation that converges to a `namespace/name` CRD
+/// reference (#548) lands here.
 #[non_exhaustive]
 pub struct IngressExtensionStores<'a> {
     pub(crate) auth_secrets: &'a reflector::Store<Secret>,
@@ -77,6 +105,7 @@ pub struct IngressExtensionStores<'a> {
     pub(crate) backend_grants: &'a crate::reference_grants::GrantSet,
     pub(crate) compressions: &'a reflector::Store<Compression>,
     pub(crate) retry_policies: &'a reflector::Store<RetryPolicy>,
+    pub(crate) rate_limits: &'a reflector::Store<RateLimit>,
 }
 
 impl<'a> IngressExtensionStores<'a> {
@@ -88,8 +117,7 @@ impl<'a> IngressExtensionStores<'a> {
         jwt_auths: &'a reflector::Store<coxswain_core::crd::JwtAuth>,
         jwks_cache: &'a crate::jwks::SharedJwksCache,
         backend_grants: &'a crate::reference_grants::GrantSet,
-        compressions: &'a reflector::Store<Compression>,
-        retry_policies: &'a reflector::Store<RetryPolicy>,
+        cr_refs: IngressCrRefStores<'a>,
     ) -> Self {
         Self {
             auth_secrets,
@@ -97,8 +125,9 @@ impl<'a> IngressExtensionStores<'a> {
             jwt_auths,
             jwks_cache,
             backend_grants,
-            compressions,
-            retry_policies,
+            compressions: cr_refs.compressions,
+            retry_policies: cr_refs.retry_policies,
+            rate_limits: cr_refs.rate_limits,
         }
     }
 }
@@ -235,9 +264,6 @@ impl IngressReconciler {
         let allow_source_range = ann.allow_source_range.clone().map(Arc::new);
         // Build the source-IP block list (deny-source-range) the same way.
         let deny_source_range = ann.deny_source_range.clone().map(Arc::new);
-        // Build the rate-limit config once and share one Arc across every route
-        // entry of this Ingress — same refcount-bump sharing pattern as above.
-        let rate_limit = ann.rate_limit.clone().map(Arc::new);
         // Resolve auth annotations once per Ingress; share one Arc chain across
         // every path. `ext-auth` (#549), `auth-basic-secret` (#24), and
         // `auth-jwt` (#441) are independently additive — every configured
@@ -283,6 +309,20 @@ impl IngressReconciler {
         // resolvers above.
         let retries =
             resolve_retry_config(ann.retry.as_ref(), auth_stores.retry_policies, &route_id);
+        // Build the rate-limit config once and share one Arc across every route entry.
+        // Resolved via the same `resolve_spec` the HTTPRoute/GRPCRoute ExtensionRef path
+        // uses (#552); a missing RateLimit CR fails open (no rate limiting), unlike the
+        // auth resolvers above. `has_auth` mirrors the auth-family checks above and
+        // suppresses the header-keying bypass-risk advisory (#411) when an auth check
+        // is also configured on this Ingress.
+        let has_auth = ann.auth_ext.is_some() || ann.auth_basic.is_some();
+        let rate_limit = resolve_rate_limit_config(
+            ann.rate_limit.as_ref(),
+            auth_stores.rate_limits,
+            &route_id,
+            has_auth,
+            &mut annotation_issues,
+        );
         // Build the trusted-proxy forwarded-IP config once and share one Arc across every path.
         let forwarded_for = ann.forwarded_for.clone().map(Arc::new);
         // Build the circuit-breaker config once and share one Arc across every route entry.
@@ -1690,8 +1730,11 @@ mod tests {
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
                 &empty_backend_grants(),
-                &empty_compression_store(),
-                &empty_retry_policy_store(),
+                IngressCrRefStores::new(
+                    &empty_compression_store(),
+                    &empty_retry_policy_store(),
+                    &empty_rate_limit_store(),
+                ),
             ),
         );
         assert!(
@@ -1732,8 +1775,11 @@ mod tests {
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
                 &empty_backend_grants(),
-                &empty_compression_store(),
-                &empty_retry_policy_store(),
+                IngressCrRefStores::new(
+                    &empty_compression_store(),
+                    &empty_retry_policy_store(),
+                    &empty_rate_limit_store(),
+                ),
             ),
         );
         assert!(
@@ -2019,8 +2065,11 @@ mod tests {
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
                 &empty_backend_grants(),
-                &empty_compression_store(),
-                &retry_policies,
+                IngressCrRefStores::new(
+                    &empty_compression_store(),
+                    &retry_policies,
+                    &empty_rate_limit_store(),
+                ),
             ),
         );
         let table = builder.build().unwrap();
@@ -2310,8 +2359,11 @@ mod tests {
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
                 &empty_backend_grants(),
-                &empty_compression_store(),
-                &empty_retry_policy_store(),
+                IngressCrRefStores::new(
+                    &empty_compression_store(),
+                    &empty_retry_policy_store(),
+                    &empty_rate_limit_store(),
+                ),
             ),
         );
         let table = builder.build().unwrap();

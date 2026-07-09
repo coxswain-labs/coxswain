@@ -5,7 +5,7 @@
 //! - [`traffic_policy`] — timeout and retry annotations.
 //! - [`routing`] — path rewrite and regex opt-in annotations.
 //! - [`filters`] — request/response header modifiers, redirect, and ssl-redirect annotations.
-//! - [`edge_access`] — source-IP allow/deny, forwarded-for trust, rate limiting.
+//! - [`edge_access`] — source-IP allow/deny, forwarded-for trust.
 //! - [`auth`] — request authentication (`auth-*`, #24).
 //! - [`client_cert`] — per-host client-certificate mTLS (`auth-tls-*`, #267).
 //! - [`caching`] — RFC 7234 response-cache opt-in.
@@ -41,7 +41,7 @@ pub use traffic_policy::*;
 
 use coxswain_core::routing::{
     CircuitBreakerConfig, FilterAction, ForwardedForConfig, HeaderMod, LoadBalance, NormalizeLevel,
-    PathModifier, RateLimitConfig, RouteTimeouts, SessionAffinity,
+    PathModifier, RouteTimeouts, SessionAffinity,
 };
 use std::collections::BTreeMap;
 
@@ -148,10 +148,15 @@ pub(super) struct IngressAnnotations {
     /// Sticky-session binding from the `session-*` annotations (#15).
     /// `None` (the default, or an invalid/incomplete value) keeps round-robin.
     pub session_affinity: Option<SessionAffinity>,
-    /// Per-route rate-limiting config from the `rate-limit-*` annotations (#25).
-    /// `None` (the default, or when `rate-limit-rps` is absent/invalid) disables
-    /// rate limiting for the route (fail-open).
-    pub rate_limit: Option<RateLimitConfig>,
+    /// `RateLimit` CR reference from `rate-limit` (#552), in intermediate
+    /// (pre-resolved) `namespace/name` form. `None` when the annotation is
+    /// absent or malformed (WARN emitted). The reconciler resolves this into
+    /// the same
+    /// [`RateLimitConfig`][coxswain_core::routing::RateLimitConfig] the
+    /// HTTPRoute/GRPCRoute `ExtensionRef` filter produces (Gateway API
+    /// parity, #552). A missing CR fails **open** (no rate limiting) —
+    /// unlike the auth annotations, a broken reference degrades gracefully.
+    pub rate_limit: Option<auth::SecretRef>,
     /// `Secret` reference from `auth-basic-secret` (#24), in intermediate
     /// (pre-resolved) `namespace/name` form. `None` when the annotation is
     /// absent or malformed (WARN emitted). The reconciler resolves this into
@@ -432,16 +437,17 @@ impl IngressAnnotations {
         // ── Session affinity (#15) ────────────────────────────────────────────
         let session_affinity = parse_session_affinity(ann, route_id, &mut diag);
 
-        // ── Rate limiting (#25) ───────────────────────────────────────────────
-        let has_auth = get(ann, auth::EXT_AUTH).is_some() || get(ann, AUTH_BASIC_SECRET).is_some();
-        let rate_limit = parse_rate_limit(
-            get(ann, RATE_LIMIT_RPS),
-            get(ann, RATE_LIMIT_BURST),
-            get(ann, RATE_LIMIT_BY),
-            route_id,
-            has_auth,
-            &mut diag,
-        );
+        // ── RateLimit CR reference (#552) ─────────────────────────────────────
+        let rate_limit = get(ann, traffic_policy::RATE_LIMIT).and_then(|v| {
+            let r = auth::parse_secret_ref(v);
+            if r.is_none() {
+                issue!(
+                    traffic_policy::RATE_LIMIT,
+                    "invalid rate-limit — expected \"namespace/name\"; rate limiting disabled"
+                );
+            }
+            r
+        });
 
         // ── Basic auth Secret reference (#24) ─────────────────────────────────
         let auth_basic = get(ann, AUTH_BASIC_SECRET).and_then(|v| {
@@ -782,6 +788,32 @@ mod tests {
         assert!(a.retry.is_none());
         assert_eq!(diag.len(), 1);
         assert_eq!(diag[0].annotation, traffic_policy::RETRY);
+    }
+
+    #[test]
+    fn parse_rate_limit_valid_ref() {
+        let m = ann(&[(traffic_policy::RATE_LIMIT, "rl-ns/my-limit")]);
+        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
+        let r = a.rate_limit.expect("rate_limit must parse");
+        assert_eq!(r.namespace, "rl-ns");
+        assert_eq!(r.name, "my-limit");
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn parse_rate_limit_absent_is_none() {
+        let (a, diag) = IngressAnnotations::parse(None, "default/test");
+        assert!(a.rate_limit.is_none());
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn parse_rate_limit_malformed_warns_and_disables() {
+        let m = ann(&[(traffic_policy::RATE_LIMIT, "no-slash-here")]);
+        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
+        assert!(a.rate_limit.is_none());
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, traffic_policy::RATE_LIMIT);
     }
 
     #[test]
