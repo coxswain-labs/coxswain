@@ -1,11 +1,20 @@
-# connect-retry annotation fixture.
+# retry fixture (#551): the annotation names a RetryPolicy CR by
+# "namespace/name" — Ingress parity with the Gateway API ExtensionRef path.
+#
 # A Service that selects echo-a pods but on port 9999 (not listening), so every
 # upstream TCP connect attempt fails with ECONNREFUSED.
-# retry-attempts: 2 means the proxy makes 3 total attempts before returning 502.
-# Connection failures are retried implicitly whenever retry-attempts >= 1 (no
+# attempts: 2 means the proxy makes 3 total attempts before returning 502.
+# Connection failures are retried implicitly whenever attempts >= 1 (no
 # per-condition opt-in). TESTNS is substituted with the test namespace.
 #
 # Route: retry.TESTNS.local / → echo-a-wrongport:9999 (ECONNREFUSED)
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RetryPolicy
+metadata:
+  name: connect-retry
+spec:
+  attempts: 2
 ---
 apiVersion: v1
 kind: Service
@@ -23,7 +32,7 @@ kind: Ingress
 metadata:
   name: retry-ingress
   annotations:
-    ingress.coxswain-labs.dev/retry-attempts: "2"
+    ingress.coxswain-labs.dev/retry: "${TESTNS}/connect-retry"
 spec:
   ingressClassName: coxswain
   rules:
