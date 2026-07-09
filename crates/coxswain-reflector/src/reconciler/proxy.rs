@@ -1124,7 +1124,6 @@ struct GatewayApiStoreWriters {
     grants: reflector::store::Writer<ReferenceGrant>,
     policies: reflector::store::Writer<BackendTlsPolicy>,
     configmaps: reflector::store::Writer<ConfigMap>,
-    rate_limits: reflector::store::Writer<RateLimit>,
     path_rewrites: reflector::store::Writer<PathRewriteRegex>,
     ip_access: reflector::store::Writer<IpAccessControl>,
     basic_auths: reflector::store::Writer<BasicAuth>,
@@ -1158,7 +1157,6 @@ fn add_gateway_api_reflectors(
         grants,
         policies,
         configmaps,
-        rate_limits,
         path_rewrites,
         ip_access,
         basic_auths,
@@ -1234,14 +1232,6 @@ fn add_gateway_api_reflectors(
         watcher::Config::default(),
         ReflectorEffects::new(notify, health, "config_map", metrics),
         "ConfigMap",
-    );
-    spawn_reflector(
-        set,
-        rate_limits,
-        scoped_api::<RateLimit>(client.clone(), ns),
-        watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "rate_limit", metrics),
-        "RateLimit",
     );
     spawn_reflector(
         set,
@@ -1527,6 +1517,16 @@ async fn spawn_tasks(
         ReflectorEffects::new(&notify, &controller_health, "retry_policy", metrics),
         "RetryPolicy",
     );
+    // Always-on (not gated by `enable_gateway_api`): same fix, same rationale,
+    // for the Ingress `rate-limit` annotation (#552) and the `RateLimit` CR store.
+    spawn_reflector(
+        &mut set,
+        rate_limit_writer,
+        scoped_api::<RateLimit>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(&notify, &controller_health, "rate_limit", metrics),
+        "RateLimit",
+    );
 
     // --- Ingress reflectors (gated by --disable-ingress) ---
     //
@@ -1597,7 +1597,6 @@ async fn spawn_tasks(
             grants: grant_writer,
             policies: policy_writer,
             configmaps: configmap_writer,
-            rate_limits: rate_limit_writer,
             path_rewrites: path_rewrite_writer,
             ip_access: ip_access_writer,
             basic_auths: basic_auth_writer,
