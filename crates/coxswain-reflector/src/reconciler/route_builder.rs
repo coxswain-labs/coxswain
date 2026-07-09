@@ -311,8 +311,11 @@ fn build_ingress_routes(
         stores.jwt_auths,
         stores.jwks_cache,
         ownership.backend_grants,
-        stores.compressions,
-        stores.retry_policies,
+        crate::ingress::IngressCrRefStores::new(
+            stores.compressions,
+            stores.retry_policies,
+            stores.rate_limits,
+        ),
     );
     let mut pending_annotation_events: Vec<(String, String, Vec<AnnotationIssue>)> = Vec::new();
     for ingress in ingresses {

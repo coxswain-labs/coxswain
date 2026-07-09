@@ -2,12 +2,12 @@
 
 Per-route, per-client rate limiting protects upstream services from traffic spikes and abuse. Over-limit requests are rejected immediately by the proxy with **429 Too Many Requests** and a `Retry-After` header; the upstream never sees them.
 
-Two bindings are supported:
+Both bindings reference the same `RateLimit` custom resource, resolved through the identical spec→config translation — parity between the two surfaces is guaranteed by construction, not by convention:
 
 | Binding | When to use |
 |---------|-------------|
-| [Ingress annotations](#ingress-annotations) | Per-Ingress, attached to existing annotation-based config |
-| [Gateway API `ExtensionRef`](#gateway-api-extensionref) | Per-`HTTPRoute` rule, via a `RateLimit` custom resource |
+| [Ingress annotation](#ingress-annotation) | Per-Ingress: `ingress.coxswain-labs.dev/rate-limit: "namespace/name"` |
+| [Gateway API `ExtensionRef`](#gateway-api-extensionref) | Per-`HTTPRoute` rule, via the same `RateLimit` custom resource |
 
 ## Algorithm
 
@@ -28,36 +28,27 @@ The rate-limit key determines which bucket a request is counted against.
 
 **Fail-open**: when the keying dimension is unavailable — undeterminable IP, or an absent header on a header-keyed route — the request is **admitted without counting**. A missing key never blocks traffic.
 
-## Ingress annotations
+## Ingress annotation
 
-Attach a rate limit to every path rule of an Ingress:
+Reference a `RateLimit` CR — the same one an `HTTPRoute` `ExtensionRef` filter would point at — from the `rate-limit` annotation:
 
 ```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RateLimit
 metadata:
-  annotations:
-    ingress.coxswain-labs.dev/rate-limit-rps: "100"
-    ingress.coxswain-labs.dev/rate-limit-burst: "50"   # optional
-    ingress.coxswain-labs.dev/rate-limit-by: "ip"      # optional
-```
-
-| Annotation | Type | Default | Description |
-|------------|------|---------|-------------|
-| `rate-limit-rps` | integer ≥ 1 | _none_ (disabled) | Sustained rate per client (req/s) |
-| `rate-limit-burst` | integer ≥ 0 | `0` | Extra burst capacity above sustained rate |
-| `rate-limit-by` | `ip` or `header:Name` | `"ip"` | Client identity dimension |
-
-An absent or invalid `rate-limit-rps` disables rate limiting for the route (warn + **fail-open**). Invalid `rate-limit-burst` and `rate-limit-by` values log a warning and use their defaults.
-
-### Example: 100 req/s per IP with 50-request burst
-
-```yaml
+  name: api-limit
+  namespace: my-app
+spec:
+  requestsPerSecond: 100
+  burst: 50              # optional, default 0
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: my-api
+  namespace: my-app
   annotations:
-    ingress.coxswain-labs.dev/rate-limit-rps: "100"
-    ingress.coxswain-labs.dev/rate-limit-burst: "50"
+    ingress.coxswain-labs.dev/rate-limit: "my-app/api-limit"
 spec:
   ingressClassName: coxswain
   rules:
@@ -73,17 +64,35 @@ spec:
                   number: 8080
 ```
 
+**Fail-open**: if the referenced `RateLimit` CR is missing, the route serves with rate limiting disabled (a WARN is logged) rather than failing the route — the same posture as the Gateway API binding below. See the [`RateLimit` spec fields](#ratelimit-spec-fields) below for `requestsPerSecond`/`burst`/`byHeader`.
+
+!!! note "Migration from the inline rate-limit-rps/rate-limit-burst/rate-limit-by annotations (breaking)"
+    Earlier releases exposed three inline annotations — `rate-limit-rps`, `rate-limit-burst`, `rate-limit-by` — duplicating the `RateLimit` CRD schema. These are removed; move each Ingress's values into a `RateLimit` CR and point `rate-limit` at it.
+
 ### Example: 5 req/s per API key header
 
 ```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RateLimit
 metadata:
+  name: per-key-limit
+  namespace: my-app
+spec:
+  requestsPerSecond: 5
+  byHeader: "X-Api-Key"
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  namespace: my-app
   annotations:
-    ingress.coxswain-labs.dev/rate-limit-rps: "5"
-    ingress.coxswain-labs.dev/rate-limit-by: "header:X-Api-Key"
+    ingress.coxswain-labs.dev/rate-limit: "my-app/per-key-limit"
 ```
 
 !!! warning
-    Header keying can be bypassed by rotating the header value. Pair it with `auth-url` or `auth-basic-secret` to ensure the header is authenticated before being trusted. See the [rate-limit-by annotation reference](ingress-annotations.md#rate-limit-by) for details.
+    Header keying can be bypassed by rotating the header value. Pair it with `ext-auth` or `auth-basic-secret` to ensure the header is authenticated before being trusted. The controller emits a `Warning` Event on the Ingress when `byHeader` keying is configured without an auth annotation, so operators are notified at reconcile time. See the [rate-limit annotation reference](ingress-annotations.md#rate-limiting) for details.
+
+See the [Ingress annotations reference](ingress-annotations.md#rate-limiting) for the full annotation semantics.
 
 ## Gateway API ExtensionRef
 

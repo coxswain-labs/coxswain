@@ -139,27 +139,30 @@ pub const ANNOTATION_SESSION_AFFINITY_HEADER: &str =
 /// Baseline for #15: the same 3-pod `echo-aff` Service with NO session-affinity
 /// annotation — proves the default path stays plain round-robin.
 pub const SESSION_AFFINITY_NONE: &str = fixture!("session_affinity_none.yaml");
-/// Ingress with `ingress.coxswain-labs.dev/rate-limit-rps: "1"` (#25).
-/// Used to verify the proxy admits a single request within quota (200) and rejects
-/// subsequent rapid-fire requests with 429 + `Retry-After`.
+/// Ingress with `ingress.coxswain-labs.dev/rate-limit` naming a `RateLimit` CR
+/// (`requestsPerSecond: 1, burst: 0`) — Ingress parity with the Gateway API
+/// `ExtensionRef` path (#552). Used to verify the proxy admits a single request
+/// within quota (200) and rejects subsequent rapid-fire requests with 429 +
+/// `Retry-After`.
 pub const ANNOTATION_RATE_LIMIT_RPS: &str = fixture!("annotation_rate_limit_rps.yaml");
-/// Ingress with `ingress.coxswain-labs.dev/rate-limit-rps: "1"` and `rate-limit-burst: "5"` (#25).
-/// Used to verify the proxy absorbs an initial spike up to the burst cap then starts
-/// returning 429 + `Retry-After`.
+/// Ingress with `rate-limit` naming a `RateLimit` CR (`requestsPerSecond: 1,
+/// burst: 5`) (#552). Used to verify the proxy absorbs an initial spike up to
+/// the burst cap then starts returning 429 + `Retry-After`.
 pub const ANNOTATION_RATE_LIMIT_BURST: &str = fixture!("annotation_rate_limit_burst.yaml");
-/// Ingress with `ingress.coxswain-labs.dev/rate-limit-by: "header:X-Rate-Key"` (#25).
-/// Used to verify fail-open when the keying header is absent — all requests pass even
-/// at high rates.
+/// Ingress with `rate-limit` naming a `RateLimit` CR (`byHeader: X-Rate-Key`)
+/// (#552). Used to verify fail-open when the keying header is absent — all
+/// requests pass even at high rates.
 pub const ANNOTATION_RATE_LIMIT_BY_HEADER: &str = fixture!("annotation_rate_limit_by_header.yaml");
-/// Ingress with `rate-limit-by: header:X-Api-Key` **and** `auth-url` (#411 negative).
-/// Used to verify that header keying paired with an auth annotation emits no
-/// `InvalidAnnotation` Warning Event (the auth layer prevents the bypass).
+/// Ingress with `rate-limit` naming a `RateLimit` CR (`byHeader: X-Api-Key`)
+/// **and** `auth-basic-secret` (#411 negative, #552). Used to verify that
+/// header keying paired with an auth annotation emits no `InvalidAnnotation`
+/// Warning Event (the auth layer prevents the bypass).
 pub const ANNOTATION_RATE_LIMIT_BY_HEADER_WITH_AUTH: &str =
     fixture!("annotation_rate_limit_by_header_with_auth.yaml");
-/// Ingress with `ingress.coxswain-labs.dev/rate-limit-rps: "notanumber"` (#25).
-/// Used to verify that an invalid annotation value is ignored (warn + fail-open) and
-/// traffic flows unthrottled.
-pub const ANNOTATION_RATE_LIMIT_INVALID: &str = fixture!("annotation_rate_limit_invalid.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/rate-limit` pointing at a
+/// non-existent `RateLimit` CR (#552 sad path). Used to verify the reference
+/// fails **open** — traffic flows unthrottled rather than being rejected.
+pub const ANNOTATION_RATE_LIMIT_MISSING: &str = fixture!("annotation_rate_limit_missing.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/ext-auth` naming a `CoxswainExternalAuth`
 /// CR (HTTP transport, `backendRef: auth-allow:4000`) — Ingress parity with
 /// `gateway_api::EXTERNAL_AUTH_ROUTE_ALLOW` (#549 happy path). Used to verify the
@@ -365,6 +368,12 @@ pub const DRAIN_INGRESS: &str = fixture!("drain_ingress.yaml");
 ///
 /// Apply [`backends::GO_HTTPBIN`] first.
 pub const ANNOTATION_CIRCUIT_BREAKER: &str = fixture!("annotation_circuit_breaker.yaml");
+/// Ingress with an unparseable `circuit-breaker-threshold: "notanumber"` value (#29).
+/// Used to verify the VAP's general ">= 1 positive integer" rule shape rejects the
+/// Ingress at admission time (retargeted from `rate-limit-rps` after #552 converged
+/// `rate-limit` to a CR reference with no VAP rule).
+pub const ANNOTATION_CIRCUIT_BREAKER_THRESHOLD_INVALID: &str =
+    fixture!("annotation_circuit_breaker_threshold_invalid.yaml");
 
 // ── ValidatingAdmissionPolicy (#29) ─────────────────────────────────────────
 

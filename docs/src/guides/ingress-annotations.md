@@ -39,9 +39,7 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/session-affinity` | `cookie` or `header` | _none_ | `"cookie"` |
 | `ingress.coxswain-labs.dev/session-cookie-name` | string | `__coxswain_session` | `"SESSIONID"` |
 | `ingress.coxswain-labs.dev/session-header` | string | _none_ | `"X-Session-Id"` |
-| `ingress.coxswain-labs.dev/rate-limit-rps` | integer | _none_ (disabled) | `"100"` |
-| `ingress.coxswain-labs.dev/rate-limit-burst` | integer | `0` | `"50"` |
-| `ingress.coxswain-labs.dev/rate-limit-by` | `ip` or `header:Name` | `"ip"` | `"header:X-Api-Key"` |
+| `ingress.coxswain-labs.dev/rate-limit` | `namespace/name` | _none_ | `"my-ns/my-limit"` |
 | `ingress.coxswain-labs.dev/ext-auth` | `namespace/name` | _none_ | `"my-ns/my-extauth"` |
 | `ingress.coxswain-labs.dev/auth-basic-secret` | `namespace/name` | _none_ | `"my-ns/my-htpasswd"` |
 | `ingress.coxswain-labs.dev/auth-jwt` | `namespace/name` | _none_ | `"my-ns/my-jwt"` |
@@ -514,7 +512,7 @@ The value is a comma-separated list of IPv4/IPv6 CIDR blocks. A bare address wit
 
 Lets the proxy extract the **real client IP** from a forwarded-for header — necessary when Coxswain sits behind a cloud LB or CDN that terminates the connection and puts the original client IP in a header like `X-Forwarded-For` or `CF-Connecting-IP`.
 
-Without this annotation, IP-based features (`allow-source-range`, `deny-source-range`, `rate-limit-by: ip`) always see the **L4 peer address** (the LB's IP), making per-client controls ineffective behind a proxy.
+Without this annotation, IP-based features (`allow-source-range`, `deny-source-range`, IP-keyed `rate-limit`) always see the **L4 peer address** (the LB's IP), making per-client controls ineffective behind a proxy.
 
 **Master switch — disabled by default** to prevent header injection by untrusted peers:
 
@@ -684,58 +682,57 @@ metadata:
 
 ## Rate limiting
 
-Caps the request rate accepted from each client before forwarding to the upstream. Over-limit requests are rejected with **429 Too Many Requests** and a `Retry-After` header (in whole seconds) telling the client when to retry. See the [Rate limiting guide](rate-limiting.md) for full semantics and Gateway API usage.
-
-### `rate-limit-rps`
-
-Sustained request rate in requests per second, per client. Must be a positive integer >= 1. Absent or invalid values disable rate limiting for the route (**fail-open**).
+The Ingress surface for the [`RateLimit` CRD](rate-limiting.md#ratelimit-spec-fields), same idiom as `ext-auth`/`auth-jwt`/`compression`/`retry`. Value is `namespace/name` of a `RateLimit` resource; both surfaces resolve the same CR to the same runtime config, so one `RateLimit` can back an Ingress and an HTTPRoute/GRPCRoute `ExtensionRef` filter identically. Over-limit requests are rejected with **429 Too Many Requests** and a `Retry-After` header (in whole seconds) telling the client when to retry. See the [Rate limiting guide](rate-limiting.md) for the full model, including the GCRA algorithm and Gateway API usage.
 
 ```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RateLimit
 metadata:
+  name: default-limit
+  namespace: my-app
+spec:
+  requestsPerSecond: 100
+  burst: 50              # optional, default 0
+  byHeader: "X-Api-Key"  # optional; absent = limit by client IP
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: my-ingress
+  namespace: my-app
   annotations:
-    ingress.coxswain-labs.dev/rate-limit-rps: "100"
+    ingress.coxswain-labs.dev/rate-limit: "my-app/default-limit"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: my-api
+                port:
+                  number: 8080
 ```
 
-### `rate-limit-burst`
+`requestsPerSecond` is the sustained rate per client; `burst` (default `0`) is extra headroom above the sustained rate a client that has been idle may spend in a short spike — total burst capacity is `requestsPerSecond + burst`. `byHeader` selects the per-client key: absent (the default) keys by real client IP (or L4 peer when not behind a PROXY-protocol LB); a header name keys by that header's value instead. When the keying dimension is not available for a request (undeterminable IP, or an absent header on a header-keyed route) the request is **admitted without counting** (**fail-open**) — a missing key never blocks traffic.
 
-Number of requests above the sustained rate that a client may send in a short burst when it has been idle. The total burst capacity is `rps + burst` — a client that has accumulated headroom can send that many requests before being throttled. Defaults to `0` (no burst above sustained rate).
-
-```yaml
-metadata:
-  annotations:
-    ingress.coxswain-labs.dev/rate-limit-rps: "10"
-    ingress.coxswain-labs.dev/rate-limit-burst: "50"
-```
-
-### `rate-limit-by`
-
-Selects the dimension used to identify each client for its own rate-limit bucket. Two modes:
-
-| Value | Behaviour |
-|-------|-----------|
-| `"ip"` (default) | One bucket per real client IP (or L4 peer when not behind a PROXY-protocol LB) |
-| `"header:Name"` | One bucket per unique value of the named request header |
-
-```yaml
-metadata:
-  annotations:
-    ingress.coxswain-labs.dev/rate-limit-rps: "5"
-    ingress.coxswain-labs.dev/rate-limit-by: "header:X-Api-Key"
-```
-
-When the keying dimension is not available for a request (undeterminable IP, or absent header on a header-keyed route) the request is **admitted without counting** (**fail-open**) — a missing key never blocks traffic.
-
-An unrecognised `rate-limit-by` value emits a controller warning and falls back to `"ip"`.
+A missing `RateLimit` CR fails **open** (no rate limiting) — unlike the auth annotations (`ext-auth`/`auth-basic-secret`/`auth-jwt`), which fail closed with **503**. A broken or stale `rate-limit` reference degrades the route to unthrottled rather than blocking traffic.
 
 !!! warning "Header keying allows rate-limit bypass"
-    `header:Name` allocates one bucket per **unique value** of the named header. A client that rotates the header value (e.g. sends a different `X-Api-Key` on each request) starts with a full bucket every time, bypassing the per-key limit entirely.
+    `byHeader` allocates one bucket per **unique value** of the named header. A client that rotates the header value (e.g. sends a different `X-Api-Key` on each request) starts with a full bucket every time, bypassing the per-key limit entirely.
 
     Mitigate by:
 
     - combining with `ext-auth` or `auth-basic-secret` so the header value is authenticated before being trusted as a rate-limit key, or
-    - using `rate-limit-by: ip` as the primary limit and treating header keying as an optional secondary signal only.
+    - omitting `byHeader` (IP-keyed) as the primary limit and treating header keying as an optional secondary signal only.
 
-    The controller emits a `Warning` Event on the Ingress when `header:*` keying is configured without an auth annotation, so operators are notified at reconcile time.
+    The controller emits a `Warning` Event on the Ingress when `byHeader` keying is configured without an auth annotation, so operators are notified at reconcile time.
+
+!!! note "Migration from the inline rate-limit-rps/rate-limit-burst/rate-limit-by annotations (breaking)"
+    Earlier releases exposed three inline annotations — `rate-limit-rps`, `rate-limit-burst`, `rate-limit-by` — duplicating the `RateLimit` CRD schema. These are removed; move each Ingress's values into a `RateLimit` CR and point `rate-limit` at it.
 
 ## Authentication
 

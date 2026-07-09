@@ -1,17 +1,25 @@
-# rate-limit-burst annotation fixture (apply backends::ECHO first).
+# rate-limit fixture (#552) — burst field.
 #
-# The Ingress caps sustained requests to 1 req/s with a burst of 5. The proxy must:
+# The RateLimit CR caps sustained requests to 1 req/s with a burst of 5. The proxy must:
 #   * absorb an initial spike of up to 6 requests (1 rps + 5 burst) without throttling, and
 #   * reject further requests in the same second with 429 + Retry-After.
 #
 # Host: ratelimitburst.TESTNS.local -> echo-a:3000.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RateLimit
+metadata:
+  name: burst-5
+spec:
+  requestsPerSecond: 1
+  burst: 5
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: rate-limit-burst-ingress
   annotations:
-    ingress.coxswain-labs.dev/rate-limit-rps: "1"
-    ingress.coxswain-labs.dev/rate-limit-burst: "5"
+    ingress.coxswain-labs.dev/rate-limit: "${TESTNS}/burst-5"
 spec:
   ingressClassName: coxswain
   rules:

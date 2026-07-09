@@ -1,20 +1,28 @@
-# rate-limit-by annotation fixture (apply backends::ECHO first).
+# rate-limit fixture (#552) — byHeader field, no auth annotation.
 #
-# The Ingress keys the rate limit on the X-Rate-Key request header (1 req/s cap).
-# When the header is absent the rate limiter must fail-open — all requests pass.
-# The proxy must:
+# The RateLimit CR keys the rate limit on the X-Rate-Key request header (1 req/s
+# cap). When the header is absent the rate limiter must fail-open — all requests
+# pass. The proxy must:
 #   * serve requests that carry distinct X-Rate-Key values independently (each key gets
 #     its own bucket), and
 #   * serve all requests that lack X-Rate-Key, even at arbitrarily high rates (fail-open).
 #
 # Host: ratelimitheader.TESTNS.local -> echo-a:3000.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: RateLimit
+metadata:
+  name: by-header
+spec:
+  requestsPerSecond: 1
+  byHeader: X-Rate-Key
+---
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: rate-limit-by-header-ingress
   annotations:
-    ingress.coxswain-labs.dev/rate-limit-rps: "1"
-    ingress.coxswain-labs.dev/rate-limit-by: "header:X-Rate-Key"
+    ingress.coxswain-labs.dev/rate-limit: "${TESTNS}/by-header"
 spec:
   ingressClassName: coxswain
   rules:

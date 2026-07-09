@@ -1055,10 +1055,12 @@ async fn invalid_annotation_emits_warning_event() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An Ingress with `rate-limit-by: header:*` but no auth annotation must receive a
-/// `Warning InvalidAnnotation` Event with a note mentioning `rate-limit-by` and bypass
-/// risk. An Ingress that pairs the same header-keying with an auth annotation must
-/// receive no such Event (#411).
+/// An Ingress whose `rate-limit` CR sets `byHeader` but carries no auth
+/// annotation must receive a `Warning InvalidAnnotation` Event with a note
+/// mentioning `rate-limit` and bypass risk. An Ingress that pairs the same
+/// header-keying with an auth annotation must receive no such Event (#411,
+/// #552 — the check moved from parse-time to CR-resolve-time when `by_header`
+/// became a CR field).
 #[tokio::test]
 async fn rate_limit_by_header_without_auth_emits_warning_event() -> anyhow::Result<()> {
     let h = Harness::start().await?;

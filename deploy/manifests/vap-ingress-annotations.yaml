@@ -164,23 +164,6 @@ spec:
         '" — must be a non-negative integer (e.g. "3")'
 
     - expression: >-
-        !('ingress.coxswain-labs.dev/rate-limit-burst' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/rate-limit-burst'].matches('^[0-9]+$')
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/rate-limit-burst: "' +
-        variables.ann['ingress.coxswain-labs.dev/rate-limit-burst'] +
-        '" — must be a non-negative integer (e.g. "10")'
-
-    - expression: >-
-        !('ingress.coxswain-labs.dev/rate-limit-rps' in variables.ann) ||
-        (variables.ann['ingress.coxswain-labs.dev/rate-limit-rps'].matches('^[0-9]+$') &&
-         int(variables.ann['ingress.coxswain-labs.dev/rate-limit-rps']) >= 1)
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/rate-limit-rps: "' +
-        variables.ann['ingress.coxswain-labs.dev/rate-limit-rps'] +
-        '" — must be a positive integer >= 1 (e.g. "10")'
-
-    - expression: >-
         !('ingress.coxswain-labs.dev/circuit-breaker-threshold' in variables.ann) ||
         (variables.ann['ingress.coxswain-labs.dev/circuit-breaker-threshold'].matches(
            '^[0-9]+$') &&

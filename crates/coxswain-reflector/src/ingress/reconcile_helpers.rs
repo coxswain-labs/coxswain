@@ -5,12 +5,13 @@
 
 use super::annotations::AnnotationIssue;
 use super::annotations::auth::{SecretRef, parse_htpasswd};
+use super::annotations::traffic_policy;
 use crate::endpoints;
-use coxswain_core::crd::{Compression, CoxswainExternalAuth, RetryPolicy};
+use coxswain_core::crd::{Compression, CoxswainExternalAuth, RateLimit, RetryPolicy};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, BasicCredential, CompressionConfig, FilterAction,
     HostRouterBuilder, IngressAuthConfig, IngressRoutingTableBuilder, NormalizeLevel,
-    RetryPolicyConfig, WildcardKind,
+    RateLimitConfig, RetryPolicyConfig, WildcardKind,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -345,6 +346,58 @@ pub(super) fn resolve_retry_config(
     crate::gateway_api::retry::resolve_spec(&cr.spec, false, route_id)
 }
 
+// ── Rate-limit resolution ───────────────────────────────────────────────────
+
+/// Resolve the `rate-limit` annotation's `RateLimit` CR reference into a
+/// concrete [`RateLimitConfig`] — the Ingress-parity counterpart to the
+/// HTTPRoute/GRPCRoute `ExtensionRef` filter (#552). Delegates to
+/// [`crate::gateway_api::rate_limit::resolve_spec`] so both surfaces resolve
+/// the same CR to byte-identical runtime config.
+///
+/// A missing CR fails **open** (`None`, no rate limiting) — unlike the auth
+/// resolvers above, a broken rate-limit reference degrades gracefully rather
+/// than blocking traffic.
+///
+/// The `by_header` field is a CR field, unknown until the CR is resolved —
+/// unlike the former inline `rate-limit-by` annotation, whose header-without-auth
+/// bypass-risk advisory (#411) fired at parse time. That check moves here:
+/// `has_auth` (computed by the caller from the Ingress's own auth annotations)
+/// suppresses the advisory when an auth check is also configured on the route.
+pub(super) fn resolve_rate_limit_config(
+    annotation: Option<&SecretRef>,
+    rate_limits: &reflector::Store<RateLimit>,
+    route_id: &str,
+    has_auth: bool,
+    diag: &mut Vec<AnnotationIssue>,
+) -> Option<Arc<RateLimitConfig>> {
+    let r = annotation?;
+    let obj_ref = reflector::ObjectRef::<RateLimit>::new(&r.name).within(&r.namespace);
+    let Some(cr) = rate_limits.get(&obj_ref) else {
+        tracing::warn!(
+            ingress = %route_id,
+            namespace = %r.namespace,
+            name = %r.name,
+            "RateLimit CR not found — rate limiting skipped (fail-open)"
+        );
+        return None;
+    };
+    if cr.spec.by_header.is_some() && !has_auth {
+        tracing::warn!(
+            ingress = %route_id,
+            annotation = traffic_policy::RATE_LIMIT,
+            "header keying allows rate-limit bypass via header-value rotation; \
+             pair with an ip-keyed RateLimit or an auth-* annotation"
+        );
+        diag.push(AnnotationIssue {
+            annotation: traffic_policy::RATE_LIMIT,
+            message: "header keying allows rate-limit bypass via header-value rotation; \
+                      pair with an ip-keyed RateLimit or an auth-* annotation"
+                .into(),
+        });
+    }
+    crate::gateway_api::rate_limit::resolve_spec(&cr.spec)
+}
+
 /// Prepend an HTTPS `RequestRedirect` to `base`, returning the combined filter list.
 ///
 /// The HTTP-listener entry of an `ssl-redirect` route carries this leading
@@ -392,8 +445,25 @@ mod tests {
     use super::*;
     use crate::tests::fixtures::{
         empty_compression_store, empty_external_auth_store, empty_jwks_cache, empty_jwt_auth_store,
-        empty_retry_policy_store, empty_secret_store, empty_svc_store, slice_store,
+        empty_rate_limit_store, empty_retry_policy_store, empty_secret_store, empty_svc_store,
+        make_rate_limit_store, slice_store,
     };
+    use coxswain_core::crd::RateLimit;
+    use coxswain_core::routing::RateLimitKey;
+
+    // `RateLimitSpec` is `#[non_exhaustive]` — deserialize a CR instead.
+    fn rate_limit_cr(ns: &str, name: &str, by_header: Option<&str>) -> RateLimit {
+        let by_header_field = by_header
+            .map(|h| format!("\n  byHeader: {h}"))
+            .unwrap_or_default();
+        let yaml = format!(
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: RateLimit\n\
+             metadata:\n  name: {name}\n  namespace: {ns}\n\
+             spec:\n  requestsPerSecond: 10{by_header_field}\n",
+        );
+        serde_yaml::from_str(&yaml).expect("valid RateLimit")
+    }
 
     fn secret_ref(namespace: &str, name: &str) -> SecretRef {
         SecretRef {
@@ -504,5 +574,71 @@ mod tests {
         let r = secret_ref("default", "absent");
         let store = empty_retry_policy_store();
         assert!(resolve_retry_config(Some(&r), &store, "default/ing").is_disabled());
+    }
+
+    #[test]
+    fn resolve_rate_limit_config_absent_annotation_is_none() {
+        let store = empty_rate_limit_store();
+        let mut diag = vec![];
+        assert!(resolve_rate_limit_config(None, &store, "default/ing", false, &mut diag).is_none());
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn resolve_rate_limit_config_missing_cr_fails_open() {
+        // Unlike every auth resolver above, a missing RateLimit reference must
+        // NOT install a fail-closed check — rate limiting degrades to "no
+        // limit", matching the HTTPRoute/GRPCRoute ExtensionRef path. The
+        // "resolved" case is covered by `gateway_api::rate_limit::resolve_spec`'s
+        // own test module, which this function delegates to.
+        let r = secret_ref("default", "absent");
+        let store = empty_rate_limit_store();
+        let mut diag = vec![];
+        assert!(
+            resolve_rate_limit_config(Some(&r), &store, "default/ing", false, &mut diag).is_none()
+        );
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn resolve_rate_limit_config_header_without_auth_pushes_diag() {
+        let r = secret_ref("default", "by-header");
+        let store = make_rate_limit_store(vec![rate_limit_cr(
+            "default",
+            "by-header",
+            Some("X-Api-Key"),
+        )]);
+        let mut diag = vec![];
+        let cfg = resolve_rate_limit_config(Some(&r), &store, "default/ing", false, &mut diag)
+            .expect("resolved");
+        assert_eq!(cfg.key, RateLimitKey::Header(Arc::from("x-api-key")));
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, traffic_policy::RATE_LIMIT);
+    }
+
+    #[test]
+    fn resolve_rate_limit_config_header_with_auth_no_diag() {
+        let r = secret_ref("default", "by-header");
+        let store = make_rate_limit_store(vec![rate_limit_cr(
+            "default",
+            "by-header",
+            Some("X-Api-Key"),
+        )]);
+        let mut diag = vec![];
+        assert!(
+            resolve_rate_limit_config(Some(&r), &store, "default/ing", true, &mut diag).is_some()
+        );
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn resolve_rate_limit_config_ip_keyed_no_diag_regardless_of_auth() {
+        let r = secret_ref("default", "ip-keyed");
+        let store = make_rate_limit_store(vec![rate_limit_cr("default", "ip-keyed", None)]);
+        let mut diag = vec![];
+        assert!(
+            resolve_rate_limit_config(Some(&r), &store, "default/ing", false, &mut diag).is_some()
+        );
+        assert!(diag.is_empty());
     }
 }

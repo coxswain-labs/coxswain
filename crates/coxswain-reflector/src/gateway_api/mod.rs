@@ -14,6 +14,7 @@ mod grpc_reconcile;
 mod grpc_status;
 mod hostnames;
 pub(crate) mod jwt_auth;
+pub(crate) mod rate_limit;
 mod reconcile;
 mod reconcile_tls;
 pub(crate) mod retry;
