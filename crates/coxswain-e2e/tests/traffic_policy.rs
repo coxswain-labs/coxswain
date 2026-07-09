@@ -16,7 +16,7 @@
 //! (HTTP + gRPC). Routing-shape behavior lives in `routing.rs`; TLS in `tls.rs`.
 
 use coxswain_e2e::{
-    FixtureVars, Harness, IngressClassGuard, NamespaceGuard,
+    FixtureVars, Harness, NamespaceGuard,
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::wait,
 };
@@ -196,34 +196,6 @@ async fn ingress_retry_passthrough_when_cr_missing() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Verifies that `ingress.coxswain-labs.dev/connect-timeout` bounds the upstream
-/// TCP-connect phase. The backend's only EndpointSlice address is `192.0.2.1`
-/// (RFC 5737 TEST-NET-1), so the SYN is black-holed and `connect()` hangs.
-///
-/// With `connect-timeout: 500ms` the proxy abandons the connect after 500ms and
-/// returns 502 (`ConnectTimedout`). The proof is that the 502 arrives within the
-/// test client's 5s budget: without the annotation the connect would hang past it
-/// and the route would never return a clean 502.
-#[tokio::test]
-async fn annotation_connect_timeout_returns_502() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "tp-ing-connect-timeout").await?;
-
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_CONNECT_TIMEOUT,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let host = format!("connect-timeout.{}.local", ns.name);
-
-    // 502 doubles as the readiness signal: once the route is installed every
-    // request black-holes on connect and returns 502 within the 500ms deadline.
-    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
-
-    Ok(())
-}
-
 /// Verifies that `ingress.coxswain-labs.dev/read-timeout` bounds the upstream
 /// response-read phase. The slow-echo backend accepts the connection but never
 /// writes a response, holding the socket ~30s.
@@ -246,36 +218,6 @@ async fn annotation_read_timeout_returns_502() -> anyhow::Result<()> {
 
     // 502 doubles as the readiness signal: once the route is installed every
     // request times out on the upstream read and returns 502 within 500ms.
-    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
-
-    Ok(())
-}
-
-/// Verifies a class-level `connect-timeout` default sourced from
-/// `IngressClass.spec.parameters` (#190) reaches the data plane — proving the
-/// class-defaults merge is annotation-agnostic, not specific to `rewrite-target`.
-///
-/// The Ingress sets no `connect-timeout` of its own; the class default (500ms)
-/// bounds the connect to a black-holed backend (192.0.2.1, RFC 5737) and yields a
-/// prompt 502. Without the class default the connect would hang past the client's
-/// 5s budget, so the prompt 502 is the proof the class default applied.
-#[tokio::test]
-async fn class_default_connect_timeout_returns_502() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "tp-ing-cls-timeout").await?;
-
-    // Cluster-scoped IngressClass — guard deletes it on drop. Name matches the
-    // fixture's `coxswain-clstimeout-${TESTNS}`.
-    let ic_name = format!("coxswain-clstimeout-{}", ns.name);
-    let _ic_guard = IngressClassGuard::new(&ic_name);
-
-    fixtures::apply_fixture(ingress::CLASS_DEFAULT_TIMEOUT, FixtureVars::new(&ns.name)).await?;
-
-    let host = format!("clstimeout.{}.local", ns.name);
-
-    // 502 doubles as the readiness signal: once the route is installed every
-    // request black-holes on connect and returns 502 within the 500ms deadline
-    // supplied by the class default.
     wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
 
     Ok(())
@@ -1210,6 +1152,361 @@ async fn grpc_retry_not_attempted_for_non_retriable_grpc_status() -> anyhow::Res
     Ok(())
 }
 
+// ── CoxswainBackendPolicy on the Ingress surface (#554) ───────────────────────
+//
+// Before #554 the Ingress reconciler built every `BackendGroup`/`RouteEntry`
+// purely from inline annotations; it never consulted the `CoxswainBackendPolicy`
+// index the Gateway-API path already used. These two tests prove the wiring
+// itself — connect timeout / LB / circuit breaker are algorithmically identical
+// to the `backend_policy_*` Gateway-API tests above, so they are not re-verified
+// per algorithm variant here.
+
+/// Happy path (#554): a `CoxswainBackendPolicy` with `timeouts.connect: 500ms`
+/// attached to an Ingress backend Service bounds the upstream TCP-connect the
+/// same way it already does for Gateway-API routes.
+///
+/// The backend's only EndpointSlice address is `192.0.2.1` (RFC 5737
+/// TEST-NET-1), so the SYN is black-holed and `connect()` hangs. With the
+/// policy the proxy abandons the connect after 500ms and returns 502
+/// (`ConnectTimedout`). The prompt 502 within the 60s budget is the proof —
+/// without the policy reaching the Ingress path the connect would hang past it
+/// and the route would never return a clean 502.
+#[tokio::test]
+async fn ingress_backend_policy_applies_connect_timeout() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-cbp-connect").await?;
+
+    fixtures::apply_fixture(
+        ingress::BACKEND_POLICY_CONNECT_TIMEOUT,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("backend-policy-connect.{}.local", ns.name);
+
+    // 502 doubles as the readiness signal: once the route + policy are installed
+    // every request black-holes on connect and returns 502 within the 500ms
+    // deadline supplied by the policy.
+    wait::wait_for_route_status(&h.http, &host, "/", 502, Duration::from_secs(60)).await?;
+
+    Ok(())
+}
+
+/// Happy path (#554): a `CoxswainBackendPolicy` with `circuitBreaker` attached to
+/// an Ingress backend Service trips the same per-endpoint breaker Gateway-API
+/// routes already get, proving `RouteEntry::with_circuit_breaker` — a distinct
+/// code path from the `BackendGroup` fields the connect-timeout test above
+/// exercises — is wired on the Ingress surface too.
+///
+/// Mirrors `backend_policy_breaker_opens_when_upstream_errors`'s assertions
+/// exactly (negative baseline 500, then trip to fail-fast 503), here via an
+/// Ingress route rather than an HTTPRoute.
+#[tokio::test]
+async fn ingress_backend_policy_applies_circuit_breaker() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-cbp-cb").await?;
+
+    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
+    fixtures::apply_fixture(
+        ingress::BACKEND_POLICY_CIRCUIT_BREAKER,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("backend-policy-breaker.{}.local", ns.name);
+    let proxy = h.http.proxy_addr;
+
+    // Route readiness: poll /status/200 until the proxy forwards it to go-httpbin.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("{host} / route to return 200 from go-httpbin") },
+        || async {
+            if raw_status(proxy, &host, "/status/200").await == 200 {
+                Some(())
+            } else {
+                None
+            }
+        },
+    )
+    .await?;
+
+    // Negative baseline: the breaker is still closed — the first error must reach
+    // the upstream (500), not be rejected by the breaker (503).
+    let pre = raw_status(proxy, &host, "/status/500").await;
+    assert_eq!(
+        pre, 500,
+        "before the trip sequence the upstream 500 must reach the client (not a breaker 503)"
+    );
+
+    // Trip sequence: over-shoot min-requests to guarantee the breaker opens
+    // regardless of how many readiness requests remain in the 500ms window.
+    for _ in 0..8u32 {
+        raw_status(proxy, &host, "/status/500").await;
+    }
+
+    let open_status = raw_status(proxy, &host, "/status/500").await;
+    assert_eq!(
+        open_status, 503,
+        "after the trip sequence the policy circuit breaker must fail-fast with 503 \
+         (circuitBreaker.threshold=50, minRequests=4)"
+    );
+
+    Ok(())
+}
+
+// ── CoxswainBackendPolicy sessionPersistence on Gateway API routes (#554) ─────
+//
+// New capability: neither HTTPRoute nor GRPCRoute had any session-persistence
+// binding before #554. Cookie mode is exercised on HTTPRoute (shares the
+// `set_cookie_pair` helper with the Ingress cookie tests below); GRPCRoute uses
+// Header mode, the idiomatic form for a metadata-carrying protocol.
+
+/// Happy path (#554): a `CoxswainBackendPolicy` with `sessionPersistence.type:
+/// Cookie` attached to an HTTPRoute's backend Service pins a client to the same
+/// pod across requests replaying the injected cookie — the same behaviour the
+/// Ingress cookie test proves, here via the Gateway API surface for the first
+/// time.
+#[tokio::test]
+async fn session_persistence_pins_httproute_backend() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-sp-http-cookie").await?;
+
+    fixtures::apply_fixture(
+        gwa::BACKEND_POLICY_SESSION_COOKIE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("session-cookie.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
+    // All 3 endpoints must be propagated before establishing the cookie pin —
+    // mirrors the Ingress cookie test's readiness gate for the same reason.
+    wait::wait_for_distinct_backends(&gw, &host, "/", 3, Duration::from_secs(60)).await?;
+
+    let (status, hdrs, body) = gw.get_full(&host, "/").await?;
+    assert_eq!(
+        status, 200,
+        "first session-persistence request must succeed"
+    );
+    let first_pod = body
+        .and_then(|b| b.pod)
+        .expect("echo body must report the serving pod");
+    let cookie = set_cookie_pair(&hdrs, "SESSIONID")
+        .expect("cookie mode must inject a SESSIONID Set-Cookie on the first response");
+
+    for i in 0..10 {
+        let (status, _, body) = gw
+            .get_full_with_headers(&host, "/", &[("Cookie", cookie.as_str())])
+            .await?;
+        assert_eq!(status, 200, "cookie replay {i} must succeed");
+        let pod = body.and_then(|b| b.pod).unwrap_or_default();
+        assert_eq!(
+            pod, first_pod,
+            "cookie replay {i} must pin to the original pod (got {pod}, want {first_pod})"
+        );
+    }
+    Ok(())
+}
+
+/// Sad path (#554): `sessionPersistence.type: Header` with no `sessionName` on
+/// an HTTPRoute's backend policy WARNs and disables persistence entirely — the
+/// route must still serve and round-robin across pods, never erroring or
+/// hanging on the incomplete policy.
+#[tokio::test]
+async fn session_persistence_header_mode_requires_name_httproute() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-sp-http-nohdr").await?;
+
+    fixtures::apply_fixture(
+        gwa::BACKEND_POLICY_SESSION_HEADER_MISSING_NAME,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("session-header-missing.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
+
+    let mut pods = std::collections::HashSet::new();
+    for i in 0..30 {
+        let (status, hdrs, body) = gw.get_full(&host, "/").await?;
+        assert_eq!(status, 200, "request {i} must succeed");
+        assert!(
+            hdrs.get(reqwest::header::SET_COOKIE).is_none(),
+            "request {i}: an incomplete Header-mode policy must never fall back to cookies"
+        );
+        if let Some(p) = body.and_then(|b| b.pod) {
+            pods.insert(p);
+        }
+    }
+    assert!(
+        pods.len() >= 2,
+        "a policy missing sessionName must disable persistence and round-robin, saw {pods:?}"
+    );
+    Ok(())
+}
+
+/// Issue one `GrpcEcho/Echo` unary call through the Gateway VIP for `host`, with
+/// an optional `(key, value)` metadata pair injected on the outgoing request —
+/// used to drive the session-persistence Header mode, which pins by a gRPC
+/// metadata value rather than an HTTP cookie. The response's `assertions.context.pod`
+/// field (populated by the echo server from its own `POD_NAME` env var) reports
+/// which pod served the call — the gRPC equivalent of the HTTP echo body's `pod`
+/// field used throughout this file to check where a request landed.
+async fn grpc_echo_call_with_metadata(
+    gw_addr: SocketAddr,
+    host: &str,
+    metadata: Option<(&str, &str)>,
+) -> Result<grpcecho::EchoResponse, tonic::Status> {
+    let attempt = async {
+        let origin: tonic::transport::Uri = format!("http://{host}:{}", gw_addr.port())
+            .parse()
+            .map_err(|e| tonic::Status::unavailable(format!("uri: {e}")))?;
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))
+            .map_err(|e| tonic::Status::unavailable(format!("endpoint: {e}")))?
+            .origin(origin);
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(|e| tonic::Status::unavailable(format!("connect: {e}")))?;
+        let mut client = tonic::client::Grpc::new(channel);
+        client
+            .ready()
+            .await
+            .map_err(|e| tonic::Status::unavailable(format!("ready: {e}")))?;
+        let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo"
+            .parse::<tonic::codegen::http::uri::PathAndQuery>()
+            .map_err(|e| tonic::Status::unavailable(format!("path: {e}")))?;
+        let codec =
+            tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+        let mut request = tonic::Request::new(grpcecho::EchoRequest {});
+        if let Some((key, value)) = metadata {
+            let key = tonic::metadata::MetadataKey::from_bytes(key.as_bytes())
+                .map_err(|e| tonic::Status::unavailable(format!("metadata key: {e}")))?;
+            let value = tonic::metadata::MetadataValue::try_from(value)
+                .map_err(|e| tonic::Status::unavailable(format!("metadata value: {e}")))?;
+            request.metadata_mut().insert(key, value);
+        }
+        client
+            .unary(request, path, codec)
+            .await
+            .map(tonic::Response::into_inner)
+    };
+    match tokio::time::timeout(Duration::from_secs(20), attempt).await {
+        Ok(result) => result,
+        Err(_) => Err(tonic::Status::deadline_exceeded(
+            "grpc_echo_call_with_metadata did not complete within 20s",
+        )),
+    }
+}
+
+/// Happy path (#554): a `CoxswainBackendPolicy` with `sessionPersistence: {type:
+/// Header, sessionName: x-session-id}` attached to a GRPCRoute's backend Service
+/// pins every call carrying the same `x-session-id` metadata value to the same
+/// backend pod, out of the fixture's 3 `grpc-echo-aff` replicas.
+///
+/// This is the first time either `HTTPRoute` or `GRPCRoute` has had a
+/// session-persistence binding at all — before #554 the feature was Ingress-only.
+/// It gets its own test (rather than relying on the HTTPRoute one above) because
+/// GRPCRoute is reconciled by a separate code path (`GrpcRouteReconciler`, not
+/// `GatewayApiReconciler`) that wires the policy independently.
+#[tokio::test]
+async fn session_persistence_pins_grpcroute_backend() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-sp-grpc-hdr").await?;
+
+    fixtures::apply_fixture(
+        gwa::BACKEND_POLICY_SESSION_HEADER_GRPC,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("grpc-session-header.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+
+    // Readiness + baseline pin: poll until the call succeeds, then capture the
+    // serving pod for a fixed metadata value.
+    let pinned_pod = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("gRPC Echo via {host} to succeed and report a pod") },
+        || async {
+            let resp =
+                grpc_echo_call_with_metadata(gw_addr, &host, Some(("x-session-id", "user-42")))
+                    .await
+                    .ok()?;
+            resp.assertions.and_then(|a| a.context).map(|c| c.pod)
+        },
+    )
+    .await?;
+
+    for i in 0..10u32 {
+        let resp = grpc_echo_call_with_metadata(gw_addr, &host, Some(("x-session-id", "user-42")))
+            .await
+            .map_err(|s| anyhow::anyhow!("call {i} failed: {s:?}"))?;
+        let pod = resp
+            .assertions
+            .and_then(|a| a.context)
+            .map(|c| c.pod)
+            .unwrap_or_default();
+        assert_eq!(
+            pod, pinned_pod,
+            "call {i}: a fixed x-session-id metadata value must pin to one pod \
+             (got '{pod}', want '{pinned_pod}')"
+        );
+    }
+    Ok(())
+}
+
+/// Sad path (#554): `sessionPersistence.type: Header` with no `sessionName` on
+/// a GRPCRoute's backend policy WARNs and disables persistence entirely — the
+/// route must still serve and round-robin across pods.
+#[tokio::test]
+async fn session_persistence_header_mode_requires_name_grpcroute() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-sp-grpc-nohdr").await?;
+
+    fixtures::apply_fixture(
+        gwa::BACKEND_POLICY_SESSION_HEADER_MISSING_NAME_GRPC,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let host = format!("grpc-session-header-missing.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+
+    // Readiness: poll until the call succeeds at all.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("gRPC Echo via {host} to succeed") },
+        || async {
+            grpc_echo_call_with_metadata(gw_addr, &host, None)
+                .await
+                .ok()
+        },
+    )
+    .await?;
+
+    let mut pods = std::collections::HashSet::new();
+    for i in 0..30u32 {
+        let resp = grpc_echo_call_with_metadata(gw_addr, &host, Some(("x-session-id", "user-42")))
+            .await
+            .map_err(|s| anyhow::anyhow!("call {i} failed: {s:?}"))?;
+        if let Some(p) = resp.assertions.and_then(|a| a.context).map(|c| c.pod) {
+            pods.insert(p);
+        }
+    }
+    assert!(
+        pods.len() >= 2,
+        "a policy missing sessionName must disable persistence and round-robin, saw {pods:?}"
+    );
+    Ok(())
+}
+
 // ── Session affinity (#15) ─────────────────────────────────────────────────────
 //
 // One `echo-aff` Service with three pods backs each test, so a backend group holds
@@ -1231,10 +1528,11 @@ fn set_cookie_pair(hdrs: &reqwest::header::HeaderMap, name: &str) -> Option<Stri
     None
 }
 
-/// Cookie-mode affinity (happy path): the proxy injects a `SESSIONID` cookie on the
-/// first response, and every subsequent request replaying that cookie pins to the
-/// same pod. A valid pin is not re-issued. Also proves the custom
-/// `session-cookie-name` is honored.
+/// Cookie-mode session persistence (happy path, #554): a `CoxswainBackendPolicy`
+/// attached to the Ingress backend Service sets `sessionPersistence.type: Cookie`.
+/// The proxy injects a `SESSIONID` cookie on the first response, and every
+/// subsequent request replaying that cookie pins to the same pod. A valid pin is
+/// not re-issued. Also proves the custom `sessionPersistence.sessionName` is honored.
 #[tokio::test]
 async fn session_affinity_cookie_pins_client_to_same_backend_when_cookie_replayed()
 -> anyhow::Result<()> {
@@ -1242,7 +1540,7 @@ async fn session_affinity_cookie_pins_client_to_same_backend_when_cookie_replaye
     let ns = NamespaceGuard::create(&h.client, "aff-cookie").await?;
 
     fixtures::apply_fixture(
-        ingress::ANNOTATION_SESSION_AFFINITY_COOKIE,
+        ingress::BACKEND_POLICY_SESSION_COOKIE,
         FixtureVars::new(&ns.name),
     )
     .await?;
@@ -1262,7 +1560,7 @@ async fn session_affinity_cookie_pins_client_to_same_backend_when_cookie_replaye
         .and_then(|b| b.pod)
         .expect("echo body must report the serving pod");
     let cookie = set_cookie_pair(&hdrs, "SESSIONID").expect(
-        "cookie mode must inject a SESSIONID Set-Cookie (custom session-cookie-name) \
+        "cookie mode must inject a SESSIONID Set-Cookie (custom sessionPersistence.sessionName) \
          on the first response",
     );
 
@@ -1296,7 +1594,7 @@ async fn session_affinity_cookie_reestablishes_when_cookie_token_is_stale() -> a
     let ns = NamespaceGuard::create(&h.client, "aff-stale").await?;
 
     fixtures::apply_fixture(
-        ingress::ANNOTATION_SESSION_AFFINITY_COOKIE,
+        ingress::BACKEND_POLICY_SESSION_COOKIE,
         FixtureVars::new(&ns.name),
     )
     .await?;
@@ -1337,7 +1635,7 @@ async fn session_affinity_header_pins_same_header_value_to_same_backend() -> any
     let ns = NamespaceGuard::create(&h.client, "aff-header").await?;
 
     fixtures::apply_fixture(
-        ingress::ANNOTATION_SESSION_AFFINITY_HEADER,
+        ingress::BACKEND_POLICY_SESSION_HEADER,
         FixtureVars::new(&ns.name),
     )
     .await?;
@@ -1412,7 +1710,7 @@ async fn session_affinity_header_falls_back_to_round_robin_when_header_absent() 
     let ns = NamespaceGuard::create(&h.client, "aff-hdr-rr").await?;
 
     fixtures::apply_fixture(
-        ingress::ANNOTATION_SESSION_AFFINITY_HEADER,
+        ingress::BACKEND_POLICY_SESSION_HEADER,
         FixtureVars::new(&ns.name),
     )
     .await?;
@@ -1628,14 +1926,15 @@ async fn mirror_body_forwarded_without_max_body_size() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Baseline (sad/negative): a backend with no session-affinity annotation keeps plain
-/// round-robin and never injects an affinity cookie.
+/// Baseline (sad/negative, #554): an Ingress backend Service with no attached
+/// `CoxswainBackendPolicy` keeps plain round-robin and never injects an
+/// affinity cookie.
 #[tokio::test]
-async fn requests_round_robin_across_backends_when_no_affinity_annotation() -> anyhow::Result<()> {
+async fn requests_round_robin_across_backends_when_no_backend_policy() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "aff-none").await?;
 
-    fixtures::apply_fixture(ingress::SESSION_AFFINITY_NONE, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(ingress::BACKEND_POLICY_NONE, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_deployments(&ns.name, &["echo-aff"]).await?;
     let host = format!("affinity.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
@@ -1663,8 +1962,9 @@ async fn requests_round_robin_across_backends_when_no_affinity_annotation() -> a
     Ok(())
 }
 
-/// Happy path (#266): `ingress.coxswain-labs.dev/upstream-keepalive-timeout: 60s`
-/// causes Pingora to keep idle upstream connections alive for 60 s.
+/// Happy path (#266, #554): a `CoxswainBackendPolicy` with `timeouts.idle: 60s`
+/// attached to the Ingress backend Service causes Pingora to keep idle
+/// upstream connections alive for 60 s.
 ///
 /// After the route is installed, 20 sequential requests are fired on a single
 /// keep-alive client connection. At least one of those requests must reuse an
@@ -1683,7 +1983,7 @@ async fn upstream_keepalive_reuses_connections() -> anyhow::Result<()> {
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
     fixtures::apply_fixture(
-        ingress::ANNOTATION_KEEPALIVE_TIMEOUT,
+        ingress::BACKEND_POLICY_KEEPALIVE_TIMEOUT,
         FixtureVars::new(&ns.name),
     )
     .await?;
@@ -2084,139 +2384,16 @@ async fn gateway_compression_passthrough_without_accept_encoding() -> anyhow::Re
     Ok(())
 }
 
-/// Sad path (#266, #29 VAP): an unparseable `upstream-keepalive-timeout` value is
-/// rejected by the VAP at admission time. Fail-open proxy semantics remain the
-/// backstop for VAP-disabled installs, verified by the reflector unit tests.
-#[tokio::test]
-async fn upstream_keepalive_invalid_timeout_rejected_by_vap() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "kp-bad").await?;
+// ── Load-balance algorithms (#275, #276, converged to CoxswainBackendPolicy in #554) ──
+//
+// `least_conn` and the circuit breaker are exercised via `CoxswainBackendPolicy`
+// on the Gateway-API surface above (`backend_policy_least_conn_*`,
+// `backend_policy_breaker_*`) — identical algorithm, identical assertions.
+// Ingress-surface coverage below focuses on the algorithm variants that surface
+// has no other e2e for (ip_hash, hash:uri, hash:header), plus proves
+// `CoxswainBackendPolicy` wiring on Ingress works for any one algorithm.
 
-    let msg = fixtures::apply_fixture_expect_rejected(
-        ingress::ANNOTATION_KEEPALIVE_TIMEOUT_INVALID,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-    anyhow::ensure!(
-        msg.contains("upstream-keepalive-timeout"),
-        "VAP rejection message must name the offending annotation, got: {msg}"
-    );
-
-    Ok(())
-}
-
-// ── Load-balance algorithms (#275) ────────────────────────────────────────────
-
-/// Happy path (#275): with `load-balance: least_conn`, the proxy accumulates
-/// in-flight counts per endpoint and routes new requests to whichever endpoint
-/// has the fewest active connections.
-///
-/// The fixture routes to `lb-pool`, a Service backed by two pods:
-/// - `lb-fast` (echo-basic) — responds in < 1 ms.
-/// - `lb-slow` (go-httpbin) — holds the connection for 1 second via `/delay/1`.
-///
-/// 20 requests are issued with a concurrency of 4. Once `lb-slow` holds a slot
-/// for 1 second, all subsequent selections prefer `lb-fast` (active=0 vs active≥1).
-/// Asserts `fast_count > slow_count` and `slow_count ≥ 1` (both endpoints reachable).
-#[tokio::test]
-async fn least_conn_sends_more_requests_to_the_fast_upstream() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "lb-leastconn").await?;
-
-    fixtures::apply_fixture(backends::LB_MIXED, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_deployments(&ns.name, &["lb-fast", "lb-slow"]).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_LOAD_BALANCE_LEAST_CONN,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let host = format!("lb.{}.local", ns.name);
-    // Route readiness: both backends return 200 for /delay/1 (echo instantly, httpbin after 1s).
-    wait::wait_for_route_status(&h.http, &host, "/delay/1", 200, Duration::from_secs(90)).await?;
-    // BOTH lb-pool endpoints (lb-fast + lb-slow) must be compiled into the route
-    // before the burst: if only one is propagated, the distribution assertions
-    // (fast > slow, slow >= 1) are decided by which endpoint happened to land
-    // first. lb-slow (go-httpbin) sets no POD_NAME, so count endpoints via the
-    // admin route table rather than by sampling distinct pod names.
-    wait::wait_for_route_endpoints(
-        &h.shared_proxy_routes_url().await?,
-        &host,
-        2,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    // Pipelined concurrency: 20 requests with up to 4 in-flight at a time.
-    // `lb-slow` holds each connection for 1 s; new selections see lb-slow.active ≥ 1
-    // and route to lb-fast instead. A standalone reqwest client (10 s timeout — the
-    // slow backend needs headroom under load) is spawned per task; each send routes
-    // through `get_with_transient_retry` so a one-off connection blip under the
-    // parallel profile is retried rather than failing the distribution count.
-    let client = Arc::new(
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()?,
-    );
-    let sem = Arc::new(tokio::sync::Semaphore::new(4));
-    let proxy_addr = h.http.proxy_addr;
-
-    let handles: Vec<_> = (0..20u32)
-        .map(|_| {
-            let client = Arc::clone(&client);
-            let sem = Arc::clone(&sem);
-            let url = format!("http://{proxy_addr}/delay/1");
-            let host = host.clone();
-            tokio::spawn(async move {
-                let _permit = sem
-                    .acquire_owned()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("semaphore closed: {e}"))?;
-                let resp =
-                    coxswain_e2e::harness::http::get_with_transient_retry(&client, &url, &host, 3)
-                        .await
-                        .map_err(|e| anyhow::anyhow!("send: {e}"))?;
-                let status = resp.status().as_u16();
-                anyhow::ensure!(status == 200, "expected 200, got {status}");
-                let body = resp
-                    .json::<serde_json::Value>()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("parse body: {e}"))?;
-                Ok::<Option<String>, anyhow::Error>(body["pod"].as_str().map(String::from))
-            })
-        })
-        .collect();
-
-    let mut fast_count = 0usize;
-    let mut slow_count = 0usize;
-    for handle in handles {
-        let pod_opt = handle.await.map_err(|e| anyhow::anyhow!("task: {e}"))??;
-        // lb-fast (echo-basic) sets POD_NAME; lb-slow (go-httpbin) does not.
-        if pod_opt
-            .as_deref()
-            .is_some_and(|p| p.starts_with("lb-fast-"))
-        {
-            fast_count += 1;
-        } else {
-            slow_count += 1;
-        }
-    }
-
-    assert!(
-        fast_count > slow_count,
-        "least_conn must route more requests to the fast upstream; \
-         fast_count={fast_count}, slow_count={slow_count}"
-    );
-    assert!(
-        slow_count >= 1,
-        "least_conn must route at least one request to the slow upstream \
-         (both endpoints reachable); fast_count={fast_count}, slow_count={slow_count}"
-    );
-
-    Ok(())
-}
-
-/// Happy path (#275): with `load-balance: ip_hash`, all requests from the same
+/// Happy path (#275): with `loadBalancer.algorithm: ip_hash`, all requests from the same
 /// source IP must hash to the same endpoint, pinning the client to one pod for
 /// the lifetime of the route.
 ///
@@ -2231,7 +2408,7 @@ async fn ip_hash_pins_a_client_to_one_upstream() -> anyhow::Result<()> {
     fixtures::apply_fixture(backends::ECHO_TWO_REPLICAS, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_deployments(&ns.name, &["echo-two-replicas"]).await?;
     fixtures::apply_fixture(
-        ingress::ANNOTATION_LOAD_BALANCE_IP_HASH,
+        ingress::BACKEND_POLICY_LB_IP_HASH,
         FixtureVars::new(&ns.name),
     )
     .await?;
@@ -2269,26 +2446,6 @@ async fn ip_hash_pins_a_client_to_one_upstream() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Sad path (#275, #29 VAP): an unknown `load-balance` value must be rejected
-/// by the VAP at admission time with a message naming the offending annotation.
-#[tokio::test]
-async fn unknown_load_balance_value_rejected_by_vap() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "lb-unknown").await?;
-
-    let msg = fixtures::apply_fixture_expect_rejected(
-        ingress::ANNOTATION_LOAD_BALANCE_UNKNOWN,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-    anyhow::ensure!(
-        msg.contains("load-balance"),
-        "VAP rejection message must name the offending annotation, got: {msg}"
-    );
-
-    Ok(())
-}
-
 /// Happy path (#276): with `load-balance: hash:uri`, every request to the same
 /// URI must consistently hash (HRW) to the same upstream pod.
 ///
@@ -2304,7 +2461,7 @@ async fn same_uri_always_reaches_the_same_upstream() -> anyhow::Result<()> {
     fixtures::apply_fixture(backends::ECHO_TWO_REPLICAS, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_deployments(&ns.name, &["echo-two-replicas"]).await?;
     fixtures::apply_fixture(
-        ingress::ANNOTATION_LOAD_BALANCE_HASH_URI,
+        ingress::BACKEND_POLICY_LB_HASH_URI,
         FixtureVars::new(&ns.name),
     )
     .await?;
@@ -2367,7 +2524,7 @@ async fn same_hash_header_value_pins_the_upstream() -> anyhow::Result<()> {
     fixtures::apply_fixture(backends::ECHO_TWO_REPLICAS, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_deployments(&ns.name, &["echo-two-replicas"]).await?;
     fixtures::apply_fixture(
-        ingress::ANNOTATION_LOAD_BALANCE_HASH_HEADER,
+        ingress::BACKEND_POLICY_LB_HASH_HEADER,
         FixtureVars::new(&ns.name),
     )
     .await?;
@@ -2444,7 +2601,7 @@ async fn missing_hash_attribute_falls_back_to_round_robin() -> anyhow::Result<()
     fixtures::apply_fixture(backends::ECHO_TWO_REPLICAS, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_deployments(&ns.name, &["echo-two-replicas"]).await?;
     fixtures::apply_fixture(
-        ingress::ANNOTATION_LOAD_BALANCE_HASH_HEADER,
+        ingress::BACKEND_POLICY_LB_HASH_HEADER,
         FixtureVars::new(&ns.name),
     )
     .await?;
@@ -2470,241 +2627,6 @@ async fn missing_hash_attribute_falls_back_to_round_robin() -> anyhow::Result<()
         pods.len() >= 2,
         "missing hash attribute must fall back to round_robin and spread across \
          both pods; saw only {pods:?}"
-    );
-
-    Ok(())
-}
-
-// ── Circuit breaker (#282) ────────────────────────────────────────────────────
-//
-// Annotations exercised (satisfies check-annotation-coverage.sh rubric #11):
-//   ingress.coxswain-labs.dev/circuit-breaker-threshold
-//   ingress.coxswain-labs.dev/circuit-breaker-window
-//   ingress.coxswain-labs.dev/circuit-breaker-open-duration
-//   ingress.coxswain-labs.dev/circuit-breaker-min-requests
-//   ingress.coxswain-labs.dev/circuit-breaker-max-open-duration
-//
-// The fixture sets threshold=50%, min-requests=4, window=500ms, open-duration=2s.
-// window=500ms is sub-second: failsafe's EWMA time gate (elapsed >= window_millis)
-// is always satisfied because 500ms.as_secs()*1000 == 0. This lets the breaker trip
-// as soon as min-requests is met without sleeping in the test body.
-// go-httpbin's /status/:code lets tests drive configurable upstream status codes.
-
-/// Happy path (#282): after enough upstream 500s the EWMA success rate falls
-/// below `threshold`, the circuit breaker opens, and subsequent requests are
-/// fail-fast 503 (never reaching the upstream).
-///
-/// Asserts the negative: a single baseline error is a real upstream 500 (breaker
-/// still closed). After the trip batch, requests fail-fast as 503.
-/// Also asserts the `coxswain_proxy_circuit_breaker_state` gauge reads `1`
-/// (open) and `coxswain_proxy_circuit_breaker_rejected_total` is > 0.
-#[tokio::test]
-async fn breaker_opens_and_fails_fast_when_upstream_errors() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "tp-cb-open").await?;
-
-    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_CIRCUIT_BREAKER,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let host = format!("breaker.{}.local", ns.name);
-    let proxy = h.http.proxy_addr;
-
-    // Route readiness: poll /status/200 until the proxy forwards it to go-httpbin.
-    // (Uses raw_status to avoid EchoResponse JSON-parse failure on go-httpbin's body.)
-    // Note: readiness requests go through the circuit breaker and contribute to its
-    // rolling request counter — we send enough errors below to guarantee the trip
-    // threshold is reached regardless of how many readiness requests are still in
-    // the 500ms window.
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || async {
-            format!(
-                "breaker.{}.local / route to return 200 from go-httpbin",
-                ns.name
-            )
-        },
-        || async {
-            if raw_status(proxy, &host, "/status/200").await == 200 {
-                Some(())
-            } else {
-                None
-            }
-        },
-    )
-    .await?;
-
-    // Negative baseline: the circuit breaker is still closed — the first error
-    // must reach the upstream (500), not be rejected by the breaker (503).
-    let pre = raw_status(proxy, &host, "/status/500").await;
-    assert_eq!(
-        pre, 500,
-        "before the trip sequence the upstream 500 must reach the client (not a breaker 503)"
-    );
-
-    // Trip sequence: send enough errors to guarantee the breaker opens, regardless
-    // of how many readiness /status/200 requests are still in the rolling window.
-    // Individual responses may be 500 (breaker still closing) or 503 (just opened);
-    // we assert only the final state below.
-    for _ in 0..8u32 {
-        raw_status(proxy, &host, "/status/500").await;
-    }
-
-    // The breaker is now open. The next request must be fail-fast 503.
-    let open_status = raw_status(proxy, &host, "/status/500").await;
-    assert_eq!(
-        open_status, 503,
-        "after the trip sequence the circuit breaker must fail-fast with 503 \
-         (circuit-breaker-threshold=50%, circuit-breaker-min-requests=4)"
-    );
-
-    // Metric: coxswain_proxy_circuit_breaker_state for this route must be 1 (open).
-    // Filter by ns.name to avoid matching entries from other concurrent tests.
-    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
-    let ns_route = format!("route=\"ingress/{}/", ns.name);
-    assert!(
-        metrics.lines().any(|line| {
-            line.starts_with("coxswain_proxy_circuit_breaker_state{")
-                && line.contains(&ns_route)
-                && line.split_whitespace().last().is_some_and(|v| v == "1")
-        }),
-        "coxswain_proxy_circuit_breaker_state must equal 1 (open) for route in ns {}; \
-         metrics:\n{metrics}",
-        ns.name
-    );
-
-    // Metric: coxswain_proxy_circuit_breaker_rejected_total > 0 for this route.
-    assert!(
-        metrics.lines().any(|line| {
-            line.starts_with("coxswain_proxy_circuit_breaker_rejected_total{")
-                && line.contains(&ns_route)
-                && line
-                    .split_whitespace()
-                    .last()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .is_some_and(|n| n > 0)
-        }),
-        "coxswain_proxy_circuit_breaker_rejected_total must be > 0 for route in ns {}; \
-         metrics:\n{metrics}",
-        ns.name
-    );
-
-    Ok(())
-}
-
-/// Sad / recovery path (#282): after the breaker opens, `circuit-breaker-open-duration`
-/// expires and the breaker transitions to HalfOpen, allowing a probe request
-/// through. When the probe succeeds (upstream returns 200), the breaker closes
-/// and subsequent requests are served normally.
-///
-/// Also checks that `coxswain_proxy_circuit_breaker_state` is no longer `1`
-/// (open) and that `coxswain_proxy_circuit_breaker_transitions_total{to="closed"}`
-/// is > 0 after recovery.
-#[tokio::test]
-async fn breaker_closes_after_open_duration_when_upstream_recovers() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "tp-cb-recover").await?;
-
-    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_CIRCUIT_BREAKER,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let host = format!("breaker.{}.local", ns.name);
-    let proxy = h.http.proxy_addr;
-
-    // Route readiness.
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || async {
-            format!(
-                "breaker.{}.local / route to return 200 from go-httpbin",
-                ns.name
-            )
-        },
-        || async {
-            if raw_status(proxy, &host, "/status/200").await == 200 {
-                Some(())
-            } else {
-                None
-            }
-        },
-    )
-    .await?;
-
-    // Trip sequence: send enough errors to guarantee the breaker opens.
-    // (Readiness requests may already be in the window counter; we over-shoot
-    // min-requests to be robust to that.)
-    for _ in 0..8u32 {
-        raw_status(proxy, &host, "/status/500").await;
-    }
-
-    // Verify the breaker is open before testing recovery.
-    let open_status = raw_status(proxy, &host, "/status/500").await;
-    assert_eq!(
-        open_status, 503,
-        "breaker must be open (503) before the recovery window; \
-         if 500, the trip sequence did not open the breaker"
-    );
-
-    // Recovery: poll /status/200 until the proxy forwards it (200).
-    // After `circuit-breaker-open-duration` (2s) the breaker transitions to
-    // HalfOpen; the next permitted request goes to go-httpbin → 200 → closes.
-    // No bare sleep: poll_until waits on the real observable (200 response).
-    wait::poll_until(
-        Duration::from_secs(15),
-        wait::POLL_FAST,
-        || async { "circuit breaker to close (expecting 200 from /status/200)".to_string() },
-        || async {
-            if raw_status(proxy, &host, "/status/200").await == 200 {
-                Some(())
-            } else {
-                None
-            }
-        },
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("circuit breaker did not close within 15 s: {e}"))?;
-
-    // Metric: state gauge for this route must not be 1 (open) after recovery.
-    // Filter by ns.name to avoid matching entries from other concurrent tests.
-    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
-    let ns_route = format!("route=\"ingress/{}/", ns.name);
-    assert!(
-        !metrics.lines().any(|line| {
-            line.starts_with("coxswain_proxy_circuit_breaker_state{")
-                && line.contains(&ns_route)
-                && line.split_whitespace().last().is_some_and(|v| v == "1")
-        }),
-        "coxswain_proxy_circuit_breaker_state must not be 1 (open) for route in ns {} \
-         after recovery; metrics:\n{metrics}",
-        ns.name
-    );
-
-    // Metric: transitions_total{to="closed"} > 0 for this route proves the breaker closed.
-    assert!(
-        metrics.lines().any(|line| {
-            line.starts_with("coxswain_proxy_circuit_breaker_transitions_total{")
-                && line.contains(&ns_route)
-                && line.contains("to=\"closed\"")
-                && line
-                    .split_whitespace()
-                    .last()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .is_some_and(|n| n > 0)
-        }),
-        "coxswain_proxy_circuit_breaker_transitions_total{{to=\"closed\"}} must be > 0 \
-         for route in ns {} after the breaker closes; metrics:\n{metrics}",
-        ns.name
     );
 
     Ok(())

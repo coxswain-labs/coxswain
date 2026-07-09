@@ -218,7 +218,7 @@ kubectl describe ingress <name>
 # Events:
 #   Type     Reason            Age  From               Message
 #   ----     ------            ---  ----               -------
-#   Warning  InvalidAnnotation  1m  coxswain           connect-timeout: invalid duration "5 seconds" — expected a Go duration string (e.g. "5s", "1m30s")
+#   Warning  InvalidAnnotation  1m  coxswain           read-timeout: invalid duration "5 seconds" — expected a Go duration string (e.g. "5s", "1m30s")
 ```
 
 Query all annotation-parse warnings in the cluster:

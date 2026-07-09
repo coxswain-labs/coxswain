@@ -1,0 +1,37 @@
+# CoxswainBackendPolicy timeouts.idle happy-path fixture (apply backends::ECHO first, #554).
+#
+# A CoxswainBackendPolicy targeting echo-a sets `timeouts.idle: 60s`, so Pingora
+# keeps idle connections to echo-a alive for up to 60 seconds. Sequential requests
+# over the same client connection will reuse pooled upstream connections,
+# incrementing `coxswain_proxy_upstream_connections_total{state="reused"}`.
+#
+# Host: keepalive.TESTNS.local -> echo-a:3000.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: keepalive-ingress
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: keepalive.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: echo-a-keepalive-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-a
+  timeouts:
+    idle: "60s"

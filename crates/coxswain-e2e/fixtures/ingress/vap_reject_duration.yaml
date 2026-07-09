@@ -1,0 +1,25 @@
+# VAP rejection fixture: invalid duration annotation value (#29).
+#
+# `read-timeout: "notaduration"` is not a valid Go time.ParseDuration string.
+# The VAP must reject this Ingress at admission (retargeted from
+# `upstream-keepalive-timeout` after #554 converged it to
+# `CoxswainBackendPolicy`, which is not VAP-validated by design).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vap-reject-duration
+  annotations:
+    ingress.coxswain-labs.dev/read-timeout: "notaduration"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: vap-duration.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

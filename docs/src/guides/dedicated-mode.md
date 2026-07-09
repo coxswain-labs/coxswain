@@ -2,7 +2,7 @@
 
 A **dedicated proxy (per Gateway)** is a proxy `Deployment` the controller provisions for a single named `Gateway`, serving only that Gateway's routes in isolation from the shared pool. It is a pool in its own right — a `Deployment` scaled by `CoxswainGatewayParameters.spec.replicas` (default `1`), not a single pod — with its own `Service` and `ServiceAccount`.
 
-This is a Gateway API feature. A `Gateway` opts in through `spec.infrastructure.parametersRef` (GEP-1762), or inherits the choice from its `GatewayClass`'s `spec.parametersRef`, pointing at a `CoxswainGatewayParameters` object. Classic `Ingress` has no equivalent of `parametersRef` and is always served by the [shared pool](../architecture.md#shared) — as is every Gateway that doesn't opt in.
+This is a Gateway API feature. A `Gateway` opts in through `spec.infrastructure.parametersRef` (GEP-1762), or inherits the choice from its `GatewayClass`'s `spec.parametersRef`, pointing at a `CoxswainGatewayParameters` object. Classic `Ingress` has no equivalent of `parametersRef` and is always served by the [shared pool](../architecture/deployment-models.md#shared) — as is every Gateway that doesn't opt in.
 
 ## Opt a Gateway into a dedicated pool
 
@@ -138,7 +138,7 @@ cargo run --bin coxswain -- serve proxy --dedicated \
 ```
 
 Verify only that Gateway's routes are loaded — via the controller's admin port, naming this
-dedicated proxy's pod (the proxy itself carries no routes query surface, #537):
+dedicated proxy's pod (the proxy itself carries no routes query surface):
 
 ```bash
 curl -s http://<controller-admin-address>:8082/api/v1/fleet/proxies/<pod-name>/routes | jq .

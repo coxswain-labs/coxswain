@@ -16,9 +16,10 @@ use crate::k8s_utils::metadata_created_at;
 use coxswain_core::crd::{
     Compression, CoxswainExternalAuth, IpAccessControl, RateLimit, RetryPolicy,
 };
+use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{
-    BackendGroup, FilterAction, IngressAuthConfig, IngressRoutingTableBuilder, PathModifier,
-    RouteEntry, compile_path_regex,
+    BackendGroup, CircuitBreakerConfig, FilterAction, IngressAuthConfig,
+    IngressRoutingTableBuilder, PathModifier, RouteEntry, compile_path_regex,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -61,9 +62,11 @@ impl<'a> IngressClassContext<'a> {
 /// The `namespace/name`-CRD-reference stores for the annotation family that
 /// converges to a CR reference (#548): `Compression` (#550), `RetryPolicy`
 /// (#551), `RateLimit` (#552), and `IpAccessControl` (#553). Grouped into its
-/// own struct — rather than four more parameters on
-/// [`IngressExtensionStores::new`] — precisely because more of the same shape
-/// are coming: future workstreams (backend-policy #554) extend *this* struct.
+/// own struct rather than four more parameters on
+/// [`IngressExtensionStores::new`]. `CoxswainBackendPolicy` (#554) does *not*
+/// join this family: it is a GEP-713 direct-attachment policy targeting the
+/// backend `Service` itself, not referenced by a `namespace/name` annotation —
+/// see [`IngressExtensionStores::backend_policy_index`].
 #[non_exhaustive]
 pub struct IngressCrRefStores<'a> {
     pub(crate) compressions: &'a reflector::Store<Compression>,
@@ -96,11 +99,11 @@ impl<'a> IngressCrRefStores<'a> {
 /// the `CoxswainExternalAuth` CR store (`ext-auth`, #549), the `JwtAuth` CR
 /// store and JWKS cache (`auth-jwt`, #441), the backend `ReferenceGrant` set
 /// (needed to resolve a `CoxswainExternalAuth` CR's cross-namespace
-/// `backendRef`), and the converged-CR-reference stores
-/// ([`IngressCrRefStores`]) so `reconcile` stays under the workspace
+/// `backendRef`), the converged-CR-reference stores ([`IngressCrRefStores`]),
+/// and the per-Service `CoxswainBackendPolicy` index
+/// (`backend_policy_index`, #554) — so `reconcile` stays under the workspace
 /// argument-count limit. Not auth-specific despite the auth-heavy history —
-/// every Ingress annotation that converges to a `namespace/name` CRD
-/// reference (#548) lands here.
+/// every extension-CRD input an Ingress reconcile pass needs lands here.
 #[non_exhaustive]
 pub struct IngressExtensionStores<'a> {
     pub(crate) auth_secrets: &'a reflector::Store<Secret>,
@@ -112,6 +115,12 @@ pub struct IngressExtensionStores<'a> {
     pub(crate) retry_policies: &'a reflector::Store<RetryPolicy>,
     pub(crate) rate_limits: &'a reflector::Store<RateLimit>,
     pub(crate) ip_access_controls: &'a reflector::Store<IpAccessControl>,
+    /// Per-Service connection policy resolved from `CoxswainBackendPolicy`
+    /// (#554). Looked up per backend Service — a single Ingress can route
+    /// different paths to different Services, each with its own policy —
+    /// unlike the CR-reference stores above, which are looked up by an
+    /// annotation-carried name.
+    pub(crate) backend_policy_index: &'a crate::gateway_api::BackendPolicyIndex,
 }
 
 impl<'a> IngressExtensionStores<'a> {
@@ -124,6 +133,7 @@ impl<'a> IngressExtensionStores<'a> {
         jwks_cache: &'a crate::jwks::SharedJwksCache,
         backend_grants: &'a crate::reference_grants::GrantSet,
         cr_refs: IngressCrRefStores<'a>,
+        backend_policy_index: &'a crate::gateway_api::BackendPolicyIndex,
     ) -> Self {
         Self {
             auth_secrets,
@@ -135,6 +145,7 @@ impl<'a> IngressExtensionStores<'a> {
             retry_policies: cr_refs.retry_policies,
             rate_limits: cr_refs.rate_limits,
             ip_access_controls: cr_refs.ip_access_controls,
+            backend_policy_index,
         }
     }
 }
@@ -337,34 +348,38 @@ impl IngressReconciler {
         );
         // Build the trusted-proxy forwarded-IP config once and share one Arc across every path.
         let forwarded_for = ann.forwarded_for.clone().map(Arc::new);
-        // Build the circuit-breaker config once and share one Arc across every route entry.
-        let circuit_breaker = ann.circuit_breaker.clone().map(Arc::new);
 
         // One RouteEntry builder shared by all three insertion sites — rule path,
         // ssl-redirect variant, and spec.defaultBackend. Centralising the chain
         // guarantees every per-route knob is applied uniformly; the defaultBackend
         // path previously hand-rolled the chain and silently dropped knobs (#397).
         // Captures the Ingress-wide knobs by reference; callers pass the per-entry
-        // group, path pattern, metric id, and filter list.
-        let build_route_entry = |group: Arc<BackendGroup>,
-                                 path_pattern: Arc<str>,
-                                 metric_route_id: Arc<str>,
-                                 filters: Vec<FilterAction>| {
-            RouteEntry::path_only(group, route_id.clone(), created_at)
-                .with_path_pattern(path_pattern)
-                .with_metric_route_id(metric_route_id)
-                .with_timeouts(ann.timeouts.clone())
-                .with_filter_actions(filters)
-                .with_max_body_size(ann.max_body_size)
-                .with_allow_source_range(allow_source_range.clone())
-                .with_deny_source_range(deny_source_range.clone())
-                .with_access_log_enabled(class_access_log_enabled)
-                .with_rate_limit(rate_limit.clone())
-                .with_auth_chain(auth.clone())
-                .with_compression(compression.clone())
-                .with_forwarded_for(forwarded_for.clone())
-                .with_circuit_breaker(circuit_breaker.clone())
-        };
+        // group, path pattern, metric id, filter list, and circuit breaker. The
+        // circuit breaker is per-call, not captured, because it comes from the
+        // `CoxswainBackendPolicy` attached to *this path's* backend Service (#554)
+        // — a single Ingress can route different paths to different Services,
+        // each with its own policy.
+        let build_route_entry =
+            |group: Arc<BackendGroup>,
+             path_pattern: Arc<str>,
+             metric_route_id: Arc<str>,
+             filters: Vec<FilterAction>,
+             circuit_breaker: Option<Arc<CircuitBreakerConfig>>| {
+                RouteEntry::path_only(group, route_id.clone(), created_at)
+                    .with_path_pattern(path_pattern)
+                    .with_metric_route_id(metric_route_id)
+                    .with_timeouts(ann.timeouts.clone())
+                    .with_filter_actions(filters)
+                    .with_max_body_size(ann.max_body_size)
+                    .with_allow_source_range(allow_source_range.clone())
+                    .with_deny_source_range(deny_source_range.clone())
+                    .with_access_log_enabled(class_access_log_enabled)
+                    .with_rate_limit(rate_limit.clone())
+                    .with_auth_chain(auth.clone())
+                    .with_compression(compression.clone())
+                    .with_forwarded_for(forwarded_for.clone())
+                    .with_circuit_breaker(circuit_breaker.clone())
+            };
 
         tracing::debug!(name = ?ingress.metadata.name, ns, rules = rules.len(), "Reconciling Ingress");
 
@@ -415,15 +430,22 @@ impl IngressReconciler {
                         "No ready endpoints — installing dead route (503)"
                     );
                 }
+                // CoxswainBackendPolicy (#554): looked up per backend Service — this
+                // path's Service may differ from another path's within the same
+                // Ingress, each carrying its own attached policy.
+                let backend_policy = auth_stores
+                    .backend_policy_index
+                    .get(&ObjectKey::new(ns, &svc.name));
                 // Backend wire protocol comes from the Service port `appProtocol` (GEP-1911).
                 let group = Arc::new(build_ingress_backend_group(
                     ns,
                     &svc.name,
                     resolved.addrs,
                     resolved.app_protocol,
-                    &ann,
+                    backend_policy,
                     &retries,
                 ));
+                let circuit_breaker = backend_policy.and_then(|bp| bp.circuit_breaker.clone());
                 let path = path_rule.path.as_deref().unwrap_or("/");
 
                 // Every Ingress path must be absolute — the Kubernetes API server
@@ -502,6 +524,7 @@ impl IngressReconciler {
                     Arc::from(path),
                     Arc::clone(&metric_route_id),
                     path_filters.clone(),
+                    circuit_breaker.clone(),
                 );
                 if dead {
                     base_entry.error_status = Some(503);
@@ -519,6 +542,7 @@ impl IngressReconciler {
                         Arc::from(path),
                         Arc::clone(&metric_route_id),
                         ssl_filters,
+                        circuit_breaker.clone(),
                     );
                     if dead {
                         entry.error_status = Some(503);
@@ -576,15 +600,22 @@ impl IngressReconciler {
                             "No ready endpoints for defaultBackend — skipping"
                         );
                     } else {
+                        // CoxswainBackendPolicy (#554): looked up for the defaultBackend's
+                        // own Service, independent of any per-rule path's policy.
+                        let backend_policy = auth_stores
+                            .backend_policy_index
+                            .get(&ObjectKey::new(ns, &default_svc.name));
                         // Backend wire protocol comes from the Service port `appProtocol` (GEP-1911).
                         let group = Arc::new(build_ingress_backend_group(
                             ns,
                             &default_svc.name,
                             resolved.addrs,
                             resolved.app_protocol,
-                            &ann,
+                            backend_policy,
                             &retries,
                         ));
+                        let circuit_breaker =
+                            backend_policy.and_then(|bp| bp.circuit_breaker.clone());
                         let default_metric_route_id: Arc<str> =
                             Arc::from(format!("ingress/{ns}/{ingress_name}:default"));
                         // Build the defaultBackend filter vec (same base as rule-path
@@ -603,6 +634,7 @@ impl IngressReconciler {
                                 Arc::from("/"),
                                 Arc::clone(&default_metric_route_id),
                                 filters,
+                                circuit_breaker.clone(),
                             ))
                         };
                         for &listener_port in &ports {
@@ -1748,6 +1780,7 @@ mod tests {
                     &empty_rate_limit_store(),
                     &empty_ip_access_store(),
                 ),
+                &empty_backend_policy_index(),
             ),
         );
         assert!(
@@ -1794,6 +1827,7 @@ mod tests {
                     &empty_rate_limit_store(),
                     &empty_ip_access_store(),
                 ),
+                &empty_backend_policy_index(),
             ),
         );
         assert!(
@@ -2013,7 +2047,7 @@ mod tests {
 
     #[test]
     fn annotation_timeouts_stored_on_route_entry() {
-        use crate::ingress::annotations::{CONNECT_TIMEOUT, READ_TIMEOUT, SEND_TIMEOUT};
+        use crate::ingress::annotations::{READ_TIMEOUT, SEND_TIMEOUT};
         use std::time::Duration;
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
@@ -2021,18 +2055,16 @@ mod tests {
             Some("example.com"),
             "/",
             "svc",
-            &[
-                (CONNECT_TIMEOUT, "5s"),
-                (READ_TIMEOUT, "30s"),
-                (SEND_TIMEOUT, "10s"),
-            ],
+            &[(READ_TIMEOUT, "30s"), (SEND_TIMEOUT, "10s")],
         );
         let svcs = empty_svc_store();
         let mut builder = IngressRoutingTableBuilder::new();
         reconcile_no_default(&ing, &store, &svcs, &owned(&["coxswain"]), &mut builder);
         let table = builder.build().unwrap();
         let t = find_timeouts(&table, "example.com", "/");
-        assert_eq!(t.connect, Some(Duration::from_secs(5)));
+        // `connect` has no annotation source — it converged onto
+        // `CoxswainBackendPolicy.timeouts.connect` (#554).
+        assert!(t.connect.is_none());
         assert_eq!(t.read, Some(Duration::from_secs(30)));
         assert_eq!(t.send, Some(Duration::from_secs(10)));
         assert!(t.request.is_none(), "request timeout is gateway-api only");
@@ -2085,6 +2117,7 @@ mod tests {
                     &empty_rate_limit_store(),
                     &empty_ip_access_store(),
                 ),
+                &empty_backend_policy_index(),
             ),
         );
         let table = builder.build().unwrap();
@@ -2146,14 +2179,14 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn invalid_annotation_warns_but_route_still_installed() {
-        use crate::ingress::annotations::CONNECT_TIMEOUT;
+        use crate::ingress::annotations::READ_TIMEOUT;
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
             "/",
             "svc",
-            &[(CONNECT_TIMEOUT, "not-a-duration")],
+            &[(READ_TIMEOUT, "not-a-duration")],
         );
         let svcs = empty_svc_store();
         let mut builder = IngressRoutingTableBuilder::new();
@@ -2380,6 +2413,7 @@ mod tests {
                     &empty_rate_limit_store(),
                     &empty_ip_access_store(),
                 ),
+                &empty_backend_policy_index(),
             ),
         );
         let table = builder.build().unwrap();
@@ -2503,7 +2537,7 @@ mod tests {
 
     #[test]
     fn class_default_annotation_applies_when_ingress_unset() {
-        use crate::ingress::annotations::CONNECT_TIMEOUT;
+        use crate::ingress::annotations::READ_TIMEOUT;
         use std::time::Duration;
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         // Ingress claims "coxswain" but sets no annotations of its own.
@@ -2516,7 +2550,7 @@ mod tests {
             Some("coxswain"),
             None,
         );
-        let defaults = class_defaults("coxswain", &[(CONNECT_TIMEOUT, "7s")]);
+        let defaults = class_defaults("coxswain", &[(READ_TIMEOUT, "7s")]);
         let mut builder = IngressRoutingTableBuilder::new();
         reconcile_with_class_defaults(
             &ing,
@@ -2528,26 +2562,26 @@ mod tests {
         );
         let table = builder.build().unwrap();
         assert_eq!(
-            find_timeouts(&table, "example.com", "/").connect,
+            find_timeouts(&table, "example.com", "/").read,
             Some(Duration::from_secs(7)),
-            "Ingress must inherit the class default connect-timeout"
+            "Ingress must inherit the class default read-timeout"
         );
     }
 
     #[test]
     fn ingress_annotation_overrides_class_default() {
-        use crate::ingress::annotations::CONNECT_TIMEOUT;
+        use crate::ingress::annotations::READ_TIMEOUT;
         use std::time::Duration;
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
-        // Ingress sets connect-timeout=2s; class default is 7s → Ingress wins.
+        // Ingress sets read-timeout=2s; class default is 7s → Ingress wins.
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
             "/",
             "svc",
-            &[(CONNECT_TIMEOUT, "2s")],
+            &[(READ_TIMEOUT, "2s")],
         );
-        let defaults = class_defaults("coxswain", &[(CONNECT_TIMEOUT, "7s")]);
+        let defaults = class_defaults("coxswain", &[(READ_TIMEOUT, "7s")]);
         let mut builder = IngressRoutingTableBuilder::new();
         reconcile_with_class_defaults(
             &ing,
@@ -2559,7 +2593,7 @@ mod tests {
         );
         let table = builder.build().unwrap();
         assert_eq!(
-            find_timeouts(&table, "example.com", "/").connect,
+            find_timeouts(&table, "example.com", "/").read,
             Some(Duration::from_secs(2)),
             "per-Ingress annotation must override the class default per-key"
         );
@@ -2598,7 +2632,7 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn empty_string_class_default_warns_and_falls_back() {
-        use crate::ingress::annotations::CONNECT_TIMEOUT;
+        use crate::ingress::annotations::READ_TIMEOUT;
         let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress(
             "default",
@@ -2611,7 +2645,7 @@ mod tests {
         );
         // An empty string is not an "unset" sentinel: it is parsed, WARNs, and
         // falls back to the built-in default — same as a per-Ingress empty value.
-        let defaults = class_defaults("coxswain", &[(CONNECT_TIMEOUT, "")]);
+        let defaults = class_defaults("coxswain", &[(READ_TIMEOUT, "")]);
         let mut builder = IngressRoutingTableBuilder::new();
         reconcile_with_class_defaults(
             &ing,
@@ -2628,7 +2662,7 @@ mod tests {
                 .is_some()
         );
         assert!(
-            find_timeouts(&table, "example.com", "/").connect.is_none(),
+            find_timeouts(&table, "example.com", "/").read.is_none(),
             "empty class default must fall back to the built-in default"
         );
         assert!(logs_contain("invalid duration — using default"));

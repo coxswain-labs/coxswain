@@ -723,7 +723,7 @@ Semantics:
 
 `RequestSizeLimit` attached to a `GRPCRoute` is accepted but **not enforced** — the reconciler skips it and logs a WARN line (as it does for `BasicAuth`/`Compression`). gRPC message sizes are instead governed by the backend's own `max_recv_msg_size` (gRPC servers reject oversized messages with `RESOURCE_EXHAUSTED`; the default receive cap is ~4 MB).
 
-The reason is a `pingora-proxy` limitation: a `request_body_filter` rejection over HTTP/2 is swallowed by pingora's h2 proxy loop and never delivered to the client, deadlocking the request ([#509](https://github.com/coxswain-labs/coxswain/issues/509)). gRPC never sends `Content-Length`, so the up-front check that guards HTTP/2 elsewhere cannot apply. Faithful edge enforcement for gRPC/HTTP/2 needs buffer-first rejection (as Envoy's `buffer` filter does) and is deferred until pingora ships request-body buffering (pingora [#816](https://github.com/cloudflare/pingora/issues/816)/[#780](https://github.com/cloudflare/pingora/issues/780)).
+The reason is a `pingora-proxy` limitation: a `request_body_filter` rejection over HTTP/2 is swallowed by pingora's h2 proxy loop and never delivered to the client, deadlocking the request. gRPC never sends `Content-Length`, so the up-front check that guards HTTP/2 elsewhere cannot apply. Faithful edge enforcement for gRPC/HTTP/2 needs buffer-first rejection (as Envoy's `buffer` filter does) and is deferred until pingora ships request-body buffering.
 
 ### Response compression
 
@@ -848,7 +848,7 @@ Header matching uses the same `Exact` and `RegularExpression` semantics as `HTTP
 | `spec.rules[].backendRefs` | Service backends only |
 | `spec.rules[].backendRefs[].weight` | Full |
 
-GRPCRoute supports the protocol-agnostic `ExtensionRef` filters — [`RateLimit`](rate-limiting.md), [`IpAccessControl`](#ip-access-control), and [`JwtAuth`](#jwt-authentication) (bearer/JWT auth is a common gRPC pattern, unlike `BasicAuth`) — which apply identically to gRPC (HTTP/2) traffic. `PathRewriteRegex` is not supported: for gRPC the request path *is* the `/{service}/{method}` RPC address, so rewriting it is meaningless. `BasicAuth` and `Compression` are HTTP-only idioms and are not supported either — gRPC clients authenticate with bearer tokens or mTLS, and gRPC compresses per-message at the framing layer rather than via HTTP `Content-Encoding`. `RequestSizeLimit` is also not enforced on gRPC — a mid-stream body cap over HTTP/2 deadlocks the client under pingora ([#509](https://github.com/coxswain-labs/coxswain/issues/509)), so gRPC message sizes are left to the backend's `max_recv_msg_size` ([details](#request-size-limit-is-not-enforced-on-grpcroute)). Any other `ExtensionRef` (and `RequestMirror`) is skipped with a WARN log line.
+GRPCRoute supports the protocol-agnostic `ExtensionRef` filters — [`RateLimit`](rate-limiting.md), [`IpAccessControl`](#ip-access-control), and [`JwtAuth`](#jwt-authentication) (bearer/JWT auth is a common gRPC pattern, unlike `BasicAuth`) — which apply identically to gRPC (HTTP/2) traffic. `PathRewriteRegex` is not supported: for gRPC the request path *is* the `/{service}/{method}` RPC address, so rewriting it is meaningless. `BasicAuth` and `Compression` are HTTP-only idioms and are not supported either — gRPC clients authenticate with bearer tokens or mTLS, and gRPC compresses per-message at the framing layer rather than via HTTP `Content-Encoding`. `RequestSizeLimit` is also not enforced on gRPC — a mid-stream body cap over HTTP/2 deadlocks the client under pingora, so gRPC message sizes are left to the backend's `max_recv_msg_size` ([details](#request-size-limit-is-not-enforced-on-grpcroute)). Any other `ExtensionRef` (and `RequestMirror`) is skipped with a WARN log line.
 
 ### Status conditions
 
@@ -864,25 +864,44 @@ kubectl describe grpcroute my-grpc-route
 
 ## CoxswainBackendPolicy
 
-`CoxswainBackendPolicy` is a Coxswain-native [direct policy attachment](https://gateway-api.sigs.k8s.io/geps/gep-713/) (`gateway.coxswain-labs.dev/v1alpha1`) that sets per-backend upstream connection policy: connect/idle timeouts, the load-balancing algorithm, and a circuit breaker. It attaches to a `Service`; its settings apply to every Gateway API route (`HTTPRoute` or `GRPCRoute`) whose backend resolves to that Service.
+`CoxswainBackendPolicy` configures how the proxy talks to the pods behind a `Service` — connection timeouts, the load-balancing algorithm, a circuit breaker, and sticky sessions. Create one, point it at a `Service` by name, and every route that sends traffic to that Service picks up the settings — whether that route is an `HTTPRoute`, a `GRPCRoute`, or a classic `Ingress`. You do not add anything to the route itself; the policy attaches to the Service and takes effect automatically.
 
-It is the Gateway API counterpart to a family of Ingress annotations — `connect-timeout` / `upstream-keepalive-timeout`, `load-balance`, and `circuit-breaker-*` — none of which has a Gateway API standard equivalent. Each field group is **deliberately proprietary**: it is anchored to a first-class Envoy/Istio concept (LB policies, outlier detection), not an nginx-ism, and there is no upstream Gateway API convergence to await.
+```yaml
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainBackendPolicy
+metadata:
+  name: api-backend-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: api          # <- must be a Service in this same namespace
+  timeouts:
+    connect: 500ms
+```
+
+`targetRefs` is the only required field. `timeouts`, `loadBalancer`, `circuitBreaker`, and `sessionPersistence` are all independent and optional — set only the ones you need; anything you omit keeps the default connection behavior (immediate connect with no timeout override, weighted round-robin, no circuit breaker, no sticky sessions).
+
+!!! note "Why a separate resource, not a route annotation or filter?"
+    These four settings all describe the *connection to the upstream Service*, not anything about how a request is routed there — so unlike filters (retry, rate limiting, compression), which attach per-route, `CoxswainBackendPolicy` attaches per-Service ([GEP-713](https://gateway-api.sigs.k8s.io/geps/gep-713/) direct policy attachment). Two consequences follow: (1) if two routes (say an Ingress and an HTTPRoute) both send traffic to the same Service, they share one connection policy — that's intentional, since connection pooling and circuit breaking are properties of the upstream, not the route; (2) none of `loadBalancer`/`circuitBreaker` has a stable Gateway API standard to converge toward — Gateway API v1.6.0 covers neither (its closest concept, `BackendLBPolicy`, was replaced by an experimental type that only handles retry budgets and session persistence) — so those two fields are intentionally modeled after Envoy's native load-balancing policies and outlier detection instead. `sessionPersistence` does mirror Gateway API's own (experimental) `SessionPersistence` shape, as closely as Coxswain's persistence mechanism supports (see below).
 
 ### Fields
 
-| Field | Description |
-|-------|-------------|
-| `targetRefs[]` | The `Service` objects this policy applies to (same namespace). `group: ""`, `kind: Service`. |
-| `timeouts.connect` | Upstream TCP-connect timeout ([GEP-2257](https://gateway-api.sigs.k8s.io/geps/gep-2257/) duration, e.g. `500ms`, `5s`). Bounds how long the proxy waits to establish a connection before failing the request with `502`. |
-| `timeouts.idle` | Upstream keepalive idle timeout — how long an idle pooled connection is retained before eviction. |
-| `loadBalancer.algorithm` | Upstream load-balancing algorithm. One of `round_robin` (default), `least_conn`, `ewma`, `ip_hash`, `hash:uri`, `hash:source-ip`, `hash:header=<name>`, `hash:cookie=<name>`. Mirrors the Ingress `load-balance` annotation. |
-| `circuitBreaker.threshold` | Error rate (%) that trips the breaker (`1`–`100`). The gate: absent or out of range disables the breaker. |
-| `circuitBreaker.window` | Rolling window over which the EWMA error rate is computed (GEP-2257 duration). Default `10s`. |
-| `circuitBreaker.openDuration` | How long the breaker stays open before allowing a probe. Default `5s`. Starting duration when `maxOpenDuration` enables exponential backoff. |
-| `circuitBreaker.minRequests` | Minimum requests in the window before the breaker can trip. Default `10`. |
-| `circuitBreaker.maxOpenDuration` | Optional cap that enables exponential backoff from `openDuration` up to this value. Unset → constant open duration. |
+| Field | Required? | Description |
+|-------|-----------|-------------|
+| `targetRefs[]` | **Yes** | The `Service` objects this policy applies to, in the *same namespace* as the policy. Each entry: `{ group: "", kind: Service, name: <service-name> }`. |
+| `timeouts.connect` | optional | Upstream TCP-connect timeout ([GEP-2257](https://gateway-api.sigs.k8s.io/geps/gep-2257/) duration, e.g. `500ms`, `5s`). If the proxy can't establish a connection to a pod within this time, it fails the request with `502` instead of waiting indefinitely. |
+| `timeouts.idle` | optional | How long an idle, already-established connection to a pod is kept open in the connection pool before being closed. |
+| `loadBalancer.algorithm` | optional | Which algorithm picks a pod for each request. See [Load-balancing algorithm](#load-balancing-algorithm) below for the full list of values. |
+| `circuitBreaker.threshold` | optional | Error rate (%, `1`–`100`) that trips the breaker. This is the on/off switch: omit it (or set it out of range) and the circuit breaker is disabled entirely — the other `circuitBreaker.*` fields have no effect on their own. See [Circuit breaker](#circuit-breaker) below. |
+| `circuitBreaker.window` | optional | How far back the proxy looks when computing the error rate. Default `10s`. |
+| `circuitBreaker.openDuration` | optional | Once tripped, how long the breaker stays open before it lets a test request through. Default `5s`. |
+| `circuitBreaker.minRequests` | optional | Don't trip the breaker until at least this many requests have been observed in the window — protects low-traffic routes from tripping on one unlucky failure. Default `10`. |
+| `circuitBreaker.maxOpenDuration` | optional | If a pod keeps failing its recovery checks, each re-trip doubles the open duration up to this cap, instead of always waiting the same `openDuration`. Omit for a constant (non-growing) open duration. |
+| `sessionPersistence.type` | optional | How to pin a client to one pod: `Cookie` or `Header`. See [Session persistence](#session-persistence) below for guidance on which to pick. |
+| `sessionPersistence.sessionName` | conditionally required | The cookie name (`Cookie` mode — optional, defaults to `__coxswain_session`) or the request header to key on (`Header` mode — **required**, no default). |
 
-### Example
+### Full example
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -904,16 +923,81 @@ spec:
     window: 10s
     openDuration: 5s
     minRequests: 10
+  sessionPersistence:
+    type: Cookie
+    sessionName: my-session
 ```
 
 ### Behaviour
 
-- A backend `Service` with no attached policy keeps the default connection behaviour (weighted round-robin, breaker disabled).
-- The per-backend `connect` timeout takes precedence over the Gateway API `HTTPRoute.timeouts.backendRequest` fallback, but an Ingress route's explicit `connect-timeout` annotation still wins for that route.
-- **`loadBalancer.algorithm`** applies the same upstream selection the Ingress `load-balance` annotation drives; `round_robin` is a no-op (the default). The `hash:*` forms select an endpoint by a consistent hash of the named request attribute.
-- **`circuitBreaker`** drives the same per-endpoint outlier detection as the Ingress `circuit-breaker-*` annotations: once the EWMA error rate over `window` meets `threshold` (after at least `minRequests`), the breaker opens and requests fail fast with `503` until a probe after `openDuration` succeeds.
-- **Invalid values fail open.** An unparseable duration, an unrecognised `loadBalancer.algorithm`, or an out-of-range `circuitBreaker.threshold` is logged as a warning and ignored — the backend falls back to the default (round-robin / breaker disabled), never a connection-level error or a rejected resource. These fields are deliberately not schema-validated so the policy is accepted and the warning surfaces at reconcile time.
+- A backend `Service` with no attached policy keeps the default connection behaviour (weighted round-robin, breaker disabled, no session persistence).
+- The per-backend `timeouts.connect` takes precedence over the Gateway API `HTTPRoute.timeouts.backendRequest` fallback.
+- **Invalid values fail open.** An unparseable duration, an unrecognised `loadBalancer.algorithm`, an out-of-range `circuitBreaker.threshold`, or an unrecognised `sessionPersistence.type` is logged as a warning and ignored — the backend falls back to the default (round-robin / breaker disabled / no persistence), never a connection-level error or a rejected resource. These fields are deliberately not schema-validated so the policy is accepted and the warning surfaces at reconcile time.
 - **Conflicts.** If two policies target the same `Service`, the older one (by `creationTimestamp`, ties broken by name) wins; the loser receives `Accepted=False, reason=Conflicted` in its `status.ancestors[]`.
+
+### Load-balancing algorithm
+
+`loadBalancer.algorithm` selects the algorithm used to pick an upstream endpoint for each request within the backend group of a route:
+
+| Value | Description |
+|-------|-------------|
+| `round_robin` | _(default)_ Weighted round-robin using the GCD-reduced slot array. Zero per-request overhead. |
+| `least_conn` | Routes to the endpoint with the fewest in-flight requests. Maintains an atomic in-flight counter per endpoint; the counter is incremented on selection and decremented when the response completes (or when a retry selects a different endpoint). |
+| `ewma` | Routes to the endpoint with the lowest exponentially-weighted moving-average response latency (α = 1/8). Unsampled endpoints (active=0) are probed first. Latency is folded in at end-of-request. |
+| `ip_hash` | Alias for `hash:source-ip` (backward-compatible). |
+| `hash:uri` | Consistent hash on the full request URI (path + query string). Requests to the same URI always land on the same endpoint. Falls back to round-robin if the path is empty. |
+| `hash:source-ip` | Consistent hash on the resolved client IP (see [`trust-forwarded-for`](ingress-annotations.md#trust-forwarded-for) for Ingress, or the equivalent Gateway API resolution). Requests from the same IP always land on the same endpoint; unlike cookie affinity, no state is injected into the response. Falls back to round-robin if the client IP is unavailable. |
+| `hash:header=<name>` | Consistent hash on the value of the named request header (e.g. `hash:header=x-user-id`). An empty or absent header falls back to round-robin. |
+| `hash:cookie=<name>` | Consistent hash on the value of the named cookie (e.g. `hash:cookie=session`). An absent or empty cookie falls back to round-robin. |
+
+All `hash:*` values (and `ip_hash`) use **rendezvous (HRW) hashing**: when an endpoint is removed, only its keys are redistributed; all other keys remain on their existing endpoints. This is strictly better than modulo hashing, which reshuffles nearly every key on a membership change. Unknown values warn and fall back to `round_robin`; routing is never interrupted.
+
+**Mapping to Istio/Envoy** — `loadBalancer.algorithm` corresponds to `DestinationRule.trafficPolicy.loadBalancer`:
+
+| Coxswain value | Istio / Envoy equivalent |
+|----------------|--------------------------|
+| `round_robin` | `ROUND_ROBIN` |
+| `least_conn` | `LEAST_REQUEST` |
+| `ewma` | `LEAST_REQUEST` with latency-weighted selection |
+| `ip_hash` / `hash:source-ip` | `CONSISTENT_HASH` (`useSourceIp: true`) |
+| `hash:uri` | `CONSISTENT_HASH` (HTTP URI — closest analogue) |
+| `hash:header=<name>` | `CONSISTENT_HASH` (`httpHeaderName: <name>`) |
+| `hash:cookie=<name>` | `CONSISTENT_HASH` (`httpCookie.name: <name>`) |
+
+**Performance** — all algorithms run on the hot path without locks. `round_robin` allocates nothing per request. `least_conn` and `ewma` perform a linear scan over the endpoint list (typically 1–10 pods per Service) using relaxed atomics, which is negligible compared to I/O. `hash:*` values extract and hash the relevant request attribute with FNV-1a, then perform a linear rendezvous scan — negligible. The `hash:uri` path allocates a single joined `path?query` string only when a query string is present; all other hash sources are allocation-free on the hot path.
+
+### Circuit breaker
+
+The per-upstream-endpoint circuit breaker trips when a backend pod's **error rate** exceeds `threshold`, returning fail-fast **503** responses to clients until the pod shows signs of recovery. This is the Coxswain equivalent of Envoy/Istio **outlier detection**: a single degraded pod trips only its own breaker; healthy pods serving the same route keep accepting traffic.
+
+The breaker is implemented with [failsafe](https://docs.rs/failsafe)'s EWMA (exponentially weighted moving average) success-rate policy. Breaker state is tracked per `(route, endpoint-IP:port)` pair — one state machine per upstream pod, per route.
+
+**State machine:**
+
+1. **Closed** (initial) — requests flow normally; errors accumulate against the EWMA window.
+2. **Open** — error rate exceeded `threshold` after `minRequests` samples; requests fail-fast 503 without reaching the upstream. The breaker stays Open for `openDuration` (or exponentially longer, up to `maxOpenDuration`, on repeated trips).
+3. **HalfOpen** — after `openDuration` one probe request is let through. If it succeeds, the breaker closes; if it fails, it re-opens for another `openDuration`.
+
+**Observability** — three Prometheus series on the proxy admin `/metrics` endpoint:
+
+- `coxswain_proxy_circuit_breaker_state{route, upstream}` — `0` = closed, `1` = open, `2` = half-open.
+- `coxswain_proxy_circuit_breaker_rejected_total{route, upstream}` — count of fail-fast 503s issued while the breaker was open.
+- `coxswain_proxy_circuit_breaker_transitions_total{route, upstream, to}` — cumulative state transitions; `to` is `"open"`, `"half_open"`, or `"closed"`.
+
+**Fail-fast behaviour:** when the breaker is Open, the proxy returns 503 immediately without connecting to the upstream. The client sees 503; other healthy pods serving the same route continue accepting traffic via load-balancing.
+
+### Session persistence
+
+"Session persistence" (also called sticky sessions) means every request from the same client keeps landing on the same backend pod, instead of being spread across all of them by the load-balancing algorithm. Use it when a pod holds state a client needs to come back to — an in-memory session, a WebSocket connection, an in-progress upload. A backend with no `sessionPersistence` configured is unaffected: it uses `loadBalancer.algorithm` (or round-robin) as normal.
+
+There's no server-side table of "which client goes to which pod" — the pin is recomputed from the request itself every time, so it works identically across proxy replicas with no coordination between them needed. There are two ways the proxy identifies which client is which:
+
+- **`type: Cookie`** — pick this for browser clients (regular web traffic). On a client's first request, the proxy picks a pod as usual and sets a cookie identifying it (`Set-Cookie: <sessionName>=<token>; Path=/; HttpOnly`). Every later request that carries the cookie goes back to that same pod. You don't have to do anything client-side — the browser sends the cookie back automatically. `sessionName` is optional here (defaults to `__coxswain_session`); if you set one that isn't a valid cookie name, the proxy warns and falls back to the default rather than rejecting the policy.
+- **`type: Header`** — pick this for API/service clients that already send a stable identifier of their own (an API key, a tenant ID, a session token) as a request header. The proxy hashes that header's value to consistently pick one pod — no cookie is set. Unlike `Cookie` mode, `sessionName` is **required** here (it's the name of the header to key on); if you forget it, persistence is silently disabled for that policy (a warning is logged) and the route falls back to plain round-robin rather than breaking.
+
+**What happens when the pinned pod goes away:** if the pod a client was pinned to gets scaled down or replaced, the next request from that client no longer finds it. Rather than failing, the proxy falls back to round-robin and (in `Cookie` mode) picks a new pod and re-pins with a fresh cookie.
+
+**What's intentionally not supported yet:** Gateway API's own (experimental) `SessionPersistence` type also lets you set a timeout after which a session expires from inactivity (`idleTimeout`) or expires unconditionally (`absoluteTimeout`). Coxswain doesn't support either yet — since there's no server-side session table, there's nothing to time out. Adding real inactivity-based expiry would mean giving the proxy a way to track "when did I last see this client" per pinned session, which is real new work. Until then, a session stays pinned for as long as its pod keeps running.
 
 ### Status
 

@@ -1577,7 +1577,9 @@ async fn vap_rejects_invalid_boolean_annotation() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// VAP rejects an enum annotation with an invalid value (`session-affinity: "invalid"`) (#29).
+/// VAP rejects an enum annotation with an invalid value (`path-normalize: "invalid"`) (#29).
+/// Retargeted from `session-affinity` after #554 converged it to
+/// `CoxswainBackendPolicy`, which is not VAP-validated by design.
 #[tokio::test]
 async fn vap_rejects_invalid_enum_annotation() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -1588,7 +1590,7 @@ async fn vap_rejects_invalid_enum_annotation() -> anyhow::Result<()> {
     )
     .await?;
     anyhow::ensure!(
-        msg.contains("session-affinity"),
+        msg.contains("path-normalize"),
         "VAP rejection message must name the offending annotation, got: {msg}"
     );
     Ok(())
@@ -1648,18 +1650,20 @@ async fn vap_rejects_out_of_range_port_annotation() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// VAP rejects a duration annotation with an invalid value (`upstream-keepalive-timeout: "notaduration"`) (#29).
+/// VAP rejects a duration annotation with an invalid value (`read-timeout: "notaduration"`) (#29).
+/// Retargeted from `upstream-keepalive-timeout` after #554 converged it to
+/// `CoxswainBackendPolicy`, which is not VAP-validated by design.
 #[tokio::test]
 async fn vap_rejects_invalid_duration_annotation() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "vap-dur").await?;
     let msg = fixtures::apply_fixture_expect_rejected(
-        ingress::ANNOTATION_KEEPALIVE_TIMEOUT_INVALID,
+        ingress::VAP_REJECT_DURATION,
         FixtureVars::new(&ns.name),
     )
     .await?;
     anyhow::ensure!(
-        msg.contains("upstream-keepalive-timeout"),
+        msg.contains("read-timeout"),
         "VAP rejection message must name the offending annotation, got: {msg}"
     );
     Ok(())
@@ -1683,21 +1687,23 @@ async fn vap_rejects_invalid_size_string_annotation() -> anyhow::Result<()> {
 }
 
 /// VAP rejects a positive-integer annotation with an invalid value
-/// (`circuit-breaker-threshold: "notanumber"`) (#29). Retargeted from
-/// `rate-limit-rps` after #552 converged `rate-limit` to a CR reference with
-/// no VAP rule of its own — this test exercises the general ">= 1 positive
-/// integer" VAP rule shape, not `rate-limit` specifically.
+/// (`auth-tls-verify-depth: "notanumber"`) (#29). Retargeted from
+/// `circuit-breaker-threshold` after #554 converged it to
+/// `CoxswainBackendPolicy`, which is not VAP-validated by design — this test
+/// exercises the general ">= 1 positive integer" VAP rule shape, not
+/// `circuit-breaker-threshold` specifically (itself previously retargeted
+/// from `rate-limit-rps` after #552).
 #[tokio::test]
 async fn vap_rejects_invalid_positive_integer_annotation() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "vap-int").await?;
     let msg = fixtures::apply_fixture_expect_rejected(
-        ingress::ANNOTATION_CIRCUIT_BREAKER_THRESHOLD_INVALID,
+        ingress::VAP_REJECT_POSITIVE_INTEGER,
         FixtureVars::new(&ns.name),
     )
     .await?;
     anyhow::ensure!(
-        msg.contains("circuit-breaker-threshold"),
+        msg.contains("auth-tls-verify-depth"),
         "VAP rejection message must name the offending annotation, got: {msg}"
     );
     Ok(())

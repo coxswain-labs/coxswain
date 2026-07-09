@@ -988,8 +988,12 @@ async fn conflict_emits_warning_event_on_loser() -> anyhow::Result<()> {
 /// the VAP must receive a `Warning InvalidAnnotation` Kubernetes Event naming the annotation.
 /// A valid Ingress in the same namespace must receive no such Events (#401).
 ///
-/// Uses `session-cookie-name: "bad;name"` — not VAP-validated, so it reaches the controller
-/// parse path and generates a `Warning` Event while the route continues to serve (fail-open).
+/// Uses `path-normalize: "none"` — accepted by the VAP's enum check (still a listed
+/// member) but explicitly rejected downstream by the controller parse path (#483:
+/// `none` disabled normalization, re-opening path-traversal bypass), so it generates
+/// a `Warning` Event while the route continues to serve on the hardened `base`
+/// fallback (fail-open). Retargeted from `session-cookie-name` after #554 converged
+/// session affinity to `CoxswainBackendPolicy`.
 #[tokio::test]
 async fn invalid_annotation_emits_warning_event() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -998,17 +1002,17 @@ async fn invalid_annotation_emits_warning_event() -> anyhow::Result<()> {
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
-    // Ingress with `session-cookie-name: "bad;name"` — a semicolon is not a valid
-    // RFC 6265 cookie token. This annotation is NOT in the VAP so the apply succeeds.
-    // The controller falls back to the default cookie name (fail-open) and emits a
+    // Ingress with `path-normalize: "none"` — dropped in #483 (it disabled
+    // normalization). The VAP still accepts it (in the enum list), but the
+    // controller rejects it downstream, falls back to `base`, and emits a
     // Warning InvalidAnnotation Event on the Ingress.
     fixtures::apply_fixture(
-        ingress::ANNOTATION_SESSION_COOKIE_NAME_INVALID,
+        ingress::ANNOTATION_PATH_NORMALIZE_NONE_FALLS_BACK,
         FixtureVars::new(&ns.name),
     )
     .await?;
-    let bad_host = format!("affinity-bad.{}.local", ns.name);
-    wait::wait_for_route_status(&h.http, &bad_host, "/", 200, Duration::from_secs(60)).await?;
+    let bad_host = format!("pn-none.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &bad_host, "/v1", 200, Duration::from_secs(60)).await?;
 
     // Also apply a valid Ingress in the same namespace (no annotation → no event).
     fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
@@ -1019,14 +1023,14 @@ async fn invalid_annotation_emits_warning_event() -> anyhow::Result<()> {
     let event = wait::wait_for_ingress_warning_event(
         &h.client,
         &ns.name,
-        "session-cookie-invalid-ingress",
+        "pn-none",
         "InvalidAnnotation",
         Duration::from_secs(60),
     )
     .await?;
     let note = event.note.as_deref().unwrap_or("");
     assert!(
-        note.contains("session-cookie-name"),
+        note.contains("path-normalize"),
         "InvalidAnnotation Event note must mention the annotation name; got {note:?}"
     );
 

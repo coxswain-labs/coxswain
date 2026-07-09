@@ -570,11 +570,13 @@ impl RouteEntry {
 
     /// Set the per-endpoint circuit-breaker config for this route (builder-style).
     ///
-    /// Used by the Ingress reconciler to attach the config parsed from the
-    /// `ingress.coxswain-labs.dev/circuit-breaker-*` annotation family (#282).
-    /// `None` (the default, and the value for all Gateway-API routes) disables
-    /// the circuit breaker. The reconciler shares one `Arc` across every path of
-    /// an Ingress so cloning onto each entry is a refcount bump.
+    /// Populated from the `circuitBreaker` facet of the `CoxswainBackendPolicy`
+    /// attached to this route's backend `Service` (#478, #554) — the same
+    /// resolution path for Gateway API and Ingress routes alike. `None` (the
+    /// default) disables the circuit breaker. Resolved per backend Service, so
+    /// two paths of one Ingress routing to different Services may carry
+    /// different `Arc`s; two entries sharing a backend share one `Arc`, and
+    /// cloning it onto each entry is a refcount bump.
     #[must_use]
     pub fn with_circuit_breaker(
         mut self,

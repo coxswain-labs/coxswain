@@ -24,7 +24,7 @@ mod status;
 mod timeouts;
 mod tls_status;
 
-pub use backend_policy::{BackendPolicyIndex, build_backend_policy_index};
+pub use backend_policy::{BackendPolicyIndex, ResolvedBackendPolicy, build_backend_policy_index};
 pub use backend_tls::{BackendTlsIndex, build_backend_tls_index};
 pub use bindings::ListenerBinding;
 pub(crate) use bindings::parent_listener_source;

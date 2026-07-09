@@ -1,17 +1,18 @@
 //! Traffic-policy annotation constants and low-level parse helpers.
 //!
-//! Covers: connection/read/send timeouts, the `retry` `RetryPolicy` reference,
+//! Covers: per-request read/send timeouts, the `retry` `RetryPolicy` reference,
 //! the `compression` `Compression` reference, and the `rate-limit` `RateLimit`
 //! reference. All helpers emit a structured
 //! `WARN` on invalid input and return `None` (or the empty default) so the
 //! affected annotation is treated as absent — the Ingress keeps serving.
-
-use coxswain_core::routing::{LoadBalance, LoadBalanceParseError};
+//!
+//! Per-backend connection policy (connect timeout, upstream keepalive, LB
+//! algorithm, circuit breaker, session persistence) is **not** here: it
+//! converged onto `CoxswainBackendPolicy`, attached to the backend `Service`
+//! (#554) — see `crate::gateway_api::backend_policy`.
 
 // ── Timeout annotation keys ───────────────────────────────────────────────────
 
-/// Upstream TCP-connect timeout — Go `time.ParseDuration` string, e.g. `"5s"`.
-pub const CONNECT_TIMEOUT: &str = "ingress.coxswain-labs.dev/connect-timeout";
 /// Upstream read (response) timeout — Go `time.ParseDuration` string, e.g. `"60s"`.
 pub const READ_TIMEOUT: &str = "ingress.coxswain-labs.dev/read-timeout";
 /// Upstream write (request send) timeout — Go `time.ParseDuration` string, e.g. `"60s"`.
@@ -35,15 +36,6 @@ pub const RETRY: &str = "ingress.coxswain-labs.dev/retry";
 
 /// Per-request body size limit — a byte count or `k`/`m`/`g`-suffixed size, e.g. `"8m"`.
 pub const MAX_BODY_SIZE: &str = "ingress.coxswain-labs.dev/max-body-size";
-
-// ── Upstream keepalive annotation key ────────────────────────────────────────
-
-/// Per-upstream idle-connection timeout — Go `time.ParseDuration` string, e.g. `"60s"`.
-///
-/// Controls how long Pingora keeps an idle upstream connection in its keepalive
-/// pool before evicting it. Absent or invalid → WARN + Pingora default (connections
-/// stay in the LRU pool until capacity pressure forces eviction).
-pub const UPSTREAM_KEEPALIVE_TIMEOUT: &str = "ingress.coxswain-labs.dev/upstream-keepalive-timeout";
 
 // ── Compression annotation key ────────────────────────────────────────────────
 
@@ -72,44 +64,6 @@ pub const COMPRESSION: &str = "ingress.coxswain-labs.dev/compression";
 /// gracefully rather than blocking traffic.
 pub const RATE_LIMIT: &str = "ingress.coxswain-labs.dev/rate-limit";
 
-// ── Circuit-breaker annotation keys ──────────────────────────────────────────
-
-/// Error-rate threshold (1–100, percent) that trips the circuit breaker.
-///
-/// Maps to `failsafe`'s `required_success_rate = 1 - threshold_pct / 100`.
-/// When absent the circuit breaker is disabled for this route.
-pub const CIRCUIT_BREAKER_THRESHOLD: &str = "ingress.coxswain-labs.dev/circuit-breaker-threshold";
-
-/// Rolling window over which the EWMA success rate is measured.
-///
-/// Go `time.ParseDuration` string, e.g. `"10s"`. Default: `10s`.
-pub const CIRCUIT_BREAKER_WINDOW: &str = "ingress.coxswain-labs.dev/circuit-breaker-window";
-
-/// Base open duration: how long the breaker stays open before allowing a probe.
-///
-/// Go `time.ParseDuration` string, e.g. `"5s"`. Default: `5s`.
-/// When `circuit-breaker-max-open-duration` is absent this is a constant backoff
-/// (`failsafe::backoff::constant`); when it is present it is the starting duration
-/// for exponential backoff (`failsafe::backoff::exponential`).
-pub const CIRCUIT_BREAKER_OPEN_DURATION: &str =
-    "ingress.coxswain-labs.dev/circuit-breaker-open-duration";
-
-/// Minimum request count in the window before the policy may trip the breaker.
-///
-/// Maps to `failsafe`'s `min_request_threshold`. Prevents a single early
-/// failure from opening the breaker on low-traffic routes. Default: `10`.
-pub const CIRCUIT_BREAKER_MIN_REQUESTS: &str =
-    "ingress.coxswain-labs.dev/circuit-breaker-min-requests";
-
-/// Maximum open-duration cap for exponential backoff.
-///
-/// Go `time.ParseDuration` string. When present, enables
-/// `failsafe::backoff::exponential(open_duration, max_open_duration)` so the
-/// breaker stays open progressively longer across repeated trips, up to this cap.
-/// When absent the open duration is constant (`failsafe::backoff::constant`).
-pub const CIRCUIT_BREAKER_MAX_OPEN_DURATION: &str =
-    "ingress.coxswain-labs.dev/circuit-breaker-max-open-duration";
-
 // ── Mirror-target annotation key ──────────────────────────────────────────────
 
 /// Secondary backend to shadow all matched requests to, fire-and-forget.
@@ -125,8 +79,6 @@ pub const CIRCUIT_BREAKER_MAX_OPEN_DURATION: &str =
 pub const MIRROR_TARGET: &str = "ingress.coxswain-labs.dev/mirror-target";
 
 // ── Parse helpers ─────────────────────────────────────────────────────────────
-
-use super::AnnotationIssue;
 
 /// Parse a duration annotation value.
 ///
@@ -175,265 +127,6 @@ pub fn parse_byte_size(s: &str) -> Option<u64> {
             tracing::warn!(value = s, "invalid max-body-size annotation value");
             None
         })
-}
-
-// ── Load-balance annotation key and parser ────────────────────────────────────
-
-/// Per-route upstream load-balancing algorithm.
-///
-/// Valid values: `round_robin` (default), `least_conn`, `ewma`, `ip_hash`.
-/// Unknown values emit a `WARN` and fall back to `round_robin`.
-pub const LOAD_BALANCE: &str = "ingress.coxswain-labs.dev/load-balance";
-
-/// Parse the `load-balance` annotation value.
-///
-/// Returns a [`LoadBalance`]; the `hash:*` forms carry their [`HashSource`] inline
-/// via [`LoadBalance::Hash`] (#397). Valid values:
-/// - `round_robin`, `least_conn`, `ewma` — stateless/stateful LB algorithms.
-/// - `hash:uri` — consistent hash by request path + query.
-/// - `hash:source-ip` — consistent hash by resolved client IP.
-/// - `hash:header=<name>` — consistent hash by request header value.
-/// - `hash:cookie=<name>` — consistent hash by cookie value.
-/// - `ip_hash` — backward-compatible alias for `hash:source-ip`.
-///
-/// Unknown values emit a structured `WARN` (naming the Ingress via `route_id`) and
-/// return `RoundRobin`.
-#[must_use]
-pub(crate) fn parse_load_balance(
-    s: &str,
-    route_id: &str,
-    diag: &mut Vec<AnnotationIssue>,
-) -> LoadBalance {
-    // The value→algorithm vocabulary is owned by coxswain-core so the Ingress
-    // annotation and the CoxswainBackendPolicy (#389) can never drift. This
-    // surface maps each parse error to its annotation-specific WARN + diagnostic
-    // and falls back to round-robin.
-    match LoadBalance::parse_lenient(s) {
-        Ok(lb) => lb,
-        Err(e) => {
-            let message = match e {
-                LoadBalanceParseError::UnknownValue => {
-                    tracing::warn!(
-                        ingress = %route_id,
-                        value = s,
-                        "unknown load-balance value — valid values: round_robin, least_conn, ewma, \
-                         hash:uri, hash:source-ip, hash:header=<name>, hash:cookie=<name>, ip_hash; \
-                         falling back to round_robin"
-                    );
-                    format!("unknown load-balance value '{s}' — falling back to round_robin")
-                }
-                LoadBalanceParseError::EmptyHeaderName => {
-                    tracing::warn!(
-                        ingress = %route_id,
-                        value = s,
-                        "empty header name in load-balance hash expression; falling back to round_robin"
-                    );
-                    "empty header name in load-balance hash expression — falling back to round_robin"
-                        .to_string()
-                }
-                LoadBalanceParseError::InvalidHeaderName => {
-                    tracing::warn!(
-                        ingress = %route_id,
-                        value = s,
-                        "invalid header name in load-balance hash expression; falling back to round_robin"
-                    );
-                    format!("invalid header name in load-balance hash expression: {s}")
-                }
-                LoadBalanceParseError::EmptyCookieName => {
-                    tracing::warn!(
-                        ingress = %route_id,
-                        value = s,
-                        "empty cookie name in load-balance hash expression; falling back to round_robin"
-                    );
-                    "empty cookie name in load-balance hash expression — falling back to round_robin"
-                        .to_string()
-                }
-                LoadBalanceParseError::UnknownHashAttr => {
-                    tracing::warn!(
-                        ingress = %route_id,
-                        value = s,
-                        "unknown hash attribute in load-balance; valid forms: hash:uri, hash:source-ip, \
-                         hash:header=<name>, hash:cookie=<name>; falling back to round_robin"
-                    );
-                    format!("unknown hash attribute in load-balance: {s}")
-                }
-                // `LoadBalanceParseError` is `#[non_exhaustive]`: any future
-                // variant degrades to a generic WARN + round-robin fallback.
-                other => {
-                    tracing::warn!(
-                        ingress = %route_id,
-                        value = s,
-                        error = %other,
-                        "invalid load-balance value; falling back to round_robin"
-                    );
-                    format!("invalid load-balance value '{s}' — falling back to round_robin")
-                }
-            };
-            diag.push(AnnotationIssue {
-                annotation: LOAD_BALANCE,
-                message,
-            });
-            LoadBalance::RoundRobin
-        }
-    }
-}
-
-// ── Circuit-breaker parser ────────────────────────────────────────────────────
-
-/// Parse the five `circuit-breaker-*` annotations into a [`CircuitBreakerConfig`].
-///
-/// `circuit-breaker-threshold` (1–100) is the gate: absent → breaker disabled,
-/// `None` returned. Invalid values emit a structured `WARN` and also return `None`
-/// (fail-open).  The remaining four annotations default to `10s` / `5s` / `10` /
-/// absent (constant backoff) when absent or invalid.
-///
-/// The Ingress is never rejected: all parse failures produce a `WARN` + fallback.
-///
-/// # Errors
-///
-/// This function never returns an error; failures emit `WARN` tracing events and
-/// return `None` so the caller treats the annotation as absent.
-#[must_use]
-pub(crate) fn parse_circuit_breaker(
-    ann: &std::collections::BTreeMap<String, String>,
-    route_id: &str,
-    diag: &mut Vec<AnnotationIssue>,
-) -> Option<coxswain_core::routing::CircuitBreakerConfig> {
-    use super::get;
-    use coxswain_core::routing::CircuitBreakerConfig;
-
-    // threshold is the gate: absent → disabled.
-    let threshold_str = get(ann, CIRCUIT_BREAKER_THRESHOLD)?;
-    let threshold_pct = parse_threshold_pct(threshold_str).or_else(|| {
-        tracing::warn!(
-            ingress = %route_id,
-            annotation = CIRCUIT_BREAKER_THRESHOLD,
-            value = threshold_str,
-            "invalid circuit-breaker-threshold (expected 1–100) — circuit breaker disabled"
-        );
-        diag.push(AnnotationIssue {
-            annotation: CIRCUIT_BREAKER_THRESHOLD,
-            message: format!(
-                "invalid circuit-breaker-threshold '{threshold_str}' (expected 1–100) — circuit breaker disabled"
-            ),
-        });
-        None
-    })?;
-
-    let window = get(ann, CIRCUIT_BREAKER_WINDOW)
-        .and_then(|v| {
-            let d = parse_duration(v);
-            if d.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = CIRCUIT_BREAKER_WINDOW,
-                    value = v,
-                    "invalid duration — using default 10s"
-                );
-                diag.push(AnnotationIssue {
-                    annotation: CIRCUIT_BREAKER_WINDOW,
-                    message: "invalid duration — using default 10s".into(),
-                });
-            }
-            d
-        })
-        .unwrap_or_else(|| std::time::Duration::from_secs(10));
-
-    let open_duration = get(ann, CIRCUIT_BREAKER_OPEN_DURATION)
-        .and_then(|v| {
-            let d = parse_duration(v);
-            if d.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = CIRCUIT_BREAKER_OPEN_DURATION,
-                    value = v,
-                    "invalid duration — using default 5s"
-                );
-                diag.push(AnnotationIssue {
-                    annotation: CIRCUIT_BREAKER_OPEN_DURATION,
-                    message: "invalid duration — using default 5s".into(),
-                });
-            }
-            d
-        })
-        .unwrap_or_else(|| std::time::Duration::from_secs(5));
-
-    let min_requests = get(ann, CIRCUIT_BREAKER_MIN_REQUESTS)
-        .and_then(|v| {
-            let n = parse_u32(v);
-            if n.is_none() {
-                tracing::warn!(
-                    ingress = %route_id,
-                    annotation = CIRCUIT_BREAKER_MIN_REQUESTS,
-                    value = v,
-                    "invalid integer — using default 10"
-                );
-                diag.push(AnnotationIssue {
-                    annotation: CIRCUIT_BREAKER_MIN_REQUESTS,
-                    message: "invalid integer — using default 10".into(),
-                });
-            }
-            n
-        })
-        .unwrap_or(10);
-
-    let max_open_duration = get(ann, CIRCUIT_BREAKER_MAX_OPEN_DURATION).and_then(|v| {
-        let d = parse_duration(v);
-        if d.is_none() {
-            tracing::warn!(
-                ingress = %route_id,
-                annotation = CIRCUIT_BREAKER_MAX_OPEN_DURATION,
-                value = v,
-                "invalid duration — treating max-open-duration as absent (constant backoff)"
-            );
-            diag.push(AnnotationIssue {
-                annotation: CIRCUIT_BREAKER_MAX_OPEN_DURATION,
-                message:
-                    "invalid duration — treating max-open-duration as absent (constant backoff)"
-                        .into(),
-            });
-        }
-        d
-    });
-
-    // failsafe::backoff::exponential requires start.as_secs() > 0 (i.e. open_duration ≥ 1s).
-    // If the operator configured exponential backoff but open_duration rounds down to 0 seconds,
-    // fall back to constant backoff and warn rather than panic at runtime.
-    let max_open_duration = if max_open_duration.is_some() && open_duration.as_secs() == 0 {
-        tracing::warn!(
-            ingress = %route_id,
-            open_duration_ms = open_duration.as_millis(),
-            "circuit-breaker-open-duration must be ≥ 1s when circuit-breaker-max-open-duration \
-             is set (failsafe exponential backoff requires start ≥ 1 s) — \
-             treating max-open-duration as absent (constant backoff)"
-        );
-        diag.push(AnnotationIssue {
-            annotation: CIRCUIT_BREAKER_OPEN_DURATION,
-            message: "circuit-breaker-open-duration must be ≥ 1s when max-open-duration is set — treating max-open-duration as absent (constant backoff)".into(),
-        });
-        None
-    } else {
-        max_open_duration
-    };
-
-    Some(CircuitBreakerConfig::new(
-        threshold_pct,
-        min_requests,
-        window,
-        open_duration,
-        max_open_duration,
-    ))
-}
-
-/// Parse an integer percentage (1–100) from an annotation value.
-///
-/// Emits a structured `WARN` and returns `None` on invalid input.
-#[must_use]
-fn parse_threshold_pct(s: &str) -> Option<u8> {
-    match s.trim().parse::<u8>() {
-        Ok(n @ 1..=100) => Some(n),
-        _ => None,
-    }
 }
 
 // ── Mirror-target types and parser ───────────────────────────────────────────
@@ -507,9 +200,6 @@ pub(crate) fn parse_mirror_target(s: &str) -> Option<MirrorTargetRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coxswain_core::routing::HashSource;
-    use http::HeaderName;
-    use std::sync::Arc;
 
     #[test]
     fn parse_u32_valid() {
@@ -526,12 +216,11 @@ mod tests {
 
     #[test]
     fn retry_const_referenced() {
-        // References CONNECT_TIMEOUT/READ_TIMEOUT/SEND_TIMEOUT/RETRY via test
-        // constants to satisfy the annotation-coverage gate. Actual `namespace/name`
+        // References READ_TIMEOUT/SEND_TIMEOUT/RETRY via test constants to
+        // satisfy the annotation-coverage gate. Actual `namespace/name`
         // resolution is exercised in `annotations::mod::tests` (parse) and
         // `reconcile_helpers::tests` (resolve, via `resolve_retry_config`) — the
         // const has no standalone parser left in this file.
-        let _ = CONNECT_TIMEOUT;
         let _ = READ_TIMEOUT;
         let _ = SEND_TIMEOUT;
         let _ = RETRY;
@@ -626,145 +315,6 @@ mod tests {
         assert!(logs_contain("host must contain at least"));
     }
 
-    // ── UPSTREAM_KEEPALIVE_TIMEOUT ────────────────────────────────────────────
-
-    #[test]
-    fn upstream_keepalive_timeout_const_present() {
-        // Satisfies check-annotation-coverage.sh parse requirement (a) by referencing
-        // the constant in the test region.
-        let _ = UPSTREAM_KEEPALIVE_TIMEOUT;
-    }
-
-    #[test]
-    fn parse_duration_accepts_keepalive_timeout_values() {
-        // Canonical values an operator would write for upstream-keepalive-timeout.
-        let _ = UPSTREAM_KEEPALIVE_TIMEOUT;
-        assert_eq!(
-            parse_duration("60s"),
-            Some(std::time::Duration::from_secs(60))
-        );
-        assert_eq!(
-            parse_duration("5m"),
-            Some(std::time::Duration::from_secs(300))
-        );
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_duration_invalid_warns_for_keepalive_timeout() {
-        let _ = UPSTREAM_KEEPALIVE_TIMEOUT;
-        // parse_duration itself emits a WARN on invalid input.
-        assert!(parse_duration("notaduration").is_none());
-    }
-
-    // ── parse_load_balance ────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_load_balance_stateless_algorithms() {
-        // References LOAD_BALANCE to satisfy the annotation-coverage gate.
-        let _ = LOAD_BALANCE;
-        assert_eq!(
-            parse_load_balance("round_robin", "test-ingress", &mut vec![]),
-            LoadBalance::RoundRobin
-        );
-        assert_eq!(
-            parse_load_balance("least_conn", "test-ingress", &mut vec![]),
-            LoadBalance::LeastConn
-        );
-        assert_eq!(
-            parse_load_balance("ewma", "test-ingress", &mut vec![]),
-            LoadBalance::Ewma
-        );
-    }
-
-    #[test]
-    fn parse_load_balance_ip_hash_backward_compat_alias() {
-        assert_eq!(
-            parse_load_balance("ip_hash", "test-ingress", &mut vec![]),
-            LoadBalance::Hash(HashSource::SourceIp),
-            "ip_hash must remain a valid alias for hash:source-ip"
-        );
-    }
-
-    #[test]
-    fn parse_load_balance_hash_uri() {
-        assert_eq!(
-            parse_load_balance("hash:uri", "test-ingress", &mut vec![]),
-            LoadBalance::Hash(HashSource::Uri)
-        );
-    }
-
-    #[test]
-    fn parse_load_balance_hash_source_ip() {
-        assert_eq!(
-            parse_load_balance("hash:source-ip", "test-ingress", &mut vec![]),
-            LoadBalance::Hash(HashSource::SourceIp)
-        );
-    }
-
-    #[test]
-    fn parse_load_balance_hash_header() {
-        assert_eq!(
-            parse_load_balance("hash:header=x-api-key", "test-ingress", &mut vec![]),
-            LoadBalance::Hash(HashSource::Header(HeaderName::from_static("x-api-key")))
-        );
-    }
-
-    #[test]
-    fn parse_load_balance_hash_cookie() {
-        assert_eq!(
-            parse_load_balance("hash:cookie=session", "test-ingress", &mut vec![]),
-            LoadBalance::Hash(HashSource::Cookie(Arc::from("session")))
-        );
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_load_balance_hash_empty_header_warns() {
-        assert_eq!(
-            parse_load_balance("hash:header=", "test-ingress", &mut vec![]),
-            LoadBalance::RoundRobin
-        );
-        assert!(logs_contain("empty header name"));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_load_balance_hash_empty_cookie_warns() {
-        assert_eq!(
-            parse_load_balance("hash:cookie=", "test-ingress", &mut vec![]),
-            LoadBalance::RoundRobin
-        );
-        assert!(logs_contain("empty cookie name"));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_load_balance_hash_unknown_attr_warns() {
-        assert_eq!(
-            parse_load_balance("hash:unknown", "test-ingress", &mut vec![]),
-            LoadBalance::RoundRobin
-        );
-        assert!(logs_contain("unknown hash attribute"));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_load_balance_unknown_value_warns_and_returns_round_robin() {
-        assert_eq!(
-            parse_load_balance("bogus", "test-ingress", &mut vec![]),
-            LoadBalance::RoundRobin
-        );
-        assert!(logs_contain("unknown load-balance value"));
-    }
-
-    fn ann(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
-        pairs
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
     // ── COMPRESSION const reference (#550) ────────────────────────────────────
     //
     // Actual `namespace/name` resolution is exercised in
@@ -775,129 +325,5 @@ mod tests {
     #[test]
     fn compression_const_referenced() {
         let _ = COMPRESSION;
-    }
-
-    // ── parse_circuit_breaker (#282) ──────────────────────────────────────────
-
-    #[test]
-    fn parse_circuit_breaker_absent_threshold_returns_none() {
-        // References all 5 consts to satisfy check-annotation-coverage.sh parse-test gate.
-        let _ = CIRCUIT_BREAKER_THRESHOLD;
-        let _ = CIRCUIT_BREAKER_WINDOW;
-        let _ = CIRCUIT_BREAKER_OPEN_DURATION;
-        let _ = CIRCUIT_BREAKER_MIN_REQUESTS;
-        let _ = CIRCUIT_BREAKER_MAX_OPEN_DURATION;
-        // Without circuit-breaker-threshold the breaker is disabled.
-        assert!(parse_circuit_breaker(&ann(&[]), "test", &mut vec![]).is_none());
-    }
-
-    #[test]
-    fn parse_circuit_breaker_threshold_only_uses_defaults() {
-        let a = ann(&[(CIRCUIT_BREAKER_THRESHOLD, "50")]);
-        let cfg =
-            parse_circuit_breaker(&a, "test", &mut vec![]).expect("Some when threshold is present");
-        assert_eq!(cfg.threshold_pct, 50);
-        assert_eq!(cfg.window, std::time::Duration::from_secs(10));
-        assert_eq!(cfg.open_duration, std::time::Duration::from_secs(5));
-        assert_eq!(cfg.min_requests, 10);
-        assert!(cfg.max_open_duration.is_none());
-    }
-
-    #[test]
-    fn parse_circuit_breaker_all_annotations() {
-        let a = ann(&[
-            (CIRCUIT_BREAKER_THRESHOLD, "75"),
-            (CIRCUIT_BREAKER_WINDOW, "30s"),
-            (CIRCUIT_BREAKER_OPEN_DURATION, "10s"),
-            (CIRCUIT_BREAKER_MIN_REQUESTS, "5"),
-            (CIRCUIT_BREAKER_MAX_OPEN_DURATION, "60s"),
-        ]);
-        let cfg =
-            parse_circuit_breaker(&a, "test", &mut vec![]).expect("Some when threshold is present");
-        assert_eq!(cfg.threshold_pct, 75);
-        assert_eq!(cfg.window, std::time::Duration::from_secs(30));
-        assert_eq!(cfg.open_duration, std::time::Duration::from_secs(10));
-        assert_eq!(cfg.min_requests, 5);
-        assert_eq!(
-            cfg.max_open_duration,
-            Some(std::time::Duration::from_secs(60))
-        );
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_circuit_breaker_threshold_zero_warns_and_returns_none() {
-        let a = ann(&[(CIRCUIT_BREAKER_THRESHOLD, "0")]);
-        assert!(parse_circuit_breaker(&a, "test", &mut vec![]).is_none());
-        assert!(logs_contain("invalid circuit-breaker-threshold"));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_circuit_breaker_threshold_above_100_warns_and_returns_none() {
-        let a = ann(&[(CIRCUIT_BREAKER_THRESHOLD, "101")]);
-        assert!(parse_circuit_breaker(&a, "test", &mut vec![]).is_none());
-        assert!(logs_contain("invalid circuit-breaker-threshold"));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_circuit_breaker_invalid_window_warns_and_uses_default() {
-        let a = ann(&[
-            (CIRCUIT_BREAKER_THRESHOLD, "50"),
-            (CIRCUIT_BREAKER_WINDOW, "bad"),
-        ]);
-        let cfg = parse_circuit_breaker(&a, "test", &mut vec![])
-            .expect("breaker enabled despite bad window");
-        assert_eq!(cfg.window, std::time::Duration::from_secs(10));
-        assert!(logs_contain("invalid duration — using default 10s"));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_circuit_breaker_invalid_open_duration_warns_and_uses_default() {
-        let a = ann(&[
-            (CIRCUIT_BREAKER_THRESHOLD, "50"),
-            (CIRCUIT_BREAKER_OPEN_DURATION, "bad"),
-        ]);
-        let cfg = parse_circuit_breaker(&a, "test", &mut vec![])
-            .expect("breaker enabled despite bad open-duration");
-        assert_eq!(cfg.open_duration, std::time::Duration::from_secs(5));
-        assert!(logs_contain("invalid duration — using default 5s"));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_circuit_breaker_invalid_min_requests_warns_and_uses_default() {
-        let a = ann(&[
-            (CIRCUIT_BREAKER_THRESHOLD, "50"),
-            (CIRCUIT_BREAKER_MIN_REQUESTS, "bad"),
-        ]);
-        let cfg = parse_circuit_breaker(&a, "test", &mut vec![])
-            .expect("breaker enabled despite bad min-requests");
-        assert_eq!(cfg.min_requests, 10);
-        assert!(logs_contain("invalid integer — using default 10"));
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn parse_circuit_breaker_invalid_max_open_duration_warns_and_uses_constant_backoff() {
-        let a = ann(&[
-            (CIRCUIT_BREAKER_THRESHOLD, "50"),
-            (CIRCUIT_BREAKER_MAX_OPEN_DURATION, "bad"),
-        ]);
-        let cfg = parse_circuit_breaker(&a, "test", &mut vec![])
-            .expect("breaker enabled despite bad max-open-duration");
-        assert!(cfg.max_open_duration.is_none());
-        assert!(logs_contain("treating max-open-duration as absent"));
-    }
-
-    #[test]
-    fn parse_threshold_pct_boundary_values() {
-        assert_eq!(parse_threshold_pct("1"), Some(1));
-        assert_eq!(parse_threshold_pct("100"), Some(100));
-        assert!(parse_threshold_pct("0").is_none());
-        assert!(parse_threshold_pct("101").is_none());
-        assert!(parse_threshold_pct("abc").is_none());
     }
 }

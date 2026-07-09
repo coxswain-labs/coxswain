@@ -42,8 +42,13 @@ Watches Ingress, GatewayClass, Gateway, HTTPRoute, and related resources cluster
 
 The controller also runs two gRPC listeners that proxies connect to:
 
-- **Discovery (Stream) listener** (port 50051, mTLS mandatory, **leader-only**): compiles routing snapshots from K8s resources and pushes them to subscribed proxies. Each snapshot is scoped to the subscriber's declared `Scope` — see [Scope-aware dispatch](#scope-aware-dispatch) below. Only the lease holder serves streams: the leader labels its own pod (`discovery.coxswain-labs.dev/leader: "true"`) so the `coxswain-controller-discovery` Service routes dials to it, and standby replicas reject any stray stream with `FAILED_PRECONDITION` (the proxy fast-retries and re-lands on the leader). Serving from one replica gives every proxy a single, consistent watch position, and it puts the proxies' bound-listener readiness reports in the same process that writes `Gateway` status — `Programmed=True` is gated on the pool actually binding the Gateway's ports.
-- **Bootstrap (Identity) listener** (port 50052, server-auth-only TLS, **every replica**, via the separate `coxswain-controller-discovery-bootstrap` Service): acts as a certificate authority. A fresh proxy presents its ServiceAccount token and a CSR; the controller validates the token via `TokenReview`, signs a short-lived SPIFFE SVID, and returns it. SVID issuance is stateless (all replicas share one CA Secret), so it keeps working through leader churn. See [Control-plane security](guides/control-plane-security.md).
+- **Discovery (Stream) listener** (port 50051, mTLS mandatory, **leader-only**) — compiles routing snapshots from K8s resources and pushes them to subscribed proxies. Each snapshot is scoped to the subscriber's declared `Scope` — see [Scope-aware dispatch](architecture/deployment-models.md#scope-aware-dispatch).
+
+    Only the lease holder serves streams. Mechanically: the leader labels its own pod (`discovery.coxswain-labs.dev/leader: "true"`), so the `coxswain-controller-discovery` Service routes dials to it; a standby replica that gets dialled anyway (during a leader transition) rejects the stream with `FAILED_PRECONDITION`, and the proxy fast-retries until it lands on the real leader.
+
+    Why single-replica: it gives every proxy one consistent watch position (no two replicas can disagree about routing state), and it puts each proxy's bound-listener readiness report in the same process that writes `Gateway` status — so `Programmed=True` is a genuine claim that the data plane is actually bound and serving, not just that the controller compiled a snapshot.
+
+- **Bootstrap (Identity) listener** (port 50052, server-auth-only TLS, **every replica**, via the separate `coxswain-controller-discovery-bootstrap` Service) — acts as a certificate authority for new proxies. A fresh proxy presents its ServiceAccount token and a CSR; the controller validates the token via `TokenReview`, signs a short-lived SPIFFE SVID, and returns it. Unlike the Stream listener, every replica can do this (not just the leader) because issuance needs no shared state beyond the one CA Secret all replicas already read — so it keeps working through leader churn. See [Control-plane security](guides/control-plane-security.md).
 
 On a leader change, routing *updates* stall for the brief reconnect window (bounded by the Lease TTL) while every proxy keeps serving its last-good snapshot — no data-plane outage. Status writes race nothing: a demoted leader re-checks its leadership immediately before every status patch, narrowing the residual last-write-wins window to a single request round-trip (accepted; both replicas compute identical status from warm caches).
 
@@ -71,203 +76,6 @@ Like the shared proxy, the dedicated proxy holds **zero Kubernetes API credentia
 
 Designed as a recursive discovery node — a relay that subscribes to an upstream discovery stream and re-publishes snapshots to downstream proxies across a network boundary. Deferred to v0.6.
 
-## Scope-aware dispatch
-
-The controller maintains two snapshot registries:
-
-- **`SharedPool`** — five shared routing cells (Ingress table, Gateway table, TLS store, client-cert store, listener health). The shared proxy pool subscribes with this scope and receives a snapshot covering all Ingress and non-dedicated Gateway routing.
-- **`Gateway { name, namespace }`** — one entry per opted-in Gateway in the `DedicatedRoutingRegistry`. Each dedicated proxy subscribes with its own Gateway identity and receives only that Gateway's slice. Cross-namespace routes (e.g. `from: All`) are resolved controller-side — the controller's cluster-wide reflector sees every namespace's routes and compiles them into the dedicated snapshot before pushing.
-
-A `Subscribe` message with no scope field is treated as `SharedPool`. A scope message with no kind discriminator is rejected as malformed to prevent a zero-value proto from silently escalating to `SharedPool`.
-
-## Deployment models
-
-Coxswain has two macro deployment models: **Shared** and **Dedicated**. They are not mutually exclusive — a production cluster typically runs a shared proxy pool alongside one or more dedicated proxies for Gateways that need isolation.
-
-### Shared
-
-One cluster-wide proxy pool serves every `Ingress` and every `Gateway` that has not opted into dedicated mode. This is the Helm chart default: one controller `Deployment` and one shared proxy `Deployment` in `coxswain-system`.
-
-**Shared compute, per-Gateway addressing.** The shared model shares the proxy *pod* (compute), but each owned `Gateway` gets its **own `Service`/VIP**, not a shared address. The controller provisions a per-Gateway `Service` that selects the shared proxy pod and maps each advertised listener port (e.g. `:443`) to a **distinct internal `targetPort`** on the pod. The proxy keys its routing, TLS-passthrough, and TLS-terminate cert tables by the **local port it accepted on**, so the internal port is a per-Gateway discriminator and cross-Gateway hostname namespaces are isolated by address — two Gateways with overlapping hostnames (`*.example.com` on each) never leak into one another. Each Gateway reports its own VIP in `status.addresses`. This relies only on standard Kubernetes `Service` `port → targetPort` mapping (no `SO_ORIGINAL_DST`, no conntrack assumptions), so it is environment-independent across iptables, IPVS, eBPF, and cloud load balancers.
-
-**Per-Gateway infrastructure identity (GEP-1867).** Because the shared model's compute lives in `coxswain-system`, the controller also provisions a per-Gateway identity `ServiceAccount` in each owned Gateway's *own* namespace. It holds **zero RBAC** — the shared proxy runs as its own ServiceAccount; this object is the Gateway's infrastructure identity and the carrier for the propagated `spec.infrastructure.{labels,annotations}` (GEP-1867 metadata that, in a single-pod data plane, has no per-Gateway proxy in the namespace to land on). It is owner-referenced to the Gateway, so a plain delete reclaims it via GC; a migration into dedicated mode prunes it explicitly. Infrastructure annotations also propagate onto each Gateway's VIP `Service` (e.g. cloud load-balancer annotations).
-
-The fixed shared `80`/`443` listeners on the proxy pod are **Ingress-only**: Ingresses legitimately share one address because they merge by host/path and have no per-Ingress isolation. The cost of per-Gateway addressing is **one load-balancer IP per Gateway** in cloud environments — the "one IP for everything" property is intentionally given up; only the proxy compute stays shared. The shared-proxy selector the controller stamps on each VIP `Service` is supplied by the Helm chart via `--shared-proxy-selector` (the chart knows the release name; the controller cannot derive `app.kubernetes.io/instance` itself).
-
-The VIP `Service` type is set by `proxy.shared.vipServiceType` (default `LoadBalancer`), independent of the shared-proxy `Service` itself. `LoadBalancer` gives each Gateway an external address and works on cloud LBs and MetalLB, which assign a distinct IP per `Service` and route `IP:port` independently. It does **not** work on host-port-binding LBs such as k3s/OrbStack `klipper-lb`, where multiple `LoadBalancer` Services advertising the same port (e.g. `:443`) collide on the host and stay `<pending>` — set `vipServiceType: ClusterIP` there to give each Gateway a stable in-cluster VIP (typically fronted by an external ingress/LB). `NodePort` is rejected: it cannot preserve the advertised listener port.
-
-```mermaid
-flowchart LR
-    K8s[Kubernetes API]
-
-    subgraph cs[coxswain-system]
-        C[Controller]
-        SP["Proxy pool (shared)"]
-    end
-
-    subgraph n1[ns-1]
-        A1(app-1)
-    end
-
-    subgraph n2[ns-2]
-        A2(app-2)
-    end
-
-    K8s -->|watch| C
-    C -->|status writes| K8s
-    C -->|gRPC discovery| SP
-
-    Clients([Clients]) -->|Ingress +\nGateway traffic| SP
-    SP --> A1 & A2
-```
-
-**Ingress-only (runtime variant):** when Gateway API CRDs are absent at startup, the controller detects their absence, skips Gateway API reconciliation, and the shared proxy pool serves all `Ingress` resources.
-
-```mermaid
-flowchart LR
-    K8s[Kubernetes API]
-
-    subgraph cs[coxswain-system]
-        C[Controller]
-        SP["Proxy pool (shared)"]
-    end
-
-    subgraph n1[ns-1]
-        A1(app-1)
-    end
-
-    subgraph n2[ns-2]
-        A2(app-2)
-    end
-
-    K8s -->|watch\nIngress only| C
-    C -->|status writes| K8s
-    C -->|gRPC discovery| SP
-
-    Clients([Clients]) -->|Ingress traffic| SP
-    SP --> A1 & A2
-```
-
-### Dedicated (per Gateway)
-
-When a `Gateway` carries a `parametersRef` pointing at a `CoxswainGatewayParameters` object (either on the Gateway directly or inherited from its `GatewayClass`'s `spec.parametersRef`), the controller provisions a dedicated proxy — its own `Deployment`, `Service`, and `ServiceAccount` — in the Gateway's namespace. Traffic for that Gateway is served exclusively by its dedicated proxy pool; the shared proxy pool continues to serve everything else.
-
-A cluster running some dedicated Gateways alongside the shared pool is the typical mixed arrangement:
-
-```mermaid
-flowchart LR
-    K8s[Kubernetes API]
-
-    subgraph cs[coxswain-system]
-        C[Controller]
-        SP["Proxy pool (shared)"]
-    end
-
-    subgraph ns[gw-namespace-1]
-        GP["Proxy pool (dedicated)"]
-        A1(app-1)
-    end
-
-    subgraph n1[ns-1]
-        A2(app-2)
-    end
-
-    subgraph n2[ns-2]
-        A3(app-3)
-    end
-
-    K8s -->|watch| C
-    C -->|status writes| K8s
-    C -->|provisions| GP
-    C -->|gRPC discovery| SP & GP
-
-    Clients([Clients]) -->|Ingress +\nother Gateways| SP
-    Clients -->|gw-namespace-1 Gateway\ntraffic| GP
-    SP --> A2 & A3
-    GP --> A1
-```
-
-When every Gateway opts into dedicated mode and the shared proxy `Deployment` is scaled to `replicas: 0`, each team's Gateway gets a fully isolated data plane. Classic `Ingress` is unavailable in this arrangement.
-
-```mermaid
-flowchart LR
-    K8s[Kubernetes API]
-
-    subgraph cs[coxswain-system]
-        C[Controller]
-    end
-
-    subgraph ns_a[gw-namespace-1]
-        GPA["Proxy pool (dedicated)"]
-        A1(app-1)
-    end
-
-    subgraph ns_b[gw-namespace-2]
-        GPB["Proxy pool (dedicated)"]
-        A2(app-2)
-    end
-
-    K8s -->|watch| C
-    C -->|status writes| K8s
-    C -->|provisions + gRPC discovery| GPA & GPB
-
-    ClientsA([Clients]) --> GPA
-    ClientsB([Clients]) --> GPB
-    GPA --> A1
-    GPB --> A2
-```
-
-## Discovery control plane
-
-The controller compiles K8s routing snapshots and pushes them to each subscribed proxy over a mandatory-mTLS gRPC stream. Proxies apply the snapshot to their in-process routing table via an atomic pointer swap — no locks, no channels, no restart. All routing data (routes, upstream addresses, TLS certificates) arrives via the discovery stream; the proxy never reads the Kubernetes API.
-
-Each proxy also reports its **actually-bound listener ports** back over the same stream (a `NodeStatus` message, sent on stream open and on every bind change). The leader keys the Gateway `Programmed` condition on two per-proxy signals: the **bind** half — a shared-mode Gateway flips `Programmed=True` only once **every** connected shared-pool proxy has bound the Gateway's VIP ports (its per-Gateway internal `targetPort`s), a dedicated Gateway only once its own proxy has bound the effective listener ports — and the **ack** half: every relevant proxy must also have acknowledged a routing snapshot that *contains* the Gateway's current generation. The ack half matters when the ports were already bound for other Gateways (or the change is config-only, e.g. a new `frontendValidation` block): the bind check is instantly satisfied while the new configuration is still propagating. Snapshot versions are content hashes, so containment is tracked by a monotonic publish sequence: each routing rebuild stamps, per Gateway, the sequence at which its current generation was first published, and each snapshot acknowledgment records the sequence captured before that snapshot was built. Until both halves hold, `Programmed` stays at `False/Pending` with its `observedGeneration` one below the current generation, and the condition message names what is being waited on. Once a generation is `Programmed=True`, pool churn (rollouts, leader failover) never flaps it back — only a spec change re-arms the gate.
-
-### Reconnect semantics
-
-The discovery client runs a jittered-exponential-backoff reconnect supervisor (250 ms → 30 s):
-
-- **Before first snapshot** — `/readyz` returns 503 (`NotReady`). The proxy starts serving only after the first snapshot arrives.
-- **On disconnect after first snapshot** — the proxy transitions to `Degraded` (not `NotReady`). The last-good snapshot is served indefinitely; traffic never gaps and routing tables are never cleared during a reconnect window.
-- **On reconnect + new snapshot** — the proxy returns to `Ready`.
-- **Controller down** — the proxy keeps serving its last-good snapshot. No data-plane impact.
-- **Dialled a standby** (leader-label routing caught mid-transition) — the standby rejects with `FAILED_PRECONDITION`; the client retries in a fast 250–500 ms band (no exponential escalation) until it lands on the leader, widening to 0.5–2 s only if no leader exists at all.
-
-### Wire-version skew
-
-`WIRE_VERSION = 1` (current). The server rejects any client that presents a different version with `FAILED_PRECONDITION`; the client backs off permanently on that status. Recovery: roll back the mismatched component (controller or proxy) to a matching version. See [Control-plane security](guides/control-plane-security.md) for the full protocol description.
-
-## RBAC by mode
-
-| Resource | Verb | `controller` | `shared-proxy` | `dedicated-proxy` |
-|---|---|:-:|:-:|:-:|
-| HTTPRoute, Gateway, ReferenceGrant, BackendTLSPolicy | list, watch, get | ✓ (cluster) | — | — |
-| GatewayClass, Ingress, IngressClass | list, watch, get | ✓ (cluster) | — | — |
-| Service, EndpointSlice | list, watch, get | ✓ (cluster) | — | — |
-| Secret (`kubernetes.io/tls`), ConfigMap | list, watch, get | ✓ (cluster) | — | — |
-| HTTPRoute, Gateway, Ingress `/status` | update, patch | ✓ (cluster) | — | — |
-| Gateway | patch | ✓ (cluster — finalizers only) | — | — |
-| Deployment, Service, ServiceAccount | create, update, delete | ✓ (cluster) | — | — |
-| Lease | get, create, patch | ✓ (`coxswain-system`) | — | — |
-| TokenReview | create | ✓ (cluster — SVID bootstrap) | — | — |
-
-Both proxy roles hold **zero Kubernetes API credentials**. All routing data arrives via the controller's gRPC discovery stream. Each proxy mounts only a projected ServiceAccount token (audience `coxswain-discovery`) for SVID bootstrap at `/var/run/secrets/coxswain/discovery-token/token` — this is mounted by the kubelet, not via RBAC — and the public trust-bundle ConfigMap at `/var/run/secrets/coxswain/trust-bundle/ca.crt`. Neither mount requires any K8s RBAC grant.
-
-## Admin endpoints by mode
-
-| Endpoint | Controller | Shared proxy | Dedicated proxy |
-|---|:-:|:-:|:-:|
-| `/healthz`, `/readyz` | ✓ | ✓ | ✓ |
-| `/metrics` | ✓ (reconcile counts, leader status) | ✓ (traffic, errors) | ✓ (scoped to this Gateway) |
-| `/api/v1/health` | ✓ (subsystem detail, version, leader) | ✓ | ✓ |
-| `GET /` (operator UI) + `/api/v1/{fleet,routing}/*` | ✓ (cluster-wide aggregate + summaries, incl. each proxy's compiled routing table at `fleet/proxies/{name}/routes`) | — | — |
-| `/api/v1/{problems,events,manifests/*,pods/*/logs}` | ✓ | — | — |
-
-Proxy pods carry no admin query surface beyond `/healthz`/`/readyz`/`/metrics`/`/api/v1/health` — the
-controller is the sole reader of Kubernetes state and pushes routing to proxies over the discovery
-stream, so it already holds what each proxy serves and answers `fleet/proxies/{name}/routes` from its
-own local snapshot rather than fanning out to the pod.
-
 ## Request path
 
 ```mermaid
@@ -284,3 +92,9 @@ flowchart LR
 The routing table is an immutable snapshot behind an atomic pointer; each request reads it with a single atomic load — no locks, no channels. The discovery supervisor builds a new snapshot from the wire DTO and swaps the pointer atomically; in-flight requests complete against the old snapshot, the next request sees the new routing.
 
 TLS works the same way: the TLS store is an atomic snapshot rebuilt on every push. New connections use the new certificate; connections in progress complete with the old one.
+
+## Where to go next
+
+- **[Deployment models](architecture/deployment-models.md)** — the Shared and Dedicated topologies, how per-Gateway addressing works when compute is shared, and the scope-aware snapshot dispatch that keeps them isolated.
+- **[Discovery protocol](architecture/discovery-protocol.md)** — how `Programmed` status is gated on real bind + ack signals, RBAC by role, and which admin endpoints each role exposes.
+- **[Control-plane security](guides/control-plane-security.md)** — how the discovery channel is secured (mTLS, SPIFFE SVIDs, CA provisioning), reconnect behaviour, and wire-version compatibility.

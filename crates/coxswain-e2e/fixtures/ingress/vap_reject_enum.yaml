@@ -1,13 +1,16 @@
 # VAP rejection fixture: invalid enum annotation value.
 #
-# `session-affinity: "invalid"` is not a valid enum member (valid values:
-# cookie, header). The VAP must reject this Ingress at admission.
+# `path-normalize: "invalid"` is not a valid enum member (valid values: none,
+# base, merge-slashes, decode-and-merge-slashes). The VAP must reject this
+# Ingress at admission (retargeted from `session-affinity` after #554
+# converged it to `CoxswainBackendPolicy`, which is not VAP-validated by
+# design).
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: vap-reject-enum
   annotations:
-    ingress.coxswain-labs.dev/session-affinity: "invalid"
+    ingress.coxswain-labs.dev/path-normalize: "invalid"
 spec:
   ingressClassName: coxswain
   rules:

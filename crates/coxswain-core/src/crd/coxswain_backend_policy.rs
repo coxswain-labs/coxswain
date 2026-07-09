@@ -2,13 +2,20 @@
 //!
 //! Attaches to a Kubernetes `Service` (GEP-713 direct-policy attachment, the same
 //! pattern as [`ClientTrafficPolicy`](super::client_traffic_policy)) and applies
-//! per-upstream-connection settings to every Gateway API route whose backend
-//! resolves to that Service. It is the canonical home for the per-backend
-//! connection policy surface that has no Gateway API standard: `spec.timeouts`
-//! (connect/idle, #354), `spec.loadBalancer` (LB algorithm, #389), and
-//! `spec.circuitBreaker` (#478) — each a deliberately-proprietary parallel to the
-//! matching `ingress.coxswain-labs.dev/*` annotation. Upstream-keepalive parity
-//! (#365) is the remaining slot.
+//! per-upstream-connection settings to every route — Gateway API or Ingress —
+//! whose backend resolves to that Service (#554). It is the canonical, sole
+//! home for per-backend connection policy: `spec.timeouts` (connect/idle,
+//! #354), `spec.loadBalancer` (#389), `spec.circuitBreaker` (#478), and
+//! `spec.sessionPersistence` (#554). None of these has a stable Gateway API
+//! field to converge with — as of Gateway API v1.6.0 the closest upstream
+//! concept, `BackendLBPolicy`, was removed and folded into the experimental
+//! `XBackendTrafficPolicy` (GEP-3388), which covers only retry budgets and
+//! session persistence, not LB algorithm or circuit breaking. `loadBalancer`
+//! and `circuitBreaker` are therefore deliberately proprietary, anchored to
+//! Envoy's native LB policies and outlier detection / Istio's `DestinationRule`
+//! respectively — not "Gateway API parity" fields. `sessionPersistence` mirrors
+//! the shape of Gateway API's (experimental) `SessionPersistence` type as
+//! closely as our stateless affinity machinery supports.
 //!
 //! Source of truth is the Rust type below; the on-disk CRD YAML
 //! (`deploy/manifests/crds/coxswainbackendpolicies.yaml` and
@@ -22,8 +29,10 @@ use serde::{Deserialize, Serialize};
 /// Per-backend connection policy attached to one or more `Service` objects.
 ///
 /// A `CoxswainBackendPolicy` in namespace `ns` targets the `Service` objects in
-/// `targetRefs` (each in the same namespace). Its `timeouts` apply to every
-/// Gateway API route whose backend resolves to a targeted Service.
+/// `targetRefs` (each in the same namespace). Its settings apply to every
+/// route whose backend resolves to a targeted Service — Gateway API
+/// (`HTTPRoute`, `GRPCRoute`) and Ingress alike (#554) — automatically; no
+/// route needs to reference the policy by name.
 ///
 /// When two policies target the same Service, the older one (by
 /// `creationTimestamp`, ties broken by name) wins and the loser receives
@@ -55,18 +64,26 @@ pub struct CoxswainBackendPolicySpec {
     pub timeouts: Option<BackendTimeouts>,
 
     /// Upstream load-balancing algorithm for routes backed by the targeted
-    /// Service (#389). Gateway-API parity for the Ingress
-    /// `ingress.coxswain-labs.dev/load-balance` annotation. When `None` the
-    /// route keeps the default weighted round-robin.
+    /// Service (#389). Deliberately proprietary — anchored to Envoy's native LB
+    /// policies, not a Gateway API standard (see the module docs). When `None`
+    /// the route keeps the default weighted round-robin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_balancer: Option<BackendLoadBalancer>,
 
     /// Upstream circuit-breaker for routes backed by the targeted Service
-    /// (#478). Gateway-API parity for the Ingress
-    /// `ingress.coxswain-labs.dev/circuit-breaker-*` annotation family. When
+    /// (#478). Deliberately proprietary — anchored to Istio
+    /// `DestinationRule.trafficPolicy.outlierDetection` / Envoy outlier
+    /// detection, not a Gateway API standard (see the module docs). When
     /// `None` the breaker is disabled (the default).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub circuit_breaker: Option<BackendCircuitBreaker>,
+
+    /// Session persistence for routes backed by the targeted Service (#554).
+    /// Mirrors Gateway API's experimental `SessionPersistence` shape as
+    /// closely as our stateless affinity machinery supports. When `None`, no
+    /// session persistence is applied (the default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_persistence: Option<BackendSessionPersistence>,
 }
 
 /// A reference to a `Service` this policy targets.
@@ -101,8 +118,7 @@ pub struct BackendTimeouts {
     /// Upstream TCP-connect timeout. Bounds how long the proxy waits to establish
     /// a connection to a backend endpoint before failing the request (`502`).
     ///
-    /// When unset or unparseable, the proxy falls back to the per-route connect
-    /// timeout (Ingress `connect-timeout` annotation) or the Gateway API
+    /// When unset or unparseable, the proxy falls back to the Gateway API
     /// `backendRequest` budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connect: Option<String>,
@@ -118,13 +134,15 @@ pub struct BackendTimeouts {
 
 /// Upstream load-balancing algorithm selector (#389).
 ///
-/// `algorithm` is a free-form string mirroring the Ingress
-/// `ingress.coxswain-labs.dev/load-balance` annotation vocabulary 1:1, so the two
-/// surfaces resolve identical values via the same shared parser
-/// ([`LoadBalance::parse_lenient`](coxswain_core_routing_load_balance)). It is
-/// intentionally **not** schema-enum-validated: an unrecognised value reaches the
-/// reflector, which WARNs and falls back to weighted round-robin rather than the
-/// apiserver rejecting the resource (matching [`BackendTimeouts`]).
+/// `algorithm` is a free-form string, parsed by the shared
+/// [`LoadBalance::parse_lenient`](coxswain_core_routing_load_balance) parser
+/// used by every surface that selects an LB algorithm. Deliberately
+/// proprietary — Gateway API has no LB-algorithm-selection standard (upstream
+/// closed kubernetes-sigs/gateway-api#1778 "not planned"); this anchors to
+/// Envoy's native LB policies instead. It is intentionally **not**
+/// schema-enum-validated: an unrecognised value reaches the reflector, which
+/// WARNs and falls back to weighted round-robin rather than the apiserver
+/// rejecting the resource (matching [`BackendTimeouts`]).
 ///
 /// Accepted values: `round_robin` (default), `least_conn`, `ewma`, `ip_hash`,
 /// `hash:uri`, `hash:source-ip`, `hash:header=<name>`, `hash:cookie=<name>`.
@@ -140,7 +158,6 @@ pub struct BackendLoadBalancer {
 
 /// Upstream circuit-breaker settings (#478).
 ///
-/// Mirrors the `ingress.coxswain-labs.dev/circuit-breaker-*` annotation family.
 /// `threshold` is the gate: absent or out of the `1..=100` range disables the
 /// breaker (WARN + default). Durations are free-form GEP-2257 strings, **not**
 /// schema-pattern-validated — an unparseable value WARNs and falls back to the
@@ -172,6 +189,36 @@ pub struct BackendCircuitBreaker {
     /// constant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_open_duration: Option<String>,
+}
+
+/// Session-persistence settings for routes backed by the targeted Service
+/// (#554).
+///
+/// Mirrors the shape of Gateway API's experimental `SessionPersistence` type
+/// (`type` + `sessionName`) as closely as our stateless affinity machinery
+/// supports. `absoluteTimeout` / `cookieConfig` are intentionally omitted —
+/// coxswain's affinity is stateless (a deterministic token derived from the
+/// endpoint address, or a rendezvous hash), so there is no session store to
+/// expire early; accepting those fields without enforcing them would be
+/// dishonest. `idleTimeout` is also omitted: Gateway API itself removed it
+/// from `SessionPersistence` in v1.6.0.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendSessionPersistence {
+    /// Persistence mechanism: `Cookie` (the proxy injects a sticky cookie) or
+    /// `Header` (a request header is rendezvous-hashed to select the
+    /// endpoint). Free-form and **not** schema-enum-validated: an
+    /// unrecognised value reaches the reflector, which WARNs and disables
+    /// persistence (matching [`BackendLoadBalancer::algorithm`]).
+    #[serde(rename = "type")]
+    pub session_type: String,
+
+    /// Cookie name (`Cookie` mode, default `__coxswain_session` when unset) or
+    /// header name (`Header` mode, required — absent or invalid disables
+    /// persistence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
 }
 
 /// Status written back to the `CoxswainBackendPolicy` by the controller.
@@ -336,6 +383,43 @@ mod tests {
         assert_eq!(cb.open_duration.as_deref(), Some("5s"));
         assert_eq!(cb.min_requests, Some(20));
         assert_eq!(cb.max_open_duration.as_deref(), Some("1m"));
+    }
+
+    #[test]
+    fn session_persistence_round_trips() {
+        let cr = parse_cr(concat!(
+            "targetRefs:\n",
+            "- kind: Service\n",
+            "  name: my-svc\n",
+            "sessionPersistence:\n",
+            "  type: Cookie\n",
+            "  sessionName: my-session",
+        ));
+        let sp = cr
+            .spec
+            .session_persistence
+            .as_ref()
+            .expect("sessionPersistence present");
+        assert_eq!(sp.session_type, "Cookie");
+        assert_eq!(sp.session_name.as_deref(), Some("my-session"));
+    }
+
+    #[test]
+    fn session_persistence_name_is_optional() {
+        let cr = parse_cr(concat!(
+            "targetRefs:\n",
+            "- kind: Service\n",
+            "  name: my-svc\n",
+            "sessionPersistence:\n",
+            "  type: Header",
+        ));
+        let sp = cr
+            .spec
+            .session_persistence
+            .as_ref()
+            .expect("sessionPersistence present");
+        assert_eq!(sp.session_type, "Header");
+        assert!(sp.session_name.is_none());
     }
 
     #[test]

@@ -188,3 +188,9 @@ pub(crate) fn make_jwt_auth_store(
 pub(crate) fn empty_jwks_cache() -> crate::jwks::SharedJwksCache {
     crate::jwks::SharedJwksCache::new()
 }
+
+/// Empty `CoxswainBackendPolicy` index — every backend Service resolves no
+/// attached policy, leaving connection behaviour at its default.
+pub(crate) fn empty_backend_policy_index() -> crate::gateway_api::BackendPolicyIndex {
+    std::collections::HashMap::new()
+}

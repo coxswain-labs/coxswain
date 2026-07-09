@@ -9,11 +9,11 @@ kind: Ingress
 metadata:
   name: vap-valid-annotations
   annotations:
-    ingress.coxswain-labs.dev/connect-timeout: "5s"
+    ingress.coxswain-labs.dev/read-timeout: "5s"
     ingress.coxswain-labs.dev/use-regex: "false"
     ingress.coxswain-labs.dev/max-body-size: "1m"
     ingress.coxswain-labs.dev/rate-limit-rps: "100"
-    ingress.coxswain-labs.dev/session-affinity: "cookie"
+    ingress.coxswain-labs.dev/path-normalize: "base"
     ingress.coxswain-labs.dev/redirect-port: "8443"
 spec:
   ingressClassName: coxswain

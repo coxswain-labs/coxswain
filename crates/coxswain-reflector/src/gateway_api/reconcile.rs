@@ -376,9 +376,10 @@ impl GatewayApiReconciler {
                     group = group.with_tls(tls);
                 }
                 // CoxswainBackendPolicy: apply per-backend connect/idle timeouts
-                // (#354) and the LB algorithm (#389) to the BackendGroup from the
-                // highest-weight backendRef's Service policy. The circuit breaker
-                // (#478) is RouteEntry-level, carried out to the RuleContext below.
+                // (#354), the LB algorithm (#389), and session persistence (#554)
+                // to the BackendGroup from the highest-weight backendRef's Service
+                // policy. The circuit breaker (#478) is RouteEntry-level, carried
+                // out to the RuleContext below.
                 let bp = pick_backend_policy(backend_refs, route_ns, backend_policy_index);
                 if let Some(bp) = bp {
                     if bp.connect.is_some() {
@@ -389,6 +390,9 @@ impl GatewayApiReconciler {
                     }
                     if let Some(lb) = &bp.load_balance {
                         group = group.with_load_balance(lb.clone());
+                    }
+                    if bp.session_affinity.is_some() {
+                        group = group.with_session_affinity(bp.session_affinity.clone());
                     }
                 }
                 // RetryPolicy ExtensionRef (#445): attach the resolved retry policy to the

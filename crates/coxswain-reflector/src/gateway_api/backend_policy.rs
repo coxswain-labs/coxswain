@@ -3,9 +3,11 @@
 //! Resolves `CoxswainBackendPolicy` resources against the Services they target
 //! and returns:
 //! - A per-Service [`BackendPolicyIndex`] of parsed connect/idle timeouts (#354),
-//!   load-balancing algorithm (#389), and circuit-breaker config (#478), consumed
-//!   during Gateway API route building to set `BackendGroup::with_connect_timeout`
-//!   / `with_keepalive_timeout` / `with_load_balance` and `RouteEntry::with_circuit_breaker`.
+//!   load-balancing algorithm (#389), circuit-breaker config (#478), and session
+//!   persistence (#554), consumed during route building — Gateway API and
+//!   Ingress alike — to set `BackendGroup::with_connect_timeout` /
+//!   `with_keepalive_timeout` / `with_load_balance` / `with_session_affinity`
+//!   and `RouteEntry::with_circuit_breaker`.
 //! - A per-policy status map consumed by the controller to patch
 //!   `status.ancestors[]`.
 //!
@@ -13,28 +15,34 @@
 //! the same Service, the older `creationTimestamp` wins (ties broken by
 //! `{ns}/{name}`); the loser receives `Accepted=False, reason=Conflicted`.
 //!
-//! All values are parsed leniently: a malformed duration, an unknown LB selector,
-//! or an out-of-range breaker threshold WARNs and degrades to the default
-//! behaviour rather than erroring the connection or rejecting the resource.
+//! All values are parsed leniently: a malformed duration, an unknown LB
+//! selector or session-persistence type, or an out-of-range breaker threshold
+//! WARNs and degrades to the default behaviour rather than erroring the
+//! connection or rejecting the resource.
 
 use crate::duration::parse_duration;
 use crate::k8s_utils::metadata_created_at;
 use crate::status::CoxswainBackendPolicyStatusMap;
-use coxswain_core::crd::coxswain_backend_policy::{BackendCircuitBreaker, CoxswainBackendPolicy};
+use coxswain_core::crd::coxswain_backend_policy::{
+    BackendCircuitBreaker, BackendSessionPersistence, CoxswainBackendPolicy,
+};
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::routing::{CircuitBreakerConfig, LoadBalance};
+use coxswain_core::routing::{CircuitBreakerConfig, LoadBalance, SessionAffinity};
+use http::HeaderName;
 use kube::runtime::reflector;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Default circuit-breaker EWMA window when the policy omits `window` (#478).
-/// Mirrors the Ingress `circuit-breaker-window` annotation default.
 const CB_DEFAULT_WINDOW: Duration = Duration::from_secs(10);
 /// Default circuit-breaker open duration when the policy omits `openDuration`.
 const CB_DEFAULT_OPEN: Duration = Duration::from_secs(5);
 /// Default minimum-requests gate when the policy omits `minRequests`.
 const CB_DEFAULT_MIN_REQUESTS: u32 = 10;
+/// Default cookie name when `sessionPersistence.sessionName` is omitted in
+/// `Cookie` mode (#554).
+const DEFAULT_SESSION_COOKIE_NAME: &str = "__coxswain_session";
 
 /// Resolved per-`Service` connection policy from the winning policy.
 #[non_exhaustive]
@@ -49,6 +57,9 @@ pub struct ResolvedBackendPolicy {
     /// Upstream circuit-breaker config, if the policy set a valid
     /// `circuitBreaker.threshold` (#478).
     pub(crate) circuit_breaker: Option<Arc<CircuitBreakerConfig>>,
+    /// Session-affinity binding, if the policy set a recognised
+    /// `sessionPersistence.type` (#554).
+    pub(crate) session_affinity: Option<SessionAffinity>,
 }
 
 /// Per-`Service` timeout index. Keyed by the targeted Service's [`ObjectKey`].
@@ -152,6 +163,11 @@ pub fn build_backend_policy_index(
             resolve_load_balance(winner.spec.load_balancer.as_ref(), winner_ns, winner_name);
         let circuit_breaker =
             resolve_circuit_breaker(winner.spec.circuit_breaker.as_ref(), winner_ns, winner_name);
+        let session_affinity = resolve_session_persistence(
+            winner.spec.session_persistence.as_ref(),
+            winner_ns,
+            winner_name,
+        );
 
         // Only index Services whose winning policy sets at least one knob; a
         // no-op policy leaves default behaviour untouched.
@@ -159,6 +175,7 @@ pub fn build_backend_policy_index(
             || idle.is_some()
             || load_balance.is_some()
             || circuit_breaker.is_some()
+            || session_affinity.is_some()
         {
             index.insert(
                 svc_key,
@@ -167,6 +184,7 @@ pub fn build_backend_policy_index(
                     idle,
                     load_balance,
                     circuit_breaker,
+                    session_affinity,
                 },
             );
         }
@@ -252,6 +270,102 @@ fn resolve_circuit_breaker(
         open_duration,
         max_open_duration,
     )))
+}
+
+/// Resolve `sessionPersistence` (#554) into a [`SessionAffinity`] binding.
+///
+/// `type` (case-insensitive) selects the mode: `Cookie` (server-injected sticky
+/// cookie, `sessionName` optional — defaults to [`DEFAULT_SESSION_COOKIE_NAME`],
+/// an invalid token WARNs and falls back to the default) or `Header`
+/// (rendezvous-hash a request header, `sessionName` required and must be a
+/// valid header name). Any other value, or `Header` mode without a valid
+/// `sessionName`, disables persistence (WARN + `None`).
+fn resolve_session_persistence(
+    sp: Option<&BackendSessionPersistence>,
+    ns: &str,
+    name: &str,
+) -> Option<SessionAffinity> {
+    let sp = sp?;
+    match sp.session_type.trim().to_ascii_lowercase().as_str() {
+        "cookie" => {
+            let cookie_name = match sp.session_name.as_deref().map(str::trim) {
+                Some(n) if is_token(n) => Arc::from(n),
+                Some(bad) => {
+                    tracing::warn!(
+                        namespace = ns,
+                        policy = name,
+                        value = bad,
+                        default = DEFAULT_SESSION_COOKIE_NAME,
+                        "CoxswainBackendPolicy: invalid sessionPersistence.sessionName \
+                         (not an RFC 6265 token) — using default"
+                    );
+                    Arc::from(DEFAULT_SESSION_COOKIE_NAME)
+                }
+                None => Arc::from(DEFAULT_SESSION_COOKIE_NAME),
+            };
+            Some(SessionAffinity::Cookie { cookie_name })
+        }
+        "header" => {
+            let Some(raw) = sp.session_name.as_deref().map(str::trim) else {
+                tracing::warn!(
+                    namespace = ns,
+                    policy = name,
+                    "CoxswainBackendPolicy: sessionPersistence type Header requires \
+                     sessionName — persistence disabled"
+                );
+                return None;
+            };
+            match HeaderName::from_bytes(raw.as_bytes()) {
+                Ok(header) => Some(SessionAffinity::Header { header }),
+                Err(_) => {
+                    tracing::warn!(
+                        namespace = ns,
+                        policy = name,
+                        value = raw,
+                        "CoxswainBackendPolicy: invalid sessionPersistence.sessionName \
+                         header name — persistence disabled"
+                    );
+                    None
+                }
+            }
+        }
+        other => {
+            tracing::warn!(
+                namespace = ns,
+                policy = name,
+                value = other,
+                "CoxswainBackendPolicy: unknown sessionPersistence.type (expected \
+                 Cookie|Header) — persistence disabled"
+            );
+            None
+        }
+    }
+}
+
+/// `true` when `s` is a non-empty RFC 7230 / RFC 6265 token (the cookie-name
+/// grammar): only visible ASCII excluding separators and controls.
+fn is_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 /// Returns a closure that parses a duration string and WARNs on malformed input,
@@ -457,6 +571,84 @@ mod tests {
                 .expect("status")
                 .accepted
         );
+    }
+
+    #[test]
+    fn session_persistence_cookie_resolved_and_indexed() {
+        let spec = format!(
+            "{SVC_TARGET}  sessionPersistence:\n    type: Cookie\n    sessionName: my-session\n"
+        );
+        let store = store_from(vec![policy_from_spec("ns", "p1", &spec)]);
+        let (index, _) = build_backend_policy_index(&store);
+        let resolved = index.get(&ObjectKey::new("ns", "svc")).expect("indexed");
+        match resolved
+            .session_affinity
+            .as_ref()
+            .expect("affinity present")
+        {
+            SessionAffinity::Cookie { cookie_name } => {
+                assert_eq!(cookie_name.as_ref(), "my-session");
+            }
+            other => panic!("expected Cookie, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_persistence_cookie_defaults_name_when_absent() {
+        let spec = format!("{SVC_TARGET}  sessionPersistence:\n    type: Cookie\n");
+        let store = store_from(vec![policy_from_spec("ns", "p1", &spec)]);
+        let (index, _) = build_backend_policy_index(&store);
+        let resolved = index.get(&ObjectKey::new("ns", "svc")).expect("indexed");
+        match resolved
+            .session_affinity
+            .as_ref()
+            .expect("affinity present")
+        {
+            SessionAffinity::Cookie { cookie_name } => {
+                assert_eq!(cookie_name.as_ref(), DEFAULT_SESSION_COOKIE_NAME);
+            }
+            other => panic!("expected Cookie, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_persistence_header_resolved_and_indexed() {
+        let spec = format!(
+            "{SVC_TARGET}  sessionPersistence:\n    type: Header\n    sessionName: x-affinity\n"
+        );
+        let store = store_from(vec![policy_from_spec("ns", "p1", &spec)]);
+        let (index, _) = build_backend_policy_index(&store);
+        let resolved = index.get(&ObjectKey::new("ns", "svc")).expect("indexed");
+        match resolved
+            .session_affinity
+            .as_ref()
+            .expect("affinity present")
+        {
+            SessionAffinity::Header { header } => assert_eq!(header.as_str(), "x-affinity"),
+            other => panic!("expected Header, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_persistence_header_without_name_disabled_and_not_indexed() {
+        let spec = format!("{SVC_TARGET}  sessionPersistence:\n    type: Header\n");
+        let store = store_from(vec![policy_from_spec("ns", "p1", &spec)]);
+        let (index, status) = build_backend_policy_index(&store);
+        assert!(!index.contains_key(&ObjectKey::new("ns", "svc")));
+        assert!(
+            status
+                .get(&ObjectKey::new("ns", "p1"))
+                .expect("status")
+                .accepted
+        );
+    }
+
+    #[test]
+    fn session_persistence_unknown_type_disabled_and_not_indexed() {
+        let spec = format!("{SVC_TARGET}  sessionPersistence:\n    type: bogus\n");
+        let store = store_from(vec![policy_from_spec("ns", "p1", &spec)]);
+        let (index, _) = build_backend_policy_index(&store);
+        assert!(!index.contains_key(&ObjectKey::new("ns", "svc")));
     }
 
     #[test]
