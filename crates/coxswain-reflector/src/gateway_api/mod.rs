@@ -16,6 +16,7 @@ mod hostnames;
 pub(crate) mod jwt_auth;
 mod reconcile;
 mod reconcile_tls;
+pub(crate) mod retry;
 mod route_status;
 mod status;
 mod timeouts;
