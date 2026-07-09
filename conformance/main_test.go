@@ -120,15 +120,18 @@ func TestConformance(t *testing.T) {
 		features.SupportGatewayInfrastructurePropagation,
 	}
 
-	// GatewayStaticAddresses (#260): the suite overlays these onto the test's
-	// `PLACEHOLDER_USABLE_ADDRS`/`PLACEHOLDER_UNUSABLE_ADDRS` manifest values.
-	// coxswain honors a requested IP by provisioning the Gateway's VIP as a
-	// ClusterIP pinned to it, so the "usable" address must be a free IP inside the
-	// cluster's Service CIDR (the apiserver assigns it exactly); the "unusable"
-	// address is a TEST-NET-1 IP outside any Service CIDR, which the apiserver
-	// rejects → Programmed=False/AddressNotUsable. The CI run-conformance action
-	// and scripts/setup-conformance.sh both probe a free clusterIP and inject it
-	// via env so the usable IP tracks the live cluster.
+	// GatewayStaticAddresses (#260, #558): the suite overlays these onto the
+	// test's `PLACEHOLDER_USABLE_ADDRS`/`PLACEHOLDER_UNUSABLE_ADDRS` manifest
+	// values. coxswain honors a requested IP by provisioning the Gateway's VIP as
+	// a ClusterIP pinned to it, so the "usable" address must be a free IP inside
+	// the cluster's Service CIDR (the apiserver assigns it exactly) — and from the
+	// CIDR's static lower band, which random allocation never touches, so the
+	// suite's own base-manifest Services can't steal it between injection and the
+	// test run (#558). The "unusable" address is a TEST-NET-1 IP outside any
+	// Service CIDR, which the apiserver rejects →
+	// Programmed=False/AddressNotUsable. The CI run-conformance action and
+	// scripts/setup-conformance.sh both select a free static-band clusterIP and
+	// inject it via env so the usable IP tracks the live cluster.
 	ipType := v1beta1.IPAddressType
 	usable := os.Getenv("CONFORMANCE_USABLE_ADDR")
 	unusable := os.Getenv("CONFORMANCE_UNUSABLE_ADDR")

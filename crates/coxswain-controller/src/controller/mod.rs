@@ -104,6 +104,15 @@ const ERROR_REQUEUE: Duration = Duration::from_secs(15);
 /// instead of converging faster.
 const DEFERRED_PROGRAMMED_REQUEUE: Duration = Duration::from_secs(2);
 
+/// Requeue cadence for a Gateway whose status settled `AddressNotUsable` (#558).
+/// The negative is legitimate at patch time, but its inputs — the VIP Service
+/// binding and the operator's `vip_failures` snapshot — converge asynchronously
+/// on the VIP reconciler's trigger/15 s-resync cadence and fire no Gateway
+/// event, so `await_change` would strand a stale negative (the
+/// `GatewayStaticAddresses` conformance flake). Matches the VIP resync interval:
+/// one writer pass per VIP pass is enough to observe any repair.
+const SETTLED_NEGATIVE_REQUEUE: Duration = Duration::from_secs(15);
+
 /// The three reflector-published health channels the status reconcilers read
 /// (a `.load()` snapshot per reconcile) and subscribe to (to re-drive the
 /// affected work-queue when a TLS-resolution / route-health / policy-health
@@ -965,19 +974,23 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         gw.metadata.name.clone().unwrap_or_default(),
     );
 
-    // Hold a still-provisioning static-address VIP at `Pending` (#533). While
-    // `awaiting_own_vip`, an empty `resolved` set makes `evaluate_static_addresses`
-    // report `AddressNotUsable` — but that is indistinguishable from a Gateway
-    // whose VIP is merely mid-provisioning. The operator's VIP reconciler is the
-    // authority: only once it records a *definitive* failure (all requested
-    // clusterIPs rejected) is the negative settled. Until then, downgrade the
-    // premature override so the convergence gate holds `Programmed` at `gen-1`
-    // rather than stamping `AddressNotUsable@N` with empty `status.addresses` (the
-    // transient that raced the conformance `GatewayMustHaveLatestConditions` check).
-    if awaiting_own_vip
-        && static_outcome.is_address_not_usable()
-        && !ctx.vip_failures.load().contains(&key)
-    {
+    // Hold an unconfirmed `AddressNotUsable` at `Pending` (#533, #558). An
+    // empty `resolved` set (VIP mid-provisioning) — or a resolved-but-stale
+    // address observed mid-repin (the operator deletes + defer-recreates the
+    // VIP Service to repin a clusterIP) — reports `AddressNotUsable`, yet is
+    // indistinguishable from a genuinely unusable request. Settle the negative
+    // only on one of the two authorities `should_hold_pending` checks: a
+    // definitive `vip_failures` entry, or a partial match proving the VIP
+    // reconciler already honored the request as far as it can. Otherwise
+    // downgrade the override so the convergence gate holds `Programmed` at
+    // `gen-1` and the 2 s requeue keeps polling until the repin lands —
+    // settling here went quiet (`await_change`) with a stale negative the VIP
+    // reconciler never re-drives (the `GatewayStaticAddresses` flake, #558).
+    if static_outcome.should_hold_pending(
+        awaiting_own_vip,
+        ctx.vip_failures.load().contains(&key),
+        ctx.shared_vip_addressing,
+    ) {
         static_outcome.hold_pending_address();
     }
 
@@ -1097,11 +1110,18 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         }
         // Requeue until fully converged so `Programmed` lands promptly once the
         // VIP resolves AND the proxy acks, rather than waiting for an unrelated
-        // Gateway event.
-        if converged {
-            Action::await_change()
-        } else {
+        // Gateway event. A *settled* `AddressNotUsable` is converged for patch
+        // purposes but must never go fully quiet (#558): its inputs (the VIP
+        // Service binding, the `vip_failures` snapshot) converge on the VIP
+        // reconciler's own cadence and fire no Gateway event, so an
+        // `await_change` here would strand a stale negative until an unrelated
+        // event. Slow-requeue as the self-heal backstop instead.
+        if !converged {
             Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
+        } else if decision.static_outcome.is_address_not_usable() {
+            Action::requeue(SETTLED_NEGATIVE_REQUEUE)
+        } else {
+            Action::await_change()
         }
     } else if !gateway_accepted(gw) {
         // Before the data plane is synced, write the minimal Accepted-oriented
