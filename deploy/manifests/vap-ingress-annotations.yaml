@@ -288,26 +288,6 @@ spec:
     # (prefix length, address range) is left to the proxy's fail-open check.
 
     - expression: >-
-        !('ingress.coxswain-labs.dev/allow-source-range' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/allow-source-range'].split(',').all(tok,
-          tok.trim() == '' ||
-          tok.trim().matches('^[0-9a-fA-F:./]+$'))
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/allow-source-range: "' +
-        variables.ann['ingress.coxswain-labs.dev/allow-source-range'] +
-        '" — must be a comma-separated list of CIDR blocks or IPs (e.g. "10.0.0.0/8,192.168.1.0/24")'
-
-    - expression: >-
-        !('ingress.coxswain-labs.dev/deny-source-range' in variables.ann) ||
-        variables.ann['ingress.coxswain-labs.dev/deny-source-range'].split(',').all(tok,
-          tok.trim() == '' ||
-          tok.trim().matches('^[0-9a-fA-F:./]+$'))
-      messageExpression: >-
-        'ingress.coxswain-labs.dev/deny-source-range: "' +
-        variables.ann['ingress.coxswain-labs.dev/deny-source-range'] +
-        '" — must be a comma-separated list of CIDR blocks or IPs (e.g. "10.0.0.0/8,2001:db8::/32")'
-
-    - expression: >-
         !('ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs' in variables.ann) ||
         variables.ann['ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs'].split(',').all(tok,
           tok.trim() == '' ||

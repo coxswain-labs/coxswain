@@ -101,28 +101,41 @@ pub const ANNOTATION_MAX_BODY_SIZE: &str = fixture!("annotation_max_body_size.ya
 /// fail-open: the invalid limit is ignored and an oversized POST still succeeds.
 pub const ANNOTATION_MAX_BODY_SIZE_INVALID: &str =
     fixture!("annotation_max_body_size_invalid.yaml");
-/// Ingress with `ingress.coxswain-labs.dev/allow-source-range: "203.0.113.0/24"` (#264).
-/// Used to verify the proxy admits an in-range client (200, echo identity) and rejects an
-/// out-of-range client with 403; the real client IP is supplied via the PROXY protocol.
+/// Ingress with `ingress.coxswain-labs.dev/ip-access-control` naming an
+/// `IpAccessControl` CR (`allow: [203.0.113.0/24]`) — Ingress parity with the
+/// Gateway API `ExtensionRef` path (#553). Used to verify the proxy admits an
+/// in-range client (200, echo identity) and rejects an out-of-range client
+/// with 403; the real client IP is supplied via the PROXY protocol.
 pub const ANNOTATION_ALLOW_SOURCE_RANGE: &str = fixture!("annotation_allow_source_range.yaml");
-/// Ingress with `ingress.coxswain-labs.dev/deny-source-range: "203.0.113.0/24"` (#268).
-/// Used to verify the proxy rejects an in-range client with 403 and admits an out-of-range
-/// client (200, echo identity); the real client IP is supplied via the PROXY protocol.
+/// Ingress with `ip-access-control` naming an `IpAccessControl` CR
+/// (`deny: [203.0.113.0/24]`) (#553). Used to verify the proxy rejects an
+/// in-range client with 403 and admits an out-of-range client (200, echo
+/// identity); the real client IP is supplied via the PROXY protocol.
 pub const ANNOTATION_DENY_SOURCE_RANGE: &str = fixture!("annotation_deny_source_range.yaml");
-/// Ingress with both `allow-source-range: "203.0.113.0/24"` and
-/// `deny-source-range: "203.0.113.5/32"` (#268). Used to verify that deny is evaluated
-/// before allow: a client that matches both is rejected (403); a client in the allow range
-/// but not the deny range is admitted (200).
+/// Ingress with `ip-access-control` naming an `IpAccessControl` CR with both
+/// `allow: [203.0.113.0/24]` and `deny: [203.0.113.5/32]` (#553). Used to
+/// verify that deny is evaluated before allow: a client that matches both is
+/// rejected (403); a client in the allow range but not the deny range is
+/// admitted (200).
 pub const ANNOTATION_DENY_AND_ALLOW_SOURCE_RANGE: &str =
     fixture!("annotation_deny_and_allow_source_range.yaml");
-/// Ingress with `trust-forwarded-for: "true"` and `allow-source-range: "203.0.113.0/24"` (#271).
-/// Used to verify the proxy uses the first non-private IP from `X-Forwarded-For` as the effective
-/// client IP when header trust is enabled (no CIDR gate — unconditional trust).
+/// Ingress with `ip-access-control` pointing at a non-existent
+/// `IpAccessControl` CR (#553 sad path). Used to verify the reference fails
+/// **open** — traffic flows unfiltered rather than being rejected.
+pub const ANNOTATION_IP_ACCESS_CONTROL_MISSING: &str =
+    fixture!("annotation_ip_access_control_missing.yaml");
+/// Ingress with `trust-forwarded-for: "true"` and `ip-access-control` naming
+/// an `IpAccessControl` CR (`allow: [203.0.113.0/24]`) (#271, #553). Used to
+/// verify the proxy uses the first non-private IP from `X-Forwarded-For` as
+/// the effective client IP when header trust is enabled (no CIDR gate —
+/// unconditional trust).
 pub const ANNOTATION_TRUST_FORWARDED_FOR: &str = fixture!("annotation_trust_forwarded_for.yaml");
 /// Ingress with `trust-forwarded-for: "true"`, `forwarded-for-header: "X-Real-IP"`,
-/// `forwarded-for-trusted-cidrs: "10.0.0.1/32"`, and `allow-source-range: "10.0.0.1/32,203.0.113.0/24"` (#271).
-/// Used to verify the anti-spoofing gate: the proxy only trusts the custom header when the L4
-/// peer is within the configured CIDR; requests from other peers ignore the header and use the L4 IP.
+/// `forwarded-for-trusted-cidrs: "10.0.0.1/32"`, and `ip-access-control` naming an
+/// `IpAccessControl` CR (`allow: [10.0.0.1/32, 203.0.113.0/24]`) (#271, #553).
+/// Used to verify the anti-spoofing gate: the proxy only trusts the custom header
+/// when the L4 peer is within the configured CIDR; requests from other peers
+/// ignore the header and use the L4 IP.
 pub const ANNOTATION_TRUST_FORWARDED_FOR_CIDRS: &str =
     fixture!("annotation_trust_forwarded_for_cidrs.yaml");
 /// Cookie-mode session affinity (#15): a 3-pod `echo-aff` Service plus an Ingress
@@ -383,7 +396,8 @@ pub const VAP_REJECT_BOOLEAN: &str = fixture!("vap_reject_boolean.yaml");
 /// Ingress with `session-affinity: "invalid"` — invalid enum value rejected by the VAP.
 pub const VAP_REJECT_ENUM: &str = fixture!("vap_reject_enum.yaml");
 
-/// Ingress with `allow-source-range: "not-a-cidr"` — invalid CIDR rejected by the VAP.
+/// Ingress with `forwarded-for-trusted-cidrs: "not-a-cidr"` — invalid CIDR
+/// rejected by the VAP (retargeted from `allow-source-range` after #553).
 pub const VAP_REJECT_CIDR: &str = fixture!("vap_reject_cidr.yaml");
 
 /// Ingress with `auth-url: "ftp://bad.example.com"` — invalid URL rejected by the VAP.

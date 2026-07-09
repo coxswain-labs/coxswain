@@ -3,7 +3,7 @@
 # Exercises one annotation from each validated format category so the VAP
 # acceptance path is confirmed end-to-end, not just the rejection path.
 # Intentionally omits annotations whose valid values would block test traffic
-# (allow-source-range, auth-url) — VAP format coverage, not behaviour tests.
+# (auth-url) — VAP format coverage, not behaviour tests.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
