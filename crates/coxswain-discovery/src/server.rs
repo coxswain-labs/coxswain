@@ -40,7 +40,7 @@ use coxswain_core::ownership::ObjectKey;
 use coxswain_core::publish_index::SharedGatewayPublishIndex;
 use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
-    SharedTlsPassthroughTable,
+    SharedTlsPassthroughTable, SharedUdpRouteTable,
 };
 use coxswain_core::tls::{SharedClientCertStore, SharedPortTlsStore};
 
@@ -54,7 +54,7 @@ use crate::proto::v1::{
 use crate::version::{ContentHash, WIRE_VERSION};
 use crate::wire::{
     client_cert_to_wire, gateway_to_wire, ingress_to_wire, listener_status_to_wire,
-    passthrough_to_wire, port_tls_to_wire, scope_from_wire, tcp_table_to_wire,
+    passthrough_to_wire, port_tls_to_wire, scope_from_wire, tcp_table_to_wire, udp_table_to_wire,
 };
 
 // ── SnapshotSource ────────────────────────────────────────────────────────────
@@ -96,6 +96,10 @@ pub struct SnapshotSource {
     /// Only populated for [`Scope::SharedPool`] subscribers; dedicated proxies
     /// receive an empty table (TCPRoutes are shared-pool only).
     pub tcp_routes: SharedTcpRouteTable,
+    /// Port-keyed UDP routing table for UDPRoute / GEP-2645 (#506).
+    /// Only populated for [`Scope::SharedPool`] subscribers; dedicated proxies
+    /// receive an empty table (UDPRoutes are shared-pool only).
+    pub udp_routes: SharedUdpRouteTable,
     /// Per-Gateway publish-sequence index (#531). The server captures its
     /// counter **before** loading any cell for a snapshot build; a node that
     /// Acks that snapshot has therefore applied every rebuild stamped at a
@@ -116,6 +120,7 @@ impl Clone for SnapshotSource {
             passthrough_routes: self.passthrough_routes.clone(),
             terminate_routes: self.terminate_routes.clone(),
             tcp_routes: self.tcp_routes.clone(),
+            udp_routes: self.udp_routes.clone(),
             publish: self.publish.clone(),
         }
     }
@@ -230,6 +235,7 @@ struct SnapshotContent {
     tls_passthrough: p::TlsPassthroughTable,
     tls_terminate: p::TlsPassthroughTable,
     tcp_proxy: p::TcpRouteTable,
+    udp_proxy: p::UdpRouteTable,
 }
 
 impl SnapshotContent {
@@ -246,6 +252,7 @@ impl SnapshotContent {
             tls_passthrough: Some(self.tls_passthrough),
             tls_terminate: Some(self.tls_terminate),
             tcp_proxy: Some(self.tcp_proxy),
+            udp_proxy: Some(self.udp_proxy),
         }
     }
 }
@@ -284,6 +291,7 @@ fn build_snapshot(
             let passthrough = source.passthrough_routes.load();
             let terminate = source.terminate_routes.load();
             let tcp_proxy = source.tcp_routes.load();
+            let udp_proxy = source.udp_routes.load();
 
             assemble_snapshot(
                 ingress_to_wire(&ingress),
@@ -295,6 +303,7 @@ fn build_snapshot(
                     tls_passthrough: passthrough_to_wire(&passthrough),
                     tls_terminate: passthrough_to_wire(&terminate),
                     tcp_proxy: tcp_table_to_wire(&tcp_proxy),
+                    udp_proxy: udp_table_to_wire(&udp_proxy),
                 },
             )
         }
@@ -328,11 +337,12 @@ fn build_snapshot(
                                 p::PortTlsStore::default(),
                                 p::ClientCertStore::default(),
                                 p::GatewayListenerStatus::default(),
-                                // Dedicated proxies never serve TLSRoute or TCPRoute traffic.
+                                // Dedicated proxies never serve TLSRoute, TCPRoute, or UDPRoute traffic.
                                 L4TableDtos {
                                     tls_passthrough: p::TlsPassthroughTable::default(),
                                     tls_terminate: p::TlsPassthroughTable::default(),
                                     tcp_proxy: p::TcpRouteTable::default(),
+                                    udp_proxy: p::UdpRouteTable::default(),
                                 },
                             )
                         };
@@ -344,11 +354,12 @@ fn build_snapshot(
                         port_tls_to_wire(&snap.tls),
                         client_cert_to_wire(&snap.client_certs),
                         listener_status_to_wire(&snap.listener_status),
-                        // Dedicated proxies never serve TLSRoute or TCPRoute traffic.
+                        // Dedicated proxies never serve TLSRoute, TCPRoute, or UDPRoute traffic.
                         L4TableDtos {
                             tls_passthrough: p::TlsPassthroughTable::default(),
                             tls_terminate: p::TlsPassthroughTable::default(),
                             tcp_proxy: p::TcpRouteTable::default(),
+                            udp_proxy: p::UdpRouteTable::default(),
                         },
                     )
                 }
@@ -370,6 +381,7 @@ fn build_snapshot(
                                 tls_passthrough: p::TlsPassthroughTable::default(),
                                 tls_terminate: p::TlsPassthroughTable::default(),
                                 tcp_proxy: p::TcpRouteTable::default(),
+                                udp_proxy: p::UdpRouteTable::default(),
                             },
                         )
                     };
@@ -388,6 +400,7 @@ struct L4TableDtos {
     tls_passthrough: p::TlsPassthroughTable,
     tls_terminate: p::TlsPassthroughTable,
     tcp_proxy: p::TcpRouteTable,
+    udp_proxy: p::UdpRouteTable,
 }
 
 /// Assemble a [`SnapshotContent`] from pre-built wire DTOs.
@@ -427,6 +440,9 @@ fn assemble_snapshot(
         ContentHash::compute(&l4.tcp_proxy.encode_to_vec())
             .as_str()
             .to_owned(),
+        ContentHash::compute(&l4.udp_proxy.encode_to_vec())
+            .as_str()
+            .to_owned(),
     ];
     let version = ContentHash::from_per_resource(hashes).as_str().to_owned();
 
@@ -442,6 +458,7 @@ fn assemble_snapshot(
         tls_passthrough: l4.tls_passthrough,
         tls_terminate: l4.tls_terminate,
         tcp_proxy: l4.tcp_proxy,
+        udp_proxy: l4.udp_proxy,
     }
 }
 
@@ -961,6 +978,7 @@ mod tests {
             passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
             terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
             tcp_routes: coxswain_core::routing::SharedTcpRouteTable::new(),
+            udp_routes: coxswain_core::routing::SharedUdpRouteTable::new(),
             publish: SharedGatewayPublishIndex::new(),
         }
     }

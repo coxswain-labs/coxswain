@@ -15,7 +15,7 @@ use coxswain_core::health::SubsystemHandle;
 use coxswain_core::listener_status::SharedGatewayListenerStatus;
 use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
-    SharedTlsPassthroughTable,
+    SharedTlsPassthroughTable, SharedUdpRouteTable,
 };
 use coxswain_core::tls::{
     ListenerHostnamesBuilder, SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore,
@@ -38,7 +38,7 @@ use crate::svid::SharedSvid;
 use crate::version::WIRE_VERSION;
 use crate::wire::{
     client_cert_from_wire, gateway_from_wire, ingress_from_wire, listener_status_from_wire,
-    passthrough_from_wire, port_tls_from_wire, tcp_table_from_wire,
+    passthrough_from_wire, port_tls_from_wire, tcp_table_from_wire, udp_table_from_wire,
 };
 
 /// Configuration for the discovery gRPC client supervisor.
@@ -162,6 +162,8 @@ pub struct DiscoveryClient {
     terminate_routes: SharedTlsPassthroughTable,
     /// Port-keyed TCP routing table for TCPRoute / GEP-1901 (#505).
     tcp_routes: SharedTcpRouteTable,
+    /// Port-keyed UDP routing table for UDPRoute / GEP-2645 (#506).
+    udp_routes: SharedUdpRouteTable,
 }
 
 impl DiscoveryClient {
@@ -216,6 +218,7 @@ impl DiscoveryClient {
         let passthrough_routes = SharedTlsPassthroughTable::new();
         let terminate_routes = SharedTlsPassthroughTable::new();
         let tcp_routes = SharedTcpRouteTable::new();
+        let udp_routes = SharedUdpRouteTable::new();
 
         let supervisor = Supervisor {
             config,
@@ -228,6 +231,7 @@ impl DiscoveryClient {
             passthrough: passthrough_routes.clone(),
             terminate: terminate_routes.clone(),
             tcp: tcp_routes.clone(),
+            udp: udp_routes.clone(),
             health,
             health_check: health_check.to_owned(),
             has_snapshot: false,
@@ -243,6 +247,7 @@ impl DiscoveryClient {
             passthrough_routes,
             terminate_routes,
             tcp_routes,
+            udp_routes,
         };
 
         Ok((client, supervisor))
@@ -341,6 +346,14 @@ impl DiscoveryClient {
     pub fn tcp_routes(&self) -> SharedTcpRouteTable {
         self.tcp_routes.clone()
     }
+
+    /// Handle to the port-keyed UDP routing table snapshot for UDPRoute / GEP-2645 (#506).
+    ///
+    /// Updated atomically with every applied snapshot from the controller.
+    #[must_use]
+    pub fn udp_routes(&self) -> SharedUdpRouteTable {
+        self.udp_routes.clone()
+    }
 }
 
 impl coxswain_core::RoutingSource for DiscoveryClient {
@@ -375,6 +388,10 @@ impl coxswain_core::RoutingSource for DiscoveryClient {
     fn tcp_routes(&self) -> SharedTcpRouteTable {
         self.tcp_routes.clone()
     }
+
+    fn udp_routes(&self) -> SharedUdpRouteTable {
+        self.udp_routes.clone()
+    }
 }
 
 // ── supervisor ──────────────────────────────────────────────────────────────
@@ -397,6 +414,7 @@ pub struct Supervisor {
     passthrough: SharedTlsPassthroughTable,
     terminate: SharedTlsPassthroughTable,
     tcp: SharedTcpRouteTable,
+    udp: SharedUdpRouteTable,
     health: SubsystemHandle,
     health_check: String,
     has_snapshot: bool,
@@ -692,6 +710,7 @@ impl Supervisor {
                     passthrough: &self.passthrough,
                     terminate: &self.terminate,
                     tcp: &self.tcp,
+                    udp: &self.udp,
                 },
             ) {
                 Ok(()) => {
@@ -755,6 +774,7 @@ struct SnapshotCells<'a> {
     passthrough: &'a SharedTlsPassthroughTable,
     terminate: &'a SharedTlsPassthroughTable,
     tcp: &'a SharedTcpRouteTable,
+    udp: &'a SharedUdpRouteTable,
 }
 
 /// Decode all routing cells from a snapshot DTO and atomically publish them.
@@ -820,6 +840,12 @@ fn apply_snapshot(
             .as_ref()
             .unwrap_or(&p::TcpRouteTable::default()),
     )?;
+    let udp_table = udp_table_from_wire(
+        snapshot
+            .udp_proxy
+            .as_ref()
+            .unwrap_or(&p::UdpRouteTable::default()),
+    )?;
 
     // Derive the per-port HTTPS listener-hostname snapshot from the status map
     // (same data the reflector uses in build_tls) so GEP-3567 misdirected-request
@@ -846,6 +872,7 @@ fn apply_snapshot(
     cells.passthrough.store(Arc::new(passthrough_table));
     cells.terminate.store(Arc::new(terminate_table));
     cells.tcp.store(Arc::new(tcp_table));
+    cells.udp.store(Arc::new(udp_table));
 
     Ok(())
 }
@@ -1167,6 +1194,7 @@ mod tests {
                 tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
                 tls_terminate: Some(crate::proto::v1::TlsPassthroughTable::default()),
                 tcp_proxy: Some(crate::proto::v1::TcpRouteTable::default()),
+                udp_proxy: Some(crate::proto::v1::UdpRouteTable::default()),
             })),
         }
     }
@@ -1199,6 +1227,7 @@ mod tests {
                 tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
                 tls_terminate: Some(crate::proto::v1::TlsPassthroughTable::default()),
                 tcp_proxy: Some(crate::proto::v1::TcpRouteTable::default()),
+                udp_proxy: Some(crate::proto::v1::UdpRouteTable::default()),
             })),
         }
     }

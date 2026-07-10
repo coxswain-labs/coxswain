@@ -11,6 +11,7 @@ mod gateway;
 mod ingress;
 pub mod passthrough;
 pub mod tcp;
+pub mod udp;
 
 #[cfg(test)]
 mod tests;
@@ -58,3 +59,4 @@ pub use passthrough::{
     SharedTlsPassthroughTable, SniRouter, TlsPassthroughTable, TlsPassthroughTableBuilder,
 };
 pub use tcp::{SharedTcpRouteTable, TcpRouteTable, TcpRouteTableBuilder};
+pub use udp::{SharedUdpRouteTable, UdpRouteTable, UdpRouteTableBuilder};

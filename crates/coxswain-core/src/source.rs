@@ -7,7 +7,7 @@
 
 use crate::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
-    SharedTlsPassthroughTable,
+    SharedTlsPassthroughTable, SharedUdpRouteTable,
 };
 use crate::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
 
@@ -74,5 +74,15 @@ pub trait RoutingSource: Send + Sync {
     #[must_use]
     fn tcp_routes(&self) -> SharedTcpRouteTable {
         SharedTcpRouteTable::new()
+    }
+
+    /// Handle to the port-keyed UDP routing table snapshot for UDPRoute / GEP-2645 (#506).
+    ///
+    /// The default returns an empty table (no UDP routes, all datagrams on a
+    /// UDP-proxy port are dropped) so existing implementations compile unchanged
+    /// until wired.
+    #[must_use]
+    fn udp_routes(&self) -> SharedUdpRouteTable {
+        SharedUdpRouteTable::new()
     }
 }

@@ -52,7 +52,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use coxswain_core::listener_status::ProxyProtocolListenerConfig;
-use coxswain_core::routing::{SharedTcpRouteTable, SharedTlsPassthroughTable};
+use coxswain_core::routing::{SharedTcpRouteTable, SharedTlsPassthroughTable, SharedUdpRouteTable};
 use ppp::PartialResult as _;
 
 use crate::SniCertSelector;
@@ -60,6 +60,7 @@ use crate::ctx::{CONN_INFO, ConnectionInfo};
 use crate::edge::passthrough::{handle_passthrough, peek_sni};
 use crate::edge::tcp::handle_tcp_proxy;
 use crate::edge::terminate::handle_terminate;
+use crate::edge::udp::run_udp_listener;
 use crate::metrics;
 
 /// Maximum number of in-flight per-connection tasks per listener.
@@ -116,8 +117,18 @@ pub struct PassthroughConfig {
     ///
     /// An empty table causes all TCP-proxy connections to be closed immediately.
     pub tcp_table: SharedTcpRouteTable,
+    /// Port-keyed routing table for UDPRoute listeners (#506). No SNI dimension.
+    ///
+    /// An empty table causes all inbound datagrams to be dropped.
+    pub udp_table: SharedUdpRouteTable,
     /// How long to wait when connecting to a passthrough, terminate, or TCP-proxy backend.
     pub dial_timeout: Duration,
+    /// How long a UDPRoute session may sit idle before its state is evicted (#506).
+    ///
+    /// Not a connect timeout — UDP `connect()` is a local operation with no
+    /// handshake — this instead bounds how long a client 5-tuple's backend
+    /// pin and reply-pump task stay alive between datagrams.
+    pub udp_session_timeout: Duration,
 }
 
 /// Maximum number of bytes peeked while searching for a complete PROXY header.
@@ -153,6 +164,11 @@ pub enum ListenerProtocol {
     /// listener never shares a port with another protocol (Gateway API
     /// port-compatibility rules exclude the combination).
     Tcp,
+    /// Session-tracked UDP datagram forwarder (UDPRoute, GEP-2645): no accept
+    /// loop, no per-client socket — a single bound `UdpSocket` demuxes every
+    /// client through a session table keyed by client `SocketAddr`. Like
+    /// `Tcp`, a `UDP` listener never shares a port with another protocol.
+    Udp,
 }
 
 /// One listen address with its associated protocol and per-listener PROXY config.
@@ -227,6 +243,16 @@ impl ListenerSpec {
             proxy_protocol: None,
         }
     }
+
+    /// Create a UDP datagram-forwarder listener spec for a port serving a
+    /// `UDPRoute` (#506).
+    pub fn udp(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            protocol: ListenerProtocol::Udp,
+            proxy_protocol: None,
+        }
+    }
 }
 
 /// Dynamically-managed proxy acceptor for a single [`ProxyHttp`] implementation.
@@ -268,8 +294,12 @@ where
     terminate_table: SharedTlsPassthroughTable,
     /// Port-keyed routing table for TCPRoute listeners (#505).
     tcp_table: SharedTcpRouteTable,
+    /// Port-keyed routing table for UDPRoute listeners (#506).
+    udp_table: SharedUdpRouteTable,
     /// Timeout for dialling a passthrough, terminate, or TCP-proxy backend.
     l4_dial_timeout: Duration,
+    /// Idle timeout for evicting a UDPRoute session (#506).
+    udp_session_timeout: Duration,
     /// Publishes the set of ports with a live accept loop after every listener
     /// reconcile (#531). `None` (default) = no reporting. The discovery client
     /// forwards changes to the controller as `NodeStatus`, feeding the Gateway
@@ -328,7 +358,9 @@ where
             passthrough_table: passthrough.table,
             terminate_table: passthrough.terminate_table,
             tcp_table: passthrough.tcp_table,
+            udp_table: passthrough.udp_table,
             l4_dial_timeout: passthrough.dial_timeout,
+            udp_session_timeout: passthrough.udp_session_timeout,
             bound_ports_tx: None,
         })
     }
@@ -390,7 +422,9 @@ where
             passthrough_table: self.passthrough_table.clone(),
             terminate_table: self.terminate_table.clone(),
             tcp_table: self.tcp_table.clone(),
+            udp_table: self.udp_table.clone(),
             l4_dial_timeout: self.l4_dial_timeout,
+            udp_session_timeout: self.udp_session_timeout,
         };
 
         // Bind the initial desired set.
@@ -510,7 +544,9 @@ where
     passthrough_table: SharedTlsPassthroughTable,
     terminate_table: SharedTlsPassthroughTable,
     tcp_table: SharedTcpRouteTable,
+    udp_table: SharedUdpRouteTable,
     l4_dial_timeout: Duration,
+    udp_session_timeout: Duration,
 }
 
 /// Per-connection handler state: the proxy, per-listener PROXY config, and TLS
@@ -587,6 +623,19 @@ fn plan_listener_changes(
     for spec in desired {
         match active.get(&spec.addr) {
             None => plan.add.push(spec.clone()),
+            // A UDP listener binds a datagram socket; every other protocol binds a
+            // stream socket. Neither can flip into the other in place, so treat a
+            // transport-family change as remove+add rather than `reprotocol`. Gateway
+            // API port-compatibility rules make this unreachable in practice (`UDP`
+            // never shares a port with another protocol) — this only keeps the delta
+            // logic correct if that invariant is ever relaxed.
+            Some(state)
+                if (state.protocol == ListenerProtocol::Udp)
+                    != (spec.protocol == ListenerProtocol::Udp) =>
+            {
+                plan.remove.push(spec.addr);
+                plan.add.push(spec.clone());
+            }
             Some(state) if state.protocol != spec.protocol => plan.reprotocol.push(spec.clone()),
             Some(state) if state.proxy_protocol != spec.proxy_protocol => {
                 plan.reproxy.push(spec.clone());
@@ -684,7 +733,64 @@ async fn reconcile_listeners<P>(
     // drain window), so by the time a later reconcile re-adds the port the
     // socket is already free.
     for spec in plan.add {
-        let tcp = match tokio::net::TcpListener::bind(spec.addr).await {
+        let addr = spec.addr;
+        let drain_token = CancellationToken::new();
+        let (conn_shutdown_tx, conn_shutdown_rx) = watch::channel(false);
+        let (proto_tx, proto_rx) = watch::channel(spec.protocol);
+        let (proxy_config_tx, proxy_config_rx) = watch::channel(spec.proxy_protocol.clone());
+
+        // UDP has no accept loop and no per-connection handler — bind a
+        // UdpSocket and spawn the session-tracked forwarder directly, then
+        // skip the TcpListener-based path below entirely. `proto_rx` /
+        // `proxy_config_rx` / `conn_shutdown_rx` are created above for
+        // `ListenerHandle`/`ActiveListenerState` bookkeeping symmetry but are
+        // unused here: a UDP listener never flips protocol in place (Gateway
+        // API port-compatibility rules keep it exclusive on its port) and
+        // carries no PROXY-protocol support (#506).
+        if spec.protocol == ListenerProtocol::Udp {
+            let sock = match tokio::net::UdpSocket::bind(addr).await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(
+                        addr = %addr,
+                        error = %e,
+                        "Cannot bind new UDP listener; port dark until a later reconcile succeeds"
+                    );
+                    metrics::lifecycle()
+                        .with_label_values(&["bind_failed"])
+                        .inc();
+                    continue;
+                }
+            };
+
+            tracing::info!(addr = %addr, "Binding new UDP listener");
+            metrics::lifecycle().with_label_values(&["added"]).inc();
+            metrics::listeners_active()
+                .with_label_values(&["serving"])
+                .inc();
+
+            all_tasks.spawn(run_udp_listener(
+                sock,
+                addr.port(),
+                cfg.udp_table.clone(),
+                cfg.udp_session_timeout,
+                drain_token.clone(),
+                global_shutdown.clone(),
+            ));
+
+            active.insert(
+                addr,
+                ListenerHandle {
+                    drain_token,
+                    conn_shutdown_tx,
+                    proto_tx,
+                    proxy_config_tx,
+                },
+            );
+            continue;
+        }
+
+        let tcp = match tokio::net::TcpListener::bind(addr).await {
             Ok(l) => l,
             Err(e) => {
                 // A dark port is a routing outage for that Gateway until a
@@ -693,7 +799,7 @@ async fn reconcile_listeners<P>(
                 // Loud on purpose (error + metric): with drain-start socket
                 // release this should be a rare, transient collision.
                 tracing::error!(
-                    addr = %spec.addr,
+                    addr = %addr,
                     error = %e,
                     "Cannot bind new listener; port dark until a later reconcile succeeds"
                 );
@@ -703,10 +809,6 @@ async fn reconcile_listeners<P>(
                 continue;
             }
         };
-        let drain_token = CancellationToken::new();
-        let (conn_shutdown_tx, conn_shutdown_rx) = watch::channel(false);
-        let (proto_tx, proto_rx) = watch::channel(spec.protocol);
-        let (proxy_config_tx, proxy_config_rx) = watch::channel(spec.proxy_protocol.clone());
 
         let listener_cfg = ListenerConfig {
             proxy: Arc::clone(&cfg.proxy),
@@ -715,9 +817,10 @@ async fn reconcile_listeners<P>(
             passthrough_table: cfg.passthrough_table.clone(),
             terminate_table: cfg.terminate_table.clone(),
             tcp_table: cfg.tcp_table.clone(),
+            udp_table: cfg.udp_table.clone(),
             l4_dial_timeout: cfg.l4_dial_timeout,
+            udp_session_timeout: cfg.udp_session_timeout,
         };
-        let addr = spec.addr;
 
         tracing::info!(addr = %addr, "Binding new listener");
         metrics::lifecycle().with_label_values(&["added"]).inc();
@@ -1297,8 +1400,13 @@ async fn handle_standard<P>(
             // works correctly), ALPN, keepalive, and shutdown.
             let _ = proxy.process_new(stream, &conn_shutdown).await;
         }
-        // L4 and hybrid connections are dispatched before reaching this function.
-        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid | ListenerProtocol::Tcp => {}
+        // L4, hybrid, TCP, and UDP connections are dispatched before reaching
+        // this function (UDP has no per-connection handler at all — see
+        // `edge::udp`).
+        ListenerProtocol::TlsL4
+        | ListenerProtocol::TlsHybrid
+        | ListenerProtocol::Tcp
+        | ListenerProtocol::Udp => {}
     }
 }
 
@@ -1352,8 +1460,12 @@ async fn handle_proxy_protocol<P>(
     let proto_str = match protocol {
         ListenerProtocol::Http => "http",
         ListenerProtocol::Https => "https",
-        // Passthrough / hybrid connections are dispatched before reaching this function.
-        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid | ListenerProtocol::Tcp => return,
+        // Passthrough / hybrid / TCP / UDP connections are dispatched before
+        // reaching this function (UDP has no per-connection handler at all).
+        ListenerProtocol::TlsL4
+        | ListenerProtocol::TlsHybrid
+        | ListenerProtocol::Tcp
+        | ListenerProtocol::Udp => return,
     };
     let conn_info = ConnectionInfo {
         real_addr,
@@ -1388,8 +1500,12 @@ async fn handle_proxy_protocol<P>(
             }
         }
         ListenerProtocol::Http => Box::new(L4Stream::from(tcp)),
-        // Passthrough / hybrid connections are dispatched before reaching this function.
-        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid | ListenerProtocol::Tcp => return,
+        // Passthrough / hybrid / TCP / UDP connections are dispatched before
+        // reaching this function (UDP has no per-connection handler at all).
+        ListenerProtocol::TlsL4
+        | ListenerProtocol::TlsHybrid
+        | ListenerProtocol::Tcp
+        | ListenerProtocol::Udp => return,
     };
 
     let mut session = ServerSession::new_http1(stream);

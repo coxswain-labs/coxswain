@@ -13,7 +13,7 @@ use coxswain_core::routing::{
     HostPattern, HostRouter, IngressAuthConfig, IngressRoutingTable, LoadBalance, MatchPredicates,
     NormalizeLevel, PasswordHash, PathModifier, PortRoutingTable, RateLimitConfig, RateLimitKey,
     RouteEntry, RouteKind, RouteTimeouts, SessionAffinity, SubjectAltName, TcpRouteTable,
-    TlsPassthroughTable, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
+    TlsPassthroughTable, UdpRouteTable, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
 };
 
 use crate::proto::v1 as p;
@@ -760,4 +760,20 @@ pub fn tcp_table_to_wire(t: &TcpRouteTable) -> p::TcpRouteTable {
         .collect();
     ports.sort_by_key(|e| e.port);
     p::TcpRouteTable { ports }
+}
+
+/// Serialise a [`UdpRouteTable`] to its wire DTO (UDPRoute, GEP-2645, #506).
+///
+/// Same shape as [`tcp_table_to_wire`] — port-keyed, no SNI dimension.
+#[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
+pub fn udp_table_to_wire(t: &UdpRouteTable) -> p::UdpRouteTable {
+    let mut ports: Vec<p::UdpRoutePort> = t
+        .ports_iter()
+        .map(|(port, bg)| p::UdpRoutePort {
+            port: u32::from(port),
+            backend_group: Some(backend_group_to_wire(bg, 0)),
+        })
+        .collect();
+    ports.sort_by_key(|e| e.port);
+    p::UdpRouteTable { ports }
 }

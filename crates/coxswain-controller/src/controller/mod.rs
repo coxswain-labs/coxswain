@@ -25,7 +25,9 @@ use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_reflector::gw_types::ListenerSet;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
-use coxswain_reflector::gw_types::{BackendTlsPolicy, GrpcRoute, HttpRoute, TcpRoute, TlsRoute};
+use coxswain_reflector::gw_types::{
+    BackendTlsPolicy, GrpcRoute, HttpRoute, TcpRoute, TlsRoute, UdpRoute,
+};
 use coxswain_reflector::status::{
     GatewayListenerStatus, SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus,
     SharedCoxswainBackendPolicyStatus, SharedCoxswainExternalAuthStatus,
@@ -72,6 +74,7 @@ mod listenerset_status;
 mod route_events;
 mod tcp_route_events;
 mod tls_route_events;
+mod udp_route_events;
 
 pub use config::{ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress};
 
@@ -137,6 +140,10 @@ pub struct StatusChannels {
     ///
     /// Separate from the other route-kind channels for the same kind-neutrality reason.
     pub tcp_route: SharedRouteStatus,
+    /// Per-UDPRoute Accepted/ResolvedRefs health.
+    ///
+    /// Separate from the other route-kind channels for the same kind-neutrality reason.
+    pub udp_route: SharedRouteStatus,
     /// Per-`BackendTLSPolicy` ancestor health.
     pub policy: SharedBackendTlsPolicyStatus,
     /// Per-`ClientTrafficPolicy` ancestor health (#327).
@@ -315,6 +322,7 @@ impl Controller {
             policies,
             tls_routes,
             tcp_routes,
+            udp_routes,
             listener_sets,
             client_traffic_policies,
             coxswain_backend_policies,
@@ -332,6 +340,7 @@ impl Controller {
         let grpc_routes_reader = grpc_routes.reader();
         let tls_routes_reader = tls_routes.reader();
         let tcp_routes_reader = tcp_routes.reader();
+        let udp_routes_reader = udp_routes.reader();
         let ingresses_reader = ingresses.reader();
         let ingress_classes_reader = ingress_classes.reader();
         let policies_reader = policies.reader();
@@ -357,6 +366,7 @@ impl Controller {
             grpc_route_status: self.channels.grpc_route.clone(),
             tls_route_status: self.channels.tls_route.clone(),
             tcp_route_status: self.channels.tcp_route.clone(),
+            udp_route_status: self.channels.udp_route.clone(),
             policy_status: self.channels.policy.clone(),
             ctp_status: self.channels.ctp.clone(),
             cbp_status: self.channels.cbp.clone(),
@@ -380,6 +390,7 @@ impl Controller {
         let (grpc_route_tx, grpc_route_rx) = mpsc::unbounded::<()>();
         let (tls_route_tx, tls_route_rx) = mpsc::unbounded::<()>();
         let (tcp_route_tx, tcp_route_rx) = mpsc::unbounded::<()>();
+        let (udp_route_tx, udp_route_rx) = mpsc::unbounded::<()>();
         let (ing_tx, ing_rx) = mpsc::unbounded::<()>();
         let (pol_tx, pol_rx) = mpsc::unbounded::<()>();
         let (ls_tx, ls_rx) = mpsc::unbounded::<()>();
@@ -393,6 +404,7 @@ impl Controller {
             grpc_route_tx.clone(),
             tls_route_tx.clone(),
             tcp_route_tx.clone(),
+            udp_route_tx.clone(),
             ing_tx.clone(),
             pol_tx.clone(),
             ls_tx.clone(),
@@ -462,6 +474,11 @@ impl Controller {
             &mut tasks,
             self.channels.tcp_route.subscribe(),
             tcp_route_tx,
+        );
+        spawn_health_forwarder(
+            &mut tasks,
+            self.channels.udp_route.subscribe(),
+            udp_route_tx,
         );
         spawn_health_forwarder(&mut tasks, self.channels.policy.subscribe(), pol_tx);
         spawn_health_forwarder(&mut tasks, self.channels.ctp.subscribe(), ctp_tx);
@@ -555,6 +572,13 @@ impl Controller {
             .reconcile_all_on(tcp_route_rx)
             .run(reconcile_tcp_route, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, tcp_route_ctrl, "TCPRoute");
+
+        // --- UDPRoute: primary only; re-driven on udp-route-health flips +
+        // promotion. Handles datagram routes bound to protocol:UDP listeners.
+        let udp_route_ctrl = KubeController::for_shared_stream(udp_routes, udp_routes_reader)
+            .reconcile_all_on(udp_route_rx)
+            .run(reconcile_udp_route, error_policy, ctx.clone());
+        spawn_controller_stream(&mut tasks, udp_route_ctrl, "UDPRoute");
 
         // --- Ingress: primary Ingress, secondary IngressClass → all Ingresses
         // (ownership re-checked per reconcile); re-driven on promotion. ---
@@ -861,6 +885,7 @@ struct ReconcileContext {
     grpc_route_status: SharedRouteStatus,
     tls_route_status: SharedRouteStatus,
     tcp_route_status: SharedRouteStatus,
+    udp_route_status: SharedRouteStatus,
     policy_status: SharedBackendTlsPolicyStatus,
     ctp_status: SharedClientTrafficPolicyStatus,
     cbp_status: SharedCoxswainBackendPolicyStatus,
@@ -1629,6 +1654,35 @@ async fn reconcile_tcp_route_inner(route: &TcpRoute, ctx: &ReconcileContext) -> 
     let rh = ctx.tcp_route_status.load();
     if leader_write_fence(ctx) {
         tcp_route_events::mark_tcp_route_programmed(
+            &ctx.client,
+            route,
+            &ctx.controller_name,
+            &owned,
+            &rh,
+        )
+        .await;
+    }
+    Action::await_change()
+}
+
+async fn reconcile_udp_route(
+    route: Arc<UdpRoute>,
+    ctx: Arc<ReconcileContext>,
+) -> Result<Action, Infallible> {
+    let started = std::time::Instant::now();
+    let res: Result<Action, Infallible> = Ok(reconcile_udp_route_inner(&route, &ctx).await);
+    crate::metrics::observe_reconcile("status_writer", started, &res);
+    res
+}
+
+async fn reconcile_udp_route_inner(route: &UdpRoute, ctx: &ReconcileContext) -> Action {
+    if !ctx.leader.load(Ordering::Acquire) {
+        return Action::requeue(NON_LEADER_REQUEUE);
+    }
+    let owned = ctx.owned_gateways.load();
+    let rh = ctx.udp_route_status.load();
+    if leader_write_fence(ctx) {
+        udp_route_events::mark_udp_route_programmed(
             &ctx.client,
             route,
             &ctx.controller_name,

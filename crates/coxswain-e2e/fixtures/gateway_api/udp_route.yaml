@@ -1,0 +1,35 @@
+# UDP-proxy Gateway + UDPRoute fixture for GEP-2645 / #506 e2e tests.
+# The proxy session-tracks each client 5-tuple and forwards its datagrams to
+# the bound backend — no SNI peek, no TLS, no HTTP parsing.
+#
+# Substitutions (via FixtureVars::with):
+#   GATEWAY_UDP_PROXY_PORT - port for the UDP-proxy listener (8446)
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-udp-gw
+  namespace: ${TESTNS}
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: udp-proxy
+      port: ${GATEWAY_UDP_PROXY_PORT}
+      protocol: UDP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata:
+  name: udp-route
+  namespace: ${TESTNS}
+spec:
+  parentRefs:
+    - name: coxswain-udp-gw
+      namespace: ${TESTNS}
+  rules:
+    - backendRefs:
+        - name: udp-echo-a
+          port: 3000

@@ -24,6 +24,7 @@ mod status;
 mod tcp_status;
 mod timeouts;
 mod tls_status;
+mod udp_status;
 
 pub use backend_policy::{BackendPolicyIndex, ResolvedBackendPolicy, build_backend_policy_index};
 pub use backend_tls::{BackendTlsIndex, build_backend_tls_index};
@@ -51,7 +52,7 @@ pub(crate) const COXSWAIN_GROUP: &str = "gateway.coxswain-labs.dev";
 mod tests;
 
 use crate::gw_types::v::gateways::Gateway;
-use crate::gw_types::{GrpcRoute, HttpRoute, TcpRoute, TlsRoute};
+use crate::gw_types::{GrpcRoute, HttpRoute, TcpRoute, TlsRoute, UdpRoute};
 use crate::status::{BackendTlsPolicyStatusMap, RouteStatusMap};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::ReferenceGrantKey;
@@ -243,6 +244,44 @@ impl TcpRouteReconciler {
             backend_grants,
             service_store,
             "TCPRoute",
+        )
+    }
+}
+
+/// Zero-sized handle namespacing the `UDPRoute` reconciliation entry points.
+///
+/// Parallel sibling to [`TcpRouteReconciler`] — not a trait, not a generic, just a concrete
+/// handle. Consumes only protocol-filtered listeners (`protocol: UDP`). Like `TCPRoute`
+/// there is no passthrough/terminate mode split and no SNI/hostname dimension.
+#[non_exhaustive]
+pub struct UdpRouteReconciler;
+
+impl UdpRouteReconciler {
+    /// Compute per-(route, parent) `Accepted` + `ResolvedRefs` status for `UDPRoute`s.
+    ///
+    /// Only `protocol: UDP` listeners are considered — routes attached to any other
+    /// protocol listener receive `Accepted=False, NotAllowedByListeners`. Use a **separate**
+    /// [`crate::status::SharedRouteStatus`] instance to avoid key collisions with other
+    /// route kinds' status (same key shape, different kind).
+    pub(crate) fn compute_route_health(
+        routes: &[Arc<UdpRoute>],
+        gateways: &[Arc<Gateway>],
+        owned_gateways: &HashSet<ObjectKey>,
+        effective: &std::collections::HashMap<
+            ObjectKey,
+            crate::reconciler::listener_merge::EffectiveGateway,
+        >,
+        backend_grants: &HashSet<ReferenceGrantKey>,
+        service_store: &reflector::Store<Service>,
+    ) -> RouteStatusMap {
+        route_status::compute_route_health(
+            routes,
+            gateways,
+            owned_gateways,
+            effective,
+            backend_grants,
+            service_store,
+            "UDPRoute",
         )
     }
 }

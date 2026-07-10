@@ -18,8 +18,8 @@ use super::dedicated::{
 };
 use super::route_builder::{
     RouteAttachKind, build_client_certs, build_passthrough_routes, build_routes, build_tcp_routes,
-    build_terminate_routes, build_tls, count_attached_routes, merge_backend_client_cert_health,
-    resolve_backend_client_certs,
+    build_terminate_routes, build_tls, build_udp_routes, count_attached_routes,
+    merge_backend_client_cert_health, resolve_backend_client_certs,
 };
 use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
 use crate::gateway_api::{
@@ -33,6 +33,7 @@ use crate::gw_types::HttpRoute;
 use crate::gw_types::ListenerSet;
 use crate::gw_types::TcpRoute;
 use crate::gw_types::TlsRoute;
+use crate::gw_types::UdpRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
@@ -40,7 +41,7 @@ use crate::ingress::IngressPorts;
 use crate::k8s_utils::scoped_api;
 use crate::reference_grants::{
     GrantSet, flatten_basic_auth_secret_grants, flatten_ca_grants, flatten_grants,
-    flatten_ls_cert_grants, flatten_tcp_backend_grants,
+    flatten_ls_cert_grants, flatten_tcp_backend_grants, flatten_udp_backend_grants,
 };
 use crate::status::{
     ListenerSource, SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus,
@@ -62,7 +63,7 @@ use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::publish_index::SharedGatewayPublishIndex;
 use coxswain_core::routing::{
     BackendClientCert, SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
-    SharedTlsPassthroughTable,
+    SharedTlsPassthroughTable, SharedUdpRouteTable,
 };
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
 use futures::StreamExt;
@@ -305,6 +306,8 @@ pub struct SharedProxyReconciler {
     terminate_routes: SharedTlsPassthroughTable,
     /// Port-keyed TCP routing table for TCPRoute / GEP-1901 (#505).
     tcp_routes: SharedTcpRouteTable,
+    /// Port-keyed UDP routing table for UDPRoute / GEP-2645 (#506).
+    udp_routes: SharedUdpRouteTable,
     /// Per-cut-over-Gateway routing snapshots. Written by this reconciler on
     /// every rebuild; read by the discovery server to serve `Scope::Gateway` subscribers.
     dedicated_registry: DedicatedRoutingRegistry,
@@ -319,6 +322,9 @@ pub struct SharedProxyReconciler {
     /// Per-(TCPRoute, parent) health — separate from the other route-kind status
     /// maps for the same kind-neutrality reason.
     tcp_route_status: SharedRouteStatus,
+    /// Per-(UDPRoute, parent) health — separate from the other route-kind status
+    /// maps for the same kind-neutrality reason.
+    udp_route_status: SharedRouteStatus,
     policy_status: SharedBackendTlsPolicyStatus,
     ctp_status: SharedClientTrafficPolicyStatus,
     /// Per-`CoxswainBackendPolicy` ancestor health (#354).
@@ -383,6 +389,11 @@ pub struct ReconcilerOutputs {
     /// No SNI dimension — a TCP listener has exactly one mode, so this table is a
     /// plain `port → BackendGroup` map, isolated from the TLS-flavored tables.
     pub tcp_routes: SharedTcpRouteTable,
+    /// Port-keyed UDP routing table for UDPRoute / GEP-2645 (#506).
+    ///
+    /// No SNI dimension — a UDP listener has exactly one mode, so this table is a
+    /// plain `port → BackendGroup` map, isolated from the TCP/TLS-flavored tables.
+    pub udp_routes: SharedUdpRouteTable,
 }
 
 /// Shared-store subscriptions the controller's status-writer consumes to drive
@@ -415,6 +426,8 @@ pub struct StatusSubscriptions {
     pub tls_routes: ReflectHandle<TlsRoute>,
     /// Applied-`TCPRoute` stream + reader.
     pub tcp_routes: ReflectHandle<TcpRoute>,
+    /// Applied-`UDPRoute` stream + reader.
+    pub udp_routes: ReflectHandle<UdpRoute>,
     /// Applied-`ListenerSet` stream + reader (GEP-1713).
     pub listener_sets: ReflectHandle<ListenerSet>,
     /// Applied-`ClientTrafficPolicy` stream + reader (#327).
@@ -440,6 +453,7 @@ struct StatusStoreWriters {
     policies: reflector::store::Writer<BackendTlsPolicy>,
     tls_routes: reflector::store::Writer<TlsRoute>,
     tcp_routes: reflector::store::Writer<TcpRoute>,
+    udp_routes: reflector::store::Writer<UdpRoute>,
     listener_sets: reflector::store::Writer<ListenerSet>,
     client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
     coxswain_backend_policies: reflector::store::Writer<CoxswainBackendPolicy>,
@@ -460,6 +474,7 @@ struct StatusStoreOptionWriters {
     policies: Option<reflector::store::Writer<BackendTlsPolicy>>,
     tls_routes: Option<reflector::store::Writer<TlsRoute>>,
     tcp_routes: Option<reflector::store::Writer<TcpRoute>>,
+    udp_routes: Option<reflector::store::Writer<UdpRoute>>,
     listener_sets: Option<reflector::store::Writer<ListenerSet>>,
     client_traffic_policies: Option<reflector::store::Writer<ClientTrafficPolicy>>,
     coxswain_backend_policies: Option<reflector::store::Writer<CoxswainBackendPolicy>>,
@@ -484,6 +499,7 @@ impl StatusStoreWriters {
                 policies: Some(w.policies),
                 tls_routes: Some(w.tls_routes),
                 tcp_routes: Some(w.tcp_routes),
+                udp_routes: Some(w.udp_routes),
                 listener_sets: Some(w.listener_sets),
                 client_traffic_policies: Some(w.client_traffic_policies),
                 coxswain_backend_policies: Some(w.coxswain_backend_policies),
@@ -499,6 +515,7 @@ impl StatusStoreWriters {
                 policies: None,
                 tls_routes: None,
                 tcp_routes: None,
+                udp_routes: None,
                 listener_sets: None,
                 client_traffic_policies: None,
                 coxswain_backend_policies: None,
@@ -535,6 +552,7 @@ impl SharedProxyReconciler {
             passthrough_routes,
             terminate_routes,
             tcp_routes,
+            udp_routes,
         } = outputs;
         // When the controller role asks for status subscriptions, back the
         // status-relevant stores with shared informers now (sync) so the
@@ -555,6 +573,7 @@ impl SharedProxyReconciler {
                 reflector::store_shared::<BackendTlsPolicy>(STATUS_SUBSCRIBE_BUFFER);
             let (_, tls_routes) = reflector::store_shared::<TlsRoute>(STATUS_SUBSCRIBE_BUFFER);
             let (_, tcp_routes) = reflector::store_shared::<TcpRoute>(STATUS_SUBSCRIBE_BUFFER);
+            let (_, udp_routes) = reflector::store_shared::<UdpRoute>(STATUS_SUBSCRIBE_BUFFER);
             let (_, listener_sets) =
                 reflector::store_shared::<ListenerSet>(STATUS_SUBSCRIBE_BUFFER);
             let (_, client_traffic_policies) =
@@ -593,6 +612,9 @@ impl SharedProxyReconciler {
                 tcp_routes: tcp_routes.subscribe().unwrap_or_else(|| {
                     panic!("invariant: store_shared writer must yield a TCPRoute subscriber")
                 }),
+                udp_routes: udp_routes.subscribe().unwrap_or_else(|| {
+                    panic!("invariant: store_shared writer must yield a UDPRoute subscriber")
+                }),
                 listener_sets: listener_sets.subscribe().unwrap_or_else(|| {
                     panic!("invariant: store_shared writer must yield a ListenerSet subscriber")
                 }),
@@ -626,6 +648,7 @@ impl SharedProxyReconciler {
                 policies,
                 tls_routes,
                 tcp_routes,
+                udp_routes,
                 listener_sets,
                 client_traffic_policies,
                 coxswain_backend_policies,
@@ -647,10 +670,12 @@ impl SharedProxyReconciler {
             passthrough_routes,
             terminate_routes,
             tcp_routes,
+            udp_routes,
             route_status: SharedRouteStatus::new(),
             grpc_route_status: SharedRouteStatus::new(),
             tls_route_status: SharedRouteStatus::new(),
             tcp_route_status: SharedRouteStatus::new(),
+            udp_route_status: SharedRouteStatus::new(),
             policy_status: SharedBackendTlsPolicyStatus::new(),
             ctp_status: SharedClientTrafficPolicyStatus::new(),
             cbp_status: SharedCoxswainBackendPolicyStatus::new(),
@@ -717,6 +742,15 @@ impl SharedProxyReconciler {
         self.tcp_route_status.clone()
     }
 
+    /// Returns the shared UDPRoute status handle so the Controller can subscribe to
+    /// updates published by this reconciler.
+    ///
+    /// Separate from the other route-kind status handles — `RouteParentKey` is
+    /// kind-neutral, so UDPRoute status must live in its own map.
+    pub fn udp_route_status(&self) -> SharedRouteStatus {
+        self.udp_route_status.clone()
+    }
+
     /// Returns the shared `BackendTLSPolicy` status handle so the Controller can
     /// write `status.ancestors[]` when leader.
     pub fn policy_status(&self) -> SharedBackendTlsPolicyStatus {
@@ -765,6 +799,14 @@ impl SharedProxyReconciler {
         self.tcp_routes.clone()
     }
 
+    /// Returns the port-keyed UDP routing table (GEP-2645, #506).
+    ///
+    /// The proxy reads this on each inbound datagram on a `UDP`-protocol
+    /// listener port to pick a backend purely by port — no SNI peek is involved.
+    pub fn udp_routes(&self) -> SharedUdpRouteTable {
+        self.udp_routes.clone()
+    }
+
     /// Returns the fleet snapshot handle so the admin API can read the current
     /// set of coxswain pods. Only populated when [`ReconcilerOptions::watch_fleet`]
     /// is `true` (controller role); returns an empty snapshot otherwise.
@@ -796,6 +838,7 @@ pub(super) struct ReflectorStores<'a> {
     pub(super) grpc_routes: &'a reflector::Store<GrpcRoute>,
     pub(super) tls_routes: &'a reflector::Store<TlsRoute>,
     pub(super) tcp_routes: &'a reflector::Store<TcpRoute>,
+    pub(super) udp_routes: &'a reflector::Store<UdpRoute>,
     pub(super) ingresses: &'a reflector::Store<Ingress>,
     pub(super) ingress_classes: &'a reflector::Store<IngressClass>,
     /// `CoxswainIngressClassParameters` CRs in scope — the per-class annotation
@@ -896,6 +939,7 @@ pub(super) struct SharedOutputs<'a> {
     pub(super) grpc_route_status: &'a SharedRouteStatus,
     pub(super) tls_route_status: &'a SharedRouteStatus,
     pub(super) tcp_route_status: &'a SharedRouteStatus,
+    pub(super) udp_route_status: &'a SharedRouteStatus,
     pub(super) policy_status: &'a SharedBackendTlsPolicyStatus,
     pub(super) ctp_status: &'a SharedClientTrafficPolicyStatus,
     pub(super) cbp_status: &'a SharedCoxswainBackendPolicyStatus,
@@ -903,6 +947,7 @@ pub(super) struct SharedOutputs<'a> {
     pub(super) passthrough_routes: &'a SharedTlsPassthroughTable,
     pub(super) terminate_routes: &'a SharedTlsPassthroughTable,
     pub(super) tcp_routes: &'a SharedTcpRouteTable,
+    pub(super) udp_routes: &'a SharedUdpRouteTable,
     pub(super) publish_index: &'a SharedGatewayPublishIndex,
     pub(super) ingress_event_tx: Option<&'a tokio::sync::mpsc::Sender<IngressEvent>>,
 }
@@ -1075,6 +1120,7 @@ impl BackgroundService for SharedProxyReconciler {
             grpc_route_status: self.grpc_route_status.clone(),
             tls_route_status: self.tls_route_status.clone(),
             tcp_route_status: self.tcp_route_status.clone(),
+            udp_route_status: self.udp_route_status.clone(),
             policy_status: self.policy_status.clone(),
             ctp_status: self.ctp_status.clone(),
             cbp_status: self.cbp_status.clone(),
@@ -1083,6 +1129,7 @@ impl BackgroundService for SharedProxyReconciler {
             passthrough_routes: self.passthrough_routes.clone(),
             terminate_routes: self.terminate_routes.clone(),
             tcp_routes: self.tcp_routes.clone(),
+            udp_routes: self.udp_routes.clone(),
             fleet: self.fleet.clone(),
             owned_gateways: self.owned_gateways.clone(),
             leader: Arc::clone(&self.leader),
@@ -1124,6 +1171,7 @@ struct SharedHandles {
     grpc_route_status: SharedRouteStatus,
     tls_route_status: SharedRouteStatus,
     tcp_route_status: SharedRouteStatus,
+    udp_route_status: SharedRouteStatus,
     policy_status: SharedBackendTlsPolicyStatus,
     ctp_status: SharedClientTrafficPolicyStatus,
     cbp_status: SharedCoxswainBackendPolicyStatus,
@@ -1136,6 +1184,8 @@ struct SharedHandles {
     terminate_routes: SharedTlsPassthroughTable,
     /// Port-keyed TCP routing table for TCPRoute / GEP-1901 (#505).
     tcp_routes: SharedTcpRouteTable,
+    /// Port-keyed UDP routing table for UDPRoute / GEP-2645 (#506).
+    udp_routes: SharedUdpRouteTable,
     /// Populated by the fleet task when `watch_fleet` is enabled; carried here
     /// so the fleet-rebuild task can publish into the same cell that callers
     /// obtain via [`SharedProxyReconciler::fleet`].
@@ -1171,6 +1221,7 @@ struct GatewayApiStoreWriters {
     grpc_routes: reflector::store::Writer<GrpcRoute>,
     tls_routes: reflector::store::Writer<TlsRoute>,
     tcp_routes: reflector::store::Writer<TcpRoute>,
+    udp_routes: reflector::store::Writer<UdpRoute>,
     gateways: reflector::store::Writer<Gateway>,
     gateway_classes: reflector::store::Writer<GatewayClass>,
     grants: reflector::store::Writer<ReferenceGrant>,
@@ -1204,6 +1255,7 @@ fn add_gateway_api_reflectors(
         grpc_routes,
         tls_routes,
         tcp_routes,
+        udp_routes,
         gateways,
         gateway_classes,
         grants,
@@ -1249,6 +1301,14 @@ fn add_gateway_api_reflectors(
         watcher::Config::default(),
         ReflectorEffects::new(notify, health, "tcp_route", metrics),
         "TcpRoute",
+    );
+    spawn_reflector(
+        set,
+        udp_routes,
+        scoped_api::<UdpRoute>(client.clone(), ns),
+        watcher::Config::default(),
+        ReflectorEffects::new(notify, health, "udp_route", metrics),
+        "UdpRoute",
     );
     spawn_reflector(
         set,
@@ -1379,6 +1439,7 @@ async fn spawn_tasks(
         grpc_route_status,
         tls_route_status,
         tcp_route_status,
+        udp_route_status,
         policy_status,
         ctp_status,
         cbp_status,
@@ -1387,6 +1448,7 @@ async fn spawn_tasks(
         passthrough_routes,
         terminate_routes,
         tcp_routes,
+        udp_routes,
         fleet,
         owned_gateways,
         leader,
@@ -1446,6 +1508,7 @@ async fn spawn_tasks(
     let (compression_reader, compression_writer) = reflector::store::<Compression>();
     let (tls_route_reader, tls_route_writer) = reader_writer::<TlsRoute>(pre.tls_routes);
     let (tcp_route_reader, tcp_route_writer) = reader_writer::<TcpRoute>(pre.tcp_routes);
+    let (udp_route_reader, udp_route_writer) = reader_writer::<UdpRoute>(pre.udp_routes);
     // ListenerSet is a status-relevant store: in the controller role its writer is
     // the shared one pre-created in `new`, so the status-writer's subscription and
     // the data-plane reader observe the same synced store (GEP-1713).
@@ -1658,6 +1721,7 @@ async fn spawn_tasks(
             grpc_routes: grpc_route_writer,
             tls_routes: tls_route_writer,
             tcp_routes: tcp_route_writer,
+            udp_routes: udp_route_writer,
             gateways: gateway_writer,
             gateway_classes: gateway_class_writer,
             grants: grant_writer,
@@ -1832,6 +1896,7 @@ async fn spawn_tasks(
                 grpc_routes: &grpc_route_reader,
                 tls_routes: &tls_route_reader,
                 tcp_routes: &tcp_route_reader,
+                udp_routes: &udp_route_reader,
                 ingresses: &ingress_reader,
                 ingress_classes: &class_reader,
                 ingress_class_parameters: &class_params_reader,
@@ -1874,6 +1939,7 @@ async fn spawn_tasks(
                 grpc_route_status: &grpc_route_status,
                 tls_route_status: &tls_route_status,
                 tcp_route_status: &tcp_route_status,
+                udp_route_status: &udp_route_status,
                 policy_status: &policy_status,
                 ctp_status: &ctp_status,
                 cbp_status: &cbp_status,
@@ -1882,6 +1948,7 @@ async fn spawn_tasks(
                 passthrough_routes: &passthrough_routes,
                 terminate_routes: &terminate_routes,
                 tcp_routes: &tcp_routes,
+                udp_routes: &udp_routes,
                 ingress_event_tx: ingress_event_tx.as_ref(),
             };
             let rebuild_start = std::time::Instant::now();
@@ -1955,6 +2022,7 @@ fn rebuild(
     let ls_cert_grants = flatten_ls_cert_grants(&grants_snapshot);
     let basic_auth_secret_grants = flatten_basic_auth_secret_grants(&grants_snapshot);
     let tcp_backend_grants = flatten_tcp_backend_grants(&grants_snapshot);
+    let udp_backend_grants = flatten_udp_backend_grants(&grants_snapshot);
 
     tracing::debug!(
         http_routes = routes.len(),
@@ -2062,6 +2130,7 @@ fn rebuild(
 
     let tls_routes = stores.tls_routes.state();
     let tcp_routes_crs = stores.tcp_routes.state();
+    let udp_routes_crs = stores.udp_routes.state();
     // GEP-1713: ListenerSet → parent Gateway map so a `parentRef.kind: ListenerSet`
     // route counts against the listener on its parent Gateway's health entry.
     let ls_parent: HashMap<ObjectKey, ObjectKey> = effective
@@ -2100,6 +2169,13 @@ fn rebuild(
         &ls_parent,
         &mut gateway_listener_status,
         RouteAttachKind::Tcp,
+    );
+    count_attached_routes(
+        &udp_routes_crs,
+        &owned_gateways,
+        &ls_parent,
+        &mut gateway_listener_status,
+        RouteAttachKind::Udp,
     );
 
     // Wire CTP-resolved proxy_protocol config into each listener's `ListenerInfo`
@@ -2295,6 +2371,20 @@ fn rebuild(
     outputs
         .tcp_route_status
         .store_and_notify(tcp_route_status_map);
+
+    // Build the port-keyed UDP routing table from UDPRoutes bound to
+    // `protocol: UDP` listeners (GEP-2645, #506). No SNI/hostname dimension —
+    // isolated from both TCP and TLS L4 tables.
+    let udp_route_status_map = build_udp_routes(
+        stores,
+        &owned_gateways,
+        &effective,
+        &udp_backend_grants,
+        outputs.udp_routes,
+    );
+    outputs
+        .udp_route_status
+        .store_and_notify(udp_route_status_map);
 
     // #531 ack gate: stamp the publish index LAST, after every routing cell
     // above has been stored — the sequence bump is the publication fence the

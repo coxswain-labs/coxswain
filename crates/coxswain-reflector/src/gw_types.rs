@@ -27,6 +27,7 @@ pub use v::httproutes::HttpRoute;
 pub use v::listenersets::ListenerSet;
 pub use v::tcproutes::TcpRoute;
 pub use v::tlsroutes::TlsRoute;
+pub use v::udproutes::UdpRoute;
 
 /// Gateway API condition `type`/`reason` constants (#510), parsed straight
 /// from upstream Go source by the repo-root `xtask` crate — not channel-scoped,

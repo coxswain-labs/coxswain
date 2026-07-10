@@ -308,6 +308,7 @@ fn implicit_allows_kind(protocol: &str, route_kind: &str) -> bool {
         "HTTP" | "HTTPS" => matches!(route_kind, "HTTPRoute" | "GRPCRoute"),
         "TLS" => route_kind == "TLSRoute",
         "TCP" => route_kind == "TCPRoute",
+        "UDP" => route_kind == "UDPRoute",
         _ => false,
     }
 }

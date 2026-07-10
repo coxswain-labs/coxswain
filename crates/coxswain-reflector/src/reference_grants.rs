@@ -82,6 +82,18 @@ pub fn flatten_tcp_backend_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
     flatten(grants, GATEWAY_API_GROUP, "TCPRoute", "Service")
 }
 
+/// Flatten the `UDPRoute → Service` grants used when a UDPRoute `backendRef`
+/// points at a Service in another namespace (GEP-2645, #506). Kept separate
+/// from [`flatten_grants`]'s `backend_grants` (`from.kind: HTTPRoute`) and from
+/// [`flatten_tcp_backend_grants`] for the same reason: [`ReferenceGrantKey`]
+/// carries no `from.kind`, so merging would let an HTTPRoute- or TCPRoute-scoped
+/// grant silently also permit a UDPRoute's backendRef between the same
+/// namespace pair.
+#[must_use]
+pub fn flatten_udp_backend_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
+    flatten(grants, GATEWAY_API_GROUP, "UDPRoute", "Service")
+}
+
 fn flatten(
     grants: &[Arc<ReferenceGrant>],
     from_group: &str,

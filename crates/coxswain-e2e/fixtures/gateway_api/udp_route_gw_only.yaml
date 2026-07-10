@@ -1,0 +1,21 @@
+# UDP-proxy Gateway fixture (no UDPRoute) for GEP-2645 / #506 sad-path e2e test.
+# Verifies that a `protocol: UDP` listener becomes Programmed=True even with zero
+# routes, and that inbound datagrams get no reply when no UDPRoute is attached.
+#
+# Substitutions (via FixtureVars::with):
+#   GATEWAY_UDP_PROXY_PORT - port for the UDP-proxy listener (8446)
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-udp-gw-only
+  namespace: ${TESTNS}
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: udp-proxy
+      port: ${GATEWAY_UDP_PROXY_PORT}
+      protocol: UDP
+      allowedRoutes:
+        namespaces:
+          from: Same

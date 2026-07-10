@@ -310,6 +310,47 @@ pub(crate) fn connections_total() -> &'static IntCounterVec {
     })
 }
 
+/// Gauge: open UDPRoute sessions tracked by the proxy, by listener port (#506).
+///
+/// A session is one client 5-tuple with a backend pinned for its lifetime; see
+/// `edge::udp` for the session-table model.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
+pub(crate) fn udp_sessions_active() -> &'static IntGaugeVec {
+    static GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        register_int_gauge_vec!(
+            Opts::new(
+                "coxswain_proxy_udp_sessions_active",
+                "Open UDPRoute sessions tracked by the proxy, by listener port",
+            ),
+            &["listener"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Counter: cumulative UDPRoute sessions created by the proxy, by listener port (#506).
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
+pub(crate) fn udp_sessions_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_proxy_udp_sessions_total",
+                "Cumulative UDPRoute sessions created, by listener port",
+            ),
+            &["listener"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
 /// Counter: upstream connections established by the proxy, classified by whether
 /// the connection was freshly opened or reused from the keepalive pool.
 ///

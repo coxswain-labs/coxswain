@@ -111,6 +111,17 @@ pub const GRPC_ECHO: &str = concat!(
     "/fixtures/backends/grpc_echo.yaml"
 );
 
+/// UDP echo backend for UDPRoute e2e tests (#506).
+///
+/// Runs `echo-basic` in `UDP_ECHO_SERVER=1` mode on port 3000/UDP, replying
+/// with a JSON envelope naming the responding pod so tests can assert which
+/// backend served a datagram. Uses `images::ECHO_UDP`, not the shared
+/// HTTP/TLS [`ECHO`] image (which predates `UDP_ECHO_SERVER`).
+pub const UDP_ECHO: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/udp_echo.yaml"
+);
+
 /// Standalone go-httpbin backend for circuit-breaker tests (#282).
 ///
 /// Exposes `/status/:code` so tests can drive configurable upstream HTTP

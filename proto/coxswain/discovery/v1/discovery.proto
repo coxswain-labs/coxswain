@@ -151,6 +151,8 @@ message Snapshot {
   TlsPassthroughTable tls_terminate = 16;
   // TCPRoute (#505): port→backend table, no SNI/hostname dimension.
   TcpRouteTable tcp_proxy = 17;
+  // UDPRoute (#506): port→backend table, no SNI/hostname dimension.
+  UdpRouteTable udp_proxy = 18;
   // repeated (reserved for v0.6 delta streaming)
   reserved 40;
   reserved "removed_resources";
@@ -813,6 +815,9 @@ enum ListenerReadiness {
   // protocol: TCP — proxy dials the bound backend and splices the raw stream;
   // no SNI, no TLS, no HTTP parsing (TCPRoute, GEP-1901, #505).
   LISTENER_READINESS_TCP_PROXY = 10;
+  // protocol: UDP — proxy forwards datagrams to the bound backend via a
+  // session-tracked table; no SNI, no TLS, no HTTP parsing (UDPRoute, GEP-2645, #506).
+  LISTENER_READINESS_UDP_PROXY = 11;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -843,6 +848,16 @@ message TcpRouteTable {
 }
 
 message TcpRoutePort {
+  uint32 port = 1;
+  BackendGroup backend_group = 2;
+}
+
+// UDPRoute (#506): plain port→backend map, no SNI/hostname dimension.
+message UdpRouteTable {
+  repeated UdpRoutePort ports = 1;
+}
+
+message UdpRoutePort {
   uint32 port = 1;
   BackendGroup backend_group = 2;
 }

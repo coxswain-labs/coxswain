@@ -18,8 +18,8 @@ use coxswain_core::routing::{
     JwtConfig, JwtHeaderLoc, LoadBalance, MatchPredicates, MirrorFraction, NormalizeLevel,
     PasswordHash, PathModifier, QueryPredicate, RateLimitConfig, RateLimitKey, RouteEntry,
     RouteKind, RouteTimeouts, RouterError, SessionAffinity, SubjectAltName, TcpRouteTable,
-    TcpRouteTableBuilder, TlsPassthroughTable, TlsPassthroughTableBuilder, UpstreamCa, UpstreamTls,
-    ValueMatch, WildcardKind,
+    TcpRouteTableBuilder, TlsPassthroughTable, TlsPassthroughTableBuilder, UdpRouteTable,
+    UdpRouteTableBuilder, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
 };
 
 use super::MAX_MIRROR_DEPTH;
@@ -888,6 +888,28 @@ pub fn passthrough_from_wire(
 #[must_use = "the rebuilt TCP route table must be stored for the proxy to use it"]
 pub fn tcp_table_from_wire(dto: &p::TcpRouteTable) -> Result<TcpRouteTable, WireError> {
     let mut builder = TcpRouteTableBuilder::new();
+    for port_entry in &dto.ports {
+        let port = port_entry.port as u16;
+        let bg = match &port_entry.backend_group {
+            Some(bg) => Arc::new(bg_from_wire(bg, 0)?),
+            None => continue,
+        };
+        builder = builder.add_route(port, bg);
+    }
+    Ok(builder.build())
+}
+
+/// Reconstruct a [`UdpRouteTable`] from its wire DTO (UDPRoute, GEP-2645, #506).
+///
+/// Same shape as [`tcp_table_from_wire`] — port-keyed, no SNI dimension.
+///
+/// # Errors
+///
+/// Returns [`WireError`] if any backend group fails to decode (malformed
+/// address, missing required field, etc.).
+#[must_use = "the rebuilt UDP route table must be stored for the proxy to use it"]
+pub fn udp_table_from_wire(dto: &p::UdpRouteTable) -> Result<UdpRouteTable, WireError> {
+    let mut builder = UdpRouteTableBuilder::new();
     for port_entry in &dto.ports {
         let port = port_entry.port as u16;
         let bg = match &port_entry.backend_group {

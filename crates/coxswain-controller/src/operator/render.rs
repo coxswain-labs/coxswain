@@ -474,18 +474,21 @@ pub(super) fn service_type_to_k8s_string(t: ServiceType) -> String {
         .unwrap_or_else(|| "LoadBalancer".to_string())
 }
 
-/// The listener `(name, port)` pairs a dedicated proxy exposes: the effective set
-/// (Gateway's own + attached ListenerSets', GEP-1713) when present, else the
-/// Gateway's own `spec.listeners`. Deduplicated on port (the effective set already
-/// is, with collision-free names; the fallback dedups here keeping the first name).
+/// The listener `(name, port, protocol)` triples a dedicated proxy exposes: the
+/// effective set (Gateway's own + attached ListenerSets', GEP-1713) when present,
+/// else the Gateway's own `spec.listeners`. Deduplicated on port (the effective set
+/// already is, with collision-free names; the fallback dedups here keeping the
+/// first name). `protocol` is the raw Gateway API listener protocol string
+/// (`HTTP`, `HTTPS`, `TLS`, `TCP`, `UDP`) — see [`k8s_service_protocol`] for the
+/// k8s-`ServicePort`/`ContainerPort` mapping.
 fn listener_name_ports(
     gateway: &Gateway,
     effective_ports: &[EffectiveListenerPort],
-) -> Vec<(String, u16)> {
+) -> Vec<(String, u16, String)> {
     if !effective_ports.is_empty() {
         return effective_ports
             .iter()
-            .map(|l| (l.name.clone(), l.port))
+            .map(|l| (l.name.clone(), l.port, l.protocol.clone()))
             .collect();
     }
     let mut seen: BTreeSet<u16> = BTreeSet::new();
@@ -495,10 +498,25 @@ fn listener_name_ports(
             continue;
         };
         if seen.insert(port) {
-            out.push((listener.name.clone(), port));
+            out.push((listener.name.clone(), port, listener.protocol.clone()));
         }
     }
     out
+}
+
+/// Map a Gateway API listener `protocol` to its Kubernetes `ServicePort`/
+/// `ContainerPort` `protocol`.
+///
+/// Every listener protocol coxswain routes rides over TCP except `UDP`
+/// (UDPRoute, GEP-2645, #506) — kube-proxy's iptables/ipvs rules are keyed by
+/// protocol, so a UDP listener's Service and container ports must be declared
+/// `UDP` or datagrams are never forwarded to it. Shared with [`super::render_shared`]
+/// — both the dedicated-mode and shared-mode Service-port renderers need it.
+pub(super) fn k8s_service_protocol(listener_protocol: &str) -> &'static str {
+    match listener_protocol {
+        "UDP" => "UDP",
+        _ => "TCP",
+    }
 }
 
 /// One ServicePort per effective listener port (Gateway's own + attached
@@ -508,11 +526,11 @@ fn listener_name_ports(
 fn service_ports(gateway: &Gateway, effective_ports: &[EffectiveListenerPort]) -> Vec<ServicePort> {
     listener_name_ports(gateway, effective_ports)
         .into_iter()
-        .map(|(name, port)| ServicePort {
+        .map(|(name, port, protocol)| ServicePort {
             name: Some(name),
             port: i32::from(port),
             target_port: Some(IntOrString::Int(i32::from(port))),
-            protocol: Some("TCP".to_string()),
+            protocol: Some(k8s_service_protocol(&protocol).to_string()),
             ..Default::default()
         })
         .collect()
@@ -703,13 +721,13 @@ fn container_ports(
 ) -> Vec<ContainerPort> {
     let mut seen: BTreeSet<i32> = BTreeSet::new();
     let mut out = Vec::new();
-    for (name, port) in listener_name_ports(gateway, effective_ports) {
+    for (name, port, protocol) in listener_name_ports(gateway, effective_ports) {
         let port = i32::from(port);
         seen.insert(port);
         out.push(ContainerPort {
             name: Some(name),
             container_port: port,
-            protocol: Some("TCP".to_string()),
+            protocol: Some(k8s_service_protocol(&protocol).to_string()),
             ..Default::default()
         });
     }

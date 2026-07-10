@@ -198,6 +198,10 @@ pub(crate) fn listener_route_kind_info(
         group: Some(GW_GROUP.to_string()),
         kind: "TCPRoute".to_string(),
     };
+    let udp_route_kind = || GatewayStatusListenersSupportedKinds {
+        group: Some(GW_GROUP.to_string()),
+        kind: "UDPRoute".to_string(),
+    };
     // Any `protocol: TLS` listener (Passthrough or Terminate) carries TLSRoute
     // as its natural route kind. `protocol: HTTPS` is distinct — TLS terminated
     // at the gateway but with HTTP/GRPC parsing — so it falls through to the
@@ -206,6 +210,9 @@ pub(crate) fn listener_route_kind_info(
     // `protocol: TCP` (GEP-1901) carries TCPRoute as its only route kind — no
     // passthrough/terminate split, unlike TLS.
     let is_tcp_listener = listener.protocol == "TCP";
+    // `protocol: UDP` (GEP-2645) carries UDPRoute as its only route kind — same
+    // no-split shape as TCP.
+    let is_udp_listener = listener.protocol == "UDP";
 
     let allowed = match listener
         .allowed_routes
@@ -220,6 +227,9 @@ pub(crate) fn listener_route_kind_info(
             if is_tcp_listener {
                 return (false, vec![tcp_route_kind()]);
             }
+            if is_udp_listener {
+                return (false, vec![udp_route_kind()]);
+            }
             return (false, vec![http_route_kind()]);
         }
     };
@@ -227,6 +237,7 @@ pub(crate) fn listener_route_kind_info(
     let mut includes_http_route = false;
     let mut includes_tls_route = false;
     let mut includes_tcp_route = false;
+    let mut includes_udp_route = false;
     for k in allowed {
         let group_ok = k
             .group
@@ -238,6 +249,8 @@ pub(crate) fn listener_route_kind_info(
             includes_tls_route = true;
         } else if k.kind == "TCPRoute" && group_ok && is_tcp_listener {
             includes_tcp_route = true;
+        } else if k.kind == "UDPRoute" && group_ok && is_udp_listener {
+            includes_udp_route = true;
         } else {
             has_invalid = true;
         }
@@ -251,6 +264,9 @@ pub(crate) fn listener_route_kind_info(
     }
     if includes_tcp_route {
         supported.push(tcp_route_kind());
+    }
+    if includes_udp_route {
+        supported.push(udp_route_kind());
     }
     (has_invalid, supported)
 }
