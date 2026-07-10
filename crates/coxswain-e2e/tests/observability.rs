@@ -233,13 +233,27 @@ fn count_or_zero(body: &str, metric: &str) -> f64 {
     wait::parse_metric_value(body, metric).unwrap_or(0.0)
 }
 
+/// `true` iff `controller_metrics` is a scrape of the LEADING controller
+/// replica. The controller runs 2 replicas under leader election
+/// (`coxswain_controller_leader` gauge); the discovery server's `Stream` RPC
+/// is leader-gated (#531), so `snapshot_build_seconds`/`ack_latency_seconds`
+/// are only ever observed on the leader — a standby's `build_snapshot`/
+/// `handle_ack` code paths never run. The e2e harness's controller
+/// port-forward targets `svc/coxswain-controller`, which non-deterministically
+/// lands on whichever replica was up when the tunnel was established, so
+/// assertions on those two series must gate on this, exactly as a real
+/// Prometheus query would (`coxswain_controller_leader == 1`).
+fn is_leader(controller_metrics: &str) -> bool {
+    wait::parse_metric_value(controller_metrics, "coxswain_controller_leader") == Some(1.0)
+}
+
 /// #513: a resource change that actually converges (the route starts serving)
 /// must advance every convergence-pipeline stage's histogram sample count past
 /// a pre-change baseline — debounce-wait and rebuild on the controller,
-/// snapshot-build and ack-latency on the discovery server (also the
-/// controller process), and snapshot-apply on the discovery client (the
-/// proxy process). Comparing against a captured baseline (rather than
-/// asserting bare presence) proves the pipeline is wired end-to-end for THIS
+/// snapshot-build and ack-latency on the discovery server (leader-only, see
+/// [`is_leader`]), and snapshot-apply on the discovery client (the proxy
+/// process). Comparing against a captured baseline (rather than asserting
+/// bare presence) proves the pipeline is wired end-to-end for THIS
 /// convergence, not just that the series exist from an earlier one.
 #[tokio::test]
 async fn convergence_stage_metrics_recorded_after_route_change() -> anyhow::Result<()> {
@@ -254,6 +268,7 @@ async fn convergence_stage_metrics_recorded_after_route_change() -> anyhow::Resu
         .text()
         .await?;
     let before_proxy = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let leader = is_leader(&before_controller);
     let before_debounce = count_or_zero(
         &before_controller,
         "coxswain_controller_reconcile_debounce_seconds_count",
@@ -302,10 +317,12 @@ async fn convergence_stage_metrics_recorded_after_route_change() -> anyhow::Resu
                     &controller,
                     "coxswain_controller_routing_table_rebuild_duration_seconds_count",
                 ) > before_rebuild
-                && count_or_zero(&controller, "coxswain_discovery_snapshot_build_seconds_count")
-                    > before_build
-                && count_or_zero(&controller, "coxswain_discovery_ack_latency_seconds_count")
-                    > before_ack
+                && (!leader
+                    || count_or_zero(&controller, "coxswain_discovery_snapshot_build_seconds_count")
+                        > before_build)
+                && (!leader
+                    || count_or_zero(&controller, "coxswain_discovery_ack_latency_seconds_count")
+                        > before_ack)
                 && count_or_zero(&proxy, "coxswain_discovery_snapshot_apply_seconds_count")
                     > before_apply;
             advanced.then_some(())
@@ -318,12 +335,13 @@ async fn convergence_stage_metrics_recorded_after_route_change() -> anyhow::Resu
 
 /// #513 role-scoping (sad path, companion to the happy-path test above):
 /// mirrors the `*_emits_*_prefix_metrics` role-split contract. Reflector
-/// stages (debounce, rebuild) and discovery-server stages (snapshot-build,
-/// ack-latency) live only on the controller process; post-#424 the shared
-/// proxy is a pure discovery client, never a reflector, and never runs the
-/// discovery server. The discovery-client apply stage is the mirror image —
-/// proxy-only. A stage metric leaking to the wrong role is the failure this
-/// test guards.
+/// stages (debounce, rebuild) live on every controller replica; discovery-server
+/// stages (snapshot-build, ack-latency) are additionally leader-gated (see
+/// [`is_leader`]) — a standby controller never runs them, by design (#531),
+/// not by bug. Post-#424 the shared proxy is a pure discovery client, never a
+/// reflector, and never runs the discovery server. The discovery-client apply
+/// stage is the mirror image — proxy-only. A stage metric leaking to the
+/// wrong role is the failure this test guards.
 #[tokio::test]
 async fn stage_metrics_are_role_scoped() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -338,10 +356,12 @@ async fn stage_metrics_are_role_scoped() -> anyhow::Result<()> {
         controller.contains("coxswain_controller_reconcile_debounce_seconds"),
         "controller /metrics must expose the reflector debounce-wait stage"
     );
-    assert!(
-        controller.contains("coxswain_discovery_snapshot_build_seconds"),
-        "controller /metrics must expose the discovery-server snapshot-build stage"
-    );
+    if is_leader(&controller) {
+        assert!(
+            controller.contains("coxswain_discovery_snapshot_build_seconds"),
+            "the LEADING controller's /metrics must expose the discovery-server snapshot-build stage"
+        );
+    }
     assert!(
         proxy.contains("coxswain_discovery_snapshot_apply_seconds"),
         "proxy /metrics must expose the discovery-client apply stage"
