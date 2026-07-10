@@ -27,7 +27,7 @@ use coxswain_proxy::{
     PassthroughConfig, ProxyAcceptor, RateLimiterRegistry, RoutingEngine, RoutingSource,
     SharedProxyConfig, SniCertSelector, UpstreamCaCache,
 };
-use coxswain_reflector::{GatewayListenerStatus, ListenerReadiness};
+use coxswain_reflector::{DebounceSettings, GatewayListenerStatus, ListenerReadiness};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::server::Server;
 use pingora_core::server::ShutdownWatch;
@@ -99,6 +99,11 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     );
 
     let controller_config = build_controller_config(&args.common, &args.controller)?;
+    let debounce = DebounceSettings::new(
+        args.controller.reconcile_debounce_min,
+        args.controller.reconcile_debounce_max,
+    )
+    .context("invalid --reconcile-debounce-min/--reconcile-debounce-max")?;
 
     let mut server = build_minimal_server();
     let health = HealthRegistry::new();
@@ -115,6 +120,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             ),
             enable_gateway_api: !args.common.disable_gateway_api,
             enable_ingress: !args.common.disable_ingress,
+            debounce,
         },
         health.clone(),
     )?;
