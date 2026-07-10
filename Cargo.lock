@@ -965,6 +965,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "coxswain-core",
+ "criterion",
  "futures",
  "gateway-api-types",
  "http",

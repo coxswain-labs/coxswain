@@ -37,6 +37,11 @@ tracing = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 rustls = { workspace = true }
 serde_yaml = { workspace = true }
 tracing-test = { workspace = true }
+
+[[bench]]
+name = "convergence"
+harness = false

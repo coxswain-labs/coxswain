@@ -8,7 +8,16 @@ use kube::runtime::reflector;
 use std::net::{IpAddr, SocketAddr};
 
 /// Resolved addresses and protocol metadata for a single backend service port.
-pub(crate) struct ResolvedEndpoints {
+///
+/// `pub` and `#[doc(hidden)]` only so `crates/coxswain-reflector/benches/convergence.rs`
+/// (#513) can name [`resolve`]'s return type — never construct this from
+/// outside the crate; there is no stability guarantee across coxswain
+/// releases. `#[non_exhaustive]` (not the `intentionally open` opt-out) is
+/// the right annotation here: the bench only reads fields, never constructs
+/// via literal, so there's no reason to forgo the stability guard.
+#[doc(hidden)]
+#[non_exhaustive]
+pub struct ResolvedEndpoints {
     pub addrs: Vec<SocketAddr>,
     /// Backend wire protocol, parsed from `Service.spec.ports[].appProtocol`.
     pub app_protocol: BackendProtocol,
@@ -74,7 +83,18 @@ pub(crate) fn port_for_name(
 /// it differs from the service port. Also returns the `appProtocol` of the
 /// matched Service port (if any) for backend protocol selection. Never
 /// queries the API server.
-pub(crate) fn resolve(
+///
+/// The full `slices.state()` scan below is the O(routes × endpoints) hot spot
+/// #511's endpoint-resolution cache targets: every backend reference in a
+/// rebuild calls this once, and each call rescans every `EndpointSlice` in the
+/// store regardless of which service it's looking for.
+///
+/// `pub` and `#[doc(hidden)]` only so `crates/coxswain-reflector/benches/convergence.rs`
+/// (#513) can call this directly with a synthetic store — not a supported
+/// external entry point; no semver guarantee.
+// intentionally open: benchmark entry point, not semver API (#513)
+#[doc(hidden)]
+pub fn resolve(
     ns: &str,
     svc: &str,
     port: i32,
