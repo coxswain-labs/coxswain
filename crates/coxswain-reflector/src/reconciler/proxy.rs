@@ -231,6 +231,10 @@ pub struct ReconcilerOptions {
     /// egress to an identity provider (the Istio model, not Envoy's default
     /// proxy-side fetch); see [`crate::jwks`].
     pub fetch_remote_jwks: bool,
+    /// Bounds for the adaptive rebuild debounce (#512). Replaces the
+    /// reconciler's original fixed 500 ms coalescing timer — see
+    /// [`super::debounce::settle`].
+    pub debounce: crate::DebounceSettings,
 }
 
 impl Default for ReconcilerOptions {
@@ -246,6 +250,7 @@ impl Default for ReconcilerOptions {
             enable_gateway_api: true,
             fetch_remote_jwks: false,
             enable_ingress: true,
+            debounce: crate::DebounceSettings::default(),
         }
     }
 }
@@ -831,6 +836,8 @@ struct ReconcilerConfig {
     enable_ingress: bool,
     /// See [`ReconcilerOptions::fetch_remote_jwks`].
     fetch_remote_jwks: bool,
+    /// See [`ReconcilerOptions::debounce`].
+    debounce: crate::DebounceSettings,
 }
 
 pub(super) struct ReflectorStores<'a> {
@@ -1106,6 +1113,7 @@ impl BackgroundService for SharedProxyReconciler {
             enable_gateway_api: self.opts.enable_gateway_api,
             enable_ingress: self.opts.enable_ingress,
             fetch_remote_jwks: self.opts.fetch_remote_jwks,
+            debounce: self.opts.debounce,
         };
         let handles = SharedHandles {
             ingress_routes: self.ingress_routes.clone(),
@@ -1466,6 +1474,7 @@ async fn spawn_tasks(
         enable_gateway_api,
         enable_ingress,
         fetch_remote_jwks,
+        debounce,
     } = config;
     // Status-relevant stores reuse the shared writers pre-created in `new` (so
     // the status-writer's subscriptions observe the same synced stores); the
@@ -1873,29 +1882,25 @@ async fn spawn_tasks(
         });
     }
 
-    // --- Trailing-edge debounce + rebuild ---
+    // --- Adaptive trailing-edge debounce + rebuild (#512) ---
     //
-    // Waits for the first notification, then races subsequent notifications
-    // against a 500 ms timer. Each new notification resets the timer. When
-    // the timer expires uninterrupted, the full routing table is rebuilt from
-    // the current store snapshots — never from the API server.
+    // Waits for the first notification, then settles via `debounce::settle`:
+    // a short quiet window (`debounce.min()`) fires fast for an isolated
+    // event, widening only up to a hard ceiling (`debounce.max()`) under
+    // sustained churn. When it settles, the full routing table is rebuilt
+    // from the current store snapshots — never from the API server.
     set.spawn(async move {
         let mut routing_table_published = false;
         loop {
             notify.notified().await;
             // #513: the debounce-wait stage starts the instant the first watch
             // event of this cycle is observed (here, not before — the loop was
-            // idle waiting for it) and ends when the trailing-edge timer fires
-            // uninterrupted. This is the "notify → debounce fire" leg of the
-            // convergence pipeline, measured independently of rebuild() cost
-            // so #512's adaptive-debounce work has a stage to shrink.
+            // idle waiting for it) and ends when `settle` returns. This is the
+            // "notify → debounce fire" leg of the convergence pipeline,
+            // measured independently of rebuild() cost — #512 shrinks this
+            // stage for isolated edits without changing the churn ceiling.
             let debounce_start = std::time::Instant::now();
-            loop {
-                tokio::select! {
-                    _ = notify.notified() => {}
-                    _ = tokio::time::sleep(Duration::from_millis(500)) => break,
-                }
-            }
+            super::debounce::settle(&notify, debounce).await;
             let debounce_wait = debounce_start.elapsed();
             metrics.observe_debounce_wait(debounce_wait);
             // One VIP-Service read per rebuild (#472), shared by every builder.

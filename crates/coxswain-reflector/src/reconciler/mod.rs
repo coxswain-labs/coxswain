@@ -20,12 +20,14 @@
 //! orchestration.
 
 pub mod controller;
+mod debounce;
 mod dedicated;
 pub(crate) mod listener_merge;
 pub mod proxy;
 mod route_builder;
 
 pub use controller::ControllerReconciler;
+pub use debounce::{DebounceSettings, DebounceSettingsError};
 pub use proxy::{
     IngressDefaultBackend, IngressDefaultBackendParseError, IngressEvent, ReconcilerHealth,
     ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler, StatusSubscriptions,
