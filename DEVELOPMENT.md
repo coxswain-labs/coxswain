@@ -283,6 +283,49 @@ Examples for other clusters:
 
 ---
 
+## Convergence benchmarks
+
+Control-plane convergence — `watch event → notify → debounce fire → rebuild() → snapshot build → discovery push → proxy apply` — has per-stage Prometheus histograms (`coxswain_{proxy,controller}_reconcile_debounce_seconds`, `coxswain_{proxy,controller}_routing_table_rebuild_duration_seconds`, `coxswain_discovery_snapshot_build_seconds`, `coxswain_discovery_ack_latency_seconds`, `coxswain_discovery_snapshot_apply_seconds`) and two benchmark layers (#513). **Neither layer's numbers are committed to this repo** — they're environment-dependent (OrbStack vs CI kind, machine noise) and a committed snapshot goes stale and misleads the moment hardware or cluster state changes.
+
+### Layer 1 — synthetic scaling curves (criterion)
+
+Deterministic, no cluster needed. Demonstrates cost as a function of cluster size, independent of any one machine's absolute numbers:
+
+```bash
+# endpoints::resolve() cost vs. route count x endpoints/service (O(routes x endpoints), #511's target)
+cargo bench -p coxswain-reflector --bench convergence
+
+# routing-table build cost vs. total route count (#511's partitioned-rebuild target)
+cargo bench -p coxswain-core --bench routing
+```
+
+Criterion persists every run's results under `target/criterion/` (gitignored) and auto-diffs each new run against the prior one — this, not a hand-copied table, is the mechanism a later change (#511, #512) uses to prove a win:
+
+```bash
+# before the change
+cargo bench -p coxswain-reflector --bench convergence -- --save-baseline pre-511
+# after the change
+cargo bench -p coxswain-reflector --bench convergence -- --baseline pre-511
+```
+
+### Layer 2 — real full-rebuild operating point (live cluster)
+
+The synthetic benches model `resolve()` and table-build in isolation; this layer scrapes the stage histograms off a REAL controller + proxy after a real workload — the actual private `rebuild()` end-to-end, doubling as validation that the instrumentation is wired correctly.
+
+```bash
+# 1. Drive a real workload against the cluster (conformance is the canonical
+#    driver — the largest realistic Gateway API route set this repo exercises).
+bash scripts/setup-conformance.sh --reset 'orb delete -f k8s && orb start k8s'
+cd conformance && go test -v -timeout 60m -run TestConformance -args ... && cd ..
+
+# 2. Capture the stage histograms.
+bash scripts/capture-convergence-baseline.sh
+```
+
+Post the script's output as a comment on the relevant GitHub issue (e.g. #513, or the issue making the claim) — that comment, timestamped and environment-noted, is what #511/#512/#383 cite as the baseline reference. Do not paste the numbers into this file or any other tracked doc.
+
+---
+
 ## Troubleshooting
 
 ### macOS: BoringSSL build setup
