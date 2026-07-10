@@ -79,6 +79,8 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_PROXY_THREADS` | `--proxy-threads` | `2` | Worker threads per proxy service; set to CPU core count for maximum throughput |
 | `COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE` | `--proxy-upstream-keepalive-pool-size` | `128` | Maximum idle upstream connections in Pingora's keepalive pool; connections beyond the limit are evicted LRU |
 | `COXSWAIN_INGRESS_PROXY_TRUSTED_SOURCES` | `--ingress-proxy-trusted-sources` | _(none)_ | Comma-separated CIDRs allowed to send PROXY-protocol headers on Ingress listeners; only meaningful with `--ingress-accept-proxy-protocol` |
+| `COXSWAIN_RECONCILE_DEBOUNCE_MIN` | `--reconcile-debounce-min` | `20ms` | _(controller)_ Trailing quiet window for the rebuild debounce; a watch event resets it, and it firing with no further events rebuilds the routing table. Must be ≤ the max |
+| `COXSWAIN_RECONCILE_DEBOUNCE_MAX` | `--reconcile-debounce-max` | `500ms` | _(controller)_ Hard ceiling on the same debounce, measured from the first event of a cycle; bounds convergence under sustained churn (e.g. a rolling deploy). Must be ≥ the min |
 | `COXSWAIN_STATUS_ADDRESS` | `--status-address` | _(none)_ | IP or hostname written to `Ingress.status` and `Gateway.status.addresses`; required for cert-manager HTTP-01 and external-dns |
 | `COXSWAIN_WATCH_NAMESPACE` | `--watch-namespace` | _(cluster-wide)_ | Restrict the controller and proxy watch to a single namespace; both pods must be set to the same value |
 | `POD_NAME` | `--pod-name` | `coxswain-local` | Pod name used as the leader-election holder identity |
