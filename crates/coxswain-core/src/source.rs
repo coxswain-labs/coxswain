@@ -6,7 +6,8 @@
 //! without creating a circular dependency between the two crates.
 
 use crate::routing::{
-    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
+    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
+    SharedTlsPassthroughTable,
 };
 use crate::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
 
@@ -63,5 +64,15 @@ pub trait RoutingSource: Send + Sync {
     #[must_use]
     fn terminate_routes(&self) -> SharedTlsPassthroughTable {
         SharedTlsPassthroughTable::new()
+    }
+
+    /// Handle to the port-keyed TCP routing table snapshot for TCPRoute / GEP-1901 (#505).
+    ///
+    /// The default returns an empty table (no TCP routes, all connections on a
+    /// TCP-proxy port are dropped) so existing implementations compile unchanged
+    /// until wired.
+    #[must_use]
+    fn tcp_routes(&self) -> SharedTcpRouteTable {
+        SharedTcpRouteTable::new()
     }
 }

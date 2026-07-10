@@ -175,6 +175,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         dedicated: status_writer.outputs.dedicated_registry.clone(),
         passthrough_routes: status_writer.outputs.passthrough_routes.clone(),
         terminate_routes: status_writer.outputs.terminate_routes.clone(),
+        tcp_routes: status_writer.outputs.tcp_routes.clone(),
         publish: publish_index.clone(),
     };
     let discovery_service = coxswain_discovery::DiscoveryService::new(
@@ -551,6 +552,7 @@ fn wire_gateway_only_proxy_services(
         PassthroughConfig {
             table: source.passthrough_routes(),
             terminate_table: source.terminate_routes(),
+            tcp_table: source.tcp_routes(),
             dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
         },
     )
@@ -719,6 +721,7 @@ fn wire_proxy_services(
                 PassthroughConfig {
                     table: source.passthrough_routes(),
                     terminate_table: source.terminate_routes(),
+                    tcp_table: source.tcp_routes(),
                     dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
                 },
             )
@@ -746,6 +749,7 @@ fn wire_proxy_services(
         PassthroughConfig {
             table: source.passthrough_routes(),
             terminate_table: source.terminate_routes(),
+            tcp_table: source.tcp_routes(),
             dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
         },
     )
@@ -1217,6 +1221,8 @@ impl pingora_core::services::background::BackgroundService for GrpcAuthChannelGc
 /// Per-port protocol upgrade rules:
 /// - TLSRoute passthrough or terminate-only → `TlsL4`
 /// - TLSRoute (any) + HTTPS terminate on the same port → `TlsHybrid`
+/// - TCPRoute (`TcpProxy` readiness) → `Tcp`; never hybridizes with another
+///   protocol on the same port (#505)
 ///
 /// `ListenerInfo.proxy_protocol` (resolved from `ClientTrafficPolicy`) is
 /// forwarded to the `ListenerSpec.proxy_protocol` field for the acceptor to
@@ -1248,6 +1254,11 @@ fn derive_gateway_specs(
                 ListenerReadiness::TlsPassthrough | ListenerReadiness::TlsTerminate => {
                     ListenerProtocol::TlsL4
                 }
+                // TCPRoute (#505): a TCP listener never shares a port with another
+                // protocol (Gateway API port-compatibility rules exclude the
+                // combination, enforced at listener-conflict resolution), so no
+                // hybrid-upgrade arm is needed below, unlike TlsL4/Https.
+                ListenerReadiness::TcpProxy => ListenerProtocol::Tcp,
                 _ => ListenerProtocol::Https,
             };
             let new_pp = info.proxy_protocol.clone();

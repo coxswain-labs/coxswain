@@ -22,7 +22,7 @@ use coxswain_e2e::{
     ControllerOptions, ControllerProcess, FixtureVars, Harness, HttpClient, IngressClassGuard,
     NamespaceGuard, bootstrap,
     fixtures::{self, backends, gateway_api as gwa, ingress},
-    harness::{http, wait},
+    harness::{GATEWAY_TCP_PROXY_PORT, http, wait},
 };
 use gateway_api_types::apis::standard::httproutes::HttpRoute;
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
@@ -2622,4 +2622,156 @@ async fn route_returns_500_when_rule_has_no_backend_refs() -> anyhow::Result<()>
     );
 
     Ok(())
+}
+
+// ── TCP proxy (TCPRoute / GEP-1901, #505) ─────────────────────────────────────
+
+/// Happy path: a `protocol: TCP` listener + TCPRoute forwards a raw connection
+/// to the bound backend.
+///
+/// No SNI, no TLS, no HTTP awareness at the proxy — a plain TCP connect that
+/// happens to carry an HTTP/1.1 request is spliced byte-for-byte to the echo
+/// backend, which returns a JSON body naming the pod that served it.
+#[tokio::test]
+async fn tcp_route_forwards_raw_connection_to_backend() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-tcp-happy").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    fixtures::apply_fixture(
+        gwa::TCP_ROUTE,
+        FixtureVars::new(&ns.name).with(
+            "GATEWAY_TCP_PROXY_PORT",
+            &GATEWAY_TCP_PROXY_PORT.to_string(),
+        ),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-tcp-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let tcp_addr = h.gateway_tcp_addr(&ns.name).await?;
+    let body = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { "TCPRoute to become live".to_string() },
+        || async {
+            try_tcp_proxy(
+                &tcp_addr,
+                "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .ok()
+        },
+    )
+    .await?;
+
+    let echo: http::EchoResponse = serde_json::from_str(&body).context("parse echo JSON body")?;
+    echo.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// Sad path: a `protocol: TCP` listener exists but zero TCPRoutes are attached.
+///
+/// The Gateway should still become `Programmed=True` (the listener configuration
+/// is valid even with no routes attached), and any incoming connection is dropped
+/// (no backend to forward to).
+#[tokio::test]
+async fn tcp_listener_without_route_is_programmed_but_drops() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-tcp-noroute").await?;
+
+    // Apply only the Gateway (no TCPRoute).
+    fixtures::apply_fixture(
+        gwa::TCP_ROUTE_GW_ONLY,
+        FixtureVars::new(&ns.name).with(
+            "GATEWAY_TCP_PROXY_PORT",
+            &GATEWAY_TCP_PROXY_PORT.to_string(),
+        ),
+    )
+    .await?;
+
+    // Gateway should become Programmed even with no routes.
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-tcp-gw-only",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Any connection to the TCP-proxy port is dropped (no backend to forward to).
+    let tcp_addr = h.gateway_tcp_addr(&ns.name).await?;
+    let result = try_tcp_proxy(
+        &tcp_addr,
+        "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "expected connection error with no TCPRoute attached, got success",
+    );
+
+    Ok(())
+}
+
+/// Open a raw TCP connection to `addr`, send `req` verbatim, and return whatever
+/// comes back as a UTF-8 string.
+///
+/// No TLS, no SNI — the proxy splices the raw stream. `req` happens to be an
+/// HTTP/1.1 request so the echo backend responds with its usual JSON body;
+/// the caller extracts the body after the `\r\n\r\n` header terminator.
+///
+/// # Errors
+///
+/// Returns an error if the TCP connect, write, or read fails, or if the
+/// response is not a well-formed `HTTP/1.1 200` response (a closed/reset
+/// connection surfaces as a read or connect error, which is what the sad-path
+/// test asserts on).
+async fn try_tcp_proxy(addr: &std::net::SocketAddr, req: &str) -> anyhow::Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut tcp = tokio::net::TcpStream::connect(addr)
+        .await
+        .context("TCP connect")?;
+    tcp.write_all(req.as_bytes())
+        .await
+        .context("write request")?;
+    tcp.flush().await.context("flush")?;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match tcp.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(anyhow::Error::new(e)).context("read response"),
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf).to_string();
+    anyhow::ensure!(
+        text.starts_with("HTTP/1.1 200"),
+        "unexpected response: {}",
+        text.lines().next().unwrap_or("")
+    );
+
+    Ok(text
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default())
 }

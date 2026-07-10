@@ -1024,14 +1024,22 @@ impl GatewayApiReconciler {
             } else if listener.protocol == "HTTP" {
                 // Cleartext HTTP: nothing to resolve, ready by default.
                 ListenerReadiness::NotApplicable
+            } else if listener.protocol == "TCP" {
+                // Raw TCP proxy (GEP-1901 / TCPRoute): no cert, no SNI, no
+                // passthrough-vs-terminate split — a TCP listener has exactly one mode.
+                if vip_pending {
+                    ListenerReadiness::VipPending
+                } else {
+                    ListenerReadiness::TcpProxy
+                }
             } else if listener.protocol != "HTTPS" {
-                // Not TLS (handled above), not HTTP, not HTTPS → a protocol
+                // Not TLS (handled above), not HTTP, not TCP, not HTTPS → a protocol
                 // coxswain does not route. GatewayListenerUnsupportedProtocol
                 // (#517): the listener is not Accepted and its owning Gateway
                 // rolls up to `ListenersNotValid`.
                 ListenerReadiness::UnsupportedProtocol {
                     message: format!(
-                        "listener protocol {:?} is not supported; coxswain routes HTTP, HTTPS, and TLS",
+                        "listener protocol {:?} is not supported; coxswain routes HTTP, HTTPS, TLS, and TCP",
                         listener.protocol
                     ),
                 }

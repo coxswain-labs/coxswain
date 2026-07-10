@@ -21,6 +21,7 @@ mod reconcile_tls;
 pub(crate) mod retry;
 mod route_status;
 mod status;
+mod tcp_status;
 mod timeouts;
 mod tls_status;
 
@@ -50,7 +51,7 @@ pub(crate) const COXSWAIN_GROUP: &str = "gateway.coxswain-labs.dev";
 mod tests;
 
 use crate::gw_types::v::gateways::Gateway;
-use crate::gw_types::{GrpcRoute, HttpRoute, TlsRoute};
+use crate::gw_types::{GrpcRoute, HttpRoute, TcpRoute, TlsRoute};
 use crate::status::{BackendTlsPolicyStatusMap, RouteStatusMap};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::ReferenceGrantKey;
@@ -204,6 +205,44 @@ impl TlsRouteReconciler {
             backend_grants,
             service_store,
             "TLSRoute",
+        )
+    }
+}
+
+/// Zero-sized handle namespacing the `TCPRoute` reconciliation entry points.
+///
+/// Parallel sibling to [`TlsRouteReconciler`] — not a trait, not a generic, just a concrete
+/// handle. Consumes only protocol-filtered listeners (`protocol: TCP`). Unlike `TLSRoute`
+/// there is no passthrough/terminate mode split and no SNI/hostname dimension.
+#[non_exhaustive]
+pub struct TcpRouteReconciler;
+
+impl TcpRouteReconciler {
+    /// Compute per-(route, parent) `Accepted` + `ResolvedRefs` status for `TCPRoute`s.
+    ///
+    /// Only `protocol: TCP` listeners are considered — routes attached to any other
+    /// protocol listener receive `Accepted=False, NotAllowedByListeners`. Use a **separate**
+    /// [`crate::status::SharedRouteStatus`] instance to avoid key collisions with other
+    /// route kinds' status (same key shape, different kind).
+    pub(crate) fn compute_route_health(
+        routes: &[Arc<TcpRoute>],
+        gateways: &[Arc<Gateway>],
+        owned_gateways: &HashSet<ObjectKey>,
+        effective: &std::collections::HashMap<
+            ObjectKey,
+            crate::reconciler::listener_merge::EffectiveGateway,
+        >,
+        backend_grants: &HashSet<ReferenceGrantKey>,
+        service_store: &reflector::Store<Service>,
+    ) -> RouteStatusMap {
+        route_status::compute_route_health(
+            routes,
+            gateways,
+            owned_gateways,
+            effective,
+            backend_grants,
+            service_store,
+            "TCPRoute",
         )
     }
 }

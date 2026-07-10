@@ -17,8 +17,9 @@ use coxswain_core::routing::{
     HeaderPredicate, HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable,
     JwtConfig, JwtHeaderLoc, LoadBalance, MatchPredicates, MirrorFraction, NormalizeLevel,
     PasswordHash, PathModifier, QueryPredicate, RateLimitConfig, RateLimitKey, RouteEntry,
-    RouteKind, RouteTimeouts, RouterError, SessionAffinity, SubjectAltName, TlsPassthroughTable,
-    TlsPassthroughTableBuilder, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
+    RouteKind, RouteTimeouts, RouterError, SessionAffinity, SubjectAltName, TcpRouteTable,
+    TcpRouteTableBuilder, TlsPassthroughTable, TlsPassthroughTableBuilder, UpstreamCa, UpstreamTls,
+    ValueMatch, WildcardKind,
 };
 
 use super::MAX_MIRROR_DEPTH;
@@ -874,6 +875,26 @@ pub fn passthrough_from_wire(
             };
             builder = builder.add_route(port, &pattern, bg);
         }
+    }
+    Ok(builder.build())
+}
+
+/// Decode a [`TcpRouteTable`] from a protobuf DTO (#505).
+///
+/// # Errors
+///
+/// Returns [`WireError`] if any backend group fails to decode (bad address,
+/// missing required field, etc.).
+#[must_use = "the rebuilt TCP route table must be stored for the proxy to use it"]
+pub fn tcp_table_from_wire(dto: &p::TcpRouteTable) -> Result<TcpRouteTable, WireError> {
+    let mut builder = TcpRouteTableBuilder::new();
+    for port_entry in &dto.ports {
+        let port = port_entry.port as u16;
+        let bg = match &port_entry.backend_group {
+            Some(bg) => Arc::new(bg_from_wire(bg, 0)?),
+            None => continue,
+        };
+        builder = builder.add_route(port, bg);
     }
     Ok(builder.build())
 }

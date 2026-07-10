@@ -10,6 +10,7 @@ pub(crate) mod common;
 mod gateway;
 mod ingress;
 pub mod passthrough;
+pub mod tcp;
 
 #[cfg(test)]
 mod tests;
@@ -56,3 +57,4 @@ pub use ingress::{
 pub use passthrough::{
     SharedTlsPassthroughTable, SniRouter, TlsPassthroughTable, TlsPassthroughTableBuilder,
 };
+pub use tcp::{SharedTcpRouteTable, TcpRouteTable, TcpRouteTableBuilder};

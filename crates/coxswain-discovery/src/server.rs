@@ -39,7 +39,8 @@ use coxswain_core::node_registry::{NodeScope, SharedNodeRegistry};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::publish_index::SharedGatewayPublishIndex;
 use coxswain_core::routing::{
-    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
+    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
+    SharedTlsPassthroughTable,
 };
 use coxswain_core::tls::{SharedClientCertStore, SharedPortTlsStore};
 
@@ -53,7 +54,7 @@ use crate::proto::v1::{
 use crate::version::{ContentHash, WIRE_VERSION};
 use crate::wire::{
     client_cert_to_wire, gateway_to_wire, ingress_to_wire, listener_status_to_wire,
-    passthrough_to_wire, port_tls_to_wire, scope_from_wire,
+    passthrough_to_wire, port_tls_to_wire, scope_from_wire, tcp_table_to_wire,
 };
 
 // ── SnapshotSource ────────────────────────────────────────────────────────────
@@ -91,6 +92,10 @@ pub struct SnapshotSource {
     /// Only populated for [`Scope::SharedPool`] subscribers; dedicated proxies
     /// receive an empty table (TLSRoutes are shared-pool only).
     pub terminate_routes: SharedTlsPassthroughTable,
+    /// Port-keyed TCP routing table for TCPRoute / GEP-1901 (#505).
+    /// Only populated for [`Scope::SharedPool`] subscribers; dedicated proxies
+    /// receive an empty table (TCPRoutes are shared-pool only).
+    pub tcp_routes: SharedTcpRouteTable,
     /// Per-Gateway publish-sequence index (#531). The server captures its
     /// counter **before** loading any cell for a snapshot build; a node that
     /// Acks that snapshot has therefore applied every rebuild stamped at a
@@ -110,6 +115,7 @@ impl Clone for SnapshotSource {
             dedicated: self.dedicated.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
             terminate_routes: self.terminate_routes.clone(),
+            tcp_routes: self.tcp_routes.clone(),
             publish: self.publish.clone(),
         }
     }
@@ -223,6 +229,7 @@ struct SnapshotContent {
     listener_status: p::GatewayListenerStatus,
     tls_passthrough: p::TlsPassthroughTable,
     tls_terminate: p::TlsPassthroughTable,
+    tcp_proxy: p::TcpRouteTable,
 }
 
 impl SnapshotContent {
@@ -238,6 +245,7 @@ impl SnapshotContent {
             listener_status: Some(self.listener_status),
             tls_passthrough: Some(self.tls_passthrough),
             tls_terminate: Some(self.tls_terminate),
+            tcp_proxy: Some(self.tcp_proxy),
         }
     }
 }
@@ -275,6 +283,7 @@ fn build_snapshot(
             let listener_status = source.listener_status.load();
             let passthrough = source.passthrough_routes.load();
             let terminate = source.terminate_routes.load();
+            let tcp_proxy = source.tcp_routes.load();
 
             assemble_snapshot(
                 ingress_to_wire(&ingress),
@@ -282,8 +291,11 @@ fn build_snapshot(
                 port_tls_to_wire(&tls),
                 client_cert_to_wire(&client_certs),
                 listener_status_to_wire(&listener_status),
-                passthrough_to_wire(&passthrough),
-                passthrough_to_wire(&terminate),
+                L4TableDtos {
+                    tls_passthrough: passthrough_to_wire(&passthrough),
+                    tls_terminate: passthrough_to_wire(&terminate),
+                    tcp_proxy: tcp_table_to_wire(&tcp_proxy),
+                },
             )
         }
         Scope::Gateway { name, namespace } => {
@@ -316,10 +328,12 @@ fn build_snapshot(
                                 p::PortTlsStore::default(),
                                 p::ClientCertStore::default(),
                                 p::GatewayListenerStatus::default(),
-                                // Dedicated proxies never serve TLS passthrough routes.
-                                p::TlsPassthroughTable::default(),
-                                // Dedicated proxies never serve TLS terminate routes.
-                                p::TlsPassthroughTable::default(),
+                                // Dedicated proxies never serve TLSRoute or TCPRoute traffic.
+                                L4TableDtos {
+                                    tls_passthrough: p::TlsPassthroughTable::default(),
+                                    tls_terminate: p::TlsPassthroughTable::default(),
+                                    tcp_proxy: p::TcpRouteTable::default(),
+                                },
                             )
                         };
                     }
@@ -330,10 +344,12 @@ fn build_snapshot(
                         port_tls_to_wire(&snap.tls),
                         client_cert_to_wire(&snap.client_certs),
                         listener_status_to_wire(&snap.listener_status),
-                        // Dedicated proxies never serve TLS passthrough routes.
-                        p::TlsPassthroughTable::default(),
-                        // Dedicated proxies never serve TLS terminate routes.
-                        p::TlsPassthroughTable::default(),
+                        // Dedicated proxies never serve TLSRoute or TCPRoute traffic.
+                        L4TableDtos {
+                            tls_passthrough: p::TlsPassthroughTable::default(),
+                            tls_terminate: p::TlsPassthroughTable::default(),
+                            tcp_proxy: p::TcpRouteTable::default(),
+                        },
                     )
                 }
                 // Fail closed: the Gateway is not (yet) cut over, so this proxy
@@ -350,8 +366,11 @@ fn build_snapshot(
                             p::PortTlsStore::default(),
                             p::ClientCertStore::default(),
                             p::GatewayListenerStatus::default(),
-                            p::TlsPassthroughTable::default(),
-                            p::TlsPassthroughTable::default(),
+                            L4TableDtos {
+                                tls_passthrough: p::TlsPassthroughTable::default(),
+                                tls_terminate: p::TlsPassthroughTable::default(),
+                                tcp_proxy: p::TcpRouteTable::default(),
+                            },
                         )
                     };
                 }
@@ -360,6 +379,15 @@ fn build_snapshot(
     };
     content.seq = seq;
     content
+}
+
+/// The L4 wire DTOs [`assemble_snapshot`] groups to stay under the workspace
+/// 7-argument limit: TLS passthrough, TLS terminate (#481), and TCP proxy (#505)
+/// — the three port-keyed tables that bypass the L7 routing tables entirely.
+struct L4TableDtos {
+    tls_passthrough: p::TlsPassthroughTable,
+    tls_terminate: p::TlsPassthroughTable,
+    tcp_proxy: p::TcpRouteTable,
 }
 
 /// Assemble a [`SnapshotContent`] from pre-built wire DTOs.
@@ -372,8 +400,7 @@ fn assemble_snapshot(
     tls_dto: p::PortTlsStore,
     client_certs_dto: p::ClientCertStore,
     listener_status_dto: p::GatewayListenerStatus,
-    tls_passthrough_dto: p::TlsPassthroughTable,
-    tls_terminate_dto: p::TlsPassthroughTable,
+    l4: L4TableDtos,
 ) -> SnapshotContent {
     let hashes = vec![
         ContentHash::compute(&ingress_dto.encode_to_vec())
@@ -391,10 +418,13 @@ fn assemble_snapshot(
         ContentHash::compute(&listener_status_dto.encode_to_vec())
             .as_str()
             .to_owned(),
-        ContentHash::compute(&tls_passthrough_dto.encode_to_vec())
+        ContentHash::compute(&l4.tls_passthrough.encode_to_vec())
             .as_str()
             .to_owned(),
-        ContentHash::compute(&tls_terminate_dto.encode_to_vec())
+        ContentHash::compute(&l4.tls_terminate.encode_to_vec())
+            .as_str()
+            .to_owned(),
+        ContentHash::compute(&l4.tcp_proxy.encode_to_vec())
             .as_str()
             .to_owned(),
     ];
@@ -409,8 +439,9 @@ fn assemble_snapshot(
         tls_store: tls_dto,
         client_cert_store: client_certs_dto,
         listener_status: listener_status_dto,
-        tls_passthrough: tls_passthrough_dto,
-        tls_terminate: tls_terminate_dto,
+        tls_passthrough: l4.tls_passthrough,
+        tls_terminate: l4.tls_terminate,
+        tcp_proxy: l4.tcp_proxy,
     }
 }
 
@@ -929,6 +960,7 @@ mod tests {
             dedicated: DedicatedRoutingRegistry::new(),
             passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
             terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
+            tcp_routes: coxswain_core::routing::SharedTcpRouteTable::new(),
             publish: SharedGatewayPublishIndex::new(),
         }
     }

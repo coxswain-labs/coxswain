@@ -175,6 +175,7 @@ pub fn spawn_status_writer(
         "httproute",
         "grpcroute",
         "tls_route",
+        "tcp_route",
         "gateway",
         "gateway_class",
         "listener_set",
@@ -202,6 +203,7 @@ pub fn spawn_status_writer(
 
     let passthrough_routes = coxswain_core::routing::SharedTlsPassthroughTable::new();
     let terminate_routes = coxswain_core::routing::SharedTlsPassthroughTable::new();
+    let tcp_routes = coxswain_core::routing::SharedTcpRouteTable::new();
     let outputs = ReconcilerOutputs {
         ingress_routes,
         gateway_routes,
@@ -213,6 +215,7 @@ pub fn spawn_status_writer(
         dedicated_registry,
         passthrough_routes: passthrough_routes.clone(),
         terminate_routes: terminate_routes.clone(),
+        tcp_routes: tcp_routes.clone(),
     };
 
     // Create the ingress-event channel before the reconciler, so the sender can
@@ -233,6 +236,7 @@ pub fn spawn_status_writer(
             dedicated_registry: outputs.dedicated_registry.clone(),
             passthrough_routes: passthrough_routes.clone(),
             terminate_routes: terminate_routes.clone(),
+            tcp_routes: tcp_routes.clone(),
         },
         owned_gateways.clone(),
         Arc::clone(&leader),
@@ -262,6 +266,7 @@ pub fn spawn_status_writer(
     let route_status: SharedRouteStatus = reconciler.route_status();
     let grpc_route_status: SharedRouteStatus = reconciler.grpc_route_status();
     let tls_route_status: SharedRouteStatus = reconciler.tls_route_status();
+    let tcp_route_status: SharedRouteStatus = reconciler.tcp_route_status();
     let policy_status: SharedBackendTlsPolicyStatus = reconciler.policy_status();
     let ctp_status: SharedClientTrafficPolicyStatus = reconciler.ctp_status();
     let cbp_status: SharedCoxswainBackendPolicyStatus = reconciler.cbp_status();
@@ -282,6 +287,7 @@ pub fn spawn_status_writer(
             route: route_status,
             grpc_route: grpc_route_status,
             tls_route: tls_route_status,
+            tcp_route: tcp_route_status,
             policy: policy_status,
             ctp: ctp_status,
             cbp: cbp_status,

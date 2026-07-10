@@ -33,6 +33,8 @@ pub const GATEWAY_HTTP_PORT: u16 = 8000;
 pub const GATEWAY_HTTPS_PORT: u16 = 8443;
 /// Port pre-declared in the gateway Service for TLS-passthrough listeners (TLSRoute, GEP-2643).
 pub const GATEWAY_TLS_PASSTHROUGH_PORT: u16 = 8444;
+/// Port pre-declared in the gateway Service for raw TCP-proxy listeners (TCPRoute, GEP-1901, #505).
+pub const GATEWAY_TCP_PROXY_PORT: u16 = 8445;
 
 /// The local Kubernetes cluster distribution detected from the current context.
 #[derive(Debug, Clone)]

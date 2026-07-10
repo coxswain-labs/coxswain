@@ -113,6 +113,7 @@ pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerI
             message: dto.detail.clone(),
         },
         p::ListenerReadiness::TlsTerminate => ListenerReadiness::TlsTerminate,
+        p::ListenerReadiness::TcpProxy => ListenerReadiness::TcpProxy,
     };
 
     let mut li = ListenerInfo::default();

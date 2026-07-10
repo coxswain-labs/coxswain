@@ -9,7 +9,8 @@
 //! circular dependency. It is re-exported here for backwards compatibility.
 
 use coxswain_core::routing::{
-    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
+    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
+    SharedTlsPassthroughTable,
 };
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
 
@@ -31,6 +32,21 @@ pub struct KubernetesSource {
     listener_hostnames: SharedListenerHostnames,
     passthrough_routes: SharedTlsPassthroughTable,
     terminate_routes: SharedTlsPassthroughTable,
+    tcp_routes: SharedTcpRouteTable,
+}
+
+/// The L4 routing-table handles [`KubernetesSource::new`] groups to stay under
+/// the workspace 7-argument limit: TLS passthrough, TLS terminate (#481), and
+/// TCP proxy (#505) — the three port-keyed tables that bypass the L7 routing
+/// tables entirely.
+// intentionally open: field-literal constructed by callers of `KubernetesSource::new`.
+pub struct L4RoutingTables {
+    /// SNI-keyed routing table for TLSRoute `mode: Passthrough` listeners.
+    pub passthrough_routes: SharedTlsPassthroughTable,
+    /// SNI-keyed routing table for TLSRoute `mode: Terminate` listeners (#481).
+    pub terminate_routes: SharedTlsPassthroughTable,
+    /// Port-keyed routing table for TCPRoute listeners (#505).
+    pub tcp_routes: SharedTcpRouteTable,
 }
 
 impl KubernetesSource {
@@ -42,8 +58,7 @@ impl KubernetesSource {
         tls_store: SharedPortTlsStore,
         client_cert_store: SharedClientCertStore,
         listener_hostnames: SharedListenerHostnames,
-        passthrough_routes: SharedTlsPassthroughTable,
-        terminate_routes: SharedTlsPassthroughTable,
+        l4_tables: L4RoutingTables,
     ) -> Self {
         Self {
             ingress_routes,
@@ -51,8 +66,9 @@ impl KubernetesSource {
             tls_store,
             client_cert_store,
             listener_hostnames,
-            passthrough_routes,
-            terminate_routes,
+            passthrough_routes: l4_tables.passthrough_routes,
+            terminate_routes: l4_tables.terminate_routes,
+            tcp_routes: l4_tables.tcp_routes,
         }
     }
 }
@@ -84,5 +100,9 @@ impl RoutingSource for KubernetesSource {
 
     fn terminate_routes(&self) -> SharedTlsPassthroughTable {
         self.terminate_routes.clone()
+    }
+
+    fn tcp_routes(&self) -> SharedTcpRouteTable {
+        self.tcp_routes.clone()
     }
 }
