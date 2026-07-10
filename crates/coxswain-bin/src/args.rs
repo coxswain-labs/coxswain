@@ -326,11 +326,19 @@ pub(crate) struct ProxyArgs {
     /// between datagrams before the proxy evicts it (the next datagram from
     /// that client re-selects a backend as a fresh session).
     ///
+    /// Kept short by default: a session's server-side lifetime is decoupled
+    /// from how fast its exchange actually completes (UDP has no protocol-level
+    /// "done" signal), so it always lingers for the full timeout even after a
+    /// one-shot request/response (DNS-shaped) has already finished. A long
+    /// default compounds badly under bursty short-lived traffic — thousands of
+    /// completed-but-still-lingering sessions can exhaust the per-listener
+    /// session table in seconds.
+    ///
     /// Accepts human-readable durations: `5s`, `30s`.
     #[arg(
         long,
         env = "COXSWAIN_PROXY_UDP_SESSION_TIMEOUT",
-        default_value = "30s",
+        default_value = "10s",
         value_parser = humantime::parse_duration,
     )]
     pub proxy_udp_session_timeout: Duration,

@@ -646,12 +646,21 @@ async fn gateway_listener_protocol_validation() -> anyhow::Result<()> {
     );
 
     // ── mixed: Gateway accepted (True) but reason ListenersNotValid ──
-    wait::wait_for_gateway_condition(
+    //
+    // Waits for the reason too, not just the status: the controller
+    // reconciles a freshly-created Gateway immediately, independent of the
+    // reflector's async per-listener protocol validation, so this Gateway can
+    // transiently report Accepted=True/Accepted (no listener snapshot yet)
+    // before a later reconcile corrects it to Accepted=True/ListenersNotValid.
+    // wait_for_gateway_condition (status-only) would return on that transient
+    // match and flake this assertion.
+    wait::wait_for_gateway_condition_reason(
         &h.client,
         "coxswain-mixed",
         &ns.name,
         "Accepted",
         "True",
+        "ListenersNotValid",
         Duration::from_secs(60),
     )
     .await?;

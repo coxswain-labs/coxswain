@@ -1293,7 +1293,7 @@ kubectl describe tcproute my-tcp-route
 
 A `UDPRoute` forwards UDP datagrams purely by listener port — same port-keyed model as `TCPRoute`, no SNI or hostname dimension (GEP-2645).
 
-UDP is connectionless, so the proxy can't reuse a dial-once-and-splice model. Instead, the first datagram from a client address picks a backend (via the same weighted load-balancing as every other route kind) and pins it for that client's session; a background task relays the backend's replies back to the client. A session with no activity for `--proxy-udp-session-timeout` (default `30s`) is evicted — the next datagram from that client picks a backend afresh.
+UDP is connectionless, so the proxy can't reuse a dial-once-and-splice model. Instead, the first datagram from a client address picks a backend (via the same weighted load-balancing as every other route kind) and pins it for that client's session; a background task relays the backend's replies back to the client. A session with no activity for `--proxy-udp-session-timeout` (default `10s`) is evicted — the next datagram from that client picks a backend afresh.
 
 ### Gateway listener
 

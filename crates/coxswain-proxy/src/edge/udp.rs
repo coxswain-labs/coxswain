@@ -23,6 +23,19 @@
 //! client socket (hence a fresh session) per probe and expects the
 //! distribution to converge across sessions.
 //!
+//! # The recv loop never awaits per-datagram
+//!
+//! [`run_udp_listener`]'s loop is the only reader of the shared listener
+//! socket, so anything it awaits before looping back to `recv_from` delays
+//! *every other client's* next datagram too. [`handle_datagram`] is therefore
+//! synchronous: a repeat datagram on an existing session uses
+//! [`UdpSocket::try_send`] (non-blocking), and a brand-new session's
+//! bind/connect/first-send/reply-pump all run in a freshly spawned task. This
+//! matters under concurrent fresh-session bursts (again, exactly the weighted
+//! conformance test's traffic shape) — serializing session setup inline once
+//! queued enough new sessions past the client's own read timeout to fail the
+//! test, even though no datagram was actually lost.
+//!
 //! Sessions age out after `idle_timeout` of inactivity — UDP has no FIN/RST,
 //! so "connection end" is purely a timeout policy, matched by the reply-pump
 //! task's own recv timeout.
@@ -58,13 +71,29 @@ use coxswain_core::routing::{Selected, SharedUdpRouteTable};
 
 use crate::metrics;
 
-/// Max UDP datagram size (theoretical max payload for a UDP packet).
+/// Max UDP datagram size (theoretical max payload for a UDP packet). Used for
+/// the one shared per-listener recv buffer — costs nothing extra to keep at
+/// the true max since there is exactly one of these per listener, not one per
+/// session.
 const MAX_DATAGRAM: usize = 65535;
+
+/// Reply-pump buffer size, allocated once per session. Must stay at
+/// [`MAX_DATAGRAM`]: this forwarder is protocol-agnostic (any UDPRoute
+/// backend, not just small request/response protocols), and a `recv()` into
+/// an undersized buffer silently truncates a larger datagram rather than
+/// erroring — corrupting a delivered reply is worse than the UDP-normal
+/// "drop and let the client retry" outcome, so there is no safe smaller size.
+const SESSION_REPLY_BUF: usize = MAX_DATAGRAM;
 
 /// Maximum concurrent sessions per listener. A client beyond this limit has its
 /// datagram dropped (logged) rather than evicting an existing session — mirrors
-/// `MAX_CONCURRENT_CONNECTIONS` in `edge::accept`.
-const MAX_CONCURRENT_SESSIONS: usize = 4096;
+/// `MAX_CONCURRENT_CONNECTIONS` in `edge::accept`, sized down from that
+/// sibling's 4096 because each UDP session pins a full [`SESSION_REPLY_BUF`]
+/// (64 KiB) for its lifetime, unlike a TCP connection's transient splice
+/// buffer: 2048 × 64 KiB ≈ 128 MiB worst case, about half of the shared-proxy
+/// chart's default 256Mi memory limit, leaving headroom for routing snapshots
+/// and the rest of the proxy's normal working set.
+const MAX_CONCURRENT_SESSIONS: usize = 2048;
 
 /// One tracked client flow: the backend-bound socket and last-activity stamp.
 ///
@@ -129,8 +158,7 @@ pub(crate) async fn run_udp_listener(
                             },
                             client,
                             &buf[..n],
-                        )
-                        .await;
+                        );
                     }
                     Err(e) => {
                         debug!(port = listener_port, error = %e, "UDP proxy: recv error");
@@ -149,9 +177,22 @@ pub(crate) async fn run_udp_listener(
 }
 
 /// Handle one inbound datagram: forward it on the client's existing session,
-/// or create a new session (backend pick + upstream bind/connect) if this is
+/// or spawn a new session (backend pick + upstream bind/connect) if this is
 /// the first datagram from `client`.
-async fn handle_datagram(state: ListenerState<'_>, client: SocketAddr, payload: &[u8]) {
+///
+/// Deliberately synchronous (no `.await`): this is called from the single
+/// per-listener recv loop, so anything awaited here blocks that loop from
+/// picking up the *next* client's datagram. Repeat traffic on an existing
+/// session uses [`UdpSocket::try_send`] (non-blocking — UDP's kernel send
+/// buffer accepts near-unconditionally). A brand-new session needs bind +
+/// connect, which are real (if fast) async operations, so that work — and the
+/// session's entire reply-pump lifetime — runs in its own spawned task
+/// instead of inline here. Without this, N clients opening fresh sessions
+/// concurrently (exactly the Gateway API weighted-routing conformance test's
+/// traffic shape: one new UDP socket per probe) would have their session
+/// setup serialized through this one loop, queuing later arrivals long enough
+/// to blow past the client's own read timeout.
+fn handle_datagram(state: ListenerState<'_>, client: SocketAddr, payload: &[u8]) {
     let ListenerState {
         socket: listener_socket,
         table,
@@ -162,14 +203,14 @@ async fn handle_datagram(state: ListenerState<'_>, client: SocketAddr, payload: 
     } = state;
 
     // Fast path: existing session. Clone the Arc and drop the DashMap guard
-    // before awaiting — holding a shard guard across `.await` would stall any
-    // writer (e.g. the reply-pump's eviction) on the same shard for the
-    // duration of the send.
+    // before touching the session — holding a shard guard while the
+    // reply-pump task also wants it (e.g. to evict on idle) would stall that
+    // writer for no reason.
     if let Some(entry) = sessions.get(&client) {
         let session = Arc::clone(&entry);
         drop(entry);
         *session.last_seen.lock() = Instant::now();
-        if let Err(e) = session.upstream.send(payload).await {
+        if let Err(e) = session.upstream.try_send(payload) {
             debug!(
                 peer = %client,
                 port = listener_port,
@@ -217,6 +258,36 @@ async fn handle_datagram(state: ListenerState<'_>, client: SocketAddr, payload: 
         }
     };
 
+    let payload = payload.to_vec();
+    let listener_socket = Arc::clone(listener_socket);
+    let sessions = Arc::clone(sessions);
+    pump_tasks.spawn(async move {
+        establish_and_run_session(
+            listener_socket,
+            sessions,
+            client,
+            backend_addr,
+            payload,
+            idle_timeout,
+            listener_port,
+        )
+        .await;
+    });
+}
+
+/// Bind + connect a fresh upstream socket for a new session, forward its
+/// first datagram, register the session, then run its reply pump for the
+/// rest of the session's lifetime — all in one spawned task so the recv loop
+/// in [`run_udp_listener`] never waits on it (see [`handle_datagram`]).
+async fn establish_and_run_session(
+    listener_socket: Arc<UdpSocket>,
+    sessions: Arc<SessionMap>,
+    client: SocketAddr,
+    backend_addr: SocketAddr,
+    payload: Vec<u8>,
+    idle_timeout: Duration,
+    listener_port: u16,
+) {
     let bind_addr: SocketAddr = if backend_addr.is_ipv4() {
         (Ipv4Addr::UNSPECIFIED, 0).into()
     } else {
@@ -248,7 +319,7 @@ async fn handle_datagram(state: ListenerState<'_>, client: SocketAddr, payload: 
         upstream,
         last_seen: Mutex::new(Instant::now()),
     });
-    if let Err(e) = session.upstream.send(payload).await {
+    if let Err(e) = session.upstream.send(&payload).await {
         debug!(
             peer = %client,
             backend = %backend_addr,
@@ -268,19 +339,15 @@ async fn handle_datagram(state: ListenerState<'_>, client: SocketAddr, payload: 
         .with_label_values(&[listener])
         .inc();
 
-    let pump_socket = Arc::clone(listener_socket);
-    let pump_sessions = Arc::clone(sessions);
-    pump_tasks.spawn(async move {
-        run_reply_pump(
-            pump_socket,
-            session,
-            client,
-            pump_sessions,
-            idle_timeout,
-            listener_port,
-        )
-        .await;
-    });
+    run_reply_pump(
+        listener_socket,
+        session,
+        client,
+        sessions,
+        idle_timeout,
+        listener_port,
+    )
+    .await;
 }
 
 /// Pump replies from one session's backend-bound socket back to the client via
@@ -294,7 +361,7 @@ async fn run_reply_pump(
     idle_timeout: Duration,
     listener_port: u16,
 ) {
-    let mut buf = vec![0u8; MAX_DATAGRAM];
+    let mut buf = vec![0u8; SESSION_REPLY_BUF];
     loop {
         match timeout(idle_timeout, session.upstream.recv(&mut buf)).await {
             Ok(Ok(n)) => {
@@ -327,7 +394,12 @@ async fn run_reply_pump(
         }
     }
 
-    sessions.remove(&client);
+    // Two datagrams racing on the same brand-new client (e.g. a client that
+    // retries before its first send's session finished establishing) can spawn
+    // two competing sessions for one key; the later insert wins the map entry.
+    // Remove only if we still own it, so this task's teardown can never evict
+    // a *different*, still-live session that happens to share our client key.
+    sessions.remove_if(&client, |_, entry| Arc::ptr_eq(entry, &session));
     let mut buf = itoa::Buffer::new();
     let listener = buf.format(listener_port);
     metrics::udp_sessions_active()
