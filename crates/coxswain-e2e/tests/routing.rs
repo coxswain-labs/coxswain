@@ -16,6 +16,12 @@
 //! HTTPRoute filters, request/backend timeouts, rewrite-target annotation, and
 //! downstream HTTP/2 (h2c prior-knowledge and h1 backward compatibility).
 //! TLS lives in `tls.rs`; traffic-policy knobs in `traffic_policy.rs`.
+//!
+//! `route_propagation_time_*` (#513 follow-up): black-box "apply -> first
+//! successful request" latency measurements, logged for citation against
+//! github.com/howardjohn/gateway-api-bench's Route Propagation Time
+//! benchmark (Agentgateway: 10-30ms) — the reference #512 (adaptive
+//! debounce) aims to close the gap toward.
 
 use anyhow::Context as _;
 use coxswain_e2e::{
@@ -124,6 +130,102 @@ async fn ingress_path_match_routes_to_backend() -> anyhow::Result<()> {
     // wait_for_route rather than a bare get() to tolerate transient timeouts.
     let resp = wait::wait_for_route(&h.http, &host, "/b", Duration::from_secs(15)).await?;
     resp.assert_backend("echo-b");
+
+    Ok(())
+}
+
+/// Route-propagation-time measurement (#513 follow-up): the black-box
+/// "apply -> first successful request" latency, the same metric
+/// github.com/howardjohn/gateway-api-bench's "Route Propagation Time" test
+/// reports for other Gateway API implementations (Agentgateway: 10-30ms;
+/// Istio: 120-300ms; Envoy Gateway/Nginx: ~600-800ms at 3000 routes).
+///
+/// Logs the measured value via [`wait::log_measurement`] (not a direct
+/// `tracing::info!` — see that function's doc comment for why a call from
+/// this file would be silently dropped) so `cargo nextest run ...
+/// --no-capture` surfaces a citable number for a #512 (adaptive debounce)
+/// before/after comparison. The
+/// assertion itself is a generous regression ceiling, not a tight benchmark
+/// gate: this suite's own e2e/OrbStack overhead (kubectl apply round trip,
+/// HTTP client connect setup) means it will never hit the purpose-built
+/// benchmark rig's 10-30ms floor — but a multi-second regression here is real
+/// signal, and today's number (dominated by the reflector's fixed 500ms
+/// debounce floor, see the #513 baseline on issue #513) is the reference
+/// #512 must beat.
+#[tokio::test]
+async fn route_propagation_time_ingress_apply_to_first_success() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-ing-prop-time").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("ingress.{}.local", ns.name);
+    let start = std::time::Instant::now();
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    let resp = wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+    let elapsed = start.elapsed();
+    resp.assert_backend("echo-a");
+
+    wait::log_measurement(
+        "route propagation time (Ingress): apply -> first successful request \
+         (cf. gateway-api-bench Route Propagation Time; Agentgateway 10-30ms)",
+        elapsed,
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "route propagation regressed badly: {elapsed:?} \
+         (e2e/OrbStack overhead means low seconds is expected today, not \
+         Agentgateway's purpose-built-rig 10-30ms; anything this far off \
+         signals a real regression, not measurement noise)"
+    );
+
+    Ok(())
+}
+
+/// Gateway API counterpart to
+/// [`route_propagation_time_ingress_apply_to_first_success`] — see its doc
+/// comment for the full rationale, with one architectural difference worth
+/// flagging: Gateway API traffic reaches this test's namespace through a
+/// **per-Gateway VIP** (#472), resolved by [`Harness::gateway_http`] from the
+/// Gateway's `status.addresses` — unlike Ingress, which has no per-resource
+/// provisioning step and rides the shared proxy's single well-known port.
+/// `gwa::PATH_MATCHING` creates the `Gateway` and the `HTTPRoute` together in
+/// one apply (matching every other Gateway API test in this file), so this
+/// number necessarily includes one-time-per-namespace Gateway/VIP
+/// provisioning alongside route propagation — it is not a pure apples-to-apples
+/// match to Agentgateway's route-only benchmark, which measures route changes
+/// against an already-provisioned Gateway. Kept anyway because it is still the
+/// closest black-box number this harness can produce for the Gateway API
+/// surface, and any regression in it is real signal regardless.
+#[tokio::test]
+async fn route_propagation_time_gateway_api_apply_to_first_success() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-prop-time").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host = format!("echo.{}.local", ns.name);
+    let start = std::time::Instant::now();
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/a", Duration::from_secs(60)).await?;
+    let elapsed = start.elapsed();
+    resp.assert_backend("echo-a");
+
+    wait::log_measurement(
+        "route propagation time (Gateway API): apply -> first successful request \
+         (cf. gateway-api-bench Route Propagation Time; Agentgateway 10-30ms)",
+        elapsed,
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "route propagation regressed badly: {elapsed:?} \
+         (e2e/OrbStack overhead means low seconds is expected today, not \
+         Agentgateway's purpose-built-rig 10-30ms; anything this far off \
+         signals a real regression, not measurement noise)"
+    );
 
     Ok(())
 }

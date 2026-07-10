@@ -27,11 +27,19 @@
 # Requires: kubectl pointed at the target cluster, coxswain installed in the
 # coxswain-system namespace (Helm release name `coxswain` — the default from
 # charts/coxswain).
+#
+# The controller runs 2 replicas under leader election, and the discovery
+# server's Stream RPC is leader-gated (#531) -- a standby replica's
+# build_snapshot()/handle_ack() never run, so snapshot_build_seconds and
+# ack_latency_seconds are only ever observed on the LEADER. Port-forwarding
+# `svc/coxswain-controller` lands on whichever replica the Service picks,
+# non-deterministically -- so this script finds the leader pod explicitly
+# rather than trusting the Service to route there.
 
 set -euo pipefail
 
 NAMESPACE="coxswain-system"
-CONTROLLER_SVC="svc/coxswain-controller"
+LEADER_LABEL="app.kubernetes.io/component=controller,discovery.coxswain-labs.dev/leader=true"
 PROXY_SVC="svc/coxswain-shared-proxy-internal"
 ADMIN_PORT=8082
 
@@ -51,8 +59,8 @@ free_port() {
 }
 
 port_forward() {
-  local svc="$1" local_port="$2"
-  kubectl port-forward -n "$NAMESPACE" "$svc" "${local_port}:${ADMIN_PORT}" \
+  local target="$1" local_port="$2"
+  kubectl port-forward -n "$NAMESPACE" "$target" "${local_port}:${ADMIN_PORT}" \
     >/dev/null 2>&1 &
   echo $!
 }
@@ -67,9 +75,15 @@ wait_for_port() {
   return 1
 }
 
+leader_pod="$(kubectl get pods -n "$NAMESPACE" -l "$LEADER_LABEL" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
+if [[ -z "$leader_pod" ]]; then
+  echo "could not find a controller pod labelled discovery.coxswain-labs.dev/leader=true -- is coxswain deployed and healthy?" >&2
+  exit 1
+fi
+
 controller_pf_port="$(free_port)"
 proxy_pf_port="$(free_port)"
-controller_pf_pid="$(port_forward "$CONTROLLER_SVC" "$controller_pf_port")"
+controller_pf_pid="$(port_forward "pod/${leader_pod}" "$controller_pf_port")"
 proxy_pf_pid="$(port_forward "$PROXY_SVC" "$proxy_pf_port")"
 wait_for_port "$controller_pf_port"
 wait_for_port "$proxy_pf_port"
@@ -93,6 +107,7 @@ extract_histogram_mean() {
 
 echo "# Convergence baseline captured $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "# Cluster: $(kubectl config current-context 2>/dev/null || echo unknown)"
+echo "# Leading controller replica: ${leader_pod}"
 echo
 
 controller_metrics="$(curl -sf "http://127.0.0.1:${controller_pf_port}/metrics")"
