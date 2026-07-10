@@ -12,10 +12,20 @@
 //! picks them up automatically wherever an `AdminServer` runs.
 
 use prometheus::{
-    IntCounter, IntCounterVec, IntGauge, Opts, register_int_counter, register_int_counter_vec,
-    register_int_gauge,
+    Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, register_histogram,
+    register_int_counter, register_int_counter_vec, register_int_gauge,
 };
 use std::sync::OnceLock;
+
+/// Histogram buckets for the #513 convergence-stage timings this module
+/// exposes (`snapshot_build_seconds`, `ack_latency_seconds`,
+/// `snapshot_apply_seconds`). Snapshot build/apply are sub-millisecond to
+/// low-millisecond (serialization/decoding of an in-memory DTO); ack latency
+/// spans a network round trip plus proxy-side apply, so its useful mass runs
+/// wider — the shared bucket set covers both without a second table.
+const STAGE_DURATION_BUCKETS: &[f64] = &[
+    0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+];
 
 // ── Client channel-state encoding ───────────────────────────────────────────
 
@@ -97,6 +107,53 @@ pub fn acks_total() -> &'static IntCounter {
         register_int_counter!(
             "coxswain_discovery_acks_total",
             "Cumulative snapshot Acks received from connected proxies"
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Histogram: wall-clock cost of one [`crate::server`] `build_snapshot` call —
+/// the "snapshot build" stage of the #513 convergence pipeline (reading the
+/// routing cells and serializing them into the wire DTO). Observed on every
+/// build, whether or not the content differs from the last Ack (a same-content
+/// rebuild still pays this cost before the no-op is detected).
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn snapshot_build_seconds() -> &'static Histogram {
+    static HIST: OnceLock<Histogram> = OnceLock::new();
+    HIST.get_or_init(|| {
+        register_histogram!(
+            HistogramOpts::new(
+                "coxswain_discovery_snapshot_build_seconds",
+                "Wall-clock duration of one discovery snapshot build (routing cells -> wire DTO)"
+            )
+            .buckets(STAGE_DURATION_BUCKETS.to_vec())
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Histogram: wall-clock time from a snapshot being sent to a proxy to that
+/// proxy's matching Ack arriving — the "push to proxy apply to Ack" leg of the
+/// #513 convergence pipeline in one number (network round trip plus
+/// client-side decode and apply). Observed in [`crate::server::run_stream`]'s
+/// Ack handler; a Nack or a stream drop before Ack never observes — last-good
+/// is retained, and there is no completed convergence to time.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn ack_latency_seconds() -> &'static Histogram {
+    static HIST: OnceLock<Histogram> = OnceLock::new();
+    HIST.get_or_init(|| {
+        register_histogram!(
+            HistogramOpts::new(
+                "coxswain_discovery_ack_latency_seconds",
+                "Wall-clock time from a snapshot push to the matching client Ack"
+            )
+            .buckets(STAGE_DURATION_BUCKETS.to_vec())
         )
         .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
     })
@@ -237,6 +294,33 @@ pub fn client_state() -> &'static IntGauge {
         register_int_gauge!(
             "coxswain_discovery_client_state",
             "Discovery-client channel state: 0=pending, 1=ready, 2=degraded"
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Histogram: wall-clock cost of one `apply_snapshot` call in
+/// [`crate::client`] — the "proxy apply" stage of the #513 convergence
+/// pipeline (decoding every wire DTO and, on success, publishing the
+/// [`Shared`] routing cells). Observed on every call regardless of outcome —
+/// a rejected (Nack'd) decode still pays most of the cost this histogram
+/// times before failing, and that cost is exactly what a malformed-snapshot
+/// regression would inflate.
+///
+/// [`Shared`]: coxswain_core::Shared
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn snapshot_apply_seconds() -> &'static Histogram {
+    static HIST: OnceLock<Histogram> = OnceLock::new();
+    HIST.get_or_init(|| {
+        register_histogram!(
+            HistogramOpts::new(
+                "coxswain_discovery_snapshot_apply_seconds",
+                "Wall-clock duration of one discovery-client snapshot apply (wire DTO -> routing cells)"
+            )
+            .buckets(STAGE_DURATION_BUCKETS.to_vec())
         )
         .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
     })

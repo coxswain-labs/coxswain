@@ -29,6 +29,13 @@ use std::time::{Duration, SystemTime};
 /// Histogram buckets for routing-table rebuild duration in seconds.
 const REBUILD_DURATION_BUCKETS: &[f64] = &[0.005, 0.025, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0];
 
+/// Histogram buckets for the debounce-wait stage (#513). Fine-grained below
+/// 500ms — the fixed trailing-edge debounce (`reconciler/proxy.rs`) is the
+/// floor #512 targets, so the interesting mass is sub-ceiling, not near it.
+const DEBOUNCE_WAIT_BUCKETS: &[f64] = &[
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 0.75, 1.0, 2.0,
+];
+
 /// Identifies which pod role is emitting the reflector's series.
 ///
 /// Selects the `coxswain_proxy_*` vs `coxswain_controller_*` series prefix at
@@ -71,6 +78,15 @@ impl ReflectorMetrics {
             .with_label_values(&[result])
             .inc();
         routing_table_rebuild_duration_seconds(self.prefix).observe(duration.as_secs_f64());
+    }
+
+    /// Observe one debounce-wait stage (#513): wall time from the first
+    /// watch-event notification that opens a debounce cycle to the trailing-edge
+    /// timer firing and `rebuild()` starting. Emitted once per rebuild cycle by
+    /// the debounce loop, immediately before [`Self::observe_rebuild`] — the two
+    /// histograms together account for "watch event → routing table published".
+    pub fn observe_debounce_wait(&self, duration: Duration) {
+        reconcile_debounce_seconds(self.prefix).observe(duration.as_secs_f64());
     }
 
     /// Set the routing-table size gauges from the result of a successful build.
@@ -259,6 +275,35 @@ fn routing_table_rebuild_duration_seconds(prefix: MetricsPrefix) -> &'static His
                     "Wall-clock duration of one controller routing-table rebuild"
                 )
                 .buckets(REBUILD_DURATION_BUCKETS.to_vec())
+            )
+            .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+        }),
+    }
+}
+
+/// `reconcile_debounce_seconds` — the #513 debounce-wait stage. See
+/// [`ReflectorMetrics::observe_debounce_wait`].
+fn reconcile_debounce_seconds(prefix: MetricsPrefix) -> &'static Histogram {
+    static PROXY: OnceLock<Histogram> = OnceLock::new();
+    static CTRL: OnceLock<Histogram> = OnceLock::new();
+    match prefix {
+        MetricsPrefix::Proxy => PROXY.get_or_init(|| {
+            register_histogram!(
+                HistogramOpts::new(
+                    "coxswain_proxy_reconcile_debounce_seconds",
+                    "Wall time from the first coalesced watch event to the debounce timer firing, in the proxy reflector"
+                )
+                .buckets(DEBOUNCE_WAIT_BUCKETS.to_vec())
+            )
+            .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+        }),
+        MetricsPrefix::Controller => CTRL.get_or_init(|| {
+            register_histogram!(
+                HistogramOpts::new(
+                    "coxswain_controller_reconcile_debounce_seconds",
+                    "Wall time from the first coalesced watch event to the debounce timer firing, in the controller reflector"
+                )
+                .buckets(DEBOUNCE_WAIT_BUCKETS.to_vec())
             )
             .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
         }),

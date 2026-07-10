@@ -24,7 +24,7 @@
 //! `Programmed` readiness gate (#531).
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
 use prost::Message as _;
@@ -272,6 +272,20 @@ impl SnapshotContent {
 ///   `PERMISSION_DENIED` check in `stream()` and closes the race where a Gateway
 ///   entry appears *after* the stream was opened (#427).
 fn build_snapshot(
+    source: &SnapshotSource,
+    scope: &Scope,
+    peer_svid: Option<&PeerSvid>,
+) -> SnapshotContent {
+    // #513: times the whole call, including every early-return (fail-closed
+    // empty-snapshot) branch inside `build_snapshot_inner` — those still pay
+    // the cell-read cost this stage measures, just not the wire-DTO assembly.
+    let start = std::time::Instant::now();
+    let content = build_snapshot_inner(source, scope, peer_svid);
+    crate::metrics::snapshot_build_seconds().observe(start.elapsed().as_secs_f64());
+    content
+}
+
+fn build_snapshot_inner(
     source: &SnapshotSource,
     scope: &Scope,
     peer_svid: Option<&PeerSvid>,
@@ -656,6 +670,11 @@ struct StreamState {
     /// Content of the last snapshot sent, retained so Nack retransmits can
     /// replay the same payload with a fresh nonce.
     last_sent: Option<SnapshotContent>,
+    /// When `last_sent` was transmitted (#513 ack-latency stage). Set every
+    /// time `last_sent` is set, cleared never — a Nack retransmit keeps the
+    /// original send time, so a snapshot that took a Nack round trip before
+    /// converging reports its true end-to-end latency, not just the retry leg.
+    sent_at: Option<Instant>,
 }
 
 /// Map a discovery [`Scope`] to the core-local [`NodeScope`] mirror.
@@ -693,6 +712,7 @@ async fn run_stream(
         last_acked: None,
         in_flight: Some(initial.version.clone()),
         last_sent: Some(initial.clone()),
+        sent_at: Some(Instant::now()),
     };
     if send_content(&tx, initial).await.is_err() {
         registry.disconnect(&sub.node_id);
@@ -772,6 +792,7 @@ async fn run_stream(
                 if Some(current.version.as_str()) != state.last_acked.as_deref() {
                     state.in_flight = Some(current.version.clone());
                     state.last_sent = Some(current.clone());
+                    state.sent_at = Some(Instant::now());
                     if send_content(&tx, current).await.is_err() {
                         break;
                     }
@@ -817,6 +838,17 @@ async fn handle_ack(
         .as_ref()
         .filter(|sent| sent.version == ack.version)
         .map_or(0, |sent| sent.seq);
+    // #513: ack-latency stage. Only observed for an Ack matching what's
+    // actually in flight — a stale/duplicate Ack (same filter as `acked_seq`
+    // above) carries no honest send timestamp to measure against.
+    if state
+        .last_sent
+        .as_ref()
+        .is_some_and(|sent| sent.version == ack.version)
+        && let Some(sent_at) = state.sent_at
+    {
+        crate::metrics::ack_latency_seconds().observe(sent_at.elapsed().as_secs_f64());
+    }
     registry.record_ack(
         &sub.node_id,
         ack.version.clone(),
@@ -833,6 +865,7 @@ async fn handle_ack(
     if Some(current.version.as_str()) != state.last_acked.as_deref() {
         state.in_flight = Some(current.version.clone());
         state.last_sent = Some(current.clone());
+        state.sent_at = Some(Instant::now());
         send_content(tx, current).await?;
     } else {
         // Identical content: the node's applied snapshot is equivalent to the
