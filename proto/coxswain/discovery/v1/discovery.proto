@@ -149,6 +149,8 @@ message Snapshot {
   // TLSRouteModeTerminate (#481): SNI→plaintext-backend table; proxy terminates TLS
   // on accept and L4-splices the decrypted stream. Reuses TlsPassthroughTable message.
   TlsPassthroughTable tls_terminate = 16;
+  // TCPRoute (#505): port→backend table, no SNI/hostname dimension.
+  TcpRouteTable tcp_proxy = 17;
   // repeated (reserved for v0.6 delta streaming)
   reserved 40;
   reserved "removed_resources";
@@ -808,6 +810,9 @@ enum ListenerReadiness {
   // protocol: TLS, tls.mode: Terminate — proxy terminates TLS using the listener
   // cert and L4-splices the decrypted stream to the backend (TLSRouteModeTerminate, #481).
   LISTENER_READINESS_TLS_TERMINATE = 9;
+  // protocol: TCP — proxy dials the bound backend and splices the raw stream;
+  // no SNI, no TLS, no HTTP parsing (TCPRoute, GEP-1901, #505).
+  LISTENER_READINESS_TCP_PROXY = 10;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -830,4 +835,14 @@ message TlsPassthroughEntry {
     bool   catchall = 3;         // true = match any SNI (or no SNI)
   }
   BackendGroup backend_group = 4;
+}
+
+// TCPRoute (#505): plain port→backend map, no SNI/hostname dimension.
+message TcpRouteTable {
+  repeated TcpRoutePort ports = 1;
+}
+
+message TcpRoutePort {
+  uint32 port = 1;
+  BackendGroup backend_group = 2;
 }

@@ -33,6 +33,8 @@ pub const GATEWAY_HTTP_PORT: u16 = 8000;
 pub const GATEWAY_HTTPS_PORT: u16 = 8443;
 /// Port pre-declared in the gateway Service for TLS-passthrough listeners (TLSRoute, GEP-2643).
 pub const GATEWAY_TLS_PASSTHROUGH_PORT: u16 = 8444;
+/// Port pre-declared in the gateway Service for raw TCP-proxy listeners (TCPRoute, GEP-1901, #505).
+pub const GATEWAY_TCP_PROXY_PORT: u16 = 8445;
 
 /// The local Kubernetes cluster distribution detected from the current context.
 #[derive(Debug, Clone)]
@@ -987,24 +989,55 @@ async fn cert_manager_installed() -> bool {
         .unwrap_or(false)
 }
 
-/// Returns `true` only if `ReferenceGrant` is served at v1 (Gateway API >= v1.0.0).
+/// Gateway API CRDs the harness depends on being present at v1 before it can trust
+/// [`gateway_v1_crds_installed`]'s "already installed, skip reinstall" verdict, and
+/// that [`wait_for_crds_established`] blocks on before returning.
+///
+/// Keep this in sync with the resource kinds the reflector actually watches
+/// (`crates/coxswain-reflector/src/reconciler/proxy.rs`) — a CRD missing from this
+/// list is invisible to both checks, so a cluster carrying an older Gateway API CRD
+/// set (missing the newest addition) is wrongly treated as fully provisioned. See
+/// the `gateway_v1_crds_installed` doc comment for the incident this guards against.
+const REQUIRED_GATEWAY_API_CRDS: [&str; 4] = [
+    "gateways.gateway.networking.k8s.io",
+    "httproutes.gateway.networking.k8s.io",
+    "referencegrants.gateway.networking.k8s.io",
+    "tcproutes.gateway.networking.k8s.io",
+];
+
+/// Returns `true` only if every CRD in [`REQUIRED_GATEWAY_API_CRDS`] is served at v1.
+///
+/// Checking a single "has Gateway API been installed at all" indicator (historically
+/// just `ReferenceGrant`) is not sufficient: a cluster can carry an older Gateway API
+/// CRD set — with `ReferenceGrant` at v1 since well before this repo adopted it — while
+/// missing a resource added by a *later* spec bump (`TCPRoute` landed in v1.6.0, #505).
+/// That mismatch trips this check as "already installed", skips the reinstall, and
+/// leaves the new resource's CRD absent — the reflector then 404s on it forever and
+/// `/readyz` never turns healthy (#505 CI incident: every e2e suite timed out at the
+/// Helm install step, not just the ones exercising `TCPRoute`).
 async fn gateway_v1_crds_installed() -> bool {
-    Command::new("kubectl")
-        .args([
-            "get",
-            "crd",
-            "referencegrants.gateway.networking.k8s.io",
-            "-o",
-            "jsonpath={.spec.versions[*].name}",
-            "--ignore-not-found",
-        ])
-        .output()
-        .await
-        .map(|o| {
-            let out = String::from_utf8_lossy(&o.stdout);
-            out.split_whitespace().any(|v| v == "v1")
-        })
-        .unwrap_or(false)
+    for crd in REQUIRED_GATEWAY_API_CRDS {
+        let served_v1 = Command::new("kubectl")
+            .args([
+                "get",
+                "crd",
+                crd,
+                "-o",
+                "jsonpath={.spec.versions[*].name}",
+                "--ignore-not-found",
+            ])
+            .output()
+            .await
+            .map(|o| {
+                let out = String::from_utf8_lossy(&o.stdout);
+                out.split_whitespace().any(|v| v == "v1")
+            })
+            .unwrap_or(false);
+        if !served_v1 {
+            return false;
+        }
+    }
+    true
 }
 
 async fn kubectl_apply_url(url: &str) -> anyhow::Result<()> {
@@ -1018,15 +1051,13 @@ async fn kubectl_apply_url(url: &str) -> anyhow::Result<()> {
 }
 
 async fn wait_for_crds_established() -> anyhow::Result<()> {
+    let crd_args: Vec<String> = REQUIRED_GATEWAY_API_CRDS
+        .iter()
+        .map(|c| format!("crd/{c}"))
+        .collect();
     let status = Command::new("kubectl")
-        .args([
-            "wait",
-            "--for=condition=Established",
-            "--timeout=60s",
-            "crd/gateways.gateway.networking.k8s.io",
-            "crd/httproutes.gateway.networking.k8s.io",
-            "crd/referencegrants.gateway.networking.k8s.io",
-        ])
+        .args(["wait", "--for=condition=Established", "--timeout=60s"])
+        .args(&crd_args)
         .status()
         .await
         .context("kubectl wait CRDs")?;

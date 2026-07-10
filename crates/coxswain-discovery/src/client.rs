@@ -14,7 +14,8 @@ use std::time::Duration;
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::listener_status::SharedGatewayListenerStatus;
 use coxswain_core::routing::{
-    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTlsPassthroughTable,
+    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
+    SharedTlsPassthroughTable,
 };
 use coxswain_core::tls::{
     ListenerHostnamesBuilder, SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore,
@@ -37,7 +38,7 @@ use crate::svid::SharedSvid;
 use crate::version::WIRE_VERSION;
 use crate::wire::{
     client_cert_from_wire, gateway_from_wire, ingress_from_wire, listener_status_from_wire,
-    passthrough_from_wire, port_tls_from_wire,
+    passthrough_from_wire, port_tls_from_wire, tcp_table_from_wire,
 };
 
 /// Configuration for the discovery gRPC client supervisor.
@@ -159,6 +160,8 @@ pub struct DiscoveryClient {
     passthrough_routes: SharedTlsPassthroughTable,
     /// SNI-keyed TLS terminate routing table for TLSRouteModeTerminate (#481).
     terminate_routes: SharedTlsPassthroughTable,
+    /// Port-keyed TCP routing table for TCPRoute / GEP-1901 (#505).
+    tcp_routes: SharedTcpRouteTable,
 }
 
 impl DiscoveryClient {
@@ -212,6 +215,7 @@ impl DiscoveryClient {
         let listener_hostnames = SharedListenerHostnames::new();
         let passthrough_routes = SharedTlsPassthroughTable::new();
         let terminate_routes = SharedTlsPassthroughTable::new();
+        let tcp_routes = SharedTcpRouteTable::new();
 
         let supervisor = Supervisor {
             config,
@@ -223,6 +227,7 @@ impl DiscoveryClient {
             listener_hostnames: listener_hostnames.clone(),
             passthrough: passthrough_routes.clone(),
             terminate: terminate_routes.clone(),
+            tcp: tcp_routes.clone(),
             health,
             health_check: health_check.to_owned(),
             has_snapshot: false,
@@ -237,6 +242,7 @@ impl DiscoveryClient {
             listener_hostnames,
             passthrough_routes,
             terminate_routes,
+            tcp_routes,
         };
 
         Ok((client, supervisor))
@@ -327,6 +333,14 @@ impl DiscoveryClient {
     pub fn terminate_routes(&self) -> SharedTlsPassthroughTable {
         self.terminate_routes.clone()
     }
+
+    /// Handle to the port-keyed TCP routing table snapshot for TCPRoute / GEP-1901 (#505).
+    ///
+    /// Updated atomically with every applied snapshot from the controller.
+    #[must_use]
+    pub fn tcp_routes(&self) -> SharedTcpRouteTable {
+        self.tcp_routes.clone()
+    }
 }
 
 impl coxswain_core::RoutingSource for DiscoveryClient {
@@ -357,6 +371,10 @@ impl coxswain_core::RoutingSource for DiscoveryClient {
     fn terminate_routes(&self) -> SharedTlsPassthroughTable {
         self.terminate_routes.clone()
     }
+
+    fn tcp_routes(&self) -> SharedTcpRouteTable {
+        self.tcp_routes.clone()
+    }
 }
 
 // ── supervisor ──────────────────────────────────────────────────────────────
@@ -378,6 +396,7 @@ pub struct Supervisor {
     listener_hostnames: SharedListenerHostnames,
     passthrough: SharedTlsPassthroughTable,
     terminate: SharedTlsPassthroughTable,
+    tcp: SharedTcpRouteTable,
     health: SubsystemHandle,
     health_check: String,
     has_snapshot: bool,
@@ -672,6 +691,7 @@ impl Supervisor {
                     listener_hostnames: &self.listener_hostnames,
                     passthrough: &self.passthrough,
                     terminate: &self.terminate,
+                    tcp: &self.tcp,
                 },
             ) {
                 Ok(()) => {
@@ -734,6 +754,7 @@ struct SnapshotCells<'a> {
     listener_hostnames: &'a SharedListenerHostnames,
     passthrough: &'a SharedTlsPassthroughTable,
     terminate: &'a SharedTlsPassthroughTable,
+    tcp: &'a SharedTcpRouteTable,
 }
 
 /// Decode all routing cells from a snapshot DTO and atomically publish them.
@@ -793,6 +814,12 @@ fn apply_snapshot(
             .as_ref()
             .unwrap_or(&p::TlsPassthroughTable::default()),
     )?;
+    let tcp_table = tcp_table_from_wire(
+        snapshot
+            .tcp_proxy
+            .as_ref()
+            .unwrap_or(&p::TcpRouteTable::default()),
+    )?;
 
     // Derive the per-port HTTPS listener-hostname snapshot from the status map
     // (same data the reflector uses in build_tls) so GEP-3567 misdirected-request
@@ -818,6 +845,7 @@ fn apply_snapshot(
     cells.status.store_and_notify(listener_status_map);
     cells.passthrough.store(Arc::new(passthrough_table));
     cells.terminate.store(Arc::new(terminate_table));
+    cells.tcp.store(Arc::new(tcp_table));
 
     Ok(())
 }
@@ -1138,6 +1166,7 @@ mod tests {
                 listener_status: Some(GatewayListenerStatus::default()),
                 tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
                 tls_terminate: Some(crate::proto::v1::TlsPassthroughTable::default()),
+                tcp_proxy: Some(crate::proto::v1::TcpRouteTable::default()),
             })),
         }
     }
@@ -1169,6 +1198,7 @@ mod tests {
                 listener_status: Some(GatewayListenerStatus::default()),
                 tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
                 tls_terminate: Some(crate::proto::v1::TlsPassthroughTable::default()),
+                tcp_proxy: Some(crate::proto::v1::TcpRouteTable::default()),
             })),
         }
     }

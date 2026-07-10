@@ -25,6 +25,7 @@ pub use v::httproutes::HttpRoute;
 // for a stable import path alongside the route kinds; its listeners are merged into the
 // parent Gateway's effective listener set during reconcile.
 pub use v::listenersets::ListenerSet;
+pub use v::tcproutes::TcpRoute;
 pub use v::tlsroutes::TlsRoute;
 
 /// Gateway API condition `type`/`reason` constants (#510), parsed straight

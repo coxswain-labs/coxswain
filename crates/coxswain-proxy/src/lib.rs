@@ -39,4 +39,4 @@ pub use policy::auth::JwksKeyCache;
 pub use policy::grpc_channel::GrpcAuthChannelCache;
 pub use policy::rate_limit::RateLimiterRegistry;
 pub use routing::engine::RoutingEngine;
-pub use routing::source::{KubernetesSource, RoutingSource};
+pub use routing::source::{KubernetesSource, L4RoutingTables, RoutingSource};

@@ -52,12 +52,13 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use coxswain_core::listener_status::ProxyProtocolListenerConfig;
-use coxswain_core::routing::SharedTlsPassthroughTable;
+use coxswain_core::routing::{SharedTcpRouteTable, SharedTlsPassthroughTable};
 use ppp::PartialResult as _;
 
 use crate::SniCertSelector;
 use crate::ctx::{CONN_INFO, ConnectionInfo};
 use crate::edge::passthrough::{handle_passthrough, peek_sni};
+use crate::edge::tcp::handle_tcp_proxy;
 use crate::edge::terminate::handle_terminate;
 use crate::metrics;
 
@@ -111,7 +112,11 @@ pub struct PassthroughConfig {
     ///
     /// An empty table causes all terminate connections to be closed immediately.
     pub terminate_table: SharedTlsPassthroughTable,
-    /// How long to wait when connecting to a passthrough or terminate backend.
+    /// Port-keyed routing table for TCPRoute listeners (#505). No SNI dimension.
+    ///
+    /// An empty table causes all TCP-proxy connections to be closed immediately.
+    pub tcp_table: SharedTcpRouteTable,
+    /// How long to wait when connecting to a passthrough, terminate, or TCP-proxy backend.
     pub dial_timeout: Duration,
 }
 
@@ -142,6 +147,12 @@ pub enum ListenerProtocol {
     /// passthrough or terminate TLSRoute, handle it as L4. If not, fall through
     /// to standard TLS-terminate processing (`Https`).
     TlsHybrid,
+    /// Raw TCP proxy (TCPRoute, GEP-1901): dial the bound backend and splice —
+    /// no SNI peek, no TLS, no HTTP layer. Unlike `TlsL4` there is no
+    /// passthrough-vs-terminate split and no hybrid fallthrough: a `TCP`
+    /// listener never shares a port with another protocol (Gateway API
+    /// port-compatibility rules exclude the combination).
+    Tcp,
 }
 
 /// One listen address with its associated protocol and per-listener PROXY config.
@@ -207,6 +218,15 @@ impl ListenerSpec {
             proxy_protocol: None,
         }
     }
+
+    /// Create a raw TCP proxy listener spec for a port serving a `TCPRoute` (#505).
+    pub fn tcp(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            protocol: ListenerProtocol::Tcp,
+            proxy_protocol: None,
+        }
+    }
 }
 
 /// Dynamically-managed proxy acceptor for a single [`ProxyHttp`] implementation.
@@ -246,7 +266,9 @@ where
     passthrough_table: SharedTlsPassthroughTable,
     /// SNI-keyed terminate routing table for TLSRoute terminate listeners (#481).
     terminate_table: SharedTlsPassthroughTable,
-    /// Timeout for dialling a passthrough or terminate backend.
+    /// Port-keyed routing table for TCPRoute listeners (#505).
+    tcp_table: SharedTcpRouteTable,
+    /// Timeout for dialling a passthrough, terminate, or TCP-proxy backend.
     l4_dial_timeout: Duration,
     /// Publishes the set of ports with a live accept loop after every listener
     /// reconcile (#531). `None` (default) = no reporting. The discovery client
@@ -305,6 +327,7 @@ where
             drain_timeout,
             passthrough_table: passthrough.table,
             terminate_table: passthrough.terminate_table,
+            tcp_table: passthrough.tcp_table,
             l4_dial_timeout: passthrough.dial_timeout,
             bound_ports_tx: None,
         })
@@ -366,6 +389,7 @@ where
             drain_timeout: self.drain_timeout,
             passthrough_table: self.passthrough_table.clone(),
             terminate_table: self.terminate_table.clone(),
+            tcp_table: self.tcp_table.clone(),
             l4_dial_timeout: self.l4_dial_timeout,
         };
 
@@ -485,6 +509,7 @@ where
     drain_timeout: Duration,
     passthrough_table: SharedTlsPassthroughTable,
     terminate_table: SharedTlsPassthroughTable,
+    tcp_table: SharedTcpRouteTable,
     l4_dial_timeout: Duration,
 }
 
@@ -506,6 +531,7 @@ where
     protocol: ListenerProtocol,
     passthrough_table: SharedTlsPassthroughTable,
     terminate_table: SharedTlsPassthroughTable,
+    tcp_table: SharedTcpRouteTable,
     l4_dial_timeout: Duration,
 }
 
@@ -688,6 +714,7 @@ async fn reconcile_listeners<P>(
             drain_timeout: cfg.drain_timeout,
             passthrough_table: cfg.passthrough_table.clone(),
             terminate_table: cfg.terminate_table.clone(),
+            tcp_table: cfg.tcp_table.clone(),
             l4_dial_timeout: cfg.l4_dial_timeout,
         };
         let addr = spec.addr;
@@ -788,6 +815,7 @@ async fn run_listener<P>(
                                     protocol,
                                     passthrough_table: cfg.passthrough_table.clone(),
                                     terminate_table: cfg.terminate_table.clone(),
+                                    tcp_table: cfg.tcp_table.clone(),
                                     l4_dial_timeout: cfg.l4_dial_timeout,
                                 };
                                 let conn_sd = conn_shutdown_rx.clone();
@@ -995,11 +1023,60 @@ where
     None
 }
 
+/// Dispatch one connection on a `protocol: TCP` port (TCPRoute, GEP-1901).
+///
+/// When the listener has PROXY protocol enabled and the peer is trusted, the
+/// PROXY header is stripped first via `peek_and_drain_proxy_header`. After any
+/// PROXY stripping, the connection is spliced straight to the bound backend —
+/// no SNI peek, no TLS, no hybrid fallthrough (a `TCP` listener never shares a
+/// port with another protocol; see [`ListenerProtocol::Tcp`]).
+async fn dispatch_tcp<P>(mut tcp: TcpStream, peer_addr: SocketAddr, handler: &ConnHandler<P>)
+where
+    P: ProxyHttp + Send + Sync + 'static,
+    <P as ProxyHttp>::CTX: Send + Sync,
+{
+    if let Some(pp) = handler.proxy_protocol.as_ref().filter(|pp| pp.enabled) {
+        if !pp.is_trusted(&peer_addr.ip()) {
+            tracing::debug!(peer = %peer_addr, "TCP proxy: rejecting connection from untrusted source (PROXY enabled)");
+            return;
+        }
+        match peek_and_drain_proxy_header(&mut tcp, peer_addr).await {
+            Ok(real_addr) => {
+                tracing::debug!(
+                    peer = %peer_addr,
+                    real = %real_addr,
+                    "TCP proxy: stripped PROXY header"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(
+                    peer = %peer_addr,
+                    error = %e,
+                    "TCP proxy: PROXY header read failed, dropping connection"
+                );
+                return;
+            }
+        }
+    }
+
+    let port = handler.local_addr.port();
+    handle_tcp_proxy(
+        tcp,
+        peer_addr,
+        &handler.tcp_table,
+        port,
+        handler.l4_dial_timeout,
+    )
+    .await;
+}
+
 /// Handle one accepted TCP connection.
 ///
 /// Dispatches based on protocol and PROXY-protocol configuration:
 /// - `TlsL4`: strip PROXY header (if enabled), peek SNI, splice passthrough or terminate.
 /// - `TlsHybrid`: same as `TlsL4` but falls through to HTTPS if no L4 route matches.
+/// - `Tcp`: strip PROXY header (if enabled), splice straight to the bound backend —
+///   no SNI peek, no TLS, no HTTP layer.
 /// - PROXY-protocol path (when `proxy_protocol` is `Some` and `enabled`): strip PROXY header,
 ///   inject real client address, then run the Pingora HTTP loop.
 /// - Standard Pingora path: ALPN, HTTP/1.1 and HTTP/2 without PROXY handling.
@@ -1013,6 +1090,13 @@ async fn handle_connection<P>(
     <P as ProxyHttp>::CTX: Send + Sync,
 {
     let _conn_guard = ConnectionGuard::new(handler.local_addr.port());
+
+    // Raw TCP proxy ports never run through the HTTP proxy layer or any TLS/SNI
+    // logic — dispatch and return immediately.
+    if handler.protocol == ListenerProtocol::Tcp {
+        dispatch_tcp(tcp, peer_addr, &handler).await;
+        return;
+    }
 
     // TLS L4 and hybrid ports are independent of the PROXY-protocol setting — they
     // never run through the HTTP proxy layer.
@@ -1214,7 +1298,7 @@ async fn handle_standard<P>(
             let _ = proxy.process_new(stream, &conn_shutdown).await;
         }
         // L4 and hybrid connections are dispatched before reaching this function.
-        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid => {}
+        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid | ListenerProtocol::Tcp => {}
     }
 }
 
@@ -1269,7 +1353,7 @@ async fn handle_proxy_protocol<P>(
         ListenerProtocol::Http => "http",
         ListenerProtocol::Https => "https",
         // Passthrough / hybrid connections are dispatched before reaching this function.
-        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid => return,
+        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid | ListenerProtocol::Tcp => return,
     };
     let conn_info = ConnectionInfo {
         real_addr,
@@ -1305,7 +1389,7 @@ async fn handle_proxy_protocol<P>(
         }
         ListenerProtocol::Http => Box::new(L4Stream::from(tcp)),
         // Passthrough / hybrid connections are dispatched before reaching this function.
-        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid => return,
+        ListenerProtocol::TlsL4 | ListenerProtocol::TlsHybrid | ListenerProtocol::Tcp => return,
     };
 
     let mut session = ServerSession::new_http1(stream);

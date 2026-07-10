@@ -14,10 +14,11 @@ use crate::endpoints;
 use crate::gateway_api::hostnames_intersect;
 use crate::gateway_api::{
     GatewayApiReconciler, GrpcRouteReconciler, GrpcRouteResolution, ListenerBinding, RouteLike,
-    TlsRouteReconciler, parent_listener_source,
+    TcpRouteReconciler, TlsRouteReconciler, parent_listener_source,
 };
+use crate::gw_types::v::tcproutes::TcpRouteParentRefs;
 use crate::gw_types::v::tlsroutes::TlsRouteParentRefs;
-use crate::gw_types::{GrpcRoute, HttpRoute};
+use crate::gw_types::{GrpcRoute, HttpRoute, TcpRoute};
 use crate::ingress::annotations::AnnotationIssue;
 use crate::ingress::{IngressClassContext, IngressPorts, IngressReconciler, resolve_class_params};
 use crate::keys::ListenerKey;
@@ -30,7 +31,8 @@ use coxswain_core::reference_grants::{self as reference_grants, ReferenceGrantKe
 use coxswain_core::routing::{
     BackendClientCert, BackendGroup, GatewayRoutingTableBuilder, IngressRoutingTableBuilder,
     RouteEntry, RoutingTable, RoutingTableBuilder, SharedGatewayRoutingTable,
-    SharedIngressRoutingTable, SharedTlsPassthroughTable, TlsPassthroughTableBuilder,
+    SharedIngressRoutingTable, SharedTcpRouteTable, SharedTlsPassthroughTable,
+    TcpRouteTableBuilder, TlsPassthroughTableBuilder,
 };
 use coxswain_core::shared::Shared;
 use coxswain_core::tls::{
@@ -726,32 +728,50 @@ pub(super) fn merge_backend_client_cert_health(
     }
 }
 
+/// Selects which listener flavor a route kind is eligible to attach to, for
+/// [`count_attached_routes`]. Mirrors the protocol-implied `allowedRoutes.kinds`
+/// default: `Http` (HTTPRoute/GRPCRoute) attaches to plain listeners, `TlsL4`
+/// (TLSRoute) attaches to `TlsPassthrough`/`TlsTerminate` listeners, `Tcp`
+/// (TCPRoute) attaches only to `TcpProxy` listeners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RouteAttachKind {
+    Http,
+    TlsL4,
+    Tcp,
+}
+
 /// Increment `attached_routes` counters for each gateway listener whose hostname
 /// intersects with the route's hostnames. Only owned gateways are counted.
 ///
 /// Generic over [`RouteLike`] so the one algorithm serves every route kind
-/// (HTTPRoute, GRPCRoute, TLSRoute) — GRPC/TLS listeners would otherwise always
-/// report `attachedRoutes: 0` (#470). `passthrough_kind` flips listener
-/// eligibility by kind: TLSRoutes attach to `TlsPassthrough` or `TlsTerminate`
-/// listeners; HTTP/GRPC routes attach only to non-TLS-L4 listeners (the
-/// `allowedRoutes.kinds` restriction implied by listener protocol/mode).
+/// (HTTPRoute, GRPCRoute, TLSRoute, TCPRoute) — GRPC/TLS/TCP listeners would
+/// otherwise always report `attachedRoutes: 0` (#470). `kind` selects listener
+/// eligibility: TLSRoutes attach to `TlsPassthrough` or `TlsTerminate` listeners,
+/// TCPRoutes attach only to `TcpProxy` listeners, and HTTP/GRPC routes attach
+/// only to plain (non-L4) listeners (the `allowedRoutes.kinds` restriction
+/// implied by listener protocol/mode).
 pub(super) fn count_attached_routes<R: RouteLike>(
     routes: &[Arc<R>],
     owned_gateways: &HashSet<ObjectKey>,
     ls_parent: &HashMap<ObjectKey, ObjectKey>,
     gateway_listener_status: &mut HashMap<ObjectKey, GatewayListenerStatus>,
-    passthrough_kind: bool,
+    kind: RouteAttachKind,
 ) {
-    // TLSRoutes (passthrough_kind=true) attach to any TLS-L4 listener (Passthrough
-    // or Terminate). HTTP/GRPC routes attach only to non-TLS-L4 listeners.
-    // VipPending is intentionally absent: a listener whose VIP port is not yet
-    // allocated is not programmed (Programmed=False) and must not accept routes.
+    // VipPending is intentionally absent from every arm below: a listener whose
+    // VIP port is not yet allocated is not programmed (Programmed=False) and
+    // must not accept routes.
     let listener_accepts = |info: &ListenerInfo| {
-        let is_tls_l4 = matches!(
+        let listener_kind = if matches!(
             info.readiness,
             ListenerReadiness::TlsPassthrough | ListenerReadiness::TlsTerminate
-        );
-        passthrough_kind == is_tls_l4
+        ) {
+            RouteAttachKind::TlsL4
+        } else if matches!(info.readiness, ListenerReadiness::TcpProxy) {
+            RouteAttachKind::Tcp
+        } else {
+            RouteAttachKind::Http
+        };
+        kind == listener_kind
     };
 
     for route in routes {
@@ -1124,6 +1144,217 @@ fn build_tls_l4_routes(
     )
 }
 
+/// Returns `true` if a TCPRoute `parentRef` (`pr`) binds to the given listener.
+///
+/// Same three-step check as [`tls_route_binds`] (source match, `sectionName`,
+/// `port`) — TCPRoute's `parentRefs` shape is structurally identical to
+/// TLSRoute's, just without a hostname dimension.
+fn tcp_route_binds(
+    pr: &TcpRouteParentRefs,
+    source: &ListenerSource,
+    gw_ns: &str,
+    gw_name: &str,
+    listener_name: &str,
+    listener_port: u16,
+    route_ns: &str,
+) -> bool {
+    let pr_ns = pr.namespace.as_deref().unwrap_or(route_ns);
+    let pr_source =
+        parent_listener_source(pr.group.as_deref(), pr.kind.as_deref(), pr_ns, &pr.name);
+    let target_ok = match (source, &pr_source) {
+        (ListenerSource::Gateway, ListenerSource::Gateway) => pr_ns == gw_ns && pr.name == gw_name,
+        (ListenerSource::ListenerSet(a), ListenerSource::ListenerSet(b)) => a == b,
+        _ => false,
+    };
+    if !target_ok {
+        return false;
+    }
+    if let Some(sn) = pr.section_name.as_deref()
+        && sn != listener_name
+    {
+        return false;
+    }
+    if let Some(port) = pr.port
+        && port as u16 != listener_port
+    {
+        return false;
+    }
+    true
+}
+
+/// Build and publish the port-keyed TCP routing table from `TCPRoute` resources
+/// bound to `protocol: TCP` Gateway listeners (GEP-1901, #505).
+///
+/// Unlike the TLS L4 tables there is no SNI/hostname dimension: a TCP listener
+/// has exactly one mode and a bound backend is selected purely by port. The
+/// Standard channel further constrains `TCPRoute` to exactly one rule with no
+/// matches, so the last-writer-wins semantics of [`TcpRouteTableBuilder`] only
+/// matter across distinct routes racing for the same port (rare misconfiguration).
+///
+/// Returns per-(TCPRoute, parentRef) health so the controller can write
+/// `Accepted` / `ResolvedRefs` status conditions on each route.
+///
+/// `backend_grants` must be the `TCPRoute → Service` set
+/// ([`flatten_tcp_backend_grants`](crate::reference_grants::flatten_tcp_backend_grants)),
+/// not the generic `HTTPRoute`-scoped set — `ReferenceGrantKey` carries no
+/// `from.kind`, so passing the wrong set would silently cross-permit backends.
+pub(super) fn build_tcp_routes(
+    stores: &ReflectorStores<'_>,
+    owned_gateways: &HashSet<ObjectKey>,
+    effective: &HashMap<ObjectKey, EffectiveGateway>,
+    backend_grants: &HashSet<ReferenceGrantKey>,
+    out: &SharedTcpRouteTable,
+) -> RouteStatusMap {
+    let tcp_routes = stores.tcp_routes.state();
+    let gateways = stores.gateways.state();
+    let vip_internal = stores.vip_internal;
+
+    // Precedence order, descending (newest/lowest-precedence first, oldest/
+    // highest-precedence last): when two TCPRoutes bind the same port —
+    // unavoidable given TCPRoute has no SNI/hostname to disambiguate — the
+    // table builder is last-writer-wins, so the winner must be processed
+    // last. Mirrors the GEP-1713 ListenerSet precedence idiom in
+    // `listener_merge.rs` (creationTimestamp ASC, then "{ns}/{name}" ASC),
+    // reversed here to fit last-writer-wins instead of append-in-order.
+    let mut tcp_routes_by_precedence: Vec<&Arc<TcpRoute>> = tcp_routes.iter().collect();
+    tcp_routes_by_precedence.sort_by(|a, b| {
+        let ta = a.metadata.creation_timestamp.as_ref();
+        let tb = b.metadata.creation_timestamp.as_ref();
+        let key = |r: &TcpRoute| {
+            format!(
+                "{}/{}",
+                r.metadata.namespace.as_deref().unwrap_or(""),
+                r.metadata.name.as_deref().unwrap_or("")
+            )
+        };
+        tb.cmp(&ta).then_with(|| key(b).cmp(&key(a)))
+    });
+
+    let mut builder = TcpRouteTableBuilder::new();
+
+    for gw in &gateways {
+        let gw_ns = gw.metadata.namespace.as_deref().unwrap_or("default");
+        let gw_name = gw.metadata.name.as_deref().unwrap_or("");
+        let gw_key = ObjectKey::new(gw_ns, gw_name);
+        if !owned_gateways.contains(&gw_key) {
+            continue;
+        }
+
+        let Some(eff) = effective.get(&gw_key) else {
+            continue;
+        };
+
+        for listener in &eff.listeners {
+            if listener.protocol != "TCP" {
+                continue;
+            }
+            // Lost a port-compatibility conflict to a higher-precedence listener
+            // (GEP-1713) — not programmed, so no routing entries.
+            if listener.conflict.is_conflicted() {
+                continue;
+            }
+
+            let listener_port = listener.port as u16;
+            let bind_port = vip_internal
+                .get(&(gw_key.clone(), listener_port))
+                .copied()
+                .unwrap_or(listener_port);
+            let route_namespaces = &listener.route_namespaces;
+            let source = &listener.source;
+
+            for route in &tcp_routes_by_precedence {
+                let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+
+                if !route_namespaces.allows(route_ns) {
+                    continue;
+                }
+
+                let parent_refs = route.spec.parent_refs.as_deref().unwrap_or(&[]);
+                let binds = parent_refs.iter().any(|pr| {
+                    tcp_route_binds(
+                        pr,
+                        source,
+                        gw_ns,
+                        gw_name,
+                        &listener.name,
+                        listener_port,
+                        route_ns,
+                    )
+                });
+                if !binds {
+                    continue;
+                }
+
+                // Standard channel enforces exactly one rule with no matches; the
+                // loop is last-writer-wins per port like the TLS L4 path, in case
+                // that constraint ever loosens.
+                for rule in &route.spec.rules {
+                    let weighted: Vec<(Vec<std::net::SocketAddr>, u16)> = rule
+                        .backend_refs
+                        .iter()
+                        .filter_map(|b| {
+                            let port = b.port?;
+                            let weight = b.weight.unwrap_or(1);
+                            if weight <= 0 {
+                                return None;
+                            }
+                            let b_kind = b.kind.as_deref().unwrap_or("Service");
+                            let b_group = b.group.as_deref().unwrap_or("");
+                            if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
+                                return None;
+                            }
+                            let ns = b.namespace.as_deref().unwrap_or(route_ns);
+                            if ns != route_ns
+                                && !reference_grants::backend_ref_allowed(
+                                    route_ns,
+                                    ns,
+                                    &b.name,
+                                    backend_grants,
+                                )
+                            {
+                                tracing::warn!(
+                                    route_ns,
+                                    backend_ns = ns,
+                                    backend_svc = %b.name,
+                                    "TCPRoute cross-namespace backendRef denied — no ReferenceGrant"
+                                );
+                                return None;
+                            }
+                            let resolved = endpoints::resolve(
+                                ns,
+                                &b.name,
+                                port,
+                                stores.slices,
+                                stores.services,
+                            );
+                            Some((resolved.addrs, weight as u16))
+                        })
+                        .collect();
+
+                    let group_name = rule
+                        .backend_refs
+                        .first()
+                        .map(|b| b.name.clone())
+                        .unwrap_or_default();
+                    let bg = Arc::new(BackendGroup::weighted(group_name, weighted));
+
+                    builder = builder.add_route(bind_port, bg);
+                }
+            }
+        }
+    }
+
+    out.store(Arc::new(builder.build()));
+    TcpRouteReconciler::compute_route_health(
+        &tcp_routes,
+        &gateways,
+        owned_gateways,
+        effective,
+        backend_grants,
+        stores.services,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1223,7 +1454,13 @@ mod tests {
     #[test]
     fn grpc_route_increments_attached_routes_on_http_listener() {
         let mut map = health(vec![listener("http", ListenerReadiness::NotApplicable, 80)]);
-        count_attached_routes(&[grpc_route()], &owned(), &HashMap::new(), &mut map, false);
+        count_attached_routes(
+            &[grpc_route()],
+            &owned(),
+            &HashMap::new(),
+            &mut map,
+            RouteAttachKind::Http,
+        );
         assert_eq!(
             attached(&map, "http"),
             1,
@@ -1238,7 +1475,13 @@ mod tests {
             ListenerReadiness::TlsPassthrough,
             443,
         )]);
-        count_attached_routes(&[tls_route()], &owned(), &HashMap::new(), &mut map, true);
+        count_attached_routes(
+            &[tls_route()],
+            &owned(),
+            &HashMap::new(),
+            &mut map,
+            RouteAttachKind::TlsL4,
+        );
         assert_eq!(
             attached(&map, "tls"),
             1,
@@ -1250,7 +1493,13 @@ mod tests {
     fn tls_route_not_counted_against_https_listener() {
         // protocol: HTTPS listeners (readiness Resolved) carry HTTPRoute, not TLSRoute.
         let mut map = health(vec![listener("https", ListenerReadiness::Resolved, 443)]);
-        count_attached_routes(&[tls_route()], &owned(), &HashMap::new(), &mut map, true);
+        count_attached_routes(
+            &[tls_route()],
+            &owned(),
+            &HashMap::new(),
+            &mut map,
+            RouteAttachKind::TlsL4,
+        );
         assert_eq!(
             attached(&map, "https"),
             0,
@@ -1265,7 +1514,13 @@ mod tests {
             ListenerReadiness::TlsTerminate,
             8443,
         )]);
-        count_attached_routes(&[tls_route()], &owned(), &HashMap::new(), &mut map, true);
+        count_attached_routes(
+            &[tls_route()],
+            &owned(),
+            &HashMap::new(),
+            &mut map,
+            RouteAttachKind::TlsL4,
+        );
         assert_eq!(
             attached(&map, "tls-terminate"),
             1,
@@ -1280,7 +1535,13 @@ mod tests {
             ListenerReadiness::TlsPassthrough,
             443,
         )]);
-        count_attached_routes(&[http_route()], &owned(), &HashMap::new(), &mut map, false);
+        count_attached_routes(
+            &[http_route()],
+            &owned(),
+            &HashMap::new(),
+            &mut map,
+            RouteAttachKind::Http,
+        );
         assert_eq!(
             attached(&map, "tls"),
             0,
@@ -1337,7 +1598,13 @@ mod tests {
 
         let ls_parent: HashMap<ObjectKey, ObjectKey> =
             std::iter::once((ls_key.clone(), ObjectKey::new("default", "gw"))).collect();
-        count_attached_routes(&[route], &owned(), &ls_parent, &mut map, true);
+        count_attached_routes(
+            &[route],
+            &owned(),
+            &ls_parent,
+            &mut map,
+            RouteAttachKind::TlsL4,
+        );
 
         let gw_health = &map[&ObjectKey::new("default", "gw")];
         assert_eq!(

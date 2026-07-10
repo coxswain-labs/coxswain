@@ -70,6 +70,18 @@ pub fn flatten_ls_cert_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
     flatten(grants, GATEWAY_API_GROUP, "ListenerSet", "Secret")
 }
 
+/// Flatten the `TCPRoute → Service` grants used when a TCPRoute `backendRef`
+/// points at a Service in another namespace (GEP-1901, #505). Kept separate
+/// from [`flatten_grants`]'s `backend_grants` (`from.kind: HTTPRoute`) rather
+/// than folding into the same set: [`ReferenceGrantKey`] carries no
+/// `from.kind`, so merging would let an HTTPRoute-scoped grant silently also
+/// permit a TCPRoute's backendRef between the same namespace pair — the same
+/// per-kind isolation [`flatten_ls_cert_grants`] applies to `ListenerSet`.
+#[must_use]
+pub fn flatten_tcp_backend_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
+    flatten(grants, GATEWAY_API_GROUP, "TCPRoute", "Service")
+}
+
 fn flatten(
     grants: &[Arc<ReferenceGrant>],
     from_group: &str,

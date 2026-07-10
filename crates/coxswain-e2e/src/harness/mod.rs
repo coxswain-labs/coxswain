@@ -11,8 +11,8 @@ pub mod wait;
 
 use anyhow::Context as _;
 pub use bootstrap::{
-    GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, GATEWAY_TLS_PASSTHROUGH_PORT, bootstrap,
-    bootstrap_cluster,
+    GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, GATEWAY_TCP_PROXY_PORT, GATEWAY_TLS_PASSTHROUGH_PORT,
+    bootstrap, bootstrap_cluster,
 };
 pub use controller::{ControllerOptions, ControllerProcess, INGRESS_HTTP_PORT, INGRESS_HTTPS_PORT};
 pub use http::HttpClient;
@@ -119,6 +119,17 @@ impl Harness {
     ) -> anyhow::Result<std::net::SocketAddr> {
         self.gateway_vip(namespace, GATEWAY_TLS_PASSTHROUGH_PORT)
             .await
+    }
+
+    /// Resolve the per-Gateway VIP (#472) of the single Gateway in `namespace`
+    /// as a [`SocketAddr`] on its TCP-proxy listener ([`GATEWAY_TCP_PROXY_PORT`],
+    /// TCPRoute / GEP-1901, #505).
+    ///
+    /// # Errors
+    ///
+    /// See [`Harness::gateway_http`].
+    pub async fn gateway_tcp_addr(&self, namespace: &str) -> anyhow::Result<std::net::SocketAddr> {
+        self.gateway_vip(namespace, GATEWAY_TCP_PROXY_PORT).await
     }
 
     /// Resolve the single owned Gateway's VIP in `namespace` on `port`, waiting

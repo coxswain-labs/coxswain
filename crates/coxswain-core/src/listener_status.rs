@@ -163,6 +163,14 @@ pub enum ListenerReadiness {
     /// the internal port is known, the next rebuild replaces this with
     /// `TlsPassthrough`, `TlsTerminate`, or `Resolved`.
     VipPending,
+    /// `protocol: TCP` listener (GEP-1901 / `TCPRoute`).
+    ///
+    /// The proxy routes the raw TCP connection to the bound backend purely by
+    /// listener port — no certificate, no SNI, no HTTP parsing. Unlike `TLS`
+    /// there is no passthrough/terminate distinction: a `TCP` listener has
+    /// exactly one mode. The data plane creates a `ListenerProtocol::Tcp`
+    /// listener on this port.
+    TcpProxy,
 }
 
 impl ListenerReadiness {
@@ -190,7 +198,11 @@ impl ListenerReadiness {
     pub fn is_healthy(&self) -> bool {
         matches!(
             self,
-            Self::NotApplicable | Self::Resolved | Self::TlsPassthrough | Self::TlsTerminate
+            Self::NotApplicable
+                | Self::Resolved
+                | Self::TlsPassthrough
+                | Self::TlsTerminate
+                | Self::TcpProxy
         )
     }
 
@@ -206,9 +218,11 @@ impl ListenerReadiness {
             Self::Unsupported { .. } => "UnsupportedValue",
             Self::UnsupportedProtocol { .. } => "UnsupportedProtocol",
             Self::VipPending => "Pending",
-            Self::NotApplicable | Self::Resolved | Self::TlsPassthrough | Self::TlsTerminate => {
-                "Resolved"
-            }
+            Self::NotApplicable
+            | Self::Resolved
+            | Self::TlsPassthrough
+            | Self::TlsTerminate
+            | Self::TcpProxy => "Resolved",
         }
     }
 
@@ -224,7 +238,11 @@ impl ListenerReadiness {
             | Self::UnsupportedProtocol { message }
             | Self::ResolvedPartial { message } => message.as_str(),
             Self::VipPending => "waiting for VIP port allocation",
-            Self::NotApplicable | Self::Resolved | Self::TlsPassthrough | Self::TlsTerminate => "",
+            Self::NotApplicable
+            | Self::Resolved
+            | Self::TlsPassthrough
+            | Self::TlsTerminate
+            | Self::TcpProxy => "",
         }
     }
 
@@ -244,15 +262,23 @@ impl ListenerReadiness {
     pub fn is_tls_terminate(&self) -> bool {
         matches!(self, Self::TlsTerminate)
     }
+
+    /// Returns `true` when this is a `TCP` proxy listener (GEP-1901 / `TCPRoute`).
+    ///
+    /// Used by the bin layer to drive a `Tcp`-protocol listener on this port.
+    #[must_use]
+    pub fn is_tcp_proxy(&self) -> bool {
+        matches!(self, Self::TcpProxy)
+    }
 }
 
 /// The Gateway listener `protocol` values coxswain implements routing for.
 ///
-/// `HTTP` (cleartext L7), `HTTPS` (TLS-terminated L7), and `TLS`
-/// (passthrough/terminate L4, GEP-2643). A listener declaring any other protocol
-/// is not Accepted — see [`is_supported_listener_protocol`] and
-/// [`ListenerReadiness::UnsupportedProtocol`].
-pub const SUPPORTED_LISTENER_PROTOCOLS: [&str; 3] = ["HTTP", "HTTPS", "TLS"];
+/// `HTTP` (cleartext L7), `HTTPS` (TLS-terminated L7), `TLS`
+/// (passthrough/terminate L4, GEP-2643), and `TCP` (raw L4 proxy, GEP-1901). A
+/// listener declaring any other protocol is not Accepted — see
+/// [`is_supported_listener_protocol`] and [`ListenerReadiness::UnsupportedProtocol`].
+pub const SUPPORTED_LISTENER_PROTOCOLS: [&str; 4] = ["HTTP", "HTTPS", "TLS", "TCP"];
 
 /// Whether `protocol` is one coxswain routes ([`SUPPORTED_LISTENER_PROTOCOLS`]).
 ///

@@ -1,0 +1,21 @@
+# TCP-proxy Gateway fixture (no TCPRoute) for GEP-1901 / #505 sad-path e2e test.
+# Verifies that a `protocol: TCP` listener becomes Programmed=True even with zero
+# routes, and that incoming connections are dropped when no TCPRoute is attached.
+#
+# Substitutions (via FixtureVars::with):
+#   GATEWAY_TCP_PROXY_PORT - port for the TCP-proxy listener (8445)
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-tcp-gw-only
+  namespace: ${TESTNS}
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: tcp-proxy
+      port: ${GATEWAY_TCP_PROXY_PORT}
+      protocol: TCP
+      allowedRoutes:
+        namespaces:
+          from: Same

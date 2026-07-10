@@ -194,11 +194,18 @@ pub(crate) fn listener_route_kind_info(
         group: Some(GW_GROUP.to_string()),
         kind: "TLSRoute".to_string(),
     };
+    let tcp_route_kind = || GatewayStatusListenersSupportedKinds {
+        group: Some(GW_GROUP.to_string()),
+        kind: "TCPRoute".to_string(),
+    };
     // Any `protocol: TLS` listener (Passthrough or Terminate) carries TLSRoute
     // as its natural route kind. `protocol: HTTPS` is distinct — TLS terminated
     // at the gateway but with HTTP/GRPC parsing — so it falls through to the
     // HTTPRoute default.
     let is_tls_listener = listener.protocol == "TLS";
+    // `protocol: TCP` (GEP-1901) carries TCPRoute as its only route kind — no
+    // passthrough/terminate split, unlike TLS.
+    let is_tcp_listener = listener.protocol == "TCP";
 
     let allowed = match listener
         .allowed_routes
@@ -210,12 +217,16 @@ pub(crate) fn listener_route_kind_info(
             if is_tls_listener {
                 return (false, vec![tls_route_kind()]);
             }
+            if is_tcp_listener {
+                return (false, vec![tcp_route_kind()]);
+            }
             return (false, vec![http_route_kind()]);
         }
     };
     let mut has_invalid = false;
     let mut includes_http_route = false;
     let mut includes_tls_route = false;
+    let mut includes_tcp_route = false;
     for k in allowed {
         let group_ok = k
             .group
@@ -225,6 +236,8 @@ pub(crate) fn listener_route_kind_info(
             includes_http_route = true;
         } else if k.kind == "TLSRoute" && group_ok && is_tls_listener {
             includes_tls_route = true;
+        } else if k.kind == "TCPRoute" && group_ok && is_tcp_listener {
+            includes_tcp_route = true;
         } else {
             has_invalid = true;
         }
@@ -235,6 +248,9 @@ pub(crate) fn listener_route_kind_info(
     }
     if includes_tls_route {
         supported.push(tls_route_kind());
+    }
+    if includes_tcp_route {
+        supported.push(tcp_route_kind());
     }
     (has_invalid, supported)
 }

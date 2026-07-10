@@ -12,8 +12,8 @@ use coxswain_core::routing::{
     ExtAuthTransport, FilterAction, ForwardedForConfig, GatewayRoutingTable, HashSource, HeaderMod,
     HostPattern, HostRouter, IngressAuthConfig, IngressRoutingTable, LoadBalance, MatchPredicates,
     NormalizeLevel, PasswordHash, PathModifier, PortRoutingTable, RateLimitConfig, RateLimitKey,
-    RouteEntry, RouteKind, RouteTimeouts, SessionAffinity, SubjectAltName, TlsPassthroughTable,
-    UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
+    RouteEntry, RouteKind, RouteTimeouts, SessionAffinity, SubjectAltName, TcpRouteTable,
+    TlsPassthroughTable, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
 };
 
 use crate::proto::v1 as p;
@@ -739,4 +739,25 @@ pub fn passthrough_to_wire(t: &TlsPassthroughTable) -> p::TlsPassthroughTable {
         .collect();
     ports.sort_by_key(|e| e.port);
     p::TlsPassthroughTable { ports }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// TCP route table (#505)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Encode a [`TcpRouteTable`] as a protobuf DTO.
+///
+/// Ports are emitted in ascending order for content-hash stability. No SNI
+/// dimension — each port carries exactly one backend group.
+#[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
+pub fn tcp_table_to_wire(t: &TcpRouteTable) -> p::TcpRouteTable {
+    let mut ports: Vec<p::TcpRoutePort> = t
+        .ports_iter()
+        .map(|(port, bg)| p::TcpRoutePort {
+            port: u32::from(port),
+            backend_group: Some(backend_group_to_wire(bg, 0)),
+        })
+        .collect();
+    ports.sort_by_key(|e| e.port);
+    p::TcpRouteTable { ports }
 }

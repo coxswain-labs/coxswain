@@ -25,7 +25,7 @@ use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_reflector::gw_types::ListenerSet;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
-use coxswain_reflector::gw_types::{BackendTlsPolicy, GrpcRoute, HttpRoute, TlsRoute};
+use coxswain_reflector::gw_types::{BackendTlsPolicy, GrpcRoute, HttpRoute, TcpRoute, TlsRoute};
 use coxswain_reflector::status::{
     GatewayListenerStatus, SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus,
     SharedCoxswainBackendPolicyStatus, SharedCoxswainExternalAuthStatus,
@@ -70,6 +70,7 @@ mod leader_label;
 mod listenerset_events;
 mod listenerset_status;
 mod route_events;
+mod tcp_route_events;
 mod tls_route_events;
 
 pub use config::{ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress};
@@ -132,6 +133,10 @@ pub struct StatusChannels {
     ///
     /// Separate from `route` and `grpc_route` for the same kind-neutrality reason.
     pub tls_route: SharedRouteStatus,
+    /// Per-TCPRoute Accepted/ResolvedRefs health.
+    ///
+    /// Separate from the other route-kind channels for the same kind-neutrality reason.
+    pub tcp_route: SharedRouteStatus,
     /// Per-`BackendTLSPolicy` ancestor health.
     pub policy: SharedBackendTlsPolicyStatus,
     /// Per-`ClientTrafficPolicy` ancestor health (#327).
@@ -309,6 +314,7 @@ impl Controller {
             ingress_classes,
             policies,
             tls_routes,
+            tcp_routes,
             listener_sets,
             client_traffic_policies,
             coxswain_backend_policies,
@@ -325,6 +331,7 @@ impl Controller {
         let routes_reader = routes.reader();
         let grpc_routes_reader = grpc_routes.reader();
         let tls_routes_reader = tls_routes.reader();
+        let tcp_routes_reader = tcp_routes.reader();
         let ingresses_reader = ingresses.reader();
         let ingress_classes_reader = ingress_classes.reader();
         let policies_reader = policies.reader();
@@ -349,6 +356,7 @@ impl Controller {
             route_status: self.channels.route.clone(),
             grpc_route_status: self.channels.grpc_route.clone(),
             tls_route_status: self.channels.tls_route.clone(),
+            tcp_route_status: self.channels.tcp_route.clone(),
             policy_status: self.channels.policy.clone(),
             ctp_status: self.channels.ctp.clone(),
             cbp_status: self.channels.cbp.clone(),
@@ -371,6 +379,7 @@ impl Controller {
         let (route_tx, route_rx) = mpsc::unbounded::<()>();
         let (grpc_route_tx, grpc_route_rx) = mpsc::unbounded::<()>();
         let (tls_route_tx, tls_route_rx) = mpsc::unbounded::<()>();
+        let (tcp_route_tx, tcp_route_rx) = mpsc::unbounded::<()>();
         let (ing_tx, ing_rx) = mpsc::unbounded::<()>();
         let (pol_tx, pol_rx) = mpsc::unbounded::<()>();
         let (ls_tx, ls_rx) = mpsc::unbounded::<()>();
@@ -383,6 +392,7 @@ impl Controller {
             route_tx.clone(),
             grpc_route_tx.clone(),
             tls_route_tx.clone(),
+            tcp_route_tx.clone(),
             ing_tx.clone(),
             pol_tx.clone(),
             ls_tx.clone(),
@@ -447,6 +457,11 @@ impl Controller {
             &mut tasks,
             self.channels.tls_route.subscribe(),
             tls_route_tx,
+        );
+        spawn_health_forwarder(
+            &mut tasks,
+            self.channels.tcp_route.subscribe(),
+            tcp_route_tx,
         );
         spawn_health_forwarder(&mut tasks, self.channels.policy.subscribe(), pol_tx);
         spawn_health_forwarder(&mut tasks, self.channels.ctp.subscribe(), ctp_tx);
@@ -533,6 +548,13 @@ impl Controller {
             .reconcile_all_on(tls_route_rx)
             .run(reconcile_tls_route, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, tls_route_ctrl, "TLSRoute");
+
+        // --- TCPRoute: primary only; re-driven on tcp-route-health flips +
+        // promotion. Handles raw-TCP routes bound to protocol:TCP listeners.
+        let tcp_route_ctrl = KubeController::for_shared_stream(tcp_routes, tcp_routes_reader)
+            .reconcile_all_on(tcp_route_rx)
+            .run(reconcile_tcp_route, error_policy, ctx.clone());
+        spawn_controller_stream(&mut tasks, tcp_route_ctrl, "TCPRoute");
 
         // --- Ingress: primary Ingress, secondary IngressClass → all Ingresses
         // (ownership re-checked per reconcile); re-driven on promotion. ---
@@ -838,6 +860,7 @@ struct ReconcileContext {
     route_status: SharedRouteStatus,
     grpc_route_status: SharedRouteStatus,
     tls_route_status: SharedRouteStatus,
+    tcp_route_status: SharedRouteStatus,
     policy_status: SharedBackendTlsPolicyStatus,
     ctp_status: SharedClientTrafficPolicyStatus,
     cbp_status: SharedCoxswainBackendPolicyStatus,
@@ -1577,6 +1600,35 @@ async fn reconcile_tls_route_inner(route: &TlsRoute, ctx: &ReconcileContext) -> 
     let rh = ctx.tls_route_status.load();
     if leader_write_fence(ctx) {
         tls_route_events::mark_tls_route_programmed(
+            &ctx.client,
+            route,
+            &ctx.controller_name,
+            &owned,
+            &rh,
+        )
+        .await;
+    }
+    Action::await_change()
+}
+
+async fn reconcile_tcp_route(
+    route: Arc<TcpRoute>,
+    ctx: Arc<ReconcileContext>,
+) -> Result<Action, Infallible> {
+    let started = std::time::Instant::now();
+    let res: Result<Action, Infallible> = Ok(reconcile_tcp_route_inner(&route, &ctx).await);
+    crate::metrics::observe_reconcile("status_writer", started, &res);
+    res
+}
+
+async fn reconcile_tcp_route_inner(route: &TcpRoute, ctx: &ReconcileContext) -> Action {
+    if !ctx.leader.load(Ordering::Acquire) {
+        return Action::requeue(NON_LEADER_REQUEUE);
+    }
+    let owned = ctx.owned_gateways.load();
+    let rh = ctx.tcp_route_status.load();
+    if leader_write_fence(ctx) {
+        tcp_route_events::mark_tcp_route_programmed(
             &ctx.client,
             route,
             &ctx.controller_name,

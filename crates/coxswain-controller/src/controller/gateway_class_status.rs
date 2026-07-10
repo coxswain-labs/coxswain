@@ -53,6 +53,7 @@ pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteSchemeRedirect",
     "ListenerSet",
     "ReferenceGrant",
+    "TCPRoute",
     "TLSRoute",
     "TLSRouteModeMixed",
     "TLSRouteModeTerminate",

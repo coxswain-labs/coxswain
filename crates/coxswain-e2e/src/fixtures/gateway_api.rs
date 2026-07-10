@@ -477,6 +477,19 @@ pub const TLS_PASSTHROUGH: &str = fixture!("tls_passthrough.yaml");
 /// Placeholders: `GATEWAY_TLS_PASSTHROUGH_PORT`, `PASSTHROUGH_HOSTNAME`.
 pub const TLS_PASSTHROUGH_GW_ONLY: &str = fixture!("tls_passthrough_gw_only.yaml");
 
+// ── TCP proxy (TCPRoute / GEP-1901, #505) ─────────────────────────────────────
+
+/// Gateway with `protocol: TCP` + TCPRoute (GEP-1901, #505). The proxy dials the
+/// bound backend and splices the raw stream — no SNI peek, no TLS, no HTTP parsing.
+/// Placeholders: `GATEWAY_TCP_PROXY_PORT`.
+pub const TCP_ROUTE: &str = fixture!("tcp_route.yaml");
+
+/// Gateway with a `protocol: TCP` listener only (no TCPRoute).
+/// Used to verify the Gateway becomes `Programmed=True` even with zero routes,
+/// and that incoming connections are dropped (no backend to forward to).
+/// Placeholders: `GATEWAY_TCP_PROXY_PORT`.
+pub const TCP_ROUTE_GW_ONLY: &str = fixture!("tcp_route_gw_only.yaml");
+
 // ── TLS terminate (TLSRouteModeTerminate, #481) ───────────────────────────────
 
 /// Gateway with `protocol: TLS, tls.mode: Terminate` + TLSRoute to a plaintext backend.
