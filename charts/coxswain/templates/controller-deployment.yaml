@@ -116,6 +116,11 @@ spec:
               value: {{ .Values.controller.leaseTtl | quote }}
             - name: COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL
               value: {{ .Values.controller.leaseRenewInterval | quote }}
+            # Adaptive reconcile debounce (#512).
+            - name: COXSWAIN_RECONCILE_DEBOUNCE_MIN
+              value: {{ .Values.controller.reconcileDebounceMin | quote }}
+            - name: COXSWAIN_RECONCILE_DEBOUNCE_MAX
+              value: {{ .Values.controller.reconcileDebounceMax | quote }}
             {{- if .Values.controller.statusAddress }}
             - name: COXSWAIN_STATUS_ADDRESS
               value: {{ .Values.controller.statusAddress | quote }}

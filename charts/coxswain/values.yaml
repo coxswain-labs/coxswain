@@ -195,6 +195,17 @@ controller:
   # its lease.
   leaseRenewInterval: 5s
 
+  # COXSWAIN_RECONCILE_DEBOUNCE_MIN — trailing quiet window for the
+  # reconciler's rebuild debounce (#512). A watch event resets this timer;
+  # when it elapses with no further events, the routing table rebuilds.
+  # Governs how fast an isolated resource change converges.
+  reconcileDebounceMin: 20ms
+  # COXSWAIN_RECONCILE_DEBOUNCE_MAX — hard ceiling on the same debounce,
+  # measured from the first event of a cycle. Bounds convergence under
+  # sustained churn (e.g. a rolling deploy) that keeps resetting
+  # reconcileDebounceMin.
+  reconcileDebounceMax: 500ms
+
   # COXSWAIN_STATUS_ADDRESS — external IP/hostname written to Ingress and
   # Gateway status. Required for cert-manager HTTP-01 + external-dns.
   statusAddress: ""
