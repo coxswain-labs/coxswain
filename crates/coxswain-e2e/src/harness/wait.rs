@@ -1048,6 +1048,22 @@ pub fn parse_metric_value(exposition: &str, metric: &str) -> Option<f64> {
         })
 }
 
+/// Log a citable elapsed-time measurement at INFO level.
+///
+/// Test files under `tests/` each compile as their own crate (named after the
+/// file stem, e.g. `routing`), not `coxswain_e2e` — and the harness's tracing
+/// subscriber is a hardcoded `coxswain_e2e=debug,warn` filter
+/// (`harness/bootstrap.rs`), so a `tracing::info!` called directly from a test
+/// file is silently dropped regardless of `--no-capture` or `RUST_LOG`. This
+/// helper's call site is inside the `coxswain_e2e` crate, so its target
+/// matches the filter and the line actually appears under `cargo nextest run
+/// ... --no-capture`. Use this — not `println!`/`eprintln!` — whenever a test
+/// wants to surface a measured number for human citation (e.g. a route
+/// convergence latency to compare against an external benchmark).
+pub fn log_measurement(label: &str, elapsed: Duration) {
+    tracing::info!(elapsed_ms = elapsed.as_millis() as u64, "{label}");
+}
+
 /// Sum `coxswain_controller_reconcile_total{...,result="ok"}` across all
 /// `controller` labels. Returns `None` if no `result="ok"` series is present
 /// (the metric `observe_reconcile` labels a successful reconcile `result="ok"`).
