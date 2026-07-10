@@ -11,6 +11,10 @@
 //!   — migrated verbatim from `health.rs`.
 //! - `proxy_pod_emits_proxy_prefix_metrics` + `controller_pod_emits_controller_prefix_metrics`
 //!   — Prometheus surface scoped per pod role.
+//! - `convergence_stage_metrics_recorded_after_route_change` + `stage_metrics_are_role_scoped`
+//!   — #513 per-stage convergence timing: a route change advances every stage's
+//!   histogram sample count, and each stage's series is scoped to the pod role
+//!   that owns it (reflector stages controller-only, discovery-apply proxy-only).
 //! - `access_log_*` — five cases that pin the access-log contract: required
 //!   fields (including the new `route_id` join key), path-mode behaviour,
 //!   error-path emission, and disabled-mode silence.
@@ -217,6 +221,151 @@ async fn controller_pod_emits_controller_prefix_metrics() -> anyhow::Result<()> 
     assert!(
         !metrics.contains("coxswain_proxy_requests_total"),
         "controller-pod /metrics must NOT expose coxswain_proxy_requests_total"
+    );
+
+    Ok(())
+}
+
+/// Read a bare (no-label) Prometheus histogram/counter sample, defaulting to
+/// `0.0` when the series is absent — lets a before/after comparison treat
+/// "not yet registered" the same as "zero observations so far".
+fn count_or_zero(body: &str, metric: &str) -> f64 {
+    wait::parse_metric_value(body, metric).unwrap_or(0.0)
+}
+
+/// #513: a resource change that actually converges (the route starts serving)
+/// must advance every convergence-pipeline stage's histogram sample count past
+/// a pre-change baseline — debounce-wait and rebuild on the controller,
+/// snapshot-build and ack-latency on the discovery server (also the
+/// controller process), and snapshot-apply on the discovery client (the
+/// proxy process). Comparing against a captured baseline (rather than
+/// asserting bare presence) proves the pipeline is wired end-to-end for THIS
+/// convergence, not just that the series exist from an earlier one.
+#[tokio::test]
+async fn convergence_stage_metrics_recorded_after_route_change() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-conv").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let before_controller = reqwest::get(h.controller_admin_url("/metrics"))
+        .await?
+        .text()
+        .await?;
+    let before_proxy = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let before_debounce = count_or_zero(
+        &before_controller,
+        "coxswain_controller_reconcile_debounce_seconds_count",
+    );
+    let before_rebuild = count_or_zero(
+        &before_controller,
+        "coxswain_controller_routing_table_rebuild_duration_seconds_count",
+    );
+    let before_build = count_or_zero(
+        &before_controller,
+        "coxswain_discovery_snapshot_build_seconds_count",
+    );
+    let before_ack = count_or_zero(
+        &before_controller,
+        "coxswain_discovery_ack_latency_seconds_count",
+    );
+    let before_apply = count_or_zero(
+        &before_proxy,
+        "coxswain_discovery_snapshot_apply_seconds_count",
+    );
+
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    let host = format!("ingress.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+
+    wait::poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        || async {
+            "timed out waiting for convergence stage metrics to advance past their pre-change baseline"
+                .to_string()
+        },
+        || async {
+            let controller = reqwest::get(h.controller_admin_url("/metrics"))
+                .await
+                .ok()?
+                .text()
+                .await
+                .ok()?;
+            let proxy = reqwest::get(h.admin_url("/metrics")).await.ok()?.text().await.ok()?;
+            let advanced = count_or_zero(
+                &controller,
+                "coxswain_controller_reconcile_debounce_seconds_count",
+            ) > before_debounce
+                && count_or_zero(
+                    &controller,
+                    "coxswain_controller_routing_table_rebuild_duration_seconds_count",
+                ) > before_rebuild
+                && count_or_zero(&controller, "coxswain_discovery_snapshot_build_seconds_count")
+                    > before_build
+                && count_or_zero(&controller, "coxswain_discovery_ack_latency_seconds_count")
+                    > before_ack
+                && count_or_zero(&proxy, "coxswain_discovery_snapshot_apply_seconds_count")
+                    > before_apply;
+            advanced.then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// #513 role-scoping (sad path, companion to the happy-path test above):
+/// mirrors the `*_emits_*_prefix_metrics` role-split contract. Reflector
+/// stages (debounce, rebuild) and discovery-server stages (snapshot-build,
+/// ack-latency) live only on the controller process; post-#424 the shared
+/// proxy is a pure discovery client, never a reflector, and never runs the
+/// discovery server. The discovery-client apply stage is the mirror image —
+/// proxy-only. A stage metric leaking to the wrong role is the failure this
+/// test guards.
+#[tokio::test]
+async fn stage_metrics_are_role_scoped() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+
+    let controller = reqwest::get(h.controller_admin_url("/metrics"))
+        .await?
+        .text()
+        .await?;
+    let proxy = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+
+    assert!(
+        controller.contains("coxswain_controller_reconcile_debounce_seconds"),
+        "controller /metrics must expose the reflector debounce-wait stage"
+    );
+    assert!(
+        controller.contains("coxswain_discovery_snapshot_build_seconds"),
+        "controller /metrics must expose the discovery-server snapshot-build stage"
+    );
+    assert!(
+        proxy.contains("coxswain_discovery_snapshot_apply_seconds"),
+        "proxy /metrics must expose the discovery-client apply stage"
+    );
+
+    assert!(
+        !proxy.contains("coxswain_controller_reconcile_debounce_seconds"),
+        "proxy-pod /metrics must NOT expose the controller-only debounce stage"
+    );
+    assert!(
+        !proxy.contains("coxswain_controller_routing_table_rebuild_duration_seconds"),
+        "proxy-pod /metrics must NOT expose the controller-only rebuild stage"
+    );
+    assert!(
+        !proxy.contains("coxswain_discovery_snapshot_build_seconds"),
+        "proxy-pod /metrics must NOT expose the server-only snapshot-build stage"
+    );
+    assert!(
+        !proxy.contains("coxswain_discovery_ack_latency_seconds"),
+        "proxy-pod /metrics must NOT expose the server-only ack-latency stage"
+    );
+    assert!(
+        !controller.contains("coxswain_discovery_snapshot_apply_seconds"),
+        "controller-pod /metrics must NOT expose the proxy-only apply stage"
     );
 
     Ok(())

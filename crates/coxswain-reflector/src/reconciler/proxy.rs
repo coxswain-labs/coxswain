@@ -1883,12 +1883,21 @@ async fn spawn_tasks(
         let mut routing_table_published = false;
         loop {
             notify.notified().await;
+            // #513: the debounce-wait stage starts the instant the first watch
+            // event of this cycle is observed (here, not before — the loop was
+            // idle waiting for it) and ends when the trailing-edge timer fires
+            // uninterrupted. This is the "notify → debounce fire" leg of the
+            // convergence pipeline, measured independently of rebuild() cost
+            // so #512's adaptive-debounce work has a stage to shrink.
+            let debounce_start = std::time::Instant::now();
             loop {
                 tokio::select! {
                     _ = notify.notified() => {}
                     _ = tokio::time::sleep(Duration::from_millis(500)) => break,
                 }
             }
+            let debounce_wait = debounce_start.elapsed();
+            metrics.observe_debounce_wait(debounce_wait);
             // One VIP-Service read per rebuild (#472), shared by every builder.
             let vip_internal = crate::port_alloc::read_vip_internal_ports(&service_reader.state());
             let stores = ReflectorStores {
@@ -1961,8 +1970,24 @@ async fn spawn_tasks(
                 leader.load(Ordering::Acquire),
                 &outputs,
             );
+            let rebuild_duration = rebuild_start.elapsed();
             // Mirror routing-table size gauges and TLS cert counters from published snapshots.
-            record_rebuild_metrics(&metrics, &outputs, rebuild_start.elapsed(), published);
+            record_rebuild_metrics(&metrics, &outputs, rebuild_duration, published);
+            // #513: correlate this convergence across the reflector/discovery/proxy
+            // tiers by the rebuild sequence — `rebuild()` unconditionally stamps
+            // `publish_index` (proxy.rs `stamp_rebuild` call), so `current_seq()`
+            // here is exactly this rebuild's sequence. The discovery server logs
+            // the same seq (captured before its snapshot build) alongside the
+            // snapshot's content-hash `version`, letting an operator join a
+            // reflector log line to a discovery push by `seq` and a discovery
+            // push to a proxy apply by `version`.
+            tracing::debug!(
+                seq = outputs.publish_index.current_seq(),
+                published,
+                debounce_ms = debounce_wait.as_millis() as u64,
+                rebuild_ms = rebuild_duration.as_millis() as u64,
+                "convergence: routing table rebuilt"
+            );
             // First successful publish: flip the readiness checks that gate
             // `/readyz` on having an honest routing table. Subsequent rebuilds
             // do not re-touch the checks — `Ready` is idempotent and there is

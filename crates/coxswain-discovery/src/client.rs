@@ -698,7 +698,11 @@ impl Supervisor {
             let version = snapshot.version.clone();
             let nonce = snapshot.nonce.clone();
 
-            match apply_snapshot(
+            // #513: proxy-apply stage — decode every wire DTO and publish the
+            // routing cells. Timed regardless of outcome: a rejected (Nack'd)
+            // decode still pays most of this cost before failing.
+            let apply_start = std::time::Instant::now();
+            let apply_result = apply_snapshot(
                 &snapshot,
                 SnapshotCells {
                     ingress: &self.ingress,
@@ -712,7 +716,9 @@ impl Supervisor {
                     tcp: &self.tcp,
                     udp: &self.udp,
                 },
-            ) {
+            );
+            crate::metrics::snapshot_apply_seconds().observe(apply_start.elapsed().as_secs_f64());
+            match apply_result {
                 Ok(()) => {
                     debug!(version, "discovery snapshot applied; sending Ack");
                     let ack = p::ClientMessage {
