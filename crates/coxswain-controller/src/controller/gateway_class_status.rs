@@ -57,6 +57,7 @@ pub(super) const SUPPORTED_FEATURES: &[&str] = &[
     "TLSRoute",
     "TLSRouteModeMixed",
     "TLSRouteModeTerminate",
+    "UDPRoute",
 ];
 
 /// Returns true when the GatewayClass status needs to be (re-)patched.

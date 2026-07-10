@@ -490,6 +490,22 @@ pub const TCP_ROUTE: &str = fixture!("tcp_route.yaml");
 /// Placeholders: `GATEWAY_TCP_PROXY_PORT`.
 pub const TCP_ROUTE_GW_ONLY: &str = fixture!("tcp_route_gw_only.yaml");
 
+// ── UDP proxy (UDPRoute / GEP-2645, #506) ─────────────────────────────────────
+
+/// Gateway with `protocol: UDP` + UDPRoute (GEP-2645, #506). The proxy
+/// session-tracks each client 5-tuple and forwards its datagrams to the bound
+/// backend — no SNI peek, no TLS, no HTTP parsing.
+/// Placeholders: `GATEWAY_UDP_PROXY_PORT`.
+pub const UDP_ROUTE: &str = fixture!("udp_route.yaml");
+
+/// Gateway with a `protocol: UDP` listener only (no UDPRoute).
+/// Used to verify the Gateway becomes `Programmed=True` even with zero routes,
+/// and that inbound datagrams get no reply (no backend to forward to) — the
+/// sad-path assertion is timeout-based, not error-based, since UDP has no
+/// connect-time failure signal.
+/// Placeholders: `GATEWAY_UDP_PROXY_PORT`.
+pub const UDP_ROUTE_GW_ONLY: &str = fixture!("udp_route_gw_only.yaml");
+
 // ── TLS terminate (TLSRouteModeTerminate, #481) ───────────────────────────────
 
 /// Gateway with `protocol: TLS, tls.mode: Terminate` + TLSRoute to a plaintext backend.

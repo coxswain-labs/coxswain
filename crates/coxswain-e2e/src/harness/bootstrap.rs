@@ -35,6 +35,8 @@ pub const GATEWAY_HTTPS_PORT: u16 = 8443;
 pub const GATEWAY_TLS_PASSTHROUGH_PORT: u16 = 8444;
 /// Port pre-declared in the gateway Service for raw TCP-proxy listeners (TCPRoute, GEP-1901, #505).
 pub const GATEWAY_TCP_PROXY_PORT: u16 = 8445;
+/// Port pre-declared in the gateway Service for UDP-proxy listeners (UDPRoute, GEP-2645, #506).
+pub const GATEWAY_UDP_PROXY_PORT: u16 = 8446;
 
 /// The local Kubernetes cluster distribution detected from the current context.
 #[derive(Debug, Clone)]
@@ -998,11 +1000,12 @@ async fn cert_manager_installed() -> bool {
 /// list is invisible to both checks, so a cluster carrying an older Gateway API CRD
 /// set (missing the newest addition) is wrongly treated as fully provisioned. See
 /// the `gateway_v1_crds_installed` doc comment for the incident this guards against.
-const REQUIRED_GATEWAY_API_CRDS: [&str; 4] = [
+const REQUIRED_GATEWAY_API_CRDS: [&str; 5] = [
     "gateways.gateway.networking.k8s.io",
     "httproutes.gateway.networking.k8s.io",
     "referencegrants.gateway.networking.k8s.io",
     "tcproutes.gateway.networking.k8s.io",
+    "udproutes.gateway.networking.k8s.io",
 ];
 
 /// Returns `true` only if every CRD in [`REQUIRED_GATEWAY_API_CRDS`] is served at v1.

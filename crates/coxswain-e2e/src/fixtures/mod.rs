@@ -151,6 +151,7 @@ fn prepare_fixture_content(path: &Path, vars: FixtureVars) -> anyhow::Result<(St
 
     // Pinned external images: single source of truth in `images`.
     content = substitute(&content, "ECHO_IMAGE", images::ECHO);
+    content = substitute(&content, "ECHO_UDP_IMAGE", images::ECHO_UDP);
     content = substitute(&content, "BUSYBOX_IMAGE", images::BUSYBOX);
     content = substitute(&content, "WEBSOCKET_ECHO_IMAGE", images::WEBSOCKET_ECHO);
     content = substitute(&content, "GO_HTTPBIN_IMAGE", images::GO_HTTPBIN);

@@ -18,7 +18,7 @@
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, GeneratedCert, Harness, MtlsCerts, NamespaceGuard,
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress},
-    harness::{GATEWAY_TCP_PROXY_PORT, GATEWAY_TLS_PASSTHROUGH_PORT, wait},
+    harness::{GATEWAY_TCP_PROXY_PORT, GATEWAY_TLS_PASSTHROUGH_PORT, GATEWAY_UDP_PROXY_PORT, wait},
 };
 use gateway_api_types::apis::standard::gateways::Gateway;
 use gateway_api_types::apis::standard::grpcroutes::GrpcRoute;
@@ -646,12 +646,21 @@ async fn gateway_listener_protocol_validation() -> anyhow::Result<()> {
     );
 
     // ── mixed: Gateway accepted (True) but reason ListenersNotValid ──
-    wait::wait_for_gateway_condition(
+    //
+    // Waits for the reason too, not just the status: the controller
+    // reconciles a freshly-created Gateway immediately, independent of the
+    // reflector's async per-listener protocol validation, so this Gateway can
+    // transiently report Accepted=True/Accepted (no listener snapshot yet)
+    // before a later reconcile corrects it to Accepted=True/ListenersNotValid.
+    // wait_for_gateway_condition (status-only) would return on that transient
+    // match and flake this assertion.
+    wait::wait_for_gateway_condition_reason(
         &h.client,
         "coxswain-mixed",
         &ns.name,
         "Accepted",
         "True",
+        "ListenersNotValid",
         Duration::from_secs(60),
     )
     .await?;
@@ -2236,6 +2245,90 @@ async fn tcp_listener_reports_tcp_route_in_supported_kinds() -> anyhow::Result<(
         listener_supported_kinds(&gw, "tcp-proxy"),
         Some(vec!["TCPRoute".to_string()]),
         "protocol:TCP listener must report supportedKinds=[TCPRoute], not HTTPRoute"
+    );
+
+    Ok(())
+}
+
+/// A UDPRoute on a `protocol: UDP` listener bumps that listener's
+/// `attachedRoutes` to 1. Guards the same class of bug as #470 for TLSRoute/TCPRoute:
+/// `count_attached_routes` must recognise `UdpProxy` readiness as its own
+/// route-attach kind, not silently fall through the HTTP/GRPC default.
+#[tokio::test]
+async fn udp_route_counted_in_listener_attached_routes() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-udp-attached").await?;
+
+    fixtures::apply_fixture(
+        gwa::UDP_ROUTE,
+        FixtureVars::new(&ns.name).with(
+            "GATEWAY_UDP_PROXY_PORT",
+            &GATEWAY_UDP_PROXY_PORT.to_string(),
+        ),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let observed = gw_api.get("coxswain-udp-gw").await.ok().map_or_else(
+                || "<could not fetch Gateway>".to_string(),
+                |gw| {
+                    format!(
+                        "attachedRoutes={:?}",
+                        listener_attached_routes(&gw, "udp-proxy")
+                    )
+                },
+            );
+            format!(
+                "Gateway coxswain-udp-gw listener 'udp-proxy' to report \
+                 attachedRoutes=1; observed {observed}"
+            )
+        },
+        || async {
+            let gw = gw_api.get("coxswain-udp-gw").await.ok()?;
+            (listener_attached_routes(&gw, "udp-proxy") == Some(1)).then_some(())
+        },
+    )
+    .await
+}
+
+/// A `protocol: UDP` listener reports `UDPRoute` in its `supportedKinds` — not
+/// `HTTPRoute`. Guards the same class of bug as the TLS/Terminate and TCP cases
+/// above: `listener_route_kind_info` must recognise `protocol: UDP` as its own
+/// kind, not default to HTTPRoute.
+#[tokio::test]
+async fn udp_listener_reports_udp_route_in_supported_kinds() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-udp-kinds").await?;
+
+    fixtures::apply_fixture(
+        gwa::UDP_ROUTE,
+        FixtureVars::new(&ns.name).with(
+            "GATEWAY_UDP_PROXY_PORT",
+            &GATEWAY_UDP_PROXY_PORT.to_string(),
+        ),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-udp-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let gw = gw_api.get("coxswain-udp-gw").await?;
+    assert_eq!(
+        listener_supported_kinds(&gw, "udp-proxy"),
+        Some(vec!["UDPRoute".to_string()]),
+        "protocol:UDP listener must report supportedKinds=[UDPRoute], not HTTPRoute"
     );
 
     Ok(())

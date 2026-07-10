@@ -1,24 +1,23 @@
 # Gateway API guide
 
-Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) standard channel. It supports `GatewayClass`, `Gateway`, `ListenerSet`, `HTTPRoute`, `GRPCRoute`, and `TLSRoute` resources.
+Coxswain implements the [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) standard channel. It supports `GatewayClass`, `Gateway`, `ListenerSet`, `HTTPRoute`, `GRPCRoute`, `TLSRoute`, `TCPRoute`, and `UDPRoute` resources.
 
 ## Supported resources
 
 | Resource | API version | Support |
 |----------|-------------|---------|
 | `GatewayClass` | `gateway.networking.k8s.io/v1` | Full |
-| `Gateway` | `gateway.networking.k8s.io/v1` | HTTP, HTTPS, and TLS passthrough listeners |
+| `Gateway` | `gateway.networking.k8s.io/v1` | HTTP, HTTPS, TLS passthrough/terminate, TCP, and UDP listeners |
 | `ListenerSet` | `gateway.networking.k8s.io/v1` | Attach listeners to a Gateway across namespaces — see the [ListenerSet guide](listener-sets.md) |
 | `HTTPRoute` | `gateway.networking.k8s.io/v1` | Path, header, method, and query matching; weighted traffic split |
 | `GRPCRoute` | `gateway.networking.k8s.io/v1` | Service and method matching; cleartext h2c backends |
-| `TLSRoute` | `gateway.networking.k8s.io/v1alpha2` | SNI-keyed L4 passthrough; no TLS termination at proxy |
+| `TLSRoute` | `gateway.networking.k8s.io/v1` | SNI-keyed L4 passthrough and/or terminate — see [below](#tlsroute) |
+| `TCPRoute` | `gateway.networking.k8s.io/v1` | Raw TCP proxy, port-keyed — see [below](#tcproute) |
+| `UDPRoute` | `gateway.networking.k8s.io/v1` | Session-tracked UDP datagram forwarding, port-keyed — see [below](#udproute) |
 | `ReferenceGrant` | `gateway.networking.k8s.io/v1beta1` | Cross-namespace backend and certificate access |
 | `BackendTLSPolicy` | `gateway.networking.k8s.io/v1` | Upstream TLS configuration referencing a CA `ConfigMap` or `Secret` |
 | `CoxswainBackendPolicy` | `gateway.coxswain-labs.dev/v1alpha1` | Coxswain-native per-`Service` connection policy: connect/idle timeouts, load-balancing algorithm, circuit breaker — see [below](#coxswainbackendpolicy) |
 | `CoxswainExternalAuth` | `gateway.coxswain-labs.dev/v1alpha1` | External authorization (`ext_authz`, HTTP or gRPC) as an HTTPRoute `ExtensionRef` filter or a Gateway-attached `targetRefs` policy — see [below](#external-authorization-ext_authz) |
-
-!!! warning "Not supported"
-    `TCPRoute` and `UDPRoute` are not implemented.
 
 ## GatewayClass
 
@@ -1226,3 +1225,131 @@ spec:
 
 !!! note
     Both listeners must use distinct hostnames on the shared port. An SNI that matches neither listener is dropped — the proxy never falls through from one table to the other.
+
+## TCPRoute
+
+A `TCPRoute` routes raw TCP connections purely by listener port — there is no SNI or hostname dimension, and no HTTP-layer parsing. The proxy dials the bound backend on accept and splices the two byte streams together (GEP-1901).
+
+### Gateway listener
+
+Use `protocol: TCP`. A `TCP` listener never shares a port with another protocol — Gateway API's own port-compatibility rules exclude the combination.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+  namespace: default
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: tcp-proxy
+      port: 5432
+      protocol: TCP
+      allowedRoutes:
+        namespaces:
+          from: Same
+```
+
+### Example
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: TCPRoute
+metadata:
+  name: my-tcp-route
+  namespace: default
+spec:
+  parentRefs:
+    - name: my-gateway
+  rules:
+    - backendRefs:
+        - name: my-tcp-service
+          port: 5432
+```
+
+### Supported fields
+
+| Field | Support |
+|-------|---------|
+| `spec.parentRefs` | Full (including `sectionName` and `port`) |
+| `spec.rules[].backendRefs` | Service backends only |
+| `spec.rules[].backendRefs[].weight` | Full |
+
+The Standard channel constrains `TCPRoute` to exactly one rule with no matches; when two `TCPRoute`s bind the same listener port, the highest-precedence route (oldest `creationTimestamp`, then name) wins.
+
+### Status conditions
+
+| Condition | True when |
+|-----------|-----------|
+| `Accepted` | The route is attached to a `protocol: TCP` listener |
+| `ResolvedRefs` | All `backendRefs` resolve to a reachable Service |
+
+```bash
+kubectl describe tcproute my-tcp-route
+```
+
+## UDPRoute
+
+A `UDPRoute` forwards UDP datagrams purely by listener port — same port-keyed model as `TCPRoute`, no SNI or hostname dimension (GEP-2645).
+
+UDP is connectionless, so the proxy can't reuse a dial-once-and-splice model. Instead, the first datagram from a client address picks a backend (via the same weighted load-balancing as every other route kind) and pins it for that client's session; a background task relays the backend's replies back to the client. A session with no activity for `--proxy-udp-session-timeout` (default `10s`) is evicted — the next datagram from that client picks a backend afresh.
+
+### Gateway listener
+
+Use `protocol: UDP`. Like `TCP`, a `UDP` listener never shares a port with another protocol.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: my-gateway
+  namespace: default
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: udp-proxy
+      port: 5353
+      protocol: UDP
+      allowedRoutes:
+        namespaces:
+          from: Same
+```
+
+### Example
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: UDPRoute
+metadata:
+  name: my-udp-route
+  namespace: default
+spec:
+  parentRefs:
+    - name: my-gateway
+  rules:
+    - backendRefs:
+        - name: my-udp-service
+          port: 5353
+```
+
+### Supported fields
+
+| Field | Support |
+|-------|---------|
+| `spec.parentRefs` | Full (including `sectionName` and `port`) |
+| `spec.rules[].backendRefs` | Service backends only |
+| `spec.rules[].backendRefs[].weight` | Full — each new client session picks a backend independently, so weights converge across sessions rather than within a single client's traffic |
+
+The Standard channel constrains `UDPRoute` to exactly one rule with no matches; when two `UDPRoute`s bind the same listener port, the highest-precedence route (oldest `creationTimestamp`, then name) wins.
+
+### Status conditions
+
+| Condition | True when |
+|-----------|-----------|
+| `Accepted` | The route is attached to a `protocol: UDP` listener |
+| `ResolvedRefs` | All `backendRefs` resolve to a reachable Service |
+
+```bash
+kubectl describe udproute my-udp-route
+```

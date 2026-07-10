@@ -318,6 +318,31 @@ pub(crate) struct ProxyArgs {
     )]
     pub proxy_tls_passthrough_dial_timeout: Duration,
 
+    /// Idle timeout for a UDPRoute session (#506).
+    ///
+    /// Not a connect timeout — UDP `connect()` is a local operation with no
+    /// handshake. A UDPRoute session is a client 5-tuple pinned to a backend;
+    /// this bounds how long that pin and its reply-forwarding task stay alive
+    /// between datagrams before the proxy evicts it (the next datagram from
+    /// that client re-selects a backend as a fresh session).
+    ///
+    /// Kept short by default: a session's server-side lifetime is decoupled
+    /// from how fast its exchange actually completes (UDP has no protocol-level
+    /// "done" signal), so it always lingers for the full timeout even after a
+    /// one-shot request/response (DNS-shaped) has already finished. A long
+    /// default compounds badly under bursty short-lived traffic — thousands of
+    /// completed-but-still-lingering sessions can exhaust the per-listener
+    /// session table in seconds.
+    ///
+    /// Accepts human-readable durations: `5s`, `30s`.
+    #[arg(
+        long,
+        env = "COXSWAIN_PROXY_UDP_SESSION_TIMEOUT",
+        default_value = "10s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub proxy_udp_session_timeout: Duration,
+
     /// Enable HAProxy PROXY protocol v1/v2 on **Ingress** listeners.
     ///
     /// When set, every connection accepted on the Ingress HTTP/HTTPS ports

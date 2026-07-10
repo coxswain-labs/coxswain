@@ -1,0 +1,56 @@
+# UDP echo backend for UDPRoute e2e tests (#506).
+# Uses registry.k8s.io/gateway-api/echo-basic with UDP_ECHO_SERVER=1 — the same
+# image reference upstream's own UDPRoute conformance tests use. Returns a JSON
+# envelope { request, namespace, ingress, service, pod } echoing the sent bytes
+# plus pod identity (injected via Downward API), so tests can assert which
+# backend served a datagram.
+#
+# Applied per-test-namespace via apply_fixture(BACKENDS_UDP_ECHO, &ns.name, &[]).
+# Port 3000 matches the other echo fixtures' convention.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: udp-echo-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: udp-echo-a
+  template:
+    metadata:
+      labels:
+        app: udp-echo-a
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: echo
+          image: ${ECHO_UDP_IMAGE}
+          ports:
+            - containerPort: 3000
+              protocol: UDP
+          env:
+            - name: UDP_ECHO_SERVER
+              value: "1"
+            - name: UDP_PORT
+              value: "3000"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: udp-echo-a
+spec:
+  selector:
+    app: udp-echo-a
+  ports:
+    - port: 3000
+      targetPort: 3000
+      protocol: UDP

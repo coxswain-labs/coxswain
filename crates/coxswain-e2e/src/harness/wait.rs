@@ -1144,6 +1144,56 @@ pub async fn wait_for_gateway_condition(
     .await
 }
 
+/// Poll until the named Gateway has a top-level condition with the given
+/// type, status, AND reason. Plain status alone is not enough for conditions
+/// whose reason can change without a status flip: the controller reconciles
+/// the Gateway the moment it's created (independent of the reflector's async
+/// listener-protocol validation), so a freshly-created Gateway can briefly
+/// report `Accepted=True/Accepted` (no listener snapshot yet, defaults to
+/// healthy) before a later reconcile — driven once the reflector actually
+/// computes and stores per-listener readiness — corrects it to
+/// `Accepted=True/ListenersNotValid`. [`wait_for_gateway_condition`] would
+/// return on the first (transient) match; use this instead whenever the
+/// specific reason, not just the status, is part of what's under test.
+pub async fn wait_for_gateway_condition_reason(
+    client: &kube::Client,
+    name: &str,
+    namespace: &str,
+    type_: &str,
+    status: &str,
+    reason: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let api: Api<Gateway> = Api::namespaced(client.clone(), namespace);
+    poll_until(
+        timeout,
+        POLL,
+        || async {
+            format!(
+                "Gateway {namespace}/{name} to have condition {type_}={status}({reason}); observed {}",
+                gateway_state(&api, name).await
+            )
+        },
+        || async {
+            api.get(name)
+                .await
+                .ok()
+                .filter(|gw| {
+                    gw.status
+                        .as_ref()
+                        .and_then(|s| s.conditions.as_deref())
+                        .is_some_and(|conds| {
+                            conds
+                                .iter()
+                                .any(|c| c.type_ == type_ && c.status == status && c.reason == reason)
+                        })
+                })
+                .map(|_| ())
+        },
+    )
+    .await
+}
+
 /// Poll until the named Gateway's per-listener status has a condition with the given type and status.
 pub async fn wait_for_gateway_listener_condition(
     client: &kube::Client,

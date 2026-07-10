@@ -32,6 +32,7 @@ func TestConformance(t *testing.T) {
 		suite.GatewayGRPCConformanceProfileName,
 		suite.GatewayTLSConformanceProfileName,
 		suite.GatewayTCPConformanceProfileName,
+		suite.GatewayUDPConformanceProfileName,
 	}
 
 	// Declare only features that are currently implemented.
@@ -114,6 +115,8 @@ func TestConformance(t *testing.T) {
 		features.SupportTLSRouteModeMixed,
 		// Standard: TCPRoute — GEP-1901 (#505)
 		features.SupportTCPRoute,
+		// Standard: UDPRoute — GEP-2645 (#506)
+		features.SupportUDPRoute,
 		// Standard: ListenerSet — GEP-1713 (#93)
 		features.SupportListenerSet,
 		// Extended: Gateway infrastructure metadata propagation — GEP-1867 (#482).

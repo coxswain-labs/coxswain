@@ -63,6 +63,7 @@ fn source_with_two_gateways() -> SnapshotSource {
         passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         tcp_routes: coxswain_core::routing::SharedTcpRouteTable::new(),
+        udp_routes: coxswain_core::routing::SharedUdpRouteTable::new(),
         publish: SharedGatewayPublishIndex::new(),
     };
 

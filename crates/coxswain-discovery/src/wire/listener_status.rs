@@ -111,6 +111,7 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
         }
         ListenerReadiness::TlsTerminate => (p::ListenerReadiness::TlsTerminate, String::new()),
         ListenerReadiness::TcpProxy => (p::ListenerReadiness::TcpProxy, String::new()),
+        ListenerReadiness::UdpProxy => (p::ListenerReadiness::UdpProxy, String::new()),
         // A shared-mode HTTPS/TLS listener still waiting for its VIP internal port
         // (#472). It has no dedicated wire value: the distinction is proxy-invisible
         // and transient (the next rebuild replaces it with the resolved outcome).

@@ -10,7 +10,7 @@
 
 use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
-    SharedTlsPassthroughTable,
+    SharedTlsPassthroughTable, SharedUdpRouteTable,
 };
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
 
@@ -33,12 +33,13 @@ pub struct KubernetesSource {
     passthrough_routes: SharedTlsPassthroughTable,
     terminate_routes: SharedTlsPassthroughTable,
     tcp_routes: SharedTcpRouteTable,
+    udp_routes: SharedUdpRouteTable,
 }
 
 /// The L4 routing-table handles [`KubernetesSource::new`] groups to stay under
-/// the workspace 7-argument limit: TLS passthrough, TLS terminate (#481), and
-/// TCP proxy (#505) — the three port-keyed tables that bypass the L7 routing
-/// tables entirely.
+/// the workspace 7-argument limit: TLS passthrough, TLS terminate (#481),
+/// TCP proxy (#505), and UDP proxy (#506) — the four port-keyed tables that
+/// bypass the L7 routing tables entirely.
 // intentionally open: field-literal constructed by callers of `KubernetesSource::new`.
 pub struct L4RoutingTables {
     /// SNI-keyed routing table for TLSRoute `mode: Passthrough` listeners.
@@ -47,6 +48,8 @@ pub struct L4RoutingTables {
     pub terminate_routes: SharedTlsPassthroughTable,
     /// Port-keyed routing table for TCPRoute listeners (#505).
     pub tcp_routes: SharedTcpRouteTable,
+    /// Port-keyed routing table for UDPRoute listeners (#506).
+    pub udp_routes: SharedUdpRouteTable,
 }
 
 impl KubernetesSource {
@@ -69,6 +72,7 @@ impl KubernetesSource {
             passthrough_routes: l4_tables.passthrough_routes,
             terminate_routes: l4_tables.terminate_routes,
             tcp_routes: l4_tables.tcp_routes,
+            udp_routes: l4_tables.udp_routes,
         }
     }
 }
@@ -104,5 +108,9 @@ impl RoutingSource for KubernetesSource {
 
     fn tcp_routes(&self) -> SharedTcpRouteTable {
         self.tcp_routes.clone()
+    }
+
+    fn udp_routes(&self) -> SharedUdpRouteTable {
+        self.udp_routes.clone()
     }
 }

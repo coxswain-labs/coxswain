@@ -20,6 +20,19 @@
 /// metadata so tests can assert which backend served a request.
 pub(crate) const ECHO: &str = "gcr.io/k8s-staging-gateway-api/echo-basic:v20260314-v1.5.1@sha256:1930f87f9a037f8acadc37e79185bb217614d9674304e3c1f6074aec8ff6b8dc";
 
+/// `echo-basic` with `UDP_ECHO_SERVER` support (UDPRoute e2e, #506).
+///
+/// The shared [`ECHO`] tag predates upstream's `UDP_ECHO_SERVER` gate (verified:
+/// running it with `UDP_ECHO_SERVER=1` produces no "UDP server listening" log
+/// line), so UDPRoute tests use this separate, newer tag instead of bumping the
+/// shared constant — containing blast radius to the one suite that needs it
+/// rather than risking every HTTP/TLS/security suite on an untested bump. This
+/// is the exact image reference upstream's own `UDPRoute` conformance test
+/// manifests use (`base/manifests.yaml` / `tests/udproute-*.yaml` in
+/// `sigs.k8s.io/gateway-api/conformance`), confirmed to honor
+/// `UDP_ECHO_SERVER=1` + `UDP_PORT`.
+pub(crate) const ECHO_UDP: &str = "registry.k8s.io/gateway-api/echo-basic:v1.6.0-dev.2@sha256:5dd376a93d8ec7cb8c15b46973bdb1c686db48135058d2606f2e0cf30f8dd63d";
+
 /// `busybox` — used by `slow_echo` for an `nc`/`sleep` upstream that drives
 /// request/connect timeout assertions.
 pub(crate) const BUSYBOX: &str =

@@ -22,7 +22,7 @@ use coxswain_e2e::{
     ControllerOptions, ControllerProcess, FixtureVars, Harness, HttpClient, IngressClassGuard,
     NamespaceGuard, bootstrap,
     fixtures::{self, backends, gateway_api as gwa, ingress},
-    harness::{GATEWAY_TCP_PROXY_PORT, http, wait},
+    harness::{GATEWAY_TCP_PROXY_PORT, GATEWAY_UDP_PROXY_PORT, http, wait},
 };
 use gateway_api_types::apis::standard::httproutes::HttpRoute;
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
@@ -2774,4 +2774,136 @@ async fn try_tcp_proxy(addr: &std::net::SocketAddr, req: &str) -> anyhow::Result
         .split_once("\r\n\r\n")
         .map(|(_, body)| body.to_string())
         .unwrap_or_default())
+}
+
+// ── UDP proxy (UDPRoute / GEP-2645, #506) ─────────────────────────────────────
+
+/// Happy path: a `protocol: UDP` listener + UDPRoute forwards a client's
+/// datagram to the bound backend and relays the reply back to the client.
+#[tokio::test]
+async fn udp_route_forwards_datagram_to_backend() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-udp-happy").await?;
+
+    fixtures::apply_fixture(backends::UDP_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["udp-echo-a"]).await?;
+
+    fixtures::apply_fixture(
+        gwa::UDP_ROUTE,
+        FixtureVars::new(&ns.name).with(
+            "GATEWAY_UDP_PROXY_PORT",
+            &GATEWAY_UDP_PROXY_PORT.to_string(),
+        ),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-udp-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let udp_addr = h.gateway_udp_addr(&ns.name).await?;
+    let body = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { "UDPRoute to become live".to_string() },
+        || async {
+            try_udp_proxy(&udp_addr, b"hello-udp", Duration::from_secs(2))
+                .await
+                .ok()
+        },
+    )
+    .await?;
+
+    let echo: http::EchoResponse = serde_json::from_str(&body).context("parse echo JSON body")?;
+    echo.assert_backend("udp-echo-a");
+
+    Ok(())
+}
+
+/// Sad path: a `protocol: UDP` listener exists but zero UDPRoutes are attached.
+///
+/// The Gateway should still become `Programmed=True` (the listener
+/// configuration is valid even with no routes attached). Unlike TCP, UDP has
+/// no connect-time failure signal — a datagram sent to an unrouted port is
+/// simply never replied to, so the sad-path assertion is a timeout, not a
+/// connection error.
+#[tokio::test]
+async fn udp_listener_without_route_drops_datagram() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-udp-noroute").await?;
+
+    // Apply only the Gateway (no UDPRoute).
+    fixtures::apply_fixture(
+        gwa::UDP_ROUTE_GW_ONLY,
+        FixtureVars::new(&ns.name).with(
+            "GATEWAY_UDP_PROXY_PORT",
+            &GATEWAY_UDP_PROXY_PORT.to_string(),
+        ),
+    )
+    .await?;
+
+    // Gateway should become Programmed even with no routes.
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-udp-gw-only",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // A datagram to the UDP-proxy port with no UDPRoute attached gets no reply.
+    let udp_addr = h.gateway_udp_addr(&ns.name).await?;
+    let result = try_udp_proxy(&udp_addr, b"hello-udp", Duration::from_secs(3)).await;
+
+    assert!(
+        result.is_err(),
+        "expected no reply with no UDPRoute attached, got a response",
+    );
+
+    Ok(())
+}
+
+/// Send `payload` as one UDP datagram to `addr` and wait up to `timeout` for a
+/// reply, returning it as a UTF-8 string.
+///
+/// No TLS, no per-datagram framing — the proxy forwards the raw payload as-is;
+/// `payload` happens to be plain bytes the UDP echo backend wraps in its own
+/// JSON envelope, so the caller parses that envelope from the returned string.
+///
+/// # Errors
+///
+/// Returns an error if the socket bind/connect/send fails, or if no reply
+/// arrives within `timeout` — the latter is exactly what the sad-path test
+/// asserts on (UDP has no connect-time failure signal, only silence).
+async fn try_udp_proxy(
+    addr: &std::net::SocketAddr,
+    payload: &[u8],
+    timeout: Duration,
+) -> anyhow::Result<String> {
+    let bind_addr = if addr.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = tokio::net::UdpSocket::bind(bind_addr)
+        .await
+        .context("UDP bind")?;
+    socket.connect(addr).await.context("UDP connect")?;
+    socket.send(payload).await.context("send datagram")?;
+
+    let mut buf = [0u8; 4096];
+    let n = tokio::time::timeout(timeout, socket.recv(&mut buf))
+        .await
+        .context("timed out waiting for UDP reply")?
+        .context("recv datagram")?;
+
+    Ok(String::from_utf8_lossy(&buf[..n]).to_string())
 }

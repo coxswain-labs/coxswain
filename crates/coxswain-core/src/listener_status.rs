@@ -171,6 +171,14 @@ pub enum ListenerReadiness {
     /// exactly one mode. The data plane creates a `ListenerProtocol::Tcp`
     /// listener on this port.
     TcpProxy,
+    /// `protocol: UDP` listener (GEP-2645 / `UDPRoute`).
+    ///
+    /// The proxy forwards datagrams to the bound backend purely by listener
+    /// port — no certificate, no SNI, no HTTP parsing, and (unlike TCP) no
+    /// persistent connection: each client 5-tuple gets a session-tracked
+    /// backend pick with idle eviction. The data plane creates a
+    /// `ListenerProtocol::Udp` listener on this port.
+    UdpProxy,
 }
 
 impl ListenerReadiness {
@@ -203,6 +211,7 @@ impl ListenerReadiness {
                 | Self::TlsPassthrough
                 | Self::TlsTerminate
                 | Self::TcpProxy
+                | Self::UdpProxy
         )
     }
 
@@ -222,7 +231,8 @@ impl ListenerReadiness {
             | Self::Resolved
             | Self::TlsPassthrough
             | Self::TlsTerminate
-            | Self::TcpProxy => "Resolved",
+            | Self::TcpProxy
+            | Self::UdpProxy => "Resolved",
         }
     }
 
@@ -242,7 +252,8 @@ impl ListenerReadiness {
             | Self::Resolved
             | Self::TlsPassthrough
             | Self::TlsTerminate
-            | Self::TcpProxy => "",
+            | Self::TcpProxy
+            | Self::UdpProxy => "",
         }
     }
 
@@ -270,15 +281,24 @@ impl ListenerReadiness {
     pub fn is_tcp_proxy(&self) -> bool {
         matches!(self, Self::TcpProxy)
     }
+
+    /// Returns `true` when this is a `UDP` proxy listener (GEP-2645 / `UDPRoute`).
+    ///
+    /// Used by the bin layer to drive a `Udp`-protocol listener on this port.
+    #[must_use]
+    pub fn is_udp_proxy(&self) -> bool {
+        matches!(self, Self::UdpProxy)
+    }
 }
 
 /// The Gateway listener `protocol` values coxswain implements routing for.
 ///
 /// `HTTP` (cleartext L7), `HTTPS` (TLS-terminated L7), `TLS`
-/// (passthrough/terminate L4, GEP-2643), and `TCP` (raw L4 proxy, GEP-1901). A
-/// listener declaring any other protocol is not Accepted — see
-/// [`is_supported_listener_protocol`] and [`ListenerReadiness::UnsupportedProtocol`].
-pub const SUPPORTED_LISTENER_PROTOCOLS: [&str; 4] = ["HTTP", "HTTPS", "TLS", "TCP"];
+/// (passthrough/terminate L4, GEP-2643), `TCP` (raw L4 proxy, GEP-1901), and
+/// `UDP` (datagram L4 proxy, GEP-2645). A listener declaring any other
+/// protocol is not Accepted — see [`is_supported_listener_protocol`] and
+/// [`ListenerReadiness::UnsupportedProtocol`].
+pub const SUPPORTED_LISTENER_PROTOCOLS: [&str; 5] = ["HTTP", "HTTPS", "TLS", "TCP", "UDP"];
 
 /// Whether `protocol` is one coxswain routes ([`SUPPORTED_LISTENER_PROTOCOLS`]).
 ///

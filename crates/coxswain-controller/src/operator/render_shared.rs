@@ -11,8 +11,8 @@
 //! shared↔dedicated migration never entangles the two lifecycles.
 
 use super::render::{
-    SHARED_GATEWAY_VIP_COMPONENT, final_labels, gateway_owner_reference, overlay_infra_annotations,
-    service_type_to_k8s_string,
+    SHARED_GATEWAY_VIP_COMPONENT, final_labels, gateway_owner_reference, k8s_service_protocol,
+    overlay_infra_annotations, service_type_to_k8s_string,
 };
 use coxswain_core::crd::ServiceType;
 use coxswain_reflector::EffectiveListenerPort;
@@ -272,7 +272,7 @@ fn shared_service_ports(
             name: Some(listener.name.clone()),
             port: i32::from(listener.port),
             target_port: Some(IntOrString::Int(i32::from(internal))),
-            protocol: Some("TCP".to_string()),
+            protocol: Some(k8s_service_protocol(&listener.protocol).to_string()),
             ..Default::default()
         });
     }

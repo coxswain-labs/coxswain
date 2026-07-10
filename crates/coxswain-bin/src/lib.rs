@@ -176,6 +176,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         passthrough_routes: status_writer.outputs.passthrough_routes.clone(),
         terminate_routes: status_writer.outputs.terminate_routes.clone(),
         tcp_routes: status_writer.outputs.tcp_routes.clone(),
+        udp_routes: status_writer.outputs.udp_routes.clone(),
         publish: publish_index.clone(),
     };
     let discovery_service = coxswain_discovery::DiscoveryService::new(
@@ -553,7 +554,9 @@ fn wire_gateway_only_proxy_services(
             table: source.passthrough_routes(),
             terminate_table: source.terminate_routes(),
             tcp_table: source.tcp_routes(),
+            udp_table: source.udp_routes(),
             dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+            udp_session_timeout: proxy.proxy_udp_session_timeout,
         },
     )
     .context("build dedicated GatewayProxy acceptor")?;
@@ -722,7 +725,9 @@ fn wire_proxy_services(
                     table: source.passthrough_routes(),
                     terminate_table: source.terminate_routes(),
                     tcp_table: source.tcp_routes(),
+                    udp_table: source.udp_routes(),
                     dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+                    udp_session_timeout: proxy.proxy_udp_session_timeout,
                 },
             )
             .context("build IngressProxy acceptor")?,
@@ -750,7 +755,9 @@ fn wire_proxy_services(
             table: source.passthrough_routes(),
             terminate_table: source.terminate_routes(),
             tcp_table: source.tcp_routes(),
+            udp_table: source.udp_routes(),
             dial_timeout: proxy.proxy_tls_passthrough_dial_timeout,
+            udp_session_timeout: proxy.proxy_udp_session_timeout,
         },
     )
     .context("build GatewayProxy acceptor")?;
@@ -1223,6 +1230,8 @@ impl pingora_core::services::background::BackgroundService for GrpcAuthChannelGc
 /// - TLSRoute (any) + HTTPS terminate on the same port → `TlsHybrid`
 /// - TCPRoute (`TcpProxy` readiness) → `Tcp`; never hybridizes with another
 ///   protocol on the same port (#505)
+/// - UDPRoute (`UdpProxy` readiness) → `Udp`; never hybridizes with another
+///   protocol on the same port (#506)
 ///
 /// `ListenerInfo.proxy_protocol` (resolved from `ClientTrafficPolicy`) is
 /// forwarded to the `ListenerSpec.proxy_protocol` field for the acceptor to
@@ -1254,11 +1263,12 @@ fn derive_gateway_specs(
                 ListenerReadiness::TlsPassthrough | ListenerReadiness::TlsTerminate => {
                     ListenerProtocol::TlsL4
                 }
-                // TCPRoute (#505): a TCP listener never shares a port with another
-                // protocol (Gateway API port-compatibility rules exclude the
-                // combination, enforced at listener-conflict resolution), so no
-                // hybrid-upgrade arm is needed below, unlike TlsL4/Https.
+                // TCPRoute (#505) / UDPRoute (#506): a TCP or UDP listener never
+                // shares a port with another protocol (Gateway API port-compatibility
+                // rules exclude the combination, enforced at listener-conflict
+                // resolution), so no hybrid-upgrade arm is needed below, unlike TlsL4/Https.
                 ListenerReadiness::TcpProxy => ListenerProtocol::Tcp,
+                ListenerReadiness::UdpProxy => ListenerProtocol::Udp,
                 _ => ListenerProtocol::Https,
             };
             let new_pp = info.proxy_protocol.clone();

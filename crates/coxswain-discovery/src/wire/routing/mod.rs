@@ -55,10 +55,13 @@ mod encode;
 pub(crate) use decode::{bg_from_wire, rate_limit_from_wire, upstream_tls_from_wire};
 pub use decode::{
     gateway_from_wire, ingress_from_wire, passthrough_from_wire, tcp_table_from_wire,
+    udp_table_from_wire,
 };
 #[cfg(test)]
 pub(crate) use encode::upstream_tls_to_wire;
-pub use encode::{gateway_to_wire, ingress_to_wire, passthrough_to_wire, tcp_table_to_wire};
+pub use encode::{
+    gateway_to_wire, ingress_to_wire, passthrough_to_wire, tcp_table_to_wire, udp_table_to_wire,
+};
 
 #[cfg(test)]
 mod tests {
