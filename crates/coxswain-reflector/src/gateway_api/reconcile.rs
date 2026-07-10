@@ -1032,14 +1032,22 @@ impl GatewayApiReconciler {
                 } else {
                     ListenerReadiness::TcpProxy
                 }
+            } else if listener.protocol == "UDP" {
+                // UDP datagram forwarder (GEP-2645 / UDPRoute): no cert, no SNI, no
+                // passthrough-vs-terminate split — a UDP listener has exactly one mode.
+                if vip_pending {
+                    ListenerReadiness::VipPending
+                } else {
+                    ListenerReadiness::UdpProxy
+                }
             } else if listener.protocol != "HTTPS" {
-                // Not TLS (handled above), not HTTP, not TCP, not HTTPS → a protocol
-                // coxswain does not route. GatewayListenerUnsupportedProtocol
+                // Not TLS (handled above), not HTTP, not TCP, not UDP, not HTTPS → a
+                // protocol coxswain does not route. GatewayListenerUnsupportedProtocol
                 // (#517): the listener is not Accepted and its owning Gateway
                 // rolls up to `ListenersNotValid`.
                 ListenerReadiness::UnsupportedProtocol {
                     message: format!(
-                        "listener protocol {:?} is not supported; coxswain routes HTTP, HTTPS, TLS, and TCP",
+                        "listener protocol {:?} is not supported; coxswain routes HTTP, HTTPS, TLS, TCP, and UDP",
                         listener.protocol
                     ),
                 }
@@ -1296,6 +1304,135 @@ mod tests {
         );
         // No cert was installed in the TLS store (build is empty).
         assert_eq!(builder.build().port_count(), 0);
+    }
+
+    // ── L4 proxy listeners: TCPRoute (#505) / UDPRoute (#506) ─────────────────
+
+    /// A raw L4 proxy listener (`protocol: TCP` or `protocol: UDP`): no TLS
+    /// field, no hostname — routing is by listener port alone.
+    fn l4_listener(protocol: &str) -> EffectiveListener {
+        use crate::status::ConflictReason;
+        EffectiveListener {
+            source: ListenerSource::Gateway,
+            owning_namespace: "default".to_string(),
+            name: "l4-proxy".to_string(),
+            port: 5000,
+            protocol: protocol.to_string(),
+            hostname: None,
+            tls: None,
+            route_namespaces: coxswain_core::listener_status::RouteNamespaceSet::All,
+            allowed_route_kinds: vec![],
+            conflict: ConflictReason::None,
+        }
+    }
+
+    /// `protocol: TCP` with no VIP Service yet → VipPending, not TcpProxy.
+    /// Regression for the class of bug this guards: a hardcoded protocol match
+    /// in `reconcile_tls` that never gained a `"TCP"` arm would silently fall
+    /// through to `UnsupportedProtocol`, exactly like the UDP gap below.
+    #[test]
+    fn tcp_proxy_without_vip_is_pending() {
+        let listener = l4_listener("TCP");
+        let secrets = empty_secrets();
+        let empty = HashSet::new();
+        let mut builder = PortTlsStoreBuilder::new();
+        let health = GatewayApiReconciler::reconcile_tls(
+            &GatewayTlsTarget {
+                gw_name: "gw",
+                listeners: std::slice::from_ref(&listener),
+                internal_ports: &HashMap::new(), // no VIP yet
+            },
+            &secrets,
+            &empty,
+            &empty,
+            &mut builder,
+        );
+        let outcome = &health.listeners[&ListenerStatusKey::gateway("l4-proxy")].readiness;
+        assert!(
+            matches!(outcome, ListenerReadiness::VipPending),
+            "TCP proxy with internal_port=0 must be VipPending, got {outcome:?}"
+        );
+    }
+
+    /// `protocol: TCP` once VIP is allocated → TcpProxy (healthy), never
+    /// `UnsupportedProtocol`.
+    #[test]
+    fn tcp_proxy_with_vip_is_healthy() {
+        let listener = l4_listener("TCP");
+        let secrets = empty_secrets();
+        let empty = HashSet::new();
+        let mut builder = PortTlsStoreBuilder::new();
+        let health = GatewayApiReconciler::reconcile_tls(
+            &GatewayTlsTarget {
+                gw_name: "gw",
+                listeners: std::slice::from_ref(&listener),
+                internal_ports: &HashMap::from([(5000u16, 30002u16)]),
+            },
+            &secrets,
+            &empty,
+            &empty,
+            &mut builder,
+        );
+        let outcome = &health.listeners[&ListenerStatusKey::gateway("l4-proxy")].readiness;
+        assert!(
+            matches!(outcome, ListenerReadiness::TcpProxy),
+            "TCP proxy with VIP allocated must be TcpProxy, got {outcome:?}"
+        );
+    }
+
+    /// `protocol: UDP` with no VIP Service yet → VipPending, not UdpProxy.
+    #[test]
+    fn udp_proxy_without_vip_is_pending() {
+        let listener = l4_listener("UDP");
+        let secrets = empty_secrets();
+        let empty = HashSet::new();
+        let mut builder = PortTlsStoreBuilder::new();
+        let health = GatewayApiReconciler::reconcile_tls(
+            &GatewayTlsTarget {
+                gw_name: "gw",
+                listeners: std::slice::from_ref(&listener),
+                internal_ports: &HashMap::new(), // no VIP yet
+            },
+            &secrets,
+            &empty,
+            &empty,
+            &mut builder,
+        );
+        let outcome = &health.listeners[&ListenerStatusKey::gateway("l4-proxy")].readiness;
+        assert!(
+            matches!(outcome, ListenerReadiness::VipPending),
+            "UDP proxy with internal_port=0 must be VipPending, got {outcome:?}"
+        );
+    }
+
+    /// `protocol: UDP` once VIP is allocated → UdpProxy (healthy), never
+    /// `UnsupportedProtocol`. Regression for #506: `reconcile_tls` originally
+    /// had no `"UDP"` arm, so every `protocol: UDP` listener fell through to
+    /// `UnsupportedProtocol` even though `SUPPORTED_LISTENER_PROTOCOLS` and
+    /// every other UDPRoute code path had already been updated — caught only
+    /// by a live e2e run, not by any unit test.
+    #[test]
+    fn udp_proxy_with_vip_is_healthy() {
+        let listener = l4_listener("UDP");
+        let secrets = empty_secrets();
+        let empty = HashSet::new();
+        let mut builder = PortTlsStoreBuilder::new();
+        let health = GatewayApiReconciler::reconcile_tls(
+            &GatewayTlsTarget {
+                gw_name: "gw",
+                listeners: std::slice::from_ref(&listener),
+                internal_ports: &HashMap::from([(5000u16, 30003u16)]),
+            },
+            &secrets,
+            &empty,
+            &empty,
+            &mut builder,
+        );
+        let outcome = &health.listeners[&ListenerStatusKey::gateway("l4-proxy")].readiness;
+        assert!(
+            matches!(outcome, ListenerReadiness::UdpProxy),
+            "UDP proxy with VIP allocated must be UdpProxy, got {outcome:?}"
+        );
     }
 
     // ── Original path-matching tests (unchanged behaviour) ────────────────────
