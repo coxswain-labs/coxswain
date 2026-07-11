@@ -13,7 +13,7 @@
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use parking_lot::Mutex;
 
@@ -325,14 +325,84 @@ fn severity_is_ready(sev: u8) -> bool {
     sev == SEV_READY || sev == SEV_DEGRADED
 }
 
+/// Process-liveness backstop consulted by the `/healthz` liveness probe.
+///
+/// Distinct from [`HealthRegistry`], which gates *readiness* (`/readyz`): a
+/// subsystem going `Failed`/`Pending` removes the pod from endpoints but does
+/// not restart it. `LivenessGate` is the stronger, one-way signal for faults
+/// that only a pod restart can clear.
+///
+/// It exists for the #573 relist wedge: a reflector whose watch relist never
+/// completes leaves the controller serving a stale/empty world while every
+/// readiness check still passes (the lease renews, reconciles tick). The
+/// primary fix makes that wedge unreachable; this gate is the defense-in-depth
+/// backstop — a monitor trips it after a relist stays incomplete past a bounded
+/// window, failing `/healthz` so kubelet restarts the pod and its reflectors
+/// relist from scratch.
+///
+/// Tripping is intentionally irreversible: the process cannot self-repair a
+/// wedged watch fabric in place, so the gate stays down until the restart
+/// replaces the process.
+#[non_exhaustive]
+#[derive(Clone)]
+pub struct LivenessGate {
+    alive: Arc<AtomicBool>,
+}
+
+impl LivenessGate {
+    /// Construct a gate in the live state.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            alive: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// True while the process is considered live. `/healthz` returns 200 iff
+    /// this holds.
+    #[must_use]
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
+    }
+
+    /// Irreversibly trip the gate. Subsequent [`Self::is_alive`] calls return
+    /// `false`, so `/healthz` reports unhealthy and kubelet restarts the pod.
+    pub fn trip(&self) {
+        self.alive.store(false, Ordering::Release);
+    }
+}
+
+impl Default for LivenessGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(missing_docs)]
 
-    use crate::health::{CheckState, HealthRegistry};
+    use crate::health::{CheckState, HealthRegistry, LivenessGate};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
+
+    #[test]
+    fn liveness_gate_starts_alive_and_trips_irreversibly() {
+        let gate = LivenessGate::new();
+        assert!(gate.is_alive(), "a fresh gate is live");
+        // A clone shares the same underlying flag.
+        let clone = gate.clone();
+        gate.trip();
+        assert!(!gate.is_alive(), "tripping fails the gate");
+        assert!(
+            !clone.is_alive(),
+            "clones observe the trip (shared flag), so /healthz sees it regardless of which handle tripped"
+        );
+        // Trip is one-way: no path back to alive.
+        clone.trip();
+        assert!(!clone.is_alive());
+    }
 
     fn degraded(reason: &str) -> CheckState {
         CheckState::Degraded {

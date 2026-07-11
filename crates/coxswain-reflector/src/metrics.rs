@@ -173,10 +173,178 @@ impl ReflectorMetrics {
         }
         watch_errors_total().with_label_values(&[kind]).inc();
     }
+
+    /// Record relist *progress* for `kind` — an `Event::Init` (relist began) or
+    /// `Event::InitApply` (an object streamed in during the list phase).
+    ///
+    /// Controller-only. Marks the kind's relist in-flight and (re)starts its
+    /// stall timer at now, so the liveness backstop (#573) measures time since
+    /// the *last* progress, not since the relist began. A relist that keeps
+    /// streaming objects — or keeps retrying its LIST — never looks stalled; only
+    /// one truly frozen mid-relist (no further progress, no `InitDone`) does.
+    pub fn observe_relist_progress(&self, kind: &'static str) {
+        if !matches!(self.prefix, MetricsPrefix::Controller) {
+            return;
+        }
+        relist_registry().progress(kind, tokio::time::Instant::now());
+    }
+
+    /// Record that a watch relist *completed* (`Event::InitDone`) for `kind`.
+    ///
+    /// Controller-only. Clears the in-flight state (`watch_relists_pending{kind}`
+    /// → 0) and arms the backstop for that kind — a kind is only eligible to trip
+    /// liveness once it has completed at least one relist, so a slow cold-start
+    /// initial sync is never mistaken for a wedge.
+    pub fn observe_relist_completed(&self, kind: &'static str) {
+        if !matches!(self.prefix, MetricsPrefix::Controller) {
+            return;
+        }
+        relist_registry().completed(kind);
+    }
 }
 
 fn i64_from_usize(v: usize) -> i64 {
     i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+/// Bounded window a *single in-flight relist may make no progress* before the
+/// liveness backstop trips (#573). Deliberately generous — far beyond any
+/// legitimate apiserver LIST page latency — so a slow-but-streaming initial sync
+/// never restarts a healthy pod. Measured from the last relist *progress*
+/// (`Event::Init`/`InitApply`), not from when the relist began, so a large
+/// relist that keeps streaming objects is never mistaken for a wedge.
+pub const RELIST_STUCK_WINDOW: Duration = Duration::from_secs(150);
+
+/// Poll cadence of the relist liveness monitor.
+const RELIST_MONITOR_TICK: Duration = Duration::from_secs(15);
+
+/// Per-kind relist state.
+///
+/// The wedge signal is deliberately **not** a cumulative `started - completed`
+/// diff: kube's watcher emits an `Event::Init` on every relist *attempt* but an
+/// `Event::InitDone` only on success, so a single transient LIST failure leaves
+/// an orphaned `Init` and would peg such a diff above zero forever — restarting
+/// a healthy controller. Instead we track a single "relist in flight since"
+/// instant, refreshed on every progress event and cleared on `InitDone`. A
+/// frozen relist stops refreshing it; a retrying or streaming one keeps it
+/// current.
+#[derive(Default, Clone, Copy)]
+struct KindRelist {
+    /// When the current in-flight relist last made progress, or `None` once the
+    /// relist has completed (`InitDone`). `Some` and old = stalled.
+    in_flight_since: Option<tokio::time::Instant>,
+    /// A kind is "armed" once it has completed at least one relist. Until then a
+    /// slow cold-start initial sync would look identical to a wedge, so the
+    /// backstop ignores it.
+    armed: bool,
+}
+
+/// Process-global relist accounting, keyed by the reflector `kind` label.
+struct RelistRegistry {
+    kinds: parking_lot::Mutex<std::collections::HashMap<&'static str, KindRelist>>,
+}
+
+fn relist_registry() -> &'static RelistRegistry {
+    static R: OnceLock<RelistRegistry> = OnceLock::new();
+    R.get_or_init(|| RelistRegistry {
+        kinds: parking_lot::Mutex::new(std::collections::HashMap::new()),
+    })
+}
+
+impl RelistRegistry {
+    /// A relist made progress (`Init` or `InitApply`) for `kind` at `now`.
+    fn progress(&self, kind: &'static str, now: tokio::time::Instant) {
+        let mut kinds = self.kinds.lock();
+        kinds.entry(kind).or_default().in_flight_since = Some(now);
+        drop(kinds);
+        set_relist_in_flight(kind, true);
+    }
+
+    /// A relist completed (`InitDone`) for `kind`: clears in-flight and arms it.
+    fn completed(&self, kind: &'static str) {
+        let mut kinds = self.kinds.lock();
+        let entry = kinds.entry(kind).or_default();
+        entry.in_flight_since = None;
+        entry.armed = true;
+        drop(kinds);
+        set_relist_in_flight(kind, false);
+    }
+
+    /// `(kind, stalled_for, armed)` for every kind: `stalled_for` is how long the
+    /// kind's in-flight relist has gone without progress, or `None` if no relist
+    /// is in flight.
+    fn snapshot(&self, now: tokio::time::Instant) -> Vec<(&'static str, Option<Duration>, bool)> {
+        self.kinds
+            .lock()
+            .iter()
+            .map(|(kind, r)| {
+                let stalled_for = r.in_flight_since.map(|since| now.duration_since(since));
+                (*kind, stalled_for, r.armed)
+            })
+            .collect()
+    }
+}
+
+fn set_relist_in_flight(kind: &'static str, in_flight: bool) {
+    watch_relists_pending()
+        .with_label_values(&[kind])
+        .set(i64::from(in_flight));
+}
+
+fn watch_relists_pending() -> &'static IntGaugeVec {
+    static GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        register_int_gauge_vec!(
+            Opts::new(
+                "coxswain_controller_watch_relists_pending",
+                "1 while a reflector's watch relist is in flight (Init seen, InitDone not yet), by kind. A kind pinned at 1 for minutes is the #573 wedge signature (relist began but never completed)."
+            ),
+            &["kind"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Decide whether the liveness backstop should trip for one kind. Pure so the
+/// guard logic is unit-testable without the monitor's clock or the global
+/// registry:
+/// - no relist in flight (`stalled_for` is `None`) never trips;
+/// - a kind that has never completed a relist (`!armed`) never trips — a slow
+///   cold-start initial sync is not a wedge;
+/// - otherwise it trips once an in-flight relist has made no progress for
+///   `window` (`Init`/`InitApply` refresh the clock, so only a *frozen* relist
+///   reaches it).
+fn relist_backstop_trips(stalled_for: Option<Duration>, armed: bool, window: Duration) -> bool {
+    armed && stalled_for.is_some_and(|d| d >= window)
+}
+
+/// Run the relist liveness backstop (#573). Controller role only.
+///
+/// Every [`RELIST_MONITOR_TICK`] it inspects each kind. A kind that is armed
+/// (has completed ≥1 relist) but whose in-flight relist has made no progress for
+/// [`RELIST_STUCK_WINDOW`] trips `gate`, failing `/healthz` so kubelet restarts
+/// the pod — reflectors then relist from scratch. The primary #573 fix should
+/// make this unreachable; it is the self-heal backstop of last resort.
+///
+/// Runs forever; drop the driving task to stop it.
+pub async fn run_relist_liveness_monitor(gate: coxswain_core::health::LivenessGate) {
+    let mut ticker = tokio::time::interval(RELIST_MONITOR_TICK);
+    loop {
+        ticker.tick().await;
+        let now = tokio::time::Instant::now();
+        for (kind, stalled_for, armed) in relist_registry().snapshot(now) {
+            if relist_backstop_trips(stalled_for, armed, RELIST_STUCK_WINDOW) {
+                tracing::error!(
+                    kind,
+                    stalled_secs = stalled_for.map(|d| d.as_secs()),
+                    window_secs = RELIST_STUCK_WINDOW.as_secs(),
+                    "watch relist has made no progress within the liveness window; \
+                     tripping liveness to force a pod restart (#573)"
+                );
+                gate.trip();
+            }
+        }
+    }
 }
 
 fn routing_table_hosts(prefix: MetricsPrefix) -> &'static IntGauge {
@@ -391,4 +559,115 @@ fn watch_errors_total() -> &'static IntCounterVec {
         )
         .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(missing_docs)]
+    use super::*;
+    use coxswain_core::health::LivenessGate;
+
+    fn fresh_registry() -> RelistRegistry {
+        RelistRegistry {
+            kinds: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// `(in_flight, armed)` for `kind`, evaluated at `now`.
+    fn state(reg: &RelistRegistry, kind: &str, now: tokio::time::Instant) -> (bool, bool) {
+        reg.snapshot(now)
+            .into_iter()
+            .find(|(k, _, _)| *k == kind)
+            .map(|(_, stalled, armed)| (stalled.is_some(), armed))
+            .unwrap_or_else(|| panic!("kind {kind:?} not tracked"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn relist_registry_tracks_in_flight_and_arming() {
+        let reg = fresh_registry();
+        let now = tokio::time::Instant::now();
+        // Cold start: a relist begins, none completed → in flight, NOT armed. A
+        // slow initial sync must not look like a wedge to the backstop.
+        reg.progress("k", now);
+        assert_eq!(
+            state(&reg, "k", now),
+            (true, false),
+            "an uncompleted first relist is in flight but not yet armed"
+        );
+        // Relist completes → not in flight, now armed.
+        reg.completed("k");
+        assert_eq!(
+            state(&reg, "k", now),
+            (false, true),
+            "a completed relist clears in-flight and arms the kind"
+        );
+        // A second relist starts and never completes → in flight again, still armed.
+        // This is the #573 wedge shape the monitor watches for.
+        reg.progress("k", now);
+        assert_eq!(
+            state(&reg, "k", now),
+            (true, true),
+            "a stuck relist after arming is the wedge signature"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn orphaned_init_does_not_look_wedged_after_recovery() {
+        // Regression: kube emits `Init` on every relist attempt but `InitDone`
+        // only on success, so a transient LIST failure leaves an orphaned
+        // progress event. A cumulative started-minus-completed diff would peg
+        // "pending" forever and restart a healthy pod. The in-flight model must
+        // clear cleanly once the retry finally completes.
+        let reg = fresh_registry();
+        let now = tokio::time::Instant::now();
+        reg.progress("k", now); // Init (attempt 1)
+        reg.completed("k"); // arm
+        reg.progress("k", now); // Init (attempt 2 — LIST fails before InitDone)
+        reg.progress("k", now); // Init (attempt 3 — retry)
+        reg.completed("k"); // InitDone at last
+        assert_eq!(
+            state(&reg, "k", now),
+            (false, true),
+            "after the retry completes, no relist is in flight — the orphaned Init attempts leave no residue"
+        );
+    }
+
+    #[test]
+    fn relist_backstop_trip_decision() {
+        let window = RELIST_STUCK_WINDOW;
+        // Armed + in-flight relist stalled past the window → trip.
+        assert!(
+            relist_backstop_trips(Some(window), true, window),
+            "an armed kind whose relist stalled for the full window must trip"
+        );
+        assert!(
+            relist_backstop_trips(Some(window * 2), true, window),
+            "still trips well past the window"
+        );
+        // Not yet at the window → no trip (generous grace for slow relists).
+        assert!(
+            !relist_backstop_trips(Some(window - Duration::from_millis(1)), true, window),
+            "must not trip before the window elapses"
+        );
+        // Never completed a relist (cold start) → never trips, however long.
+        assert!(
+            !relist_backstop_trips(Some(window * 10), false, window),
+            "an unarmed cold-start relist is not a wedge"
+        );
+        // No relist in flight → nothing to trip on.
+        assert!(
+            !relist_backstop_trips(None, true, window),
+            "a fully-converged kind (no relist in flight) never trips"
+        );
+    }
+
+    #[test]
+    fn liveness_gate_used_by_monitor_starts_alive_and_trips_once() {
+        // Sanity on the gate the monitor drives (core owns the type; this guards
+        // the reflector's use of it).
+        let gate = LivenessGate::new();
+        assert!(gate.is_alive());
+        gate.trip();
+        assert!(!gate.is_alive(), "trip is one-way");
+    }
 }

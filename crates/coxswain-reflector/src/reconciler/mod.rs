@@ -25,6 +25,7 @@ mod dedicated;
 pub(crate) mod listener_merge;
 pub mod proxy;
 mod route_builder;
+pub(crate) mod shared_stream;
 
 pub use controller::ControllerReconciler;
 pub use debounce::{DebounceSettings, DebounceSettingsError};

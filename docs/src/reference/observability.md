@@ -61,6 +61,7 @@ The `listener` label is the **local port the proxy accepted the connection on**.
 | `coxswain_controller_status_patch_duration_seconds` | Histogram | `kind` |
 | `coxswain_controller_watch_events_total` | Counter | `kind`, `event` (`init_done`/`apply`/`delete`/`restart`) |
 | `coxswain_controller_watch_errors_total` | Counter | `kind` |
+| `coxswain_controller_watch_relists_pending` | Gauge | `kind` (relists started but not yet completed) |
 | `coxswain_controller_routing_table_hosts` | Gauge | — (mirrors the proxy view; drift indicates a stale snapshot) |
 | `coxswain_controller_routing_table_routes` | Gauge | `kind` |
 | `coxswain_controller_routing_table_rebuilds_total` | Counter | `result` |
@@ -68,6 +69,8 @@ The `listener` label is the **local port the proxy accepted the connection on**.
 | `coxswain_controller_tls_certs_loaded` | Gauge | `bucket` |
 
 `coxswain_controller_reconcile_errors_total`'s `reason` label is a bounded classification of the underlying Kubernetes API error: `namespace_terminating` (SSA into a namespace mid-deletion — a self-resolving race), `conflict` (409), `forbidden` (RBAC), `not_found`, `invalid` (422 validation/webhook rejection), `api_other`, `transport`, `internal`. Errors classified `forbidden`/`invalid` are persistent — the operator polls them at a flat 15 s because retrying faster cannot fix RBAC or a rejected spec; every other class retries with a per-Gateway exponential backoff (0.5 s doubling to a 15 s cap, reset on the first success). A sustained non-zero rate on a persistent reason is an operator-action signal, not a transient blip.
+
+`coxswain_controller_watch_relists_pending{kind}` is the **watch-relist wedge** signal (#573). A reflector relist increments it on `Event::Init` (relist started) and decrements it on `Event::InitDone` (relist completed); in steady state every kind sits at 0, briefly ticking to 1 while a relist is in flight. A kind pinned **above 0** for minutes is the wedge signature: the watch relist began but its `InitDone` never arrived, so that store is serving a stale (often empty) snapshot while the pod otherwise looks healthy — the lease renews and reconcile counters climb. Alert on any `kind` staying non-zero beyond a minute. The controller's liveness backstop restarts the pod automatically if this persists past ~2.5 min (see [Health endpoints](#health-endpoints)); the alert exists so operators see the wedge (and the restart) rather than silent staleness. The root cause — kube's back-pressuring shared-store dispatcher — was replaced by a lossy fan-out that cannot wedge, so a sustained non-zero here after the fix indicates a new, unrelated watch fault worth investigating.
 
 `coxswain_controller_gateways_held_pending` counts shared-mode Gateways whose top-level `Programmed` is currently deferred (`False/Pending` with `observedGeneration` one below the current generation) awaiting VIP resolution, proxy bind, or snapshot ack. Legitimate holds clear within seconds of a spec change; alert on this gauge staying non-zero — before it existed, a Gateway stuck here was indistinguishable from healthy reconcile traffic. Terminally-invalid configurations (every listener unserviceable, unsupported `parametersRef`) never enter the hold: they settle `Programmed=False/Invalid` at the current generation immediately.
 
@@ -114,13 +117,15 @@ relabelings:
 
 | Endpoint | Port | Returns |
 |----------|------|---------|
-| `/healthz` | `8081` | Always `200 ok` while the process is running |
+| `/healthz` | `8081` | `200 ok` while the process is live; `503 not live` on the controller if the relist backstop has tripped (see below) |
 | `/readyz` | `8081` | `200` once all subsystems are Ready or Degraded; `503` otherwise |
 
 `/readyz` returns 503 during startup until:
 
 1. All Kubernetes reflectors emit their first `InitDone` event (CRDs must be installed)
 2. The routing table is built for the first time
+
+On the **controller** pod, `/healthz` is also a liveness backstop for the watch-relist wedge (#573): if any reflector's watch relist starts but never completes for longer than ~2.5 min (tracked by `coxswain_controller_watch_relists_pending`), the controller trips its liveness gate and `/healthz` returns `503 not live`, so the kubelet restarts the pod and its reflectors relist from scratch. The gate arms only after a kind has completed its first relist, so a slow cold-start initial sync never trips it. The proxy pod keeps the historical always-`200` liveness semantics.
 
 Inspect the per-subsystem detail via the admin port (open `kubectl -n coxswain-system port-forward svc/coxswain-shared-proxy-internal 8082:8082` in a separate terminal first; a non-default Helm release name `<rel>` prefixes the Service as `<rel>-coxswain-shared-proxy-internal`):
 
