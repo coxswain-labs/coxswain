@@ -25,11 +25,10 @@ mod dedicated;
 pub(crate) mod listener_merge;
 pub mod proxy;
 mod route_builder;
-pub(crate) mod shared_stream;
 
 pub use controller::ControllerReconciler;
 pub use debounce::{DebounceSettings, DebounceSettingsError};
 pub use proxy::{
     IngressDefaultBackend, IngressDefaultBackendParseError, IngressEvent, ReconcilerHealth,
-    ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler, StatusSubscriptions,
+    ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler, StatusStores,
 };
