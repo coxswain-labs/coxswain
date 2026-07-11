@@ -106,6 +106,22 @@ pub(super) async fn patch_gateway_status(
             );
             GatewayPatchOutcome::Conflict
         }
+        Err(kube::Error::Api(ref ae)) if ae.code == 404 => {
+            // The Gateway was deleted after this reconcile read it from the
+            // (lagging) store. Retrying is not just pointless, it is harmful:
+            // a Failed→requeue here self-sustains forever on an object that
+            // will never reappear, spamming the apiserver and keeping the
+            // work queue hot until the store catches up (observed in CI:
+            // deleted conformance fixtures still being patched 20 minutes
+            // after deletion). The store's DELETE event is the authoritative
+            // terminal signal — report Landed so the caller goes quiet.
+            tracing::debug!(
+                name,
+                ns,
+                "Gateway status patch skipped: object deleted; awaiting the store's delete event"
+            );
+            GatewayPatchOutcome::Landed
+        }
         Err(e) => {
             tracing::warn!(name, ns, error = %e, "Failed to patch Gateway status");
             GatewayPatchOutcome::Failed
