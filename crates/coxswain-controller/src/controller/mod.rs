@@ -494,63 +494,68 @@ impl Controller {
 
         // --- Gateway: primary Gateway, secondary GatewayClass → Gateways in
         // that class, re-driven on TLS-health flips + promotion. ---
-        let gateway_ctrl = KubeController::for_shared_stream(gateways, gateways_reader.clone())
-            .watches_shared_stream(gateway_classes_for_gateways, {
-                let gw_store = gateways_reader.clone();
-                move |gc: Arc<GatewayClass>| -> Vec<ObjectRef<Gateway>> {
-                    let Some(class_name) = gc.meta().name.clone() else {
-                        return Vec::new();
-                    };
-                    gw_store
-                        .state()
-                        .into_iter()
-                        .filter(|gw| gw.spec.gateway_class_name == class_name)
-                        .map(|gw| ObjectRef::from_obj(gw.as_ref()))
-                        .collect()
-                }
-            })
-            .reconcile_all_on(gw_rx)
-            .run(reconcile_gateway, error_policy, ctx.clone());
+        let gateway_ctrl =
+            KubeController::for_shared_stream(gateways.into_stream(), gateways_reader.clone())
+                .watches_shared_stream(gateway_classes_for_gateways.into_stream(), {
+                    let gw_store = gateways_reader.clone();
+                    move |gc: Arc<GatewayClass>| -> Vec<ObjectRef<Gateway>> {
+                        let Some(class_name) = gc.meta().name.clone() else {
+                            return Vec::new();
+                        };
+                        gw_store
+                            .state()
+                            .into_iter()
+                            .filter(|gw| gw.spec.gateway_class_name == class_name)
+                            .map(|gw| ObjectRef::from_obj(gw.as_ref()))
+                            .collect()
+                    }
+                })
+                .reconcile_all_on(gw_rx)
+                .run(reconcile_gateway, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, gateway_ctrl, "Gateway");
 
         // --- ListenerSet: primary ListenerSet, secondary Gateway → its
         // ListenerSets (a parent allowedListeners/listeners edit re-drives the
         // attached ListenerSets), re-driven on TLS-health flips + promotion
         // (GEP-1713). ---
-        let listenerset_ctrl =
-            KubeController::for_shared_stream(listener_sets, listener_sets_reader.clone())
-                .watches_shared_stream(gateways_for_listener_sets, {
-                    let ls_store = listener_sets_reader.clone();
-                    move |gw: Arc<Gateway>| -> Vec<ObjectRef<ListenerSet>> {
-                        let gw_ns = gw.meta().namespace.clone().unwrap_or_default();
-                        let gw_name = gw.meta().name.clone().unwrap_or_default();
-                        ls_store
-                            .state()
-                            .into_iter()
-                            .filter(|ls| {
-                                let ls_ns = ls.meta().namespace.clone().unwrap_or_default();
-                                let pr = &ls.spec.parent_ref;
-                                let pns = pr.namespace.clone().unwrap_or(ls_ns);
-                                pns == gw_ns && pr.name == gw_name
-                            })
-                            .map(|ls| ObjectRef::from_obj(ls.as_ref()))
-                            .collect()
-                    }
-                })
-                .reconcile_all_on(ls_rx)
-                .run(reconcile_listenerset, error_policy, ctx.clone());
+        let listenerset_ctrl = KubeController::for_shared_stream(
+            listener_sets.into_stream(),
+            listener_sets_reader.clone(),
+        )
+        .watches_shared_stream(gateways_for_listener_sets.into_stream(), {
+            let ls_store = listener_sets_reader.clone();
+            move |gw: Arc<Gateway>| -> Vec<ObjectRef<ListenerSet>> {
+                let gw_ns = gw.meta().namespace.clone().unwrap_or_default();
+                let gw_name = gw.meta().name.clone().unwrap_or_default();
+                ls_store
+                    .state()
+                    .into_iter()
+                    .filter(|ls| {
+                        let ls_ns = ls.meta().namespace.clone().unwrap_or_default();
+                        let pr = &ls.spec.parent_ref;
+                        let pns = pr.namespace.clone().unwrap_or(ls_ns);
+                        pns == gw_ns && pr.name == gw_name
+                    })
+                    .map(|ls| ObjectRef::from_obj(ls.as_ref()))
+                    .collect()
+            }
+        })
+        .reconcile_all_on(ls_rx)
+        .run(reconcile_listenerset, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, listenerset_ctrl, "ListenerSet");
 
         // --- GatewayClass: primary only; re-driven on promotion. ---
-        let gateway_class_ctrl =
-            KubeController::for_shared_stream(gateway_classes, ctx.gateway_classes.clone())
-                .reconcile_all_on(gc_rx)
-                .run(reconcile_gateway_class, error_policy, ctx.clone());
+        let gateway_class_ctrl = KubeController::for_shared_stream(
+            gateway_classes.into_stream(),
+            ctx.gateway_classes.clone(),
+        )
+        .reconcile_all_on(gc_rx)
+        .run(reconcile_gateway_class, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, gateway_class_ctrl, "GatewayClass");
 
         // --- HTTPRoute: primary only; re-driven on route-health flips +
         // promotion. ---
-        let route_ctrl = KubeController::for_shared_stream(routes, routes_reader)
+        let route_ctrl = KubeController::for_shared_stream(routes.into_stream(), routes_reader)
             .reconcile_all_on(route_rx)
             .run(reconcile_route, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, route_ctrl, "HTTPRoute");
@@ -558,76 +563,86 @@ impl Controller {
         // --- GRPCRoute: primary only; re-driven on grpc-route-health flips +
         // promotion. Sibling to HTTPRoute, feeds the same gateway routing table
         // via a parallel reconcile path.
-        let grpc_route_ctrl = KubeController::for_shared_stream(grpc_routes, grpc_routes_reader)
-            .reconcile_all_on(grpc_route_rx)
-            .run(reconcile_grpc_route, error_policy, ctx.clone());
+        let grpc_route_ctrl =
+            KubeController::for_shared_stream(grpc_routes.into_stream(), grpc_routes_reader)
+                .reconcile_all_on(grpc_route_rx)
+                .run(reconcile_grpc_route, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, grpc_route_ctrl, "GRPCRoute");
 
         // --- TLSRoute: primary only; re-driven on tls-route-health flips +
         // promotion. Handles SNI-passthrough routes bound to TLS/Passthrough listeners.
-        let tls_route_ctrl = KubeController::for_shared_stream(tls_routes, tls_routes_reader)
-            .reconcile_all_on(tls_route_rx)
-            .run(reconcile_tls_route, error_policy, ctx.clone());
+        let tls_route_ctrl =
+            KubeController::for_shared_stream(tls_routes.into_stream(), tls_routes_reader)
+                .reconcile_all_on(tls_route_rx)
+                .run(reconcile_tls_route, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, tls_route_ctrl, "TLSRoute");
 
         // --- TCPRoute: primary only; re-driven on tcp-route-health flips +
         // promotion. Handles raw-TCP routes bound to protocol:TCP listeners.
-        let tcp_route_ctrl = KubeController::for_shared_stream(tcp_routes, tcp_routes_reader)
-            .reconcile_all_on(tcp_route_rx)
-            .run(reconcile_tcp_route, error_policy, ctx.clone());
+        let tcp_route_ctrl =
+            KubeController::for_shared_stream(tcp_routes.into_stream(), tcp_routes_reader)
+                .reconcile_all_on(tcp_route_rx)
+                .run(reconcile_tcp_route, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, tcp_route_ctrl, "TCPRoute");
 
         // --- UDPRoute: primary only; re-driven on udp-route-health flips +
         // promotion. Handles datagram routes bound to protocol:UDP listeners.
-        let udp_route_ctrl = KubeController::for_shared_stream(udp_routes, udp_routes_reader)
-            .reconcile_all_on(udp_route_rx)
-            .run(reconcile_udp_route, error_policy, ctx.clone());
+        let udp_route_ctrl =
+            KubeController::for_shared_stream(udp_routes.into_stream(), udp_routes_reader)
+                .reconcile_all_on(udp_route_rx)
+                .run(reconcile_udp_route, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, udp_route_ctrl, "UDPRoute");
 
         // --- Ingress: primary Ingress, secondary IngressClass → all Ingresses
         // (ownership re-checked per reconcile); re-driven on promotion. ---
-        let ingress_ctrl = KubeController::for_shared_stream(ingresses, ingresses_reader.clone())
-            .watches_shared_stream(ingress_classes, {
-                let ing_store = ingresses_reader.clone();
-                move |_ic: Arc<IngressClass>| -> Vec<ObjectRef<Ingress>> {
-                    ing_store
-                        .state()
-                        .into_iter()
-                        .map(|ing| ObjectRef::from_obj(ing.as_ref()))
-                        .collect()
-                }
-            })
-            .reconcile_all_on(ing_rx)
-            .run(reconcile_ingress, error_policy, ctx.clone());
+        let ingress_ctrl =
+            KubeController::for_shared_stream(ingresses.into_stream(), ingresses_reader.clone())
+                .watches_shared_stream(ingress_classes.into_stream(), {
+                    let ing_store = ingresses_reader.clone();
+                    move |_ic: Arc<IngressClass>| -> Vec<ObjectRef<Ingress>> {
+                        ing_store
+                            .state()
+                            .into_iter()
+                            .map(|ing| ObjectRef::from_obj(ing.as_ref()))
+                            .collect()
+                    }
+                })
+                .reconcile_all_on(ing_rx)
+                .run(reconcile_ingress, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, ingress_ctrl, "Ingress");
 
         // --- BackendTLSPolicy: primary only; re-driven on policy-health flips +
         // promotion. ---
-        let policy_ctrl = KubeController::for_shared_stream(policies, policies_reader)
-            .reconcile_all_on(pol_rx)
-            .run(reconcile_policy, error_policy, ctx.clone());
+        let policy_ctrl =
+            KubeController::for_shared_stream(policies.into_stream(), policies_reader)
+                .reconcile_all_on(pol_rx)
+                .run(reconcile_policy, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, policy_ctrl, "BackendTLSPolicy");
 
         // --- ClientTrafficPolicy: primary only; re-driven on ctp-health flips +
         // promotion (#327). ---
-        let ctp_ctrl = KubeController::for_shared_stream(client_traffic_policies, ctps_reader)
-            .reconcile_all_on(ctp_rx)
-            .run(reconcile_ctp, error_policy, ctx.clone());
+        let ctp_ctrl =
+            KubeController::for_shared_stream(client_traffic_policies.into_stream(), ctps_reader)
+                .reconcile_all_on(ctp_rx)
+                .run(reconcile_ctp, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, ctp_ctrl, "ClientTrafficPolicy");
 
         // --- CoxswainBackendPolicy: primary only; re-driven on cbp-health flips +
         // promotion (#354). ---
-        let cbp_ctrl = KubeController::for_shared_stream(coxswain_backend_policies, cbps_reader)
-            .reconcile_all_on(cbp_rx)
-            .run(reconcile_cbp, error_policy, ctx.clone());
+        let cbp_ctrl =
+            KubeController::for_shared_stream(coxswain_backend_policies.into_stream(), cbps_reader)
+                .reconcile_all_on(cbp_rx)
+                .run(reconcile_cbp, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, cbp_ctrl, "CoxswainBackendPolicy");
 
         // --- CoxswainExternalAuth: primary only; re-driven on external-auth-health
         // flips + promotion (#23). ---
-        let ea_ctrl =
-            KubeController::for_shared_stream(coxswain_external_auths, external_auths_reader)
-                .reconcile_all_on(ea_rx)
-                .run(reconcile_external_auth, error_policy, ctx.clone());
+        let ea_ctrl = KubeController::for_shared_stream(
+            coxswain_external_auths.into_stream(),
+            external_auths_reader,
+        )
+        .reconcile_all_on(ea_rx)
+        .run(reconcile_external_auth, error_policy, ctx.clone());
         spawn_controller_stream(&mut tasks, ea_ctrl, "CoxswainExternalAuth");
 
         tracing::info!(pod = %self.config.pod_name, is_leader, "Status-writer work-queues active");

@@ -65,6 +65,10 @@ pub struct StatusWriterConfig {
     pub enable_ingress: bool,
     /// Bounds for the reconciler's adaptive rebuild debounce (#512).
     pub debounce: coxswain_reflector::DebounceSettings,
+    /// Relist liveness backstop gate (#573). Trips `/healthz` if a reflector's
+    /// watch relist wedges, so kubelet restarts the pod. `None` disables the
+    /// backstop (e.g. dev harnesses without a liveness probe).
+    pub liveness_gate: Option<coxswain_core::health::LivenessGate>,
 }
 
 /// Error returned from [`spawn_status_writer`] when the wiring fails before
@@ -120,6 +124,7 @@ pub fn spawn_status_writer(
         enable_gateway_api,
         enable_ingress,
         debounce,
+        liveness_gate,
     } = config;
 
     let ingress_routes = coxswain_core::routing::SharedIngressRoutingTable::new();
@@ -267,6 +272,9 @@ pub fn spawn_status_writer(
             // egress to a JWKS identity provider; see `coxswain_reflector::jwks`.
             opts.fetch_remote_jwks = true;
             opts.debounce = debounce;
+            // Relist wedge backstop (#573): the reconciler spawns the monitor
+            // that trips this gate on a stuck relist.
+            opts.liveness_gate = liveness_gate;
             opts
         },
     );

@@ -26,7 +26,9 @@ pub mod tls;
 
 pub use dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 pub use fleet::{Component, FleetEntry, FleetSnapshot, SharedFleet};
-pub use health::{CheckState, HealthRegistry, HealthSnapshot, SubsystemHandle, SubsystemSnapshot};
+pub use health::{
+    CheckState, HealthRegistry, HealthSnapshot, LivenessGate, SubsystemHandle, SubsystemSnapshot,
+};
 pub use identity::{
     AuthnError, CsrPem, IssuedSvid, IssuerError, SpiffeId, SpiffeIdError, SvidIssuer,
     TokenAuthenticator,

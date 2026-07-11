@@ -24,6 +24,7 @@ use coxswain_e2e::{
     harness::wait,
 };
 use gateway_api_types::apis::standard::gateways::Gateway;
+use gateway_api_types::apis::standard::httproutes::HttpRoute;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Pod;
 use k8s_openapi::api::networking::v1::Ingress;
@@ -1258,5 +1259,140 @@ async fn promotion_redrives_gateway_created_before_leadership_acquired() -> anyh
     let host = format!("echo.{}.local", ns.name);
     let gw_http = h.gateway_http(&ns.name).await?;
     wait::wait_for_backend(&gw_http, &host, "/a", "echo-a", Duration::from_secs(30)).await?;
+    Ok(())
+}
+
+// ── #573: shared-store relist wedge under churn ───────────────────────────────
+
+/// Number of apply+delete HTTPRoute cycles in a churn burst. Each cycle drives
+/// two events (apply + delete) through the controller's shared HTTPRoute store,
+/// exercising the lossy fan-out (`shared_stream`) that replaced kube's
+/// back-pressuring `store_shared` dispatcher (#573).
+const ROUTE_CHURN_CYCLES: usize = 60;
+
+/// Apply then immediately delete `cycles` distinct HTTPRoutes, driving sustained
+/// apply/delete churn through the controller's shared HTTPRoute store. The
+/// routes parent onto `coxswain-test`; they need not become Accepted (they may
+/// be deleted before reconcile) — the point is the volume of store events.
+async fn churn_httproutes(client: &kube::Client, ns: &str, cycles: usize) -> anyhow::Result<()> {
+    let routes: Api<HttpRoute> = Api::namespaced(client.clone(), ns);
+    let params = PatchParams::apply("e2e-churn");
+    for i in 0..cycles {
+        let name = format!("churn-{i}");
+        let body = json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": { "name": &name, "namespace": ns },
+            "spec": {
+                "parentRefs": [{ "name": "coxswain-test" }],
+                "rules": [{ "backendRefs": [{ "name": "echo-a", "port": 3000 }] }]
+            }
+        });
+        routes
+            .patch(&name, &params, &Patch::Apply(&body))
+            .await
+            .with_context(|| format!("apply churn route {name}"))?;
+        routes
+            .delete(&name, &DeleteParams::default())
+            .await
+            .with_context(|| format!("delete churn route {name}"))?;
+    }
+    Ok(())
+}
+
+/// #573 happy path: a route created *after* a sustained churn burst still
+/// converges. Before the fix, enough churn against a lagging shared-store
+/// subscriber wedged the root reflector — relists stopped completing and the
+/// store froze on a stale/empty snapshot, so nothing created afterwards ever
+/// reconciled. This asserts the store keeps processing across the burst: the
+/// `coxswain-test` Gateway is Programmed, a churn burst runs, and a fresh
+/// HTTPRoute created afterwards reaches Programmed=True.
+#[tokio::test]
+async fn fresh_route_converges_after_churn_burst() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "churn-fresh").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_gateway_programmed(
+        &h.client,
+        "coxswain-test",
+        &ns.name,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Sustained churn through the shared HTTPRoute store.
+    churn_httproutes(&h.client, &ns.name, ROUTE_CHURN_CYCLES).await?;
+
+    // A route created AFTER the burst must still converge — the store did not
+    // wedge on a stale relist.
+    let routes: Api<HttpRoute> = Api::namespaced(h.client.clone(), &ns.name);
+    let fresh = json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "HTTPRoute",
+        "metadata": { "name": "post-churn", "namespace": &ns.name },
+        "spec": {
+            "parentRefs": [{ "name": "coxswain-test" }],
+            "hostnames": ["post-churn.local"],
+            "rules": [{ "backendRefs": [{ "name": "echo-a", "port": 3000 }] }]
+        }
+    });
+    routes
+        .patch(
+            "post-churn",
+            &PatchParams::apply("e2e-test"),
+            &Patch::Apply(&fresh),
+        )
+        .await
+        .context("apply post-churn route")?;
+    wait::wait_for_httproute_programmed(&h.client, "post-churn", &ns.name, Duration::from_secs(60))
+        .await?;
+
+    // And the wedge signature is absent: every relist completed.
+    wait::wait_for_relists_settled(&h.controller_admin_url("/metrics"), Duration::from_secs(30))
+        .await?;
+    Ok(())
+}
+
+/// #573 failure-mode guard: a churn burst must not leave a stuck relist, and the
+/// existing Gateway's status must not go stale/zombie. This asserts the wedge
+/// *signature* directly — `coxswain_controller_watch_relists_pending` settles to
+/// 0 (a relist that began but never finished would pin it above 0) — and that
+/// the live `coxswain-test` Gateway is still Programmed at its current
+/// generation after the burst (a wedged store would freeze its status).
+#[tokio::test]
+async fn route_churn_burst_leaves_no_stuck_relist() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "churn-nostuck").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_gateway_programmed(
+        &h.client,
+        "coxswain-test",
+        &ns.name,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Churn the shared HTTPRoute store while the Gateway is live.
+    churn_httproutes(&h.client, &ns.name, ROUTE_CHURN_CYCLES).await?;
+
+    // Primary assertion: no reflector is stuck mid-relist (the #573 signature).
+    wait::wait_for_relists_settled(&h.controller_admin_url("/metrics"), Duration::from_secs(30))
+        .await?;
+
+    // No zombie: the existing Gateway's status is still maintained (re-confirmed
+    // Programmed at current generation), not frozen behind a wedged store.
+    wait::wait_for_gateway_programmed(
+        &h.client,
+        "coxswain-test",
+        &ns.name,
+        Duration::from_secs(30),
+    )
+    .await?;
     Ok(())
 }

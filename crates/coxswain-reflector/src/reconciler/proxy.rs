@@ -21,6 +21,7 @@ use super::route_builder::{
     build_terminate_routes, build_tls, build_udp_routes, count_attached_routes,
     merge_backend_client_cert_health, resolve_backend_client_certs,
 };
+use super::shared_stream::{self, FanoutSender, Subscription};
 use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
 use crate::gateway_api::{
     BackendPolicyIndex, BackendTlsIndex, GatewayApiReconciler, GrpcRouteReconciler,
@@ -58,6 +59,7 @@ use coxswain_core::crd::{
 };
 use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 use coxswain_core::fleet::{self, SharedFleet};
+use coxswain_core::health::LivenessGate;
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
 use coxswain_core::publish_index::SharedGatewayPublishIndex;
@@ -73,7 +75,7 @@ use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::{
     Client,
     api::Api,
-    runtime::{WatchStreamExt, reflector, reflector::ReflectHandle, watcher},
+    runtime::{WatchStreamExt, reflector, reflector::ObjectRef, watcher},
 };
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
@@ -235,6 +237,12 @@ pub struct ReconcilerOptions {
     /// reconciler's original fixed 500 ms coalescing timer — see
     /// [`super::debounce::settle`].
     pub debounce: crate::DebounceSettings,
+    /// When `Some`, spawn the relist liveness backstop (#573): a monitor that
+    /// trips this gate — failing `/healthz` so kubelet restarts the pod — if any
+    /// reflector's watch relist stays incomplete past
+    /// [`crate::metrics::RELIST_STUCK_WINDOW`]. Controller role only; the proxy
+    /// role leaves this `None` (its reflectors don't gate cluster status).
+    pub liveness_gate: Option<LivenessGate>,
 }
 
 impl Default for ReconcilerOptions {
@@ -251,6 +259,7 @@ impl Default for ReconcilerOptions {
             fetch_remote_jwks: false,
             enable_ingress: true,
             debounce: crate::DebounceSettings::default(),
+            liveness_gate: None,
         }
     }
 }
@@ -404,9 +413,11 @@ pub struct ReconcilerOutputs {
 /// Shared-store subscriptions the controller's status-writer consumes to drive
 /// its reconcile work-queues off the reflector's informers (#347).
 ///
-/// Each [`ReflectHandle`] is simultaneously a `Stream<Item = Arc<K>>` of applied
-/// objects (the work-queue trigger) and a handle to the synced store via
-/// [`ReflectHandle::reader`]. The handles are independent broadcast subscribers:
+/// Each [`Subscription`] yields a `Stream<Item = Arc<K>>` of applied objects
+/// (the work-queue trigger, via [`Subscription::into_stream`]) and a handle to
+/// the synced store (via [`Subscription::reader`]). The subscriptions are
+/// independent lossy broadcast subscribers over plain reflector stores — a
+/// slow or unpolled one can never back-pressure the root reflector (#573).
 /// `clone()` one to feed a second consumer (e.g. a primary trigger plus a
 /// secondary `watches_shared_stream` on another Controller). Obtained once from
 /// [`SharedProxyReconciler::status_subscriptions`].
@@ -414,33 +425,33 @@ pub struct ReconcilerOutputs {
 #[derive(Clone)]
 pub struct StatusSubscriptions {
     /// Applied-`Gateway` stream + reader.
-    pub gateways: ReflectHandle<Gateway>,
+    pub gateways: Subscription<Gateway>,
     /// Applied-`GatewayClass` stream + reader.
-    pub gateway_classes: ReflectHandle<GatewayClass>,
+    pub gateway_classes: Subscription<GatewayClass>,
     /// Applied-`HTTPRoute` stream + reader.
-    pub routes: ReflectHandle<HttpRoute>,
+    pub routes: Subscription<HttpRoute>,
     /// Applied-`GRPCRoute` stream + reader.
-    pub grpc_routes: ReflectHandle<GrpcRoute>,
+    pub grpc_routes: Subscription<GrpcRoute>,
     /// Applied-`Ingress` stream + reader.
-    pub ingresses: ReflectHandle<Ingress>,
+    pub ingresses: Subscription<Ingress>,
     /// Applied-`IngressClass` stream + reader.
-    pub ingress_classes: ReflectHandle<IngressClass>,
+    pub ingress_classes: Subscription<IngressClass>,
     /// Applied-`BackendTLSPolicy` stream + reader.
-    pub policies: ReflectHandle<BackendTlsPolicy>,
+    pub policies: Subscription<BackendTlsPolicy>,
     /// Applied-`TLSRoute` stream + reader.
-    pub tls_routes: ReflectHandle<TlsRoute>,
+    pub tls_routes: Subscription<TlsRoute>,
     /// Applied-`TCPRoute` stream + reader.
-    pub tcp_routes: ReflectHandle<TcpRoute>,
+    pub tcp_routes: Subscription<TcpRoute>,
     /// Applied-`UDPRoute` stream + reader.
-    pub udp_routes: ReflectHandle<UdpRoute>,
+    pub udp_routes: Subscription<UdpRoute>,
     /// Applied-`ListenerSet` stream + reader (GEP-1713).
-    pub listener_sets: ReflectHandle<ListenerSet>,
+    pub listener_sets: Subscription<ListenerSet>,
     /// Applied-`ClientTrafficPolicy` stream + reader (#327).
-    pub client_traffic_policies: ReflectHandle<ClientTrafficPolicy>,
+    pub client_traffic_policies: Subscription<ClientTrafficPolicy>,
     /// Applied-`CoxswainBackendPolicy` stream + reader (#354).
-    pub coxswain_backend_policies: ReflectHandle<CoxswainBackendPolicy>,
+    pub coxswain_backend_policies: Subscription<CoxswainBackendPolicy>,
     /// Applied-`CoxswainExternalAuth` stream + reader (#23).
-    pub coxswain_external_auths: ReflectHandle<CoxswainExternalAuth>,
+    pub coxswain_external_auths: Subscription<CoxswainExternalAuth>,
 }
 
 /// Pre-created shared-store writers for the status-relevant types.
@@ -449,20 +460,20 @@ pub struct StatusSubscriptions {
 /// [`StatusSubscriptions`] exist at wiring time, before `start`), stashed behind
 /// a `Mutex`, and moved into [`spawn_tasks`] on `start` to drive the reflectors.
 struct StatusStoreWriters {
-    gateways: reflector::store::Writer<Gateway>,
-    gateway_classes: reflector::store::Writer<GatewayClass>,
-    routes: reflector::store::Writer<HttpRoute>,
-    grpc_routes: reflector::store::Writer<GrpcRoute>,
-    ingresses: reflector::store::Writer<Ingress>,
-    ingress_classes: reflector::store::Writer<IngressClass>,
-    policies: reflector::store::Writer<BackendTlsPolicy>,
-    tls_routes: reflector::store::Writer<TlsRoute>,
-    tcp_routes: reflector::store::Writer<TcpRoute>,
-    udp_routes: reflector::store::Writer<UdpRoute>,
-    listener_sets: reflector::store::Writer<ListenerSet>,
-    client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
-    coxswain_backend_policies: reflector::store::Writer<CoxswainBackendPolicy>,
-    coxswain_external_auths: reflector::store::Writer<CoxswainExternalAuth>,
+    gateways: shared_stream::SharedStoreWriter<Gateway>,
+    gateway_classes: shared_stream::SharedStoreWriter<GatewayClass>,
+    routes: shared_stream::SharedStoreWriter<HttpRoute>,
+    grpc_routes: shared_stream::SharedStoreWriter<GrpcRoute>,
+    ingresses: shared_stream::SharedStoreWriter<Ingress>,
+    ingress_classes: shared_stream::SharedStoreWriter<IngressClass>,
+    policies: shared_stream::SharedStoreWriter<BackendTlsPolicy>,
+    tls_routes: shared_stream::SharedStoreWriter<TlsRoute>,
+    tcp_routes: shared_stream::SharedStoreWriter<TcpRoute>,
+    udp_routes: shared_stream::SharedStoreWriter<UdpRoute>,
+    listener_sets: shared_stream::SharedStoreWriter<ListenerSet>,
+    client_traffic_policies: shared_stream::SharedStoreWriter<ClientTrafficPolicy>,
+    coxswain_backend_policies: shared_stream::SharedStoreWriter<CoxswainBackendPolicy>,
+    coxswain_external_auths: shared_stream::SharedStoreWriter<CoxswainExternalAuth>,
 }
 
 /// `Option`-wrapped form of [`StatusStoreWriters`] produced by
@@ -470,20 +481,20 @@ struct StatusStoreWriters {
 ///
 /// Named to avoid a `clippy::type_complexity` violation on the method's return type.
 struct StatusStoreOptionWriters {
-    routes: Option<reflector::store::Writer<HttpRoute>>,
-    grpc_routes: Option<reflector::store::Writer<GrpcRoute>>,
-    ingresses: Option<reflector::store::Writer<Ingress>>,
-    ingress_classes: Option<reflector::store::Writer<IngressClass>>,
-    gateways: Option<reflector::store::Writer<Gateway>>,
-    gateway_classes: Option<reflector::store::Writer<GatewayClass>>,
-    policies: Option<reflector::store::Writer<BackendTlsPolicy>>,
-    tls_routes: Option<reflector::store::Writer<TlsRoute>>,
-    tcp_routes: Option<reflector::store::Writer<TcpRoute>>,
-    udp_routes: Option<reflector::store::Writer<UdpRoute>>,
-    listener_sets: Option<reflector::store::Writer<ListenerSet>>,
-    client_traffic_policies: Option<reflector::store::Writer<ClientTrafficPolicy>>,
-    coxswain_backend_policies: Option<reflector::store::Writer<CoxswainBackendPolicy>>,
-    coxswain_external_auths: Option<reflector::store::Writer<CoxswainExternalAuth>>,
+    routes: Option<shared_stream::SharedStoreWriter<HttpRoute>>,
+    grpc_routes: Option<shared_stream::SharedStoreWriter<GrpcRoute>>,
+    ingresses: Option<shared_stream::SharedStoreWriter<Ingress>>,
+    ingress_classes: Option<shared_stream::SharedStoreWriter<IngressClass>>,
+    gateways: Option<shared_stream::SharedStoreWriter<Gateway>>,
+    gateway_classes: Option<shared_stream::SharedStoreWriter<GatewayClass>>,
+    policies: Option<shared_stream::SharedStoreWriter<BackendTlsPolicy>>,
+    tls_routes: Option<shared_stream::SharedStoreWriter<TlsRoute>>,
+    tcp_routes: Option<shared_stream::SharedStoreWriter<TcpRoute>>,
+    udp_routes: Option<shared_stream::SharedStoreWriter<UdpRoute>>,
+    listener_sets: Option<shared_stream::SharedStoreWriter<ListenerSet>>,
+    client_traffic_policies: Option<shared_stream::SharedStoreWriter<ClientTrafficPolicy>>,
+    coxswain_backend_policies: Option<shared_stream::SharedStoreWriter<CoxswainBackendPolicy>>,
+    coxswain_external_auths: Option<shared_stream::SharedStoreWriter<CoxswainExternalAuth>>,
 }
 
 impl StatusStoreWriters {
@@ -560,90 +571,44 @@ impl SharedProxyReconciler {
             udp_routes,
         } = outputs;
         // When the controller role asks for status subscriptions, back the
-        // status-relevant stores with shared informers now (sync) so the
-        // matching subscriptions exist before `start` runs and can be handed to
-        // the status-writer at wiring time. `subscribe()` is infallible here:
-        // the writer comes from `store_shared`, which always carries a
-        // dispatcher.
+        // status-relevant stores now (sync) so the matching subscriptions exist
+        // before `start` runs and can be handed to the status-writer at wiring
+        // time. Each is a *plain* reflector store paired with a lossy broadcast
+        // fan-out (`shared_stream::shared_store`) — deliberately NOT kube's
+        // `store_shared`, whose back-pressuring dispatcher wedges the root
+        // reflector when a subscriber lags (#573). The `SharedStoreWriter` (store
+        // writer + fan-out sender) drives the reflector; the `Subscription` is
+        // the status-writer's trigger + reader.
         let (status_store_writers, status_subscriptions) = if opts.status_subscriptions {
-            let (_, gateways) = reflector::store_shared::<Gateway>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, gateway_classes) =
-                reflector::store_shared::<GatewayClass>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, routes) = reflector::store_shared::<HttpRoute>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, grpc_routes) = reflector::store_shared::<GrpcRoute>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, ingresses) = reflector::store_shared::<Ingress>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, ingress_classes) =
-                reflector::store_shared::<IngressClass>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, policies) =
-                reflector::store_shared::<BackendTlsPolicy>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, tls_routes) = reflector::store_shared::<TlsRoute>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, tcp_routes) = reflector::store_shared::<TcpRoute>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, udp_routes) = reflector::store_shared::<UdpRoute>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, listener_sets) =
-                reflector::store_shared::<ListenerSet>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, client_traffic_policies) =
-                reflector::store_shared::<ClientTrafficPolicy>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, coxswain_backend_policies) =
-                reflector::store_shared::<CoxswainBackendPolicy>(STATUS_SUBSCRIBE_BUFFER);
-            let (_, coxswain_external_auths) =
-                reflector::store_shared::<CoxswainExternalAuth>(STATUS_SUBSCRIBE_BUFFER);
+            let (gateways_w, gateways) =
+                shared_stream::shared_store::<Gateway>(STATUS_SUBSCRIBE_BUFFER);
+            let (gateway_classes_w, gateway_classes) =
+                shared_stream::shared_store::<GatewayClass>(STATUS_SUBSCRIBE_BUFFER);
+            let (routes_w, routes) =
+                shared_stream::shared_store::<HttpRoute>(STATUS_SUBSCRIBE_BUFFER);
+            let (grpc_routes_w, grpc_routes) =
+                shared_stream::shared_store::<GrpcRoute>(STATUS_SUBSCRIBE_BUFFER);
+            let (ingresses_w, ingresses) =
+                shared_stream::shared_store::<Ingress>(STATUS_SUBSCRIBE_BUFFER);
+            let (ingress_classes_w, ingress_classes) =
+                shared_stream::shared_store::<IngressClass>(STATUS_SUBSCRIBE_BUFFER);
+            let (policies_w, policies) =
+                shared_stream::shared_store::<BackendTlsPolicy>(STATUS_SUBSCRIBE_BUFFER);
+            let (tls_routes_w, tls_routes) =
+                shared_stream::shared_store::<TlsRoute>(STATUS_SUBSCRIBE_BUFFER);
+            let (tcp_routes_w, tcp_routes) =
+                shared_stream::shared_store::<TcpRoute>(STATUS_SUBSCRIBE_BUFFER);
+            let (udp_routes_w, udp_routes) =
+                shared_stream::shared_store::<UdpRoute>(STATUS_SUBSCRIBE_BUFFER);
+            let (listener_sets_w, listener_sets) =
+                shared_stream::shared_store::<ListenerSet>(STATUS_SUBSCRIBE_BUFFER);
+            let (client_traffic_policies_w, client_traffic_policies) =
+                shared_stream::shared_store::<ClientTrafficPolicy>(STATUS_SUBSCRIBE_BUFFER);
+            let (coxswain_backend_policies_w, coxswain_backend_policies) =
+                shared_stream::shared_store::<CoxswainBackendPolicy>(STATUS_SUBSCRIBE_BUFFER);
+            let (coxswain_external_auths_w, coxswain_external_auths) =
+                shared_stream::shared_store::<CoxswainExternalAuth>(STATUS_SUBSCRIBE_BUFFER);
             let subs = StatusSubscriptions {
-                gateways: gateways.subscribe().unwrap_or_else(|| {
-                    panic!("invariant: store_shared writer must yield a Gateway subscriber")
-                }),
-                gateway_classes: gateway_classes.subscribe().unwrap_or_else(|| {
-                    panic!("invariant: store_shared writer must yield a GatewayClass subscriber")
-                }),
-                routes: routes.subscribe().unwrap_or_else(|| {
-                    panic!("invariant: store_shared writer must yield an HTTPRoute subscriber")
-                }),
-                grpc_routes: grpc_routes.subscribe().unwrap_or_else(|| {
-                    panic!("invariant: store_shared writer must yield a GRPCRoute subscriber")
-                }),
-                ingresses: ingresses.subscribe().unwrap_or_else(|| {
-                    panic!("invariant: store_shared writer must yield an Ingress subscriber")
-                }),
-                ingress_classes: ingress_classes.subscribe().unwrap_or_else(|| {
-                    panic!("invariant: store_shared writer must yield an IngressClass subscriber")
-                }),
-                policies: policies.subscribe().unwrap_or_else(|| {
-                    panic!(
-                        "invariant: store_shared writer must yield a BackendTLSPolicy subscriber"
-                    )
-                }),
-                tls_routes: tls_routes.subscribe().unwrap_or_else(|| {
-                    panic!("invariant: store_shared writer must yield a TLSRoute subscriber")
-                }),
-                tcp_routes: tcp_routes.subscribe().unwrap_or_else(|| {
-                    panic!("invariant: store_shared writer must yield a TCPRoute subscriber")
-                }),
-                udp_routes: udp_routes.subscribe().unwrap_or_else(|| {
-                    panic!("invariant: store_shared writer must yield a UDPRoute subscriber")
-                }),
-                listener_sets: listener_sets.subscribe().unwrap_or_else(|| {
-                    panic!("invariant: store_shared writer must yield a ListenerSet subscriber")
-                }),
-                client_traffic_policies: client_traffic_policies.subscribe().unwrap_or_else(|| {
-                    panic!(
-                        "invariant: store_shared writer must yield a ClientTrafficPolicy subscriber"
-                    )
-                }),
-                coxswain_backend_policies: coxswain_backend_policies.subscribe().unwrap_or_else(
-                    || {
-                        panic!(
-                            "invariant: store_shared writer must yield a CoxswainBackendPolicy subscriber"
-                        )
-                    },
-                ),
-                coxswain_external_auths: coxswain_external_auths.subscribe().unwrap_or_else(
-                    || {
-                        panic!(
-                            "invariant: store_shared writer must yield a CoxswainExternalAuth subscriber"
-                        )
-                    },
-                ),
-            };
-            let writers = StatusStoreWriters {
                 gateways,
                 gateway_classes,
                 routes,
@@ -658,6 +623,22 @@ impl SharedProxyReconciler {
                 client_traffic_policies,
                 coxswain_backend_policies,
                 coxswain_external_auths,
+            };
+            let writers = StatusStoreWriters {
+                gateways: gateways_w,
+                gateway_classes: gateway_classes_w,
+                routes: routes_w,
+                grpc_routes: grpc_routes_w,
+                ingresses: ingresses_w,
+                ingress_classes: ingress_classes_w,
+                policies: policies_w,
+                tls_routes: tls_routes_w,
+                tcp_routes: tcp_routes_w,
+                udp_routes: udp_routes_w,
+                listener_sets: listener_sets_w,
+                client_traffic_policies: client_traffic_policies_w,
+                coxswain_backend_policies: coxswain_backend_policies_w,
+                coxswain_external_auths: coxswain_external_auths_w,
             };
             (Some(writers), Some(subs))
         } else {
@@ -838,6 +819,8 @@ struct ReconcilerConfig {
     fetch_remote_jwks: bool,
     /// See [`ReconcilerOptions::debounce`].
     debounce: crate::DebounceSettings,
+    /// See [`ReconcilerOptions::liveness_gate`].
+    liveness_gate: Option<LivenessGate>,
 }
 
 pub(super) struct ReflectorStores<'a> {
@@ -1010,19 +993,34 @@ pub(super) struct Ownership<'a> {
 }
 
 /// Per-reflector side-effect channels: rebuild notification, readiness flip,
-/// and metric observation.
+/// metric observation, and (for status-relevant stores) the lossy fan-out
+/// sender that feeds the status-writer's work-queues.
 ///
 /// Grouped so [`spawn_reflector`] stays under `clippy::too_many_arguments`.
-pub(super) struct ReflectorEffects {
+/// Generic over the watched kind `K` solely to carry the type-correct
+/// [`FanoutSender`]; plain (non-shared) reflectors leave it `None`.
+pub(super) struct ReflectorEffects<K>
+where
+    K: kube::Resource + Clone + 'static,
+    K::DynamicType: Eq + std::hash::Hash + Clone,
+{
     notify: Arc<Notify>,
     controller_health: SubsystemHandle,
     /// Health-check name to flip Ready on first `Event::InitDone`. Also used
     /// as the `kind` metric label for `watch_events_total` / `watch_errors_total`.
     check: &'static str,
     metrics: crate::ReflectorMetrics,
+    /// Lossy fan-out to the status-writer's subscriptions (#573). `Some` only
+    /// for status-relevant stores in the controller role; `None` makes the
+    /// reflector a plain cache with no fan-out.
+    fanout: Option<FanoutSender<K>>,
 }
 
-impl ReflectorEffects {
+impl<K> ReflectorEffects<K>
+where
+    K: kube::Resource + Clone + 'static,
+    K::DynamicType: Eq + std::hash::Hash + Clone,
+{
     pub(super) fn new(
         notify: &Arc<Notify>,
         health: &SubsystemHandle,
@@ -1034,7 +1032,17 @@ impl ReflectorEffects {
             controller_health: health.clone(),
             check,
             metrics,
+            fanout: None,
         }
+    }
+
+    /// Attach the lossy fan-out sender for a status-relevant store. `None` (the
+    /// proxy role, where the store is plain) is a no-op, so status spawn sites
+    /// can pass their `Option<FanoutSender>` unconditionally.
+    #[must_use]
+    pub(super) fn with_fanout(mut self, tx: Option<FanoutSender<K>>) -> Self {
+        self.fanout = tx;
+        self
     }
 }
 
@@ -1043,7 +1051,7 @@ pub(super) fn spawn_reflector<T>(
     writer: reflector::store::Writer<T>,
     api: Api<T>,
     config: watcher::Config,
-    effects: ReflectorEffects,
+    effects: ReflectorEffects<T>,
     label: &'static str,
 ) where
     T: kube::Resource
@@ -1060,7 +1068,12 @@ pub(super) fn spawn_reflector<T>(
         controller_health,
         check,
         metrics,
+        fanout,
     } = effects;
+    // Read handle onto the *same* store the reflector writes, captured before
+    // `writer` is moved in. Used on `InitDone` to fan the freshly-swapped store
+    // out to subscribers. `None` when this store has no fan-out.
+    let store_reader = fanout.as_ref().map(|_| writer.as_reader());
     set.spawn(async move {
         let stream = reflector::reflector(writer, watcher(api, config).default_backoff());
         tokio::pin!(stream);
@@ -1070,18 +1083,48 @@ pub(super) fn spawn_reflector<T>(
                     notify.notify_one();
                     controller_health.ready(check);
                     metrics.observe_watch_event(check, "init_done");
+                    metrics.observe_relist_completed(check);
+                    // `reflector()` swaps the relist buffer into the store
+                    // before yielding this event, so `state()` is the fresh
+                    // post-relist world. Fan every key out so subscribers
+                    // reconcile the new snapshot (mirrors kube's dispatcher,
+                    // without its back-pressure).
+                    if let (Some(tx), Some(reader)) = (&fanout, &store_reader) {
+                        for obj in reader.state() {
+                            let _ = tx.send(ObjectRef::from_obj(obj.as_ref()));
+                        }
+                    }
                 }
-                Ok(watcher::Event::Apply(_)) => {
+                Ok(watcher::Event::Init) => {
+                    // A relist began: mark it in flight and (re)start its stall
+                    // clock. The bulk fan-out happens on `InitDone`.
+                    notify.notify_one();
+                    metrics.observe_watch_event(check, "restart");
+                    metrics.observe_relist_progress(check);
+                }
+                Ok(watcher::Event::InitApply(_)) => {
+                    // An object streamed in during the list phase: relist
+                    // progress. Buffered by `reflector()` into the pending
+                    // snapshot; fanned out in bulk on `InitDone`. Refreshing the
+                    // stall clock here keeps a large-but-streaming relist from
+                    // ever looking frozen to the liveness backstop.
+                    notify.notify_one();
+                    metrics.observe_watch_event(check, "restart");
+                    metrics.observe_relist_progress(check);
+                }
+                Ok(watcher::Event::Apply(obj)) => {
                     notify.notify_one();
                     metrics.observe_watch_event(check, "apply");
+                    // The store already holds `obj` (applied before this yield),
+                    // so a subscriber that resolves the ref finds it. Lossy send:
+                    // a full/absent subscriber never blocks the reflector (#573).
+                    if let Some(tx) = &fanout {
+                        let _ = tx.send(ObjectRef::from_obj(&obj));
+                    }
                 }
                 Ok(watcher::Event::Delete(_)) => {
                     notify.notify_one();
                     metrics.observe_watch_event(check, "delete");
-                }
-                Ok(_) => {
-                    notify.notify_one();
-                    metrics.observe_watch_event(check, "restart");
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "{label} reflector error");
@@ -1114,6 +1157,7 @@ impl BackgroundService for SharedProxyReconciler {
             enable_ingress: self.opts.enable_ingress,
             fetch_remote_jwks: self.opts.fetch_remote_jwks,
             debounce: self.opts.debounce,
+            liveness_gate: self.opts.liveness_gate.clone(),
         };
         let handles = SharedHandles {
             ingress_routes: self.ingress_routes.clone(),
@@ -1204,20 +1248,29 @@ struct SharedHandles {
     proxy_health: SubsystemHandle,
 }
 
-/// Resolve a `(reader, writer)` pair for a reflector store: reuse a shared
-/// writer pre-created in [`SharedProxyReconciler::new`] (its reader is the same
-/// synced store the status-writer subscribed to), or create a fresh
-/// non-shared store when status subscriptions are disabled.
+/// Resolve a `(reader, writer, fanout)` triple for a reflector store: reuse a
+/// pre-created [`shared_stream::SharedStoreWriter`] from
+/// [`SharedProxyReconciler::new`] (its reader is the same synced store the
+/// status-writer subscribed to, and its `tx` is the lossy fan-out feeding those
+/// subscriptions), or create a fresh non-shared store with no fan-out when
+/// status subscriptions are disabled (the proxy role).
 fn reader_writer<K>(
-    pre: Option<reflector::store::Writer<K>>,
-) -> (reflector::Store<K>, reflector::store::Writer<K>)
+    pre: Option<shared_stream::SharedStoreWriter<K>>,
+) -> (
+    reflector::Store<K>,
+    reflector::store::Writer<K>,
+    Option<FanoutSender<K>>,
+)
 where
     K: kube::Resource + Clone + 'static,
     K::DynamicType: Eq + std::hash::Hash + Clone + Default,
 {
     match pre {
-        Some(writer) => (writer.as_reader(), writer),
-        None => reflector::store::<K>(),
+        Some(shared) => (shared.writer.as_reader(), shared.writer, Some(shared.tx)),
+        None => {
+            let (reader, writer) = reflector::store::<K>();
+            (reader, writer, None)
+        }
     }
 }
 
@@ -1242,6 +1295,20 @@ struct GatewayApiStoreWriters {
     namespaces: reflector::store::Writer<Namespace>,
     client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
     coxswain_backend_policies: reflector::store::Writer<CoxswainBackendPolicy>,
+    /// Lossy fan-out senders for the status-relevant stores in this bundle
+    /// (`Some` only in the controller role). Paired with the matching writer;
+    /// attached to the reflector via `ReflectorEffects::with_fanout` (#573).
+    routes_fanout: Option<FanoutSender<HttpRoute>>,
+    grpc_routes_fanout: Option<FanoutSender<GrpcRoute>>,
+    tls_routes_fanout: Option<FanoutSender<TlsRoute>>,
+    tcp_routes_fanout: Option<FanoutSender<TcpRoute>>,
+    udp_routes_fanout: Option<FanoutSender<UdpRoute>>,
+    gateways_fanout: Option<FanoutSender<Gateway>>,
+    gateway_classes_fanout: Option<FanoutSender<GatewayClass>>,
+    policies_fanout: Option<FanoutSender<BackendTlsPolicy>>,
+    listener_sets_fanout: Option<FanoutSender<ListenerSet>>,
+    client_traffic_policies_fanout: Option<FanoutSender<ClientTrafficPolicy>>,
+    coxswain_backend_policies_fanout: Option<FanoutSender<CoxswainBackendPolicy>>,
 }
 
 /// Spawn all Gateway API reflectors into `set`.
@@ -1276,6 +1343,17 @@ fn add_gateway_api_reflectors(
         namespaces,
         client_traffic_policies,
         coxswain_backend_policies,
+        routes_fanout,
+        grpc_routes_fanout,
+        tls_routes_fanout,
+        tcp_routes_fanout,
+        udp_routes_fanout,
+        gateways_fanout,
+        gateway_classes_fanout,
+        policies_fanout,
+        listener_sets_fanout,
+        client_traffic_policies_fanout,
+        coxswain_backend_policies_fanout,
     } = writers;
 
     spawn_reflector(
@@ -1283,7 +1361,7 @@ fn add_gateway_api_reflectors(
         routes,
         scoped_api::<HttpRoute>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "httproute", metrics),
+        ReflectorEffects::new(notify, health, "httproute", metrics).with_fanout(routes_fanout),
         "HttpRoute",
     );
     spawn_reflector(
@@ -1291,7 +1369,7 @@ fn add_gateway_api_reflectors(
         grpc_routes,
         scoped_api::<GrpcRoute>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "grpcroute", metrics),
+        ReflectorEffects::new(notify, health, "grpcroute", metrics).with_fanout(grpc_routes_fanout),
         "GrpcRoute",
     );
     spawn_reflector(
@@ -1299,7 +1377,7 @@ fn add_gateway_api_reflectors(
         tls_routes,
         scoped_api::<TlsRoute>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "tls_route", metrics),
+        ReflectorEffects::new(notify, health, "tls_route", metrics).with_fanout(tls_routes_fanout),
         "TlsRoute",
     );
     spawn_reflector(
@@ -1307,7 +1385,7 @@ fn add_gateway_api_reflectors(
         tcp_routes,
         scoped_api::<TcpRoute>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "tcp_route", metrics),
+        ReflectorEffects::new(notify, health, "tcp_route", metrics).with_fanout(tcp_routes_fanout),
         "TcpRoute",
     );
     spawn_reflector(
@@ -1315,7 +1393,7 @@ fn add_gateway_api_reflectors(
         udp_routes,
         scoped_api::<UdpRoute>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "udp_route", metrics),
+        ReflectorEffects::new(notify, health, "udp_route", metrics).with_fanout(udp_routes_fanout),
         "UdpRoute",
     );
     spawn_reflector(
@@ -1323,7 +1401,7 @@ fn add_gateway_api_reflectors(
         gateways,
         scoped_api::<Gateway>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "gateway", metrics),
+        ReflectorEffects::new(notify, health, "gateway", metrics).with_fanout(gateways_fanout),
         "Gateway",
     );
     spawn_reflector(
@@ -1331,7 +1409,8 @@ fn add_gateway_api_reflectors(
         gateway_classes,
         Api::<GatewayClass>::all(client.clone()),
         watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "gateway_class", metrics),
+        ReflectorEffects::new(notify, health, "gateway_class", metrics)
+            .with_fanout(gateway_classes_fanout),
         "GatewayClass",
     );
     spawn_reflector(
@@ -1347,7 +1426,8 @@ fn add_gateway_api_reflectors(
         policies,
         scoped_api::<BackendTlsPolicy>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "backend_tls_policy", metrics),
+        ReflectorEffects::new(notify, health, "backend_tls_policy", metrics)
+            .with_fanout(policies_fanout),
         "BackendTlsPolicy",
     );
     // ConfigMaps have no type= field selector equivalent; all CMs in scope are
@@ -1391,7 +1471,8 @@ fn add_gateway_api_reflectors(
         listener_sets,
         scoped_api::<ListenerSet>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "listener_set", metrics),
+        ReflectorEffects::new(notify, health, "listener_set", metrics)
+            .with_fanout(listener_sets_fanout),
         "ListenerSet",
     );
     // Namespaces are cluster-scoped and watched only so a Gateway's
@@ -1414,7 +1495,8 @@ fn add_gateway_api_reflectors(
         client_traffic_policies,
         scoped_api::<ClientTrafficPolicy>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "client_traffic_policy", metrics),
+        ReflectorEffects::new(notify, health, "client_traffic_policy", metrics)
+            .with_fanout(client_traffic_policies_fanout),
         "ClientTrafficPolicy",
     );
     // `CoxswainBackendPolicy` CRs — per-backend connect/idle timeouts (#354).
@@ -1423,7 +1505,8 @@ fn add_gateway_api_reflectors(
         coxswain_backend_policies,
         scoped_api::<CoxswainBackendPolicy>(client.clone(), ns),
         watcher::Config::default(),
-        ReflectorEffects::new(notify, health, "coxswain_backend_policy", metrics),
+        ReflectorEffects::new(notify, health, "coxswain_backend_policy", metrics)
+            .with_fanout(coxswain_backend_policies_fanout),
         "CoxswainBackendPolicy",
     );
 }
@@ -1475,19 +1558,22 @@ async fn spawn_tasks(
         enable_ingress,
         fetch_remote_jwks,
         debounce,
+        liveness_gate,
     } = config;
     // Status-relevant stores reuse the shared writers pre-created in `new` (so
     // the status-writer's subscriptions observe the same synced stores); the
     // rest are always fresh non-shared stores.
     let pre = StatusStoreWriters::into_option_writers(status_writers);
-    let (route_reader, route_writer) = reader_writer::<HttpRoute>(pre.routes);
-    let (grpc_route_reader, grpc_route_writer) = reader_writer::<GrpcRoute>(pre.grpc_routes);
-    let (ingress_reader, ingress_writer) = reader_writer::<Ingress>(pre.ingresses);
-    let (class_reader, class_writer) = reader_writer::<IngressClass>(pre.ingress_classes);
+    let (route_reader, route_writer, route_tx) = reader_writer::<HttpRoute>(pre.routes);
+    let (grpc_route_reader, grpc_route_writer, grpc_route_tx) =
+        reader_writer::<GrpcRoute>(pre.grpc_routes);
+    let (ingress_reader, ingress_writer, ingress_tx) = reader_writer::<Ingress>(pre.ingresses);
+    let (class_reader, class_writer, ingress_class_tx) =
+        reader_writer::<IngressClass>(pre.ingress_classes);
     let (class_params_reader, class_params_writer) =
         reflector::store::<CoxswainIngressClassParameters>();
-    let (gateway_reader, gateway_writer) = reader_writer::<Gateway>(pre.gateways);
-    let (gateway_class_reader, gateway_class_writer) =
+    let (gateway_reader, gateway_writer, gateway_tx) = reader_writer::<Gateway>(pre.gateways);
+    let (gateway_class_reader, gateway_class_writer, gateway_class_tx) =
         reader_writer::<GatewayClass>(pre.gateway_classes);
     let (slice_reader, slice_writer) = reflector::store::<EndpointSlice>();
     let (grant_reader, grant_writer) = reflector::store::<ReferenceGrant>();
@@ -1495,7 +1581,7 @@ async fn spawn_tasks(
     let (auth_secret_reader, auth_secret_writer) = reflector::store::<Secret>();
     let (auth_tls_secret_reader, auth_tls_secret_writer) = reflector::store::<Secret>();
     let (service_reader, service_writer) = reflector::store::<Service>();
-    let (policy_reader, policy_writer) = reader_writer::<BackendTlsPolicy>(pre.policies);
+    let (policy_reader, policy_writer, policy_tx) = reader_writer::<BackendTlsPolicy>(pre.policies);
     let (configmap_reader, configmap_writer) = reflector::store::<ConfigMap>();
     let (rate_limit_reader, rate_limit_writer) = reflector::store::<RateLimit>();
     let (retry_policy_reader, retry_policy_writer) = reflector::store::<RetryPolicy>();
@@ -1510,30 +1596,41 @@ async fn spawn_tasks(
     // subscribes to it via `StatusSubscriptions.coxswain_external_auths` (#23) to
     // write `status.ancestors[]`, and the data-plane reader resolves both the
     // route-level ExtensionRef filter and the Gateway-attached policy index.
-    let (external_auth_reader, external_auth_writer) =
+    let (external_auth_reader, external_auth_writer, external_auth_tx) =
         reader_writer::<CoxswainExternalAuth>(pre.coxswain_external_auths);
     let (request_size_limit_reader, request_size_limit_writer) =
         reflector::store::<RequestSizeLimit>();
     let (compression_reader, compression_writer) = reflector::store::<Compression>();
-    let (tls_route_reader, tls_route_writer) = reader_writer::<TlsRoute>(pre.tls_routes);
-    let (tcp_route_reader, tcp_route_writer) = reader_writer::<TcpRoute>(pre.tcp_routes);
-    let (udp_route_reader, udp_route_writer) = reader_writer::<UdpRoute>(pre.udp_routes);
+    let (tls_route_reader, tls_route_writer, tls_route_tx) =
+        reader_writer::<TlsRoute>(pre.tls_routes);
+    let (tcp_route_reader, tcp_route_writer, tcp_route_tx) =
+        reader_writer::<TcpRoute>(pre.tcp_routes);
+    let (udp_route_reader, udp_route_writer, udp_route_tx) =
+        reader_writer::<UdpRoute>(pre.udp_routes);
     // ListenerSet is a status-relevant store: in the controller role its writer is
     // the shared one pre-created in `new`, so the status-writer's subscription and
     // the data-plane reader observe the same synced store (GEP-1713).
-    let (listener_set_reader, listener_set_writer) =
+    let (listener_set_reader, listener_set_writer, listener_set_tx) =
         reader_writer::<ListenerSet>(pre.listener_sets);
     // ClientTrafficPolicy is a status-relevant store: the controller role subscribes
     // to it via `StatusSubscriptions.client_traffic_policies` (#327).
-    let (ctp_reader, ctp_writer) =
+    let (ctp_reader, ctp_writer, ctp_tx) =
         reader_writer::<ClientTrafficPolicy>(pre.client_traffic_policies);
     // CoxswainBackendPolicy is a status-relevant store: the controller role
     // subscribes to it via `StatusSubscriptions.coxswain_backend_policies` (#354).
-    let (cbp_reader, cbp_writer) =
+    let (cbp_reader, cbp_writer, cbp_tx) =
         reader_writer::<CoxswainBackendPolicy>(pre.coxswain_backend_policies);
     let (namespace_reader, namespace_writer) = reflector::store::<Namespace>();
     let notify = Arc::new(Notify::new());
     let mut set = JoinSet::new();
+
+    // Relist liveness backstop (#573), controller role only: trips the gate
+    // (failing `/healthz`) if any reflector's watch relist stays incomplete past
+    // the window, so kubelet restarts a wedged pod. Spawned before the
+    // reflectors so it is already ticking when the first relists begin.
+    if let Some(gate) = liveness_gate {
+        set.spawn(crate::metrics::run_relist_liveness_monitor(gate));
+    }
     let ns = watch_namespace.as_deref();
 
     // --- Always-on reflectors (both surfaces) ---
@@ -1614,7 +1711,8 @@ async fn spawn_tasks(
             &controller_health,
             "coxswain_external_auth",
             metrics,
-        ),
+        )
+        .with_fanout(external_auth_tx),
         "CoxswainExternalAuth",
     );
     // Always-on (not gated by `enable_gateway_api`): the Ingress `compression`
@@ -1676,7 +1774,8 @@ async fn spawn_tasks(
             ingress_writer,
             scoped_api::<Ingress>(client.clone(), ns),
             watcher::Config::default(),
-            ReflectorEffects::new(&notify, &controller_health, "ingress", metrics),
+            ReflectorEffects::new(&notify, &controller_health, "ingress", metrics)
+                .with_fanout(ingress_tx),
             "Ingress",
         );
         spawn_reflector(
@@ -1684,7 +1783,8 @@ async fn spawn_tasks(
             class_writer,
             Api::<IngressClass>::all(client.clone()),
             watcher::Config::default(),
-            ReflectorEffects::new(&notify, &controller_health, "ingress_class", metrics),
+            ReflectorEffects::new(&notify, &controller_health, "ingress_class", metrics)
+                .with_fanout(ingress_class_tx),
             "IngressClass",
         );
         // Watched cluster-wide (like IngressClass): an IngressClass is cluster-scoped
@@ -1743,6 +1843,17 @@ async fn spawn_tasks(
             namespaces: namespace_writer,
             client_traffic_policies: ctp_writer,
             coxswain_backend_policies: cbp_writer,
+            routes_fanout: route_tx,
+            grpc_routes_fanout: grpc_route_tx,
+            tls_routes_fanout: tls_route_tx,
+            tcp_routes_fanout: tcp_route_tx,
+            udp_routes_fanout: udp_route_tx,
+            gateways_fanout: gateway_tx,
+            gateway_classes_fanout: gateway_class_tx,
+            policies_fanout: policy_tx,
+            listener_sets_fanout: listener_set_tx,
+            client_traffic_policies_fanout: ctp_tx,
+            coxswain_backend_policies_fanout: cbp_tx,
         };
         if crate::crds::gateway_api_crds_present(&client).await {
             add_gateway_api_reflectors(

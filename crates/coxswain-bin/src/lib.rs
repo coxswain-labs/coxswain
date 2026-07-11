@@ -107,6 +107,9 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
 
     let mut server = build_minimal_server();
     let health = HealthRegistry::new();
+    // Relist wedge backstop (#573): the reconciler's monitor trips this gate on
+    // a stuck watch relist; `/healthz` reports it so kubelet restarts the pod.
+    let liveness_gate = coxswain_core::health::LivenessGate::new();
 
     let status_writer = spawn_status_writer(
         StatusWriterConfig {
@@ -121,6 +124,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             enable_gateway_api: !args.common.disable_gateway_api,
             enable_ingress: !args.common.disable_ingress,
             debounce,
+            liveness_gate: Some(liveness_gate.clone()),
         },
         health.clone(),
     )?;
@@ -287,6 +291,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             "health".to_string(),
             coxswain_health::HealthServer {
                 registry: health.clone(),
+                liveness: Some(liveness_gate.clone()),
             },
         );
         svc.add_tcp(&health_addr.to_string());
@@ -1395,6 +1400,9 @@ fn wire_management_servers(
             "health".to_string(),
             coxswain_health::HealthServer {
                 registry: config.health.clone(),
+                // Proxy / dev roles have no relist monitor to trip a gate;
+                // `/healthz` keeps its historical always-live semantics.
+                liveness: None,
             },
         );
         svc.add_tcp(&health_addr.to_string());

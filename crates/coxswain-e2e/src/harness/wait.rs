@@ -1048,6 +1048,70 @@ pub fn parse_metric_value(exposition: &str, metric: &str) -> Option<f64> {
         })
 }
 
+/// Maximum value across every labelled sample of `metric` (e.g. the busiest
+/// `kind` of a `{kind="…"}` gauge). `None` if the series is absent (a
+/// lazily-registered gauge reads as 0 until first set).
+#[must_use]
+pub fn max_labelled_metric(exposition: &str, metric: &str) -> Option<f64> {
+    let mut max: Option<f64> = None;
+    for line in exposition.lines().filter(|l| !l.starts_with('#')) {
+        let name = line.split(&[' ', '{'][..]).next().unwrap_or("");
+        if name != metric {
+            continue;
+        }
+        let after = match line.rsplit_once('}') {
+            Some((_, rest)) => rest,
+            None => match line.split_once(' ') {
+                Some((_, rest)) => rest,
+                None => continue,
+            },
+        };
+        if let Some(v) = after
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse::<f64>().ok())
+        {
+            max = Some(max.map_or(v, |m| m.max(v)));
+        }
+    }
+    max
+}
+
+/// Poll until every controller reflector's watch relist has completed — i.e. no
+/// `coxswain_controller_watch_relists_pending{kind=…}` sample stays above 0.
+///
+/// A sustained non-zero value is the #573 wedge signature: a relist began
+/// (`Event::Init`) but its `InitDone` never arrived, so the store serves a
+/// stale/empty world. A brief non-zero during an in-flight relist self-heals,
+/// which is why this polls rather than sampling once.
+pub async fn wait_for_relists_settled(metrics_url: &str, timeout: Duration) -> anyhow::Result<()> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("build reqwest client")?;
+    poll_until(
+        timeout,
+        POLL,
+        || async {
+            let pending = fetch_metrics(&client, metrics_url)
+                .await
+                .ok()
+                .and_then(|b| max_labelled_metric(&b, "coxswain_controller_watch_relists_pending"));
+            format!(
+                "all controller watch relists to complete (max watch_relists_pending=0); \
+                 observed max pending={pending:?}"
+            )
+        },
+        || async {
+            let body = fetch_metrics(&client, metrics_url).await.ok()?;
+            let max = max_labelled_metric(&body, "coxswain_controller_watch_relists_pending")
+                .unwrap_or(0.0);
+            (max == 0.0).then_some(())
+        },
+    )
+    .await
+}
+
 /// Log a citable elapsed-time measurement at INFO level.
 ///
 /// Test files under `tests/` each compile as their own crate (named after the
