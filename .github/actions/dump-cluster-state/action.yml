@@ -32,3 +32,20 @@ runs:
         kubectl logs -n coxswain-system deploy/coxswain-shared-proxy --tail=200 --all-containers --ignore-errors || true
         echo "=== Previous container logs (shared-proxy, if crashed) ==="
         kubectl logs -n coxswain-system deploy/coxswain-shared-proxy --tail=200 --all-containers --previous --ignore-errors || true
+        # Controller /metrics (#570): the metric families that distinguish the
+        # known failure shapes without needing to catch them live in logs —
+        # reconcile_errors_total{reason} (transient vs persistent apiserver
+        # errors), gateways_held_pending (convergence gate stuck), and
+        # watch_events_total{event="restart"} / watch_errors_total (a wedged
+        # or restarting shared watch stream, the stale-store signature).
+        echo "=== Controller /metrics (coxswain_* families) ==="
+        PODS=$(kubectl get pods -n coxswain-system \
+          -l app.kubernetes.io/component=controller \
+          -o jsonpath='{.items[*].metadata.name}') || true
+        for POD in $PODS; do
+          echo "--- $POD ---"
+          # Via the apiserver pod proxy — the runtime image is distroless
+          # (no shell/wget to exec). 8082 is the admin port serving /metrics.
+          kubectl get --raw "/api/v1/namespaces/coxswain-system/pods/${POD}:8082/proxy/metrics" 2>/dev/null \
+            | grep -E '^coxswain_' || true
+        done

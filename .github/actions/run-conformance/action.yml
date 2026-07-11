@@ -93,9 +93,17 @@ runs:
           --set image.pullPolicy=Never \
           --set controller.coxswainImage=coxswain:e2e \
           --set controller.ingress.enabled=false \
+          --set controller.replicas=1 \
           --skip-crds \
           --wait \
           --timeout 120s
+        # controller.replicas=1 (#570): HA failover buys nothing in a
+        # throwaway conformance cluster, and the 4-vCPU runner is the
+        # bottleneck — the observed flake shapes (client GETs to the kind
+        # apiserver timing out, store staleness cascading into stale
+        # observedGeneration waits) are starvation, not product bugs. One
+        # controller replica halves controller CPU + lease/watch traffic and
+        # makes the leader-handover wait below deterministic.
 
     - name: Wait for controller leader handover
       shell: bash
