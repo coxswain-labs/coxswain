@@ -3180,3 +3180,295 @@ async fn dedicated_gateway_listener_addition_trails_programmed_until_rebound() -
     .await?;
     Ok(())
 }
+
+// ─── #570: settled-negative convergence (terminally-invalid listeners) ───────
+
+/// Create a `kubernetes.io/tls` Secret whose `tls.crt`/`tls.key` hold garbage
+/// (non-PEM) bytes — the reflector must classify the listener referencing it
+/// as `InvalidCertificateRef`.
+async fn create_malformed_tls_secret(
+    client: &kube::Client,
+    ns: &str,
+    name: &str,
+) -> anyhow::Result<()> {
+    use k8s_openapi::api::core::v1::Secret;
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use kube::api::PostParams;
+    use std::collections::BTreeMap;
+    let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+    secrets
+        .create(
+            &PostParams::default(),
+            &Secret {
+                metadata: ObjectMeta {
+                    name: Some(name.to_string()),
+                    ..Default::default()
+                },
+                type_: Some("kubernetes.io/tls".to_string()),
+                data: Some({
+                    let mut m = BTreeMap::new();
+                    m.insert(
+                        "tls.crt".to_string(),
+                        k8s_openapi::ByteString(b"not a certificate".to_vec()),
+                    );
+                    m.insert(
+                        "tls.key".to_string(),
+                        k8s_openapi::ByteString(b"not a key".to_vec()),
+                    );
+                    m
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+/// Assert every top-level condition on the Gateway reports
+/// `observedGeneration == metadata.generation` — the conformance
+/// `GatewayMustHaveLatestConditions` invariant the #570 spin violated.
+fn assert_conditions_at_current_generation(gw: &Gateway) {
+    let generation = gw.metadata.generation.unwrap_or(0);
+    let conds = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or(&[]);
+    assert!(!conds.is_empty(), "Gateway has no top-level conditions");
+    for c in conds {
+        assert_eq!(
+            c.observed_generation.unwrap_or(0),
+            generation,
+            "condition {} stale: observedGeneration {} != generation {generation}",
+            c.type_,
+            c.observed_generation.unwrap_or(0),
+        );
+    }
+}
+
+/// #570 sad path (shared mode): a Gateway whose sole HTTPS listener references
+/// a malformed Secret must SETTLE — `Programmed=False, reason=Invalid` with
+/// every top-level condition at the current `observedGeneration` — instead of
+/// holding `Programmed=False/Pending` at `generation-1` forever (the
+/// conformance `gateway-*-malformed-secret` indefinite spin).
+#[tokio::test]
+async fn gateway_with_malformed_tls_secret_settles_programmed_false_invalid_at_current_generation()
+-> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-gw-malformed-tls").await?;
+
+    let host = format!("tls-malformed.{}.local", ns.name);
+    let secret_name = "cert-malformed";
+    create_malformed_tls_secret(&h.client, &ns.name, secret_name).await?;
+    fixtures::apply_fixture(
+        gwa::TLS_GATEWAY_NO_CERTS,
+        FixtureVars::new(&ns.name)
+            .with("LISTENER_HOSTNAME", &host)
+            .with("SECRET_NAME", secret_name),
+    )
+    .await?;
+
+    // The settled negative: Programmed=False with the terminal reason, not the
+    // held Pending.
+    wait::wait_for_gateway_condition_reason(
+        &h.client,
+        "coxswain-tls-no-cert",
+        &ns.name,
+        "Programmed",
+        "False",
+        "Invalid",
+        Duration::from_secs(30),
+    )
+    .await?;
+    // The listener carries the specific negative.
+    wait::wait_for_gateway_listener_condition(
+        &h.client,
+        "coxswain-tls-no-cert",
+        &ns.name,
+        "https",
+        "ResolvedRefs",
+        "False",
+        Duration::from_secs(10),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let gw = gw_api.get("coxswain-tls-no-cert").await?;
+    assert_conditions_at_current_generation(&gw);
+    Ok(())
+}
+
+/// #570 recovery path (shared mode): fixing the malformed Secret in place (no
+/// Gateway spec change, no generation bump) must flip the settled
+/// `Programmed=False/Invalid` back to `True` — recovery is event-driven off
+/// the Secret watch, with no operator intervention on the Gateway itself.
+#[tokio::test]
+async fn gateway_recovers_programmed_true_after_malformed_secret_fixed() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-gw-malformed-fix").await?;
+
+    let host = format!("tls-fixable.{}.local", ns.name);
+    let secret_name = "cert-fixable";
+    create_malformed_tls_secret(&h.client, &ns.name, secret_name).await?;
+    fixtures::apply_fixture(
+        gwa::TLS_GATEWAY_NO_CERTS,
+        FixtureVars::new(&ns.name)
+            .with("LISTENER_HOSTNAME", &host)
+            .with("SECRET_NAME", secret_name),
+    )
+    .await?;
+    wait::wait_for_gateway_condition_reason(
+        &h.client,
+        "coxswain-tls-no-cert",
+        &ns.name,
+        "Programmed",
+        "False",
+        "Invalid",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let generation_while_broken = gw_api
+        .get("coxswain-tls-no-cert")
+        .await?
+        .metadata
+        .generation
+        .unwrap_or(0);
+
+    // Fix the Secret IN PLACE: replace the garbage bytes with a real cert.
+    let cert = GeneratedCert::for_host(&host);
+    let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+        Api::namespaced(h.client.clone(), &ns.name);
+    let fix = serde_json::json!({
+        "data": {
+            "tls.crt": cert.cert_b64(),
+            "tls.key": cert.key_b64(),
+        }
+    });
+    secrets
+        .patch(secret_name, &PatchParams::default(), &Patch::Merge(&fix))
+        .await?;
+
+    wait::wait_for_gateway_programmed(
+        &h.client,
+        "coxswain-tls-no-cert",
+        &ns.name,
+        Duration::from_secs(30),
+    )
+    .await?;
+    let gw = gw_api.get("coxswain-tls-no-cert").await?;
+    assert_eq!(
+        gw.metadata.generation.unwrap_or(0),
+        generation_while_broken,
+        "recovery must not require a Gateway spec change"
+    );
+    assert_conditions_at_current_generation(&gw);
+    Ok(())
+}
+
+/// #570 mixed-validity (shared mode): one serviceable HTTP listener and one
+/// HTTPS listener with a malformed Secret. The Gateway must reach
+/// `Programmed=True` (the valid listener binds and serves traffic — asserted
+/// by backend identity) while the invalid listener keeps its per-listener
+/// `ResolvedRefs=False`; the invalid listener must not hold the Gateway's
+/// top-level convergence hostage.
+#[tokio::test]
+async fn gateway_with_one_invalid_listener_still_programs_valid_listener() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-gw-mixed-tls").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let tls_host = format!("tls-mixed.{}.local", ns.name);
+    let secret_name = "cert-mixed-malformed";
+    create_malformed_tls_secret(&h.client, &ns.name, secret_name).await?;
+    fixtures::apply_fixture(
+        gwa::TLS_GATEWAY_MIXED_INVALID,
+        FixtureVars::new(&ns.name)
+            .with("LISTENER_HOSTNAME", &tls_host)
+            .with("SECRET_NAME", secret_name),
+    )
+    .await?;
+
+    wait::wait_for_gateway_programmed(
+        &h.client,
+        "coxswain-mixed-tls",
+        &ns.name,
+        Duration::from_secs(60),
+    )
+    .await?;
+    // The invalid listener keeps its own negative — Programmed=True above must
+    // not have been reached by treating the broken listener as healthy.
+    wait::wait_for_gateway_listener_condition(
+        &h.client,
+        "coxswain-mixed-tls",
+        &ns.name,
+        "https",
+        "ResolvedRefs",
+        "False",
+        Duration::from_secs(10),
+    )
+    .await?;
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    assert_conditions_at_current_generation(&gw_api.get("coxswain-mixed-tls").await?);
+
+    // The valid listener actually serves: backend identity via the Gateway VIP.
+    let host = format!("echo.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
+    let resp = wait::wait_for_route(&gw, &host, "/probe", Duration::from_secs(60)).await?;
+    resp.assert_backend("echo-a");
+    Ok(())
+}
+
+/// #570 sad path (dedicated mode): the operator's status writer mirrors the
+/// shared writer's settled negative — a dedicated Gateway whose sole HTTPS
+/// listener references a malformed Secret settles `Programmed=False/Invalid`
+/// at the current generation instead of parking on the proxy bind gate's
+/// `Pending` forever.
+#[tokio::test]
+async fn dedicated_gateway_with_malformed_tls_secret_settles_programmed_false_invalid()
+-> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-dedgw-malformed-tls").await?;
+
+    let host = format!("ded-tls-malformed.{}.local", ns.name);
+    let secret_name = "ded-cert-malformed";
+    create_malformed_tls_secret(&h.client, &ns.name, secret_name).await?;
+    fixtures::apply_fixture(
+        dedicated::DEDICATED_GATEWAY_INVALID_TLS,
+        FixtureVars::new(&ns.name)
+            .with("LISTENER_HOSTNAME", &host)
+            .with("SECRET_NAME", secret_name),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition_reason(
+        &h.client,
+        "dedicated-invalid-tls-gw",
+        &ns.name,
+        "Programmed",
+        "False",
+        "Invalid",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let gw_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    let gw = gw_api.get("dedicated-invalid-tls-gw").await?;
+    // The dedicated writer stamps every owned condition at the current
+    // generation; the settled Invalid must not sit on the held Pending rung.
+    let generation = gw.metadata.generation.unwrap_or(0);
+    let prog = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .and_then(|cs| cs.iter().find(|c| c.type_ == "Programmed"))
+        .unwrap_or_else(|| panic!("dedicated Gateway missing Programmed condition"));
+    assert_eq!(
+        prog.observed_generation.unwrap_or(0),
+        generation,
+        "settled Invalid must stamp at the current generation"
+    );
+    Ok(())
+}

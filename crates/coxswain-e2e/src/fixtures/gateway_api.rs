@@ -51,8 +51,13 @@ pub const QUERY_PARAM_MATCHING: &str = fixture!("query_param_matching.yaml");
 pub const COMBINED_MATCHING: &str = fixture!("combined_matching.yaml");
 /// Gateway HTTPS listener with TLS termination via a Secret.
 pub const TLS_TERMINATION: &str = fixture!("tls_termination.yaml");
-/// Gateway HTTPS listener with no `certificateRefs` (tests error status).
+/// Gateway HTTPS listener whose `certificateRefs` Secret does not exist in
+/// the fixture — the test supplies (or deliberately withholds/corrupts) it
+/// via the `SECRET_NAME` substitution to exercise error status.
 pub const TLS_GATEWAY_NO_CERTS: &str = fixture!("tls_gateway_no_certs.yaml");
+/// Mixed-validity Gateway (#570): serviceable HTTP listener + HTTPS listener
+/// referencing a malformed Secret, plus an HTTPRoute on the HTTP listener.
+pub const TLS_GATEWAY_MIXED_INVALID: &str = fixture!("tls_gateway_mixed_invalid.yaml");
 /// Two shared-mode Gateways terminating the SAME hostname with different certs,
 /// each on its own per-Gateway VIP — cross-Gateway TLS isolation (#472).
 pub const TLS_ISOLATION_CROSS_GATEWAY: &str = fixture!("tls_isolation_cross_gateway.yaml");

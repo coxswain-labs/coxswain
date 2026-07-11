@@ -53,7 +53,10 @@ The `listener` label is the **local port the proxy accepted the connection on**.
 | `coxswain_controller_leader_transitions_total` | Counter | — |
 | `coxswain_controller_reconcile_total` | Counter | `controller`, `result` (`ok`/`error`) |
 | `coxswain_controller_reconcile_duration_seconds` | Histogram | `controller` |
-| `coxswain_controller_reconcile_errors_total` | Counter | `controller` |
+| `coxswain_controller_reconcile_errors_total` | Counter | `controller`, `reason` (see below) |
+| `coxswain_controller_gateways_held_pending` | Gauge | — (shared-mode Gateways holding `Programmed` deferred) |
+| `coxswain_controller_vip_reconcile_total` | Counter | `result` (`ok`/`degraded`) |
+| `coxswain_controller_vip_apply_failures_total` | Counter | — |
 | `coxswain_controller_status_patch_total` | Counter | `kind`, `result` (`ok`/`error`/`conflict`) |
 | `coxswain_controller_status_patch_duration_seconds` | Histogram | `kind` |
 | `coxswain_controller_watch_events_total` | Counter | `kind`, `event` (`init_done`/`apply`/`delete`/`restart`) |
@@ -63,6 +66,10 @@ The `listener` label is the **local port the proxy accepted the connection on**.
 | `coxswain_controller_routing_table_rebuilds_total` | Counter | `result` |
 | `coxswain_controller_routing_table_rebuild_duration_seconds` | Histogram | — |
 | `coxswain_controller_tls_certs_loaded` | Gauge | `bucket` |
+
+`coxswain_controller_reconcile_errors_total`'s `reason` label is a bounded classification of the underlying Kubernetes API error: `namespace_terminating` (SSA into a namespace mid-deletion — a self-resolving race), `conflict` (409), `forbidden` (RBAC), `not_found`, `invalid` (422 validation/webhook rejection), `api_other`, `transport`, `internal`. Errors classified `forbidden`/`invalid` are persistent — the operator polls them at a flat 15 s because retrying faster cannot fix RBAC or a rejected spec; every other class retries with a per-Gateway exponential backoff (0.5 s doubling to a 15 s cap, reset on the first success). A sustained non-zero rate on a persistent reason is an operator-action signal, not a transient blip.
+
+`coxswain_controller_gateways_held_pending` counts shared-mode Gateways whose top-level `Programmed` is currently deferred (`False/Pending` with `observedGeneration` one below the current generation) awaiting VIP resolution, proxy bind, or snapshot ack. Legitimate holds clear within seconds of a spec change; alert on this gauge staying non-zero — before it existed, a Gateway stuck here was indistinguishable from healthy reconcile traffic. Terminally-invalid configurations (every listener unserviceable, unsupported `parametersRef`) never enter the hold: they settle `Programmed=False/Invalid` at the current generation immediately.
 
 ### Discovery channel metrics (`coxswain_discovery_*`)
 

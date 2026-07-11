@@ -788,9 +788,10 @@ async fn https_terminate_cert_isolated_per_gateway() -> anyhow::Result<()> {
 /// Gateway with an HTTPS listener referencing a non-existent Secret must have
 /// the `https` listener's `ResolvedRefs` and `Programmed` conditions set to
 /// `False`. Once the Secret is created both listener conditions must flip to
-/// `True`. The gateway-level `Programmed` condition remains `True` throughout
-/// (the controller always sets it to True; per-listener conditions express
-/// individual listener health).
+/// `True`. While the sole listener is broken the gateway-level `Programmed`
+/// settles at `False/Invalid` (#570 — a settled negative, never an eternal
+/// `Pending` hold); the top-level settle-and-recover flow has its own
+/// coverage in `status_conditions.rs`.
 #[tokio::test]
 async fn tls_missing_secret_marks_gateway_not_programmed() -> anyhow::Result<()> {
     let h = Harness::start().await?;
