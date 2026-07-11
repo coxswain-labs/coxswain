@@ -91,10 +91,24 @@ const NON_LEADER_REQUEUE: Duration = Duration::from_secs(20);
 /// the shared writer's constant for why shorter cadences backfire.
 const BIND_GATE_REQUEUE: Duration = Duration::from_secs(2);
 
-/// Default re-queue after a reconcile error. Short backoff is fine — most
-/// errors here are transient (apiserver hiccup, missing object that's about
-/// to be created).
+/// Cap on the per-object exponential error backoff, and the flat re-queue for
+/// persistent error classes (#570).
+///
+/// Shape rationale: transient errors (namespace-terminating races, 409
+/// conflicts, apiserver hiccups) usually resolve in well under a second, so
+/// [`error_policy`] retries them per-object at
+/// `ERROR_BACKOFF_BASE << attempts` (0.5s, 1s, 2s, 4s, 8s, then this cap) —
+/// a flat 15 s here was measured turning a sub-second race into 30-60 s
+/// Gateway convergence stalls (2-4 error cycles). Persistent classes
+/// (`forbidden`, `invalid` — see `metrics::reason_is_persistent`) skip the
+/// ramp and poll flat at this cap: faster retries cannot fix RBAC or a spec
+/// the apiserver rejects. The attempt counter resets on the first successful
+/// reconcile.
 const ERROR_REQUEUE: Duration = Duration::from_secs(15);
+
+/// First step of the per-object exponential error backoff — see
+/// [`ERROR_REQUEUE`] for the full shape.
+const ERROR_BACKOFF_BASE: Duration = Duration::from_millis(500);
 
 /// Re-queue interval while a dedicated→shared hand-off is in flight: we have
 /// cleared our dedicated-mode status and are waiting for the shared pool to
@@ -117,6 +131,15 @@ pub(super) enum ReconcileError {
     /// SSA of one of the three rendered resources failed.
     #[error("apply: {0}")]
     Apply(#[from] apply::ApplyError),
+}
+
+impl crate::metrics::ReconcileErrorReason for ReconcileError {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Kube(e) => crate::metrics::classify_kube_error(e),
+            Self::Apply(a) => crate::metrics::classify_kube_error(a.kube_source()),
+        }
+    }
 }
 
 /// Bundle of inputs the operator's [`BackgroundService::start`] needs from
@@ -315,6 +338,11 @@ pub(super) struct ReconcileContext {
     /// Per-Gateway publish-sequence index (#531): ack half of the gate.
     publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
+    /// Consecutive reconcile-error count per Gateway, driving the per-object
+    /// exponential backoff in [`error_policy`] (#570). Incremented there,
+    /// cleared by [`reconcile`] on the first `Ok`. Guard is never held across
+    /// an `.await` (same discipline as `last_hashes`).
+    error_attempts: Mutex<HashMap<ObjectKey, u32>>,
 }
 
 /// Finalizer key the operator places on every dedicated-mode Gateway. It keeps
@@ -566,6 +594,7 @@ impl BackgroundService for Operator {
             node_registry: self.config.node_registry.clone(),
             publish_index: self.config.publish_index.clone(),
             last_hashes: Mutex::new(HashMap::new()),
+            error_attempts: Mutex::new(HashMap::new()),
         });
 
         // Single serialized VIP reconciler (#472): the sole writer of shared-mode
@@ -781,8 +810,15 @@ impl BackgroundService for Operator {
 
 async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Action, ReconcileError> {
     let started = std::time::Instant::now();
-    let res = reconcile_inner(gw, ctx).await;
+    let key = gateway_key(&gw);
+    let res = reconcile_inner(gw, Arc::clone(&ctx)).await;
     crate::metrics::observe_reconcile("operator", started, &res);
+    if res.is_ok() {
+        // First success ends the error streak — the next error backs off
+        // from the base again. Covers deletion too: the final (deletion-path)
+        // reconcile returns Ok and drops the entry.
+        ctx.error_attempts.lock().remove(&key);
+    }
     res
 }
 
@@ -825,7 +861,25 @@ async fn reconcile_inner(
             // GC of in-namespace resources (Deployment/Service/SA) is
             // owner-ref driven; nothing else to do here.
             ctx.last_hashes.lock().remove(&key);
+            ctx.error_attempts.lock().remove(&key);
         }
+        return Ok(Action::await_change());
+    }
+
+    // ----- Terminating-namespace short-circuit ---------------------------
+    //
+    // The apiserver rejects any *new* content in a terminating namespace
+    // (403 `NamespaceTerminating`), so every SSA below is doomed until the
+    // Gateway's own DELETE event arrives — erroring here only burns error-
+    // backoff cycles on an outcome that is already decided. Park until that
+    // event. Ordered AFTER the finalizer/deletion path above: finalizer
+    // *removal* is a patch to existing content, which terminating namespaces
+    // still accept, and holding it back would deadlock the namespace delete.
+    if namespace_is_terminating(&ctx.namespaces_store, gw_namespace) {
+        tracing::debug!(
+            gateway = %gateway_id(&gw),
+            "operator: namespace is terminating; parking until the Gateway delete event"
+        );
         return Ok(Action::await_change());
     }
 
@@ -932,6 +986,7 @@ async fn reconcile_inner(
                 delete_dedicated_resources(&ctx.client, gw_namespace, &resource_name).await?;
                 remove_finalizer(&ctx.client, &gw).await?;
                 ctx.last_hashes.lock().remove(&key);
+                ctx.error_attempts.lock().remove(&key);
             }
             // Shared-mode Gateway (no parametersRef): its VIP Service is owned by
             // the serialized `run_vip_reconciler` task (signalled at the top of
@@ -1079,26 +1134,61 @@ async fn reconcile_inner(
     //    config is still propagating.
     // The anti-flap latch keeps an already-Programmed generation immune to
     // pod-replacement churn.
-    let proxy_bound = match &ctx.node_registry {
-        Some(registry) => {
-            crate::status_common::gateway_programmed_at_current_gen(&gw) || {
-                let snapshot_acked = match &ctx.publish_index {
-                    Some(index) => index.get(&key).is_some_and(|stamp| {
-                        stamp.generation >= gw.metadata.generation.unwrap_or(0)
-                            && registry.gateway_node_acked(gw_namespace, gw_name, stamp.seq)
-                    }),
-                    None => true,
-                };
-                snapshot_acked
-                    && registry.load().gateway_node_bound(
-                        gw_namespace,
-                        gw_name,
-                        &dedicated_ports.iter().map(|p| p.port).collect(),
-                    )
+    // Known window (accepted): the health map is not generation-stamped, so a
+    // spec edit that FIXES the config can briefly read stale all-terminal
+    // health and stamp False/Invalid at the new generation; the rebuild that
+    // recomputes health re-drives this reconcile and corrects it within one
+    // rebuild cycle. Stamping health with its source generation would close
+    // it (publish_index-style) — deferred until a consumer needs it.
+    // Settled-negative escape (#570), dedicated mirror of the shared writer's:
+    // listeners that settled terminally negative are excluded from the bind
+    // wait (their port may never bind), and a Gateway whose EVERY listener has
+    // settled skips the gate entirely — `programmed_outcome` turns that into a
+    // settled `Programmed=False/Invalid` at the current generation instead of
+    // an eternal held `Pending`. An empty health map (reflector lag) settles
+    // nothing and awaits everything — fail closed.
+    let all_listeners_settled_negative = !gateway_health.listeners.is_empty()
+        && gateway_health
+            .listeners
+            .values()
+            .all(|info| info.is_terminally_unserviceable());
+    let awaited_dedicated_ports: std::collections::BTreeSet<u16> = dedicated_ports
+        .iter()
+        .map(|p| p.port)
+        .filter(|port| {
+            let mut any_claimant = false;
+            let all_negative = gateway_health
+                .listeners
+                .values()
+                .filter(|info| info.bind_port() == *port)
+                .all(|info| {
+                    any_claimant = true;
+                    info.is_terminally_unserviceable()
+                });
+            !(any_claimant && all_negative)
+        })
+        .collect();
+    let proxy_bound = all_listeners_settled_negative
+        || match &ctx.node_registry {
+            Some(registry) => {
+                crate::status_common::gateway_programmed_at_current_gen(&gw) || {
+                    let snapshot_acked = match &ctx.publish_index {
+                        Some(index) => index.get(&key).is_some_and(|stamp| {
+                            stamp.generation >= gw.metadata.generation.unwrap_or(0)
+                                && registry.gateway_node_acked(gw_namespace, gw_name, stamp.seq)
+                        }),
+                        None => true,
+                    };
+                    snapshot_acked
+                        && registry.load().gateway_node_bound(
+                            gw_namespace,
+                            gw_name,
+                            &awaited_dedicated_ports,
+                        )
+                }
             }
-        }
-        None => true,
-    };
+            None => true,
+        };
     let inputs = status::DedicatedGatewayStatusInputs {
         gw: &gw,
         service: service.as_ref(),
@@ -1439,6 +1529,17 @@ fn count_ready_proxy_pods(pods_store: &Store<Pod>, gw_namespace: &str, gw_name: 
         .count()
 }
 
+/// Returns true iff the named namespace is observed mid-deletion
+/// (`deletionTimestamp` set). Store-lag caveat: a deletion the reflector has
+/// not applied yet reads as "not terminating" — callers must treat this as a
+/// fast-path skip, not a guarantee; the race that slips through still fails
+/// with a classified `NamespaceTerminating` error and short backoff.
+fn namespace_is_terminating(namespaces: &Store<Namespace>, namespace: &str) -> bool {
+    namespaces.state().iter().any(|ns| {
+        ns.metadata.name.as_deref() == Some(namespace) && ns.metadata.deletion_timestamp.is_some()
+    })
+}
+
 /// Returns true iff the Pod's `status.conditions` carries a `Ready=True`
 /// entry. Kubelet flips this based on the Pod's readiness probe — for
 /// dedicated-proxy Pods that means `/readyz` is passing.
@@ -1449,13 +1550,43 @@ fn pod_is_ready(pod: &Pod) -> bool {
         .is_some_and(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
 }
 
-fn error_policy(obj: Arc<Gateway>, err: &ReconcileError, _ctx: Arc<ReconcileContext>) -> Action {
+fn error_policy(obj: Arc<Gateway>, err: &ReconcileError, ctx: Arc<ReconcileContext>) -> Action {
+    use crate::metrics::ReconcileErrorReason as _;
+    let reason = err.reason();
+    let delay = if crate::metrics::reason_is_persistent(reason) {
+        // RBAC / validation rejections: retrying faster cannot fix them —
+        // poll flat at the cap until the config changes.
+        ERROR_REQUEUE
+    } else {
+        let attempts = {
+            let mut map = ctx.error_attempts.lock();
+            let n = map.entry(gateway_key(&obj)).or_insert(0);
+            let attempts = *n;
+            *n = n.saturating_add(1);
+            attempts
+            // Guard drops here — before the tracing call below.
+        };
+        error_backoff_delay(attempts)
+    };
     tracing::warn!(
         gateway = %gateway_id(&obj),
         error = %err,
+        reason,
+        delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
         "operator: reconcile error; backing off"
     );
-    Action::requeue(ERROR_REQUEUE)
+    Action::requeue(delay)
+}
+
+/// Delay for the `attempts`-th consecutive transient reconcile error:
+/// `ERROR_BACKOFF_BASE << attempts`, capped at [`ERROR_REQUEUE`]. See
+/// [`ERROR_REQUEUE`] for the shape rationale.
+fn error_backoff_delay(attempts: u32) -> Duration {
+    // 500ms << 5 = 16s already exceeds the 15s cap; clamping the shift keeps
+    // the multiplication overflow-free for any attempt count.
+    ERROR_BACKOFF_BASE
+        .saturating_mul(1 << attempts.min(5))
+        .min(ERROR_REQUEUE)
 }
 
 pub(super) fn gateway_id(gw: &Gateway) -> String {
@@ -1551,6 +1682,50 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    #[test]
+    fn error_backoff_ramps_from_base_to_cap_and_saturates() {
+        let expected = [500u64, 1000, 2000, 4000, 8000, 15000, 15000];
+        for (attempts, ms) in expected.into_iter().enumerate() {
+            assert_eq!(
+                error_backoff_delay(u32::try_from(attempts).unwrap_or(u32::MAX)),
+                Duration::from_millis(ms),
+                "attempt {attempts}"
+            );
+        }
+        // Far beyond the ramp — must stay clamped, never overflow.
+        assert_eq!(error_backoff_delay(u32::MAX), ERROR_REQUEUE);
+    }
+
+    #[test]
+    fn namespace_is_terminating_only_for_deletion_timestamped_namespace() {
+        use kube::runtime::{reflector, watcher};
+        let (reader, mut writer) = reflector::store::<Namespace>();
+        let ns = |name: &str, terminating: bool| Namespace {
+            metadata: kube::api::ObjectMeta {
+                name: Some(name.into()),
+                deletion_timestamp: terminating.then(|| {
+                    k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                        k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
+                    )
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // InitDone first: it swaps the (empty) init buffer into the store, so
+        // Apply events sent before it would be discarded.
+        writer.apply_watcher_event(&watcher::Event::InitDone);
+        writer.apply_watcher_event(&watcher::Event::Apply(ns("alive", false)));
+        writer.apply_watcher_event(&watcher::Event::Apply(ns("dying", true)));
+
+        assert!(namespace_is_terminating(&reader, "dying"));
+        assert!(!namespace_is_terminating(&reader, "alive"));
+        // Unobserved namespace (store lag / never watched) must read as NOT
+        // terminating — the short-circuit is a fast path, never a gate that
+        // could park a healthy Gateway.
+        assert!(!namespace_is_terminating(&reader, "unknown"));
     }
 
     #[test]

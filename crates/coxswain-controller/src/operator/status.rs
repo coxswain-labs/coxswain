@@ -188,6 +188,7 @@ pub(crate) fn build_dedicated_gateway_status_patch(
         &addresses,
         &static_outcome,
         inputs.proxy_bound,
+        listeners_settled_negative(inputs),
     );
     let cut_over = cut_over_outcome(inputs.accepted, inputs.ready_pod_count);
 
@@ -326,6 +327,7 @@ pub(crate) fn dedicated_gateway_needs_status_patch(
         &desired_addresses,
         &static_outcome,
         inputs.proxy_bound,
+        listeners_settled_negative(inputs),
     );
     let cut_over = cut_over_outcome(inputs.accepted, inputs.ready_pod_count);
 
@@ -581,6 +583,20 @@ fn listener_acceptance_rollup(inputs: &DedicatedGatewayStatusInputs<'_>) -> (boo
     (any_accepted, any_unaccepted)
 }
 
+/// Settled-negative rollup (#570): `true` when the Gateway has listener
+/// health computed and EVERY listener is terminally unserviceable (see
+/// [`coxswain_reflector::status::ListenerInfo::is_terminally_unserviceable`]).
+/// An empty health map (reflector not yet synced) is NOT settled — the
+/// bind/ack gate keeps waiting instead.
+fn listeners_settled_negative(inputs: &DedicatedGatewayStatusInputs<'_>) -> bool {
+    !inputs.listener_status.listeners.is_empty()
+        && inputs
+            .listener_status
+            .listeners
+            .values()
+            .all(|info| info.is_terminally_unserviceable())
+}
+
 fn accepted_outcome(
     accepted: AcceptedOutcome,
     static_outcome: &StaticAddressOutcome,
@@ -635,6 +651,7 @@ fn programmed_outcome(
     addresses: &[StatusAddress],
     static_outcome: &StaticAddressOutcome,
     proxy_bound: bool,
+    listeners_settled_negative: bool,
 ) -> ConditionOutcome {
     // Accepted=False — either an unresolvable parametersRef or an unsupported
     // requested address type (#260) — means the Gateway cannot be programmed.
@@ -644,6 +661,19 @@ fn programmed_outcome(
             status: "False",
             reason: Reason::Typed(GatewayConditionReason::Invalid),
             message: "Gateway spec is invalid; see the Accepted condition for details",
+        };
+    }
+    // Settled negative (#570): every listener is terminally unserviceable —
+    // the proxy will never serve this spec, so the verdict outranks the
+    // pod/address/bind waits below, whose inputs may never arrive for such a
+    // Gateway. `Invalid` stamps at the current generation (not the held
+    // `Pending` rung), matching conformance's "settled conditions AT the
+    // current generation" requirement.
+    if listeners_settled_negative {
+        return ConditionOutcome {
+            status: "False",
+            reason: Reason::Typed(GatewayConditionReason::Invalid),
+            message: "no listener is serviceable; see the per-listener conditions",
         };
     }
     if ready_pod_count == 0 {
@@ -871,7 +901,7 @@ mod tests {
         GatewayStatusListeners,
     };
     use coxswain_reflector::ingress::IngressPorts;
-    use coxswain_reflector::status::GatewayListenerStatus;
+    use coxswain_reflector::status::{GatewayListenerStatus, ListenerStatusKey};
     use k8s_openapi::api::core::v1::{
         LoadBalancerIngress, LoadBalancerStatus, Node, NodeAddress, NodeStatus, Service,
         ServiceSpec, ServiceStatus,
@@ -1028,6 +1058,42 @@ mod tests {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn all_invalid_listeners_settle_programmed_false_invalid_at_current_generation() {
+        // #570 dedicated mirror: every listener terminally unserviceable →
+        // Programmed=False/Invalid stamped AT the current generation, even
+        // with zero Ready pods and the bind gate closed — the verdict is
+        // settled and must not be held at Pending/gen-1.
+        use coxswain_reflector::status::{ListenerInfo, ListenerReadiness};
+        let gw = gateway(2, vec![("https", 443)], None);
+        let mut health = GatewayListenerStatus::default();
+        let mut info = ListenerInfo::default();
+        info.readiness = ListenerReadiness::InvalidCertificateRef {
+            message: "malformed PEM".to_string(),
+        };
+        info.port = 443;
+        health
+            .listeners
+            .insert(ListenerStatusKey::gateway("https"), info);
+        let mut i = inputs(&gw, None, &[], &health, AcceptedOutcome::Accepted, 0);
+        i.proxy_bound = false;
+        let patch = build_dedicated_gateway_status_patch(&i, 2, &epoch());
+        assert_eq!(
+            condition_of(&patch, "Programmed"),
+            Some(("False".to_string(), "Invalid".to_string())),
+            "settled negative outranks the pod/address/bind waits"
+        );
+        let prog_gen = patch["status"]["conditions"]
+            .as_array()
+            .and_then(|cs| cs.iter().find(|c| c["type"] == "Programmed").cloned())
+            .map(|c| c["observedGeneration"].as_i64().unwrap_or(-1));
+        assert_eq!(
+            prog_gen,
+            Some(2),
+            "settled Invalid stamps at the current generation, not the Pending gen-1 hold"
+        );
     }
 
     // ============================================================================
