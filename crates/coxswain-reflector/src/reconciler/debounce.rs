@@ -1,9 +1,11 @@
 //! Adaptive trailing-edge debounce for the reconciler rebuild loop (#512).
 //!
 //! Replaces the reconciler's original fixed 500 ms coalescing timer with a
-//! configurable "debounce + maxWait" window: a short quiet period settles an
-//! isolated watch event quickly, while a hard ceiling bounds the wait under
-//! sustained churn so a rebuild is never starved indefinitely.
+//! configurable escalating quiet window: an isolated watch event settles
+//! quickly, but each event that interrupts an in-progress quiet window
+//! doubles it (capped at a hard ceiling), so sustained churn increasingly
+//! resembles the old fixed-window behavior instead of firing a rebuild per
+//! event.
 
 use std::time::Duration;
 use thiserror::Error;
@@ -11,11 +13,14 @@ use tokio::sync::Notify;
 
 /// Bounds for the reconciler's adaptive rebuild debounce.
 ///
-/// `min` is the trailing quiet window: the settle loop fires this long after
-/// the *last* watch event, and every new event resets it. `max` is a hard
-/// ceiling measured from the *first* event of the cycle — it never resets, so
-/// a rebuild fires within `max` even under continuous churn (e.g. a rolling
-/// deploy). Setting `min == max` reproduces a fixed-window debounce.
+/// `min` is the starting trailing quiet window: an isolated watch event
+/// settles this long after it fires. Each subsequent event that interrupts
+/// an in-progress quiet window doubles it (capped at `max`), so a cluster of
+/// events spaced further apart than the initial window still increasingly
+/// coalesces rather than firing one rebuild per event. `max` is also a hard
+/// ceiling measured from the *first* event of the cycle — it never resets,
+/// so a rebuild fires within `max` even under continuous churn (e.g. a
+/// rolling deploy). Setting `min == max` reproduces a fixed-window debounce.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct DebounceSettings {
@@ -83,17 +88,22 @@ impl Default for DebounceSettings {
 /// (so its own elapsed-time metric starts exactly there) and calls this
 /// function immediately after.
 ///
-/// Fires when either bound elapses first: `settings.min()` of quiet (no new
-/// notification since the last one), or `settings.max()` since this function
-/// was entered. Every notification observed while waiting resets only the
-/// quiet timer — the ceiling is absolute, so a rebuild is never starved by
-/// continuous churn.
+/// Fires when either bound elapses first: the current quiet window (starting
+/// at `settings.min()`, doubling — capped at `settings.max()` — on every
+/// notification that interrupts it), or `settings.max()` since this function
+/// was entered. The doubling means events spaced further apart than the
+/// initial `min` still increasingly coalesce as churn continues, rather than
+/// each firing its own rebuild; the absolute ceiling means a rebuild is never
+/// starved by continuous churn.
 pub(crate) async fn settle(notify: &Notify, settings: DebounceSettings) {
     let deadline = tokio::time::Instant::now() + settings.max();
+    let mut window = settings.min();
     loop {
         tokio::select! {
-            _ = notify.notified() => {}
-            _ = tokio::time::sleep(settings.min()) => break,
+            _ = notify.notified() => {
+                window = (window * 2).min(settings.max());
+            }
+            _ = tokio::time::sleep(window) => break,
             _ = tokio::time::sleep_until(deadline) => break,
         }
     }
@@ -143,7 +153,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_notification_within_min_resets_the_quiet_window() {
+    async fn a_notification_within_min_doubles_the_quiet_window() {
         let notify = Notify::new();
         let settings = DebounceSettings::new(Duration::from_millis(20), Duration::from_millis(500))
             .expect("valid bounds");
@@ -159,8 +169,41 @@ mod tests {
 
         assert_eq!(
             start.elapsed(),
-            Duration::from_millis(30),
-            "one reset 10ms in must push settle to 10ms + a fresh 20ms quiet window"
+            Duration::from_millis(50),
+            "one interruption 10ms in must double the window (20ms -> 40ms), settling at 10ms + 40ms"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn repeated_interruptions_compound_the_widening() {
+        let notify = std::sync::Arc::new(Notify::new());
+        let settings = DebounceSettings::new(Duration::from_millis(20), Duration::from_millis(500))
+            .expect("valid bounds");
+
+        // Three events 10ms apart, each comfortably inside the
+        // then-current (already-doubled) window: 20ms -> 40ms -> 80ms -> a
+        // final 160ms quiet window (no more events) settles the cycle.
+        let churn_notify = std::sync::Arc::clone(&notify);
+        let churner = tokio::spawn(async move {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                churn_notify.notify_waiters();
+            }
+        });
+
+        let start = tokio::time::Instant::now();
+        settle(&notify, settings).await;
+        churner.await.expect("churner task must not panic");
+
+        // Events at t=10,20,30 double the window each time (20->40->80->160);
+        // the last, uninterrupted 160ms window (from t=30) settles at t=190 —
+        // strictly longer than a single doubling (50ms, see the test above),
+        // proving the widening compounds across repeated interruptions.
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(190),
+            "three compounding doublings (20->40->80->160) must settle at t=190, not re-arm \
+             at a flat 20ms/40ms each time"
         );
     }
 
