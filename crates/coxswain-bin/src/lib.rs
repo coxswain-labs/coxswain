@@ -1446,7 +1446,23 @@ fn build_server(args: &ProxyArgs) -> Server {
 }
 
 fn build_minimal_server() -> Server {
-    let mut server = Server::new_with_opt_and_conf(Some(Opt::default()), ServerConf::default());
+    let conf = ServerConf {
+        // The controller role serves no client traffic — there is nothing to
+        // drain on shutdown. Pingora's `GracefulTerminate` (SIGTERM) path
+        // sleeps the FULL grace period unconditionally (`thread::sleep`, not
+        // a drain wait), and an unset grace defaults to pingora's
+        // EXIT_TIMEOUT of 300s — longer than Kubernetes' 30s
+        // `terminationGracePeriodSeconds`, so every controller pod rode out
+        // the whole 30s and died by SIGKILL: rollouts, chart upgrades, and
+        // node drains all paid ~30s per replica (#570 follow-up; measured
+        // via `kubectl delete pod`). Zero grace exits immediately after the
+        // shutdown signal propagates; background services (lease step-down,
+        // reflector teardown) get the runtime-shutdown timeout to finish.
+        grace_period_seconds: Some(0),
+        graceful_shutdown_timeout_seconds: Some(5),
+        ..ServerConf::default()
+    };
+    let mut server = Server::new_with_opt_and_conf(Some(Opt::default()), conf);
     server.bootstrap();
     server
 }
