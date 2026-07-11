@@ -372,7 +372,6 @@ mod tests {
                 }],
                 retry_after_seconds: 0,
             }),
-            ..Default::default()
         }))
     }
 

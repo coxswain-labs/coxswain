@@ -894,20 +894,26 @@ mod tests {
         let healthy = ListenerInfo::default();
         assert!(!healthy.is_terminally_unserviceable());
 
-        let mut bad_readiness = ListenerInfo::default();
-        bad_readiness.readiness = ListenerReadiness::InvalidCertificateRef {
-            message: "bad pem".to_string(),
+        let bad_readiness = ListenerInfo {
+            readiness: ListenerReadiness::InvalidCertificateRef {
+                message: "bad pem".to_string(),
+            },
+            ..ListenerInfo::default()
         };
         assert!(bad_readiness.is_terminally_unserviceable());
 
-        let mut bad_frontend = ListenerInfo::default();
-        bad_frontend.frontend_outcome = FrontendValidationOutcome::InvalidCACertificateRef {
-            message: "no ca.crt".to_string(),
+        let bad_frontend = ListenerInfo {
+            frontend_outcome: FrontendValidationOutcome::InvalidCACertificateRef {
+                message: "no ca.crt".to_string(),
+            },
+            ..ListenerInfo::default()
         };
         assert!(bad_frontend.is_terminally_unserviceable());
 
-        let mut conflicted = ListenerInfo::default();
-        conflicted.conflict = ConflictReason::HostnameConflict;
+        let conflicted = ListenerInfo {
+            conflict: ConflictReason::HostnameConflict,
+            ..ListenerInfo::default()
+        };
         assert!(conflicted.is_terminally_unserviceable());
     }
 

@@ -1705,11 +1705,11 @@ mod tests {
         let ns = |name: &str, terminating: bool| Namespace {
             metadata: kube::api::ObjectMeta {
                 name: Some(name.into()),
-                deletion_timestamp: terminating.then(|| {
+                deletion_timestamp: terminating.then_some(
                     k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
                         k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
-                    )
-                }),
+                    ),
+                ),
                 ..Default::default()
             },
             ..Default::default()
