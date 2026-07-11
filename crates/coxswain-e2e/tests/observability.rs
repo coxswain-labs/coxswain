@@ -464,8 +464,11 @@ async fn isolated_route_change_debounces_well_under_fixed_floor() -> anyhow::Res
 }
 
 /// #512 sad-path companion: a rapid burst of annotation patches to ONE owned
-/// Ingress — all submitted back-to-back — must still coalesce into far fewer
-/// rebuilds than the number of patches (no per-event rebuild storm).
+/// Ingress — all dispatched CONCURRENTLY (not one-at-a-time with an awaited
+/// round trip between each, which stretches real inter-event gaps well past
+/// the debounce window and isn't a faithful "burst") — must still coalesce
+/// into far fewer rebuilds than the number of patches (no per-event rebuild
+/// storm).
 ///
 /// `coxswain_controller_routing_table_rebuild_duration_seconds_count` is a
 /// cluster-wide series shared with every OTHER concurrently-running e2e test
@@ -501,15 +504,22 @@ async fn event_burst_within_window_coalesces_to_few_rebuilds() -> anyhow::Result
     const POKE_ANNOTATION: &str = "e2e.coxswain-labs.dev/poke";
     let ingresses: Api<Ingress> = Api::namespaced(h.client.clone(), &ns.name);
     let burst_start = std::time::Instant::now();
-    for i in 0..BURST {
-        let poke = serde_json::json!({ "metadata": { "annotations": { POKE_ANNOTATION: i.to_string() } } });
-        ingresses
-            .patch(
-                "echo-ingress",
-                &PatchParams::default(),
-                &Patch::Merge(&poke),
-            )
-            .await?;
+    let patches = (0..BURST).map(|i| {
+        let ingresses = ingresses.clone();
+        async move {
+            let poke =
+                serde_json::json!({ "metadata": { "annotations": { POKE_ANNOTATION: i.to_string() } } });
+            ingresses
+                .patch(
+                    "echo-ingress",
+                    &PatchParams::default(),
+                    &Patch::Merge(&poke),
+                )
+                .await
+        }
+    });
+    for result in futures::future::join_all(patches).await {
+        result?;
     }
 
     // 3x the default 500ms debounce ceiling: comfortably long enough for every
