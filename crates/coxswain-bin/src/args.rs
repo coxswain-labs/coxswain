@@ -630,6 +630,34 @@ pub(crate) struct ControllerArgs {
         default_value = "cluster.local"
     )]
     pub discovery_trust_domain: String,
+
+    /// Minimum trailing-edge quiet window for the reconciler's rebuild
+    /// debounce (#512).
+    ///
+    /// A watch event resets this timer; when it elapses with no further
+    /// events, the routing table rebuilds. Governs how fast an isolated
+    /// resource change converges. Must be at most `--reconcile-debounce-max`.
+    #[arg(
+        long,
+        env = "COXSWAIN_RECONCILE_DEBOUNCE_MIN",
+        default_value = "20ms",
+        value_parser = humantime::parse_duration,
+    )]
+    pub reconcile_debounce_min: Duration,
+
+    /// Maximum debounce wait for the reconciler's rebuild loop (#512).
+    ///
+    /// A hard ceiling measured from the first event of a debounce cycle: even
+    /// under continuous churn (e.g. a rolling deploy) that keeps resetting
+    /// `--reconcile-debounce-min`, the routing table rebuilds within this
+    /// bound. Must be at least `--reconcile-debounce-min`.
+    #[arg(
+        long,
+        env = "COXSWAIN_RECONCILE_DEBOUNCE_MAX",
+        default_value = "500ms",
+        value_parser = humantime::parse_duration,
+    )]
+    pub reconcile_debounce_max: Duration,
 }
 
 /// CA provisioning mode selector.
@@ -1190,6 +1218,65 @@ mod tests {
             "proxy",
             "--shared",
             "--discovery-port=50051",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// `--reconcile-debounce-min`/`-max` default to 20ms/500ms on the
+    /// `controller` role.
+    #[test]
+    fn reconcile_debounce_defaults() {
+        let cli =
+            Cli::try_parse_from(["coxswain", "serve", "controller"]).expect("controller parses");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Controller(args)) = serve.role else {
+            panic!("expected controller role");
+        };
+        assert_eq!(
+            args.controller.reconcile_debounce_min,
+            Duration::from_millis(20)
+        );
+        assert_eq!(
+            args.controller.reconcile_debounce_max,
+            Duration::from_millis(500)
+        );
+    }
+
+    /// `--reconcile-debounce-min`/`-max` accept custom human-readable durations.
+    #[test]
+    fn reconcile_debounce_accepts_custom_values() {
+        let cli = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "controller",
+            "--reconcile-debounce-min=10ms",
+            "--reconcile-debounce-max=1s",
+        ])
+        .expect("controller parses with custom debounce bounds");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Controller(args)) = serve.role else {
+            panic!("expected controller role");
+        };
+        assert_eq!(
+            args.controller.reconcile_debounce_min,
+            Duration::from_millis(10)
+        );
+        assert_eq!(
+            args.controller.reconcile_debounce_max,
+            Duration::from_secs(1)
+        );
+    }
+
+    /// `--reconcile-debounce-min`/`-max` do not exist on the `proxy` role.
+    #[test]
+    fn proxy_rejects_reconcile_debounce_flags() {
+        let err = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "proxy",
+            "--shared",
+            "--reconcile-debounce-min=10ms",
         ])
         .unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);

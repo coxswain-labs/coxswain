@@ -15,6 +15,10 @@
 //!   — #513 per-stage convergence timing: a route change advances every stage's
 //!   histogram sample count, and each stage's series is scoped to the pod role
 //!   that owns it (reflector stages controller-only, discovery-apply proxy-only).
+//! - `isolated_route_change_debounces_well_under_fixed_floor` +
+//!   `event_burst_within_window_coalesces_to_few_rebuilds` — #512 adaptive
+//!   debounce: an isolated change settles far under the old fixed 500ms floor,
+//!   and a rapid burst on one Ingress still coalesces into few rebuilds.
 //! - `access_log_*` — five cases that pin the access-log contract: required
 //!   fields (including the new `route_id` join key), path-mode behaviour,
 //!   error-path emission, and disabled-mode silence.
@@ -39,7 +43,9 @@ use coxswain_e2e::{
     harness::wait,
 };
 use k8s_openapi::api::events::v1::Event as K8sEvent;
+use k8s_openapi::api::networking::v1::Ingress;
 use kube::Api;
+use kube::api::{Patch, PatchParams};
 use std::time::Duration;
 
 mod common;
@@ -386,6 +392,172 @@ async fn stage_metrics_are_role_scoped() -> anyhow::Result<()> {
     assert!(
         !controller.contains("coxswain_discovery_snapshot_apply_seconds"),
         "controller-pod /metrics must NOT expose the proxy-only apply stage"
+    );
+
+    Ok(())
+}
+
+/// #512 happy path: a single isolated Ingress apply (no concurrent churn)
+/// must settle in well under the reflector's old fixed 500ms debounce floor.
+/// Compares the mean debounce-wait (`_sum`/`_count` delta) against a 300ms
+/// bound — comfortably above the default 20ms quiet window, comfortably below
+/// the 500ms ceiling this replaces — and confirms via `wait_for_route` that
+/// the change actually converged, not just that a metric moved.
+#[tokio::test]
+async fn isolated_route_change_debounces_well_under_fixed_floor() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-debounce-fast").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let before = reqwest::get(h.controller_admin_url("/metrics"))
+        .await?
+        .text()
+        .await?;
+    let before_sum = count_or_zero(
+        &before,
+        "coxswain_controller_reconcile_debounce_seconds_sum",
+    );
+    let before_count = count_or_zero(
+        &before,
+        "coxswain_controller_reconcile_debounce_seconds_count",
+    );
+
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    let host = format!("ingress.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+
+    let (after_sum, after_count) = wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL_FAST,
+        || async {
+            "timed out waiting for the debounce-wait histogram to advance past its pre-change baseline"
+                .to_string()
+        },
+        || async {
+            let body = reqwest::get(h.controller_admin_url("/metrics"))
+                .await
+                .ok()?
+                .text()
+                .await
+                .ok()?;
+            let sum = count_or_zero(&body, "coxswain_controller_reconcile_debounce_seconds_sum");
+            let count = count_or_zero(
+                &body,
+                "coxswain_controller_reconcile_debounce_seconds_count",
+            );
+            (count > before_count).then_some((sum, count))
+        },
+    )
+    .await?;
+
+    let mean_wait = (after_sum - before_sum) / (after_count - before_count);
+    assert!(
+        mean_wait < 0.3,
+        "expected an isolated Ingress apply to debounce in well under the old 500ms fixed \
+         floor, got a mean debounce-wait of {mean_wait}s (sum {before_sum}->{after_sum}, \
+         count {before_count}->{after_count})"
+    );
+
+    Ok(())
+}
+
+/// #512 sad-path companion: a rapid burst of annotation patches to ONE owned
+/// Ingress — all dispatched CONCURRENTLY (not one-at-a-time with an awaited
+/// round trip between each, which stretches real inter-event gaps well past
+/// the debounce window and isn't a faithful "burst") — must still coalesce
+/// into far fewer rebuilds than the number of patches (no per-event rebuild
+/// storm).
+///
+/// `coxswain_controller_routing_table_rebuild_duration_seconds_count` is a
+/// cluster-wide series shared with every OTHER concurrently-running e2e test
+/// that touches routing (this suite runs tests in parallel against one
+/// controller pod), so it never goes quiet — an earlier version of this test
+/// polled for the count to stop changing and flaked/timed out under that
+/// noise. Instead this reads the delta over a FIXED, bounded real-time window
+/// (`SETTLE_BUDGET`, comfortably above the default 500ms debounce ceiling)
+/// measured from the first patch, then compares against a loose threshold
+/// (half the burst size) that tolerates a handful of noise increments from
+/// sibling tests while still failing hard on an actual per-event storm.
+#[tokio::test]
+async fn event_burst_within_window_coalesces_to_few_rebuilds() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-debounce-burst").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    let host = format!("ingress.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+
+    let before = reqwest::get(h.controller_admin_url("/metrics"))
+        .await?
+        .text()
+        .await?;
+    let before_rebuild = count_or_zero(
+        &before,
+        "coxswain_controller_routing_table_rebuild_duration_seconds_count",
+    );
+
+    const BURST: usize = 30;
+    const POKE_ANNOTATION: &str = "e2e.coxswain-labs.dev/poke";
+    let ingresses: Api<Ingress> = Api::namespaced(h.client.clone(), &ns.name);
+    let burst_start = std::time::Instant::now();
+    let patches = (0..BURST).map(|i| {
+        let ingresses = ingresses.clone();
+        async move {
+            let poke =
+                serde_json::json!({ "metadata": { "annotations": { POKE_ANNOTATION: i.to_string() } } });
+            ingresses
+                .patch(
+                    "echo-ingress",
+                    &PatchParams::default(),
+                    &Patch::Merge(&poke),
+                )
+                .await
+        }
+    });
+    for result in futures::future::join_all(patches).await {
+        result?;
+    }
+
+    // 3x the default 500ms debounce ceiling: comfortably long enough for every
+    // one of the burst's debounce cycles to settle and rebuild, short enough
+    // to bound (not eliminate) noise exposure from concurrent sibling tests.
+    const SETTLE_BUDGET: Duration = Duration::from_millis(1500);
+    let after_rebuild = wait::poll_until(
+        Duration::from_secs(10),
+        wait::POLL_FAST,
+        || async { "timed out waiting out the post-burst settle budget".to_string() },
+        || async {
+            if burst_start.elapsed() < SETTLE_BUDGET {
+                return None;
+            }
+            let body = reqwest::get(h.controller_admin_url("/metrics"))
+                .await
+                .ok()?
+                .text()
+                .await
+                .ok()?;
+            Some(count_or_zero(
+                &body,
+                "coxswain_controller_routing_table_rebuild_duration_seconds_count",
+            ))
+        },
+    )
+    .await?;
+
+    let rebuilds = after_rebuild - before_rebuild;
+    assert!(
+        rebuilds >= 1.0,
+        "expected the burst to trigger at least one rebuild, got {rebuilds}"
+    );
+    assert!(
+        rebuilds < (BURST / 2) as f64,
+        "expected {BURST} rapid annotation patches to coalesce into far fewer rebuilds, got \
+         {rebuilds} (routing_table_rebuild_duration_seconds_count advanced from \
+         {before_rebuild} to {after_rebuild}) — a rebuild-per-event storm defeats the debounce"
     );
 
     Ok(())

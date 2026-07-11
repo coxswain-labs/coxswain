@@ -59,9 +59,9 @@ pub use jwks::SharedJwksCache;
 pub use metrics::{MetricsPrefix, ReflectorMetrics};
 pub use reconciler::listener_merge::{EffectiveListenerPort, effective_listener_ports};
 pub use reconciler::{
-    ControllerReconciler, IngressDefaultBackend, IngressDefaultBackendParseError, IngressEvent,
-    ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler,
-    StatusSubscriptions,
+    ControllerReconciler, DebounceSettings, DebounceSettingsError, IngressDefaultBackend,
+    IngressDefaultBackendParseError, IngressEvent, ReconcilerHealth, ReconcilerOptions,
+    ReconcilerOutputs, SharedProxyReconciler, StatusSubscriptions,
 };
 pub use status::{
     BackendTlsPolicyStatus, BackendTlsPolicyStatusMap, ClientTrafficPolicyStatus,

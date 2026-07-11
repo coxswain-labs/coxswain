@@ -80,6 +80,11 @@ spec:
               value: "15s"
             - name: COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL
               value: "5s"
+            # Adaptive reconcile debounce (#512).
+            - name: COXSWAIN_RECONCILE_DEBOUNCE_MIN
+              value: "20ms"
+            - name: COXSWAIN_RECONCILE_DEBOUNCE_MAX
+              value: "500ms"
             # Discovery control plane / CA (#423).
             - name: COXSWAIN_DISCOVERY_PORT
               value: "50051"

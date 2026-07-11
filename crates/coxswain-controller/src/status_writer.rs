@@ -63,6 +63,8 @@ pub struct StatusWriterConfig {
     /// Enable the Ingress surface. When `false`, Ingress reflectors and health
     /// checks are not registered.
     pub enable_ingress: bool,
+    /// Bounds for the reconciler's adaptive rebuild debounce (#512).
+    pub debounce: coxswain_reflector::DebounceSettings,
 }
 
 /// Error returned from [`spawn_status_writer`] when the wiring fails before
@@ -117,6 +119,7 @@ pub fn spawn_status_writer(
         ingress_ports,
         enable_gateway_api,
         enable_ingress,
+        debounce,
     } = config;
 
     let ingress_routes = coxswain_core::routing::SharedIngressRoutingTable::new();
@@ -263,6 +266,7 @@ pub fn spawn_status_writer(
             // Controller role only (#441) — the read-only proxy must never
             // egress to a JWKS identity provider; see `coxswain_reflector::jwks`.
             opts.fetch_remote_jwks = true;
+            opts.debounce = debounce;
             opts
         },
     );
