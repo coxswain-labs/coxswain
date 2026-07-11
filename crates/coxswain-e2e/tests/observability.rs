@@ -464,11 +464,19 @@ async fn isolated_route_change_debounces_well_under_fixed_floor() -> anyhow::Res
 }
 
 /// #512 sad-path companion: a rapid burst of annotation patches to ONE owned
-/// Ingress — all submitted back-to-back, well inside the debounce quiet
-/// window — must still coalesce into far fewer rebuilds than the number of
-/// patches (no per-event rebuild storm). Settlement is detected by polling
-/// the rebuild-count histogram for 3 consecutive stable reads (a real,
-/// repeatedly-observed post-condition — not a fixed sleep).
+/// Ingress — all submitted back-to-back — must still coalesce into far fewer
+/// rebuilds than the number of patches (no per-event rebuild storm).
+///
+/// `coxswain_controller_routing_table_rebuild_duration_seconds_count` is a
+/// cluster-wide series shared with every OTHER concurrently-running e2e test
+/// that touches routing (this suite runs tests in parallel against one
+/// controller pod), so it never goes quiet — an earlier version of this test
+/// polled for the count to stop changing and flaked/timed out under that
+/// noise. Instead this reads the delta over a FIXED, bounded real-time window
+/// (`SETTLE_BUDGET`, comfortably above the default 500ms debounce ceiling)
+/// measured from the first patch, then compares against a loose threshold
+/// (half the burst size) that tolerates a handful of noise increments from
+/// sibling tests while still failing hard on an actual per-event storm.
 #[tokio::test]
 async fn event_burst_within_window_coalesces_to_few_rebuilds() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -489,9 +497,10 @@ async fn event_burst_within_window_coalesces_to_few_rebuilds() -> anyhow::Result
         "coxswain_controller_routing_table_rebuild_duration_seconds_count",
     );
 
-    const BURST: usize = 10;
+    const BURST: usize = 30;
     const POKE_ANNOTATION: &str = "e2e.coxswain-labs.dev/poke";
     let ingresses: Api<Ingress> = Api::namespaced(h.client.clone(), &ns.name);
+    let burst_start = std::time::Instant::now();
     for i in 0..BURST {
         let poke = serde_json::json!({ "metadata": { "annotations": { POKE_ANNOTATION: i.to_string() } } });
         ingresses
@@ -503,38 +512,28 @@ async fn event_burst_within_window_coalesces_to_few_rebuilds() -> anyhow::Result
             .await?;
     }
 
-    // Interior mutability (not `let mut` captured by the FnMut closure below):
-    // an async block returned from an `FnMut` cannot hold a `&mut` reference
-    // to outer state across calls (it would have to outlive the borrow), but
-    // a `Cell` captured by shared reference sidesteps that entirely.
-    let last_seen = std::cell::Cell::new(None::<f64>);
-    let stable_reads = std::cell::Cell::new(0u32);
-    const STABLE_READS_REQUIRED: u32 = 3;
+    // 3x the default 500ms debounce ceiling: comfortably long enough for every
+    // one of the burst's debounce cycles to settle and rebuild, short enough
+    // to bound (not eliminate) noise exposure from concurrent sibling tests.
+    const SETTLE_BUDGET: Duration = Duration::from_millis(1500);
     let after_rebuild = wait::poll_until(
-        Duration::from_secs(5),
+        Duration::from_secs(10),
         wait::POLL_FAST,
+        || async { "timed out waiting out the post-burst settle budget".to_string() },
         || async {
-            "the post-burst rebuild count never stabilized (3 consecutive identical reads)"
-                .to_string()
-        },
-        || async {
+            if burst_start.elapsed() < SETTLE_BUDGET {
+                return None;
+            }
             let body = reqwest::get(h.controller_admin_url("/metrics"))
                 .await
                 .ok()?
                 .text()
                 .await
                 .ok()?;
-            let current = count_or_zero(
+            Some(count_or_zero(
                 &body,
                 "coxswain_controller_routing_table_rebuild_duration_seconds_count",
-            );
-            if last_seen.get() == Some(current) {
-                stable_reads.set(stable_reads.get() + 1);
-            } else {
-                stable_reads.set(0);
-                last_seen.set(Some(current));
-            }
-            (stable_reads.get() >= STABLE_READS_REQUIRED).then_some(current)
+            ))
         },
     )
     .await?;
@@ -545,7 +544,7 @@ async fn event_burst_within_window_coalesces_to_few_rebuilds() -> anyhow::Result
         "expected the burst to trigger at least one rebuild, got {rebuilds}"
     );
     assert!(
-        rebuilds < BURST as f64,
+        rebuilds < (BURST / 2) as f64,
         "expected {BURST} rapid annotation patches to coalesce into far fewer rebuilds, got \
          {rebuilds} (routing_table_rebuild_duration_seconds_count advanced from \
          {before_rebuild} to {after_rebuild}) — a rebuild-per-event storm defeats the debounce"
