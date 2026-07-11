@@ -1,0 +1,41 @@
+# Dedicated-mode Gateway whose sole HTTPS listener references a malformed
+# Secret (#570): the operator's status writer must settle
+# Programmed=False/Invalid at the current generation instead of holding the
+# Pending bind gate open forever (the proxy never serves this spec).
+# Placeholders replaced at test runtime:
+#   TESTNS            - test namespace
+#   LISTENER_HOSTNAME - hostname for the broken HTTPS listener
+#   SECRET_NAME       - name of the malformed Secret (created by the test)
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: dedicated-invalid-tls-params
+spec:
+  replicas: 1
+  serviceType: ClusterIP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: dedicated-invalid-tls-gw
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    parametersRef:
+      group: gateway.coxswain-labs.dev
+      kind: CoxswainGatewayParameters
+      name: dedicated-invalid-tls-params
+  listeners:
+    - name: https
+      port: 8110
+      protocol: HTTPS
+      hostname: "${LISTENER_HOSTNAME}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: ${SECRET_NAME}
+      allowedRoutes:
+        namespaces:
+          from: Same

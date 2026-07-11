@@ -44,9 +44,9 @@ use crate::reference_grants::{
     flatten_ls_cert_grants, flatten_tcp_backend_grants, flatten_udp_backend_grants,
 };
 use crate::status::{
-    ListenerSource, SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus,
-    SharedCoxswainBackendPolicyStatus, SharedCoxswainExternalAuthStatus,
-    SharedGatewayListenerStatus, SharedRouteStatus,
+    GatewayListenerStatus, ListenerSource, SharedBackendTlsPolicyStatus,
+    SharedClientTrafficPolicyStatus, SharedCoxswainBackendPolicyStatus,
+    SharedCoxswainExternalAuthStatus, SharedGatewayListenerStatus, SharedRouteStatus,
 };
 use async_trait::async_trait;
 use coxswain_core::cluster::{PARAMETERS_REF_GROUP, PARAMETERS_REF_KIND, SharedClusterSummary};
@@ -2355,6 +2355,28 @@ fn rebuild(
         .filter_map(|gw| build_dedicated_gateway_snapshot(gw, stores, &dedicated_inputs))
         .collect();
     let dedicated_keys: HashSet<ObjectKey> = registry_map.keys().cloned().collect();
+    // Fold each dedicated snapshot's listener health into the controller-side
+    // cell too (#570). The snapshot copy only travels the discovery wire to
+    // the dedicated proxy; without this fold the controller cell keeps a
+    // cut-over Gateway's entry frozen at its LAST pre-cut-over shared-path
+    // value — `VipPending`, because the shared path keys internal ports off
+    // VIP Services a dedicated Gateway never gets — so the operator status
+    // writer never sees the real per-listener readiness (a malformed cert
+    // reads as eternally-pending instead of settling `InvalidCertificateRef`).
+    // Scoped to `dedicated_keys`: the shared writer's own `update_scoped`
+    // below owns every non-cut-over entry. Ordered BEFORE the publish-index
+    // stamp so the stamped health fingerprints cover these entries.
+    let dedicated_health: HashMap<ObjectKey, GatewayListenerStatus> = registry_map
+        .values()
+        .flat_map(|snap| {
+            snap.listener_status
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+        })
+        .collect();
+    outputs
+        .listener_status
+        .update_scoped(dedicated_health, |k| dedicated_keys.contains(k));
     outputs.dedicated_registry.store(Arc::new(registry_map));
 
     // Build the SNI-keyed TLS passthrough table from TLSRoutes bound to

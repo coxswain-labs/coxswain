@@ -101,6 +101,11 @@ pub(super) async fn run_vip_reconciler(ctx: Arc<ReconcileContext>, mut shutdown:
 /// apply cannot shift the port landscape for anyone else: the retried pass sees
 /// exactly the assignments that actually persisted.
 async fn reconcile_all_vips(ctx: &ReconcileContext) {
+    // Degraded = this pass completed but some Gateway's VIP state may be
+    // stale until the next tick (LIST fallback, live-read failure, actionable
+    // apply/prune failure). Recorded on `vip_reconcile_total{result}` so a
+    // stuck VIP loop is alertable instead of log-only (#570).
+    let mut degraded = false;
     let gateways = ctx.gateways_store.state();
     let services = ctx.services_store.state();
     let classes = ctx.class_store.state();
@@ -145,6 +150,7 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
                 "operator: authoritative VIP-Service LIST failed; falling back to \
                  the (possibly stale) Services store for this pass"
             );
+            degraded = true;
             super::shared_alloc::existing_internal_ports(&services)
         }
     };
@@ -212,6 +218,7 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
                         error = %e,
                         "operator: live VIP Service read failed; deferring static bind to next pass"
                     );
+                    degraded = true;
                     continue;
                 }
             };
@@ -243,7 +250,7 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
                 requested_cluster_ip: None,
             });
         if let Err(e) = apply::apply_shared_vip_service(&ctx.client, ctrl_ns, &service).await {
-            log_vip_apply_failure(gw, &e, "Service");
+            degraded |= log_vip_apply_failure(gw, &e, "Service");
         }
     }
 
@@ -273,13 +280,21 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
                 service = %format!("{ctrl_ns}/{name}"),
                 "operator: pruned orphan VIP Service (Gateway gone or no longer shared)"
             ),
-            Err(e) => tracing::warn!(
-                service = %format!("{ctrl_ns}/{name}"),
-                error = %e,
-                "operator: failed to prune VIP Service; will retry"
-            ),
+            Err(e) => {
+                tracing::warn!(
+                    service = %format!("{ctrl_ns}/{name}"),
+                    error = %e,
+                    "operator: failed to prune VIP Service; will retry"
+                );
+                crate::metrics::vip_apply_failures_total().inc();
+                degraded = true;
+            }
         }
     }
+
+    crate::metrics::vip_reconcile_total()
+        .with_label_values(&[if degraded { "degraded" } else { "ok" }])
+        .inc();
 }
 
 /// The `(Gateway, listenerPort) → internalPort` assignments currently persisted
@@ -491,16 +506,20 @@ async fn apply_static_vip_candidate(
     apply::apply_shared_vip_service(&b.ctx.client, b.ctrl_ns, &service).await
 }
 
-/// Log a VIP Service apply failure. A `NamespaceTerminating` 403 (mid-deletion)
-/// is expected and self-heals, so it is logged at debug to avoid a retry-spam of
-/// warnings; everything else warns and is retried next pass.
-fn log_vip_apply_failure(gw: &Gateway, err: &apply::ApplyError, kind: &str) {
+/// Log a VIP Service apply failure and count it on
+/// `vip_apply_failures_total`. A `NamespaceTerminating` 403 (mid-deletion) is
+/// expected and self-heals, so it is logged at debug, not counted, and does
+/// not degrade the pass; everything else warns, counts, and is retried next
+/// pass. Returns `true` for the actionable (counted) case so the caller can
+/// mark the pass degraded (#570).
+fn log_vip_apply_failure(gw: &Gateway, err: &apply::ApplyError, kind: &str) -> bool {
     if err.to_string().contains("being terminated") {
         tracing::debug!(
             gateway = %gateway_id(gw),
             kind,
             "operator: VIP apply skipped — namespace is terminating"
         );
+        false
     } else {
         tracing::warn!(
             gateway = %gateway_id(gw),
@@ -508,6 +527,8 @@ fn log_vip_apply_failure(gw: &Gateway, err: &apply::ApplyError, kind: &str) {
             kind,
             "operator: failed to apply shared-mode VIP resource; will retry"
         );
+        crate::metrics::vip_apply_failures_total().inc();
+        true
     }
 }
 

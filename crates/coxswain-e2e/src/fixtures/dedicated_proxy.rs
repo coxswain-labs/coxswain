@@ -38,6 +38,12 @@ pub const DEDICATED_GATEWAY_LOADBALANCER: &str = fixture!("dedicated_gateway_loa
 pub const DEDICATED_GATEWAY_INVALID_PARAMS: &str =
     fixture!("dedicated_gateway_invalid_params.yaml");
 
+/// Dedicated-mode `Gateway` whose sole HTTPS listener references a malformed
+/// Secret (#570). Used to verify the operator settles
+/// `Programmed=False/Invalid` at the current generation instead of holding
+/// the bind gate's `Pending` forever.
+pub const DEDICATED_GATEWAY_INVALID_TLS: &str = fixture!("dedicated_gateway_invalid_tls.yaml");
+
 /// Dedicated-mode `Gateway` whose `CoxswainGatewayParameters` sets every spec
 /// knob at once (`replicas`, `image`, `resources`, `serviceType: NodePort`,
 /// `podTemplate`). Used by the #333 per-field coverage test to assert each one

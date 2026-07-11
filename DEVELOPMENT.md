@@ -346,3 +346,10 @@ cp .cargo/config.toml.example .cargo/config.toml
 ```
 
 Edit `.cargo/config.toml` if your Xcode path or SDK version differs. After that, `cargo build` and `cargo check` work without extra environment variables. The config file is gitignored — the paths are machine-local.
+
+### Gateway convergence stalls (#570 regression signatures)
+
+Two historical failure signatures, both fixed in #570 — if either reappears, start from the named metric rather than the logs (container log rotation drops the WARN samples long before a run finishes):
+
+- **Tests/conformance steps clustering at 30–60 s** — the operator reconcile loop is burning error-retry cycles. Check `coxswain_controller_reconcile_errors_total{controller="operator", reason=…}`: transient reasons (`namespace_terminating`, `conflict`, `transport`) retry on a per-Gateway exponential backoff (0.5 s → 15 s cap), so a healthy run shows only a handful per reason; persistent reasons (`forbidden`, `invalid`) poll flat at 15 s and mean RBAC or a rejected rendered spec — fix the config, don't wait it out.
+- **A Gateway spinning forever with conditions stuck below `metadata.generation`** — the shared writer's convergence gate is holding `Programmed` deferred. Check `coxswain_controller_gateways_held_pending`: it must return to zero within seconds of any spec change. Terminally-invalid configurations (malformed cert Secret, unsupported `parametersRef`, every listener unserviceable) must never hold — they settle `Programmed=False/Invalid` at the current generation; if one holds instead, the settled-negative escape in `reconcile_gateway_inner` (controller) / `programmed_outcome` (operator) regressed. `coxswain_controller_vip_reconcile_total{result="degraded"}` climbing alongside points at the VIP loop starving `awaiting_own_vip` instead.

@@ -68,6 +68,20 @@ pub(super) enum ApplyError {
     Pdb(#[source] kube::Error),
 }
 
+impl ApplyError {
+    /// The underlying apiserver error, exposed for the bounded reason
+    /// classification on `reconcile_errors_total{reason}` (#570).
+    pub(super) fn kube_source(&self) -> &kube::Error {
+        match self {
+            Self::ServiceAccount(e)
+            | Self::Service(e)
+            | Self::Deployment(e)
+            | Self::Hpa(e)
+            | Self::Pdb(e) => e,
+        }
+    }
+}
+
 /// Server-side-apply the three rendered resources to the cluster.
 ///
 /// Applies are sequenced ServiceAccount → Service → Deployment. The

@@ -319,6 +319,26 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         format!("proxy.shared.vipServiceType={vip_service_type}"),
         "--set".into(),
         format!("controller.coxswainImage={E2E_IMAGE}"),
+        // E2E-only rollout acceleration (#570 follow-up). The production
+        // defaults (5s/10s readiness probe, 15s/5s lease) put a ~57s floor
+        // under every helm mutation — and under the restore the NEXT
+        // default-options test pays — measured as three mutation+restore
+        // pairs costing ~350s of the status_conditions serial pass alone
+        // (2-replica controller rolls serially at probe cadence, then
+        // wait_for_leader_ready sits out the lease handover). Faster probes
+        // bound pod-Ready detection at ~3s and the short lease bounds
+        // handover at one renew tick after the old leader's step-down
+        // (2s × 3 ≤ 6s satisfies the controller's lease-ratio validation).
+        // Production values.yaml is untouched; resilience tests poll real
+        // post-conditions, not lease timings.
+        "--set".into(),
+        "readinessProbe.initialDelaySeconds=1".into(),
+        "--set".into(),
+        "readinessProbe.periodSeconds=2".into(),
+        "--set".into(),
+        "controller.leaseTtl=6s".into(),
+        "--set".into(),
+        "controller.leaseRenewInterval=2s".into(),
         "--skip-crds".into(), // CRDs are pre-applied with SSA above
         "--wait".into(),
         "--timeout".into(),

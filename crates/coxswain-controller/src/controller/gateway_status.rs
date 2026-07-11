@@ -46,6 +46,13 @@ pub(super) struct SharedAddressDecision {
     /// (`programmed_override`) is unaffected — it is a real result for the
     /// current generation.
     pub(super) converged: bool,
+    /// `true` when the Gateway's terminal outcome is already decided negative
+    /// for its current generation (#570): an unsupported `parametersRef`, or
+    /// every listener terminally unserviceable. Drives `Programmed=False,
+    /// reason=Invalid` stamped at the CURRENT generation — never the
+    /// `Pending`/`gen-1` hold, whose data-plane wait may never complete for
+    /// these states. Always set together with `converged = true`.
+    pub(super) settled_negative: bool,
     /// Human-readable cause for a `Programmed=False/Pending` hold beyond the
     /// generic address wait — the proxy-pool bind gate (#531): which/how many
     /// connected nodes have not yet bound which internal ports. Message only:
@@ -67,11 +74,14 @@ impl SharedAddressDecision {
 
     /// Desired `(status, reason)` for the top-level `Programmed` condition:
     /// `(False, AddressNotUsable | Invalid)` when a requested address could not
-    /// be honored; `(False, Pending)` while not yet converged (#533);
+    /// be honored; `(False, Invalid)` when the Gateway has settled negative
+    /// (#570 — unsupported `parametersRef` or all listeners terminally
+    /// unserviceable); `(False, Pending)` while not yet converged (#533);
     /// else the canonical `(True, Programmed)`.
     fn desired_programmed(&self) -> (&'static str, GatewayConditionReason) {
         match self.static_outcome.programmed_override {
             Some(reason) => ("False", reason),
+            None if self.settled_negative => ("False", GatewayConditionReason::Invalid),
             None if !self.converged => ("False", GatewayConditionReason::Pending),
             None => ("True", GatewayConditionReason::Programmed),
         }
@@ -561,6 +571,7 @@ mod tests {
             static_outcome: StaticAddressOutcome::not_engaged(),
             params_ref_unsupported: false,
             converged: true,
+            settled_negative: false,
             pending_detail: None,
         }
     }
@@ -572,6 +583,7 @@ mod tests {
             static_outcome: StaticAddressOutcome::not_engaged(),
             params_ref_unsupported: false,
             converged: true,
+            settled_negative: false,
             pending_detail: None,
         }
     }
@@ -938,6 +950,7 @@ mod tests {
             },
             params_ref_unsupported: false,
             converged: true,
+            settled_negative: false,
             pending_detail: None,
         }
     }
@@ -997,6 +1010,7 @@ mod tests {
             },
             params_ref_unsupported: true,
             converged: true,
+            settled_negative: false,
             pending_detail: None,
         };
         let patch = build_gateway_status_patch(
@@ -1262,6 +1276,7 @@ mod tests {
             static_outcome: StaticAddressOutcome::not_engaged(),
             params_ref_unsupported: false,
             converged: false,
+            settled_negative: false,
             pending_detail: None,
         }
     }
@@ -1300,6 +1315,44 @@ mod tests {
             prog["observedGeneration"], 2,
             "Programmed held one generation below current until converged"
         );
+    }
+
+    #[test]
+    fn patch_settles_programmed_false_invalid_at_current_generation() {
+        // #570: a settled negative (unsupported parametersRef / all listeners
+        // terminally unserviceable) must NOT be held at Pending/gen-1 — the
+        // verdict is decided, so Programmed=False/Invalid stamps at the
+        // CURRENT generation and `GatewayMustHaveLatestConditions` passes.
+        let gw = gateway(3, None, None);
+        let mut decision = not_converged();
+        decision.converged = true;
+        decision.settled_negative = true;
+        let patch = build_gateway_status_patch(
+            &gw,
+            &default_status(),
+            3,
+            &epoch(),
+            &decision,
+            IngressPorts::default(),
+        );
+        let conds = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions");
+        let prog = conds
+            .iter()
+            .find(|c| c["type"] == "Programmed")
+            .expect("Programmed");
+        assert_eq!(prog["status"], "False");
+        assert_eq!(prog["reason"], "Invalid");
+        assert_eq!(
+            prog["observedGeneration"], 3,
+            "settled negative stamps at the current generation, never the gen-1 hold"
+        );
+        let acc = conds
+            .iter()
+            .find(|c| c["type"] == "Accepted")
+            .expect("Accepted");
+        assert_eq!(acc["observedGeneration"], 3);
     }
 
     #[test]

@@ -13,16 +13,40 @@ use kube::{
 // Single patch call sets all Gateway conditions, listener statuses, and addresses at once.
 // A JSON merge patch replaces the entire conditions array, so splitting calls
 // would cause conditions to toggle in a watch-feedback loop.
+
+/// Outcome of one Gateway status patch attempt, driving the caller's requeue
+/// choice (#570). The desired status is on the object only for [`Self::Landed`];
+/// either failure variant means the caller must requeue (never `await_change`)
+/// because relying on the conflicting writer's watch event alone leaves a
+/// missed/coalesced event stranding stale conditions indefinitely (observed
+/// as conformance gateways stuck at observedGeneration 0). The retry is a
+/// fresh reconcile that recomputes the decision from current state — never an
+/// in-place resend of this (stale) patch, which would reintroduce the #531
+/// clobber.
+pub(super) enum GatewayPatchOutcome {
+    /// The write landed — or was structurally impossible (no name/generation)
+    /// and retrying cannot help.
+    Landed,
+    /// 409 stale-view conflict: the pinned `resourceVersion` lost the race. A
+    /// prompt retry is correct — the conflict itself proves fresh state exists.
+    Conflict,
+    /// Any other API error (RBAC, webhook rejection, transport). Possibly
+    /// persistent: retry on the slow error cadence, not the prompt one, so a
+    /// misconfigured install doesn't hammer the apiserver at the deferred
+    /// cadence forever (mirrors the operator's persistent-class backoff).
+    Failed,
+}
+
 pub(super) async fn patch_gateway_status(
     client: &Client,
     gw: &Gateway,
     health: &GatewayListenerStatus,
     decision: &SharedAddressDecision,
     ingress_ports: IngressPorts,
-) {
+) -> GatewayPatchOutcome {
     let name = match gw.metadata.name.as_deref() {
         Some(n) => n,
-        None => return,
+        None => return GatewayPatchOutcome::Landed,
     };
     let ns = gw.metadata.namespace.as_deref().unwrap_or("default");
     let Some(generation) = gw.metadata.generation else {
@@ -31,7 +55,7 @@ pub(super) async fn patch_gateway_status(
             ns,
             "Skipping Gateway status patch: metadata.generation is unset"
         );
-        return;
+        return GatewayPatchOutcome::Landed;
     };
     let api: Api<Gateway> = Api::namespaced(client.clone(), ns);
     let now = Time(k8s_openapi::jiff::Timestamp::now());
@@ -69,15 +93,38 @@ pub(super) async fn patch_gateway_status(
         .await;
     crate::metrics::observe_status_patch("gateway", started, &result);
     match result {
-        Ok(_) => tracing::info!(name, ns, "Gateway status patched"),
+        Ok(_) => {
+            tracing::info!(name, ns, "Gateway status patched");
+            GatewayPatchOutcome::Landed
+        }
         Err(kube::Error::Api(ref ae)) if ae.code == 409 => {
             tracing::debug!(
                 name,
                 ns,
                 "Gateway status patch skipped: object changed since this reconcile \
-                 observed it (stale view); the newer object's event re-drives"
+                 observed it (stale view); requeueing to recompute from fresh state"
             );
+            GatewayPatchOutcome::Conflict
         }
-        Err(e) => tracing::warn!(name, ns, error = %e, "Failed to patch Gateway status"),
+        Err(kube::Error::Api(ref ae)) if ae.code == 404 => {
+            // The Gateway was deleted after this reconcile read it from the
+            // (lagging) store. Retrying is not just pointless, it is harmful:
+            // a Failed→requeue here self-sustains forever on an object that
+            // will never reappear, spamming the apiserver and keeping the
+            // work queue hot until the store catches up (observed in CI:
+            // deleted conformance fixtures still being patched 20 minutes
+            // after deletion). The store's DELETE event is the authoritative
+            // terminal signal — report Landed so the caller goes quiet.
+            tracing::debug!(
+                name,
+                ns,
+                "Gateway status patch skipped: object deleted; awaiting the store's delete event"
+            );
+            GatewayPatchOutcome::Landed
+        }
+        Err(e) => {
+            tracing::warn!(name, ns, error = %e, "Failed to patch Gateway status");
+            GatewayPatchOutcome::Failed
+        }
     }
 }

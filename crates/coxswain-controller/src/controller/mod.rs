@@ -90,9 +90,12 @@ const LEASE_NAME: &str = "coxswain-leader-lock";
 /// promptly (the lease TTL defaults to 15 s).
 const NON_LEADER_REQUEUE: Duration = Duration::from_secs(20);
 
-/// Re-queue interval after a reconcile error (none of the status helpers
-/// currently surface one, so this is a backstop for the framework's error
-/// policy).
+/// Re-queue interval after a possibly-persistent status-write failure
+/// (RBAC, webhook rejection, transport — anything but a 409 stale-view
+/// conflict, which retries at [`DEFERRED_PROGRAMMED_REQUEUE`]). Slow on
+/// purpose: a misconfigured install must poll, not hammer, the apiserver
+/// (#570). Also the backstop for the framework's error policy, which the
+/// `Infallible` reconcilers never invoke.
 const ERROR_REQUEUE: Duration = Duration::from_secs(15);
 
 /// Re-queue interval while a Gateway's `Programmed` condition is deferred
@@ -377,6 +380,7 @@ impl Controller {
             vip_failures: self.vip_failures.clone(),
             node_registry: self.node_registry.clone(),
             publish_index: self.publish_index.clone(),
+            held_pending: parking_lot::Mutex::new(HashSet::new()),
         });
 
         // One re-drive channel per work-queue. Each is fed by the relevant
@@ -668,6 +672,7 @@ impl Controller {
                         Self::try_renew(&lease_lock, &self.config.pod_name, renew_bound).await,
                         tokio::time::Instant::now(),
                     );
+                    ctx.refresh_held_pending(leading);
                     if leading != is_leader {
                         if leading {
                             tracing::info!(pod = %self.config.pod_name, "Acquired leadership");
@@ -909,6 +914,55 @@ struct ReconcileContext {
     /// Per-Gateway publish-sequence index (#531): the ack half of the
     /// `Programmed` gate. `None` disables it (tests / dev).
     publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
+    /// Gateways currently exiting the reconcile through a deferred-`Programmed`
+    /// requeue — the backing set for the `gateways_held_pending` gauge (#570).
+    /// Inserted on the not-converged path, removed on any settled exit, and
+    /// pruned against the Gateway store each pass (a deleted Gateway fires no
+    /// reconcile of its own). Guard never held across an `.await`.
+    held_pending: parking_lot::Mutex<HashSet<ObjectKey>>,
+}
+
+impl ReconcileContext {
+    /// Record one Gateway's held-pending state and refresh the
+    /// `gateways_held_pending` gauge. Prunes keys whose Gateway no longer
+    /// exists in the store so deletions (which fire no reconcile) cannot
+    /// strand the gauge above zero.
+    fn track_held_pending(&self, key: &ObjectKey, held: bool) {
+        let mut set = self.held_pending.lock();
+        if held {
+            set.insert(key.clone());
+        } else {
+            set.remove(key);
+        }
+        set.retain(|k| {
+            self.gateways
+                .get(&ObjectRef::new(&k.name).within(&k.ns))
+                .is_some()
+        });
+        crate::metrics::gateways_held_pending().set(i64::try_from(set.len()).unwrap_or(i64::MAX));
+    }
+
+    /// Periodic hygiene for the held-pending gauge, run on every lease tick
+    /// (#570). A follower exports 0 — the set is the LEADER's view, and a
+    /// demoted replica must not keep exporting its stale count (summing the
+    /// gauge across pods would double-count). The leader prunes entries whose
+    /// Gateway was deleted: a deletion fires no reconcile of its own, so
+    /// without this tick the LAST Gateway in a cluster (common at e2e
+    /// teardown) would strand the gauge above zero with no reconcile traffic
+    /// left to prune it.
+    fn refresh_held_pending(&self, is_leader: bool) {
+        let mut set = self.held_pending.lock();
+        if is_leader {
+            set.retain(|k| {
+                self.gateways
+                    .get(&ObjectRef::new(&k.name).within(&k.ns))
+                    .is_some()
+            });
+        } else {
+            set.clear();
+        }
+        crate::metrics::gateways_held_pending().set(i64::try_from(set.len()).unwrap_or(i64::MAX));
+    }
 }
 
 /// Error policy shared by every work-queue. The status reconcilers are
@@ -956,15 +1010,25 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     // cannot recur. An un-owned (or not-yet-observed) class yields
     // `await_change`; the GatewayClass → Gateway secondary watch re-drives this
     // Gateway once its class lands.
+    let key = ObjectKey::new(
+        gw.metadata.namespace.clone().unwrap_or_default(),
+        gw.metadata.name.clone().unwrap_or_default(),
+    );
     let classes = ctx.gateway_classes.state();
     let (owned, owned_dedicated) = classify_gateway_classes(&classes, &ctx.controller_name);
     let class_name = gw.spec.gateway_class_name.as_str();
+    // Both ownership exits clear the held-pending gauge: a Gateway that lost
+    // its owned class or migrated shared→dedicated while held will never
+    // traverse this writer's converged exit again, and the store prune cannot
+    // remove it (the Gateway still exists).
     if !owned.contains(class_name) {
+        ctx.track_held_pending(&key, false);
         return Action::await_change();
     }
     // Dedicated-mode Gateways are the operator's to write (#211); skipping here
     // keeps the two writers from racing on `status.conditions`.
     if is_dedicated_mode(gw, &owned_dedicated) {
+        ctx.track_held_pending(&key, false);
         return Action::await_change();
     }
 
@@ -1017,11 +1081,6 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     let awaiting_own_vip =
         ctx.shared_vip_addressing && !matches!(vip.address, VipAddress::Resolved(_));
 
-    let key = ObjectKey::new(
-        gw.metadata.namespace.clone().unwrap_or_default(),
-        gw.metadata.name.clone().unwrap_or_default(),
-    );
-
     // Hold an unconfirmed `AddressNotUsable` at `Pending` (#533, #558). An
     // empty `resolved` set (VIP mid-provisioning) — or a resolved-but-stale
     // address observed mid-repin (the operator deletes + defer-recreates the
@@ -1041,6 +1100,36 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     ) {
         static_outcome.hold_pending_address();
     }
+
+    // Settled-negative escape (#570): when the Gateway's terminal outcome is
+    // already decided — an unsupported `parametersRef`, or every listener
+    // terminally unserviceable (invalid cert ref, failed frontend CA, lost
+    // conflict, unsupported protocol/value) — the data-plane wait below (own
+    // VIP, proxy bind, snapshot ack) can never change the verdict, and for
+    // several of these states never completes at all (the VIP reconciler
+    // skips Gateways with a `parametersRef`; nothing re-drives an invalid
+    // listener). Holding `Programmed` at `Pending`/`gen-1` here is what spun
+    // the invalid-config conformance fixtures forever. Converge now and stamp
+    // the negative at the CURRENT generation; recovery is event-driven (a
+    // Secret/spec fix re-triggers a rebuild, flips the health entry, and the
+    // health forwarder re-drives this queue), with the slow settled-negative
+    // requeue below as the #558-style backstop. Gated on subsystem readiness:
+    // an empty pre-sync health map must not read as "all listeners invalid".
+    // Known window (accepted): health is not generation-stamped, so a spec
+    // edit that FIXES the config can briefly read stale all-terminal health
+    // and stamp False/Invalid at the new generation; the rebuild that
+    // recomputes health re-drives this queue and corrects it within one
+    // rebuild cycle.
+    let subsystem_ready = ctx.health.is_subsystem_ready("controller");
+    let health_map = ctx.listener_status.load();
+    let health = health_map.get(&key).cloned().unwrap_or_default();
+    let settled_negative = subsystem_ready
+        && (params_ref_unsupported
+            || (!health.listeners.is_empty()
+                && health
+                    .listeners
+                    .values()
+                    .all(|info| info.is_terminally_unserviceable())));
 
     // Anti-flap latch first (#533, #531): once the Gateway is Programmed at
     // its live generation, convergence is settled — VIP re-resolution and pool
@@ -1084,9 +1173,15 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     // pre-update config. Zero connected nodes fails closed; a Gateway not yet
     // stamped by the reflector (or stamped at an older generation) fails
     // closed too.
+    // #570: await only internal ports a serviceable listener still needs. A
+    // port whose every contributing listener has settled negative can stay
+    // unbound forever without blocking convergence; a port no health entry
+    // claims (health lag) stays awaited — fail closed.
+    let awaited_internal_ports =
+        awaited_internal_ports(&vip.internal_ports, &health, subsystem_ready);
     let (proxies_bound, proxy_pending_detail) = match &ctx.node_registry {
-        Some(registry) if ctx.shared_vip_addressing && !latched => {
-            let ports_bound = registry.all_shared_nodes_bound(&vip.internal_ports);
+        Some(registry) if ctx.shared_vip_addressing && !latched && !settled_negative => {
+            let ports_bound = registry.all_shared_nodes_bound(&awaited_internal_ports);
             let snapshot_acked = match &ctx.publish_index {
                 Some(index) => index.get(&key).is_some_and(|stamp| {
                     stamp.generation >= gw.metadata.generation.unwrap_or(0)
@@ -1105,7 +1200,7 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
                         gw.metadata.generation.unwrap_or(0)
                     )
                 } else {
-                    proxy_bind_pending_detail(&registry.load(), &vip.internal_ports)
+                    proxy_bind_pending_detail(&registry.load(), &awaited_internal_ports)
                 }
             });
             (bound, detail)
@@ -1133,21 +1228,25 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     let publishable_addresses = !static_outcome.feature_engaged
         || static_outcome.programmed_override.is_some()
         || !static_outcome.status_addresses.is_empty();
-    let converged = (latched || (!awaiting_own_vip && proxies_bound)) && publishable_addresses;
+    // A settled negative is converged by definition (#570): its verdict is
+    // already decided for this generation, and its data-plane inputs (own
+    // VIP, bind, ack) may never arrive at all.
+    let converged = settled_negative
+        || ((latched || (!awaiting_own_vip && proxies_bound)) && publishable_addresses);
 
     let decision = gateway_status::SharedAddressDecision {
         legacy_addr: owned_status_addr,
         static_outcome,
         params_ref_unsupported,
         converged,
+        settled_negative,
         pending_detail: proxy_pending_detail,
     };
 
-    if ctx.health.is_subsystem_ready("controller") {
-        let health_map = ctx.listener_status.load();
-        let health = health_map.get(&key).cloned().unwrap_or_default();
+    if subsystem_ready {
+        let mut patch_outcome = gateway_events::GatewayPatchOutcome::Landed;
         if gateway_needs_status_patch(gw, &health, &decision) && leader_write_fence(ctx) {
-            gateway_events::patch_gateway_status(
+            patch_outcome = gateway_events::patch_gateway_status(
                 &ctx.client,
                 gw,
                 &health,
@@ -1165,10 +1264,30 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         // `await_change` here would strand a stale negative until an unrelated
         // event. Slow-requeue as the self-heal backstop instead.
         if !converged {
+            ctx.track_held_pending(&key, true);
             Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
-        } else if decision.static_outcome.is_address_not_usable() {
+        } else if matches!(patch_outcome, gateway_events::GatewayPatchOutcome::Conflict) {
+            // The desired status is NOT on the object: the pinned
+            // resourceVersion lost a stale-view race. Requeue promptly to
+            // recompute from fresh state instead of trusting the conflicting
+            // writer's watch event alone — a missed/coalesced event otherwise
+            // strands stale conditions indefinitely (#570).
+            ctx.track_held_pending(&key, false);
+            Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
+        } else if matches!(patch_outcome, gateway_events::GatewayPatchOutcome::Failed) {
+            // Possibly-persistent write failure (RBAC, webhook, transport):
+            // retry on the slow error cadence so a misconfigured install
+            // doesn't hammer the apiserver at the deferred cadence forever.
+            ctx.track_held_pending(&key, false);
+            Action::requeue(ERROR_REQUEUE)
+        } else if decision.settled_negative || decision.static_outcome.is_address_not_usable() {
+            // Settled negatives (#570) share the #558 backstop: recovery is
+            // event-driven (health flip / spec edit re-drives the queue), but
+            // a negative must never go fully quiet on a missed event.
+            ctx.track_held_pending(&key, false);
             Action::requeue(SETTLED_NEGATIVE_REQUEUE)
         } else {
+            ctx.track_held_pending(&key, false);
             Action::await_change()
         }
     } else if !gateway_accepted(gw) {
@@ -1186,10 +1305,12 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
             )
             .await;
         }
+        ctx.track_held_pending(&key, true);
         Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
     } else {
         // Accepted already set, but the subsystem is not ready yet: revisit
         // shortly so `Programmed` lands without waiting for the next event.
+        ctx.track_held_pending(&key, true);
         Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
     }
 }
@@ -1331,6 +1452,40 @@ fn service_internal_ports(
         .filter_map(|p| match &p.target_port {
             Some(IntOrString::Int(i)) => u16::try_from(*i).ok(),
             _ => None,
+        })
+        .collect()
+}
+
+/// Filter a Gateway's VIP internal ports down to those the proxy-pool bind
+/// gate should still await (#570): drop every port whose contributing
+/// listeners have ALL settled terminally negative — such a port may stay
+/// unbound forever and must not hold `Programmed` at `Pending`.
+///
+/// Fail-closed rules: before the controller subsystem is ready the health map
+/// is not trustworthy, so every port stays awaited; likewise a port no health
+/// entry claims (health lag behind the Service) stays awaited.
+fn awaited_internal_ports(
+    internal_ports: &std::collections::BTreeSet<u16>,
+    health: &GatewayListenerStatus,
+    subsystem_ready: bool,
+) -> std::collections::BTreeSet<u16> {
+    if !subsystem_ready {
+        return internal_ports.clone();
+    }
+    internal_ports
+        .iter()
+        .copied()
+        .filter(|port| {
+            let mut any_claimant = false;
+            let all_negative = health
+                .listeners
+                .values()
+                .filter(|info| info.bind_port() == *port)
+                .all(|info| {
+                    any_claimant = true;
+                    info.is_terminally_unserviceable()
+                });
+            !(any_claimant && all_negative)
         })
         .collect()
 }
@@ -1941,6 +2096,40 @@ mod tests {
             StatusAddress::Ip(i) => Some(*i),
             StatusAddress::Hostname(_) => None,
         }
+    }
+
+    // ── settled-negative bind-wait filtering (#570) ──────────────────────────
+
+    #[test]
+    fn awaited_ports_drop_fully_negative_claims_and_fail_closed_otherwise() {
+        use coxswain_reflector::status::{
+            GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerStatusKey,
+        };
+        let mut health = GatewayListenerStatus::default();
+        let mut invalid = ListenerInfo::default();
+        invalid.readiness = ListenerReadiness::InvalidCertificateRef {
+            message: "bad pem".to_string(),
+        };
+        invalid.internal_port = 30001;
+        health
+            .listeners
+            .insert(ListenerStatusKey::gateway("bad"), invalid);
+        let mut valid = ListenerInfo::default();
+        valid.internal_port = 30002;
+        health
+            .listeners
+            .insert(ListenerStatusKey::gateway("good"), valid);
+
+        // 30001: sole claimant settled negative → dropped from the wait.
+        // 30002: serviceable claimant → awaited.
+        // 30003: no claimant (health lag) → awaited, fail closed.
+        let ports: std::collections::BTreeSet<u16> = [30001, 30002, 30003].into();
+        let awaited = awaited_internal_ports(&ports, &health, true);
+        assert_eq!(awaited, [30002, 30003].into());
+
+        // Subsystem not ready → the health map is untrustworthy; everything
+        // stays awaited.
+        assert_eq!(awaited_internal_ports(&ports, &health, false), ports);
     }
 
     // ── latched address preservation (#531) ──────────────────────────────────

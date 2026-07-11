@@ -215,6 +215,29 @@ impl ListenerReadiness {
         )
     }
 
+    /// Returns `true` for settled-negative outcomes that no amount of waiting
+    /// fixes — only a spec edit or a referenced resource changing (either of
+    /// which re-triggers a rebuild and recomputes this) can.
+    ///
+    /// Distinct from both transient not-yet states (`VipPending`, which the
+    /// next allocation pass resolves) and degraded-but-serving
+    /// (`ResolvedPartial`, whose listener still binds and serves). Convergence
+    /// gates use this to stop awaiting data-plane convergence for listeners
+    /// whose outcome is already decided, so the owning Gateway's `Programmed`
+    /// settles at the current generation instead of holding `Pending` forever
+    /// (#570).
+    #[must_use]
+    pub fn is_terminally_invalid(&self) -> bool {
+        matches!(
+            self,
+            Self::RefNotPermitted { .. }
+                | Self::InvalidCertificateRef { .. }
+                | Self::Invalid { .. }
+                | Self::Unsupported { .. }
+                | Self::UnsupportedProtocol { .. }
+        )
+    }
+
     /// Stable reason string for the `Programmed` listener condition.
     #[must_use]
     pub fn reason(&self) -> &'static str {
@@ -587,6 +610,23 @@ pub struct ListenerInfo {
 }
 
 impl ListenerInfo {
+    /// Returns `true` when this listener has settled into a state the data
+    /// plane will never serve under its current spec: terminally-invalid
+    /// readiness (see [`ListenerReadiness::is_terminally_invalid`]), a failed
+    /// GEP-91 frontend client-cert CA, or a lost GEP-1713 port conflict.
+    ///
+    /// Convergence gates exclude these listeners from the proxy bind/ack wait
+    /// and settle the owning Gateway's `Programmed` at the current generation
+    /// (#570) — the negative is already decided, and any change that could
+    /// revive the listener (spec edit, Secret/ConfigMap fix, conflict winner
+    /// leaving) re-triggers a rebuild that recomputes this predicate.
+    #[must_use]
+    pub fn is_terminally_unserviceable(&self) -> bool {
+        self.readiness.is_terminally_invalid()
+            || self.frontend_outcome.is_failed()
+            || self.conflict.is_conflicted()
+    }
+
     /// Port the proxy actually binds and keys routing on: the allocated
     /// [`Self::internal_port`] when non-zero, else the spec [`Self::port`].
     ///
@@ -818,6 +858,64 @@ impl SharedGatewayListenerStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminally_invalid_covers_settled_negatives_only() {
+        let msg = || "boom".to_string();
+        // Settled negatives — no amount of waiting fixes these.
+        for r in [
+            ListenerReadiness::RefNotPermitted { message: msg() },
+            ListenerReadiness::InvalidCertificateRef { message: msg() },
+            ListenerReadiness::Invalid { message: msg() },
+            ListenerReadiness::Unsupported { message: msg() },
+            ListenerReadiness::UnsupportedProtocol { message: msg() },
+        ] {
+            assert!(r.is_terminally_invalid(), "{r:?} must be terminal");
+        }
+        // Healthy, transient (VipPending resolves on the next allocation
+        // pass), and degraded-but-serving (ResolvedPartial still binds) —
+        // none of these may settle the convergence gate negative.
+        for r in [
+            ListenerReadiness::NotApplicable,
+            ListenerReadiness::Resolved,
+            ListenerReadiness::ResolvedPartial { message: msg() },
+            ListenerReadiness::VipPending,
+            ListenerReadiness::TlsPassthrough,
+            ListenerReadiness::TlsTerminate,
+            ListenerReadiness::TcpProxy,
+            ListenerReadiness::UdpProxy,
+        ] {
+            assert!(!r.is_terminally_invalid(), "{r:?} must not be terminal");
+        }
+    }
+
+    #[test]
+    fn listener_unserviceable_via_readiness_frontend_or_conflict() {
+        let healthy = ListenerInfo::default();
+        assert!(!healthy.is_terminally_unserviceable());
+
+        let bad_readiness = ListenerInfo {
+            readiness: ListenerReadiness::InvalidCertificateRef {
+                message: "bad pem".to_string(),
+            },
+            ..ListenerInfo::default()
+        };
+        assert!(bad_readiness.is_terminally_unserviceable());
+
+        let bad_frontend = ListenerInfo {
+            frontend_outcome: FrontendValidationOutcome::InvalidCACertificateRef {
+                message: "no ca.crt".to_string(),
+            },
+            ..ListenerInfo::default()
+        };
+        assert!(bad_frontend.is_terminally_unserviceable());
+
+        let conflicted = ListenerInfo {
+            conflict: ConflictReason::HostnameConflict,
+            ..ListenerInfo::default()
+        };
+        assert!(conflicted.is_terminally_unserviceable());
+    }
 
     #[test]
     fn frontend_outcome_reason_and_failed_flags() {
