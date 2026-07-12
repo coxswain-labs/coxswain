@@ -141,6 +141,14 @@ pub struct RouteResolution<'a> {
 /// - for every rule's `backendRefs`, [`EndpointCache::fingerprint`] for that
 ///   `(namespace, service, port)` — catches endpoint/Service-port churn on a
 ///   backend this route uses, independent of the route's own spec.
+/// - for every rule's `RequestMirror` filter, [`EndpointCache::fingerprint`]
+///   for the mirror backend — its endpoints are baked into the compiled router
+///   but are not a `backendRef`, so this is the only thing that dirties the
+///   partition when the mirror target's pods roll.
+///
+/// Contributions combine with `wrapping_add`, not XOR: XOR self-cancels when a
+/// route contributes the same value twice (two rules to one Service, or sharing
+/// one CR), silently dropping that input from the fingerprint.
 ///
 /// Deliberately does **not** track: Gateway-attached policies resolved via
 /// `targetRef` (`BackendTLSPolicy`, `CoxswainBackendPolicy`, the Gateway-level
@@ -158,21 +166,33 @@ pub(crate) fn route_fingerprint(
     services: &reflector::Store<Service>,
     resolution: &RouteResolution<'_>,
 ) -> u64 {
+    // `wrapping_add` (not XOR) to combine contributions: XOR self-cancels when
+    // a route contributes the same value twice — e.g. two rules routing to the
+    // *same* Service, or sharing one ExtensionRef CR — which would zero out that
+    // input and let its churn go unseen (#511). Addition stays order-independent
+    // without the idempotent-cancellation hazard.
     let mut fp: u64 = 0;
     let mut hasher = DefaultHasher::new();
     route.metadata.resource_version.hash(&mut hasher);
-    fp ^= hasher.finish();
+    fp = fp.wrapping_add(hasher.finish());
 
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     for rule in route.spec.rules.as_deref().unwrap_or(&[]) {
-        for (_group, kind, name) in super::filters::ext_refs(rule.filters.as_deref().unwrap_or(&[]))
-        {
-            fp ^= ext_ref_fingerprint(route_ns, kind, name, resolution);
+        let filters = rule.filters.as_deref().unwrap_or(&[]);
+        for (_group, kind, name) in super::filters::ext_refs(filters) {
+            fp = fp.wrapping_add(ext_ref_fingerprint(route_ns, kind, name, resolution));
+        }
+        // RequestMirror backends are baked into the compiled router but aren't
+        // `backend_refs`; fold their endpoints so mirror-pod churn dirties the
+        // partition (#511 finding B).
+        for (mns, mname, mport) in super::filters::mirror_backend_refs(filters) {
+            let ns = mns.unwrap_or(route_ns);
+            fp = fp.wrapping_add(endpoint_cache.fingerprint(ns, mname, mport, services));
         }
         for b in rule.backend_refs.as_deref().unwrap_or(&[]) {
             let Some(port) = b.port else { continue };
             let ns = b.namespace.as_deref().unwrap_or(route_ns);
-            fp ^= endpoint_cache.fingerprint(ns, &b.name, port, services);
+            fp = fp.wrapping_add(endpoint_cache.fingerprint(ns, &b.name, port, services));
         }
     }
     fp
@@ -2837,6 +2857,71 @@ mod tests {
             assert_ne!(
                 before, after,
                 "editing the referenced RateLimit CR must move the fingerprint even though the route itself didn't change"
+            );
+        }
+
+        #[test]
+        fn same_service_in_two_rules_still_detects_backend_change() {
+            // Two rules routing to the SAME (svc, 80). Under XOR the two equal
+            // endpoint contributions cancel to zero, so a change to that
+            // service would go unseen; `wrapping_add` keeps it visible (#511).
+            let mut route = make_route("default", &["example.com"], None, "svc");
+            let rule0 = route.spec.rules.as_ref().unwrap()[0].clone();
+            route.spec.rules.as_mut().unwrap().push(rule0);
+            route.metadata.resource_version = Some("1".to_string());
+            let cache = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+            let rls = empty_rate_limit_store();
+
+            let svcs_v1 = make_svc_store(vec![service("default", "svc", "1")]);
+            let before = route_fingerprint(
+                &route,
+                &cache,
+                &svcs_v1,
+                &resolution_with_rate_limits!(&rls),
+            );
+            let svcs_v2 = make_svc_store(vec![service("default", "svc", "2")]);
+            let after = route_fingerprint(
+                &route,
+                &cache,
+                &svcs_v2,
+                &resolution_with_rate_limits!(&rls),
+            );
+
+            assert_ne!(
+                before, after,
+                "a backend change on a Service referenced by two rules must move the fingerprint — XOR would self-cancel the duplicated contribution to zero"
+            );
+        }
+
+        #[test]
+        fn same_ext_ref_cr_in_two_rules_still_detects_cr_change() {
+            // Both rules reference the SAME RateLimit CR — XOR would cancel.
+            let mut route = make_route("default", &["example.com"], None, "svc");
+            route.spec.rules.as_mut().unwrap()[0].filters = Some(vec![rate_limit_ext_ref("rl")]);
+            let rule0 = route.spec.rules.as_ref().unwrap()[0].clone();
+            route.spec.rules.as_mut().unwrap().push(rule0);
+            route.metadata.resource_version = Some("1".to_string());
+            let cache = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+            let svcs = empty_svc_store();
+
+            let rls_v1 = make_rate_limit_store(vec![rate_limit_cr("default", "rl", "1")]);
+            let before = route_fingerprint(
+                &route,
+                &cache,
+                &svcs,
+                &resolution_with_rate_limits!(&rls_v1),
+            );
+            let rls_v2 = make_rate_limit_store(vec![rate_limit_cr("default", "rl", "2")]);
+            let after = route_fingerprint(
+                &route,
+                &cache,
+                &svcs,
+                &resolution_with_rate_limits!(&rls_v2),
+            );
+
+            assert_ne!(
+                before, after,
+                "editing a RateLimit CR shared by two rules must move the fingerprint — XOR would self-cancel it"
             );
         }
 

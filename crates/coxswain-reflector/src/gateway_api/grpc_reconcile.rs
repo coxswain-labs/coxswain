@@ -96,30 +96,34 @@ pub(crate) fn route_fingerprint(
     services: &reflector::Store<Service>,
     resolution: &GrpcRouteResolution<'_>,
 ) -> u64 {
+    // `wrapping_add` (not XOR): XOR self-cancels equal contributions — two rules
+    // to the same Service, or sharing one ExtensionRef CR — zeroing that input
+    // so its churn goes unseen (#511). See the HTTP `route_fingerprint`.
     let mut fp: u64 = 0;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     route.metadata.resource_version.hash(&mut hasher);
-    fp ^= hasher.finish();
+    fp = fp.wrapping_add(hasher.finish());
 
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     for rule in route.spec.rules.as_deref().unwrap_or(&[]) {
         for (_group, kind, name) in super::filters::ext_refs(rule.filters.as_deref().unwrap_or(&[]))
         {
-            fp ^= ext_ref_fingerprint(route_ns, kind, name, resolution);
+            fp = fp.wrapping_add(ext_ref_fingerprint(route_ns, kind, name, resolution));
         }
         for b in rule.backend_refs.as_deref().unwrap_or(&[]) {
             let Some(port) = b.port else { continue };
             let ns = b.namespace.as_deref().unwrap_or(route_ns);
-            fp ^= endpoint_cache.fingerprint(ns, &b.name, port, services);
+            fp = fp.wrapping_add(endpoint_cache.fingerprint(ns, &b.name, port, services));
         }
     }
     fp
 }
 
-/// GRPCRoute's narrower `ext_ref_fingerprint` dispatch — only the three kinds
-/// [`GrpcRouteResolution`] supports (`RateLimit`, `IpAccessControl`,
-/// `JwtAuth`); every other kind (including HTTP-only ones like `BasicAuth`)
-/// falls through to the same `(kind, name)` sentinel as an unrecognized kind.
+/// GRPCRoute's narrower `ext_ref_fingerprint` dispatch — only the kinds
+/// [`GrpcRouteResolution`] supports (`RateLimit`, `RetryPolicy`,
+/// `IpAccessControl`, `JwtAuth`); every other kind (including HTTP-only ones
+/// like `BasicAuth`) falls through to the same `(kind, name)` sentinel as an
+/// unrecognized kind.
 fn ext_ref_fingerprint(
     route_ns: &str,
     kind: &str,

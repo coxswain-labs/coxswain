@@ -1,6 +1,6 @@
 //! Shared fingerprint primitives for the partitioned incremental rebuild (#511).
 //!
-//! A fingerprint is a `u64` derived from `resourceVersion` strings — cheap,
+//! A fingerprint is a `u64` derived from an object's change token — cheap,
 //! in-memory-only (never persisted across restarts, never compared across
 //! process boundaries), and not a stability guarantee: `DefaultHasher`'s
 //! algorithm is unspecified across Rust versions, which is fine here since
@@ -9,9 +9,37 @@
 //! deep-comparing the object itself.
 
 use kube::Resource;
+use kube::api::ObjectMeta;
 use kube::runtime::reflector;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+
+/// Hash an object's *spec-change* token: its `metadata.generation` when the API
+/// server maintains one, else its `resourceVersion`.
+///
+/// Generation is bumped only on **spec** changes; `resourceVersion` bumps on
+/// *any* write, including the controller's own high-frequency **status** writes
+/// (a Gateway's `Programmed`/`observedGeneration`, a policy CR's `Accepted`
+/// conditions). Folding generation for objects that track it means those status
+/// writes don't churn the fingerprint and needlessly dirty every partition each
+/// reconcile — the difference between the partitioned rebuild actually reusing
+/// work and rebuilding the whole table on every reconcile of a busy cluster
+/// (#511). Objects without a status subresource (Secret, ConfigMap) carry no
+/// generation and fall back to `resourceVersion`, which for them moves only on
+/// real data edits. The `0`/`1` discriminant keeps a generation `i64` from
+/// colliding with a `resourceVersion` string that happens to hash alike.
+fn hash_change_token<H: Hasher>(meta: &ObjectMeta, hasher: &mut H) {
+    match meta.generation {
+        Some(generation) => {
+            0u8.hash(hasher);
+            generation.hash(hasher);
+        }
+        None => {
+            1u8.hash(hasher);
+            meta.resource_version.hash(hasher);
+        }
+    }
+}
 
 /// Fingerprint of one object's `resourceVersion`, looked up by `(namespace,
 /// name)` — O(1) via the store's index, not a scan. Object absent (deleted,
@@ -31,20 +59,23 @@ where
 }
 
 /// Aggregate, order-independent fingerprint of every object currently in
-/// `store` — an XOR fold of each member's `(namespace, name, resourceVersion)`,
-/// so it moves on any member add/remove/edit regardless of iteration order.
-/// O(objects in store); call once per rebuild; never per-route or per-lookup.
+/// `store` — an XOR fold of each member's `(namespace, name, `[change
+/// token`](hash_change_token)`)`, so it moves on any member add/remove/**spec**
+/// edit regardless of iteration order, but **not** on the controller's own
+/// status writes. O(objects in store); call once per rebuild; never per-route
+/// or per-lookup.
 ///
 /// Used as a coarse, always-correct fallback for inputs that a per-route
 /// static scan can't cheaply and precisely attribute (`targetRef`-based
 /// policy attachment, a CR's own one-hop reference to a Secret/ConfigMap):
 /// fold this epoch identically into every partition's fingerprint, so any
 /// change here invalidates the whole table for that one rebuild pass rather
-/// than risking a partition wrongly believing itself unaffected. These
-/// sources churn far less often than the endpoint/route-structural changes
-/// the partitioned rebuild specifically targets, so this fallback doesn't
-/// undermine its benchmarked wins — see the `RouteResolution`-adjacent doc on
-/// `route_fingerprint` for exactly which inputs fall into this bucket.
+/// than risking a partition wrongly believing itself unaffected. Ignoring
+/// status writes (via the generation-preferring change token) is what keeps
+/// this whole-table fallback from firing on essentially every reconcile of a
+/// cluster whose Gateways/policies the controller is actively status-writing —
+/// see the `RouteResolution`-adjacent doc on `route_fingerprint` for exactly
+/// which inputs fall into this bucket.
 pub(crate) fn store_epoch<K>(store: &reflector::Store<K>) -> u64
 where
     K: Resource<DynamicType = ()> + Clone + Send + Sync + 'static,
@@ -54,7 +85,7 @@ where
         let mut hasher = DefaultHasher::new();
         meta.namespace.hash(&mut hasher);
         meta.name.hash(&mut hasher);
-        meta.resource_version.hash(&mut hasher);
+        hash_change_token(meta, &mut hasher);
         acc ^ hasher.finish()
     })
 }
@@ -77,6 +108,16 @@ mod tests {
             "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
              kind: RateLimit\n\
              metadata:\n  name: {name}\n  namespace: {ns}\n  resourceVersion: \"{resource_version}\"\n\
+             spec:\n  requestsPerSecond: 1\n",
+        );
+        serde_yaml::from_str(&yaml).expect("valid RateLimit")
+    }
+
+    fn rate_limit_gen(ns: &str, name: &str, generation: i64, resource_version: &str) -> RateLimit {
+        let yaml = format!(
+            "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+             kind: RateLimit\n\
+             metadata:\n  name: {name}\n  namespace: {ns}\n  generation: {generation}\n  resourceVersion: \"{resource_version}\"\n\
              spec:\n  requestsPerSecond: 1\n",
         );
         serde_yaml::from_str(&yaml).expect("valid RateLimit")
@@ -131,5 +172,29 @@ mod tests {
         let a = store_with(vec![rate_limit("ns", "a", "1"), rate_limit("ns", "b", "1")]);
         let b = store_with(vec![rate_limit("ns", "b", "1"), rate_limit("ns", "a", "1")]);
         assert_eq!(store_epoch(&a), store_epoch(&b));
+    }
+
+    #[test]
+    fn store_epoch_ignores_status_writes_but_catches_spec_changes() {
+        // For an object the API server tracks a `generation` for (every object
+        // with a status subresource — Gateways, coxswain CRs), a status write
+        // bumps `resourceVersion` while leaving `generation` fixed; a spec edit
+        // bumps `generation`. The epoch must ignore the former (else the
+        // controller's own status writes dirty the whole table every reconcile)
+        // and catch the latter (#511).
+        let base = store_with(vec![rate_limit_gen("ns", "rl", 5, "100")]);
+        let status_write = store_with(vec![rate_limit_gen("ns", "rl", 5, "101")]);
+        let spec_change = store_with(vec![rate_limit_gen("ns", "rl", 6, "102")]);
+
+        assert_eq!(
+            store_epoch(&base),
+            store_epoch(&status_write),
+            "a status-only write (generation unchanged) must not churn the epoch"
+        );
+        assert_ne!(
+            store_epoch(&base),
+            store_epoch(&spec_change),
+            "a spec change (generation bumped) must move the epoch"
+        );
     }
 }

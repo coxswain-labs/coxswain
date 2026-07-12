@@ -107,6 +107,17 @@ impl SharedJwksCache {
         self.0.tx.subscribe()
     }
 
+    /// Current cache generation — bumped by [`Self::publish`] on every fetch
+    /// that changes the cache. Because the reconcile bakes resolved JWKS
+    /// *text* into a route's compiled config (`jwt_auth::resolve_spec`), a
+    /// key rotation moves this counter but no watched-resource `resourceVersion`;
+    /// the partitioned rebuild folds this into its global epoch so a rotated-out
+    /// key can't survive on a reused partition (#511).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        *self.0.tx.borrow()
+    }
+
     /// Publish a new full snapshot and bump the generation counter.
     fn publish(&self, snapshot: HashMap<Box<str>, CacheState>) {
         self.0.entries.store(Arc::new(snapshot));

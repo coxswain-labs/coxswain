@@ -166,12 +166,13 @@ pub(super) fn resolve_backend_client_certs(
 }
 
 /// Aggregate fingerprint of every input a per-route static scan can't
-/// precisely attribute to specific routes (#511) — see
-/// [`crate::gateway_api::http_route_fingerprint`]'s doc for the exact list
-/// this covers: `targetRef`-based policy attachment (`BackendTLSPolicy`,
-/// `CoxswainBackendPolicy`, the Gateway-level `CoxswainExternalAuth`
-/// mandate), a `BasicAuth` CR's own `secretRef` target, GEP-3155 backend
-/// client certs, and the `ReferenceGrant`s gating cross-namespace refs.
+/// precisely attribute to specific routes (#511). Covers: `targetRef`-based
+/// policy attachment (`BackendTLSPolicy`, `CoxswainBackendPolicy`, the
+/// Gateway-level `CoxswainExternalAuth` mandate — its CR store *and* its
+/// backend-service endpoints), a `BasicAuth` CR's own `secretRef` target
+/// (via the auth-secret store + grants), GEP-3155 backend client certs, the
+/// `ReferenceGrant`s gating cross-namespace refs, and the JWKS-cache
+/// generation (baked JWKS text rotates independently of any watched store).
 /// Folded identically into every `(port, host)` partition's fingerprint — any
 /// change here marks the WHOLE table dirty for one rebuild pass, the safe
 /// fallback for indirections this pass doesn't track per-route. These
@@ -182,13 +183,44 @@ fn compute_global_epoch(stores: &ReflectorStores<'_>, ownership: &Ownership<'_>)
     let mut epoch = 0u64;
     epoch ^= crate::fingerprint::store_epoch(stores.policies);
     epoch ^= crate::fingerprint::store_epoch(stores.coxswain_backend_policies);
+    // `CoxswainExternalAuth` CRs: a Gateway-level `targetRef` mandate is
+    // prepended to every bound route's auth chain and is deliberately *not*
+    // in `route_fingerprint` (it's targetRef-indexed, not route-spec-static),
+    // so its own edits must move the epoch here — else a relaxed/redirected
+    // mandate keeps being enforced on reused partitions.
+    epoch ^= crate::fingerprint::store_epoch(stores.external_auths);
     epoch ^= crate::fingerprint::store_epoch(stores.auth_secrets);
     epoch ^= crate::fingerprint::store_epoch(stores.secrets);
     epoch ^= crate::fingerprint::store_epoch(stores.configmaps);
     epoch ^= crate::fingerprint::store_epoch(stores.client_traffic_policies);
     epoch ^= crate::fingerprint::store_epoch(stores.gateways);
+    // The reconcile bakes resolved JWKS *text* into JWT route configs; a key
+    // rotation bumps the cache generation (and wakes the rebuild loop) but no
+    // watched `resourceVersion`. Fold the generation so a rotated-out key
+    // can't survive on a reused JWT partition.
+    epoch ^= stores.jwks_cache.generation();
     epoch ^= hash_grant_set(ownership.backend_grants);
     epoch ^= hash_grant_set(ownership.basic_auth_secret_grants);
+    // Ext-auth backend endpoints are baked into route auth chains (both the
+    // route-level ExtensionRef and the Gateway mandate); their pod churn moves
+    // neither the CR's rv nor any store above. Fold each ext-auth service's
+    // endpoint fingerprint — `wrapping_add` (not XOR) so two CRs sharing one
+    // backend service don't cancel each other to zero.
+    let mut ext_auth_endpoints = 0u64;
+    for cr in stores.external_auths.state() {
+        let Some(policy_ns) = cr.metadata.namespace.as_deref() else {
+            continue;
+        };
+        let b = &cr.spec.backend_ref;
+        let ns = b.namespace.as_deref().unwrap_or(policy_ns);
+        ext_auth_endpoints = ext_auth_endpoints.wrapping_add(stores.endpoint_cache.fingerprint(
+            ns,
+            &b.name,
+            i32::from(b.port),
+            stores.services,
+        ));
+    }
+    epoch ^= ext_auth_endpoints;
     epoch
 }
 

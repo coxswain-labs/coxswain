@@ -108,7 +108,11 @@ pub(crate) fn plan(
         );
         for (hostname_opt, port) in bindings {
             let key: PartitionKey = (port, hostname_opt);
-            *partition_fp.entry(key.clone()).or_insert(0) ^= fp;
+            // `wrapping_add`, not XOR: two routes on one partition with equal
+            // fingerprints (possible — `resourceVersion` values aren't unique
+            // across objects) would XOR-cancel, hiding both from dirtiness.
+            let slot = partition_fp.entry(key.clone()).or_insert(0);
+            *slot = slot.wrapping_add(fp);
             http_members.entry(key).or_default().push(i);
         }
     }
@@ -140,7 +144,8 @@ pub(crate) fn plan(
         );
         for (hostname_opt, port) in bindings {
             let key: PartitionKey = (port, hostname_opt);
-            *partition_fp.entry(key.clone()).or_insert(0) ^= fp;
+            let slot = partition_fp.entry(key.clone()).or_insert(0);
+            *slot = slot.wrapping_add(fp);
             grpc_members.entry(key).or_default().push(i);
         }
     }

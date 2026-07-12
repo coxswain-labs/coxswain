@@ -93,6 +93,15 @@ impl EndpointCache {
             group.slices.push(slice);
         }
         self.groups = groups;
+        // Reclaim cached resolutions whose `(namespace, service)` group no
+        // longer exists, so churn of short-lived Services can't grow `pool`
+        // without bound (#511). Entries for still-live groups whose fingerprint
+        // moved are re-resolved lazily by `get`; this only drops vanished ones.
+        let live: std::collections::HashSet<(Arc<str>, Arc<str>)> =
+            self.groups.keys().cloned().collect();
+        self.pool.borrow_mut().retain(|key, _| {
+            live.contains(&(Arc::clone(&key.namespace), Arc::clone(&key.service)))
+        });
     }
 
     /// Resolves `(ns, svc, port)`, reusing the cached entry when the owning
@@ -363,6 +372,45 @@ mod tests {
         assert!(
             std::sync::Arc::ptr_eq(&b1, &b2),
             "svc-b must reuse its cached entry — unaffected by svc-a's churn"
+        );
+    }
+
+    #[test]
+    fn refresh_prunes_pool_entries_for_vanished_services() {
+        // Without pruning, every `(ns,svc,port)` ever resolved would leak a
+        // permanent `pool` entry — an unbounded controller memory growth under
+        // churn of short-lived Services (#511).
+        let mut cache = EndpointCache::default();
+        let slices = slice_store(vec![
+            make_slice_with_conditions("ns", "svc-a", "10.0.0.1", None, Some(true)),
+            make_slice_with_conditions("ns", "svc-b", "10.0.1.1", None, Some(true)),
+        ]);
+        cache.refresh(&slices);
+        cache.get("ns", "svc-a", 8080, &empty_svc_store());
+        cache.get("ns", "svc-b", 8080, &empty_svc_store());
+        assert_eq!(cache.pool.borrow().len(), 2);
+
+        // svc-b's slices vanish (its Service was deleted); the next refresh must
+        // reclaim its cached resolution, leaving only svc-a's.
+        let slices = slice_store(vec![make_slice_with_conditions(
+            "ns",
+            "svc-a",
+            "10.0.0.1",
+            None,
+            Some(true),
+        )]);
+        cache.refresh(&slices);
+        assert_eq!(
+            cache.pool.borrow().len(),
+            1,
+            "the vanished service's cached resolution must be reclaimed on refresh"
+        );
+        assert!(
+            !cache
+                .get("ns", "svc-a", 8080, &empty_svc_store())
+                .addrs
+                .is_empty(),
+            "the surviving service still resolves"
         );
     }
 }

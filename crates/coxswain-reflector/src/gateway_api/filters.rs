@@ -94,6 +94,28 @@ pub(super) fn ext_refs<F: ExtRefFilter>(filters: &[F]) -> impl Iterator<Item = (
     filters.iter().filter_map(F::ext_ref)
 }
 
+/// `(namespace, name, port)` of each `RequestMirror` filter's backend Service.
+///
+/// The partition fingerprint (#511) needs these: a mirror backend's endpoints
+/// are baked into the compiled router (a `BackendGroup`) but are **not** a
+/// `backend_ref`, so their pod churn would otherwise not dirty the partition,
+/// leaving a reused router mirroring to dead IPs. Over-inclusive by design
+/// (any ref carrying a port, before the core-Service eligibility check the
+/// translator applies) — forfeiting reuse for an exotic mirror ref is safe;
+/// missing one risks stale mirror endpoints.
+pub(super) fn mirror_backend_refs(
+    filters: &[HttpRouteRulesFilters],
+) -> impl Iterator<Item = (Option<&str>, &str, i32)> {
+    filters.iter().filter_map(|f| {
+        if !matches!(f.r#type, HttpRouteRulesFiltersType::RequestMirror) {
+            return None;
+        }
+        let bref = &f.request_mirror.as_ref()?.backend_ref;
+        let port = bref.port?;
+        Some((bref.namespace.as_deref(), bref.name.as_str(), port))
+    })
+}
+
 /// Translates `HTTPRouteFilter` entries into `FilterAction` values.
 ///
 /// `matched_prefix` is the path pattern for this match rule (used for
