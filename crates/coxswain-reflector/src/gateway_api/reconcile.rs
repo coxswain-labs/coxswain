@@ -1001,25 +1001,27 @@ impl GatewayApiReconciler {
                     ListenerReadiness::TlsPassthrough
                 }
             } else if listener.protocol == "TLS" {
-                if vip_pending {
-                    ListenerReadiness::VipPending
-                } else {
-                    // TLS/Terminate (TLSRouteModeTerminate, #481): resolve the cert exactly as for
-                    // HTTPS and install it into the per-port TLS store so the proxy's SniCertSelector
-                    // finds it. Remap Resolved → TlsTerminate so the bin layer creates a TlsL4
-                    // proxy port (L4 splice) rather than an HTTPS (L7 HTTP) listener.
-                    let grants = grants_for_source(&listener.source, cert_grants, ls_cert_grants);
-                    match resolve_listener_tls(
-                        target.gw_name,
-                        listener,
-                        secrets,
-                        grants,
-                        builder,
-                        bind_port,
-                    ) {
-                        ListenerReadiness::Resolved => ListenerReadiness::TlsTerminate,
-                        other => other,
-                    }
+                // TLS/Terminate (TLSRouteModeTerminate, #481): resolve the cert exactly as for
+                // HTTPS and install it into the per-port TLS store so the proxy's SniCertSelector
+                // finds it. Remap Resolved → TlsTerminate so the bin layer creates a TlsL4
+                // proxy port (L4 splice) rather than an HTTPS (L7 HTTP) listener. Resolve refs
+                // FIRST so a terminal ref failure (RefNotPermitted / InvalidCertificateRef)
+                // surfaces on `ResolvedRefs` regardless of VIP allocation; only the install is
+                // deferred while `vip_pending`, in which case a cleanly-resolved cert becomes
+                // VipPending until the next rebuild binds it at the real port.
+                let grants = grants_for_source(&listener.source, cert_grants, ls_cert_grants);
+                match resolve_listener_tls(
+                    target.gw_name,
+                    listener,
+                    secrets,
+                    grants,
+                    builder,
+                    bind_port,
+                    !vip_pending,
+                ) {
+                    ListenerReadiness::Resolved if vip_pending => ListenerReadiness::VipPending,
+                    ListenerReadiness::Resolved => ListenerReadiness::TlsTerminate,
+                    other => other,
                 }
             } else if listener.protocol == "HTTP" {
                 // Cleartext HTTP: nothing to resolve, ready by default.
@@ -1051,25 +1053,34 @@ impl GatewayApiReconciler {
                         listener.protocol
                     ),
                 }
-            } else if vip_pending {
-                // Same VIP race as TLS listeners: defer until the internal port is
-                // known so Programmed=True is not published before kube-proxy NAT
-                // is programmed. Cert resolution is skipped; the next rebuild
-                // (after the VIP Service appears) installs it at the right port.
-                ListenerReadiness::VipPending
             } else {
+                // HTTPS. Resolve refs FIRST so a terminal ref failure
+                // (RefNotPermitted / InvalidCertificateRef) surfaces on
+                // `ResolvedRefs` regardless of VIP allocation: a listener whose
+                // cert ref is not permitted is invalid whether or not its VIP
+                // internal port exists — and an invalid listener may never be
+                // allocated one, so gating ref resolution on the port would strand
+                // it at `Pending` forever. Only the cert *install* is deferred
+                // while `vip_pending`; a cleanly-resolved cert with no port yet
+                // becomes `VipPending` (Programmed deferred, per the kube-proxy NAT
+                // race), and the next rebuild installs it at the real bind port.
+                //
                 // A ListenerSet listener's cross-namespace cert is permitted by a
                 // `from.kind: ListenerSet` grant; a Gateway listener's by
                 // `from.kind: Gateway` (GEP-1713). Pick the matching grant set.
                 let grants = grants_for_source(&listener.source, cert_grants, ls_cert_grants);
-                resolve_listener_tls(
+                match resolve_listener_tls(
                     target.gw_name,
                     listener,
                     secrets,
                     grants,
                     builder,
                     bind_port,
-                )
+                    !vip_pending,
+                ) {
+                    ListenerReadiness::Resolved if vip_pending => ListenerReadiness::VipPending,
+                    other => other,
+                }
             };
             let mut li = ListenerInfo::default();
             li.readiness = readiness;
@@ -1190,6 +1201,65 @@ mod tests {
         );
     }
 
+    /// Conformance regression (`ListenerSetReferenceGrant`): a ListenerSet
+    /// listener whose cross-namespace cert ref has NO permitting grant must be
+    /// `RefNotPermitted` on `ResolvedRefs` **even when its VIP internal port is
+    /// not allocated** (`internal_ports` empty → `internal_port = 0`). An invalid
+    /// listener may never be allocated a port at all, so a VIP-pending short
+    /// circuit here strands `ResolvedRefs` at `Pending "waiting for VIP port
+    /// allocation"` forever instead of settling `RefNotPermitted` — the exact
+    /// failure the conformance suite catches.
+    #[test]
+    fn listener_set_unpermitted_cross_ns_cert_is_refnotpermitted_without_vip() {
+        use crate::reconciler::listener_merge::{
+            EffectiveCertRef, EffectiveListener, EffectiveTls,
+        };
+        use crate::status::ConflictReason;
+        use coxswain_core::ownership::ObjectKey;
+
+        let ls_key = ObjectKey::new("team-a", "ls");
+        let listener = EffectiveListener {
+            source: ListenerSource::ListenerSet(ls_key.clone()),
+            owning_namespace: "team-a".to_string(),
+            name: "https".to_string(),
+            port: 8443,
+            protocol: "HTTPS".to_string(),
+            hostname: None,
+            tls: Some(EffectiveTls {
+                passthrough: false,
+                certificate_refs: vec![EffectiveCertRef {
+                    group: None,
+                    kind: None,
+                    name: "cert".to_string(),
+                    namespace: Some("certs".to_string()),
+                }],
+            }),
+            route_namespaces: coxswain_core::listener_status::RouteNamespaceSet::All,
+            allowed_route_kinds: vec![],
+            conflict: ConflictReason::None,
+        };
+        let secrets = empty_secrets();
+        let empty = HashSet::new();
+        let mut builder = PortTlsStoreBuilder::new();
+        let health = GatewayApiReconciler::reconcile_tls(
+            &GatewayTlsTarget {
+                gw_name: "gw",
+                listeners: std::slice::from_ref(&listener),
+                internal_ports: &HashMap::new(), // no VIP → internal_port = 0
+            },
+            &secrets,
+            &empty, // no cert_grants
+            &empty, // no ls_cert_grants → the cross-ns ref is not permitted
+            &mut builder,
+        );
+        let outcome =
+            &health.listeners[&ListenerStatusKey::listener_set(ls_key, "https")].readiness;
+        assert!(
+            matches!(outcome, ListenerReadiness::RefNotPermitted { .. }),
+            "an unpermitted cross-ns cert with no VIP port must be RefNotPermitted, not VipPending, got {outcome:?}"
+        );
+    }
+
     // ── VipPending: deferred readiness when internal_port is not yet allocated ──
 
     fn tls_listener(protocol: &str, passthrough: bool) -> EffectiveListener {
@@ -1279,9 +1349,69 @@ mod tests {
         );
     }
 
-    /// TLS/Terminate with no VIP Service yet → VipPending (cert resolution skipped).
+    /// A minimal `kubernetes.io/tls` Secret that [`load_tls_cert`] accepts
+    /// (correct type + `-----BEGIN` PEM markers; the leaf-parse failure it
+    /// tolerates). Enough to drive the `Resolved` path in tests.
+    fn resolvable_tls_secret(ns: &str, name: &str) -> Secret {
+        use k8s_openapi::ByteString;
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+        let mut data = std::collections::BTreeMap::new();
+        data.insert(
+            "tls.crt".to_string(),
+            ByteString(b"-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n".to_vec()),
+        );
+        data.insert(
+            "tls.key".to_string(),
+            ByteString(b"-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n".to_vec()),
+        );
+        Secret {
+            metadata: ObjectMeta {
+                name: Some(name.to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            type_: Some("kubernetes.io/tls".to_string()),
+            data: Some(data),
+            ..Default::default()
+        }
+    }
+
+    /// TLS/Terminate whose cert *resolves* but whose VIP port is not yet
+    /// allocated → `VipPending`: `Programmed` is deferred until the internal port
+    /// is known, and the cert is NOT installed at the wrong bind port (deferred
+    /// to the next rebuild). This is the legitimate VIP-defer path.
     #[test]
-    fn tls_terminate_without_vip_is_pending() {
+    fn tls_terminate_resolved_cert_without_vip_defers_install() {
+        let listener = tls_listener("TLS", false);
+        let secrets = make_secret_store(vec![resolvable_tls_secret("default", "cert")]);
+        let empty = HashSet::new();
+        let mut builder = PortTlsStoreBuilder::new();
+        let health = GatewayApiReconciler::reconcile_tls(
+            &GatewayTlsTarget {
+                gw_name: "gw",
+                listeners: std::slice::from_ref(&listener),
+                internal_ports: &HashMap::new(), // no VIP yet
+            },
+            &secrets,
+            &empty,
+            &empty,
+            &mut builder,
+        );
+        let outcome = &health.listeners[&ListenerStatusKey::gateway("tls")].readiness;
+        assert!(
+            matches!(outcome, ListenerReadiness::VipPending),
+            "TLS/Terminate with a resolvable cert but no VIP port must be VipPending, got {outcome:?}"
+        );
+        // The cert install is deferred — nothing keyed at the (unknown) bind port.
+        assert_eq!(builder.build().port_count(), 0);
+    }
+
+    /// A terminal cert-ref failure must surface on `ResolvedRefs` **independent of
+    /// VIP allocation**: a TLS/Terminate listener whose Secret is missing is
+    /// `InvalidCertificateRef` even with no internal port — the VIP-pending state
+    /// must NOT mask it (regression: it used to short-circuit to `VipPending`).
+    #[test]
+    fn tls_terminate_missing_cert_is_invalid_even_without_vip() {
         let listener = tls_listener("TLS", false);
         let secrets = empty_secrets();
         let empty = HashSet::new();
@@ -1299,10 +1429,9 @@ mod tests {
         );
         let outcome = &health.listeners[&ListenerStatusKey::gateway("tls")].readiness;
         assert!(
-            matches!(outcome, ListenerReadiness::VipPending),
-            "TLS/Terminate with internal_port=0 must be VipPending, got {outcome:?}"
+            matches!(outcome, ListenerReadiness::InvalidCertificateRef { .. }),
+            "a missing cert must surface as InvalidCertificateRef regardless of VIP, got {outcome:?}"
         );
-        // No cert was installed in the TLS store (build is empty).
         assert_eq!(builder.build().port_count(), 0);
     }
 

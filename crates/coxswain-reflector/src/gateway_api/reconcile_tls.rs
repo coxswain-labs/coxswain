@@ -103,6 +103,19 @@ pub(super) fn grants_for_source<'g>(
     }
 }
 
+/// Resolve an HTTPS / TLS-Terminate listener's `certificateRefs` and compute its
+/// [`ListenerReadiness`].
+///
+/// `install_certs` decouples *ref validation* from the *cert install* side
+/// effect: reference resolution (which yields `RefNotPermitted` /
+/// `InvalidCertificateRef` / `Resolved`) always runs, because it drives the
+/// `ResolvedRefs` condition and must not depend on VIP port allocation. When
+/// `install_certs` is `false` — the caller has no allocated internal port yet
+/// (`VipPending`) — a successfully-loaded cert is still counted (so the readiness
+/// verdict is identical) but NOT added to `builder`, avoiding an install at the
+/// wrong bind port; the next rebuild re-runs this with the real port and
+/// `install_certs = true`. A terminal ref failure is returned regardless of
+/// `install_certs` so the caller can surface it on `ResolvedRefs` immediately.
 pub(super) fn resolve_listener_tls(
     gw_name: &str,
     listener: &EffectiveListener,
@@ -110,6 +123,7 @@ pub(super) fn resolve_listener_tls(
     cert_grants: &HashSet<ReferenceGrantKey>,
     builder: &mut PortTlsStoreBuilder,
     bind_port: u16,
+    install_certs: bool,
 ) -> ListenerReadiness {
     // ListenerSet listeners resolve their certificateRefs in the ListenerSet's own
     // namespace (GEP-1713), not the parent Gateway's; Gateway listeners use the
@@ -189,7 +203,13 @@ pub(super) fn resolve_listener_tls(
 
         match load_tls_cert(ref_ns, &cert_ref.name, secrets) {
             Ok(cert) => {
-                builder.add_cert(bind_port, hostname, Arc::new(cert));
+                // Count the successful load either way so the readiness verdict is
+                // identical whether or not we install; skip the install itself
+                // when the bind port is not yet known (VipPending) — see the
+                // `install_certs` doc.
+                if install_certs {
+                    builder.add_cert(bind_port, hostname, Arc::new(cert));
+                }
                 resolved_count += 1;
                 tracing::debug!(
                     gateway = %format!("{gw_name}"),
