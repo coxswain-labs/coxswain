@@ -10,7 +10,6 @@ use super::listener_merge::{EffectiveGateway, EffectiveListener};
 use super::proxy::{
     IngressDefaultBackend, IngressEvent, Ownership, ReflectorStores, SharedOutputs,
 };
-use crate::endpoints;
 use crate::gateway_api::hostnames_intersect;
 use crate::gateway_api::{
     GatewayApiReconciler, GrpcRouteReconciler, GrpcRouteResolution, ListenerBinding, RouteLike,
@@ -31,9 +30,9 @@ use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self as reference_grants, ReferenceGrantKey};
 use coxswain_core::routing::{
     BackendClientCert, BackendGroup, GatewayRoutingTableBuilder, IngressRoutingTableBuilder,
-    RouteEntry, RoutingTable, RoutingTableBuilder, SharedGatewayRoutingTable,
+    RouteConflict, RouteEntry, RoutingTable, RoutingTableBuilder, SharedGatewayRoutingTable,
     SharedIngressRoutingTable, SharedTcpRouteTable, SharedTlsPassthroughTable, SharedUdpRouteTable,
-    TcpRouteTableBuilder, TlsPassthroughTableBuilder, UdpRouteTableBuilder,
+    TcpRouteTableBuilder, TlsPassthroughTableBuilder, UdpRouteTableBuilder, WildcardKind,
 };
 use coxswain_core::shared::Shared;
 use coxswain_core::tls::{
@@ -61,6 +60,14 @@ use std::sync::Arc;
 /// disrupt or partially clear the other. Returns `true` only when BOTH builds
 /// publish successfully — the proxy is not considered "fully synchronised"
 /// until each table has had at least one honest publish.
+/// Publish outputs plus the shared-pool Gateway partition-reuse cache (#511) —
+/// grouped so [`build_routes`] stays under the workspace's 7-argument
+/// threshold.
+pub(super) struct RouteBuildIo<'a> {
+    pub(super) outputs: &'a SharedOutputs<'a>,
+    pub(super) gateway_partitions: &'a mut super::cache::PartitionCache,
+}
+
 pub(super) fn build_routes(
     stores: &ReflectorStores<'_>,
     routes: &[Arc<HttpRoute>],
@@ -68,8 +75,12 @@ pub(super) fn build_routes(
     ingresses: &[Arc<Ingress>],
     ownership: &Ownership<'_>,
     ingress_cfg: IngressBuildConfig<'_>,
-    outputs: &SharedOutputs<'_>,
+    io: RouteBuildIo<'_>,
 ) -> bool {
+    let RouteBuildIo {
+        outputs,
+        gateway_partitions,
+    } = io;
     let gateway_published = build_gateway_routes(
         stores,
         routes,
@@ -77,6 +88,7 @@ pub(super) fn build_routes(
         ownership,
         outputs.gateway_routes,
         true,
+        gateway_partitions,
     );
     let ingress_published = build_ingress_routes(
         stores,
@@ -153,8 +165,64 @@ pub(super) fn resolve_backend_client_certs(
     }
 }
 
-/// Build the Gateway-API routing table from `HTTPRoute` resources and publish
-/// it to `shared`. Returns `true` if the publish succeeded.
+/// Aggregate fingerprint of every input a per-route static scan can't
+/// precisely attribute to specific routes (#511) — see
+/// [`crate::gateway_api::http_route_fingerprint`]'s doc for the exact list
+/// this covers: `targetRef`-based policy attachment (`BackendTLSPolicy`,
+/// `CoxswainBackendPolicy`, the Gateway-level `CoxswainExternalAuth`
+/// mandate), a `BasicAuth` CR's own `secretRef` target, GEP-3155 backend
+/// client certs, and the `ReferenceGrant`s gating cross-namespace refs.
+/// Folded identically into every `(port, host)` partition's fingerprint — any
+/// change here marks the WHOLE table dirty for one rebuild pass, the safe
+/// fallback for indirections this pass doesn't track per-route. These
+/// sources churn far less often than the endpoint/route-structural changes
+/// the partitioned rebuild specifically targets, so this fallback doesn't
+/// undermine its benchmarked wins.
+fn compute_global_epoch(stores: &ReflectorStores<'_>, ownership: &Ownership<'_>) -> u64 {
+    let mut epoch = 0u64;
+    epoch ^= crate::fingerprint::store_epoch(stores.policies);
+    epoch ^= crate::fingerprint::store_epoch(stores.coxswain_backend_policies);
+    epoch ^= crate::fingerprint::store_epoch(stores.auth_secrets);
+    epoch ^= crate::fingerprint::store_epoch(stores.secrets);
+    epoch ^= crate::fingerprint::store_epoch(stores.configmaps);
+    epoch ^= crate::fingerprint::store_epoch(stores.client_traffic_policies);
+    epoch ^= crate::fingerprint::store_epoch(stores.gateways);
+    epoch ^= hash_grant_set(ownership.backend_grants);
+    epoch ^= hash_grant_set(ownership.basic_auth_secret_grants);
+    epoch
+}
+
+/// Order-independent fold of a `ReferenceGrantKey` set's members.
+fn hash_grant_set(grants: &HashSet<ReferenceGrantKey>) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    grants.iter().fold(0u64, |acc, g| {
+        let mut hasher = DefaultHasher::new();
+        g.hash(&mut hasher);
+        acc ^ hasher.finish()
+    })
+}
+
+/// `"*"` for the catch-all bucket, the wildcard string as-is (already
+/// `*.example.com`-shaped) or the exact hostname — matching
+/// [`coxswain_core::routing::RouteConflict::host`]'s own convention, so a
+/// flat conflict list can be filtered down to one partition's slice.
+fn conflict_host_repr(hostname_opt: Option<&str>) -> &str {
+    hostname_opt.unwrap_or("*")
+}
+
+/// Build the Gateway-API routing table from `HTTPRoute`/`GRPCRoute` resources
+/// and publish it to `shared`. Returns `true` if the publish succeeded.
+///
+/// Partitioned rebuild (#511): only `(port, host)` partitions whose
+/// fingerprint moved since `partitions` last cached them are recompiled via
+/// `HostRouterBuilder`; unaffected partitions splice their cached
+/// `Arc<HostRouter>` in directly. See `reconciler::gateway_partition` for the
+/// dirty-partition/dirty-route decision and `reconciler::cache` for the cache
+/// itself. Falls back to recompiling a partition whenever its cache entry is
+/// missing or stale — this function never serves a partition it hasn't just
+/// verified is still correct.
+///
 /// `skip_cut_over` drops cut-over Gateways from the listener-info map —
 /// correct for the *shared* reconciler (those listeners bind on the dedicated
 /// proxy instead). The dedicated reconciler must pass `false`: its target
@@ -167,6 +235,7 @@ pub(super) fn build_gateway_routes(
     ownership: &Ownership<'_>,
     shared: &SharedGatewayRoutingTable,
     skip_cut_over: bool,
+    partitions: &mut super::cache::PartitionCache,
 ) -> bool {
     let vip_internal = stores.vip_internal;
     // Precompute ListenerKey → (hostname, spec port, bind port) from every owned
@@ -215,63 +284,161 @@ pub(super) fn build_gateway_routes(
         })
         .collect();
 
-    let mut builder = GatewayRoutingTableBuilder::new();
-    for route in routes {
+    let resolution = crate::gateway_api::RouteResolution {
+        listener_info: &listener_info,
+        policy_index: ownership.policy_index,
+        backend_policy_index: ownership.backend_policy_index,
+        rate_limits: stores.rate_limits,
+        retry_policies: stores.retry_policies,
+        path_rewrites: stores.path_rewrites,
+        ip_access: stores.ip_access,
+        basic_auths: stores.basic_auths,
+        external_auths: stores.external_auths,
+        external_auth_gateway_index: ownership.external_auth_gateway_index,
+        jwt_auths: stores.jwt_auths,
+        jwks_cache: stores.jwks_cache,
+        auth_secrets: stores.auth_secrets,
+        basic_auth_secret_grants: ownership.basic_auth_secret_grants,
+        request_size_limits: stores.request_size_limits,
+        compressions: stores.compressions,
+        backend_client_certs: ownership.backend_client_certs,
+        backend_client_cert_failures: ownership.backend_client_cert_failures,
+    };
+    let grpc_resolution = GrpcRouteResolution {
+        listener_info: &listener_info,
+        policy_index: ownership.policy_index,
+        backend_policy_index: ownership.backend_policy_index,
+        rate_limits: stores.rate_limits,
+        retry_policies: stores.retry_policies,
+        ip_access: stores.ip_access,
+        jwt_auths: stores.jwt_auths,
+        jwks_cache: stores.jwks_cache,
+    };
+
+    let global_epoch = compute_global_epoch(stores, ownership);
+    let plan = super::gateway_partition::plan(
+        &super::gateway_partition::GatewayPartitionInputs {
+            routes,
+            grpc_routes,
+            listener_info: &listener_info,
+            endpoint_cache: stores.endpoint_cache,
+            services: stores.services,
+            resolution: &resolution,
+            grpc_resolution: &grpc_resolution,
+            global_epoch,
+        },
+        partitions,
+    );
+
+    // Translate only the routes bound to at least one dirty partition, into a
+    // throwaway builder scoped to this rebuild pass. A route bound only to
+    // clean partitions is not touched — no `resolve_weighted_backends`, no
+    // filter/auth/policy resolution, matching "route translation for
+    // unaffected routes is not re-run".
+    let mut fresh_builder = GatewayRoutingTableBuilder::new();
+    for &i in &plan.dirty_http {
         GatewayApiReconciler::reconcile(
-            route,
-            stores.slices,
+            &routes[i],
+            stores.endpoint_cache,
             stores.services,
             ownership.gateways,
             ownership.backend_grants,
-            crate::gateway_api::RouteResolution {
-                listener_info: &listener_info,
-                policy_index: ownership.policy_index,
-                backend_policy_index: ownership.backend_policy_index,
-                rate_limits: stores.rate_limits,
-                retry_policies: stores.retry_policies,
-                path_rewrites: stores.path_rewrites,
-                ip_access: stores.ip_access,
-                basic_auths: stores.basic_auths,
-                external_auths: stores.external_auths,
-                external_auth_gateway_index: ownership.external_auth_gateway_index,
-                jwt_auths: stores.jwt_auths,
-                jwks_cache: stores.jwks_cache,
-                auth_secrets: stores.auth_secrets,
-                basic_auth_secret_grants: ownership.basic_auth_secret_grants,
-                request_size_limits: stores.request_size_limits,
-                compressions: stores.compressions,
-                backend_client_certs: ownership.backend_client_certs,
-                backend_client_cert_failures: ownership.backend_client_cert_failures,
-            },
-            &mut builder,
+            resolution,
+            &mut fresh_builder,
         );
     }
-    // GRPCRoute rules are installed into the same builder — gRPC is HTTP/2 POST
-    // `/{Service}/{Method}`, so it competes in the same routing table as HTTPRoute.
-    for grpc_route in grpc_routes {
+    for &i in &plan.dirty_grpc {
         GrpcRouteReconciler::reconcile(
-            grpc_route,
-            stores.slices,
+            &grpc_routes[i],
+            stores.endpoint_cache,
             stores.services,
             ownership.gateways,
             ownership.backend_grants,
-            GrpcRouteResolution {
-                listener_info: &listener_info,
-                policy_index: ownership.policy_index,
-                backend_policy_index: ownership.backend_policy_index,
-                rate_limits: stores.rate_limits,
-                retry_policies: stores.retry_policies,
-                ip_access: stores.ip_access,
-                jwt_auths: stores.jwt_auths,
-                jwks_cache: stores.jwks_cache,
-            },
-            &mut builder,
+            grpc_resolution,
+            &mut fresh_builder,
         );
     }
 
+    let fresh_table = if plan.dirty.is_empty() {
+        None
+    } else {
+        match fresh_builder.build() {
+            Ok(table) => Some(table),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    table = "gateway",
+                    "Routing table build failed — retaining previous table"
+                );
+                return false;
+            }
+        }
+    };
+
+    // Assemble the final table: for each LIVE partition (`plan.fingerprints`'
+    // keys — the authoritative "this partition still has routes bound to it
+    // this rebuild" set), splice the freshly-built `Arc<HostRouter>` (dirty)
+    // or the still-cached one (clean) directly, bypassing `HostRouterBuilder`
+    // for clean partitions entirely. A single `publish_routes` call below
+    // performs the one atomic `Shared::store` — no reader ever observes a
+    // table assembled from only some of this rebuild's partitions.
+    let mut final_builder = GatewayRoutingTableBuilder::new();
+    let mut live_keys: HashSet<super::cache::PartitionKey> =
+        HashSet::with_capacity(plan.fingerprints.len());
+    for (key, fp) in &plan.fingerprints {
+        live_keys.insert(key.clone());
+        let (port, hostname_opt) = key;
+        let host_repr = conflict_host_repr(hostname_opt.as_deref());
+
+        let router = if plan.dirty.contains(key) {
+            let Some(table) = fresh_table.as_ref() else {
+                continue;
+            };
+            let Some(router) =
+                table.get_compiled(*port, hostname_opt.as_deref(), WildcardKind::MultiLabel)
+            else {
+                // This dirty partition's bound routes all resolved to zero
+                // installed rules (e.g. a Redirect-only rule with no match,
+                // or every backendRef invalid) — nothing to route; drop it
+                // from both the published table and the cache.
+                continue;
+            };
+            let conflicts: Vec<RouteConflict> = table
+                .conflicts()
+                .iter()
+                .filter(|c| c.port == *port && c.host == host_repr)
+                .cloned()
+                .collect();
+            partitions.insert(key.clone(), *fp, Arc::clone(&router), conflicts.clone());
+            final_builder.extend_conflicts(conflicts);
+            router
+        } else {
+            let Some(router) = partitions.get(key, *fp) else {
+                // Shouldn't happen — a "clean" partition was, by definition, a
+                // cache hit during planning. Defensive: treat as a miss rather
+                // than silently dropping the partition from the published
+                // table (skip it here; it will show up as new/dirty next
+                // rebuild since planning re-checks the cache from scratch).
+                continue;
+            };
+            final_builder.extend_conflicts(partitions.conflicts_for(key).to_vec());
+            router
+        };
+
+        let pb = final_builder.for_port(*port);
+        match hostname_opt {
+            None => pb.insert_compiled_catchall(router),
+            Some(h) if h.starts_with("*.") => {
+                pb.insert_compiled_wildcard_host(h, WildcardKind::MultiLabel, router);
+            }
+            Some(h) => pb.insert_compiled_exact_host(h.clone(), router),
+        }
+    }
+    partitions.retain_only(&live_keys);
+
     publish_routes(
         shared,
-        builder,
+        final_builder,
         "gateway",
         routes.len() + grpc_routes.len(),
         ownership.gateways.len(),
@@ -326,7 +493,7 @@ fn build_ingress_routes(
     for ingress in ingresses {
         let issues = IngressReconciler::reconcile(
             ingress,
-            stores.slices,
+            stores.endpoint_cache,
             stores.services,
             &class_ctx,
             ingress_ports,
@@ -354,13 +521,9 @@ fn build_ingress_routes(
     // Ingress port. Per-Ingress defaults always win because they are installed on the
     // host router (matched first).
     if let Some(db) = ingress_default_backend {
-        let resolved = endpoints::resolve(
-            &db.namespace,
-            &db.name,
-            db.port,
-            stores.slices,
-            stores.services,
-        );
+        let resolved = stores
+            .endpoint_cache
+            .get(&db.namespace, &db.name, db.port, stores.services);
         if resolved.addrs.is_empty() {
             tracing::warn!(
                 svc = %format!("{}/{}", db.namespace, db.name),
@@ -369,8 +532,11 @@ fn build_ingress_routes(
         } else {
             let protocol = resolved.app_protocol;
             let group = Arc::new(
-                BackendGroup::new(format!("{}/{}", db.namespace, db.name), resolved.addrs)
-                    .with_protocol(protocol),
+                BackendGroup::new(
+                    format!("{}/{}", db.namespace, db.name),
+                    resolved.addrs.clone(),
+                )
+                .with_protocol(protocol),
             );
             let svc_id = format!("{}/{}", db.namespace, db.name);
             // Distinct kind prefix so the controller-wide `--ingress-default-backend`
@@ -1109,14 +1275,11 @@ fn build_tls_l4_routes(
                                 );
                                 return None;
                             }
-                            let resolved = endpoints::resolve(
-                                ns,
-                                &b.name,
-                                port,
-                                stores.slices,
-                                stores.services,
-                            );
-                            Some((resolved.addrs, weight as u16))
+                            let resolved =
+                                stores
+                                    .endpoint_cache
+                                    .get(ns, &b.name, port, stores.services);
+                            Some((resolved.addrs.clone(), weight as u16))
                         })
                         .collect();
 
@@ -1326,14 +1489,11 @@ pub(super) fn build_tcp_routes(
                                 );
                                 return None;
                             }
-                            let resolved = endpoints::resolve(
-                                ns,
-                                &b.name,
-                                port,
-                                stores.slices,
-                                stores.services,
-                            );
-                            Some((resolved.addrs, weight as u16))
+                            let resolved =
+                                stores
+                                    .endpoint_cache
+                                    .get(ns, &b.name, port, stores.services);
+                            Some((resolved.addrs.clone(), weight as u16))
                         })
                         .collect();
 
@@ -1537,14 +1697,11 @@ pub(super) fn build_udp_routes(
                                 );
                                 return None;
                             }
-                            let resolved = endpoints::resolve(
-                                ns,
-                                &b.name,
-                                port,
-                                stores.slices,
-                                stores.services,
-                            );
-                            Some((resolved.addrs, weight as u16))
+                            let resolved =
+                                stores
+                                    .endpoint_cache
+                                    .get(ns, &b.name, port, stores.services);
+                            Some((resolved.addrs.clone(), weight as u16))
                         })
                         .collect();
 

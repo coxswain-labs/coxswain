@@ -504,7 +504,7 @@ mod tests {
 
     #[test]
     fn reconcile_tls_failure_does_not_affect_routes() {
-        let slice_st = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let slice_st = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let secrets = secret_store(vec![]); // missing secret
         let ingress = make_ingress_with_tls(
             "default",

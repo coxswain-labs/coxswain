@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn reconcile_timeouts_stored_and_round_trip() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
 
         let route = HttpRoute {
             metadata: ObjectMeta {
@@ -178,7 +178,7 @@ mod tests {
 
     #[test]
     fn reconcile_timeouts_missing_field_falls_back_to_none() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();

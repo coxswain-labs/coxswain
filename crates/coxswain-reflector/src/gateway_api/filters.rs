@@ -1,6 +1,6 @@
 //! Translates `HTTPRouteRule` filter specs into [`FilterAction`][coxswain_core::routing::FilterAction]s.
 
-use crate::endpoints;
+use crate::endpoints::pool::EndpointCache;
 use crate::gw_types::v::grpcroutes::{GrpcRouteRulesFilters, GrpcRouteRulesFiltersType};
 use crate::gw_types::v::httproutes::{
     HttpRouteRulesBackendRefsFilters, HttpRouteRulesBackendRefsFiltersType, HttpRouteRulesFilters,
@@ -19,7 +19,6 @@ use coxswain_core::routing::{
 };
 use http::{HeaderName, Method};
 use k8s_openapi::api::core::v1::{Secret, Service};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -32,7 +31,7 @@ pub(super) use super::ip_access_control::CidrSet;
 /// Store references needed to resolve `backendRef` targets in filters (e.g.
 /// `RequestMirror`).
 pub(super) struct BackendStores<'a> {
-    pub(super) slices: &'a reflector::Store<EndpointSlice>,
+    pub(super) endpoint_cache: &'a EndpointCache,
     pub(super) services: &'a reflector::Store<Service>,
     pub(super) grants: &'a HashSet<ReferenceGrantKey>,
 }
@@ -350,7 +349,9 @@ pub(super) fn build_filters(
                 };
 
                 let resolved =
-                    endpoints::resolve(mirror_ns, &bref.name, port, stores.slices, stores.services);
+                    stores
+                        .endpoint_cache
+                        .get(mirror_ns, &bref.name, port, stores.services);
                 if !resolved.service_exists {
                     tracing::warn!(
                         mirror_ns,
@@ -363,7 +364,7 @@ pub(super) fn build_filters(
                 // filter anyway so the proxy can log the drop at dispatch time.
                 let mirror_group = Arc::new(BackendGroup::new(
                     format!("{mirror_ns}/{}", bref.name),
-                    resolved.addrs,
+                    resolved.addrs.clone(),
                 ));
                 out.push(FilterAction::Mirror {
                     backend: mirror_group,
@@ -892,7 +893,7 @@ pub(super) fn resolve_external_auth<F: ExtRefFilter>(
     route_ns: &str,
     external_auths: &reflector::Store<CoxswainExternalAuth>,
     services: &reflector::Store<Service>,
-    slices: &reflector::Store<EndpointSlice>,
+    endpoint_cache: &EndpointCache,
     grants: &HashSet<ReferenceGrantKey>,
 ) -> Option<Arc<IngressAuthConfig>> {
     ext_refs(filters).find_map(|(g, k, n)| {
@@ -909,7 +910,11 @@ pub(super) fn resolve_external_auth<F: ExtRefFilter>(
             return None;
         };
         Some(Arc::new(super::external_auth::resolve_spec(
-            &cr.spec, route_ns, services, slices, grants,
+            &cr.spec,
+            route_ns,
+            services,
+            endpoint_cache,
+            grants,
         )))
     })
 }
@@ -1240,7 +1245,7 @@ mod tests {
 
     #[test]
     fn reconcile_request_header_modifier_stored() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route_with_filters(
             "default",
             "example.com",
@@ -1303,7 +1308,7 @@ mod tests {
 
     #[test]
     fn reconcile_response_header_modifier_stored() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route_with_filters(
             "default",
             "example.com",
@@ -1366,7 +1371,7 @@ mod tests {
 
     #[test]
     fn reconcile_request_redirect_stored() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route_with_filters(
             "default",
             "example.com",
@@ -1430,7 +1435,7 @@ mod tests {
 
     #[test]
     fn reconcile_url_rewrite_replace_prefix_stored() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route_with_filters(
             "default",
             "example.com",
@@ -1501,7 +1506,7 @@ mod tests {
 
     #[test]
     fn reconcile_cors_filter_stored() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route_with_filters(
             "default",
             "example.com",

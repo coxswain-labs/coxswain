@@ -17,8 +17,8 @@ use super::dedicated::{
     compute_ownership, gateway_is_cut_over,
 };
 use super::route_builder::{
-    RouteAttachKind, build_client_certs, build_passthrough_routes, build_routes, build_tcp_routes,
-    build_terminate_routes, build_tls, build_udp_routes, count_attached_routes,
+    RouteAttachKind, RouteBuildIo, build_client_certs, build_passthrough_routes, build_routes,
+    build_tcp_routes, build_terminate_routes, build_tls, build_udp_routes, count_attached_routes,
     merge_backend_client_cert_health, resolve_backend_client_certs,
 };
 use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
@@ -1005,8 +1005,13 @@ pub(super) struct ReflectorStores<'a> {
     /// `allowedListeners.namespaces.from: Selector` against the ListenerSet's
     /// namespace labels; nothing else consumes it.
     pub(super) namespaces: &'a reflector::Store<Namespace>,
-    pub(super) slices: &'a reflector::Store<EndpointSlice>,
     pub(super) services: &'a reflector::Store<Service>,
+    /// Incrementally-maintained `(namespace, service, port)` endpoint-resolution
+    /// cache (#511) — every route builder reads through this instead of
+    /// scanning the `EndpointSlice` store directly. `refresh()`'d once per
+    /// rebuild from the `EndpointSlice` store before this struct is
+    /// constructed; see [`super::cache::ReflectorCaches`].
+    pub(super) endpoint_cache: &'a crate::endpoints::pool::EndpointCache,
     /// `(Gateway, listenerPort) → internalPort` map (#472), read ONCE per rebuild
     /// from the VIP Services so the routing/TLS/passthrough/listener-bind keyings
     /// all agree on one Service snapshot. A per-builder re-read could observe a
@@ -2196,6 +2201,10 @@ async fn spawn_tasks(
     // from the current store snapshots — never from the API server.
     set.spawn(async move {
         let mut routing_table_published = false;
+        // Cross-rebuild reuse state (#511) — owned by this task, outliving any
+        // single `rebuild()` call, since `rebuild()` itself has no handle to
+        // what it published last cycle. See `reconciler::cache` module docs.
+        let mut caches = super::cache::ReflectorCaches::default();
         // #574 backstop: a periodic resync re-runs the rebuild even when no watch
         // event fires, so a *silently stalled watch connection* (a stream that
         // never delivers, distinct from the store) can't leave the routing table
@@ -2237,6 +2246,11 @@ async fn spawn_tasks(
             metrics.observe_debounce_wait(debounce_wait);
             // One VIP-Service read per rebuild (#472), shared by every builder.
             let vip_internal = crate::port_alloc::read_vip_internal_ports(&service_reader.state());
+            // Regroup the EndpointSlice store by (namespace, service) before any
+            // builder runs (#511) — resolve_from_group / EndpointCache::get reads
+            // this rebuild's grouping, never re-scanning the full store per
+            // backend reference.
+            caches.endpoints.refresh(&slice_reader);
             let stores = ReflectorStores {
                 routes: &route_reader,
                 grpc_routes: &grpc_route_reader,
@@ -2250,8 +2264,8 @@ async fn spawn_tasks(
                 gateway_classes: &gateway_class_reader,
                 listener_sets: &listener_set_reader,
                 namespaces: &namespace_reader,
-                slices: &slice_reader,
                 services: &service_reader,
+                endpoint_cache: &caches.endpoints,
                 vip_internal: &vip_internal,
                 grants: &grant_reader,
                 secrets: &secret_reader,
@@ -2305,7 +2319,11 @@ async fn spawn_tasks(
                 ingress_default_backend.as_ref(),
                 ingress_ports,
                 leader.load(Ordering::Acquire),
-                &outputs,
+                RebuildIo {
+                    outputs: &outputs,
+                    gateway_partitions: &mut caches.gateway_partitions,
+                    dedicated_partitions: &mut caches.dedicated_partitions,
+                },
             );
             let rebuild_duration = rebuild_start.elapsed();
             // Mirror routing-table size gauges and TLS cert counters from published snapshots.
@@ -2399,6 +2417,19 @@ fn enqueue_status_keys(queue: &StatusWorkqueue, stores: &ReflectorStores<'_>) {
     );
 }
 
+/// Publish outputs plus the cross-rebuild partition-reuse caches (#511) a
+/// rebuild pass writes into — grouped so `rebuild()` stays under the
+/// workspace's 7-argument threshold. Carries the two partition-cache fields
+/// directly (not `&mut ReflectorCaches` as a whole): `stores.endpoint_cache`
+/// is a separate borrow of `ReflectorCaches::endpoints` alive for this same
+/// call, and borrowing the whole struct here would conflict with it — these
+/// are disjoint fields, so the caller passes each by its own `&mut`.
+pub(super) struct RebuildIo<'a> {
+    pub(super) outputs: &'a SharedOutputs<'a>,
+    pub(super) gateway_partitions: &'a mut super::cache::PartitionCache,
+    pub(super) dedicated_partitions: &'a mut HashMap<ObjectKey, super::cache::PartitionCache>,
+}
+
 /// Returns `true` if a new routing table was published (the rebuild succeeded).
 /// Used by the debounce loop to flip the first-publish readiness checks once.
 fn rebuild(
@@ -2408,8 +2439,13 @@ fn rebuild(
     ingress_default_backend: Option<&IngressDefaultBackend>,
     ingress_ports: IngressPorts,
     leader: bool,
-    outputs: &SharedOutputs<'_>,
+    io: RebuildIo<'_>,
 ) -> bool {
+    let RebuildIo {
+        outputs,
+        gateway_partitions,
+        dedicated_partitions,
+    } = io;
     // #531: the generations stamped into the publish index at the END of this
     // rebuild MUST come from a store snapshot taken BEFORE any routing cell is
     // built. The live watcher store keeps updating while the cells build; a
@@ -2477,7 +2513,7 @@ fn rebuild(
             stores.external_auths,
             &owned_gateways,
             stores.services,
-            stores.slices,
+            stores.endpoint_cache,
             &backend_grants,
         );
 
@@ -2526,7 +2562,10 @@ fn rebuild(
             default_backend: ingress_default_backend,
             ports: ingress_ports,
         },
-        outputs,
+        RouteBuildIo {
+            outputs,
+            gateway_partitions,
+        },
     );
 
     let mut gateway_listener_status = build_tls(
@@ -2743,7 +2782,9 @@ fn rebuild(
         .gateways
         .state()
         .iter()
-        .filter_map(|gw| build_dedicated_gateway_snapshot(gw, stores, &dedicated_inputs))
+        .filter_map(|gw| {
+            build_dedicated_gateway_snapshot(gw, stores, &dedicated_inputs, dedicated_partitions)
+        })
         .collect();
     let dedicated_keys: HashSet<ObjectKey> = registry_map.keys().cloned().collect();
     // Fold each dedicated snapshot's listener health into the controller-side

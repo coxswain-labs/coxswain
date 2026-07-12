@@ -9,6 +9,7 @@ use super::reconcile_tls::{
     GatewayTlsTarget, grants_for_source, resolve_listener_tls, resolve_route_client_cert,
 };
 use crate::endpoints;
+use crate::endpoints::pool::EndpointCache;
 use crate::gw_types::{
     HttpRoute,
     v::httproutes::{
@@ -32,9 +33,10 @@ use coxswain_core::routing::{
 };
 use coxswain_core::tls::PortTlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -45,7 +47,11 @@ use std::time::SystemTime;
 /// listener-binding table, the `BackendTLSPolicy` index, and the `RateLimit`
 /// CR store — so the function stays under the workspace
 /// `clippy::too_many_arguments` threshold without each call site repeating the
-/// three-arg suffix.
+/// three-arg suffix. `Copy` (every field is a shared reference) so the same
+/// value can cheaply feed both [`route_fingerprint`] (planning, by reference)
+/// and `reconcile` (translation, by value) for #511's partitioned rebuild
+/// without constructing it twice.
+#[derive(Clone, Copy)]
 #[non_exhaustive]
 pub struct RouteResolution<'a> {
     /// `(gw_ns, gw_name, listener_name) → (hostname, port)` mapping for every
@@ -79,7 +85,7 @@ pub struct RouteResolution<'a> {
     /// `CoxswainExternalAuth` CR store for resolving `ExternalAuth` `ExtensionRef`
     /// filters on `HTTPRouteRule`s into per-route ext_authz config (#23).
     /// HTTPRoute-only. The auth-service `backendRef` is resolved to endpoints
-    /// against `services`/`slices`, gated by the same backend `grants`.
+    /// against `services`/`endpoint_cache`, gated by the same backend `grants`.
     pub external_auths: &'a reflector::Store<CoxswainExternalAuth>,
     /// Per-Gateway ext-auth mandate from `CoxswainExternalAuth` policies attached
     /// via `targetRefs` (#23, GEP-713). A route bound to a Gateway present here has
@@ -124,6 +130,102 @@ pub struct RouteResolution<'a> {
     pub backend_client_cert_failures: &'a HashSet<ObjectKey>,
 }
 
+/// Spec-static fingerprint of everything [`GatewayApiReconciler::reconcile`]
+/// would need to translate `route`, without running the translation (#511).
+/// Combines:
+/// - `route`'s own `resourceVersion` — catches every change to its own spec
+///   (hostnames, backendRefs, filters, rules) in one hash, computed once here.
+/// - for every rule's `ExtensionRef`-targeted CR (via the shared [`ext_refs`]
+///   scanner), that CR's own `resourceVersion` — catches a CR being edited
+///   independently of the route that references it.
+/// - for every rule's `backendRefs`, [`EndpointCache::fingerprint`] for that
+///   `(namespace, service, port)` — catches endpoint/Service-port churn on a
+///   backend this route uses, independent of the route's own spec.
+///
+/// Deliberately does **not** track: Gateway-attached policies resolved via
+/// `targetRef` (`BackendTLSPolicy`, `CoxswainBackendPolicy`, the Gateway-level
+/// `CoxswainExternalAuth` mandate, GEP-3155 backend client certs), nor a
+/// `BasicAuth` CR's own `secretRef` target. These are index-based or one-hop
+/// indirections a per-route static scan can't cheaply and precisely resolve;
+/// the partitioned rebuild instead folds [`fingerprint::store_epoch`] of
+/// their source stores into every partition uniformly, so any change there
+/// invalidates the whole table for one rebuild pass rather than risking a
+/// partition wrongly believing itself unaffected (see
+/// `reconciler::route_builder`'s partition-fingerprint assembly).
+pub(crate) fn route_fingerprint(
+    route: &HttpRoute,
+    endpoint_cache: &EndpointCache,
+    services: &reflector::Store<Service>,
+    resolution: &RouteResolution<'_>,
+) -> u64 {
+    let mut fp: u64 = 0;
+    let mut hasher = DefaultHasher::new();
+    route.metadata.resource_version.hash(&mut hasher);
+    fp ^= hasher.finish();
+
+    let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+    for rule in route.spec.rules.as_deref().unwrap_or(&[]) {
+        for (_group, kind, name) in super::filters::ext_refs(rule.filters.as_deref().unwrap_or(&[]))
+        {
+            fp ^= ext_ref_fingerprint(route_ns, kind, name, resolution);
+        }
+        for b in rule.backend_refs.as_deref().unwrap_or(&[]) {
+            let Some(port) = b.port else { continue };
+            let ns = b.namespace.as_deref().unwrap_or(route_ns);
+            fp ^= endpoint_cache.fingerprint(ns, &b.name, port, services);
+        }
+    }
+    fp
+}
+
+/// Fingerprint of a single spec-static `ExtensionRef` target `(kind, name)`
+/// in `route_ns` — the referenced CR's own `resourceVersion`, via a direct
+/// store lookup (no full scan). An unrecognized `kind` still folds in
+/// `(kind, name)` directly rather than being silently dropped, so an
+/// `ExtensionRef` this dispatch doesn't know about still moves the
+/// fingerprint deterministically — safe (it just forfeits reuse for that
+/// route instead of risking staleness).
+fn ext_ref_fingerprint(
+    route_ns: &str,
+    kind: &str,
+    name: &str,
+    resolution: &RouteResolution<'_>,
+) -> u64 {
+    match kind {
+        "RateLimit" => {
+            crate::fingerprint::object_fingerprint(resolution.rate_limits, route_ns, name)
+        }
+        "RetryPolicy" => {
+            crate::fingerprint::object_fingerprint(resolution.retry_policies, route_ns, name)
+        }
+        "PathRewriteRegex" => {
+            crate::fingerprint::object_fingerprint(resolution.path_rewrites, route_ns, name)
+        }
+        "IpAccessControl" => {
+            crate::fingerprint::object_fingerprint(resolution.ip_access, route_ns, name)
+        }
+        "BasicAuth" => {
+            crate::fingerprint::object_fingerprint(resolution.basic_auths, route_ns, name)
+        }
+        "CoxswainExternalAuth" => {
+            crate::fingerprint::object_fingerprint(resolution.external_auths, route_ns, name)
+        }
+        "JwtAuth" => crate::fingerprint::object_fingerprint(resolution.jwt_auths, route_ns, name),
+        "RequestSizeLimit" => {
+            crate::fingerprint::object_fingerprint(resolution.request_size_limits, route_ns, name)
+        }
+        "Compression" => {
+            crate::fingerprint::object_fingerprint(resolution.compressions, route_ns, name)
+        }
+        _ => {
+            let mut hasher = DefaultHasher::new();
+            kind.hash(&mut hasher);
+            name.hash(&mut hasher);
+            hasher.finish()
+        }
+    }
+}
+
 impl GatewayApiReconciler {
     /// Skips routes whose `spec.parentRefs` do not include at least one Gateway
     /// managed by this controller. Never queries the API server.
@@ -136,7 +238,7 @@ impl GatewayApiReconciler {
     ///   the policy's SNI / CA override is attached.
     pub fn reconcile(
         route: &HttpRoute,
-        slices: &reflector::Store<EndpointSlice>,
+        endpoint_cache: &EndpointCache,
         services: &reflector::Store<Service>,
         owned_gateways: &HashSet<ObjectKey>,
         grants: &HashSet<ReferenceGrantKey>,
@@ -312,8 +414,13 @@ impl GatewayApiReconciler {
                 let backend_refs: &[HttpRouteRulesBackendRefs] =
                     rule.backend_refs.as_deref().unwrap_or(&[]);
 
-                let resolved =
-                    resolve_weighted_backends(backend_refs, route_ns, slices, services, grants);
+                let resolved = resolve_weighted_backends(
+                    backend_refs,
+                    route_ns,
+                    endpoint_cache,
+                    services,
+                    grants,
+                );
                 let group_name = backend_group_name(backend_refs, route_ns);
                 let protocols: Vec<BackendProtocol> =
                     resolved.iter().map(|(r, _)| r.app_protocol).collect();
@@ -450,7 +557,7 @@ impl GatewayApiReconciler {
                 route_ns,
                 external_auths,
                 services,
-                slices,
+                endpoint_cache,
                 grants,
             );
             let jwt_auth =
@@ -488,7 +595,7 @@ impl GatewayApiReconciler {
                 compression,
                 route_ns,
                 path_rewrites,
-                slices,
+                endpoint_cache,
                 services,
                 grants,
             };
@@ -515,7 +622,7 @@ impl GatewayApiReconciler {
 fn resolve_weighted_backends(
     backend_refs: &[HttpRouteRulesBackendRefs],
     route_ns: &str,
-    slices: &reflector::Store<EndpointSlice>,
+    endpoint_cache: &EndpointCache,
     services: &reflector::Store<Service>,
     grants: &HashSet<ReferenceGrantKey>,
 ) -> Vec<(endpoints::ResolvedEndpoints, u16)> {
@@ -525,27 +632,13 @@ fn resolve_weighted_backends(
         .map(|(b, port)| {
             let weight = weight_of(b);
             if weight == 0 {
-                return (
-                    endpoints::ResolvedEndpoints {
-                        addrs: vec![],
-                        app_protocol: BackendProtocol::default(),
-                        service_exists: false,
-                    },
-                    0,
-                );
+                return (endpoints::ResolvedEndpoints::empty(), 0);
             }
 
             let b_kind = b.kind.as_deref().unwrap_or("Service");
             let b_group = b.group.as_deref().unwrap_or("");
             if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
-                return (
-                    endpoints::ResolvedEndpoints {
-                        addrs: vec![],
-                        app_protocol: BackendProtocol::default(),
-                        service_exists: false,
-                    },
-                    weight,
-                );
+                return (endpoints::ResolvedEndpoints::empty(), weight);
             }
 
             let ns = b.namespace.as_deref().unwrap_or(route_ns);
@@ -558,18 +651,11 @@ fn resolve_weighted_backends(
                     backend_svc = %b.name,
                     "Cross-namespace backendRef denied — no matching ReferenceGrant"
                 );
-                return (
-                    endpoints::ResolvedEndpoints {
-                        addrs: vec![],
-                        app_protocol: BackendProtocol::default(),
-                        service_exists: false,
-                    },
-                    weight,
-                );
+                return (endpoints::ResolvedEndpoints::empty(), weight);
             }
 
             (
-                endpoints::resolve(ns, &b.name, port, slices, services),
+                (*endpoint_cache.get(ns, &b.name, port, services)).clone(),
                 weight,
             )
         })
@@ -605,7 +691,7 @@ struct RuleContext<'a> {
     compression: Option<Arc<CompressionConfig>>,
     route_ns: &'a str,
     path_rewrites: &'a reflector::Store<PathRewriteRegex>,
-    slices: &'a reflector::Store<EndpointSlice>,
+    endpoint_cache: &'a EndpointCache,
     services: &'a reflector::Store<Service>,
     grants: &'a HashSet<ReferenceGrantKey>,
 }
@@ -654,7 +740,7 @@ fn apply_rule(
     };
 
     let backend_stores = super::filters::BackendStores {
-        slices: ctx.slices,
+        endpoint_cache: ctx.endpoint_cache,
         services: ctx.services,
         grants: ctx.grants,
     };
@@ -1568,7 +1654,7 @@ mod tests {
 
     #[test]
     fn reconcile_exact_path() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route(
             "default",
             &["example.com"],
@@ -1618,7 +1704,7 @@ mod tests {
 
     #[test]
     fn reconcile_prefix_path() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route(
             "default",
             &["example.com"],
@@ -1668,7 +1754,7 @@ mod tests {
 
     #[test]
     fn reconcile_regex_path() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route(
             "default",
             &["example.com"],
@@ -1718,7 +1804,7 @@ mod tests {
 
     #[test]
     fn reconcile_no_matches_defaults_to_root_prefix() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
@@ -1759,7 +1845,7 @@ mod tests {
 
     #[test]
     fn reconcile_skips_route_without_owned_parent() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
         let grants = HashSet::new();
@@ -1802,7 +1888,7 @@ mod tests {
 
     #[test]
     fn reconcile_header_exact_routes_to_correct_backend() {
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "svc-a", "10.0.0.1"),
             make_slice("default", "svc-b", "10.0.0.2"),
         ]);
@@ -1890,7 +1976,7 @@ mod tests {
 
     #[test]
     fn reconcile_header_regex_routes_to_correct_backend() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route(
             "default",
             &["example.com"],
@@ -1940,7 +2026,7 @@ mod tests {
 
     #[test]
     fn reconcile_method_routes_to_correct_backend() {
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "svc-get", "10.0.0.1"),
             make_slice("default", "svc-post", "10.0.0.2"),
         ]);
@@ -2032,7 +2118,7 @@ mod tests {
 
     #[test]
     fn reconcile_query_param_routes_to_correct_backend() {
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "svc-v1", "10.0.0.1"),
             make_slice("default", "svc-v2", "10.0.0.2"),
         ]);
@@ -2118,7 +2204,7 @@ mod tests {
 
     #[test]
     fn reconcile_invalid_regex_skips_match_entry() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route(
             "default",
             &["example.com"],
@@ -2233,7 +2319,7 @@ mod tests {
     fn weighted_backends_80_20_split() {
         let a_ip = "10.0.0.1";
         let b_ip = "10.0.1.1";
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "svc-a", a_ip),
             make_slice("default", "svc-b", b_ip),
         ]);
@@ -2290,7 +2376,7 @@ mod tests {
     fn zero_weight_backend_gets_no_traffic() {
         let a_ip = "10.0.0.1";
         let b_ip = "10.0.1.1";
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "svc-a", a_ip),
             make_slice("default", "svc-b", b_ip),
         ]);
@@ -2339,7 +2425,7 @@ mod tests {
 
     #[test]
     fn all_zero_weights_installs_error_route() {
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "svc-a", "10.0.0.1"),
             make_slice("default", "svc-b", "10.0.1.1"),
         ]);
@@ -2398,7 +2484,7 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         GatewayApiReconciler::reconcile(
             &route,
-            &slice_store(vec![]),
+            &endpoint_cache(vec![]),
             &crate::tests::fixtures::make_svc_store(vec![svc]),
             &default_owned(),
             &HashSet::new(),
@@ -2441,7 +2527,7 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         GatewayApiReconciler::reconcile(
             &route,
-            &slice_store(vec![]),
+            &endpoint_cache(vec![]),
             &empty_svc_store(),
             &default_owned(),
             &HashSet::new(),
@@ -2507,7 +2593,7 @@ mod tests {
         let mut builder = RoutingTableBuilder::new();
         GatewayApiReconciler::reconcile(
             route,
-            &slice_store(vec![]),
+            &endpoint_cache(vec![]),
             &empty_svc_store(),
             &default_owned(),
             &HashSet::new(),
@@ -2569,7 +2655,7 @@ mod tests {
     fn absent_weight_defaults_to_1() {
         let a_ip = "10.0.0.1";
         let b_ip = "10.0.1.1";
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "svc-a", a_ip),
             make_slice("default", "svc-b", b_ip),
         ]);
@@ -2612,5 +2698,248 @@ mod tests {
         let results: Vec<_> = (0..4).map(|_| upstream.next_endpoint().unwrap()).collect();
         // With equal weights, slots = [0, 1]; cycling: a, b, a, b
         assert_eq!(results, [a, b, a, b]);
+    }
+
+    // ── route_fingerprint (#511) ──────────────────────────────────────────────
+
+    mod route_fingerprint_tests {
+        use super::*;
+        use crate::gw_types::v::httproutes::HttpRouteRulesFiltersExtensionRef;
+        use crate::tests::fixtures::{make_rate_limit_store, make_svc_store};
+        use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
+        use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+
+        fn rate_limit_ext_ref(name: &str) -> HttpRouteRulesFilters {
+            HttpRouteRulesFilters {
+                r#type: HttpRouteRulesFiltersType::ExtensionRef,
+                extension_ref: Some(HttpRouteRulesFiltersExtensionRef {
+                    group: "gateway.coxswain-labs.dev".to_string(),
+                    kind: "RateLimit".to_string(),
+                    name: name.to_string(),
+                }),
+                ..Default::default()
+            }
+        }
+
+        fn rate_limit_cr(ns: &str, name: &str, resource_version: &str) -> RateLimit {
+            let yaml = format!(
+                "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
+                 kind: RateLimit\n\
+                 metadata:\n  name: {name}\n  namespace: {ns}\n  resourceVersion: \"{resource_version}\"\n\
+                 spec:\n  requestsPerSecond: 1\n",
+            );
+            serde_yaml::from_str(&yaml).expect("valid RateLimit")
+        }
+
+        fn service(ns: &str, name: &str, resource_version: &str) -> Service {
+            Service {
+                metadata: ObjectMeta {
+                    name: Some(name.to_string()),
+                    namespace: Some(ns.to_string()),
+                    resource_version: Some(resource_version.to_string()),
+                    ..Default::default()
+                },
+                spec: Some(ServiceSpec {
+                    ports: Some(vec![ServicePort {
+                        port: 80,
+                        target_port: Some(IntOrString::Int(8080)),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        /// Builds a `RouteResolution` with every store empty except
+        /// `rate_limits` (passed in by the caller); mirrors the
+        /// exhaustive-field construction pattern used throughout this file's
+        /// other tests. Every non-`rate_limits` field is a fresh, locally-owned
+        /// empty store/map — cheap, and avoids fighting borrow lifetimes with
+        /// a shared/static instance.
+        macro_rules! resolution_with_rate_limits {
+            ($rate_limits:expr) => {
+                RouteResolution {
+                    listener_info: &no_listener_info(),
+                    policy_index: &HashMap::new(),
+                    backend_policy_index: &HashMap::new(),
+                    rate_limits: $rate_limits,
+                    retry_policies: &empty_retry_policy_store(),
+                    path_rewrites: &empty_path_rewrite_store(),
+                    ip_access: &empty_ip_access_store(),
+                    basic_auths: &empty_basic_auth_store(),
+                    external_auths: &empty_external_auth_store(),
+                    external_auth_gateway_index: &HashMap::new(),
+                    jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                    jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
+                    auth_secrets: &empty_secret_store(),
+                    basic_auth_secret_grants: &HashSet::new(),
+                    request_size_limits: &empty_request_size_limit_store(),
+                    compressions: &empty_compression_store(),
+                    backend_client_certs: &HashMap::new(),
+                    backend_client_cert_failures: &HashSet::new(),
+                }
+            };
+        }
+
+        #[test]
+        fn deterministic_for_identical_inputs() {
+            let route = make_route("default", &["example.com"], None, "svc");
+            let cache = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+            let svcs = empty_svc_store();
+            let rls = empty_rate_limit_store();
+            let resolution = resolution_with_rate_limits!(&rls);
+            let a = route_fingerprint(&route, &cache, &svcs, &resolution);
+            let b = route_fingerprint(&route, &cache, &svcs, &resolution);
+            assert_eq!(a, b);
+        }
+
+        #[test]
+        fn changes_when_route_resource_version_changes() {
+            let mut route = make_route("default", &["example.com"], None, "svc");
+            let cache = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+            let svcs = empty_svc_store();
+            let rls = empty_rate_limit_store();
+            let resolution = resolution_with_rate_limits!(&rls);
+            let before = route_fingerprint(&route, &cache, &svcs, &resolution);
+
+            route.metadata.resource_version = Some("2".to_string());
+            let after = route_fingerprint(&route, &cache, &svcs, &resolution);
+            assert_ne!(before, after);
+        }
+
+        #[test]
+        fn changes_when_referenced_rate_limit_cr_changes_independent_of_route() {
+            let mut route = make_route("default", &["example.com"], None, "svc");
+            route.spec.rules.as_mut().unwrap()[0].filters = Some(vec![rate_limit_ext_ref("rl")]);
+            // The route's own resourceVersion never changes across the two
+            // resolutions below — only the RateLimit CR it references does.
+            route.metadata.resource_version = Some("1".to_string());
+            let cache = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+            let svcs = empty_svc_store();
+
+            let rls_v1 = make_rate_limit_store(vec![rate_limit_cr("default", "rl", "1")]);
+            let before = route_fingerprint(
+                &route,
+                &cache,
+                &svcs,
+                &resolution_with_rate_limits!(&rls_v1),
+            );
+
+            let rls_v2 = make_rate_limit_store(vec![rate_limit_cr("default", "rl", "2")]);
+            let after = route_fingerprint(
+                &route,
+                &cache,
+                &svcs,
+                &resolution_with_rate_limits!(&rls_v2),
+            );
+
+            assert_ne!(
+                before, after,
+                "editing the referenced RateLimit CR must move the fingerprint even though the route itself didn't change"
+            );
+        }
+
+        #[test]
+        fn unaffected_by_an_unrelated_rate_limit_cr_changing() {
+            let mut route = make_route("default", &["example.com"], None, "svc");
+            route.spec.rules.as_mut().unwrap()[0].filters = Some(vec![rate_limit_ext_ref("rl-a")]);
+            route.metadata.resource_version = Some("1".to_string());
+            let cache = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+            let svcs = empty_svc_store();
+
+            let rls_before = make_rate_limit_store(vec![
+                rate_limit_cr("default", "rl-a", "1"),
+                rate_limit_cr("default", "rl-b", "1"),
+            ]);
+            let before = route_fingerprint(
+                &route,
+                &cache,
+                &svcs,
+                &resolution_with_rate_limits!(&rls_before),
+            );
+
+            // rl-b (not referenced by this route) changes; rl-a is untouched.
+            let rls_after = make_rate_limit_store(vec![
+                rate_limit_cr("default", "rl-a", "1"),
+                rate_limit_cr("default", "rl-b", "2"),
+            ]);
+            let after = route_fingerprint(
+                &route,
+                &cache,
+                &svcs,
+                &resolution_with_rate_limits!(&rls_after),
+            );
+
+            assert_eq!(
+                before, after,
+                "an unreferenced CR changing must not move this route's fingerprint"
+            );
+        }
+
+        #[test]
+        fn changes_when_backend_service_port_mapping_changes() {
+            let route = make_route("default", &["example.com"], None, "svc");
+            let rls = empty_rate_limit_store();
+            let cache = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+
+            let svcs_v1 = make_svc_store(vec![service("default", "svc", "1")]);
+            let before = route_fingerprint(
+                &route,
+                &cache,
+                &svcs_v1,
+                &resolution_with_rate_limits!(&rls),
+            );
+
+            let svcs_v2 = make_svc_store(vec![service("default", "svc", "2")]);
+            let after = route_fingerprint(
+                &route,
+                &cache,
+                &svcs_v2,
+                &resolution_with_rate_limits!(&rls),
+            );
+
+            assert_ne!(
+                before, after,
+                "a backend Service edit must move the fingerprint via the EndpointCache, \
+                 independent of the route's own spec"
+            );
+        }
+
+        #[test]
+        fn unaffected_by_an_unrelated_services_endpoints() {
+            let route = make_route("default", &["example.com"], None, "svc");
+            let rls = empty_rate_limit_store();
+            let svcs = empty_svc_store();
+
+            let cache_before = endpoint_cache(vec![
+                make_slice("default", "svc", "10.0.0.1"),
+                make_slice("default", "other-svc", "10.0.1.1"),
+            ]);
+            let before = route_fingerprint(
+                &route,
+                &cache_before,
+                &svcs,
+                &resolution_with_rate_limits!(&rls),
+            );
+
+            // other-svc's endpoint changes; svc's slice (and its EndpointSlice
+            // object name/resourceVersion) is untouched.
+            let cache_after = endpoint_cache(vec![
+                make_slice("default", "svc", "10.0.0.1"),
+                make_slice("default", "other-svc", "10.0.1.2"),
+            ]);
+            let after = route_fingerprint(
+                &route,
+                &cache_after,
+                &svcs,
+                &resolution_with_rate_limits!(&rls),
+            );
+
+            assert_eq!(
+                before, after,
+                "an unreferenced service's endpoint churn must not move this route's fingerprint"
+            );
+        }
     }
 }

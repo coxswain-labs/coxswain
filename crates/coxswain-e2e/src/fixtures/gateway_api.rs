@@ -8,6 +8,10 @@ macro_rules! fixture {
 
 /// HTTPRoute path-based routing rules.
 pub const PATH_MATCHING: &str = fixture!("path_matching.yaml");
+/// Two independent HTTPRoutes sharing one Gateway, each a single host to a
+/// distinct backend — one `(port, host)` routing-table partition per host
+/// (#511).
+pub const TWO_HOSTS: &str = fixture!("two_hosts.yaml");
 /// HTTPRoute (#504) with a first rule named `named-rule` (matches `/a`) and a
 /// second unnamed rule (matches `/b`). Hostnamed
 /// `http-named-rule.${TESTNS}.local`. Backends: `echo-a`/`echo-b` (via

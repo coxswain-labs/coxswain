@@ -62,6 +62,18 @@ pub(crate) fn slice_store(slices: Vec<EndpointSlice>) -> reflector::Store<Endpoi
     writer.as_reader()
 }
 
+/// Builds a ready-to-use [`crate::endpoints::pool::EndpointCache`] from a set of
+/// `EndpointSlice`s — the test-fixture equivalent of the `refresh()` call the
+/// rebuild loop performs once per cycle (#511). Callers that used to build a
+/// raw [`slice_store`] to feed a `slices`-typed parameter now build one of
+/// these instead, since route builders read through the cache rather than
+/// scanning the `EndpointSlice` store directly.
+pub(crate) fn endpoint_cache(slices: Vec<EndpointSlice>) -> crate::endpoints::pool::EndpointCache {
+    let mut cache = crate::endpoints::pool::EndpointCache::default();
+    cache.refresh(&slice_store(slices));
+    cache
+}
+
 pub(crate) fn empty_svc_store() -> reflector::Store<Service> {
     reflector::store::Writer::<Service>::default().as_reader()
 }

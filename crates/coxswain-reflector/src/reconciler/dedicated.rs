@@ -58,6 +58,7 @@ pub(super) fn build_dedicated_gateway_snapshot(
     gw: &Arc<Gateway>,
     stores: &ReflectorStores<'_>,
     inputs: &DedicatedBuildInputs<'_>,
+    dedicated_partitions: &mut HashMap<ObjectKey, super::cache::PartitionCache>,
 ) -> Option<(ObjectKey, Arc<DedicatedRoutingSnapshot>)> {
     let base = inputs.base_ownership;
     if !base.gateway_classes.contains(&gw.spec.gateway_class_name) {
@@ -70,6 +71,10 @@ pub(super) fn build_dedicated_gateway_snapshot(
     let name = gw.metadata.name.clone().unwrap_or_default();
     let key = ObjectKey::new(ns, name);
     let single_gw = HashSet::from([key.clone()]);
+    // Each dedicated Gateway is its own independent routing table — a
+    // `(port, host)` key here must never be confused with the shared pool's
+    // or another Gateway's cache entry (#511).
+    let partitions = dedicated_partitions.entry(key.clone()).or_default();
 
     // Narrow ownership to this one Gateway so the builders produce only its routes and
     // TLS state.  Ingress classes are empty — a dedicated proxy does not serve Ingress.
@@ -110,6 +115,7 @@ pub(super) fn build_dedicated_gateway_snapshot(
         &dedicated_ownership,
         &gw_routes_cell,
         false,
+        partitions,
     );
     // `build_tls` with `skip_cut_over=false` includes all owned-class gateways in the
     // TLS store; the extra certs are harmless because the dedicated proxy only binds

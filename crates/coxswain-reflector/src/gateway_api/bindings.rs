@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 /// The subset of a route `parentRef` the listener-binding logic reads, abstracted
 /// so [`compute_listener_bindings`] works for both `HTTPRoute` and `GRPCRoute`
 /// parentRefs (kopium emits a distinct type per route kind with identical fields).
-pub(super) trait ParentRefLike {
+pub(crate) trait ParentRefLike {
     fn group(&self) -> Option<&str>;
     fn kind(&self) -> Option<&str>;
     fn namespace(&self) -> Option<&str>;
@@ -146,7 +146,7 @@ pub struct ListenerBinding {
 /// Returns one entry per (listener hostname, listener port) binding derived from the
 /// route's `parentRefs`. `None` hostname means insert under the port's catchall.
 /// When no listener info is available (tests/misconfigured), port 80 is used as a fallback.
-pub(super) fn compute_listener_bindings<P: ParentRefLike>(
+pub(crate) fn compute_listener_bindings<P: ParentRefLike>(
     route_hostnames: &[&str],
     parent_refs: &[P],
     route_ns: &str,
@@ -300,7 +300,7 @@ pub(super) fn compute_listener_bindings<P: ParentRefLike>(
 /// [`compute_listener_bindings`] — `GrpcRouteParentRefs` implements
 /// [`ParentRefLike`], so the binding/isolation logic is shared, not copied.
 #[must_use = "compute_grpc_listener_bindings always returns a Vec"]
-pub(super) fn compute_grpc_listener_bindings(
+pub(crate) fn compute_grpc_listener_bindings(
     route_hostnames: &[&str],
     parent_refs: &[GrpcRouteParentRefs],
     route_ns: &str,
@@ -377,7 +377,7 @@ mod tests {
 
     #[test]
     fn listener_isolation_empty_listener_route_not_accessible_via_more_specific_listener() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route_with_hostnames_and_parent(
             "default",
             &["bar.com", "*.example.com"],
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn parent_ref_port_filters_to_matching_listener() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route_with_parent_port("default", &["h.example.com"], "gw", Some(80));
         let listener_info = make_listener_info(
             "default",
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn parent_ref_port_unset_attaches_to_all_listeners() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route_with_parent_port("default", &["h.example.com"], "gw", None);
         let listener_info = make_listener_info(
             "default",
@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn parent_ref_port_no_match_drops_route() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route_with_parent_port("default", &["h.example.com"], "gw", Some(9999));
         let listener_info = make_listener_info(
             "default",
@@ -598,7 +598,7 @@ mod tests {
     #[test]
     fn parent_ref_port_with_section_name_combined() {
         // parentRef with both sectionName and port: only attaches when both match.
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let listener_info = make_listener_info(
             "default",
             "gw",

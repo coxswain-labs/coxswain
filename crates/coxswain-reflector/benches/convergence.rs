@@ -18,6 +18,7 @@
 //! after a change re-run with `-- --baseline <name>` (criterion persists
 //! results under `target/criterion/`, gitignored — no numbers land in git).
 
+use coxswain_reflector::endpoints::pool::EndpointCache;
 use coxswain_reflector::endpoints::resolve;
 use criterion::{Criterion, criterion_group, criterion_main};
 use k8s_openapi::api::core::v1::{Service, ServicePort, ServiceSpec};
@@ -139,5 +140,105 @@ fn bench_resolve_scaling(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_resolve_scaling);
+/// #511 churn-only comparison: a single service's `EndpointSlice` changes
+/// (a pod cycling) against a store of `routes` distinct services. Two
+/// strategies, same input, same iteration count:
+///
+/// - `full_rescan`: the pre-#511 world — every rebuild calls
+///   [`resolve`] fresh for all `routes` backend references, so churn on ONE
+///   service still pays the full O(routes) rescan cost every time.
+/// - `pool_cached`: [`EndpointCache::refresh`] regroups the store once (one
+///   pass, same cost class as a single `resolve` scan), then
+///   [`EndpointCache::get`] serves `routes - 1` of the lookups from cache
+///   (fingerprint unchanged) and re-resolves only the one churned service —
+///   the O(1)-amortized win #511's endpoint pool targets.
+///
+/// Run with `--save-baseline pre-511` before the change and `--baseline
+/// pre-511` after (see module doc) to see `pool_cached` diverge from
+/// `full_rescan` as `routes` grows; at `routes100` they're within noise (the
+/// per-call overhead dominates), at `routes1000` `pool_cached` should be
+/// markedly cheaper since it stops paying the O(routes) rescan tax on churn.
+fn bench_endpoint_churn(c: &mut Criterion) {
+    let mut group = c.benchmark_group("endpoint_churn");
+    for &routes in &[100usize, 1000usize] {
+        let churned = "svc-0";
+
+        group.bench_function(format!("full_rescan_routes{routes}"), |b| {
+            let mut generation = 0u32;
+            b.iter(|| {
+                generation += 1;
+                let (slices, services) = build_stores_with_churn(routes, 5, churned, generation);
+                let mut total_addrs = 0usize;
+                for i in 0..routes {
+                    let name = format!("svc-{i}");
+                    let resolved = resolve(NAMESPACE, &name, SERVICE_PORT, &slices, &services);
+                    total_addrs += resolved.addrs.len();
+                }
+                std::hint::black_box(total_addrs);
+            });
+        });
+
+        group.bench_function(format!("pool_cached_routes{routes}"), |b| {
+            let mut generation = 0u32;
+            b.iter(|| {
+                generation += 1;
+                let (slices, services) = build_stores_with_churn(routes, 5, churned, generation);
+                let mut cache = EndpointCache::default();
+                cache.refresh(&slices);
+                let mut total_addrs = 0usize;
+                for i in 0..routes {
+                    let name = format!("svc-{i}");
+                    let resolved = cache.get(NAMESPACE, &name, SERVICE_PORT, &services);
+                    total_addrs += resolved.addrs.len();
+                }
+                std::hint::black_box(total_addrs);
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Like [`build_stores`], but `churned`'s slice gets a fresh distinct pod
+/// address on every call (keyed by `generation`) — models one service
+/// cycling a pod while every other service's slice is untouched.
+fn build_stores_with_churn(
+    services: usize,
+    endpoints_per_service: usize,
+    churned: &str,
+    generation: u32,
+) -> (reflector::Store<EndpointSlice>, reflector::Store<Service>) {
+    let mut slice_writer = reflector::store::Writer::<EndpointSlice>::default();
+    let mut svc_writer = reflector::store::Writer::<Service>::default();
+    for i in 0..services {
+        let name = format!("svc-{i}");
+        let slice = if name == churned {
+            make_churned_slice(&name, endpoints_per_service, generation)
+        } else {
+            make_slice(&name, endpoints_per_service)
+        };
+        slice_writer.apply_watcher_event(&watcher::Event::Apply(slice));
+        svc_writer.apply_watcher_event(&watcher::Event::Apply(make_service(&name)));
+    }
+    (slice_writer.as_reader(), svc_writer.as_reader())
+}
+
+/// [`make_slice`], but the resourceVersion (and one address octet) vary with
+/// `generation`, so [`EndpointCache`]'s fingerprint sees a genuine change on
+/// every call rather than reusing a stale cached entry across iterations.
+fn make_churned_slice(svc: &str, n: usize, generation: u32) -> EndpointSlice {
+    let mut slice = make_slice(svc, n);
+    slice.metadata.resource_version = Some(generation.to_string());
+    if let Some(endpoints) = slice.endpoints.as_mut()
+        && let Some(first) = endpoints.first_mut()
+    {
+        first.addresses = vec![format!(
+            "10.255.{}.{}",
+            (generation >> 8) & 0xff,
+            generation & 0xff
+        )];
+    }
+    slice
+}
+
+criterion_group!(benches, bench_resolve_scaling, bench_endpoint_churn);
 criterion_main!(benches);

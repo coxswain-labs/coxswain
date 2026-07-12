@@ -69,6 +69,17 @@ command = ["bash", "-c", 'echo "COXSWAIN_E2E_SERIAL=1" >> "$NEXTEST_ENV"']
 # They mutate no global config, so correctness never required serialization —
 # they sit in the serial pass purely to keep the parallel routing pass stable.
 #
+# Same category: the two `route_propagation_time_*_apply_to_first_success`
+# routing tests measure apply -> first-successful-request wall time and assert a
+# hard upper bound. Under the concurrent parallel pass, contention for the single
+# shared control plane (watch/debounce/discovery-push convergence) and, for the
+# Gateway API variant, simultaneous per-Gateway VIP provisioning inflate that
+# number from ~1.5 s to occasionally >10 s — verified reproducible on `main`
+# without any product change (~1-in-3), so it is measurement contention, not a
+# regression. As pure measurements they mutate no global config; they run in the
+# serial pass so the number reflects true uncontended convergence and the bound
+# stays a meaningful regression guard rather than a coin flip.
+#
 # The two profiles below split on exactly this set via `default-filter`, so the
 # run command stays uniform (`-E 'binary(<suite>)'`) for both passes.
 
@@ -89,6 +100,7 @@ default-filter = '''
     | test(=status_reports_load_balancer_ip) | test(=gateway_address_empty_allocates_dynamically) | test(=ingress_status_skips_unowned_ingress_class)
     | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
     | test(=timeouts_request_returns_504) | test(=timeouts_backend_request_returns_504)
+    | test(=route_propagation_time_gateway_api_apply_to_first_success) | test(=route_propagation_time_ingress_apply_to_first_success)
     | test(=proxy_generated_forwarded_reaches_backend_and_overrides_spoof)
     | test(=cert_manager_http01_challenge_issues_and_serves_certificate)
     | test(=gateway_api_disabled_skips_gateway_reconcile) | test(=ingress_disabled_skips_ingress_reconcile)
@@ -128,6 +140,7 @@ default-filter = '''
   | test(=status_reports_load_balancer_ip) | test(=gateway_address_empty_allocates_dynamically) | test(=ingress_status_skips_unowned_ingress_class)
   | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
   | test(=timeouts_request_returns_504) | test(=timeouts_backend_request_returns_504)
+  | test(=route_propagation_time_gateway_api_apply_to_first_success) | test(=route_propagation_time_ingress_apply_to_first_success)
   | test(=proxy_generated_forwarded_reaches_backend_and_overrides_spoof)
   | test(=cert_manager_http01_challenge_issues_and_serves_certificate)
   | test(=gateway_api_disabled_skips_gateway_reconcile) | test(=ingress_disabled_skips_ingress_reconcile)

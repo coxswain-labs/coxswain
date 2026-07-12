@@ -30,11 +30,56 @@
 //! - [`port_alloc`] — internal target-port allocator for shared-mode
 //!   per-Gateway addressing (#472).
 //! - [`crds`] — startup probe for Gateway API CRD presence.
+//! - [`fingerprint`] — shared `resourceVersion`-based fingerprint primitives
+//!   used by the partitioned rebuild below.
+//!
+//! ## Partitioned incremental rebuild (#511)
+//!
+//! `reconciler::proxy::rebuild()` used to reconstruct the entire Gateway API
+//! routing world — every `HTTPRoute`/`GRPCRoute`, every backend resolution,
+//! every filter/auth/policy lookup — on every single triggering watch event,
+//! regardless of what actually changed (O(total-state) per event). Two
+//! caches, both owned across rebuilds by the debounce loop
+//! (`reconciler::cache::ReflectorCaches`, since `rebuild()` itself has no
+//! handle to what it published last cycle), flatten this:
+//!
+//! - **Endpoint-resolution model** ([`endpoints::pool::EndpointCache`]):
+//!   endpoints are canonically modeled as `(namespace, service, port)`
+//!   resources ([`coxswain_core::endpoints`], settled jointly with #383,
+//!   which serializes this same model onto the discovery wire). One
+//!   grouping pass over the `EndpointSlice` store per rebuild fingerprints
+//!   each `(namespace, service)` group; `endpoints::resolve()`'s O(all
+//!   slices) scan runs only for a group whose fingerprint moved, in place of
+//!   running once per backend reference every rebuild.
+//! - **Partitioned route recompile** (`reconciler::gateway_partition`,
+//!   `reconciler::cache::PartitionCache`): the compiled Gateway routing
+//!   table is a set of `(port, host)` partitions, each an
+//!   `Arc<HostRouter>` (`coxswain_core::routing::common::port`). A
+//!   partition's fingerprint XOR-folds every route bound to it (via
+//!   `gateway_api::http_route_fingerprint`/`grpc_route_fingerprint`) plus a
+//!   `global_epoch` covering inputs a per-route static scan can't precisely
+//!   attribute — `targetRef`-based policy attachment, a `BasicAuth` CR's own
+//!   `secretRef`, GEP-3155 backend client certs, `ReferenceGrant`s. Only
+//!   partitions whose fingerprint changed are recompiled via
+//!   `HostRouterBuilder`; every other partition splices its cached
+//!   `Arc<HostRouter>` in directly
+//!   (`coxswain_core::routing::common::port::PortTableBuilder::insert_compiled_exact_host`
+//!   and its wildcard/catchall siblings) — no `matchit`/`RegexSet`
+//!   recompilation. Dedicated (per-cut-over-Gateway) snapshots keep their own
+//!   `PartitionCache`, keyed per Gateway so their `(port, host)` keys can't
+//!   collide with the shared pool's or each other's.
+//!
+//! Both caches degrade safely: any fingerprint miss (new partition, changed
+//! inputs, cache never populated) recomputes fresh rather than risking a
+//! stale reuse. `build_ingress_routes` is **not** partitioned — Ingress's
+//! annotation-driven reconcile still fully rebuilds every rebuild; only the
+//! Gateway API (HTTPRoute/GRPCRoute) path is in scope for #511.
 
 pub mod cluster;
 pub mod crds;
 pub mod duration;
 pub mod endpoints;
+pub(crate) mod fingerprint;
 pub mod gateway_api;
 pub mod gw_types;
 pub mod ingress;

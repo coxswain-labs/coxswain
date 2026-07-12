@@ -31,13 +31,15 @@ use coxswain_e2e::{
     harness::{GATEWAY_TCP_PROXY_PORT, GATEWAY_UDP_PROXY_PORT, http, wait},
 };
 use gateway_api_types::apis::standard::httproutes::HttpRoute;
+use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointSlice};
 use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::Api;
-use kube::api::{DeleteParams, PostParams};
+use kube::api::{DeleteParams, Patch, PatchParams, PostParams};
 use reqwest::Method;
 use reqwest::Version;
+use serde_json::json;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
@@ -3008,4 +3010,105 @@ async fn try_udp_proxy(
         .context("recv datagram")?;
 
     Ok(String::from_utf8_lossy(&buf[..n]).to_string())
+}
+
+// ── #511 partitioned incremental rebuild ────────────────────────────────────
+//
+// `build_gateway_routes` (HTTPRoute/GRPCRoute only — `build_ingress_routes`
+// is not partitioned, out of #511's scope) compiles a `(port, host)`
+// routing-table partition per host; an unaffected partition reuses its
+// compiled `Arc<HostRouter>` across a rebuild rather than being recompiled.
+// Black-box, this is only observable as "host A changes, host B keeps
+// serving without disruption" (happy) and "host A's backend disappears,
+// host B is unaffected" (sad) — the two scenarios below use `gwa::TWO_HOSTS`
+// (two independent HTTPRoutes, not just two rules on one object) so the
+// sibling assertion proves partition isolation, not merely object isolation.
+
+/// Adding a rule to `route-a`'s HTTPRoute recompiles only host-a's partition;
+/// `host-b` — a wholly separate HTTPRoute object sharing only the Gateway —
+/// must keep serving throughout with no observable disruption.
+#[tokio::test]
+async fn structural_route_change_preserves_sibling_hosts() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-partition-sibling").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::TWO_HOSTS, FixtureVars::new(&ns.name)).await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host_a = format!("host-a.{}.local", ns.name);
+    let host_b = format!("host-b.{}.local", ns.name);
+
+    // Baseline: both independent hosts serve their own backend.
+    wait::wait_for_backend(&gw, &host_a, "/", "echo-a", Duration::from_secs(60)).await?;
+    wait::wait_for_backend(&gw, &host_b, "/", "echo-b", Duration::from_secs(15)).await?;
+
+    // Structural change to route-a only: add a second rule matching `/new`.
+    // route-b is a wholly separate HTTPRoute object and is never touched by
+    // this patch — a stronger sibling-isolation proof than two rules on one
+    // shared object would give.
+    let routes: Api<HttpRoute> = Api::namespaced(h.client.clone(), &ns.name);
+    let patch = json!({
+        "spec": {
+            "rules": [
+                {
+                    "backendRefs": [{"name": "echo-a", "port": 3000}],
+                },
+                {
+                    "matches": [{"path": {"type": "PathPrefix", "value": "/new"}}],
+                    "backendRefs": [{"name": "echo-a", "port": 3000}],
+                },
+            ],
+        },
+    });
+    routes
+        .patch("route-a", &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .context("patch route-a to add a /new rule")?;
+
+    // route-a gains the new path...
+    wait::wait_for_backend(&gw, &host_a, "/new", "echo-a", Duration::from_secs(30)).await?;
+    // ...and host-b's untouched partition keeps serving throughout — no gap,
+    // no stale/blank response.
+    wait::wait_for_backend(&gw, &host_b, "/", "echo-b", Duration::from_secs(15)).await?;
+
+    Ok(())
+}
+
+/// Deleting `route-a`'s backing Service tombstones host-a's route (503 dead
+/// route — no endpoints ever resolved) without touching `host-b`, a wholly
+/// separate HTTPRoute object sharing only the Gateway.
+#[tokio::test]
+async fn backend_deletion_tombstones_without_touching_siblings() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-partition-delete").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::TWO_HOSTS, FixtureVars::new(&ns.name)).await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host_a = format!("host-a.{}.local", ns.name);
+    let host_b = format!("host-b.{}.local", ns.name);
+
+    wait::wait_for_backend(&gw, &host_a, "/", "echo-a", Duration::from_secs(60)).await?;
+    wait::wait_for_backend(&gw, &host_b, "/", "echo-b", Duration::from_secs(15)).await?;
+
+    // Delete host-a's backing Service entirely (not just its endpoints).
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    services
+        .delete("echo-a", &DeleteParams::default())
+        .await
+        .context("delete echo-a Service")?;
+
+    // route-a tombstones to a 500: for Gateway API, a backendRef whose Service
+    // doesn't exist is an invalid ref (ResolvedRefs=False), distinct from an
+    // existing Service with zero ready endpoints (503) — see reconcile.rs's
+    // has_valid_empty_backend doc comment.
+    wait::wait_for_route_status(&gw, &host_a, "/", 500, Duration::from_secs(60)).await?;
+    // host-b is unaffected — a separate HTTPRoute object, disjoint partition.
+    wait::wait_for_backend(&gw, &host_b, "/", "echo-b", Duration::from_secs(15)).await?;
+
+    Ok(())
 }

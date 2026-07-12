@@ -29,14 +29,18 @@ mod udp_status;
 pub use backend_policy::{BackendPolicyIndex, ResolvedBackendPolicy, build_backend_policy_index};
 pub use backend_tls::{BackendTlsIndex, build_backend_tls_index};
 pub use bindings::ListenerBinding;
-pub(crate) use bindings::parent_listener_source;
+pub(crate) use bindings::{
+    compute_grpc_listener_bindings, compute_listener_bindings, parent_listener_source,
+};
 pub use client_traffic_policy::{
     ClientTrafficPolicyIndex, effective_proxy_config, resolve_client_traffic_policies,
 };
 pub use external_auth::{ExternalAuthGatewayIndex, resolve_gateway_policies};
 pub use grpc_reconcile::GrpcRouteResolution;
+pub(crate) use grpc_reconcile::route_fingerprint as grpc_route_fingerprint;
 pub(crate) use hostnames::hostnames_intersect;
 pub use reconcile::RouteResolution;
+pub(crate) use reconcile::route_fingerprint as http_route_fingerprint;
 pub(crate) use reconcile_tls::GatewayTlsTarget;
 pub(crate) use route_status::RouteLike;
 
@@ -117,8 +121,9 @@ impl GrpcRouteReconciler {
     /// Install a `GRPCRoute`'s rules into the shared routing-table builder.
     ///
     /// Translates `spec.rules[].matches.method` (service/method) to HTTP path patterns
-    /// (`/{service}/{method}`), resolves backends via `endpoints::resolve`, and installs
-    /// routes into the same builder that [`GatewayApiReconciler::reconcile`] uses.
+    /// (`/{service}/{method}`), resolves backends via the reflector's
+    /// [`crate::endpoints::pool::EndpointCache`], and installs routes into the same
+    /// builder that [`GatewayApiReconciler::reconcile`] uses.
     ///
     /// # Errors
     ///
@@ -126,7 +131,7 @@ impl GrpcRouteReconciler {
     /// reported as warn-log entries and produce 500/503 error routes.
     pub fn reconcile(
         route: &GrpcRoute,
-        slices: &reflector::Store<k8s_openapi::api::discovery::v1::EndpointSlice>,
+        endpoint_cache: &crate::endpoints::pool::EndpointCache,
         services: &reflector::Store<Service>,
         owned_gateways: &HashSet<ObjectKey>,
         grants: &HashSet<ReferenceGrantKey>,
@@ -135,7 +140,7 @@ impl GrpcRouteReconciler {
     ) {
         grpc_reconcile::reconcile(
             route,
-            slices,
+            endpoint_cache,
             services,
             owned_gateways,
             grants,

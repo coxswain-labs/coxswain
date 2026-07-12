@@ -19,9 +19,11 @@
 //! items in this module's siblings, called from each reconciler's own
 //! orchestration.
 
+mod cache;
 pub mod controller;
 mod debounce;
 mod dedicated;
+mod gateway_partition;
 pub(crate) mod listener_merge;
 pub mod proxy;
 mod route_builder;
