@@ -46,6 +46,7 @@ pub mod port_alloc;
 pub mod reconciler;
 pub mod reference_grants;
 pub mod status;
+pub mod status_queue;
 pub mod tls;
 
 #[cfg(test)]
@@ -60,8 +61,8 @@ pub use metrics::{MetricsPrefix, ReflectorMetrics};
 pub use reconciler::listener_merge::{EffectiveListenerPort, effective_listener_ports};
 pub use reconciler::{
     ControllerReconciler, DebounceSettings, DebounceSettingsError, IngressDefaultBackend,
-    IngressDefaultBackendParseError, IngressEvent, ReconcilerHealth, ReconcilerOptions,
-    ReconcilerOutputs, SharedProxyReconciler, StatusSubscriptions,
+    IngressDefaultBackendParseError, IngressEvent, OperatorStores, ReconcilerHealth,
+    ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler, StatusStores,
 };
 pub use status::{
     BackendTlsPolicyStatus, BackendTlsPolicyStatusMap, ClientTrafficPolicyStatus,
@@ -72,3 +73,4 @@ pub use status::{
     SharedCoxswainBackendPolicyStatus, SharedCoxswainExternalAuthStatus,
     SharedGatewayListenerStatus, SharedRouteStatus,
 };
+pub use status_queue::{StatusKey, StatusKind, StatusWorkqueue};

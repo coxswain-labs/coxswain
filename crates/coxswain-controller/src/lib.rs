@@ -20,7 +20,7 @@ pub use controller::{
     Controller, ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress,
     StatusChannels,
 };
-pub use operator::{Operator, OperatorConfig};
+pub use operator::OperatorConfig;
 pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writer};
 
 // Re-export reflector primitives that bin or downstream crates expect to reach

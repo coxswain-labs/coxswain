@@ -62,6 +62,12 @@ jobs:
           platforms: linux/amd64
           load: true
           tags: coxswain:ci
+          # Smoke-only: build the fast, unoptimized `ci` profile (no fat LTO).
+          # This job just checks the Dockerfile builds and the entrypoint
+          # resolves (--help/--version); the shipped artifact still builds
+          # [profile.release] via the Dockerfile's default. See Cargo.toml.
+          build-args: |
+            CARGO_PROFILE=ci
           cache-from: type=gha,scope=image-smoke
           cache-to: type=gha,scope=image-smoke,mode=max
 

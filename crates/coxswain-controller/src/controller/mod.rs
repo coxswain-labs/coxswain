@@ -15,6 +15,10 @@
 //! service; the shared `leader` flag gates every reconcile and is the one
 //! truth-source the dedicated-mode operator also reads.
 
+use crate::operator::{
+    OperatorConfig, ReconcileContext as OperatorReconcileContext, reconcile_dedicated,
+    run_vip_reconciler,
+};
 use async_trait::async_trait;
 use coxswain_core::Shared;
 use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
@@ -33,17 +37,11 @@ use coxswain_reflector::status::{
     SharedCoxswainBackendPolicyStatus, SharedCoxswainExternalAuthStatus,
     SharedGatewayListenerStatus, SharedRouteStatus,
 };
-use coxswain_reflector::{IngressEvent, StatusSubscriptions};
-use futures::StreamExt;
-use futures::channel::mpsc::{self, UnboundedSender};
-use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
-use kube::{
-    Client, Resource as _,
-    runtime::{
-        controller::{Action, Controller as KubeController},
-        reflector::ObjectRef,
-    },
+use coxswain_reflector::{
+    IngressEvent, OperatorStores, StatusKey, StatusKind, StatusStores, StatusWorkqueue,
 };
+use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
+use kube::{Client, runtime::reflector::ObjectRef};
 use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
@@ -167,10 +165,13 @@ pub struct Controller {
     owned_gateways: OwnedGateways,
     channels: StatusChannels,
     config: ControllerConfig,
-    /// Shared-informer subscriptions handed over by the reflector; taken once
-    /// in `start` (the handles are independent broadcast subscribers and must
-    /// not be left undrained, which would back-pressure the stores).
-    subscriptions: parking_lot::Mutex<Option<StatusSubscriptions>>,
+    /// Read handles onto the reflector's authoritative status stores; taken once
+    /// in `start`. The worker resolves each drained [`StatusKey`] to its live
+    /// object through these (#574).
+    stores: parking_lot::Mutex<Option<StatusStores>>,
+    /// The single status/provisioning work queue the reflector's rebuild pass
+    /// feeds; the worker is its sole consumer (#574).
+    queue: StatusWorkqueue,
     /// Ingress diagnostic event channel. Taken once in `start` and driven by
     /// [`ingress_event_recorder::run`]. `None` in test / dev configurations
     /// that do not wire up an `ingress_event_tx` on the reconciler.
@@ -194,6 +195,12 @@ pub struct Controller {
     /// generation, not merely have its ports bound (pre-bound ports satisfy
     /// the bind gate instantly while the config is still propagating).
     publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
+    /// Dedicated-provisioning operator inputs (#574 fold): its config + the
+    /// reflector's `OperatorStores`. `run_controllers` builds the operator
+    /// reconcile context from these, spawns its VIP reconciler, and the unified
+    /// worker's Gateway branch calls `reconcile_dedicated`. `None` disables
+    /// dedicated provisioning (tests / Ingress-only).
+    operator: parking_lot::Mutex<Option<(OperatorConfig, OperatorStores)>>,
 }
 
 impl Controller {
@@ -203,9 +210,9 @@ impl Controller {
         leader: Arc<AtomicBool>,
         owned_gateways: OwnedGateways,
         channels: StatusChannels,
-        subscriptions: StatusSubscriptions,
+        stores: StatusStores,
+        queue: StatusWorkqueue,
         config: ControllerConfig,
-        ingress_event_rx: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
     ) -> Self {
         Self {
             health,
@@ -213,13 +220,37 @@ impl Controller {
             owned_gateways,
             channels,
             config,
-            subscriptions: parking_lot::Mutex::new(Some(subscriptions)),
-            ingress_event_rx: parking_lot::Mutex::new(ingress_event_rx),
+            stores: parking_lot::Mutex::new(Some(stores)),
+            queue,
+            ingress_event_rx: parking_lot::Mutex::new(None),
             vip_failures: Shared::new(),
             leadership_watch: None,
             node_registry: None,
             publish_index: None,
+            operator: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Wire the dedicated-provisioning operator (#574 fold): its config plus the
+    /// reflector's `OperatorStores`. `run_controllers` builds the operator
+    /// reconcile context, spawns its VIP reconciler, and the unified worker's
+    /// Gateway branch drives `reconcile_dedicated` for dedicated Gateways.
+    #[must_use]
+    pub fn with_operator(self, config: OperatorConfig, stores: OperatorStores) -> Self {
+        *self.operator.lock() = Some((config, stores));
+        self
+    }
+
+    /// Wire the Ingress diagnostic-event channel (route conflicts, annotation
+    /// parse failures) so `run_controllers` spawns the recorder that emits them
+    /// as Kubernetes Warning Events. `None` in test/dev configs.
+    #[must_use]
+    pub fn with_ingress_events(
+        self,
+        rx: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
+    ) -> Self {
+        *self.ingress_event_rx.lock() = rx;
+        self
     }
 
     /// Share the operator VIP reconciler's definitively-failed static-address set
@@ -310,49 +341,14 @@ impl Controller {
         crate::metrics::leader().set(i64::from(is_leader));
         self.publish_leadership(is_leader);
 
-        let subs = self
-            .subscriptions
+        // The reflector's authoritative status stores (#574). The worker resolves
+        // each drained `StatusKey` to its live object through these; a clone is
+        // kept to re-enqueue the whole world on promotion.
+        let stores = self
+            .stores
             .lock()
             .take()
-            .unwrap_or_else(|| panic!("invariant: status subscriptions taken twice"));
-        let StatusSubscriptions {
-            gateways,
-            gateway_classes,
-            routes,
-            grpc_routes,
-            ingresses,
-            ingress_classes,
-            policies,
-            tls_routes,
-            tcp_routes,
-            udp_routes,
-            listener_sets,
-            client_traffic_policies,
-            coxswain_backend_policies,
-            coxswain_external_auths,
-            ..
-        } = subs;
-
-        // Readers for ownership lookups + secondary mappers. Captured before the
-        // handles are consumed as work-queue triggers; an independent secondary
-        // subscriber for the Gateway controller's GatewayClass watch is cloned
-        // off the GatewayClass handle.
-        let gateways_reader = gateways.reader();
-        let gateway_classes_reader = gateway_classes.reader();
-        let routes_reader = routes.reader();
-        let grpc_routes_reader = grpc_routes.reader();
-        let tls_routes_reader = tls_routes.reader();
-        let tcp_routes_reader = tcp_routes.reader();
-        let udp_routes_reader = udp_routes.reader();
-        let ingresses_reader = ingresses.reader();
-        let ingress_classes_reader = ingress_classes.reader();
-        let policies_reader = policies.reader();
-        let listener_sets_reader = listener_sets.reader();
-        let ctps_reader = client_traffic_policies.reader();
-        let cbps_reader = coxswain_backend_policies.reader();
-        let external_auths_reader = coxswain_external_auths.reader();
-        let gateway_classes_for_gateways = gateway_classes.clone();
-        let gateways_for_listener_sets = gateways.clone();
+            .unwrap_or_else(|| panic!("invariant: status stores taken twice"));
 
         let ctx = Arc::new(ReconcileContext {
             client,
@@ -374,48 +370,25 @@ impl Controller {
             ctp_status: self.channels.ctp.clone(),
             cbp_status: self.channels.cbp.clone(),
             external_auth_status: self.channels.external_auth.clone(),
-            gateway_classes: gateway_classes_reader,
-            ingress_classes: ingress_classes_reader,
-            gateways: gateways_reader.clone(),
+            gateway_classes: stores.gateway_classes.clone(),
+            ingress_classes: stores.ingress_classes.clone(),
+            gateways: stores.gateways.clone(),
+            routes: stores.routes.clone(),
+            grpc_routes: stores.grpc_routes.clone(),
+            tls_routes: stores.tls_routes.clone(),
+            tcp_routes: stores.tcp_routes.clone(),
+            udp_routes: stores.udp_routes.clone(),
+            ingresses: stores.ingresses.clone(),
+            listener_sets: stores.listener_sets.clone(),
+            policies: stores.policies.clone(),
+            client_traffic_policies: stores.client_traffic_policies.clone(),
+            coxswain_backend_policies: stores.coxswain_backend_policies.clone(),
+            coxswain_external_auths: stores.coxswain_external_auths.clone(),
             vip_failures: self.vip_failures.clone(),
             node_registry: self.node_registry.clone(),
             publish_index: self.publish_index.clone(),
             held_pending: parking_lot::Mutex::new(HashSet::new()),
         });
-
-        // One re-drive channel per work-queue. Each is fed by the relevant
-        // health forwarder (TLS → Gateway, route → HTTPRoute, policy →
-        // BackendTLSPolicy) and by leader-promotion (all five). `reconcile_all_on`
-        // re-reconciles every object currently in that controller's store; the
-        // per-resource idempotency gates absorb the duplicates.
-        let (gw_tx, gw_rx) = mpsc::unbounded::<()>();
-        let (gc_tx, gc_rx) = mpsc::unbounded::<()>();
-        let (route_tx, route_rx) = mpsc::unbounded::<()>();
-        let (grpc_route_tx, grpc_route_rx) = mpsc::unbounded::<()>();
-        let (tls_route_tx, tls_route_rx) = mpsc::unbounded::<()>();
-        let (tcp_route_tx, tcp_route_rx) = mpsc::unbounded::<()>();
-        let (udp_route_tx, udp_route_rx) = mpsc::unbounded::<()>();
-        let (ing_tx, ing_rx) = mpsc::unbounded::<()>();
-        let (pol_tx, pol_rx) = mpsc::unbounded::<()>();
-        let (ls_tx, ls_rx) = mpsc::unbounded::<()>();
-        let (ctp_tx, ctp_rx) = mpsc::unbounded::<()>();
-        let (cbp_tx, cbp_rx) = mpsc::unbounded::<()>();
-        let (ea_tx, ea_rx) = mpsc::unbounded::<()>();
-        let leadership_txs = vec![
-            gw_tx.clone(),
-            gc_tx.clone(),
-            route_tx.clone(),
-            grpc_route_tx.clone(),
-            tls_route_tx.clone(),
-            tcp_route_tx.clone(),
-            udp_route_tx.clone(),
-            ing_tx.clone(),
-            pol_tx.clone(),
-            ls_tx.clone(),
-            ctp_tx.clone(),
-            cbp_tx.clone(),
-            ea_tx.clone(),
-        ];
 
         let mut tasks = JoinSet::new();
 
@@ -451,201 +424,66 @@ impl Controller {
             ));
         }
 
-        // Health → work-queue forwarders. Each bridges a `watch::Receiver<u64>`
-        // (Send, !Sync) onto the `mpsc::Unbounded` stream `reconcile_all_on`
-        // wants, dropping the initial value so a fresh subscription does not
-        // spuriously re-drive before any health flip occurs.
-        spawn_health_forwarder(&mut tasks, self.channels.tls.subscribe(), gw_tx.clone());
-        // Proxy-pool readiness (#531): a shared-pool node connecting,
-        // disconnecting, or changing its bound-port report re-drives every
-        // Gateway so `Programmed` flips promptly once the pool binds — the 2 s
-        // deferred requeue is only the backstop.
-        if let Some(registry) = &self.node_registry {
-            spawn_health_forwarder(&mut tasks, registry.subscribe(), gw_tx);
+        // The unified status/provisioning worker (#574): a single leader-gated
+        // task drains the reflector-fed work queue and dispatches each object to
+        // its `reconcile_*` handler. Replaces the 13 kube `Controller`s, their
+        // lossy-fan-out triggers, and the derived-cell health forwarders — one
+        // watch fabric, one trigger, one worker.
+        // Dedicated-provisioning operator (#574 fold): build its reconcile
+        // context off the reflector's OperatorStores, spawn its serialized VIP
+        // reconciler, and hand the context to the worker's Gateway branch.
+        let operator_ctx = self.operator.lock().take().map(|(config, stores)| {
+            Arc::new(OperatorReconcileContext::from_stores(
+                config,
+                stores,
+                ctx.client.clone(),
+            ))
+        });
+        if let Some(op_ctx) = &operator_ctx {
+            tasks.spawn(run_vip_reconciler(Arc::clone(op_ctx), shutdown.clone()));
         }
-        spawn_health_forwarder(&mut tasks, self.channels.route.subscribe(), route_tx);
-        spawn_health_forwarder(
-            &mut tasks,
-            self.channels.grpc_route.subscribe(),
-            grpc_route_tx,
-        );
-        spawn_health_forwarder(
-            &mut tasks,
-            self.channels.tls_route.subscribe(),
-            tls_route_tx,
-        );
-        spawn_health_forwarder(
-            &mut tasks,
-            self.channels.tcp_route.subscribe(),
-            tcp_route_tx,
-        );
-        spawn_health_forwarder(
-            &mut tasks,
-            self.channels.udp_route.subscribe(),
-            udp_route_tx,
-        );
-        spawn_health_forwarder(&mut tasks, self.channels.policy.subscribe(), pol_tx);
-        spawn_health_forwarder(&mut tasks, self.channels.ctp.subscribe(), ctp_tx);
-        spawn_health_forwarder(&mut tasks, self.channels.cbp.subscribe(), cbp_tx);
-        spawn_health_forwarder(&mut tasks, self.channels.external_auth.subscribe(), ea_tx);
-        // GEP-1713: a TLS-health flip changes which listeners (incl. ListenerSet
-        // ones) are programmed, so re-drive ListenerSet status off the same channel.
-        spawn_health_forwarder(&mut tasks, self.channels.tls.subscribe(), ls_tx);
 
-        // --- Gateway: primary Gateway, secondary GatewayClass → Gateways in
-        // that class, re-driven on TLS-health flips + promotion. ---
-        let gateway_ctrl =
-            KubeController::for_shared_stream(gateways.into_stream(), gateways_reader.clone())
-                .watches_shared_stream(gateway_classes_for_gateways.into_stream(), {
-                    let gw_store = gateways_reader.clone();
-                    move |gc: Arc<GatewayClass>| -> Vec<ObjectRef<Gateway>> {
-                        let Some(class_name) = gc.meta().name.clone() else {
-                            return Vec::new();
-                        };
-                        gw_store
-                            .state()
-                            .into_iter()
-                            .filter(|gw| gw.spec.gateway_class_name == class_name)
-                            .map(|gw| ObjectRef::from_obj(gw.as_ref()))
-                            .collect()
+        tasks.spawn(run_status_worker(
+            self.queue.clone(),
+            Arc::clone(&ctx),
+            operator_ctx,
+        ));
+        // Re-enqueue the whole world once at startup so the initial reconcile
+        // burst runs even before the reflector's first rebuild lands.
+        enqueue_all_status(&self.queue, &stores);
+
+        // #531 prompt signal (restored under #574): a connected shared-pool proxy
+        // reporting a bound-port change or a snapshot ack updates `node_registry`,
+        // which is NOT a Kubernetes watch event and so never triggers a rebuild —
+        // without this the Gateway `Programmed` bind gate would only re-check on
+        // its slow deferred requeue, stalling under churn. On every registry
+        // change, re-enqueue the Gateways so the gate flips within one worker
+        // pass. The reflector's per-object status derivation (route/listener
+        // health) already re-drives via the rebuild's enqueue, so only the
+        // registry (proxy-connection-sourced) signal needs its own forwarder.
+        if let Some(registry) = &self.node_registry {
+            let mut rx = registry.subscribe();
+            let queue = self.queue.clone();
+            let gateways = stores.gateways.clone();
+            tasks.spawn(async move {
+                // Drop the initial value so a fresh subscription doesn't fire a
+                // spurious re-drive before any bind report lands.
+                let _ = rx.borrow_and_update();
+                while rx.changed().await.is_ok() {
+                    for gw in gateways.state() {
+                        if let Some(name) = gw.metadata.name.clone() {
+                            let ns = gw.metadata.namespace.clone().unwrap_or_default();
+                            queue.add(StatusKey::new(
+                                StatusKind::Gateway,
+                                ObjectKey::new(ns, name),
+                            ));
+                        }
                     }
-                })
-                .reconcile_all_on(gw_rx)
-                .run(reconcile_gateway, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, gateway_ctrl, "Gateway");
+                }
+            });
+        }
 
-        // --- ListenerSet: primary ListenerSet, secondary Gateway → its
-        // ListenerSets (a parent allowedListeners/listeners edit re-drives the
-        // attached ListenerSets), re-driven on TLS-health flips + promotion
-        // (GEP-1713). ---
-        let listenerset_ctrl = KubeController::for_shared_stream(
-            listener_sets.into_stream(),
-            listener_sets_reader.clone(),
-        )
-        .watches_shared_stream(gateways_for_listener_sets.into_stream(), {
-            let ls_store = listener_sets_reader.clone();
-            move |gw: Arc<Gateway>| -> Vec<ObjectRef<ListenerSet>> {
-                let gw_ns = gw.meta().namespace.clone().unwrap_or_default();
-                let gw_name = gw.meta().name.clone().unwrap_or_default();
-                ls_store
-                    .state()
-                    .into_iter()
-                    .filter(|ls| {
-                        let ls_ns = ls.meta().namespace.clone().unwrap_or_default();
-                        let pr = &ls.spec.parent_ref;
-                        let pns = pr.namespace.clone().unwrap_or(ls_ns);
-                        pns == gw_ns && pr.name == gw_name
-                    })
-                    .map(|ls| ObjectRef::from_obj(ls.as_ref()))
-                    .collect()
-            }
-        })
-        .reconcile_all_on(ls_rx)
-        .run(reconcile_listenerset, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, listenerset_ctrl, "ListenerSet");
-
-        // --- GatewayClass: primary only; re-driven on promotion. ---
-        let gateway_class_ctrl = KubeController::for_shared_stream(
-            gateway_classes.into_stream(),
-            ctx.gateway_classes.clone(),
-        )
-        .reconcile_all_on(gc_rx)
-        .run(reconcile_gateway_class, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, gateway_class_ctrl, "GatewayClass");
-
-        // --- HTTPRoute: primary only; re-driven on route-health flips +
-        // promotion. ---
-        let route_ctrl = KubeController::for_shared_stream(routes.into_stream(), routes_reader)
-            .reconcile_all_on(route_rx)
-            .run(reconcile_route, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, route_ctrl, "HTTPRoute");
-
-        // --- GRPCRoute: primary only; re-driven on grpc-route-health flips +
-        // promotion. Sibling to HTTPRoute, feeds the same gateway routing table
-        // via a parallel reconcile path.
-        let grpc_route_ctrl =
-            KubeController::for_shared_stream(grpc_routes.into_stream(), grpc_routes_reader)
-                .reconcile_all_on(grpc_route_rx)
-                .run(reconcile_grpc_route, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, grpc_route_ctrl, "GRPCRoute");
-
-        // --- TLSRoute: primary only; re-driven on tls-route-health flips +
-        // promotion. Handles SNI-passthrough routes bound to TLS/Passthrough listeners.
-        let tls_route_ctrl =
-            KubeController::for_shared_stream(tls_routes.into_stream(), tls_routes_reader)
-                .reconcile_all_on(tls_route_rx)
-                .run(reconcile_tls_route, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, tls_route_ctrl, "TLSRoute");
-
-        // --- TCPRoute: primary only; re-driven on tcp-route-health flips +
-        // promotion. Handles raw-TCP routes bound to protocol:TCP listeners.
-        let tcp_route_ctrl =
-            KubeController::for_shared_stream(tcp_routes.into_stream(), tcp_routes_reader)
-                .reconcile_all_on(tcp_route_rx)
-                .run(reconcile_tcp_route, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, tcp_route_ctrl, "TCPRoute");
-
-        // --- UDPRoute: primary only; re-driven on udp-route-health flips +
-        // promotion. Handles datagram routes bound to protocol:UDP listeners.
-        let udp_route_ctrl =
-            KubeController::for_shared_stream(udp_routes.into_stream(), udp_routes_reader)
-                .reconcile_all_on(udp_route_rx)
-                .run(reconcile_udp_route, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, udp_route_ctrl, "UDPRoute");
-
-        // --- Ingress: primary Ingress, secondary IngressClass → all Ingresses
-        // (ownership re-checked per reconcile); re-driven on promotion. ---
-        let ingress_ctrl =
-            KubeController::for_shared_stream(ingresses.into_stream(), ingresses_reader.clone())
-                .watches_shared_stream(ingress_classes.into_stream(), {
-                    let ing_store = ingresses_reader.clone();
-                    move |_ic: Arc<IngressClass>| -> Vec<ObjectRef<Ingress>> {
-                        ing_store
-                            .state()
-                            .into_iter()
-                            .map(|ing| ObjectRef::from_obj(ing.as_ref()))
-                            .collect()
-                    }
-                })
-                .reconcile_all_on(ing_rx)
-                .run(reconcile_ingress, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, ingress_ctrl, "Ingress");
-
-        // --- BackendTLSPolicy: primary only; re-driven on policy-health flips +
-        // promotion. ---
-        let policy_ctrl =
-            KubeController::for_shared_stream(policies.into_stream(), policies_reader)
-                .reconcile_all_on(pol_rx)
-                .run(reconcile_policy, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, policy_ctrl, "BackendTLSPolicy");
-
-        // --- ClientTrafficPolicy: primary only; re-driven on ctp-health flips +
-        // promotion (#327). ---
-        let ctp_ctrl =
-            KubeController::for_shared_stream(client_traffic_policies.into_stream(), ctps_reader)
-                .reconcile_all_on(ctp_rx)
-                .run(reconcile_ctp, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, ctp_ctrl, "ClientTrafficPolicy");
-
-        // --- CoxswainBackendPolicy: primary only; re-driven on cbp-health flips +
-        // promotion (#354). ---
-        let cbp_ctrl =
-            KubeController::for_shared_stream(coxswain_backend_policies.into_stream(), cbps_reader)
-                .reconcile_all_on(cbp_rx)
-                .run(reconcile_cbp, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, cbp_ctrl, "CoxswainBackendPolicy");
-
-        // --- CoxswainExternalAuth: primary only; re-driven on external-auth-health
-        // flips + promotion (#23). ---
-        let ea_ctrl = KubeController::for_shared_stream(
-            coxswain_external_auths.into_stream(),
-            external_auths_reader,
-        )
-        .reconcile_all_on(ea_rx)
-        .run(reconcile_external_auth, error_policy, ctx.clone());
-        spawn_controller_stream(&mut tasks, ea_ctrl, "CoxswainExternalAuth");
-
-        tracing::info!(pod = %self.config.pod_name, is_leader, "Status-writer work-queues active");
+        tracing::info!(pod = %self.config.pod_name, is_leader, "Status worker active");
 
         let mut renewal_interval = tokio::time::interval_at(
             tokio::time::Instant::now() + self.config.lease.renew_interval,
@@ -700,13 +538,10 @@ impl Controller {
                         crate::metrics::leader_transitions_total().inc();
                         self.publish_leadership(is_leader);
                         if is_leader {
-                            // Promotion: re-drive every work-queue so Gateways /
-                            // routes / policies observed while we were standby
-                            // (their status writes gated off) are reconciled now,
-                            // not at the next watch event.
-                            for tx in &leadership_txs {
-                                let _ = tx.unbounded_send(());
-                            }
+                            // Promotion: re-enqueue the whole world so objects
+                            // observed while we were standby (status writes gated
+                            // off) are reconciled now, not at the next rebuild.
+                            enqueue_all_status(&self.queue, &stores);
                         }
                     }
                 }
@@ -838,50 +673,227 @@ impl BackgroundService for Controller {
     }
 }
 
-/// Bridge a health `watch::Receiver<u64>` onto an `mpsc` `()` stream feeding a
-/// work-queue's `reconcile_all_on`. The initial value is dropped via
-/// `borrow_and_update` so a fresh subscription does not fire a spurious
-/// re-drive before any health flip.
-fn spawn_health_forwarder(
-    tasks: &mut JoinSet<()>,
-    mut rx: tokio::sync::watch::Receiver<u64>,
-    tx: UnboundedSender<()>,
+/// Concurrency cap for in-flight status reconciles (#574). The single `get()`
+/// consumer hands each key to a spawned handler; this bounds how many patch
+/// round-trips run at once — matching the old per-`Controller` parallelism
+/// without letting a churn burst spawn unboundedly.
+const WORKER_CONCURRENCY: usize = 8;
+
+/// The unified status/provisioning worker (#574). Single consumer of `queue`:
+/// drains keys, resolves each to its live object, dispatches to the matching
+/// `reconcile_*` handler, and bounds in-flight reconciles with a semaphore. A
+/// deferred outcome re-enqueues via `add_after`; every key is marked `done` when
+/// its handler finishes (a re-add that lands mid-reconcile is coalesced by the
+/// queue into exactly one follow-up).
+async fn run_status_worker(
+    queue: StatusWorkqueue,
+    ctx: Arc<ReconcileContext>,
+    operator_ctx: Option<Arc<OperatorReconcileContext>>,
 ) {
-    tasks.spawn(async move {
-        let _ = rx.borrow_and_update();
-        while rx.changed().await.is_ok() {
-            if tx.unbounded_send(()).is_err() {
-                break;
-            }
+    /// Runs `queue.done(key)` on drop — including on an unwind. Without this, a
+    /// panic in a handler (a bug in an `*_events` helper) would skip `done`,
+    /// leaving the key stuck in the queue's `processing` set forever: every later
+    /// `add` would coalesce into `dirty` and never re-enqueue, so the object goes
+    /// permanently un-reconciled. The guard restores the fault isolation the old
+    /// per-kind `kube::runtime::Controller` gave for free — after `done` runs the
+    /// next rebuild's `enqueue_status_keys` re-drives the object.
+    struct DoneGuard {
+        queue: StatusWorkqueue,
+        key: StatusKey,
+    }
+    impl Drop for DoneGuard {
+        fn drop(&mut self) {
+            self.queue.done(&self.key);
         }
-    });
+    }
+
+    let sem = Arc::new(tokio::sync::Semaphore::new(WORKER_CONCURRENCY));
+    while let Some(key) = queue.get().await {
+        // Bound in-flight handlers. `acquire_owned` only errors if the semaphore
+        // is closed, which never happens (we hold it for the worker's lifetime),
+        // so a failure means shutdown — stop draining.
+        let Ok(permit) = Arc::clone(&sem).acquire_owned().await else {
+            break;
+        };
+        let ctx = Arc::clone(&ctx);
+        let operator_ctx = operator_ctx.clone();
+        let queue = queue.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let guard = DoneGuard {
+                queue: queue.clone(),
+                key: key.clone(),
+            };
+            // A deferred outcome re-enqueues; on a handler panic this line is
+            // skipped by the unwind and `guard` still frees the key.
+            let outcome = dispatch(&key, &ctx, operator_ctx.as_ref()).await;
+            if let Some(delay) = outcome.requeue_after() {
+                queue.add_after(key.clone(), delay);
+            }
+            drop(guard);
+        });
+    }
 }
 
-/// Drain a kube `Controller::run` stream, logging reconcile errors. The stream
-/// owns the work-queue; dropping it would stop reconciliation, so it is kept
-/// running until the service shuts down (which aborts the `JoinSet`).
-fn spawn_controller_stream<K>(
-    tasks: &mut JoinSet<()>,
-    stream: impl futures::Stream<
-        Item = Result<
-            (ObjectRef<K>, Action),
-            kube::runtime::controller::Error<Infallible, kube::runtime::watcher::Error>,
-        >,
-    > + Send
-    + 'static,
-    label: &'static str,
-) where
-    K: kube::Resource + 'static,
+/// Resolve a `StatusKey`'s object from its store, tolerating cluster-scoped
+/// resources (empty namespace) and objects deleted since enqueue.
+fn resolve<K>(store: &kube::runtime::reflector::Store<K>, key: &ObjectKey) -> Option<Arc<K>>
+where
+    K: kube::Resource + Clone + 'static,
+    K::DynamicType: Eq + std::hash::Hash + Clone + Default,
 {
-    tasks.spawn(async move {
-        tokio::pin!(stream);
-        while let Some(res) = stream.next().await {
-            if let Err(e) = res {
-                tracing::debug!(controller = label, error = %e, "status-writer: controller stream error");
+    let mut object_ref = ObjectRef::<K>::new(&key.name);
+    if !key.ns.is_empty() {
+        object_ref = object_ref.within(&key.ns);
+    }
+    store.get(&object_ref)
+}
+
+/// Combine two reconcile outcomes into the sooner re-drive: the min requeue
+/// delay if either defers, else `AwaitChange`. Used where the shared-pool status
+/// writer and the dedicated operator both run on one Gateway (each no-ops for
+/// the other's mode) so a deferred condition on either side re-drives promptly.
+fn sooner_requeue(a: StatusOutcome, b: StatusOutcome) -> StatusOutcome {
+    match (a.requeue_after(), b.requeue_after()) {
+        (Some(x), Some(y)) => StatusOutcome::requeue(x.min(y)),
+        (Some(d), None) | (None, Some(d)) => StatusOutcome::requeue(d),
+        (None, None) => StatusOutcome::AwaitChange,
+    }
+}
+
+/// Dispatch one drained key to its status handler. A key whose object was
+/// deleted since enqueue resolves to nothing — there is no status left to write,
+/// so it settles as [`StatusOutcome::AwaitChange`].
+async fn dispatch(
+    key: &StatusKey,
+    ctx: &ReconcileContext,
+    operator_ctx: Option<&Arc<OperatorReconcileContext>>,
+) -> StatusOutcome {
+    match key.kind {
+        StatusKind::Gateway => match resolve(&ctx.gateways, &key.object) {
+            Some(o) => {
+                // Shared-pool status writer; skips dedicated Gateways (returns
+                // `AwaitChange` for them — the operator owns their status).
+                let shared = reconcile_gateway(&o, ctx).await;
+                // Dedicated provisioning + status (#574 fold). Runs for every
+                // Gateway when the operator is wired; it no-ops for pure-shared
+                // Gateways (the inverse skip), so exactly one of the two writes.
+                // Take the sooner requeue so a deferred condition on either side
+                // (bind gate / migration / backoff) re-drives promptly.
+                match operator_ctx {
+                    Some(op) => {
+                        let dedicated = reconcile_dedicated(Arc::clone(&o), Arc::clone(op)).await;
+                        sooner_requeue(shared, dedicated)
+                    }
+                    None => shared,
+                }
+            }
+            None => StatusOutcome::AwaitChange,
+        },
+        StatusKind::GatewayClass => match resolve(&ctx.gateway_classes, &key.object) {
+            Some(o) => reconcile_gateway_class(&o, ctx).await,
+            None => StatusOutcome::AwaitChange,
+        },
+        StatusKind::HttpRoute => match resolve(&ctx.routes, &key.object) {
+            Some(o) => reconcile_route(&o, ctx).await,
+            None => StatusOutcome::AwaitChange,
+        },
+        StatusKind::GrpcRoute => match resolve(&ctx.grpc_routes, &key.object) {
+            Some(o) => reconcile_grpc_route(&o, ctx).await,
+            None => StatusOutcome::AwaitChange,
+        },
+        StatusKind::TlsRoute => match resolve(&ctx.tls_routes, &key.object) {
+            Some(o) => reconcile_tls_route(&o, ctx).await,
+            None => StatusOutcome::AwaitChange,
+        },
+        StatusKind::TcpRoute => match resolve(&ctx.tcp_routes, &key.object) {
+            Some(o) => reconcile_tcp_route(&o, ctx).await,
+            None => StatusOutcome::AwaitChange,
+        },
+        StatusKind::UdpRoute => match resolve(&ctx.udp_routes, &key.object) {
+            Some(o) => reconcile_udp_route(&o, ctx).await,
+            None => StatusOutcome::AwaitChange,
+        },
+        StatusKind::Ingress => match resolve(&ctx.ingresses, &key.object) {
+            Some(o) => reconcile_ingress(&o, ctx).await,
+            None => StatusOutcome::AwaitChange,
+        },
+        StatusKind::IngressClass => StatusOutcome::AwaitChange,
+        StatusKind::BackendTlsPolicy => match resolve(&ctx.policies, &key.object) {
+            Some(o) => reconcile_policy(&o, ctx).await,
+            None => StatusOutcome::AwaitChange,
+        },
+        StatusKind::ListenerSet => match resolve(&ctx.listener_sets, &key.object) {
+            Some(o) => reconcile_listenerset(&o, ctx).await,
+            None => StatusOutcome::AwaitChange,
+        },
+        StatusKind::ClientTrafficPolicy => match resolve(&ctx.client_traffic_policies, &key.object)
+        {
+            Some(o) => reconcile_ctp(&o, ctx).await,
+            None => StatusOutcome::AwaitChange,
+        },
+        StatusKind::CoxswainBackendPolicy => {
+            match resolve(&ctx.coxswain_backend_policies, &key.object) {
+                Some(o) => reconcile_cbp(&o, ctx).await,
+                None => StatusOutcome::AwaitChange,
             }
         }
-        tracing::warn!(controller = label, "status-writer: controller stream ended");
-    });
+        StatusKind::CoxswainExternalAuth => {
+            match resolve(&ctx.coxswain_external_auths, &key.object) {
+                Some(o) => reconcile_external_auth(&o, ctx).await,
+                None => StatusOutcome::AwaitChange,
+            }
+        }
+        // `StatusKind` is `#[non_exhaustive]`: a kind added upstream but not yet
+        // wired here simply isn't reconciled until this match is extended — a
+        // degrade, never a panic (the control plane must not crash on a new
+        // variant). See memory `non_exhaustive_wildcard_panic`.
+        _ => StatusOutcome::AwaitChange,
+    }
+}
+
+/// Re-enqueue every status-relevant object from the authoritative stores — used
+/// at startup and on leader promotion so standby-era objects reconcile promptly
+/// rather than waiting for the reflector's next rebuild. The reflector enqueues
+/// the same set after each rebuild; the queue de-duplicates.
+fn enqueue_all_status(queue: &StatusWorkqueue, stores: &StatusStores) {
+    fn enq<K>(queue: &StatusWorkqueue, kind: StatusKind, store: &kube::runtime::reflector::Store<K>)
+    where
+        K: kube::Resource + Clone + 'static,
+        K::DynamicType: Eq + std::hash::Hash + Clone + Default,
+    {
+        for obj in store.state() {
+            if let Some(name) = obj.meta().name.clone() {
+                let ns = obj.meta().namespace.clone().unwrap_or_default();
+                queue.add(StatusKey::new(kind, ObjectKey::new(ns, name)));
+            }
+        }
+    }
+    enq(queue, StatusKind::Gateway, &stores.gateways);
+    enq(queue, StatusKind::GatewayClass, &stores.gateway_classes);
+    enq(queue, StatusKind::HttpRoute, &stores.routes);
+    enq(queue, StatusKind::GrpcRoute, &stores.grpc_routes);
+    enq(queue, StatusKind::TlsRoute, &stores.tls_routes);
+    enq(queue, StatusKind::TcpRoute, &stores.tcp_routes);
+    enq(queue, StatusKind::UdpRoute, &stores.udp_routes);
+    enq(queue, StatusKind::Ingress, &stores.ingresses);
+    enq(queue, StatusKind::BackendTlsPolicy, &stores.policies);
+    enq(queue, StatusKind::ListenerSet, &stores.listener_sets);
+    enq(
+        queue,
+        StatusKind::ClientTrafficPolicy,
+        &stores.client_traffic_policies,
+    );
+    enq(
+        queue,
+        StatusKind::CoxswainBackendPolicy,
+        &stores.coxswain_backend_policies,
+    );
+    enq(
+        queue,
+        StatusKind::CoxswainExternalAuth,
+        &stores.coxswain_external_auths,
+    );
 }
 
 /// State shared across every reconcile invocation of all five work-queues.
@@ -917,6 +929,22 @@ struct ReconcileContext {
     /// Synced Gateway store, read by the ListenerSet reconciler to resolve a
     /// ListenerSet's parent Gateway and its ownership/mode (GEP-1713).
     gateways: kube::runtime::reflector::Store<Gateway>,
+    /// Synced stores the unified worker (#574) resolves each drained
+    /// [`StatusKey`] to its live object through, before dispatching to the
+    /// matching `reconcile_*` handler. The three above (`gateways`,
+    /// `gateway_classes`, `ingress_classes`) double as cross-lookup stores; the
+    /// rest exist solely so the worker can fetch the primary object by key.
+    routes: kube::runtime::reflector::Store<HttpRoute>,
+    grpc_routes: kube::runtime::reflector::Store<GrpcRoute>,
+    tls_routes: kube::runtime::reflector::Store<TlsRoute>,
+    tcp_routes: kube::runtime::reflector::Store<TcpRoute>,
+    udp_routes: kube::runtime::reflector::Store<UdpRoute>,
+    ingresses: kube::runtime::reflector::Store<Ingress>,
+    listener_sets: kube::runtime::reflector::Store<ListenerSet>,
+    policies: kube::runtime::reflector::Store<BackendTlsPolicy>,
+    client_traffic_policies: kube::runtime::reflector::Store<ClientTrafficPolicy>,
+    coxswain_backend_policies: kube::runtime::reflector::Store<CoxswainBackendPolicy>,
+    coxswain_external_auths: kube::runtime::reflector::Store<CoxswainExternalAuth>,
     /// Definitively-failed static-address VIP set (#533), published by the
     /// operator VIP reconciler; read to hold a still-provisioning Gateway at
     /// `Pending` instead of a premature `AddressNotUsable`.
@@ -980,12 +1008,43 @@ impl ReconcileContext {
     }
 }
 
-/// Error policy shared by every work-queue. The status reconcilers are
-/// infallible ([`Infallible`]) — every fallible patch is a fire-and-forget log
-/// inside the `*_events` helpers — so this is never invoked; it exists only to
-/// satisfy `Controller::run`.
-fn error_policy<K>(_obj: Arc<K>, _err: &Infallible, _ctx: Arc<ReconcileContext>) -> Action {
-    Action::requeue(ERROR_REQUEUE)
+/// Outcome of a status reconcile in the unified worker (#574).
+///
+/// Mirrors the two shapes of `kube::runtime::controller::Action` the status
+/// handlers used, but is inspectable so the worker can map it onto the work
+/// queue — kube's `Action` hides its requeue delay behind a private field. The
+/// status reconcilers are infallible (every fallible patch is a fire-and-forget
+/// log inside the `*_events` helpers), so there is no error variant: a deferred
+/// condition re-drives via [`StatusOutcome::Requeue`], everything else waits for
+/// the next rebuild to re-enqueue it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum StatusOutcome {
+    /// Re-enqueue this object after the delay — a deferred condition that the
+    /// current world can't yet settle (e.g. the #531 `Programmed` bind gate, the
+    /// dedicated→shared migration handoff, a non-leader deferral).
+    Requeue(std::time::Duration),
+    /// Nothing more to do until the next rebuild re-enqueues the object.
+    AwaitChange,
+}
+
+impl StatusOutcome {
+    /// Re-drive after `after` — the `Action::requeue` analogue.
+    pub(crate) fn requeue(after: std::time::Duration) -> Self {
+        Self::Requeue(after)
+    }
+
+    /// Wait for the next rebuild — the `Action::await_change` analogue.
+    pub(crate) fn await_change() -> Self {
+        Self::AwaitChange
+    }
+
+    /// The requeue delay, if this outcome defers.
+    pub(crate) fn requeue_after(self) -> Option<std::time::Duration> {
+        match self {
+            Self::Requeue(d) => Some(d),
+            Self::AwaitChange => None,
+        }
+    }
 }
 
 /// Last-moment leadership re-check before a status write (#531 HA rider).
@@ -1005,19 +1064,16 @@ fn leader_write_fence(ctx: &ReconcileContext) -> bool {
     leading
 }
 
-async fn reconcile_gateway(
-    gw: Arc<Gateway>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+async fn reconcile_gateway(gw: &Gateway, ctx: &ReconcileContext) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_gateway_inner(&gw, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_gateway_inner(gw, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
-async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action {
+async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
 
     // Ownership is read from the synced GatewayClass store at reconcile time —
@@ -1038,13 +1094,13 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
     // remove it (the Gateway still exists).
     if !owned.contains(class_name) {
         ctx.track_held_pending(&key, false);
-        return Action::await_change();
+        return StatusOutcome::await_change();
     }
     // Dedicated-mode Gateways are the operator's to write (#211); skipping here
     // keeps the two writers from racing on `status.conditions`.
     if is_dedicated_mode(gw, &owned_dedicated) {
         ctx.track_held_pending(&key, false);
-        return Action::await_change();
+        return StatusOutcome::await_change();
     }
 
     // Shared-mode Gateways advertise their OWN per-Gateway VIP Service address
@@ -1280,7 +1336,7 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
         // event. Slow-requeue as the self-heal backstop instead.
         if !converged {
             ctx.track_held_pending(&key, true);
-            Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
+            StatusOutcome::requeue(DEFERRED_PROGRAMMED_REQUEUE)
         } else if matches!(patch_outcome, gateway_events::GatewayPatchOutcome::Conflict) {
             // The desired status is NOT on the object: the pinned
             // resourceVersion lost a stale-view race. Requeue promptly to
@@ -1288,22 +1344,22 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
             // writer's watch event alone — a missed/coalesced event otherwise
             // strands stale conditions indefinitely (#570).
             ctx.track_held_pending(&key, false);
-            Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
+            StatusOutcome::requeue(DEFERRED_PROGRAMMED_REQUEUE)
         } else if matches!(patch_outcome, gateway_events::GatewayPatchOutcome::Failed) {
             // Possibly-persistent write failure (RBAC, webhook, transport):
             // retry on the slow error cadence so a misconfigured install
             // doesn't hammer the apiserver at the deferred cadence forever.
             ctx.track_held_pending(&key, false);
-            Action::requeue(ERROR_REQUEUE)
+            StatusOutcome::requeue(ERROR_REQUEUE)
         } else if decision.settled_negative || decision.static_outcome.is_address_not_usable() {
             // Settled negatives (#570) share the #558 backstop: recovery is
             // event-driven (health flip / spec edit re-drives the queue), but
             // a negative must never go fully quiet on a missed event.
             ctx.track_held_pending(&key, false);
-            Action::requeue(SETTLED_NEGATIVE_REQUEUE)
+            StatusOutcome::requeue(SETTLED_NEGATIVE_REQUEUE)
         } else {
             ctx.track_held_pending(&key, false);
-            Action::await_change()
+            StatusOutcome::await_change()
         }
     } else if !gateway_accepted(gw) {
         // Before the data plane is synced, write the minimal Accepted-oriented
@@ -1321,12 +1377,12 @@ async fn reconcile_gateway_inner(gw: &Gateway, ctx: &ReconcileContext) -> Action
             .await;
         }
         ctx.track_held_pending(&key, true);
-        Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
+        StatusOutcome::requeue(DEFERRED_PROGRAMMED_REQUEUE)
     } else {
         // Accepted already set, but the subsystem is not ready yet: revisit
         // shortly so `Programmed` lands without waiting for the next event.
         ctx.track_held_pending(&key, true);
-        Action::requeue(DEFERRED_PROGRAMMED_REQUEUE)
+        StatusOutcome::requeue(DEFERRED_PROGRAMMED_REQUEUE)
     }
 }
 
@@ -1613,23 +1669,20 @@ fn service_vip_address(svc: &k8s_openapi::api::core::v1::Service) -> Option<Stat
     }
 }
 
-async fn reconcile_listenerset(
-    ls: Arc<ListenerSet>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+async fn reconcile_listenerset(ls: &ListenerSet, ctx: &ReconcileContext) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_listenerset_inner(&ls, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_listenerset_inner(ls, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
 /// GEP-1713: write `ListenerSet.status`. Resolves the ListenerSet's parent Gateway
 /// and writes status only when this controller manages it (owned class) and it
 /// runs on the shared pool — a dedicated-mode Gateway (and its ListenerSets) is
 /// the operator's to write, mirroring [`reconcile_gateway_inner`]'s split.
-async fn reconcile_listenerset_inner(ls: &ListenerSet, ctx: &ReconcileContext) -> Action {
+async fn reconcile_listenerset_inner(ls: &ListenerSet, ctx: &ReconcileContext) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
 
     let ls_ns = ls.metadata.namespace.as_deref().unwrap_or("default");
@@ -1641,23 +1694,23 @@ async fn reconcile_listenerset_inner(ls: &ListenerSet, ctx: &ReconcileContext) -
     // observed; the Gateway → ListenerSet secondary watch re-drives this once it lands.
     let parent_ref = ObjectRef::<Gateway>::new(parent.name.as_str()).within(parent_ns);
     let Some(parent_gw) = ctx.gateways.get(&parent_ref) else {
-        return Action::await_change();
+        return StatusOutcome::await_change();
     };
 
     let classes = ctx.gateway_classes.state();
     let (owned, owned_dedicated) = classify_gateway_classes(&classes, &ctx.controller_name);
     if !owned.contains(parent_gw.spec.gateway_class_name.as_str()) {
-        return Action::await_change();
+        return StatusOutcome::await_change();
     }
     if is_dedicated_mode(&parent_gw, &owned_dedicated) {
-        return Action::await_change();
+        return StatusOutcome::await_change();
     }
 
     if !ctx.health.is_subsystem_ready("controller") {
         // Defer until the data plane has computed listener status; requeue rather
         // than await_change so a fresh ListenerSet doesn't stall until an
         // unrelated edit (mirrors the Gateway path's deferred-Programmed requeue).
-        return Action::requeue(DEFERRED_PROGRAMMED_REQUEUE);
+        return StatusOutcome::requeue(DEFERRED_PROGRAMMED_REQUEUE);
     }
 
     let health_map = ctx.listener_status.load();
@@ -1679,25 +1732,22 @@ async fn reconcile_listenerset_inner(ls: &ListenerSet, ctx: &ReconcileContext) -
         )
         .await;
     }
-    Action::await_change()
+    StatusOutcome::await_change()
 }
 
-async fn reconcile_gateway_class(
-    gc: Arc<GatewayClass>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+async fn reconcile_gateway_class(gc: &GatewayClass, ctx: &ReconcileContext) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_gateway_class_inner(&gc, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_gateway_class_inner(gc, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
-async fn reconcile_gateway_class_inner(gc: &GatewayClass, ctx: &ReconcileContext) -> Action {
+async fn reconcile_gateway_class_inner(gc: &GatewayClass, ctx: &ReconcileContext) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
     if gc.spec.controller_name != ctx.controller_name {
-        return Action::await_change();
+        return StatusOutcome::await_change();
     }
     if gateway_class_needs_status_patch(gc) {
         let Some(generation) = gc.metadata.generation else {
@@ -1705,29 +1755,26 @@ async fn reconcile_gateway_class_inner(gc: &GatewayClass, ctx: &ReconcileContext
                 name = gc.metadata.name.as_deref().unwrap_or(""),
                 "Skipping GatewayClass status patch: metadata.generation is unset"
             );
-            return Action::await_change();
+            return StatusOutcome::await_change();
         };
         let name = gc.metadata.name.as_deref().unwrap_or_default();
         if leader_write_fence(ctx) {
             gateway_class_events::patch_gateway_class_status(&ctx.client, name, generation).await;
         }
     }
-    Action::await_change()
+    StatusOutcome::await_change()
 }
 
-async fn reconcile_route(
-    route: Arc<HttpRoute>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+async fn reconcile_route(route: &HttpRoute, ctx: &ReconcileContext) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_route_inner(&route, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_route_inner(route, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
-async fn reconcile_route_inner(route: &HttpRoute, ctx: &ReconcileContext) -> Action {
+async fn reconcile_route_inner(route: &HttpRoute, ctx: &ReconcileContext) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
     // `mark_http_route_programmed` is idempotent (skips the patch when the
     // route already carries the conditions we would write), so it is safe to
@@ -1745,22 +1792,19 @@ async fn reconcile_route_inner(route: &HttpRoute, ctx: &ReconcileContext) -> Act
         )
         .await;
     }
-    Action::await_change()
+    StatusOutcome::await_change()
 }
 
-async fn reconcile_grpc_route(
-    route: Arc<GrpcRoute>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+async fn reconcile_grpc_route(route: &GrpcRoute, ctx: &ReconcileContext) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_grpc_route_inner(&route, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_grpc_route_inner(route, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
-async fn reconcile_grpc_route_inner(route: &GrpcRoute, ctx: &ReconcileContext) -> Action {
+async fn reconcile_grpc_route_inner(route: &GrpcRoute, ctx: &ReconcileContext) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
     let owned = ctx.owned_gateways.load();
     let rh = ctx.grpc_route_status.load();
@@ -1774,22 +1818,19 @@ async fn reconcile_grpc_route_inner(route: &GrpcRoute, ctx: &ReconcileContext) -
         )
         .await;
     }
-    Action::await_change()
+    StatusOutcome::await_change()
 }
 
-async fn reconcile_tls_route(
-    route: Arc<TlsRoute>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+async fn reconcile_tls_route(route: &TlsRoute, ctx: &ReconcileContext) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_tls_route_inner(&route, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_tls_route_inner(route, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
-async fn reconcile_tls_route_inner(route: &TlsRoute, ctx: &ReconcileContext) -> Action {
+async fn reconcile_tls_route_inner(route: &TlsRoute, ctx: &ReconcileContext) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
     let owned = ctx.owned_gateways.load();
     let rh = ctx.tls_route_status.load();
@@ -1803,22 +1844,19 @@ async fn reconcile_tls_route_inner(route: &TlsRoute, ctx: &ReconcileContext) -> 
         )
         .await;
     }
-    Action::await_change()
+    StatusOutcome::await_change()
 }
 
-async fn reconcile_tcp_route(
-    route: Arc<TcpRoute>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+async fn reconcile_tcp_route(route: &TcpRoute, ctx: &ReconcileContext) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_tcp_route_inner(&route, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_tcp_route_inner(route, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
-async fn reconcile_tcp_route_inner(route: &TcpRoute, ctx: &ReconcileContext) -> Action {
+async fn reconcile_tcp_route_inner(route: &TcpRoute, ctx: &ReconcileContext) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
     let owned = ctx.owned_gateways.load();
     let rh = ctx.tcp_route_status.load();
@@ -1832,22 +1870,19 @@ async fn reconcile_tcp_route_inner(route: &TcpRoute, ctx: &ReconcileContext) -> 
         )
         .await;
     }
-    Action::await_change()
+    StatusOutcome::await_change()
 }
 
-async fn reconcile_udp_route(
-    route: Arc<UdpRoute>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+async fn reconcile_udp_route(route: &UdpRoute, ctx: &ReconcileContext) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_udp_route_inner(&route, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_udp_route_inner(route, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
-async fn reconcile_udp_route_inner(route: &UdpRoute, ctx: &ReconcileContext) -> Action {
+async fn reconcile_udp_route_inner(route: &UdpRoute, ctx: &ReconcileContext) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
     let owned = ctx.owned_gateways.load();
     let rh = ctx.udp_route_status.load();
@@ -1861,25 +1896,22 @@ async fn reconcile_udp_route_inner(route: &UdpRoute, ctx: &ReconcileContext) -> 
         )
         .await;
     }
-    Action::await_change()
+    StatusOutcome::await_change()
 }
 
-async fn reconcile_ingress(
-    ing: Arc<Ingress>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+async fn reconcile_ingress(ing: &Ingress, ctx: &ReconcileContext) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_ingress_inner(&ing, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_ingress_inner(ing, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
-async fn reconcile_ingress_inner(ing: &Ingress, ctx: &ReconcileContext) -> Action {
+async fn reconcile_ingress_inner(ing: &Ingress, ctx: &ReconcileContext) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
     let Some(addr) = ctx.status_address.as_ref() else {
-        return Action::await_change();
+        return StatusOutcome::await_change();
     };
     let classes = ctx.ingress_classes.state();
     let (owned_classes, default_classes) = classify_ingress_classes(&classes, &ctx.controller_name);
@@ -1891,22 +1923,22 @@ async fn reconcile_ingress_inner(ing: &Ingress, ctx: &ReconcileContext) -> Actio
     {
         ingress_events::patch_ingress_status(&ctx.client, ing, addr, ctx.ingress_ports).await;
     }
-    Action::await_change()
+    StatusOutcome::await_change()
 }
 
-async fn reconcile_policy(
-    policy: Arc<BackendTlsPolicy>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+async fn reconcile_policy(policy: &BackendTlsPolicy, ctx: &ReconcileContext) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_policy_inner(&policy, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_policy_inner(policy, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
-async fn reconcile_policy_inner(policy: &BackendTlsPolicy, ctx: &ReconcileContext) -> Action {
+async fn reconcile_policy_inner(
+    policy: &BackendTlsPolicy,
+    ctx: &ReconcileContext,
+) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
     let ph = ctx.policy_status.load();
     if leader_write_fence(ctx) {
@@ -1918,22 +1950,22 @@ async fn reconcile_policy_inner(policy: &BackendTlsPolicy, ctx: &ReconcileContex
         )
         .await;
     }
-    Action::await_change()
+    StatusOutcome::await_change()
 }
 
-async fn reconcile_ctp(
-    policy: Arc<ClientTrafficPolicy>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+async fn reconcile_ctp(policy: &ClientTrafficPolicy, ctx: &ReconcileContext) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_ctp_inner(&policy, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_ctp_inner(policy, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
-async fn reconcile_ctp_inner(policy: &ClientTrafficPolicy, ctx: &ReconcileContext) -> Action {
+async fn reconcile_ctp_inner(
+    policy: &ClientTrafficPolicy,
+    ctx: &ReconcileContext,
+) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
     let ch = ctx.ctp_status.load();
     if leader_write_fence(ctx) {
@@ -1945,22 +1977,22 @@ async fn reconcile_ctp_inner(policy: &ClientTrafficPolicy, ctx: &ReconcileContex
         )
         .await;
     }
-    Action::await_change()
+    StatusOutcome::await_change()
 }
 
-async fn reconcile_cbp(
-    policy: Arc<CoxswainBackendPolicy>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+async fn reconcile_cbp(policy: &CoxswainBackendPolicy, ctx: &ReconcileContext) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_cbp_inner(&policy, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_cbp_inner(policy, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
-async fn reconcile_cbp_inner(policy: &CoxswainBackendPolicy, ctx: &ReconcileContext) -> Action {
+async fn reconcile_cbp_inner(
+    policy: &CoxswainBackendPolicy,
+    ctx: &ReconcileContext,
+) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
     let ch = ctx.cbp_status.load();
     if leader_write_fence(ctx) {
@@ -1972,25 +2004,25 @@ async fn reconcile_cbp_inner(policy: &CoxswainBackendPolicy, ctx: &ReconcileCont
         )
         .await;
     }
-    Action::await_change()
+    StatusOutcome::await_change()
 }
 
 async fn reconcile_external_auth(
-    policy: Arc<CoxswainExternalAuth>,
-    ctx: Arc<ReconcileContext>,
-) -> Result<Action, Infallible> {
+    policy: &CoxswainExternalAuth,
+    ctx: &ReconcileContext,
+) -> StatusOutcome {
     let started = std::time::Instant::now();
-    let res: Result<Action, Infallible> = Ok(reconcile_external_auth_inner(&policy, &ctx).await);
-    crate::metrics::observe_reconcile("status_writer", started, &res);
-    res
+    let outcome = reconcile_external_auth_inner(policy, ctx).await;
+    crate::metrics::observe_reconcile("status_writer", started, &Ok::<_, Infallible>(outcome));
+    outcome
 }
 
 async fn reconcile_external_auth_inner(
     policy: &CoxswainExternalAuth,
     ctx: &ReconcileContext,
-) -> Action {
+) -> StatusOutcome {
     if !ctx.leader.load(Ordering::Acquire) {
-        return Action::requeue(NON_LEADER_REQUEUE);
+        return StatusOutcome::requeue(NON_LEADER_REQUEUE);
     }
     let ch = ctx.external_auth_status.load();
     if leader_write_fence(ctx) {
@@ -2002,7 +2034,7 @@ async fn reconcile_external_auth_inner(
         )
         .await;
     }
-    Action::await_change()
+    StatusOutcome::await_change()
 }
 
 /// Classify GatewayClasses from a synced store snapshot into `(owned,

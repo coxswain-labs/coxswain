@@ -18,6 +18,8 @@ use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::OwnedGateways;
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames};
+use coxswain_core::workqueue::RateLimitConfig;
+use coxswain_reflector::StatusWorkqueue;
 use coxswain_reflector::{
     ControllerReconciler, IngressEvent, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
     SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus,
@@ -197,6 +199,9 @@ pub fn spawn_status_writer(
         "path_rewrite_regex",
         "basic_auth",
         "request_size_limit",
+        // #574 operator fold: the reflector now drives these two operator watches.
+        "coxswain_gateway_parameters",
+        "node",
     ];
 
     let mut controller_checks: Vec<&str> = ALWAYS_ON_CHECKS.to_vec();
@@ -235,6 +240,13 @@ pub fn spawn_status_writer(
     // events to be dropped rather than back-pressuring the rebuild loop.
     let (ingress_event_tx, ingress_event_rx) = tokio::sync::mpsc::channel::<IngressEvent>(256);
 
+    // The single status/provisioning work queue (#574): the reflector's rebuild
+    // pass enqueues into it; the controller's worker drains it. The rate-limiter
+    // shape matches the controller's per-object error backoff (0.5s → 15s) so a
+    // handler that defers via `add_rate_limited` ramps like the old
+    // `error_policy` did.
+    let status_queue = StatusWorkqueue::new(RateLimitConfig::default());
+
     let reconciler = ControllerReconciler::new(
         ReconcilerOutputs {
             ingress_routes: outputs.ingress_routes.clone(),
@@ -261,10 +273,11 @@ pub fn spawn_status_writer(
             opts.ingress_ports = ingress_ports;
             opts.metrics_prefix = coxswain_reflector::MetricsPrefix::Controller;
             opts.watch_fleet = true;
-            // Back the status-relevant stores with shared informers so the
-            // status-writer's work-queues reuse them instead of duplicating
-            // watches (#347).
-            opts.status_subscriptions = true;
+            // Pre-create the status-relevant stores so the worker reads them and
+            // the rebuild pass enqueues from them, instead of duplicating watches
+            // (#347, #574).
+            opts.status_stores = true;
+            opts.status_queue = Some(status_queue.clone());
             opts.ingress_event_tx = Some(ingress_event_tx);
             opts.enable_gateway_api = enable_gateway_api;
             opts.enable_ingress = enable_ingress;
@@ -289,10 +302,10 @@ pub fn spawn_status_writer(
     let cbp_status: SharedCoxswainBackendPolicyStatus = reconciler.cbp_status();
     let external_auth_status: SharedCoxswainExternalAuthStatus = reconciler.external_auth_status();
 
-    // Take the shared-informer subscriptions the reconciler created (it must
-    // hand them over since we set `status_subscriptions = true` above).
-    let subscriptions = reconciler.status_subscriptions().unwrap_or_else(|| {
-        panic!("invariant: reconciler built with status_subscriptions must yield subscriptions")
+    // Take the status-store read handles the reconciler created (it must hand
+    // them over since we set `status_stores = true` above).
+    let stores = reconciler.status_stores().unwrap_or_else(|| {
+        panic!("invariant: reconciler built with status_stores must yield stores")
     });
 
     let controller_svc = Controller::new(
@@ -311,10 +324,11 @@ pub fn spawn_status_writer(
             cbp: cbp_status,
             external_auth: external_auth_status,
         },
-        subscriptions,
+        stores,
+        status_queue,
         controller,
-        Some(ingress_event_rx),
-    );
+    )
+    .with_ingress_events(Some(ingress_event_rx));
 
     Ok(SpawnedStatusWriter {
         reconciler,

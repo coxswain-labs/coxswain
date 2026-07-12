@@ -23,6 +23,7 @@ pub mod routing;
 pub mod shared;
 pub mod source;
 pub mod tls;
+pub mod workqueue;
 
 pub use dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 pub use fleet::{Component, FleetEntry, FleetSnapshot, SharedFleet};
@@ -38,3 +39,4 @@ pub use node_registry::{NodeEntry, NodeRegistry, NodeScope, SharedNodeRegistry};
 pub use publish_index::{PublishStamp, SharedGatewayPublishIndex};
 pub use shared::Shared;
 pub use source::RoutingSource;
+pub use workqueue::{RateLimitConfig, RateLimitingWorkqueue};

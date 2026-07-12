@@ -11,7 +11,7 @@ workspace = true
 
 [dependencies]
 arc-swap             = { workspace = true }
-tokio                = { workspace = true, features = ["sync"] }
+tokio                = { workspace = true, features = ["sync", "time"] }
 form_urlencoded      = { workspace = true }
 http                 = { workspace = true }
 ipnet                = { workspace = true }
@@ -33,6 +33,9 @@ zeroize              = { workspace = true }
 criterion    = { workspace = true }
 serde_yaml   = { workspace = true }
 tracing-test = { workspace = true }
+# `test-util` for the workqueue's paused-clock tests (`start_paused`); `macros`
+# + `rt` for `#[tokio::test]` when the crate is tested in isolation.
+tokio        = { workspace = true, features = ["test-util", "macros", "rt"] }
 
 [[bench]]
 name = "routing"

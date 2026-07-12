@@ -48,16 +48,24 @@ COPY --from=planner /app/recipe.json recipe.json
 # Cook only the deps reachable from the coxswain bin — skips the coxswain-e2e
 # dependency tree. Heaviest cached layer; invalidates on Cargo.lock changes only.
 ARG CARGO_BUILD_JOBS
-RUN cargo chef cook --release --recipe-path recipe.json --bin coxswain \
+# Cargo profile to build. Defaults to `release` (the shipped artifact: GHCR
+# publish, e2e, conformance). The CI `docker-image` SMOKE job overrides this to
+# `ci` (a fast, unoptimized profile, no fat LTO) since it only checks the image
+# builds and the entrypoint resolves — see [profile.ci] in Cargo.toml.
+ARG CARGO_PROFILE=release
+RUN cargo chef cook --profile ${CARGO_PROFILE} --recipe-path recipe.json --bin coxswain \
     $([ -n "$CARGO_BUILD_JOBS" ] && echo "--jobs $CARGO_BUILD_JOBS")
 COPY . .
 # Inject the pre-built UI so the include_str! in coxswain-admin resolves.
 COPY --from=ui-builder /app/ui/dist ./ui/dist
-RUN cargo build --release --bin coxswain \
+RUN cargo build --profile ${CARGO_PROFILE} --bin coxswain \
     $([ -n "$CARGO_BUILD_JOBS" ] && echo "--jobs $CARGO_BUILD_JOBS")
 
 FROM gcr.io/distroless/cc-debian13:nonroot AS runtime
-COPY --from=builder /app/target/release/coxswain /usr/local/bin/coxswain
+# Re-declare in this stage's scope; the profile name is also the target subdir
+# (`release`/`ci`), so the binary path tracks the build-arg.
+ARG CARGO_PROFILE=release
+COPY --from=builder /app/target/${CARGO_PROFILE}/coxswain /usr/local/bin/coxswain
 
 # Static OCI image-spec annotations. Dynamic ones (created, revision, version,
 # ref.name) are added at build time by docker/metadata-action in CI.

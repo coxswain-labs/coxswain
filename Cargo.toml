@@ -156,3 +156,19 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Fast-compiling profile for the CI `docker-image` SMOKE build ONLY (opted into
+# via the Dockerfile's `CARGO_PROFILE` build-arg). That job validates that the
+# production Dockerfile builds and the entrypoint resolves (`--help` /
+# `--version`) — it needs a *functional* binary, not an optimized one. Dropping
+# fat LTO (the dominant link-time cost) and opt-level is where the compile-time
+# win comes from; `codegen-units = 256` maximizes parallelism. The artifact that
+# actually ships (GHCR publish, e2e, conformance) still builds with
+# [profile.release] — nothing here changes the released binary.
+[profile.ci]
+inherits = "release"
+opt-level = 0
+lto = false
+codegen-units = 256
+debug = false
+strip = true

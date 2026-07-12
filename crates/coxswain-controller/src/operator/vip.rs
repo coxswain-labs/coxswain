@@ -66,7 +66,7 @@ const VIP_RESYNC_INTERVAL: Duration = Duration::from_secs(15);
 /// map, and applies it atomically, so no two reconciles can diverge and
 /// double-book a port. Per-Gateway reconciles only *signal* this task via
 /// [`ReconcileContext::vip_trigger`]; the periodic tick is a store-lag backstop.
-pub(super) async fn run_vip_reconciler(ctx: Arc<ReconcileContext>, mut shutdown: ShutdownWatch) {
+pub(crate) async fn run_vip_reconciler(ctx: Arc<ReconcileContext>, mut shutdown: ShutdownWatch) {
     if ctx.shared_proxy_selector.is_empty() {
         // Shared-mode per-Gateway addressing disabled (Ingress-only install).
         return;
@@ -107,7 +107,23 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
     // stuck VIP loop is alertable instead of log-only (#570).
     let mut degraded = false;
     let gateways = ctx.gateways_store.state();
-    let services = ctx.services_store.state();
+    // #574 fold: `services_store` is now the reflector's *bulk* Service store, not
+    // the operator's old VIP-component-scoped watch. Filter to our per-Gateway VIP
+    // Services here so the durable internal-port allocation below reads only their
+    // `targetPort`s — a non-VIP Service must never enter the allocation.
+    let services: Vec<_> = ctx
+        .services_store
+        .state()
+        .into_iter()
+        .filter(|s| {
+            s.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("app.kubernetes.io/component"))
+                .map(String::as_str)
+                == Some(SHARED_GATEWAY_VIP_COMPONENT)
+        })
+        .collect();
     let classes = ctx.class_store.state();
 
     let is_shared =

@@ -8,7 +8,7 @@ use clap::Parser;
 use coxswain_admin::{AdminServer, EventSources, OperatorAggregator};
 use coxswain_controller::{
     BootstrapRejectHook, CaMode, ControllerConfig, IngressPorts, KubeTokenAuthenticator,
-    LeaseSettings, Operator, OperatorConfig, SharedGatewayListenerStatus, StatusWriterConfig,
+    LeaseSettings, OperatorConfig, SharedGatewayListenerStatus, StatusWriterConfig,
     load_or_generate, spawn_status_writer, spawn_trust_publisher,
 };
 use coxswain_core::health::{HealthRegistry, SubsystemHandle};
@@ -152,8 +152,8 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         args.common.pod_name.clone(),
     );
 
-    // Discovery gRPC server: capture a rebuild-generation receiver before
-    // `route_status` is moved into the Operator. Every controller replica
+    // Discovery gRPC server: capture a rebuild-generation receiver off the
+    // shared `route_status` handle. Every controller replica
     // LISTENS, but the Stream RPC is leader-gated (#531): standbys reject
     // streams so proxy readiness reports land on the status-writing leader.
     // Bootstrap (SVID issuance) stays un-gated on every replica.
@@ -219,58 +219,64 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         },
     ));
 
+    // #574 fold: the dedicated-provisioning operator no longer runs as its own
+    // `BackgroundService` with a separate Kubernetes client. Its reconcile
+    // context is built by the controller off the reflector's `OperatorStores`,
+    // its VIP reconciler is spawned by the controller, and the unified status
+    // worker's Gateway branch drives dedicated provisioning. Capture the operator
+    // stores from the reconciler (built with status stores in the controller
+    // role) before it is moved into its background service below.
+    let operator_stores = status_writer
+        .reconciler
+        .operator_stores()
+        .unwrap_or_else(|| panic!("invariant: controller reconciler must yield operator stores"));
+    let operator_config = OperatorConfig {
+        controller_name: args.common.controller_name.clone(),
+        controller_image: resolve_controller_image(),
+        leader: Arc::clone(&status_writer.leader),
+        listener_status,
+        ingress_ports: IngressPorts::new(
+            args.common.ingress_http_port,
+            args.common.ingress_https_port,
+        ),
+        admin_port: args.common.admin_port,
+        // mTLS Stream listener (#423): the dedicated proxy connects over https for
+        // routing snapshots and bootstraps its SVID over the server-auth bootstrap
+        // listener — the same wiring the shared proxy gets from the Helm chart,
+        // rendered here into the dedicated-proxy Deployment by the operator.
+        discovery_endpoint: format!(
+            "https://coxswain-controller-discovery.{}.svc:{}",
+            args.common.pod_namespace, args.controller.discovery_port
+        ),
+        // Bootstrap lives on its own all-replicas Service (#531): the stream
+        // Service is leader-selected, but SVID issuance must keep working through
+        // leader churn.
+        discovery_bootstrap_endpoint: format!(
+            "https://coxswain-controller-discovery-bootstrap.{}.svc:{}",
+            args.common.pod_namespace, args.controller.discovery_bootstrap_port
+        ),
+        discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token".to_string(),
+        discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt".to_string(),
+        discovery_trust_domain: args.controller.discovery_trust_domain.clone(),
+        controller_namespace: args.common.pod_namespace.clone(),
+        shared_proxy_selector: args.controller.shared_proxy_selector.clone(),
+        shared_vip_service_type: args.controller.shared_vip_service_type,
+        vip_failures: vip_failures.clone(),
+        node_registry: Some(node_registry_for_operator),
+        publish_index: Some(publish_index.clone()),
+    };
+
     server.add_service(background_service(
         "controller",
         status_writer
             .controller
-            .with_vip_failures(vip_failures.clone())
+            .with_vip_failures(vip_failures)
             .with_leadership_watch(leader_watch_tx)
             .with_node_registry(node_registry_for_controller)
-            .with_publish_index(publish_index.clone()),
+            .with_publish_index(publish_index)
+            .with_operator(operator_config, operator_stores),
     ));
     server.add_service(background_service("reconciler", status_writer.reconciler));
-
-    server.add_service(background_service(
-        "operator",
-        Operator::new(OperatorConfig {
-            controller_name: args.common.controller_name.clone(),
-            controller_image: resolve_controller_image(),
-            leader: Arc::clone(&status_writer.leader),
-            listener_status,
-            route_status,
-            ingress_ports: IngressPorts::new(
-                args.common.ingress_http_port,
-                args.common.ingress_https_port,
-            ),
-            admin_port: args.common.admin_port,
-            // mTLS Stream listener (#423): the dedicated proxy connects over
-            // https for routing snapshots and bootstraps its SVID over the
-            // server-auth bootstrap listener — the same wiring the shared proxy
-            // gets from the Helm chart, rendered here into the dedicated-proxy
-            // Deployment by the operator.
-            discovery_endpoint: format!(
-                "https://coxswain-controller-discovery.{}.svc:{}",
-                args.common.pod_namespace, args.controller.discovery_port
-            ),
-            // Bootstrap lives on its own all-replicas Service (#531): the
-            // stream Service is leader-selected, but SVID issuance must keep
-            // working through leader churn.
-            discovery_bootstrap_endpoint: format!(
-                "https://coxswain-controller-discovery-bootstrap.{}.svc:{}",
-                args.common.pod_namespace, args.controller.discovery_bootstrap_port
-            ),
-            discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token".to_string(),
-            discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt".to_string(),
-            discovery_trust_domain: args.controller.discovery_trust_domain.clone(),
-            controller_namespace: args.common.pod_namespace.clone(),
-            shared_proxy_selector: args.controller.shared_proxy_selector.clone(),
-            shared_vip_service_type: args.controller.shared_vip_service_type,
-            vip_failures,
-            leadership_rx: Some(leader_watch_rx),
-            node_registry: Some(node_registry_for_operator),
-            publish_index: Some(publish_index),
-        }),
-    ));
 
     // The aggregator's per-proxy routes/facets/problems views read these same
     // cells directly (#537) rather than fanning out to the proxy over HTTP —
