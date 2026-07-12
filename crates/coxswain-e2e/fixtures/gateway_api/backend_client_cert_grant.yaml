@@ -1,0 +1,22 @@
+# Gateway backend client-certificate (GEP-3155, #87): the ReferenceGrant that
+# permits the Gateway in TESTNS to reference the client-cert Secret in this
+# namespace.  Applied SEPARATELY from the Secret
+# (backend_client_cert_cross_ns_secret.yaml) so a test can toggle the grant
+# while touching no Secret, Gateway, or HTTPRoute — proving the grant event
+# alone reaches the data plane (#511 partition invalidation via cert_grants).
+#
+# Placeholders:
+#   TESTNS — namespace of the referencing Gateway
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-backend-cc-from-${TESTNS}
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      namespace: ${TESTNS}
+  to:
+    - group: ""
+      kind: Secret

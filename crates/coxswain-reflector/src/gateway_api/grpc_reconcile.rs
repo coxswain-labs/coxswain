@@ -8,6 +8,7 @@ use super::backend_policy::{BackendPolicyIndex, ResolvedBackendPolicy};
 use super::backend_tls::{BackendTlsIndex, ResolvedPolicy};
 use super::bindings::{ListenerBinding, compute_grpc_listener_bindings};
 use crate::endpoints;
+use crate::endpoints::pool::EndpointCache;
 use crate::gw_types::{
     GrpcRoute,
     v::grpcroutes::{
@@ -28,7 +29,6 @@ use coxswain_core::routing::{
     RouteTimeouts, UpstreamTls, ValueMatch, WildcardKind, compile_bounded,
 };
 use k8s_openapi::api::core::v1::Service;
-use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -47,6 +47,10 @@ use std::time::SystemTime;
 /// never sends `Content-Length` for the up-front check to use — so gRPC
 /// messages are size-limited by the backend's own `max_recv_msg_size` until
 /// pingora supports request-body buffering (pingora #816/#780).
+///
+/// `Copy` (every field is a shared reference) — same rationale as
+/// [`super::reconcile::RouteResolution`].
+#[derive(Clone, Copy)]
 #[non_exhaustive]
 pub struct GrpcRouteResolution<'a> {
     /// `(gw_ns, gw_name, listener_name) → (hostname, port)` for every listener on owned Gateways.
@@ -81,6 +85,61 @@ enum PolicyMatch {
     Invalid,
 }
 
+/// Spec-static fingerprint of everything [`reconcile`] would need to
+/// translate `route`, without running the translation (#511). Mirrors
+/// [`super::reconcile::route_fingerprint`] for `GRPCRoute` — see its doc for
+/// the full rationale (what this does and deliberately does not track).
+pub(crate) fn route_fingerprint(
+    route: &GrpcRoute,
+    endpoint_cache: &EndpointCache,
+    services: &reflector::Store<Service>,
+    resolution: &GrpcRouteResolution<'_>,
+) -> u64 {
+    // Combination policy (wrapping_add, never XOR) lives in the accumulator;
+    // the ExtensionRef kind → store dispatch is the single shared
+    // `ExtRefStores` — see `crate::fingerprint` for both. No mirror fold:
+    // GRPCRoute `RequestMirror` filters are unsupported (logged and skipped by
+    // `build_filters`), so no mirror endpoints are baked into gRPC routes.
+    let mut fp = crate::fingerprint::FingerprintAccumulator::default();
+    fp.add(&route.metadata.resource_version);
+    let ext_stores = resolution.ext_ref_stores();
+
+    let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+    for rule in route.spec.rules.as_deref().unwrap_or(&[]) {
+        for (_group, kind, name) in super::filters::ext_refs(rule.filters.as_deref().unwrap_or(&[]))
+        {
+            fp.add_hash(ext_stores.fingerprint(route_ns, kind, name));
+        }
+        for b in rule.backend_refs.as_deref().unwrap_or(&[]) {
+            let Some(port) = b.port else { continue };
+            let ns = b.namespace.as_deref().unwrap_or(route_ns);
+            fp.add_hash(endpoint_cache.fingerprint(ns, &b.name, port, services));
+        }
+    }
+    fp.finish()
+}
+
+impl GrpcRouteResolution<'_> {
+    /// This resolution's view of the shared `ExtensionRef` fingerprint
+    /// dispatch (#511). `None` for the HTTP-only kinds (`BasicAuth`,
+    /// `PathRewriteRegex`, …): the gRPC translator logs and skips those refs,
+    /// so the stable `(kind, name)` sentinel the dispatch falls back to is
+    /// exactly right — the compiled output doesn't depend on the CR.
+    pub(crate) fn ext_ref_stores(&self) -> crate::fingerprint::ExtRefStores<'_> {
+        crate::fingerprint::ExtRefStores {
+            rate_limits: self.rate_limits,
+            retry_policies: self.retry_policies,
+            ip_access: self.ip_access,
+            jwt_auths: self.jwt_auths,
+            path_rewrites: None,
+            basic_auths: None,
+            external_auths: None,
+            request_size_limits: None,
+            compressions: None,
+        }
+    }
+}
+
 /// Installs one GRPCRoute's rules into the shared routing-table builder.
 ///
 /// Skips routes with no parentRef to an owned Gateway. Maps each rule's
@@ -88,7 +147,7 @@ enum PolicyMatch {
 /// and translates the `headers` matcher into `MatchPredicates`.
 pub(super) fn reconcile(
     route: &GrpcRoute,
-    slices: &reflector::Store<EndpointSlice>,
+    endpoint_cache: &EndpointCache,
     services: &reflector::Store<Service>,
     owned_gateways: &HashSet<ObjectKey>,
     grants: &HashSet<ReferenceGrantKey>,
@@ -186,7 +245,8 @@ pub(super) fn reconcile(
         let backend_refs: &[GrpcRouteRulesBackendRefs] =
             rule.backend_refs.as_deref().unwrap_or(&[]);
 
-        let resolved = resolve_weighted_backends(backend_refs, route_ns, slices, services, grants);
+        let resolved =
+            resolve_weighted_backends(backend_refs, route_ns, endpoint_cache, services, grants);
         let group_name = backend_group_name(backend_refs, route_ns);
         let protocols: Vec<BackendProtocol> =
             resolved.iter().map(|(r, _)| r.app_protocol).collect();
@@ -709,7 +769,7 @@ fn build_backend_ref_filters(filters: &[GrpcRouteRulesBackendRefsFilters]) -> Ve
 fn resolve_weighted_backends(
     backend_refs: &[GrpcRouteRulesBackendRefs],
     route_ns: &str,
-    slices: &reflector::Store<EndpointSlice>,
+    endpoint_cache: &EndpointCache,
     services: &reflector::Store<Service>,
     grants: &HashSet<ReferenceGrantKey>,
 ) -> Vec<(endpoints::ResolvedEndpoints, u16)> {
@@ -719,27 +779,13 @@ fn resolve_weighted_backends(
         .map(|(b, port)| {
             let weight = weight_of(b);
             if weight == 0 {
-                return (
-                    endpoints::ResolvedEndpoints {
-                        addrs: vec![],
-                        app_protocol: BackendProtocol::default(),
-                        service_exists: false,
-                    },
-                    0,
-                );
+                return (endpoints::ResolvedEndpoints::empty(), 0);
             }
 
             let b_kind = b.kind.as_deref().unwrap_or("Service");
             let b_group = b.group.as_deref().unwrap_or("");
             if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
-                return (
-                    endpoints::ResolvedEndpoints {
-                        addrs: vec![],
-                        app_protocol: BackendProtocol::default(),
-                        service_exists: false,
-                    },
-                    weight,
-                );
+                return (endpoints::ResolvedEndpoints::empty(), weight);
             }
 
             let ns = b.namespace.as_deref().unwrap_or(route_ns);
@@ -752,18 +798,11 @@ fn resolve_weighted_backends(
                     backend_svc = %b.name,
                     "Cross-namespace backendRef denied — no matching ReferenceGrant"
                 );
-                return (
-                    endpoints::ResolvedEndpoints {
-                        addrs: vec![],
-                        app_protocol: BackendProtocol::default(),
-                        service_exists: false,
-                    },
-                    weight,
-                );
+                return (endpoints::ResolvedEndpoints::empty(), weight);
             }
 
             (
-                endpoints::resolve(ns, &b.name, port, slices, services),
+                (*endpoint_cache.get(ns, &b.name, port, services)).clone(),
                 weight,
             )
         })
@@ -1348,7 +1387,7 @@ mod tests {
         let mut builder = GatewayRoutingTableBuilder::new();
         reconcile(
             route,
-            &crate::tests::fixtures::slice_store(vec![]),
+            &crate::tests::fixtures::endpoint_cache(vec![]),
             &empty_svc_store(),
             &default_owned(),
             &HashSet::new(),
@@ -1393,5 +1432,204 @@ mod tests {
             ),
             "gRPC rule with empty backendRefs must resolve to Error(500)"
         );
+    }
+
+    // ── route_fingerprint (#511) ──────────────────────────────────────────────
+
+    mod route_fingerprint_tests {
+        use super::*;
+        use crate::tests::fixtures::{
+            empty_ip_access_store, empty_jwks_cache, empty_jwt_auth_store, empty_rate_limit_store,
+            empty_retry_policy_store, empty_svc_store, endpoint_cache, make_ip_access_store,
+            make_slice,
+        };
+
+        /// A GRPCRoute owned by `default/gw`, whose single rule carries the given
+        /// filters and a `backendRefs` entry for `svc` (port 80).
+        fn grpc_route(filters: Option<Vec<GrpcRouteRulesFilters>>, svc: &str) -> GrpcRoute {
+            use crate::gw_types::v::grpcroutes::{
+                GrpcRouteParentRefs, GrpcRouteRules, GrpcRouteRulesBackendRefs, GrpcRouteSpec,
+            };
+            use kube::api::ObjectMeta;
+            GrpcRoute {
+                metadata: ObjectMeta {
+                    name: Some("grpc-route".to_string()),
+                    namespace: Some("default".to_string()),
+                    resource_version: Some("1".to_string()),
+                    ..Default::default()
+                },
+                spec: GrpcRouteSpec {
+                    parent_refs: Some(vec![GrpcRouteParentRefs {
+                        name: "gw".to_string(),
+                        ..Default::default()
+                    }]),
+                    hostnames: None,
+                    rules: Some(vec![GrpcRouteRules {
+                        backend_refs: Some(vec![GrpcRouteRulesBackendRefs {
+                            name: svc.to_string(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
+                        filters,
+                        ..Default::default()
+                    }]),
+                },
+                ..Default::default()
+            }
+        }
+
+        /// `ip_access_cr` (defined above, shared with `grpc_ip_access_resolves_*`)
+        /// never sets `resourceVersion` — its YAML template omits the field, since
+        /// those tests only care about content. Fingerprint tests care about
+        /// `resourceVersion` specifically, so wrap it and set one explicitly.
+        fn versioned_ip_access_cr(
+            ns: &str,
+            name: &str,
+            allow: &[&str],
+            resource_version: &str,
+        ) -> IpAccessControl {
+            let mut cr = ip_access_cr(ns, name, allow, &[]);
+            cr.metadata.resource_version = Some(resource_version.to_string());
+            cr
+        }
+
+        /// `GrpcRouteResolution` with every store empty except `ip_access`
+        /// (passed in by the caller).
+        macro_rules! resolution_with_ip_access {
+            ($ip_access:expr) => {
+                GrpcRouteResolution {
+                    listener_info: &HashMap::new(),
+                    policy_index: &HashMap::new(),
+                    backend_policy_index: &HashMap::new(),
+                    rate_limits: &empty_rate_limit_store(),
+                    retry_policies: &empty_retry_policy_store(),
+                    ip_access: $ip_access,
+                    jwt_auths: &empty_jwt_auth_store(),
+                    jwks_cache: &empty_jwks_cache(),
+                }
+            };
+        }
+
+        #[test]
+        fn deterministic_for_identical_inputs() {
+            let route = grpc_route(None, "svc");
+            let cache = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+            let svcs = empty_svc_store();
+            let ip_access = empty_ip_access_store();
+            let resolution = resolution_with_ip_access!(&ip_access);
+            let a = route_fingerprint(&route, &cache, &svcs, &resolution);
+            let b = route_fingerprint(&route, &cache, &svcs, &resolution);
+            assert_eq!(a, b);
+        }
+
+        #[test]
+        fn changes_when_route_resource_version_changes() {
+            let mut route = grpc_route(None, "svc");
+            let cache = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+            let svcs = empty_svc_store();
+            let ip_access = empty_ip_access_store();
+            let resolution = resolution_with_ip_access!(&ip_access);
+            let before = route_fingerprint(&route, &cache, &svcs, &resolution);
+
+            route.metadata.resource_version = Some("2".to_string());
+            let after = route_fingerprint(&route, &cache, &svcs, &resolution);
+            assert_ne!(before, after);
+        }
+
+        #[test]
+        fn changes_when_referenced_ip_access_cr_changes_independent_of_route() {
+            let route = grpc_route(Some(vec![grpc_ip_access_filter("ipac")]), "svc");
+            let cache = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+            let svcs = empty_svc_store();
+
+            let before_store = make_ip_access_store(vec![versioned_ip_access_cr(
+                "default",
+                "ipac",
+                &["10.0.0.0/8"],
+                "1",
+            )]);
+            let before = route_fingerprint(
+                &route,
+                &cache,
+                &svcs,
+                &resolution_with_ip_access!(&before_store),
+            );
+
+            let after_store = make_ip_access_store(vec![versioned_ip_access_cr(
+                "default",
+                "ipac",
+                &["10.0.0.0/16"],
+                "2",
+            )]);
+            let after = route_fingerprint(
+                &route,
+                &cache,
+                &svcs,
+                &resolution_with_ip_access!(&after_store),
+            );
+
+            assert_ne!(
+                before, after,
+                "editing the referenced IpAccessControl CR must move the fingerprint even though the route itself didn't change"
+            );
+        }
+
+        #[test]
+        fn unaffected_by_an_unrelated_ip_access_cr_changing() {
+            let route = grpc_route(Some(vec![grpc_ip_access_filter("ipac-a")]), "svc");
+            let cache = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+            let svcs = empty_svc_store();
+
+            let before_store = make_ip_access_store(vec![
+                versioned_ip_access_cr("default", "ipac-a", &["10.0.0.0/8"], "1"),
+                versioned_ip_access_cr("default", "ipac-b", &["10.0.0.0/8"], "1"),
+            ]);
+            let before = route_fingerprint(
+                &route,
+                &cache,
+                &svcs,
+                &resolution_with_ip_access!(&before_store),
+            );
+
+            // ipac-b (not referenced by this route) changes; ipac-a is untouched.
+            let after_store = make_ip_access_store(vec![
+                versioned_ip_access_cr("default", "ipac-a", &["10.0.0.0/8"], "1"),
+                versioned_ip_access_cr("default", "ipac-b", &["10.0.0.0/16"], "2"),
+            ]);
+            let after = route_fingerprint(
+                &route,
+                &cache,
+                &svcs,
+                &resolution_with_ip_access!(&after_store),
+            );
+
+            assert_eq!(
+                before, after,
+                "an unreferenced CR changing must not move this route's fingerprint"
+            );
+        }
+
+        #[test]
+        fn changes_when_backend_service_endpoints_change() {
+            let route = grpc_route(None, "svc");
+            let svcs = empty_svc_store();
+            let ip_access = empty_ip_access_store();
+            let resolution = resolution_with_ip_access!(&ip_access);
+
+            let cache_before = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+            let before = route_fingerprint(&route, &cache_before, &svcs, &resolution);
+
+            let cache_after = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1"), {
+                let mut s = make_slice("default", "svc", "10.0.0.2");
+                s.metadata.name = Some("svc-slice-2".to_string());
+                s
+            }]);
+            let after = route_fingerprint(&route, &cache_after, &svcs, &resolution);
+
+            assert_ne!(
+                before, after,
+                "backend endpoint churn must move the fingerprint via the EndpointCache"
+            );
+        }
     }
 }

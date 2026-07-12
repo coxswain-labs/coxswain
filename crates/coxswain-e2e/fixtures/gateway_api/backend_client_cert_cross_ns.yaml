@@ -1,0 +1,74 @@
+# Gateway backend client-certificate (GEP-3155, #87): cross-namespace ref
+# (tenant namespace side).
+#
+# Gateway HTTP listener + HTTPRoute → echo-mtls backend (port 8443, requires a
+# client cert) + BackendTLSPolicy for server verification +
+# spec.tls.backend.clientCertificateRef pointing to a kubernetes.io/tls Secret
+# in ANOTHER namespace.  Without a ReferenceGrant in the Secret's namespace the
+# ref is RefNotPermitted and the data plane fails closed (502); the grant lives
+# in a separate fixture (backend_client_cert_grant.yaml) so tests can toggle it
+# independently of every other object.
+#
+# Placeholders (see gateway_api::BACKEND_CLIENT_CERT_CROSS_NS callers):
+#   CERTS_NS           — namespace holding the client-cert Secret
+#   SECRET_NAME        — name of the client-cert Secret in CERTS_NS
+#   TLS_HOSTNAME       — hostname in the backend TLS cert's SAN (and BackendTLSPolicy)
+#   CA_PEM             — PEM of the CA for the backend server cert (indented block scalar)
+#   GATEWAY_HTTP_PORT  — filled by Harness::apply
+#   TESTNS             — filled by Harness::apply
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: backend-cc-xns-ca
+data:
+  ca.crt: |
+    ${CA_PEM}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: backend-cc-xns-gw
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+  tls:
+    backend:
+      clientCertificateRef:
+        group: ""
+        kind: Secret
+        name: ${SECRET_NAME}
+        namespace: ${CERTS_NS}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: backend-cc-xns-route
+spec:
+  parentRefs:
+    - name: backend-cc-xns-gw
+  hostnames:
+    - backend-cc-xns.${TESTNS}.local
+  rules:
+    - backendRefs:
+        - name: echo-mtls
+          port: 8443
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: BackendTLSPolicy
+metadata:
+  name: backend-cc-xns-policy
+spec:
+  targetRefs:
+    - group: ""
+      kind: Service
+      name: echo-mtls
+  validation:
+    hostname: ${TLS_HOSTNAME}
+    caCertificateRefs:
+      - group: ""
+        kind: ConfigMap
+        name: backend-cc-xns-ca

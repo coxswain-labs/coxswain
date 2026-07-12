@@ -85,6 +85,7 @@ pub struct RouteInfo {
 
 /// A path rule that was silently dropped because an earlier rule already claimed the same slot.
 #[non_exhaustive]
+#[derive(Debug, Clone)]
 pub struct RouteConflict {
     /// Listener port on which the conflict occurred.
     pub port: u16,

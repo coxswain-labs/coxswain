@@ -11,7 +11,7 @@ use super::reconcile_helpers::{
     resolve_ip_access_control_config, resolve_jwt_auth_config, resolve_mirror_filter,
     resolve_rate_limit_config, resolve_retry_config,
 };
-use crate::endpoints;
+use crate::endpoints::pool::EndpointCache;
 use crate::k8s_utils::metadata_created_at;
 use coxswain_core::crd::{
     Compression, CoxswainExternalAuth, IpAccessControl, RateLimit, RetryPolicy,
@@ -22,7 +22,6 @@ use coxswain_core::routing::{
     IngressRoutingTableBuilder, PathModifier, RouteEntry, compile_path_regex,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
@@ -169,7 +168,7 @@ impl IngressReconciler {
     #[must_use = "caller should forward annotation issues as Kubernetes Events"]
     pub fn reconcile(
         ingress: &Ingress,
-        slices: &reflector::Store<EndpointSlice>,
+        endpoint_cache: &EndpointCache,
         services: &reflector::Store<Service>,
         classes: &IngressClassContext<'_>,
         ports: IngressPorts,
@@ -268,7 +267,7 @@ impl IngressReconciler {
         if let Some(filter) = ann
             .mirror_target
             .as_ref()
-            .and_then(|m| resolve_mirror_filter(m, ns, &route_id, slices, services))
+            .and_then(|m| resolve_mirror_filter(m, ns, &route_id, endpoint_cache, services))
         {
             base_filters.push(filter);
         }
@@ -302,7 +301,7 @@ impl IngressReconciler {
             ann.auth_ext.as_ref(),
             auth_stores.external_auths,
             services,
-            slices,
+            endpoint_cache,
             auth_stores.backend_grants,
             &route_id,
         );
@@ -411,7 +410,7 @@ impl IngressReconciler {
                     None => continue,
                 };
 
-                let resolved = endpoints::resolve(ns, &svc.name, port, slices, services);
+                let resolved = endpoint_cache.get(ns, &svc.name, port, services);
                 // A backend that resolves but has zero ready endpoints is kept as
                 // a dead route that returns 503 — NOT pruned. Pruning would let
                 // the path fall through to a broader route (a catch-all "/", or
@@ -440,7 +439,7 @@ impl IngressReconciler {
                 let group = Arc::new(build_ingress_backend_group(
                     ns,
                     &svc.name,
-                    resolved.addrs,
+                    resolved.addrs.clone(),
                     resolved.app_protocol,
                     backend_policy,
                     &retries,
@@ -591,8 +590,7 @@ impl IngressReconciler {
         if let Some(default_backend) = spec.and_then(|s| s.default_backend.as_ref()) {
             if let Some(default_svc) = default_backend.service.as_ref() {
                 if let Some(port) = resolve_backend_port(ns, default_svc, services) {
-                    let resolved =
-                        endpoints::resolve(ns, &default_svc.name, port, slices, services);
+                    let resolved = endpoint_cache.get(ns, &default_svc.name, port, services);
                     if resolved.addrs.is_empty() {
                         tracing::warn!(
                             ingress = ?ingress.metadata.name,
@@ -609,7 +607,7 @@ impl IngressReconciler {
                         let group = Arc::new(build_ingress_backend_group(
                             ns,
                             &default_svc.name,
-                            resolved.addrs,
+                            resolved.addrs.clone(),
                             resolved.app_protocol,
                             backend_policy,
                             &retries,
@@ -733,7 +731,7 @@ mod tests {
 
     #[test]
     fn reconcile_default_backend_catches_path_miss() {
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "rule-svc", "10.0.0.1"),
             make_slice("default", "default-svc", "10.0.0.2"),
         ]);
@@ -773,7 +771,7 @@ mod tests {
 
     #[test]
     fn reconcile_default_backend_only_routes_all_traffic() {
-        let store = slice_store(vec![make_slice("default", "default-svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "default-svc", "10.0.0.1")]);
         let ingress = make_default_only_ingress("default", "default-svc");
         let mut builder = RoutingTableBuilder::new();
         reconcile_no_default(
@@ -798,7 +796,7 @@ mod tests {
 
     #[test]
     fn reconcile_default_backend_catches_unmatched_host() {
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "rule-svc", "10.0.0.1"),
             make_slice("default", "default-svc", "10.0.0.2"),
         ]);
@@ -836,7 +834,7 @@ mod tests {
 
     #[test]
     fn reconcile_older_ingress_wins_same_prefix_path() {
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "old-svc", "10.0.0.1"),
             make_slice("default", "new-svc", "10.0.0.2"),
         ]);
@@ -884,7 +882,7 @@ mod tests {
 
     #[test]
     fn reconcile_exact_beats_prefix_same_path() {
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "exact-svc", "10.0.0.1"),
             make_slice("default", "prefix-svc", "10.0.0.2"),
         ]);
@@ -963,7 +961,7 @@ mod tests {
 
     #[test]
     fn reconcile_default_backend_skipped_when_no_endpoints() {
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "rule-svc", "10.0.0.1"),
             // no slice for default-svc → no endpoints
         ]);
@@ -991,7 +989,7 @@ mod tests {
 
     #[test]
     fn reconcile_default_backend_on_wildcard_host() {
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "rule-svc", "10.0.0.1"),
             make_slice("default", "default-svc", "10.0.0.2"),
         ]);
@@ -1031,7 +1029,7 @@ mod tests {
 
     #[test]
     fn reconcile_rule_root_path_wins_over_default_backend() {
-        let store = slice_store(vec![
+        let store = endpoint_cache(vec![
             make_slice("default", "rule-svc", "10.0.0.1"),
             make_slice("default", "default-svc", "10.0.0.2"),
         ]);
@@ -1065,7 +1063,7 @@ mod tests {
 
     #[test]
     fn reconcile_exact_path_type() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1092,7 +1090,7 @@ mod tests {
 
     #[test]
     fn reconcile_named_port_resolves_to_route() {
-        let slices = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let slices = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let svcs = make_svc_store(vec![make_service_with_named_port(
             "default", "svc", "http", 80,
         )]);
@@ -1118,7 +1116,7 @@ mod tests {
 
     #[test]
     fn reconcile_named_port_skips_when_service_missing() {
-        let slices = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let slices = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         // No Service in the store → port_for_name returns None → path skipped
         let ingress = make_ingress_named_port("default", Some("example.com"), "svc", "http");
         let mut builder = RoutingTableBuilder::new();
@@ -1139,7 +1137,7 @@ mod tests {
 
     #[test]
     fn reconcile_named_port_skips_when_port_name_not_found() {
-        let slices = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let slices = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         // Service exists but has port name "grpc", not "http"
         let svcs = make_svc_store(vec![make_service_with_named_port(
             "default", "svc", "grpc", 9000,
@@ -1163,7 +1161,7 @@ mod tests {
 
     #[test]
     fn reconcile_named_port_default_backend_resolves() {
-        let slices = slice_store(vec![
+        let slices = endpoint_cache(vec![
             make_slice("default", "rule-svc", "10.0.0.1"),
             make_slice("default", "default-svc", "10.0.0.2"),
         ]);
@@ -1243,7 +1241,7 @@ mod tests {
 
     #[test]
     fn reconcile_prefix_path_type() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1271,7 +1269,7 @@ mod tests {
 
     #[test]
     fn reconcile_implementation_specific_maps_to_prefix() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1353,7 +1351,7 @@ mod tests {
     #[test]
     fn reconcile_use_regex_matches_implementation_specific_as_regex() {
         use crate::ingress::annotations::USE_REGEX;
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_regex_ingress(
             Some("example.com"),
             &[(r"/item/[0-9]+", "ImplementationSpecific")],
@@ -1379,7 +1377,7 @@ mod tests {
     #[test]
     fn reconcile_use_regex_off_does_not_treat_path_as_regex() {
         use crate::ingress::annotations::USE_REGEX;
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_regex_ingress(
             Some("example.com"),
             &[(r"/item/[0-9]+", "ImplementationSpecific")],
@@ -1407,7 +1405,7 @@ mod tests {
     fn reconcile_use_regex_rewrite_target_substitutes_captures() {
         use crate::ingress::annotations::{REWRITE_TARGET, USE_REGEX};
         use coxswain_core::routing::{FilterAction, PathModifier, RouteOutcome};
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_regex_ingress(
             Some("example.com"),
             &[(r"/svc/(.*)", "ImplementationSpecific")],
@@ -1449,7 +1447,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn reconcile_invalid_regex_skips_only_that_path() {
         use crate::ingress::annotations::USE_REGEX;
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         // One valid and one uncompilable regex path on the same Ingress.
         let ingress = make_regex_ingress(
             Some("example.com"),
@@ -1484,7 +1482,7 @@ mod tests {
 
     #[test]
     fn reconcile_exact_hostname() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1511,7 +1509,7 @@ mod tests {
 
     #[test]
     fn reconcile_wildcard_hostname() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("*.example.com"),
@@ -1540,7 +1538,7 @@ mod tests {
 
     #[test]
     fn reconcile_no_host_goes_to_catchall() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             None,
@@ -1567,7 +1565,7 @@ mod tests {
 
     #[test]
     fn reconcile_keeps_dead_route_when_no_endpoints() {
-        let store = slice_store(vec![]); // no slices → zero ready endpoints
+        let store = endpoint_cache(vec![]); // no slices → zero ready endpoints
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1602,7 +1600,7 @@ mod tests {
 
     #[test]
     fn reconcile_matches_owned_class_name() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1631,7 +1629,7 @@ mod tests {
 
     #[test]
     fn reconcile_skips_unowned_class_name() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1660,7 +1658,7 @@ mod tests {
 
     #[test]
     fn reconcile_matches_via_legacy_annotation() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1689,7 +1687,7 @@ mod tests {
 
     #[test]
     fn reconcile_skips_unowned_legacy_annotation() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1718,7 +1716,7 @@ mod tests {
 
     #[test]
     fn reconcile_skips_when_both_unset() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1747,7 +1745,7 @@ mod tests {
 
     #[test]
     fn reconcile_claims_unclassified_when_owned_default_exists() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1794,7 +1792,7 @@ mod tests {
 
     #[test]
     fn reconcile_skips_unclassified_when_no_owned_default() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1841,7 +1839,7 @@ mod tests {
 
     #[test]
     fn reconcile_skips_when_owned_set_empty() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -1872,7 +1870,7 @@ mod tests {
     fn reconcile_path_resource_backend_skipped() {
         use k8s_openapi::api::core::v1::TypedLocalObjectReference;
 
-        let store = slice_store(vec![]);
+        let store = endpoint_cache(vec![]);
         let ingress = Ingress {
             metadata: ObjectMeta {
                 name: Some("test-ingress".to_string()),
@@ -1923,7 +1921,7 @@ mod tests {
     fn reconcile_default_backend_resource_skipped() {
         use k8s_openapi::api::core::v1::TypedLocalObjectReference;
 
-        let store = slice_store(vec![]);
+        let store = endpoint_cache(vec![]);
         let ingress = Ingress {
             metadata: ObjectMeta {
                 name: Some("test-ingress".to_string()),
@@ -1964,7 +1962,7 @@ mod tests {
 
     #[test]
     fn reconcile_field_takes_precedence_over_annotation() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         // field = "coxswain" (owned), annotation = "nginx" (not owned) → should reconcile
         let ingress = make_ingress(
             "default",
@@ -1995,7 +1993,7 @@ mod tests {
     #[tracing_test::traced_test]
     #[test]
     fn reconcile_skips_path_without_leading_slash() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ingress = make_ingress(
             "default",
             Some("example.com"),
@@ -2049,7 +2047,7 @@ mod tests {
     fn annotation_timeouts_stored_on_route_entry() {
         use crate::ingress::annotations::{READ_TIMEOUT, SEND_TIMEOUT};
         use std::time::Duration;
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
@@ -2087,7 +2085,7 @@ mod tests {
             serde_yaml::from_str(yaml).unwrap_or_else(|e| panic!("valid RetryPolicy: {e}"));
         let retry_policies = make_retry_policy_store(vec![cr]);
 
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
@@ -2135,7 +2133,7 @@ mod tests {
     fn annotation_rewrite_target_stored_as_url_rewrite_filter() {
         use crate::ingress::annotations::REWRITE_TARGET;
         use coxswain_core::routing::{FilterAction, PathModifier, RouteOutcome};
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
@@ -2180,7 +2178,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn invalid_annotation_warns_but_route_still_installed() {
         use crate::ingress::annotations::READ_TIMEOUT;
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
@@ -2205,7 +2203,7 @@ mod tests {
     fn annotation_request_header_modifier_stored_as_filter() {
         use crate::ingress::annotations::{REQUEST_HEADER_REMOVE, REQUEST_HEADER_SET};
         use coxswain_core::routing::{FilterAction, RouteOutcome};
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
@@ -2237,7 +2235,7 @@ mod tests {
     fn annotation_response_header_modifier_stored_as_filter() {
         use crate::ingress::annotations::{RESPONSE_HEADER_ADD, RESPONSE_HEADER_REMOVE};
         use coxswain_core::routing::{FilterAction, RouteOutcome};
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
@@ -2269,7 +2267,7 @@ mod tests {
     fn annotation_redirect_stored_as_filter() {
         use crate::ingress::annotations::{REDIRECT_HOSTNAME, REDIRECT_STATUS_CODE};
         use coxswain_core::routing::{FilterAction, RouteOutcome};
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
@@ -2308,7 +2306,7 @@ mod tests {
     fn annotation_header_modifier_and_rewrite_coexist_on_same_route() {
         use crate::ingress::annotations::{REQUEST_HEADER_SET, REWRITE_TARGET};
         use coxswain_core::routing::{FilterAction, RouteOutcome};
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
@@ -2346,7 +2344,7 @@ mod tests {
         use crate::ingress::annotations::REQUEST_HEADER_SET;
         use coxswain_core::routing::{FilterAction, RouteOutcome};
         // Header values cannot contain control characters.
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
@@ -2380,7 +2378,7 @@ mod tests {
     fn annotation_ssl_redirect_on_http_port_only() {
         use crate::ingress::annotations::SSL_REDIRECT;
         use coxswain_core::routing::{FilterAction, RouteOutcome};
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
@@ -2475,7 +2473,7 @@ mod tests {
     fn annotation_explicit_redirect_takes_precedence_over_ssl_redirect() {
         use crate::ingress::annotations::{REDIRECT_HOSTNAME, SSL_REDIRECT};
         use coxswain_core::routing::{FilterAction, RouteOutcome};
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress_with_annotations(
             "default",
             Some("example.com"),
@@ -2539,7 +2537,7 @@ mod tests {
     fn class_default_annotation_applies_when_ingress_unset() {
         use crate::ingress::annotations::READ_TIMEOUT;
         use std::time::Duration;
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         // Ingress claims "coxswain" but sets no annotations of its own.
         let ing = make_ingress(
             "default",
@@ -2572,7 +2570,7 @@ mod tests {
     fn ingress_annotation_overrides_class_default() {
         use crate::ingress::annotations::READ_TIMEOUT;
         use std::time::Duration;
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         // Ingress sets read-timeout=2s; class default is 7s → Ingress wins.
         let ing = make_ingress_with_annotations(
             "default",
@@ -2601,7 +2599,7 @@ mod tests {
 
     #[test]
     fn unknown_class_default_key_is_inert() {
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress(
             "default",
             Some("example.com"),
@@ -2633,7 +2631,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn empty_string_class_default_warns_and_falls_back() {
         use crate::ingress::annotations::READ_TIMEOUT;
-        let store = slice_store(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let ing = make_ingress(
             "default",
             Some("example.com"),

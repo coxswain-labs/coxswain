@@ -9,7 +9,7 @@
 
 use super::backend::BackendGroup;
 use super::entry::RouteConflict;
-use super::host_router::{HostRouter, RouteMatch};
+use super::host_router::{HostRouter, RouteMatch, WildcardKind};
 use super::port::{PortRoutingTable, PortTableBuilder};
 use super::predicate::RequestContext;
 use std::collections::HashMap;
@@ -149,6 +149,19 @@ impl<Kind> RoutingTable<Kind> {
     pub fn ports(&self) -> impl Iterator<Item = (u16, &PortRoutingTable)> {
         self.by_port.iter().map(|(p, t)| (*p, t))
     }
+
+    /// Returns the compiled `Arc<HostRouter>` at `(port, hostname_opt)`, if
+    /// present — see [`PortRoutingTable::get_compiled`] (#511 partitioned-
+    /// rebuild reuse path).
+    #[must_use]
+    pub fn get_compiled(
+        &self,
+        port: u16,
+        hostname_opt: Option<&str>,
+        kind: WildcardKind,
+    ) -> Option<Arc<HostRouter>> {
+        self.by_port.get(&port)?.get_compiled(hostname_opt, kind)
+    }
 }
 
 /// Builds an immutable [`RoutingTable`] keyed by listener port.
@@ -158,6 +171,15 @@ impl<Kind> RoutingTable<Kind> {
 #[non_exhaustive]
 pub struct RoutingTableBuilder<Kind> {
     by_port: HashMap<u16, PortTableBuilder>,
+    /// Conflicts carried over from a partitioned rebuild's reused (cached)
+    /// partitions (#511) — a clean partition splices its compiled
+    /// `Arc<HostRouter>` directly, bypassing `HostRouterBuilder::build()`, so
+    /// its already-known conflicts (detected when it was *first* compiled)
+    /// would otherwise vanish from this table's `conflicts()` even though the
+    /// underlying conflict is still real and unresolved. Merged into the
+    /// output alongside whatever this pass's own `HostRouterBuilder::build()`
+    /// calls detect fresh.
+    extra_conflicts: Vec<RouteConflict>,
     _kind: PhantomData<fn() -> Kind>,
 }
 
@@ -165,6 +187,7 @@ impl<Kind> Default for RoutingTableBuilder<Kind> {
     fn default() -> Self {
         Self {
             by_port: HashMap::new(),
+            extra_conflicts: Vec::new(),
             _kind: PhantomData,
         }
     }
@@ -183,6 +206,12 @@ impl<Kind> RoutingTableBuilder<Kind> {
         self.by_port.entry(port).or_default()
     }
 
+    /// Carries over conflicts a partitioned rebuild already knows about for a
+    /// reused (cached) partition — see the `extra_conflicts` field doc.
+    pub fn extend_conflicts(&mut self, conflicts: impl IntoIterator<Item = RouteConflict>) {
+        self.extra_conflicts.extend(conflicts);
+    }
+
     /// Compiles all registered routes into an immutable [`RoutingTable`].
     ///
     /// # Errors
@@ -191,7 +220,7 @@ impl<Kind> RoutingTableBuilder<Kind> {
     /// failed to compile.
     #[must_use = "the built RoutingTable is the reconcile output; dropping it discards all routes"]
     pub fn build(self) -> Result<RoutingTable<Kind>, RouterError> {
-        let mut conflicts: Vec<RouteConflict> = Vec::new();
+        let mut conflicts: Vec<RouteConflict> = self.extra_conflicts;
         let mut by_port: HashMap<u16, PortRoutingTable> = HashMap::new();
 
         for (port, pb) in self.by_port {

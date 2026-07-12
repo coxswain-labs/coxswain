@@ -911,9 +911,10 @@ mod tests {
     #[test]
     fn reconcile_attaches_tls_and_forces_https() {
         let _addr: std::net::SocketAddr = "10.0.0.1:443".parse().unwrap();
-        let store = crate::tests::fixtures::slice_store(vec![crate::tests::fixtures::make_slice(
-            "default", "echo", "10.0.0.1",
-        )]);
+        let store =
+            crate::tests::fixtures::endpoint_cache(vec![crate::tests::fixtures::make_slice(
+                "default", "echo", "10.0.0.1",
+            )]);
         let route = make_route("default", &["echo.example.com"], None, "echo");
 
         // Build a policy index for echo/default.

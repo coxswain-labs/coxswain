@@ -1,31 +1,22 @@
 //! Endpoint resolution: maps `EndpointSlice` ready addresses into `BackendGroup`s.
+//!
+//! `resolve()` below is the direct, uncached scan — still the correctness
+//! reference (and what benches measure against) — while [`pool`] maintains
+//! the incrementally-updated [`coxswain_core::endpoints::EndpointPool`] every
+//! route builder should read from instead (#511). See the [`pool`] module doc
+//! for the grouping/fingerprint scheme.
 
-use coxswain_core::routing::{BackendProtocol, parse_app_protocol};
+pub mod pool;
+
+pub use coxswain_core::endpoints::ResolvedEndpoints;
+
+use coxswain_core::routing::parse_app_protocol;
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::runtime::reflector;
 use std::net::{IpAddr, SocketAddr};
-
-/// Resolved addresses and protocol metadata for a single backend service port.
-///
-/// `pub` and `#[doc(hidden)]` only so `crates/coxswain-reflector/benches/convergence.rs`
-/// (#513) can name [`resolve`]'s return type — never construct this from
-/// outside the crate; there is no stability guarantee across coxswain
-/// releases. `#[non_exhaustive]` (not the `intentionally open` opt-out) is
-/// the right annotation here: the bench only reads fields, never constructs
-/// via literal, so there's no reason to forgo the stability guard.
-#[doc(hidden)]
-#[non_exhaustive]
-pub struct ResolvedEndpoints {
-    pub addrs: Vec<SocketAddr>,
-    /// Backend wire protocol, parsed from `Service.spec.ports[].appProtocol`.
-    pub app_protocol: BackendProtocol,
-    /// Whether the referenced Service exists in the cluster (present in the
-    /// Service store). Lets callers separate "valid Service, zero ready
-    /// endpoints" (Gateway API: SHOULD 503) from "no such Service" (MUST 500).
-    pub service_exists: bool,
-}
+use std::sync::Arc;
 
 struct ServicePortInfo {
     target_port: Option<i32>,
@@ -84,10 +75,13 @@ pub(crate) fn port_for_name(
 /// matched Service port (if any) for backend protocol selection. Never
 /// queries the API server.
 ///
-/// The full `slices.state()` scan below is the O(routes × endpoints) hot spot
-/// #511's endpoint-resolution cache targets: every backend reference in a
-/// rebuild calls this once, and each call rescans every `EndpointSlice` in the
-/// store regardless of which service it's looking for.
+/// The full `slices.state()` scan below is the O(routes × endpoints) full-scan
+/// this function performs on every call — deliberately kept as the
+/// correctness reference (and the #513 benchmark's baseline) rather than
+/// removed. Route builders should no longer call this directly: use
+/// [`pool::EndpointCache`]'s `(namespace, service, port)` lookup instead,
+/// which calls [`resolve_from_group`] only when a service's fingerprint has
+/// moved since the last rebuild (#511).
 ///
 /// `pub` and `#[doc(hidden)]` only so `crates/coxswain-reflector/benches/convergence.rs`
 /// (#513) can call this directly with a synthetic store — not a supported
@@ -99,6 +93,40 @@ pub fn resolve(
     svc: &str,
     port: i32,
     slices: &reflector::Store<EndpointSlice>,
+    services: &reflector::Store<Service>,
+) -> ResolvedEndpoints {
+    let matching: Vec<Arc<EndpointSlice>> = slices
+        .state()
+        .into_iter()
+        .filter(|slice| slice_matches(slice, ns, svc))
+        .collect();
+    resolve_from_group(ns, svc, port, &matching, services)
+}
+
+/// `true` when `slice` belongs to `(ns, svc)` — the `EndpointSlice`'s own
+/// namespace plus its `kubernetes.io/service-name` label.
+fn slice_matches(slice: &EndpointSlice, ns: &str, svc: &str) -> bool {
+    if slice.metadata.namespace.as_deref() != Some(ns) {
+        return false;
+    }
+    slice
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get("kubernetes.io/service-name").map(String::as_str))
+        == Some(svc)
+}
+
+/// Resolves `(ns, svc, port)` from an already-`(ns,svc)`-filtered slice list —
+/// the shared core [`resolve`] and [`pool::EndpointCache::get`] both funnel
+/// through, so the eligibility/target-port logic lives in exactly one place.
+/// `group_slices` must contain only slices matching `(ns, svc)`; passing an
+/// unfiltered list silently over-counts addresses from other services.
+pub(crate) fn resolve_from_group(
+    ns: &str,
+    svc: &str,
+    port: i32,
+    group_slices: &[Arc<EndpointSlice>],
     services: &reflector::Store<Service>,
 ) -> ResolvedEndpoints {
     let port_info = lookup_service_port(ns, svc, port, services);
@@ -113,19 +141,32 @@ pub fn resolve(
             .unwrap_or(""),
     );
 
+    let addrs = addrs_from_slices(ns, svc, group_slices.iter().map(Arc::as_ref), pod_port);
+    tracing::debug!(
+        ns,
+        svc,
+        service_port = port,
+        pod_port,
+        count = addrs.len(),
+        "Resolved endpoints"
+    );
+    let service_exists = {
+        let key = reflector::ObjectRef::<Service>::new(svc).within(ns);
+        services.get(&key).is_some()
+    };
+    ResolvedEndpoints::new(addrs, app_protocol, service_exists)
+}
+
+/// Extracts ready, non-terminating pod addresses from a set of `EndpointSlice`s
+/// already known to belong to the target service, at the given pod-facing port.
+fn addrs_from_slices<'a>(
+    ns: &str,
+    svc: &str,
+    slices: impl Iterator<Item = &'a EndpointSlice>,
+    pod_port: i32,
+) -> Vec<SocketAddr> {
     let mut addrs = Vec::new();
-    for slice in slices.state() {
-        if slice.metadata.namespace.as_deref() != Some(ns) {
-            continue;
-        }
-        let slice_svc = slice
-            .metadata
-            .labels
-            .as_ref()
-            .and_then(|l| l.get("kubernetes.io/service-name").map(String::as_str));
-        if slice_svc != Some(svc) {
-            continue;
-        }
+    for slice in slices {
         for ep in slice.endpoints.iter().flatten() {
             let cond = ep.conditions.as_ref();
 
@@ -158,23 +199,7 @@ pub fn resolve(
             }
         }
     }
-    tracing::debug!(
-        ns,
-        svc,
-        service_port = port,
-        pod_port,
-        count = addrs.len(),
-        "Resolved endpoints"
-    );
-    let service_exists = {
-        let key = reflector::ObjectRef::<Service>::new(svc).within(ns);
-        services.get(&key).is_some()
-    };
-    ResolvedEndpoints {
-        addrs,
-        app_protocol,
-        service_exists,
-    }
+    addrs
 }
 
 #[cfg(test)]

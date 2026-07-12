@@ -8,6 +8,10 @@ macro_rules! fixture {
 
 /// HTTPRoute path-based routing rules.
 pub const PATH_MATCHING: &str = fixture!("path_matching.yaml");
+/// Two independent HTTPRoutes sharing one Gateway, each a single host to a
+/// distinct backend — one `(port, host)` routing-table partition per host
+/// (#511).
+pub const TWO_HOSTS: &str = fixture!("two_hosts.yaml");
 /// HTTPRoute (#504) with a first rule named `named-rule` (matches `/a`) and a
 /// second unnamed rule (matches `/b`). Hostnamed
 /// `http-named-rule.${TESTNS}.local`. Backends: `echo-a`/`echo-b` (via
@@ -467,6 +471,23 @@ pub const BACKEND_CLIENT_CERT_MISSING_SECRET: &str =
 /// Placeholders: `TLS_HOSTNAME`, `CA_PEM`.
 pub const BACKEND_CLIENT_CERT_FAILS_CLOSED: &str =
     fixture!("backend_client_cert_fails_closed.yaml");
+
+/// Cross-namespace GEP-3155: Gateway + HTTPRoute + BackendTLSPolicy whose
+/// `clientCertificateRef` targets a Secret in another namespace (tenant side —
+/// no Secret, no grant). Placeholders: `CERTS_NS`, `SECRET_NAME`,
+/// `TLS_HOSTNAME`, `CA_PEM`.
+pub const BACKEND_CLIENT_CERT_CROSS_NS: &str = fixture!("backend_client_cert_cross_ns.yaml");
+
+/// The client-cert Secret alone (certs-namespace side, deliberately NO
+/// ReferenceGrant). Placeholders: `SECRET_NAME`, `CLIENT_CERT_B64`,
+/// `CLIENT_KEY_B64`.
+pub const BACKEND_CLIENT_CERT_CROSS_NS_SECRET: &str =
+    fixture!("backend_client_cert_cross_ns_secret.yaml");
+
+/// The ReferenceGrant alone permitting the TESTNS Gateway to reference the
+/// client-cert Secret — applied/deleted independently so tests can prove the
+/// grant toggle by itself reaches the data plane (#511).
+pub const BACKEND_CLIENT_CERT_GRANT: &str = fixture!("backend_client_cert_grant.yaml");
 
 // ── TLS passthrough (TLSRoute / GEP-2643, #70) ───────────────────────────────
 

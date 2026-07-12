@@ -107,5 +107,88 @@ fn bench_table_build(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_route_lookup, bench_table_build);
+/// #511 comparison: rebuilding a `total_routes`-route table when only ONE
+/// host actually changed. Two strategies, same host/route shape as
+/// [`bench_table_build`]:
+///
+/// - `full`: the pre-#511 world — `build_populated` repopulates every host's
+///   `HostRouterBuilder` from scratch and `.build()` compiles all of them
+///   (matchit + `RegexSet` for every host), identical to `table_build`.
+/// - `partitioned`: only the one dirty host gets a fresh `HostRouterBuilder`;
+///   every other host's already-compiled `Arc<HostRouter>` (from a
+///   once-built baseline table) is spliced in directly via
+///   `PortTableBuilder::insert_compiled_exact_host`, skipping
+///   `HostRouterBuilder::build()` (and its `matchit`/`RegexSet` compilation)
+///   for all of them. `.build()` on this mixed builder is the #511 partitioned
+///   rebuild's actual final-assembly step (`route_builder::build_gateway_routes`).
+///
+/// At `routes100` (10 hosts) the win is modest; at `routes1000` (100 hosts)
+/// `partitioned` should scale ~O(1) in the dirty-host count instead of
+/// O(hosts) — see the module doc for the `--save-baseline`/`--baseline`
+/// before/after workflow.
+fn bench_partitioned_rebuild(c: &mut Criterion) {
+    let mut group = c.benchmark_group("partitioned_rebuild");
+    for &routes in &[100usize, 1000usize] {
+        let hosts = (routes / 10).max(1);
+        // Baseline: every host compiled once, up front — models the
+        // previously-published table `route_builder` reuses `Arc<HostRouter>`
+        // from.
+        let baseline = build_populated(routes)
+            .build()
+            .unwrap_or_else(|e| panic!("{e}"));
+
+        group.bench_function(format!("full_routes{routes}"), |b| {
+            b.iter_batched(
+                || build_populated(routes),
+                |builder| builder.build().unwrap_or_else(|e| panic!("{e}")),
+                BatchSize::SmallInput,
+            );
+        });
+
+        group.bench_function(format!("partitioned_routes{routes}"), |b| {
+            b.iter_batched(
+                || {
+                    let per_host = routes / hosts;
+                    let mut builder = GatewayRoutingTableBuilder::new();
+                    // Host 0 is dirty: freshly populated, same shape as
+                    // `build_populated`'s per-host loop.
+                    let dirty_host = builder.for_port(80).exact_host("host-0.example.com");
+                    for i in 0..per_host {
+                        dirty_host.add_prefix_route(
+                            &format!("/api/v{i}"),
+                            make_entry(make_group(&format!("svc-0-{i}"), "10.0.0.1:80")),
+                        );
+                    }
+                    // Every other host reuses its already-compiled Arc from
+                    // the baseline table — no HostRouterBuilder::build() at
+                    // all for these (hosts - 1) hosts.
+                    for h in 1..hosts {
+                        let name = format!("host-{h}.example.com");
+                        let router = baseline
+                            .get_compiled(
+                                80,
+                                Some(&name),
+                                coxswain_core::routing::WildcardKind::MultiLabel,
+                            )
+                            .unwrap_or_else(|| panic!("host {name} missing from baseline table"));
+                        builder
+                            .for_port(80)
+                            .insert_compiled_exact_host(name, router);
+                    }
+                    builder
+                },
+                |builder| builder.build().unwrap_or_else(|e| panic!("{e}")),
+                BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_route_lookup,
+    bench_table_build,
+    bench_partitioned_rebuild
+);
 criterion_main!(benches);

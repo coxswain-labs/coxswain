@@ -26,7 +26,7 @@ use coxswain_e2e::{
 use gateway_api_types::apis::standard::gateways::Gateway;
 use gateway_api_types::apis::standard::httproutes::HttpRoute;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::Pod;
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
 use serde_json::json;
@@ -1394,5 +1394,169 @@ async fn route_churn_burst_leaves_no_stuck_relist() -> anyhow::Result<()> {
         Duration::from_secs(30),
     )
     .await?;
+    Ok(())
+}
+
+// ── #511 partitioned incremental rebuild ────────────────────────────────────
+//
+// `build_gateway_routes` caches one compiled `Arc<HostRouter>` per `(port,
+// host)` partition, keyed by a fingerprint folding each bound route's
+// content, its endpoint dependencies, and a `global_epoch` covering inputs a
+// per-route static scan can't precisely attribute (targetRef-based policy
+// attachment, a `BasicAuth` CR's own `secretRef`). Two properties to prove
+// black-box: (a) endpoint churn on one service re-resolves only that
+// service's partition, leaving a sibling host undisturbed; (b) a
+// global-epoch-only change (an auth Secret rotated without touching the
+// BasicAuth CR or the HTTPRoute that reference it) still gets picked up on
+// the next rebuild — the safe fallback, not a silently stale partition.
+
+/// Scaling `echo-a` from 1 to 2 replicas must resolve the new pod on
+/// `host-a`'s route; `host-b` (a separate HTTPRoute, disjoint partition,
+/// distinct backend) must keep serving throughout, undisturbed by host-a's
+/// endpoint churn.
+#[tokio::test]
+async fn endpoint_churn_reresolves_only_affected_service() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "resil-endpoint-churn").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::TWO_HOSTS, FixtureVars::new(&ns.name)).await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host_a = format!("host-a.{}.local", ns.name);
+    let host_b = format!("host-b.{}.local", ns.name);
+
+    wait::wait_for_backend(&gw, &host_a, "/", "echo-a", Duration::from_secs(60)).await?;
+    wait::wait_for_backend(&gw, &host_b, "/", "echo-b", Duration::from_secs(15)).await?;
+
+    // Scale echo-a only. echo-b, host-b's backend, is never touched.
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    deployments
+        .patch(
+            "echo-a",
+            &PatchParams::default(),
+            &Patch::Merge(&json!({"spec": {"replicas": 2}})),
+        )
+        .await
+        .context("scale echo-a to 2 replicas")?;
+
+    // host-a's partition re-resolves the new endpoint: both pods answer.
+    wait::wait_for_distinct_backends(&gw, &host_a, "/", 2, Duration::from_secs(60)).await?;
+    // host-b's disjoint partition was never recompiled by host-a's endpoint
+    // churn — it keeps serving its own single backend throughout.
+    wait::wait_for_backend(&gw, &host_b, "/", "echo-b", Duration::from_secs(15)).await?;
+
+    Ok(())
+}
+
+/// A `BasicAuth` CR's own htpasswd Secret is not precisely tracked per-route
+/// by `route_fingerprint` — it folds into `compute_global_epoch` instead, so
+/// a change to it must fall back to recompiling the BasicAuth route's
+/// partition rather than risk it wrongly believing itself unaffected.
+/// Rotating the Secret alone (the BasicAuth CR and the HTTPRoute are both
+/// untouched) must invalidate the previously-valid credentials on the next
+/// rebuild. A sibling host in a wholly separate namespace (and therefore
+/// partition, and therefore Gateway) stays up throughout, proving the
+/// fallback doesn't degrade into a stop-the-world full-table replace either.
+#[tokio::test]
+async fn unmappable_change_falls_back_to_full_rebuild() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let auth_ns = NamespaceGuard::create(&h.client, "resil-epoch-auth").await?;
+    let sibling_ns = NamespaceGuard::create(&h.client, "resil-epoch-sibling").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&auth_ns.name)).await?;
+    wait::wait_for_backends(&auth_ns.name).await?;
+    fixtures::apply_fixture(
+        gwa::BASIC_AUTH_EXTENSIONREF,
+        FixtureVars::new(&auth_ns.name),
+    )
+    .await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&sibling_ns.name)).await?;
+    wait::wait_for_backends(&sibling_ns.name).await?;
+    fixtures::apply_fixture(gwa::TWO_HOSTS, FixtureVars::new(&sibling_ns.name)).await?;
+
+    let auth_gw = h.gateway_http(&auth_ns.name).await?;
+    let sibling_gw = h.gateway_http(&sibling_ns.name).await?;
+    let auth_host = format!("gwbasicauth.{}.local", auth_ns.name);
+    let host_a = format!("host-a.{}.local", sibling_ns.name);
+    let host_b = format!("host-b.{}.local", sibling_ns.name);
+
+    // Baseline: alice:secret (bcrypt) is admitted; sibling hosts serve normally.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("gateway BasicAuth route to admit alice:secret at {auth_host}") },
+        || async {
+            match auth_gw
+                .get_full_with_headers(
+                    &auth_host,
+                    "/",
+                    &[("authorization", "Basic YWxpY2U6c2VjcmV0")],
+                )
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+    wait::wait_for_backend(&sibling_gw, &host_a, "/", "echo-a", Duration::from_secs(60)).await?;
+    wait::wait_for_backend(&sibling_gw, &host_b, "/", "echo-b", Duration::from_secs(15)).await?;
+
+    // Rotate the htpasswd Secret to a different (still valid) credential —
+    // bob replaces alice. The BasicAuth CR and the HTTPRoute are both
+    // untouched — a pure `auth_secrets`-store change, the exact
+    // untracked-by-route-fingerprint dependency the global_epoch fold exists
+    // to catch. A still-parseable htpasswd keeps `IngressAuthConfig::Basic`
+    // resolved (proving the rotation was actually picked up) rather than
+    // degrading to `Unavailable`/503 (an empty-credentials broken-config
+    // case, not a credential-rejection case).
+    let secrets: Api<Secret> = Api::namespaced(h.client.clone(), &auth_ns.name);
+    secrets
+        .patch(
+            "gw-auth-htpasswd",
+            &PatchParams::default(),
+            &Patch::Merge(&json!({
+                "data": {
+                    "auth": "Ym9iOiQyeSQwNCR3clJGUVNDQmV6WUxUeVdYSktXZXV1T2h0RnVrckFqN1B6UFl0UXNPTkVoOHJPT2pqSUxhSwo="
+                }
+            })),
+        )
+        .await
+        .context("rotate gw-auth-htpasswd to a different credential (bob)")?;
+
+    // Previously-valid credentials are now rejected — the rotation was picked
+    // up despite not being precisely tracked per-route.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!("alice:secret to be rejected (401) at {auth_host} after Secret rotation")
+        },
+        || async {
+            match auth_gw
+                .get_full_with_headers(
+                    &auth_host,
+                    "/",
+                    &[("authorization", "Basic YWxpY2U6c2VjcmV0")],
+                )
+                .await
+            {
+                Ok((401, _, _)) => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    // The sibling namespace's hosts, sharing nothing with the BasicAuth
+    // route's Gateway or partition, were never disrupted.
+    wait::wait_for_backend(&sibling_gw, &host_a, "/", "echo-a", Duration::from_secs(15)).await?;
+    wait::wait_for_backend(&sibling_gw, &host_b, "/", "echo-b", Duration::from_secs(15)).await?;
+
     Ok(())
 }

@@ -13,7 +13,6 @@ pub(super) fn pcert(store: &PortTlsStore, host: &str) -> Option<std::sync::Arc<T
     store.port(TEST_HTTPS_PORT).and_then(|s| s.find_cert(host))
 }
 pub(super) use k8s_openapi::api::core::v1::{Secret, Service};
-pub(super) use k8s_openapi::api::discovery::v1::EndpointSlice;
 pub(super) use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
     IngressServiceBackend, IngressSpec, ServiceBackendPort,
@@ -25,8 +24,8 @@ pub(super) use std::collections::{BTreeMap, HashMap, HashSet};
 pub(super) use crate::tests::fixtures::{
     empty_backend_policy_index, empty_compression_store, empty_external_auth_store,
     empty_ip_access_store, empty_jwks_cache, empty_jwt_auth_store, empty_rate_limit_store,
-    empty_retry_policy_store, empty_secret_store, empty_svc_store, make_retry_policy_store,
-    make_slice, make_svc_store, slice_store,
+    empty_retry_policy_store, empty_secret_store, empty_svc_store, endpoint_cache,
+    make_retry_policy_store, make_slice, make_svc_store,
 };
 
 /// Empty `ReferenceGrant` set — every cross-namespace `CoxswainExternalAuth`
@@ -42,7 +41,7 @@ pub(super) fn owned(names: &[&str]) -> HashSet<String> {
 
 pub(super) fn reconcile_no_default(
     ing: &Ingress,
-    slices: &reflector::Store<EndpointSlice>,
+    endpoint_cache: &crate::endpoints::pool::EndpointCache,
     svcs: &reflector::Store<Service>,
     owned: &HashSet<String>,
     b: &mut IngressRoutingTableBuilder,
@@ -50,7 +49,7 @@ pub(super) fn reconcile_no_default(
     let no_class_defaults = HashMap::new();
     let _ = IngressReconciler::reconcile(
         ing,
-        slices,
+        endpoint_cache,
         svcs,
         &IngressClassContext::new(owned, None, &no_class_defaults),
         IngressPorts::new(Some(80), None),
@@ -76,7 +75,7 @@ pub(super) fn reconcile_no_default(
 /// IngressClass name — used to exercise the #190 class-defaults merge.
 pub(super) fn reconcile_with_class_defaults(
     ing: &Ingress,
-    slices: &reflector::Store<EndpointSlice>,
+    endpoint_cache: &crate::endpoints::pool::EndpointCache,
     svcs: &reflector::Store<Service>,
     owned: &HashSet<String>,
     defaults: &HashMap<String, crate::ingress::ResolvedClassParams>,
@@ -84,7 +83,7 @@ pub(super) fn reconcile_with_class_defaults(
 ) {
     let _ = IngressReconciler::reconcile(
         ing,
-        slices,
+        endpoint_cache,
         svcs,
         &IngressClassContext::new(owned, None, defaults),
         IngressPorts::new(Some(80), None),

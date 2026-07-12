@@ -17,8 +17,8 @@
 
 use super::proxy::{IngressDefaultBackend, Ownership, ReflectorStores};
 use super::route_builder::{
-    BackendClientCertResolution, build_client_certs, build_gateway_routes, build_tls,
-    merge_backend_client_cert_health,
+    BackendClientCertResolution, GatewayTableIo, build_client_certs, build_gateway_routes,
+    build_tls, merge_backend_client_cert_health,
 };
 use crate::gw_types::GrpcRoute;
 use crate::gw_types::HttpRoute;
@@ -48,6 +48,11 @@ pub(super) struct DedicatedBuildInputs<'a> {
     pub(super) base_ownership: &'a Ownership<'a>,
     pub(super) dedicated_certs: &'a BackendClientCertResolution,
     pub(super) empty_ingress_classes: &'a HashSet<String>,
+    /// See [`GatewayTableIo::global_epoch`] — computed once per rebuild from
+    /// the base (un-narrowed) ownership; valid for every dedicated build
+    /// because the epoch reads only grant sets and stores the narrowing
+    /// doesn't touch.
+    pub(super) global_epoch: u64,
 }
 
 /// Build the routing snapshot for a single cut-over dedicated-proxy Gateway.
@@ -58,6 +63,7 @@ pub(super) fn build_dedicated_gateway_snapshot(
     gw: &Arc<Gateway>,
     stores: &ReflectorStores<'_>,
     inputs: &DedicatedBuildInputs<'_>,
+    dedicated_partitions: &mut HashMap<ObjectKey, super::cache::PartitionCache>,
 ) -> Option<(ObjectKey, Arc<DedicatedRoutingSnapshot>)> {
     let base = inputs.base_ownership;
     if !base.gateway_classes.contains(&gw.spec.gateway_class_name) {
@@ -70,6 +76,10 @@ pub(super) fn build_dedicated_gateway_snapshot(
     let name = gw.metadata.name.clone().unwrap_or_default();
     let key = ObjectKey::new(ns, name);
     let single_gw = HashSet::from([key.clone()]);
+    // Each dedicated Gateway is its own independent routing table — a
+    // `(port, host)` key here must never be confused with the shared pool's
+    // or another Gateway's cache entry (#511).
+    let partitions = dedicated_partitions.entry(key.clone()).or_default();
 
     // Narrow ownership to this one Gateway so the builders produce only its routes and
     // TLS state.  Ingress classes are empty — a dedicated proxy does not serve Ingress.
@@ -108,8 +118,12 @@ pub(super) fn build_dedicated_gateway_snapshot(
         inputs.routes,
         inputs.grpc_routes,
         &dedicated_ownership,
-        &gw_routes_cell,
-        false,
+        GatewayTableIo {
+            shared: &gw_routes_cell,
+            skip_cut_over: false,
+            partitions,
+            global_epoch: inputs.global_epoch,
+        },
     );
     // `build_tls` with `skip_cut_over=false` includes all owned-class gateways in the
     // TLS store; the extra certs are harmless because the dedicated proxy only binds

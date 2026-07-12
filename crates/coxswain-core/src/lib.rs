@@ -3,13 +3,15 @@
 //! Provides the routing table, atomic [`Shared<T>`] snapshot wrapper, TLS cert
 //! store, Kubernetes ownership helpers, `ReferenceGrant` evaluation logic, the
 //! fleet discovery snapshot, the [`RoutingSource`] trait, the
-//! [`SharedGatewayListenerStatus`] shared cell, and the
-//! [`DedicatedRoutingRegistry`] per-Gateway snapshot registry — all used by
-//! both the controller and proxy crates.
+//! [`SharedGatewayListenerStatus`] shared cell, the
+//! [`DedicatedRoutingRegistry`] per-Gateway snapshot registry, and the
+//! canonical [`endpoints`] endpoint-resource model — all used by both the
+//! controller and proxy crates.
 
 pub mod cluster;
 pub mod crd;
 pub mod dedicated_registry;
+pub mod endpoints;
 pub mod fleet;
 pub mod health;
 pub mod identity;
@@ -26,6 +28,7 @@ pub mod tls;
 pub mod workqueue;
 
 pub use dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
+pub use endpoints::{EndpointKey, EndpointPool, ResolvedEndpoints};
 pub use fleet::{Component, FleetEntry, FleetSnapshot, SharedFleet};
 pub use health::{
     CheckState, HealthRegistry, HealthSnapshot, LivenessGate, SubsystemHandle, SubsystemSnapshot,

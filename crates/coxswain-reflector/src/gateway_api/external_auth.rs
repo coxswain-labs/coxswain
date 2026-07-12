@@ -10,7 +10,7 @@
 //! ([`IngressAuthConfig::Unavailable`] → 503).
 
 use crate::duration::parse_duration;
-use crate::endpoints;
+use crate::endpoints::pool::EndpointCache;
 use crate::k8s_utils::metadata_created_at;
 use crate::status::CoxswainExternalAuthStatusMap;
 use coxswain_core::crd::{CoxswainExternalAuth, CoxswainExternalAuthSpec, ExternalAuthProtocol};
@@ -20,7 +20,6 @@ use coxswain_core::routing::{
     ExtAuthConfig, ExtAuthTransport, GrpcExtAuthConfig, HttpExtAuthConfig, IngressAuthConfig,
 };
 use k8s_openapi::api::core::v1::Service;
-use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -51,10 +50,10 @@ pub(crate) fn resolve_spec(
     spec: &CoxswainExternalAuthSpec,
     policy_ns: &str,
     services: &reflector::Store<Service>,
-    slices: &reflector::Store<EndpointSlice>,
+    endpoint_cache: &EndpointCache,
     grants: &HashSet<ReferenceGrantKey>,
 ) -> IngressAuthConfig {
-    let Some(endpoints) = resolve_backend(spec, policy_ns, services, slices, grants) else {
+    let Some(endpoints) = resolve_backend(spec, policy_ns, services, endpoint_cache, grants) else {
         return IngressAuthConfig::Unavailable;
     };
 
@@ -112,7 +111,7 @@ fn resolve_backend(
     spec: &CoxswainExternalAuthSpec,
     policy_ns: &str,
     services: &reflector::Store<Service>,
-    slices: &reflector::Store<EndpointSlice>,
+    endpoint_cache: &EndpointCache,
     grants: &HashSet<ReferenceGrantKey>,
 ) -> Option<Arc<[SocketAddr]>> {
     let b = &spec.backend_ref;
@@ -135,7 +134,7 @@ fn resolve_backend(
         );
         return None;
     }
-    let resolved = endpoints::resolve(ns, &b.name, i32::from(b.port), slices, services);
+    let resolved = endpoint_cache.get(ns, &b.name, i32::from(b.port), services);
     if resolved.addrs.is_empty() {
         tracing::warn!(
             auth_ns = ns,
@@ -145,7 +144,7 @@ fn resolve_backend(
         );
         return None;
     }
-    Some(resolved.addrs.into())
+    Some(resolved.addrs.clone().into())
 }
 
 /// Per-Gateway resolved ext-auth mandate from `CoxswainExternalAuth` policies
@@ -193,7 +192,7 @@ pub fn resolve_gateway_policies(
     policies: &reflector::Store<CoxswainExternalAuth>,
     owned_gateways: &HashSet<ObjectKey>,
     services: &reflector::Store<Service>,
-    slices: &reflector::Store<EndpointSlice>,
+    endpoint_cache: &EndpointCache,
     grants: &HashSet<ReferenceGrantKey>,
 ) -> (ExternalAuthGatewayIndex, CoxswainExternalAuthStatusMap) {
     // Candidate per Gateway: (creationTimestamp, policy_key, resolved-config).
@@ -220,7 +219,7 @@ pub fn resolve_gateway_policies(
             &policy.spec,
             policy_ns,
             services,
-            slices,
+            endpoint_cache,
             grants,
         ));
 
@@ -334,10 +333,8 @@ mod tests {
         reader
     }
 
-    fn empty_slices() -> reflector::Store<EndpointSlice> {
-        let (reader, mut writer) = reflector::store();
-        writer.apply_watcher_event(&watcher::Event::InitDone);
-        reader
+    fn empty_endpoint_cache() -> EndpointCache {
+        EndpointCache::default()
     }
 
     fn owned(gws: &[(&str, &str)]) -> HashSet<ObjectKey> {
@@ -350,7 +347,7 @@ mod tests {
             &store_from(vec![]),
             &owned(&[("ns", "gw")]),
             &empty_svc(),
-            &empty_slices(),
+            &empty_endpoint_cache(),
             &HashSet::new(),
         );
         assert!(index.is_empty());
@@ -365,7 +362,7 @@ mod tests {
             &store_from(vec![make_policy("ns", "p", None, &[])]),
             &owned(&[("ns", "gw")]),
             &empty_svc(),
-            &empty_slices(),
+            &empty_endpoint_cache(),
             &HashSet::new(),
         );
         assert!(
@@ -384,7 +381,7 @@ mod tests {
             &store_from(vec![make_policy("ns", "p", None, &["gw"])]),
             &owned(&[("ns", "gw")]),
             &empty_svc(),
-            &empty_slices(),
+            &empty_endpoint_cache(),
             &HashSet::new(),
         );
         assert!(
@@ -410,7 +407,7 @@ mod tests {
             &store_from(vec![make_policy("ns", "p", None, &["other-gw"])]),
             &owned(&[("ns", "gw")]),
             &empty_svc(),
-            &empty_slices(),
+            &empty_endpoint_cache(),
             &HashSet::new(),
         );
         assert!(index.is_empty());
@@ -430,7 +427,7 @@ mod tests {
             &store_from(vec![newer, older]),
             &owned(&[("ns", "gw")]),
             &empty_svc(),
-            &empty_slices(),
+            &empty_endpoint_cache(),
             &HashSet::new(),
         );
         assert_eq!(index.len(), 1, "one Gateway → one index entry");
@@ -456,7 +453,7 @@ mod tests {
             &store_from(vec![policy]),
             &owned(&[("ns", "gw")]),
             &empty_svc(),
-            &empty_slices(),
+            &empty_endpoint_cache(),
             &HashSet::new(),
         );
         assert_eq!(index.len(), 1, "one Gateway → one index entry");

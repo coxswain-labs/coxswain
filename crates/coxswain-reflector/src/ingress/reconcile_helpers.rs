@@ -6,7 +6,7 @@
 use super::annotations::AnnotationIssue;
 use super::annotations::auth::{SecretRef, parse_htpasswd};
 use super::annotations::traffic_policy;
-use crate::endpoints;
+use crate::endpoints::pool::EndpointCache;
 use crate::gateway_api::ResolvedBackendPolicy;
 use coxswain_core::crd::{
     Compression, CoxswainExternalAuth, IpAccessControl, RateLimit, RetryPolicy,
@@ -17,7 +17,6 @@ use coxswain_core::routing::{
     RateLimitConfig, RetryPolicyConfig, WildcardKind,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -76,7 +75,7 @@ pub(super) fn resolve_mirror_filter(
     mirror_ref: &super::annotations::traffic_policy::MirrorTargetRef,
     ns: &str,
     route_id: &str,
-    slices: &reflector::Store<EndpointSlice>,
+    endpoint_cache: &EndpointCache,
     services: &reflector::Store<Service>,
 ) -> Option<FilterAction> {
     if mirror_ref.namespace != ns {
@@ -90,11 +89,10 @@ pub(super) fn resolve_mirror_filter(
         return None;
     }
     let mirror_ns = &mirror_ref.namespace;
-    let resolved = endpoints::resolve(
+    let resolved = endpoint_cache.get(
         mirror_ns,
         &mirror_ref.service,
         i32::from(mirror_ref.port),
-        slices,
         services,
     );
     if !resolved.service_exists {
@@ -118,7 +116,7 @@ pub(super) fn resolve_mirror_filter(
     }
     let mirror_group = Arc::new(BackendGroup::new(
         format!("{mirror_ns}/{}", mirror_ref.service),
-        resolved.addrs,
+        resolved.addrs.clone(),
     ));
     Some(FilterAction::Mirror {
         backend: mirror_group,
@@ -231,7 +229,7 @@ pub(super) fn resolve_ext_auth_config(
     annotation: Option<&SecretRef>,
     external_auths: &reflector::Store<CoxswainExternalAuth>,
     services: &reflector::Store<Service>,
-    slices: &reflector::Store<EndpointSlice>,
+    endpoint_cache: &EndpointCache,
     backend_grants: &crate::reference_grants::GrantSet,
     route_id: &str,
 ) -> Option<IngressAuthConfig> {
@@ -250,7 +248,7 @@ pub(super) fn resolve_ext_auth_config(
         &cr.spec,
         &r.namespace,
         services,
-        slices,
+        endpoint_cache,
         backend_grants,
     ))
 }
@@ -494,8 +492,8 @@ mod tests {
     use crate::tests::fixtures::{
         empty_compression_store, empty_external_auth_store, empty_ip_access_store,
         empty_jwks_cache, empty_jwt_auth_store, empty_rate_limit_store, empty_retry_policy_store,
-        empty_secret_store, empty_svc_store, make_ip_access_store, make_rate_limit_store,
-        slice_store,
+        empty_secret_store, empty_svc_store, endpoint_cache, make_ip_access_store,
+        make_rate_limit_store,
     };
     use coxswain_core::crd::{IpAccessControl, RateLimit};
     use coxswain_core::routing::RateLimitKey;
@@ -559,10 +557,10 @@ mod tests {
     fn resolve_ext_auth_config_absent_annotation_is_none() {
         let store = empty_external_auth_store();
         let svcs = empty_svc_store();
-        let slices = slice_store(vec![]);
+        let cache = endpoint_cache(vec![]);
         let grants = crate::reference_grants::GrantSet::default();
         assert!(
-            resolve_ext_auth_config(None, &store, &svcs, &slices, &grants, "default/ing").is_none()
+            resolve_ext_auth_config(None, &store, &svcs, &cache, &grants, "default/ing").is_none()
         );
     }
 
@@ -574,10 +572,10 @@ mod tests {
         let r = secret_ref("default", "absent");
         let store = empty_external_auth_store();
         let svcs = empty_svc_store();
-        let slices = slice_store(vec![]);
+        let cache = endpoint_cache(vec![]);
         let grants = crate::reference_grants::GrantSet::default();
         let resolved =
-            resolve_ext_auth_config(Some(&r), &store, &svcs, &slices, &grants, "default/ing")
+            resolve_ext_auth_config(Some(&r), &store, &svcs, &cache, &grants, "default/ing")
                 .expect("missing CR must still install a check (fail closed)");
         assert!(matches!(resolved, IngressAuthConfig::Unavailable));
     }
