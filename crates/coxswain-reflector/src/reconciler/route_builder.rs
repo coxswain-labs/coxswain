@@ -52,6 +52,35 @@ use k8s_openapi::api::networking::v1::Ingress;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+/// Publish outputs plus the shared-pool Gateway partition-reuse cache (#511) —
+/// grouped so [`build_routes`] stays under the workspace's 7-argument
+/// threshold.
+pub(super) struct RouteBuildIo<'a> {
+    pub(super) outputs: &'a SharedOutputs<'a>,
+    pub(super) gateway_partitions: &'a mut super::cache::PartitionCache,
+    /// See [`GatewayTableIo::global_epoch`] — computed once per rebuild in
+    /// `reconciler::proxy::rebuild`, threaded through here to the shared-pool
+    /// Gateway build.
+    pub(super) global_epoch: u64,
+}
+
+/// Output cell, partition cache, and rebuild-wide inputs for one Gateway
+/// routing-table build — grouped so [`build_gateway_routes`] stays under the
+/// workspace's 7-argument threshold.
+pub(super) struct GatewayTableIo<'a> {
+    pub(super) shared: &'a SharedGatewayRoutingTable,
+    /// See [`build_gateway_routes`]'s doc for the shared-vs-dedicated
+    /// semantics of dropping cut-over Gateways from the listener-info map.
+    pub(super) skip_cut_over: bool,
+    pub(super) partitions: &'a mut super::cache::PartitionCache,
+    /// [`compute_global_epoch`]'s output, computed ONCE per rebuild and shared
+    /// by the shared-pool build and every dedicated-Gateway build: the epoch
+    /// reads only rebuild-wide stores and grant sets identical across all of
+    /// them, and recomputing it per build would repay a full hash pass over
+    /// every Secret/ConfigMap/policy/Gateway once per dedicated Gateway.
+    pub(super) global_epoch: u64,
+}
+
 /// Build and publish the Ingress and Gateway routing tables from their
 /// respective source resources.
 ///
@@ -60,14 +89,6 @@ use std::sync::Arc;
 /// disrupt or partially clear the other. Returns `true` only when BOTH builds
 /// publish successfully — the proxy is not considered "fully synchronised"
 /// until each table has had at least one honest publish.
-/// Publish outputs plus the shared-pool Gateway partition-reuse cache (#511) —
-/// grouped so [`build_routes`] stays under the workspace's 7-argument
-/// threshold.
-pub(super) struct RouteBuildIo<'a> {
-    pub(super) outputs: &'a SharedOutputs<'a>,
-    pub(super) gateway_partitions: &'a mut super::cache::PartitionCache,
-}
-
 pub(super) fn build_routes(
     stores: &ReflectorStores<'_>,
     routes: &[Arc<HttpRoute>],
@@ -80,15 +101,19 @@ pub(super) fn build_routes(
     let RouteBuildIo {
         outputs,
         gateway_partitions,
+        global_epoch,
     } = io;
     let gateway_published = build_gateway_routes(
         stores,
         routes,
         grpc_routes,
         ownership,
-        outputs.gateway_routes,
-        true,
-        gateway_partitions,
+        GatewayTableIo {
+            shared: outputs.gateway_routes,
+            skip_cut_over: true,
+            partitions: gateway_partitions,
+            global_epoch,
+        },
     );
     let ingress_published = build_ingress_routes(
         stores,
@@ -179,7 +204,7 @@ pub(super) fn resolve_backend_client_certs(
 /// sources churn far less often than the endpoint/route-structural changes
 /// the partitioned rebuild specifically targets, so this fallback doesn't
 /// undermine its benchmarked wins.
-fn compute_global_epoch(stores: &ReflectorStores<'_>, ownership: &Ownership<'_>) -> u64 {
+pub(super) fn compute_global_epoch(stores: &ReflectorStores<'_>, ownership: &Ownership<'_>) -> u64 {
     let mut epoch = 0u64;
     epoch ^= crate::fingerprint::store_epoch(stores.policies);
     epoch ^= crate::fingerprint::store_epoch(stores.coxswain_backend_policies);
@@ -201,38 +226,44 @@ fn compute_global_epoch(stores: &ReflectorStores<'_>, ownership: &Ownership<'_>)
     epoch ^= stores.jwks_cache.generation();
     epoch ^= hash_grant_set(ownership.backend_grants);
     epoch ^= hash_grant_set(ownership.basic_auth_secret_grants);
+    // `Gateway → Secret` grants gating the GEP-3155 backend client cert: the
+    // resolved cert is baked per-route into partitioned `RouteEntry`s
+    // (`UpstreamTls.client_cert`), and a grant create/delete moves no watched
+    // resourceVersion — the Secret and Gateway are untouched — so the grant set
+    // itself must move the epoch. (`ls_cert_grants`/`ca_grants`/`tcp`/`udp`
+    // grant sets deliberately absent: they feed only tables rebuilt in full
+    // every pass.)
+    epoch ^= hash_grant_set(ownership.cert_grants);
     // Ext-auth backend endpoints are baked into route auth chains (both the
     // route-level ExtensionRef and the Gateway mandate); their pod churn moves
     // neither the CR's rv nor any store above. Fold each ext-auth service's
     // endpoint fingerprint — `wrapping_add` (not XOR) so two CRs sharing one
     // backend service don't cancel each other to zero.
-    let mut ext_auth_endpoints = 0u64;
+    let mut ext_auth_endpoints = crate::fingerprint::FingerprintAccumulator::default();
     for cr in stores.external_auths.state() {
         let Some(policy_ns) = cr.metadata.namespace.as_deref() else {
             continue;
         };
         let b = &cr.spec.backend_ref;
         let ns = b.namespace.as_deref().unwrap_or(policy_ns);
-        ext_auth_endpoints = ext_auth_endpoints.wrapping_add(stores.endpoint_cache.fingerprint(
+        ext_auth_endpoints.add_hash(stores.endpoint_cache.fingerprint(
             ns,
             &b.name,
             i32::from(b.port),
             stores.services,
         ));
     }
-    epoch ^= ext_auth_endpoints;
+    epoch ^= ext_auth_endpoints.finish();
     epoch
 }
 
-/// Order-independent fold of a `ReferenceGrantKey` set's members.
+/// Order-independent fold of a `ReferenceGrantKey` set's members. XOR is safe
+/// here (unlike route/endpoint contribution folds): `HashSet` members are
+/// unique by definition, so equal contributions can't occur and self-cancel.
 fn hash_grant_set(grants: &HashSet<ReferenceGrantKey>) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    grants.iter().fold(0u64, |acc, g| {
-        let mut hasher = DefaultHasher::new();
-        g.hash(&mut hasher);
-        acc ^ hasher.finish()
-    })
+    grants
+        .iter()
+        .fold(0u64, |acc, g| acc ^ crate::fingerprint::hash_one(g))
 }
 
 /// `"*"` for the catch-all bucket, the wildcard string as-is (already
@@ -265,10 +296,14 @@ pub(super) fn build_gateway_routes(
     routes: &[Arc<HttpRoute>],
     grpc_routes: &[Arc<GrpcRoute>],
     ownership: &Ownership<'_>,
-    shared: &SharedGatewayRoutingTable,
-    skip_cut_over: bool,
-    partitions: &mut super::cache::PartitionCache,
+    io: GatewayTableIo<'_>,
 ) -> bool {
+    let GatewayTableIo {
+        shared,
+        skip_cut_over,
+        partitions,
+        global_epoch,
+    } = io;
     let vip_internal = stores.vip_internal;
     // Precompute ListenerKey → (hostname, spec port, bind port) from every owned
     // Gateway's EFFECTIVE listeners (its own plus those merged from attached
@@ -347,7 +382,6 @@ pub(super) fn build_gateway_routes(
         jwks_cache: stores.jwks_cache,
     };
 
-    let global_epoch = compute_global_epoch(stores, ownership);
     let plan = super::gateway_partition::plan(
         &super::gateway_partition::GatewayPartitionInputs {
             routes,
@@ -415,10 +449,7 @@ pub(super) fn build_gateway_routes(
     // performs the one atomic `Shared::store` — no reader ever observes a
     // table assembled from only some of this rebuild's partitions.
     let mut final_builder = GatewayRoutingTableBuilder::new();
-    let mut live_keys: HashSet<super::cache::PartitionKey> =
-        HashSet::with_capacity(plan.fingerprints.len());
     for (key, fp) in &plan.fingerprints {
-        live_keys.insert(key.clone());
         let (port, hostname_opt) = key;
         let host_repr = conflict_host_repr(hostname_opt.as_deref());
 
@@ -441,16 +472,24 @@ pub(super) fn build_gateway_routes(
                 .filter(|c| c.port == *port && c.host == host_repr)
                 .cloned()
                 .collect();
-            partitions.insert(key.clone(), *fp, Arc::clone(&router), conflicts.clone());
-            final_builder.extend_conflicts(conflicts);
+            final_builder.extend_conflicts(conflicts.iter().cloned());
+            partitions.insert(key.clone(), *fp, Arc::clone(&router), conflicts);
             router
         } else {
             let Some(router) = partitions.get(key, *fp) else {
                 // Shouldn't happen — a "clean" partition was, by definition, a
-                // cache hit during planning. Defensive: treat as a miss rather
-                // than silently dropping the partition from the published
-                // table (skip it here; it will show up as new/dirty next
-                // rebuild since planning re-checks the cache from scratch).
+                // cache hit during planning. Defensive: skip it (it shows up
+                // as new/dirty next rebuild since planning re-checks the cache
+                // from scratch), but LOUDLY — this publishes a table missing a
+                // live partition, i.e. its host/port 404s until the next
+                // rebuild, and that must never pass silently.
+                tracing::error!(
+                    port = *port,
+                    host = host_repr,
+                    "Partition invariant violated: planned-clean partition \
+                     missing from cache — dropped from this publish, will \
+                     recompile next rebuild"
+                );
                 continue;
             };
             final_builder.extend_conflicts(partitions.conflicts_for(key).to_vec());
@@ -466,7 +505,7 @@ pub(super) fn build_gateway_routes(
             Some(h) => pb.insert_compiled_exact_host(h.clone(), router),
         }
     }
-    partitions.retain_only(&live_keys);
+    partitions.retain_only(&plan.fingerprints);
 
     publish_routes(
         shared,

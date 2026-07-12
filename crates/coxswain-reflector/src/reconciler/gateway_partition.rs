@@ -81,74 +81,67 @@ pub(crate) fn plan(
     let mut http_members: HashMap<PartitionKey, Vec<usize>> = HashMap::new();
     let mut grpc_members: HashMap<PartitionKey, Vec<usize>> = HashMap::new();
 
-    for (i, route) in inputs.routes.iter().enumerate() {
-        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-        let hostnames: Vec<&str> = route
-            .spec
-            .hostnames
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let bindings = compute_listener_bindings(
-            &hostnames,
-            route.spec.parent_refs.as_deref().unwrap_or(&[]),
-            route_ns,
-            inputs.listener_info,
-        );
-        if bindings.is_empty() {
-            continue;
-        }
-        let fp = gateway_api::http_route_fingerprint(
-            route,
-            inputs.endpoint_cache,
-            inputs.services,
-            inputs.resolution,
-        );
-        for (hostname_opt, port) in bindings {
-            let key: PartitionKey = (port, hostname_opt);
-            // `wrapping_add`, not XOR: two routes on one partition with equal
-            // fingerprints (possible — `resourceVersion` values aren't unique
-            // across objects) would XOR-cancel, hiding both from dirtiness.
-            let slot = partition_fp.entry(key.clone()).or_insert(0);
-            *slot = slot.wrapping_add(fp);
-            http_members.entry(key).or_default().push(i);
-        }
-    }
+    fold_route_set(
+        inputs.routes,
+        &mut partition_fp,
+        &mut http_members,
+        |route| {
+            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+            let hostnames: Vec<&str> = route
+                .spec
+                .hostnames
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(String::as_str)
+                .collect();
+            compute_listener_bindings(
+                &hostnames,
+                route.spec.parent_refs.as_deref().unwrap_or(&[]),
+                route_ns,
+                inputs.listener_info,
+            )
+        },
+        |route| {
+            gateway_api::http_route_fingerprint(
+                route,
+                inputs.endpoint_cache,
+                inputs.services,
+                inputs.resolution,
+            )
+        },
+    );
 
-    for (i, route) in inputs.grpc_routes.iter().enumerate() {
-        let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
-        let hostnames: Vec<&str> = route
-            .spec
-            .hostnames
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(String::as_str)
-            .collect();
-        let bindings = compute_grpc_listener_bindings(
-            &hostnames,
-            route.spec.parent_refs.as_deref().unwrap_or(&[]),
-            route_ns,
-            inputs.listener_info,
-        );
-        if bindings.is_empty() {
-            continue;
-        }
-        let fp = gateway_api::grpc_route_fingerprint(
-            route,
-            inputs.endpoint_cache,
-            inputs.services,
-            inputs.grpc_resolution,
-        );
-        for (hostname_opt, port) in bindings {
-            let key: PartitionKey = (port, hostname_opt);
-            let slot = partition_fp.entry(key.clone()).or_insert(0);
-            *slot = slot.wrapping_add(fp);
-            grpc_members.entry(key).or_default().push(i);
-        }
-    }
+    fold_route_set(
+        inputs.grpc_routes,
+        &mut partition_fp,
+        &mut grpc_members,
+        |route| {
+            let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
+            let hostnames: Vec<&str> = route
+                .spec
+                .hostnames
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .map(String::as_str)
+                .collect();
+            compute_grpc_listener_bindings(
+                &hostnames,
+                route.spec.parent_refs.as_deref().unwrap_or(&[]),
+                route_ns,
+                inputs.listener_info,
+            )
+        },
+        |route| {
+            gateway_api::grpc_route_fingerprint(
+                route,
+                inputs.endpoint_cache,
+                inputs.services,
+                inputs.grpc_resolution,
+            )
+        },
+    );
 
     let mut fingerprints = HashMap::with_capacity(partition_fp.len());
     let mut dirty = HashSet::new();
@@ -175,6 +168,39 @@ pub(crate) fn plan(
         dirty,
         dirty_http,
         dirty_grpc,
+    }
+}
+
+/// Folds one route set's fingerprints into the partition map — the single
+/// attribution rule shared by the HTTP and gRPC passes above, so a change to
+/// it (how zero-binding routes are skipped, how contributions combine) can
+/// never apply to one route type and not the other.
+///
+/// Per route: compute bindings (empty → the route contributes to no
+/// partition, exactly as `reconcile` itself would skip it); compute the
+/// fingerprint only for bound routes; `wrapping_add` it into every bound
+/// partition (not XOR — two routes on one partition with equal fingerprints
+/// would XOR-cancel, hiding both from dirtiness; see
+/// [`crate::fingerprint::FingerprintAccumulator`]).
+fn fold_route_set<R>(
+    routes: &[Arc<R>],
+    partition_fp: &mut HashMap<PartitionKey, u64>,
+    members: &mut HashMap<PartitionKey, Vec<usize>>,
+    bindings_of: impl Fn(&R) -> Vec<(Option<String>, u16)>,
+    fingerprint_of: impl Fn(&R) -> u64,
+) {
+    for (i, route) in routes.iter().enumerate() {
+        let bindings = bindings_of(route);
+        if bindings.is_empty() {
+            continue;
+        }
+        let fp = fingerprint_of(route);
+        for (hostname_opt, port) in bindings {
+            let key: PartitionKey = (port, hostname_opt);
+            let slot = partition_fp.entry(key.clone()).or_insert(0);
+            *slot = slot.wrapping_add(fp);
+            members.entry(key).or_default().push(i);
+        }
     }
 }
 

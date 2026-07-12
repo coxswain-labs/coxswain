@@ -34,9 +34,7 @@ use coxswain_core::routing::{
 use coxswain_core::tls::PortTlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use kube::runtime::reflector;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -166,82 +164,50 @@ pub(crate) fn route_fingerprint(
     services: &reflector::Store<Service>,
     resolution: &RouteResolution<'_>,
 ) -> u64 {
-    // `wrapping_add` (not XOR) to combine contributions: XOR self-cancels when
-    // a route contributes the same value twice — e.g. two rules routing to the
-    // *same* Service, or sharing one ExtensionRef CR — which would zero out that
-    // input and let its churn go unseen (#511). Addition stays order-independent
-    // without the idempotent-cancellation hazard.
-    let mut fp: u64 = 0;
-    let mut hasher = DefaultHasher::new();
-    route.metadata.resource_version.hash(&mut hasher);
-    fp = fp.wrapping_add(hasher.finish());
+    // Combination policy (wrapping_add, never XOR) lives in the accumulator;
+    // the ExtensionRef kind → store dispatch is the single shared
+    // `ExtRefStores` — see `crate::fingerprint` for both.
+    let mut fp = crate::fingerprint::FingerprintAccumulator::default();
+    fp.add(&route.metadata.resource_version);
+    let ext_stores = resolution.ext_ref_stores();
 
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     for rule in route.spec.rules.as_deref().unwrap_or(&[]) {
         let filters = rule.filters.as_deref().unwrap_or(&[]);
         for (_group, kind, name) in super::filters::ext_refs(filters) {
-            fp = fp.wrapping_add(ext_ref_fingerprint(route_ns, kind, name, resolution));
+            fp.add_hash(ext_stores.fingerprint(route_ns, kind, name));
         }
         // RequestMirror backends are baked into the compiled router but aren't
         // `backend_refs`; fold their endpoints so mirror-pod churn dirties the
         // partition (#511 finding B).
         for (mns, mname, mport) in super::filters::mirror_backend_refs(filters) {
             let ns = mns.unwrap_or(route_ns);
-            fp = fp.wrapping_add(endpoint_cache.fingerprint(ns, mname, mport, services));
+            fp.add_hash(endpoint_cache.fingerprint(ns, mname, mport, services));
         }
         for b in rule.backend_refs.as_deref().unwrap_or(&[]) {
             let Some(port) = b.port else { continue };
             let ns = b.namespace.as_deref().unwrap_or(route_ns);
-            fp = fp.wrapping_add(endpoint_cache.fingerprint(ns, &b.name, port, services));
+            fp.add_hash(endpoint_cache.fingerprint(ns, &b.name, port, services));
         }
     }
-    fp
+    fp.finish()
 }
 
-/// Fingerprint of a single spec-static `ExtensionRef` target `(kind, name)`
-/// in `route_ns` — the referenced CR's own `resourceVersion`, via a direct
-/// store lookup (no full scan). An unrecognized `kind` still folds in
-/// `(kind, name)` directly rather than being silently dropped, so an
-/// `ExtensionRef` this dispatch doesn't know about still moves the
-/// fingerprint deterministically — safe (it just forfeits reuse for that
-/// route instead of risking staleness).
-fn ext_ref_fingerprint(
-    route_ns: &str,
-    kind: &str,
-    name: &str,
-    resolution: &RouteResolution<'_>,
-) -> u64 {
-    match kind {
-        "RateLimit" => {
-            crate::fingerprint::object_fingerprint(resolution.rate_limits, route_ns, name)
-        }
-        "RetryPolicy" => {
-            crate::fingerprint::object_fingerprint(resolution.retry_policies, route_ns, name)
-        }
-        "PathRewriteRegex" => {
-            crate::fingerprint::object_fingerprint(resolution.path_rewrites, route_ns, name)
-        }
-        "IpAccessControl" => {
-            crate::fingerprint::object_fingerprint(resolution.ip_access, route_ns, name)
-        }
-        "BasicAuth" => {
-            crate::fingerprint::object_fingerprint(resolution.basic_auths, route_ns, name)
-        }
-        "CoxswainExternalAuth" => {
-            crate::fingerprint::object_fingerprint(resolution.external_auths, route_ns, name)
-        }
-        "JwtAuth" => crate::fingerprint::object_fingerprint(resolution.jwt_auths, route_ns, name),
-        "RequestSizeLimit" => {
-            crate::fingerprint::object_fingerprint(resolution.request_size_limits, route_ns, name)
-        }
-        "Compression" => {
-            crate::fingerprint::object_fingerprint(resolution.compressions, route_ns, name)
-        }
-        _ => {
-            let mut hasher = DefaultHasher::new();
-            kind.hash(&mut hasher);
-            name.hash(&mut hasher);
-            hasher.finish()
+impl RouteResolution<'_> {
+    /// This resolution's view of the shared `ExtensionRef` fingerprint
+    /// dispatch (#511) — HTTPRoute supports every registered kind, so every
+    /// store is populated.
+    pub(crate) fn ext_ref_stores(&self) -> crate::fingerprint::ExtRefStores<'_> {
+        crate::fingerprint::ExtRefStores {
+            rate_limits: self.rate_limits,
+            retry_policies: self.retry_policies,
+            ip_access: self.ip_access,
+            jwt_auths: self.jwt_auths,
+            path_rewrites: Some(self.path_rewrites),
+            basic_auths: Some(self.basic_auths),
+            external_auths: Some(self.external_auths),
+            request_size_limits: Some(self.request_size_limits),
+            compressions: Some(self.compressions),
         }
     }
 }

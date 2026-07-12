@@ -31,7 +31,6 @@ use coxswain_core::routing::{
 use k8s_openapi::api::core::v1::Service;
 use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -96,56 +95,47 @@ pub(crate) fn route_fingerprint(
     services: &reflector::Store<Service>,
     resolution: &GrpcRouteResolution<'_>,
 ) -> u64 {
-    // `wrapping_add` (not XOR): XOR self-cancels equal contributions — two rules
-    // to the same Service, or sharing one ExtensionRef CR — zeroing that input
-    // so its churn goes unseen (#511). See the HTTP `route_fingerprint`.
-    let mut fp: u64 = 0;
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    route.metadata.resource_version.hash(&mut hasher);
-    fp = fp.wrapping_add(hasher.finish());
+    // Combination policy (wrapping_add, never XOR) lives in the accumulator;
+    // the ExtensionRef kind → store dispatch is the single shared
+    // `ExtRefStores` — see `crate::fingerprint` for both. No mirror fold:
+    // GRPCRoute `RequestMirror` filters are unsupported (logged and skipped by
+    // `build_filters`), so no mirror endpoints are baked into gRPC routes.
+    let mut fp = crate::fingerprint::FingerprintAccumulator::default();
+    fp.add(&route.metadata.resource_version);
+    let ext_stores = resolution.ext_ref_stores();
 
     let route_ns = route.metadata.namespace.as_deref().unwrap_or("default");
     for rule in route.spec.rules.as_deref().unwrap_or(&[]) {
         for (_group, kind, name) in super::filters::ext_refs(rule.filters.as_deref().unwrap_or(&[]))
         {
-            fp = fp.wrapping_add(ext_ref_fingerprint(route_ns, kind, name, resolution));
+            fp.add_hash(ext_stores.fingerprint(route_ns, kind, name));
         }
         for b in rule.backend_refs.as_deref().unwrap_or(&[]) {
             let Some(port) = b.port else { continue };
             let ns = b.namespace.as_deref().unwrap_or(route_ns);
-            fp = fp.wrapping_add(endpoint_cache.fingerprint(ns, &b.name, port, services));
+            fp.add_hash(endpoint_cache.fingerprint(ns, &b.name, port, services));
         }
     }
-    fp
+    fp.finish()
 }
 
-/// GRPCRoute's narrower `ext_ref_fingerprint` dispatch — only the kinds
-/// [`GrpcRouteResolution`] supports (`RateLimit`, `RetryPolicy`,
-/// `IpAccessControl`, `JwtAuth`); every other kind (including HTTP-only ones
-/// like `BasicAuth`) falls through to the same `(kind, name)` sentinel as an
-/// unrecognized kind.
-fn ext_ref_fingerprint(
-    route_ns: &str,
-    kind: &str,
-    name: &str,
-    resolution: &GrpcRouteResolution<'_>,
-) -> u64 {
-    match kind {
-        "RateLimit" => {
-            crate::fingerprint::object_fingerprint(resolution.rate_limits, route_ns, name)
-        }
-        "RetryPolicy" => {
-            crate::fingerprint::object_fingerprint(resolution.retry_policies, route_ns, name)
-        }
-        "IpAccessControl" => {
-            crate::fingerprint::object_fingerprint(resolution.ip_access, route_ns, name)
-        }
-        "JwtAuth" => crate::fingerprint::object_fingerprint(resolution.jwt_auths, route_ns, name),
-        _ => {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            kind.hash(&mut hasher);
-            name.hash(&mut hasher);
-            hasher.finish()
+impl GrpcRouteResolution<'_> {
+    /// This resolution's view of the shared `ExtensionRef` fingerprint
+    /// dispatch (#511). `None` for the HTTP-only kinds (`BasicAuth`,
+    /// `PathRewriteRegex`, …): the gRPC translator logs and skips those refs,
+    /// so the stable `(kind, name)` sentinel the dispatch falls back to is
+    /// exactly right — the compiled output doesn't depend on the CR.
+    pub(crate) fn ext_ref_stores(&self) -> crate::fingerprint::ExtRefStores<'_> {
+        crate::fingerprint::ExtRefStores {
+            rate_limits: self.rate_limits,
+            retry_policies: self.retry_policies,
+            ip_access: self.ip_access,
+            jwt_auths: self.jwt_auths,
+            path_rewrites: None,
+            basic_auths: None,
+            external_auths: None,
+            request_size_limits: None,
+            compressions: None,
         }
     }
 }

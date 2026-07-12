@@ -29,6 +29,17 @@ use crate::endpoints::pool::EndpointCache;
 /// exactly the `(hostname_opt, port)` shape
 /// `gateway_api::bindings::compute_listener_bindings` already produces, so a
 /// route's bindings translate into partition keys with no extra lookup.
+///
+/// Invariant: this key deliberately omits
+/// [`WildcardKind`](coxswain_core::routing::WildcardKind) — the full routing
+/// key space is `(port, host, WildcardKind)`, but every Gateway API wildcard
+/// is `MultiLabel` (deliberate, see the wildcard-semantics note in the
+/// project docs) and the `SingleLabel` (Ingress TLS) path is not partitioned.
+/// The assembly in `route_builder` hardcodes `WildcardKind::MultiLabel` on
+/// both the `get_compiled` and `insert_compiled_wildcard_host` sides under
+/// this invariant. If partitioning is ever extended to a `SingleLabel`
+/// producer, this key must grow a `WildcardKind` component first — otherwise
+/// two distinct router buckets collide under one cache entry.
 pub(crate) type PartitionKey = (u16, Option<String>);
 
 /// One cached partition: the fingerprint it was compiled under, the compiled
@@ -100,8 +111,8 @@ impl PartitionCache {
     /// that no longer exists this rebuild (route/listener deleted) must not
     /// linger and be offered as a stale reuse candidate if the same key
     /// reappears later with different bound routes.
-    pub(crate) fn retain_only(&mut self, live: &std::collections::HashSet<PartitionKey>) {
-        self.entries.retain(|key, _| live.contains(key));
+    pub(crate) fn retain_only(&mut self, live: &HashMap<PartitionKey, u64>) {
+        self.entries.retain(|key, _| live.contains_key(key));
     }
 }
 

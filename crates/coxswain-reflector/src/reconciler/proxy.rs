@@ -2551,6 +2551,12 @@ fn rebuild(
         backend_client_cert_failures: &backend_client_certs.failures,
         effective_gateways: &effective,
     };
+    // Computed ONCE per rebuild and shared by the shared-pool build below and
+    // every dedicated-Gateway build (#511): the epoch reads only rebuild-wide
+    // stores and grant sets identical across all of them, and recomputing it
+    // per build would repay a full hash pass over every Secret/ConfigMap/
+    // policy/Gateway once per dedicated Gateway.
+    let global_epoch = super::route_builder::compute_global_epoch(stores, &ownership);
 
     let routes_published = build_routes(
         stores,
@@ -2565,6 +2571,7 @@ fn rebuild(
         RouteBuildIo {
             outputs,
             gateway_partitions,
+            global_epoch,
         },
     );
 
@@ -2777,6 +2784,7 @@ fn rebuild(
         base_ownership: &ownership,
         dedicated_certs: &dedicated_backend_client_certs,
         empty_ingress_classes: &empty_ingress_classes,
+        global_epoch,
     };
     let registry_map: HashMap<ObjectKey, Arc<DedicatedRoutingSnapshot>> = stores
         .gateways
@@ -2787,6 +2795,13 @@ fn rebuild(
         })
         .collect();
     let dedicated_keys: HashSet<ObjectKey> = registry_map.keys().cloned().collect();
+    // Drop partition caches for Gateways that produced no dedicated snapshot
+    // this rebuild (deleted, or reverted from cut-over) — without this the
+    // per-Gateway `PartitionCache`s (each holding compiled `Arc<HostRouter>`s)
+    // accumulate for the controller's lifetime under Gateway churn (#511).
+    // Reappearance is safe: planning re-checks fingerprints from scratch, so
+    // an evicted Gateway simply recompiles fresh on its next cut-over.
+    dedicated_partitions.retain(|key, _| dedicated_keys.contains(key));
     // Fold each dedicated snapshot's listener health into the controller-side
     // cell too (#570). The snapshot copy only travels the discovery wire to
     // the dedicated proxy; without this fold the controller cell keeps a

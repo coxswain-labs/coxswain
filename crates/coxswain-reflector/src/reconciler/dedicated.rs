@@ -17,8 +17,8 @@
 
 use super::proxy::{IngressDefaultBackend, Ownership, ReflectorStores};
 use super::route_builder::{
-    BackendClientCertResolution, build_client_certs, build_gateway_routes, build_tls,
-    merge_backend_client_cert_health,
+    BackendClientCertResolution, GatewayTableIo, build_client_certs, build_gateway_routes,
+    build_tls, merge_backend_client_cert_health,
 };
 use crate::gw_types::GrpcRoute;
 use crate::gw_types::HttpRoute;
@@ -48,6 +48,11 @@ pub(super) struct DedicatedBuildInputs<'a> {
     pub(super) base_ownership: &'a Ownership<'a>,
     pub(super) dedicated_certs: &'a BackendClientCertResolution,
     pub(super) empty_ingress_classes: &'a HashSet<String>,
+    /// See [`GatewayTableIo::global_epoch`] — computed once per rebuild from
+    /// the base (un-narrowed) ownership; valid for every dedicated build
+    /// because the epoch reads only grant sets and stores the narrowing
+    /// doesn't touch.
+    pub(super) global_epoch: u64,
 }
 
 /// Build the routing snapshot for a single cut-over dedicated-proxy Gateway.
@@ -113,9 +118,12 @@ pub(super) fn build_dedicated_gateway_snapshot(
         inputs.routes,
         inputs.grpc_routes,
         &dedicated_ownership,
-        &gw_routes_cell,
-        false,
-        partitions,
+        GatewayTableIo {
+            shared: &gw_routes_cell,
+            skip_cut_over: false,
+            partitions,
+            global_epoch: inputs.global_epoch,
+        },
     );
     // `build_tls` with `skip_cut_over=false` includes all owned-class gateways in the
     // TLS store; the extra certs are harmless because the dedicated proxy only binds

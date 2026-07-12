@@ -180,10 +180,17 @@ fn bench_endpoint_churn(c: &mut Criterion) {
 
         group.bench_function(format!("pool_cached_routes{routes}"), |b| {
             let mut generation = 0u32;
+            // The cache deliberately lives OUTSIDE `b.iter()`, mirroring
+            // production (`ReflectorCaches` outlives every rebuild): from the
+            // second iteration on, the `routes - 1` un-churned services hit
+            // the fingerprint fast path (`Arc::clone`, no resolve) — the
+            // cross-rebuild reuse #511 exists to deliver. A per-iteration
+            // fresh cache would measure only refresh's grouping win and never
+            // the cache win.
+            let mut cache = EndpointCache::default();
             b.iter(|| {
                 generation += 1;
                 let (slices, services) = build_stores_with_churn(routes, 5, churned, generation);
-                let mut cache = EndpointCache::default();
                 cache.refresh(&slices);
                 let mut total_addrs = 0usize;
                 for i in 0..routes {

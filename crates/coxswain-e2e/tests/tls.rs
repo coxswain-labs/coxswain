@@ -3130,6 +3130,106 @@ async fn backend_mtls_invalid_client_cert_ref_fails_closed() -> anyhow::Result<(
     Ok(())
 }
 
+/// GEP-3155 cross-namespace grant toggle: creating the ReferenceGrant ALONE
+/// flips the data plane from fail-closed (502) to presenting the client cert
+/// (200), sad → happy in one test.
+///
+/// The Gateway's `clientCertificateRef` targets a Secret in a second
+/// namespace. With no grant the ref is `RefNotPermitted` → the proxy fails
+/// closed on the BackendTLSPolicy upstream (502). The test then applies ONLY
+/// the ReferenceGrant — no Secret, Gateway, HTTPRoute, or policy is touched,
+/// so no watched `resourceVersion` on any of those moves — and traffic must
+/// converge to 200 with the client cert presented.
+///
+/// This is the end-to-end proof for the #511 partitioned rebuild's grant
+/// tracking (`cert_grants` folded into the global invalidation epoch): were
+/// the grant set not folded, every `(port, host)` partition would be judged
+/// clean after the grant event and the cached fail-closed router would be
+/// served indefinitely — this test would time out at the 200 poll.
+#[tokio::test]
+async fn backend_mtls_cross_ns_grant_toggle_flips_fail_closed_to_serving() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-backend-cc-xns").await?;
+    let certs_ns = NamespaceGuard::create(&h.client, "tls-gw-backend-cc-xns-certs").await?;
+
+    // Server cert: TLS termination at the backend.
+    let tls_hostname = format!("echo-mtls-xns.{}.local", ns.name);
+    let server_cert = GeneratedCert::for_host(&tls_hostname);
+
+    // Client CA + leaf: proxy presents this to the mTLS backend once permitted.
+    let client_certs = MtlsCerts::generate();
+    let secret_name = "backend-cc-xns-client";
+
+    // Deploy echo-mtls (requires a client cert signed by the client CA).
+    fixtures::apply_fixture(
+        backends::ECHO_MTLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", server_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", server_cert.key_b64())
+            .with("TLS_CLIENT_CA_B64", client_certs.ca_cert_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-mtls"]).await?;
+
+    // Client-cert Secret in the certs namespace — deliberately NO grant yet.
+    fixtures::apply_fixture(
+        gwa::BACKEND_CLIENT_CERT_CROSS_NS_SECRET,
+        FixtureVars::new(&certs_ns.name)
+            .with("SECRET_NAME", secret_name)
+            .with("CLIENT_CERT_B64", client_certs.client_cert_b64())
+            .with("CLIENT_KEY_B64", client_certs.client_key_b64()),
+    )
+    .await?;
+
+    // Gateway (cross-ns clientCertificateRef) + HTTPRoute + BackendTLSPolicy.
+    fixtures::apply_fixture(
+        gwa::BACKEND_CLIENT_CERT_CROSS_NS,
+        FixtureVars::new(&ns.name)
+            .with("CERTS_NS", &certs_ns.name)
+            .with("SECRET_NAME", secret_name)
+            .with("TLS_HOSTNAME", &tls_hostname)
+            .with("CA_PEM", server_cert.cert_pem.clone()),
+    )
+    .await?;
+
+    // Sad path: no grant → RefNotPermitted → fail-closed 502.
+    let host = format!("backend-cc-xns.{}.local", ns.name);
+    let gw = h.gateway_http(&ns.name).await?;
+    wait::wait_for_route_status(&gw, &host, "/", 502, Duration::from_secs(90)).await?;
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "backend-cc-xns-gw",
+        &ns.name,
+        "ResolvedRefs",
+        "False",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    // The ONLY mutation: create the ReferenceGrant in the certs namespace.
+    fixtures::apply_fixture(
+        gwa::BACKEND_CLIENT_CERT_GRANT,
+        FixtureVars::new(&certs_ns.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+
+    // Happy path: the grant event alone must re-resolve the cert and recompile
+    // the affected routing — 200 with the client cert presented.
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(90)).await?;
+    resp.assert_backend("echo-mtls");
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "backend-cc-xns-gw",
+        &ns.name,
+        "ResolvedRefs",
+        "True",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    Ok(())
+}
+
 // ── TLS passthrough (TLSRoute / GEP-2643, #70) ────────────────────────────────
 
 /// Happy path: TLSRoute on a `TLS/Passthrough` listener routes raw TLS by SNI.

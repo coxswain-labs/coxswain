@@ -28,8 +28,6 @@ use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use kube::runtime::reflector;
 use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// Order-independent fold of a group's member `(name, resourceVersion)` pairs.
@@ -185,10 +183,7 @@ impl EndpointCache {
 }
 
 fn member_fingerprint(slice: &EndpointSlice) -> GroupFingerprint {
-    let mut hasher = DefaultHasher::new();
-    slice.metadata.name.hash(&mut hasher);
-    slice.metadata.resource_version.hash(&mut hasher);
-    hasher.finish()
+    crate::fingerprint::hash_one(&(&slice.metadata.name, &slice.metadata.resource_version))
 }
 
 #[cfg(test)]
