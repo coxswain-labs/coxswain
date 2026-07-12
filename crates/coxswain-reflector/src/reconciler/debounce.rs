@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 
 /// Bounds for the reconciler's adaptive rebuild debounce.
 ///
@@ -84,23 +84,39 @@ impl Default for DebounceSettings {
 }
 
 /// Wait for the reconciler's rebuild loop to settle after the first watch
-/// event of a cycle. The caller awaits that first `notify.notified()` itself
-/// (so its own elapsed-time metric starts exactly there) and calls this
-/// function immediately after.
+/// event of a cycle. The caller observes that first trigger bump itself (via
+/// `changed()` + `borrow_and_update()`, so its own elapsed-time metric starts
+/// exactly there) and calls this function immediately after, passing the same
+/// receiver.
+///
+/// `rx` is the rebuild-trigger `watch` receiver: each interrupting event is a
+/// generation bump observed via `changed()`. Unlike the former `Notify`, a
+/// `watch` bump that lands while this function is between `select!` polls is
+/// never lost — the next `changed()` still observes it. The caller must have
+/// marked the receiver current (`borrow_and_update`) before entry, so the first
+/// `changed()` here waits for *further* churn rather than re-firing on the wake
+/// that started the cycle.
 ///
 /// Fires when either bound elapses first: the current quiet window (starting
 /// at `settings.min()`, doubling — capped at `settings.max()` — on every
-/// notification that interrupts it), or `settings.max()` since this function
-/// was entered. The doubling means events spaced further apart than the
-/// initial `min` still increasingly coalesce as churn continues, rather than
-/// each firing its own rebuild; the absolute ceiling means a rebuild is never
+/// event that interrupts it), or `settings.max()` since this function was
+/// entered. The doubling means events spaced further apart than the initial
+/// `min` still increasingly coalesce as churn continues, rather than each
+/// firing its own rebuild; the absolute ceiling means a rebuild is never
 /// starved by continuous churn.
-pub(crate) async fn settle(notify: &Notify, settings: DebounceSettings) {
+pub(crate) async fn settle(rx: &mut watch::Receiver<u64>, settings: DebounceSettings) {
     let deadline = tokio::time::Instant::now() + settings.max();
     let mut window = settings.min();
     loop {
         tokio::select! {
-            _ = notify.notified() => {
+            biased;
+            changed = rx.changed() => {
+                // Err only when every sender has been dropped (shutdown); no
+                // further churn can arrive, so settle now.
+                if changed.is_err() {
+                    break;
+                }
+                rx.borrow_and_update();
                 window = (window * 2).min(settings.max());
             }
             _ = tokio::time::sleep(window) => break,
@@ -138,12 +154,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn settles_after_min_with_no_further_events() {
-        let notify = Notify::new();
+        // Keep `_tx` alive: dropping every sender makes `changed()` return Err,
+        // which would settle immediately rather than after the quiet window.
+        let (_tx, mut rx) = watch::channel(0u64);
         let settings = DebounceSettings::new(Duration::from_millis(20), Duration::from_millis(500))
             .expect("valid bounds");
 
         let start = tokio::time::Instant::now();
-        settle(&notify, settings).await;
+        settle(&mut rx, settings).await;
 
         assert_eq!(
             start.elapsed(),
@@ -153,18 +171,18 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_notification_within_min_doubles_the_quiet_window() {
-        let notify = Notify::new();
+    async fn an_event_within_min_doubles_the_quiet_window() {
+        let (tx, mut rx) = watch::channel(0u64);
         let settings = DebounceSettings::new(Duration::from_millis(20), Duration::from_millis(500))
             .expect("valid bounds");
 
         let start = tokio::time::Instant::now();
-        // `join!` polls both futures in order on entry, so `settle`'s
-        // `notified()` waiter is registered before the second future's sleep
-        // fires — the notification is guaranteed to land, not race-lost.
-        tokio::join!(settle(&notify, settings), async {
+        // A `watch` bump is durable: even if `settle` is not at its `changed()`
+        // poll when the send lands, the next `changed()` still observes it — no
+        // registration race to guard against (unlike the former `Notify`).
+        tokio::join!(settle(&mut rx, settings), async {
             tokio::time::sleep(Duration::from_millis(10)).await;
-            notify.notify_waiters();
+            tx.send_modify(|g| *g = g.wrapping_add(1));
         });
 
         assert_eq!(
@@ -176,23 +194,23 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn repeated_interruptions_compound_the_widening() {
-        let notify = std::sync::Arc::new(Notify::new());
+        let (tx, mut rx) = watch::channel(0u64);
         let settings = DebounceSettings::new(Duration::from_millis(20), Duration::from_millis(500))
             .expect("valid bounds");
 
         // Three events 10ms apart, each comfortably inside the
         // then-current (already-doubled) window: 20ms -> 40ms -> 80ms -> a
         // final 160ms quiet window (no more events) settles the cycle.
-        let churn_notify = std::sync::Arc::clone(&notify);
+        let churn_tx = tx.clone();
         let churner = tokio::spawn(async move {
             for _ in 0..3 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                churn_notify.notify_waiters();
+                churn_tx.send_modify(|g| *g = g.wrapping_add(1));
             }
         });
 
         let start = tokio::time::Instant::now();
-        settle(&notify, settings).await;
+        settle(&mut rx, settings).await;
         churner.await.expect("churner task must not panic");
 
         // Events at t=10,20,30 double the window each time (20->40->80->160);
@@ -209,22 +227,22 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn continuous_churn_is_bounded_by_the_max_ceiling() {
-        let notify = std::sync::Arc::new(Notify::new());
+        let (tx, mut rx) = watch::channel(0u64);
         let settings = DebounceSettings::new(Duration::from_millis(20), Duration::from_millis(500))
             .expect("valid bounds");
 
-        let churn_notify = std::sync::Arc::clone(&notify);
+        let churn_tx = tx.clone();
         let churner = tokio::spawn(async move {
             // Fires every 10ms — always inside `min` — for far longer than
             // `max`, simulating sustained churn (e.g. a rolling deploy).
             loop {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                churn_notify.notify_waiters();
+                churn_tx.send_modify(|g| *g = g.wrapping_add(1));
             }
         });
 
         let start = tokio::time::Instant::now();
-        tokio::time::timeout(Duration::from_millis(600), settle(&notify, settings))
+        tokio::time::timeout(Duration::from_millis(600), settle(&mut rx, settings))
             .await
             .expect("settle must fire by the max ceiling even under continuous churn");
 

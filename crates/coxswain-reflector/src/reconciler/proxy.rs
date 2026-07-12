@@ -85,7 +85,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 /// Error returned when parsing `--ingress-default-backend`.
@@ -288,17 +288,18 @@ impl Default for ReconcilerOptions {
 /// [`bulk_watch_config`].
 const CONTROL_WATCH_IDLE_TIMEOUT_SECS: u32 = 45;
 
-/// Periodic resync cadence for the rebuild loop — the #574 lost-signal backstop.
+/// Periodic resync cadence for the rebuild loop — the #574 watch-stall backstop.
 ///
-/// The loop is otherwise purely `notify`-driven; a single dropped/racy wake
-/// could leave the routing table and derived status cells stale until the next
-/// watch event (which never comes on a quiescent cluster). A periodic tick
-/// re-derives from the authoritative stores unconditionally, so a lost signal
-/// costs at most this long, not indefinitely. Idempotent: a resync with no
-/// drift republishes identical snapshots. Distinct from
-/// [`CONTROL_WATCH_IDLE_TIMEOUT_SECS`], which recovers a stalled *watch* (data
-/// never reached the store); this recovers a lost *trigger* (data in the store,
-/// wake dropped).
+/// The rebuild trigger is a lossless `watch` channel (see [`ReflectorEffects`]),
+/// so a *delivered* watch event can no longer be dropped before the rebuild
+/// loop observes it — this tick is NOT the recovery path for a raced wake. It
+/// exists for the one gap the trigger can't cover: a watch stream that goes
+/// silent *without* delivering an event (so nothing bumps the trigger) while its
+/// store still holds a now-stale snapshot. The periodic tick re-derives from the
+/// authoritative stores unconditionally, so such a gap costs at most this long.
+/// Idempotent: a resync with no drift republishes identical snapshots. Works
+/// alongside [`CONTROL_WATCH_IDLE_TIMEOUT_SECS`], which forces a stalled watch to
+/// relist; this tick additionally re-derives even before that relist lands.
 const REBUILD_RESYNC_PERIOD: Duration = Duration::from_secs(30);
 
 /// Watch config for the small control-plane resources — kube defaults plus the
@@ -1152,16 +1153,27 @@ pub(super) struct Ownership<'a> {
     pub(super) effective_gateways: &'a HashMap<ObjectKey, super::listener_merge::EffectiveGateway>,
 }
 
-/// Per-reflector side-effect channels: rebuild notification, readiness flip,
+/// Per-reflector side-effect channels: rebuild trigger, readiness flip,
 /// and metric observation.
 ///
 /// Grouped so [`spawn_reflector`] stays under `clippy::too_many_arguments`.
 /// Since #574 removed the lossy fan-out, this no longer carries a per-kind
-/// sender — every watch event just wakes the shared rebuild `notify`, and the
+/// sender — every watch event just bumps the shared rebuild trigger, and the
 /// rebuild pass enqueues the derived status keys — so it is no longer generic
 /// over the watched kind.
+///
+/// The trigger is a `watch::Sender<u64>` generation counter, NOT a
+/// `tokio::sync::Notify`. A `watch` channel never loses the latest value:
+/// `changed()`/`borrow_and_update()` on the rebuild-loop receiver observe every
+/// bump regardless of whether the loop was parked in its `select!` at the
+/// instant of the send. `Notify::notify_one` in a `select!` against the resync
+/// tick could drop an already-delivered wake if the tick branch won the same
+/// poll, leaving convergence to wait on the coarse 30 s backstop
+/// ([`REBUILD_RESYNC_PERIOD`]) — the class of stall #574 exists to remove. This
+/// also matches the reflector's *output* signals (the status cells), which are
+/// already `watch::Sender<u64>`.
 pub(super) struct ReflectorEffects {
-    notify: Arc<Notify>,
+    trigger: watch::Sender<u64>,
     controller_health: SubsystemHandle,
     /// Health-check name to flip Ready on first `Event::InitDone`. Also used
     /// as the `kind` metric label for `watch_events_total` / `watch_errors_total`.
@@ -1171,18 +1183,30 @@ pub(super) struct ReflectorEffects {
 
 impl ReflectorEffects {
     pub(super) fn new(
-        notify: &Arc<Notify>,
+        trigger: &watch::Sender<u64>,
         health: &SubsystemHandle,
         check: &'static str,
         metrics: crate::ReflectorMetrics,
     ) -> Self {
         Self {
-            notify: Arc::clone(notify),
+            trigger: trigger.clone(),
             controller_health: health.clone(),
             check,
             metrics,
         }
     }
+}
+
+/// Bump the rebuild-trigger generation counter, waking the rebuild loop.
+///
+/// `send_modify` always marks the value changed and notifies every receiver, so
+/// the wake is lossless even if the rebuild loop is mid-rebuild (not currently
+/// awaiting `changed()`) at the instant of the bump — the next `changed()` still
+/// observes the new generation. The counter value itself is unused; only the
+/// change signal matters (it wraps to avoid an unbounded increment).
+#[inline]
+fn bump_rebuild(trigger: &watch::Sender<u64>) {
+    trigger.send_modify(|g| *g = g.wrapping_add(1));
 }
 
 pub(super) fn spawn_reflector<T>(
@@ -1203,7 +1227,7 @@ pub(super) fn spawn_reflector<T>(
     T::DynamicType: Default + Clone + std::hash::Hash + Eq + Send + Sync + 'static,
 {
     let ReflectorEffects {
-        notify,
+        trigger,
         controller_health,
         check,
         metrics,
@@ -1218,7 +1242,7 @@ pub(super) fn spawn_reflector<T>(
                     // before yielding this event, so waking the rebuild loop now
                     // re-derives (routing + status) from the fresh post-relist
                     // world; the rebuild pass enqueues the status keys.
-                    notify.notify_one();
+                    bump_rebuild(&trigger);
                     controller_health.ready(check);
                     metrics.observe_watch_event(check, "init_done");
                     metrics.observe_relist_completed(check);
@@ -1226,7 +1250,7 @@ pub(super) fn spawn_reflector<T>(
                 Ok(watcher::Event::Init) => {
                     // A relist began: mark it in flight and (re)start its stall
                     // clock.
-                    notify.notify_one();
+                    bump_rebuild(&trigger);
                     metrics.observe_watch_event(check, "restart");
                     metrics.observe_relist_progress(check);
                 }
@@ -1236,18 +1260,18 @@ pub(super) fn spawn_reflector<T>(
                     // snapshot. Refreshing the stall clock here keeps a
                     // large-but-streaming relist from ever looking frozen to the
                     // liveness backstop.
-                    notify.notify_one();
+                    bump_rebuild(&trigger);
                     metrics.observe_watch_event(check, "restart");
                     metrics.observe_relist_progress(check);
                 }
                 Ok(watcher::Event::Apply(_)) => {
                     // The store already holds the object (applied before this
                     // yield); waking the rebuild loop re-derives and enqueues.
-                    notify.notify_one();
+                    bump_rebuild(&trigger);
                     metrics.observe_watch_event(check, "apply");
                 }
                 Ok(watcher::Event::Delete(_)) => {
-                    notify.notify_one();
+                    bump_rebuild(&trigger);
                     metrics.observe_watch_event(check, "delete");
                 }
                 Err(e) => {
@@ -1445,7 +1469,7 @@ fn add_gateway_api_reflectors(
     clients: WatchClientSource<'_>,
     ns: Option<&str>,
     writers: GatewayApiStoreWriters,
-    notify: &Arc<Notify>,
+    trigger: &watch::Sender<u64>,
     health: &SubsystemHandle,
     metrics: crate::ReflectorMetrics,
 ) {
@@ -1474,7 +1498,7 @@ fn add_gateway_api_reflectors(
         routes,
         scoped_api::<HttpRoute>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "httproute", metrics),
+        ReflectorEffects::new(trigger, health, "httproute", metrics),
         "HttpRoute",
     );
     spawn_reflector(
@@ -1482,7 +1506,7 @@ fn add_gateway_api_reflectors(
         grpc_routes,
         scoped_api::<GrpcRoute>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "grpcroute", metrics),
+        ReflectorEffects::new(trigger, health, "grpcroute", metrics),
         "GrpcRoute",
     );
     spawn_reflector(
@@ -1490,7 +1514,7 @@ fn add_gateway_api_reflectors(
         tls_routes,
         scoped_api::<TlsRoute>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "tls_route", metrics),
+        ReflectorEffects::new(trigger, health, "tls_route", metrics),
         "TlsRoute",
     );
     spawn_reflector(
@@ -1498,7 +1522,7 @@ fn add_gateway_api_reflectors(
         tcp_routes,
         scoped_api::<TcpRoute>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "tcp_route", metrics),
+        ReflectorEffects::new(trigger, health, "tcp_route", metrics),
         "TcpRoute",
     );
     spawn_reflector(
@@ -1506,7 +1530,7 @@ fn add_gateway_api_reflectors(
         udp_routes,
         scoped_api::<UdpRoute>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "udp_route", metrics),
+        ReflectorEffects::new(trigger, health, "udp_route", metrics),
         "UdpRoute",
     );
     spawn_reflector(
@@ -1514,7 +1538,7 @@ fn add_gateway_api_reflectors(
         gateways,
         scoped_api::<Gateway>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "gateway", metrics),
+        ReflectorEffects::new(trigger, health, "gateway", metrics),
         "Gateway",
     );
     spawn_reflector(
@@ -1522,7 +1546,7 @@ fn add_gateway_api_reflectors(
         gateway_classes,
         Api::<GatewayClass>::all(clients.client()),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "gateway_class", metrics),
+        ReflectorEffects::new(trigger, health, "gateway_class", metrics),
         "GatewayClass",
     );
     spawn_reflector(
@@ -1530,7 +1554,7 @@ fn add_gateway_api_reflectors(
         grants,
         scoped_api::<ReferenceGrant>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "reference_grant", metrics),
+        ReflectorEffects::new(trigger, health, "reference_grant", metrics),
         "ReferenceGrant",
     );
     spawn_reflector(
@@ -1538,7 +1562,7 @@ fn add_gateway_api_reflectors(
         policies,
         scoped_api::<BackendTlsPolicy>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "backend_tls_policy", metrics),
+        ReflectorEffects::new(trigger, health, "backend_tls_policy", metrics),
         "BackendTlsPolicy",
     );
     // ConfigMaps have no type= field selector equivalent; all CMs in scope are
@@ -1548,7 +1572,7 @@ fn add_gateway_api_reflectors(
         configmaps,
         scoped_api::<ConfigMap>(clients.client(), ns),
         bulk_watch_config(),
-        ReflectorEffects::new(notify, health, "config_map", metrics),
+        ReflectorEffects::new(trigger, health, "config_map", metrics),
         "ConfigMap",
     );
     spawn_reflector(
@@ -1556,7 +1580,7 @@ fn add_gateway_api_reflectors(
         path_rewrites,
         scoped_api::<PathRewriteRegex>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "path_rewrite_regex", metrics),
+        ReflectorEffects::new(trigger, health, "path_rewrite_regex", metrics),
         "PathRewriteRegex",
     );
     spawn_reflector(
@@ -1564,7 +1588,7 @@ fn add_gateway_api_reflectors(
         basic_auths,
         scoped_api::<BasicAuth>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "basic_auth", metrics),
+        ReflectorEffects::new(trigger, health, "basic_auth", metrics),
         "BasicAuth",
     );
     spawn_reflector(
@@ -1572,7 +1596,7 @@ fn add_gateway_api_reflectors(
         request_size_limits,
         scoped_api::<RequestSizeLimit>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "request_size_limit", metrics),
+        ReflectorEffects::new(trigger, health, "request_size_limit", metrics),
         "RequestSizeLimit",
     );
     // GEP-1713: ListenerSets are namespaced and merged into their parent Gateway's
@@ -1582,7 +1606,7 @@ fn add_gateway_api_reflectors(
         listener_sets,
         scoped_api::<ListenerSet>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "listener_set", metrics),
+        ReflectorEffects::new(trigger, health, "listener_set", metrics),
         "ListenerSet",
     );
     // Namespaces are cluster-scoped and watched only so a Gateway's
@@ -1595,7 +1619,7 @@ fn add_gateway_api_reflectors(
         namespaces,
         Api::<Namespace>::all(clients.client()),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "namespace", metrics),
+        ReflectorEffects::new(trigger, health, "namespace", metrics),
         "Namespace",
     );
     // `ClientTrafficPolicy` CRs — per-listener PROXY-protocol opt-in (#327).
@@ -1605,7 +1629,7 @@ fn add_gateway_api_reflectors(
         client_traffic_policies,
         scoped_api::<ClientTrafficPolicy>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "client_traffic_policy", metrics),
+        ReflectorEffects::new(trigger, health, "client_traffic_policy", metrics),
         "ClientTrafficPolicy",
     );
     // `CoxswainBackendPolicy` CRs — per-backend connect/idle timeouts (#354).
@@ -1614,7 +1638,7 @@ fn add_gateway_api_reflectors(
         coxswain_backend_policies,
         scoped_api::<CoxswainBackendPolicy>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(notify, health, "coxswain_backend_policy", metrics),
+        ReflectorEffects::new(trigger, health, "coxswain_backend_policy", metrics),
         "CoxswainBackendPolicy",
     );
 }
@@ -1741,7 +1765,11 @@ async fn spawn_tasks(
     let (cbp_reader, cbp_writer) =
         reader_writer::<CoxswainBackendPolicy>(pre.coxswain_backend_policies);
     let (namespace_reader, namespace_writer) = reader_writer::<Namespace>(op_namespaces_w);
-    let notify = Arc::new(Notify::new());
+    // Lossless rebuild trigger (#574): a `watch::Sender<u64>` generation counter,
+    // not a `Notify`. Every watch event bumps it via `bump_rebuild`; the rebuild
+    // loop reads it with `changed()`/`borrow_and_update()`, which never miss a
+    // bump — see [`ReflectorEffects`]. `rebuild_rx` is the single consumer.
+    let (rebuild_tx, mut rebuild_rx) = watch::channel(0u64);
     let mut set = JoinSet::new();
 
     // Relist liveness backstop (#573), controller role only: trips the gate
@@ -1764,7 +1792,7 @@ async fn spawn_tasks(
         slice_writer,
         scoped_api::<EndpointSlice>(watch_client(&kube_config, &client), ns),
         bulk_watch_config(),
-        ReflectorEffects::new(&notify, &controller_health, "endpoint_slice", metrics),
+        ReflectorEffects::new(&rebuild_tx, &controller_health, "endpoint_slice", metrics),
         "EndpointSlice",
     );
     // Field-selector scoped to `type=kubernetes.io/tls` to avoid pulling every Secret into memory.
@@ -1773,7 +1801,7 @@ async fn spawn_tasks(
         secret_writer,
         scoped_api::<Secret>(watch_client(&kube_config, &client), ns),
         bulk_watch_config().fields("type=kubernetes.io/tls"),
-        ReflectorEffects::new(&notify, &controller_health, "secret", metrics),
+        ReflectorEffects::new(&rebuild_tx, &controller_health, "secret", metrics),
         "Secret",
     );
     // Used to resolve targetPort for backends where servicePort ≠ targetPort.
@@ -1782,7 +1810,7 @@ async fn spawn_tasks(
         service_writer,
         scoped_api::<Service>(watch_client(&kube_config, &client), ns),
         bulk_watch_config(),
-        ReflectorEffects::new(&notify, &controller_health, "service", metrics),
+        ReflectorEffects::new(&rebuild_tx, &controller_health, "service", metrics),
         "Service",
     );
     // Label-scoped to `ingress.coxswain-labs.dev/auth-basic=true` — only opt-in
@@ -1795,7 +1823,7 @@ async fn spawn_tasks(
         auth_secret_writer,
         scoped_api::<Secret>(watch_client(&kube_config, &client), ns),
         control_watch_config().labels("ingress.coxswain-labs.dev/auth-basic=true"),
-        ReflectorEffects::new(&notify, &controller_health, "auth_secret", metrics),
+        ReflectorEffects::new(&rebuild_tx, &controller_health, "auth_secret", metrics),
         "AuthSecret",
     );
     // Always-on (not gated by `enable_gateway_api`): the Ingress `auth-jwt`
@@ -1809,7 +1837,7 @@ async fn spawn_tasks(
         jwt_auth_writer,
         scoped_api::<JwtAuth>(watch_client(&kube_config, &client), ns),
         control_watch_config(),
-        ReflectorEffects::new(&notify, &controller_health, "jwt_auth", metrics),
+        ReflectorEffects::new(&rebuild_tx, &controller_health, "jwt_auth", metrics),
         "JwtAuth",
     );
     // Always-on (not gated by `enable_gateway_api`): the Ingress `ext-auth`
@@ -1827,7 +1855,7 @@ async fn spawn_tasks(
         scoped_api::<CoxswainExternalAuth>(watch_client(&kube_config, &client), ns),
         control_watch_config(),
         ReflectorEffects::new(
-            &notify,
+            &rebuild_tx,
             &controller_health,
             "coxswain_external_auth",
             metrics,
@@ -1847,7 +1875,7 @@ async fn spawn_tasks(
         compression_writer,
         scoped_api::<Compression>(watch_client(&kube_config, &client), ns),
         control_watch_config(),
-        ReflectorEffects::new(&notify, &controller_health, "compression", metrics),
+        ReflectorEffects::new(&rebuild_tx, &controller_health, "compression", metrics),
         "Compression",
     );
     // Always-on (not gated by `enable_gateway_api`): same fix, same rationale,
@@ -1857,7 +1885,7 @@ async fn spawn_tasks(
         retry_policy_writer,
         scoped_api::<RetryPolicy>(watch_client(&kube_config, &client), ns),
         control_watch_config(),
-        ReflectorEffects::new(&notify, &controller_health, "retry_policy", metrics),
+        ReflectorEffects::new(&rebuild_tx, &controller_health, "retry_policy", metrics),
         "RetryPolicy",
     );
     // Always-on (not gated by `enable_gateway_api`): same fix, same rationale,
@@ -1867,7 +1895,7 @@ async fn spawn_tasks(
         rate_limit_writer,
         scoped_api::<RateLimit>(watch_client(&kube_config, &client), ns),
         control_watch_config(),
-        ReflectorEffects::new(&notify, &controller_health, "rate_limit", metrics),
+        ReflectorEffects::new(&rebuild_tx, &controller_health, "rate_limit", metrics),
         "RateLimit",
     );
     // Always-on (not gated by `enable_gateway_api`): same fix, same rationale,
@@ -1878,7 +1906,12 @@ async fn spawn_tasks(
         ip_access_writer,
         scoped_api::<IpAccessControl>(watch_client(&kube_config, &client), ns),
         control_watch_config(),
-        ReflectorEffects::new(&notify, &controller_health, "ip_access_control", metrics),
+        ReflectorEffects::new(
+            &rebuild_tx,
+            &controller_health,
+            "ip_access_control",
+            metrics,
+        ),
         "IpAccessControl",
     );
 
@@ -1893,7 +1926,7 @@ async fn spawn_tasks(
             ingress_writer,
             scoped_api::<Ingress>(watch_client(&kube_config, &client), ns),
             control_watch_config(),
-            ReflectorEffects::new(&notify, &controller_health, "ingress", metrics),
+            ReflectorEffects::new(&rebuild_tx, &controller_health, "ingress", metrics),
             "Ingress",
         );
         spawn_reflector(
@@ -1901,7 +1934,7 @@ async fn spawn_tasks(
             class_writer,
             Api::<IngressClass>::all(watch_client(&kube_config, &client)),
             control_watch_config(),
-            ReflectorEffects::new(&notify, &controller_health, "ingress_class", metrics),
+            ReflectorEffects::new(&rebuild_tx, &controller_health, "ingress_class", metrics),
             "IngressClass",
         );
         // Watched cluster-wide (like IngressClass): an IngressClass is cluster-scoped
@@ -1914,7 +1947,7 @@ async fn spawn_tasks(
             Api::<CoxswainIngressClassParameters>::all(watch_client(&kube_config, &client)),
             control_watch_config(),
             ReflectorEffects::new(
-                &notify,
+                &rebuild_tx,
                 &controller_health,
                 "ingress_class_parameters",
                 metrics,
@@ -1930,7 +1963,7 @@ async fn spawn_tasks(
             auth_tls_secret_writer,
             scoped_api::<Secret>(watch_client(&kube_config, &client), ns),
             control_watch_config().labels("ingress.coxswain-labs.dev/auth-tls=true"),
-            ReflectorEffects::new(&notify, &controller_health, "auth_tls_secret", metrics),
+            ReflectorEffects::new(&rebuild_tx, &controller_health, "auth_tls_secret", metrics),
             "AuthTlsSecret",
         );
     }
@@ -1970,7 +2003,7 @@ async fn spawn_tasks(
                 },
                 ns,
                 gw_writers,
-                &notify,
+                &rebuild_tx,
                 &controller_health,
                 metrics,
             );
@@ -1988,7 +2021,7 @@ async fn spawn_tasks(
             // body never reaches the take() a second time.
             let probe_client = watch_client(&kube_config, &client);
             let probe_kube_config = kube_config.clone();
-            let probe_notify = Arc::clone(&notify);
+            let probe_trigger = rebuild_tx.clone();
             let probe_health = controller_health.clone();
             let probe_watch_namespace = watch_namespace.clone();
             let mut writers_slot = Some(gw_writers);
@@ -2012,12 +2045,12 @@ async fn spawn_tasks(
                             },
                             probe_ns,
                             writers,
-                            &probe_notify,
+                            &probe_trigger,
                             &probe_health,
                             metrics,
                         );
                         probe_health.ready("gateway_api_crds");
-                        probe_notify.notify_waiters();
+                        bump_rebuild(&probe_trigger);
                         tracing::info!(
                             "Gateway API CRDs detected; reflectors started and readiness cleared"
                         );
@@ -2054,22 +2087,26 @@ async fn spawn_tasks(
     // lacks pod-read RBAC and has neither consumer) never reaches this branch.
     if watch_fleet || op_pods_w.is_some() {
         let (pod_reader, pod_writer) = reader_writer::<Pod>(op_pods_w);
-        let fleet_notify = Arc::new(Notify::new());
+        // Own `watch` trigger for the fleet snapshot (same lossless rationale as
+        // the rebuild trigger): a pod event during a `build_snapshot` must not be
+        // dropped. Distinct channel because the fleet snapshot is a separate,
+        // undebounced consumer of the pod watch, not part of the routing rebuild.
+        let (fleet_trigger, fleet_rx) = watch::channel(0u64);
         spawn_reflector(
             &mut set,
             pod_writer,
             Api::<Pod>::all(watch_client(&kube_config, &client)),
             control_watch_config().labels("app.kubernetes.io/name=coxswain"),
-            ReflectorEffects::new(&fleet_notify, &controller_health, "pod", metrics),
+            ReflectorEffects::new(&fleet_trigger, &controller_health, "pod", metrics),
             "Pod",
         );
         if watch_fleet {
             // Publishes a `SharedFleet` snapshot immediately on every pod watch
             // event — no debounce, because pod IP / annotation changes are
             // infrequent and low-latency matters for operator tooling.
+            let mut fleet_rx = fleet_rx;
             set.spawn(async move {
-                loop {
-                    fleet_notify.notified().await;
+                while fleet_rx.changed().await.is_ok() {
                     let pods = pod_reader.state();
                     fleet.store(Arc::new(fleet::build_snapshot(
                         pods.iter().map(Arc::as_ref),
@@ -2095,7 +2132,7 @@ async fn spawn_tasks(
             Api::<CoxswainGatewayParameters>::all(watch_client(&kube_config, &client)),
             control_watch_config(),
             ReflectorEffects::new(
-                &notify,
+                &rebuild_tx,
                 &controller_health,
                 "coxswain_gateway_parameters",
                 metrics,
@@ -2107,7 +2144,7 @@ async fn spawn_tasks(
             nodes_writer,
             Api::<Node>::all(watch_client(&kube_config, &client)),
             bulk_watch_config(),
-            ReflectorEffects::new(&notify, &controller_health, "node", metrics),
+            ReflectorEffects::new(&rebuild_tx, &controller_health, "node", metrics),
             "Node",
         );
     }
@@ -2135,14 +2172,17 @@ async fn spawn_tasks(
         set.spawn(async move {
             crate::jwks::run(cache, jwt_auths_for_fetch, jwks_client).await;
         });
-        // Forward cache-change notifications into the shared rebuild-trigger
-        // `Notify` so a JWKS resolving, rotating, or starting to fail re-drives
-        // the debounced rebuild below — the same mechanism every watched CR uses.
+        // Forward cache-change notifications into the shared rebuild trigger so a
+        // JWKS resolving, rotating, or starting to fail re-drives the debounced
+        // rebuild below — the same mechanism every watched CR uses. Bumping the
+        // `watch` generation is lossless even if the rebuild loop is mid-rebuild
+        // (the old `notify_waiters()` here woke only currently-parked waiters, so
+        // a JWKS change during a rebuild was dropped until the next resync tick).
         let mut jwks_changed = jwks_cache.subscribe();
-        let rebuild_notify = Arc::clone(&notify);
+        let jwks_trigger = rebuild_tx.clone();
         set.spawn(async move {
             while jwks_changed.changed().await.is_ok() {
-                rebuild_notify.notify_waiters();
+                bump_rebuild(&jwks_trigger);
             }
         });
     }
@@ -2156,10 +2196,15 @@ async fn spawn_tasks(
     // from the current store snapshots — never from the API server.
     set.spawn(async move {
         let mut routing_table_published = false;
-        // #574 lost-signal backstop: a periodic resync re-runs the rebuild even
-        // when no `notify` fires, so a dropped/racy wake can't leave the routing
-        // table and derived status cells stale indefinitely (see
-        // [`REBUILD_RESYNC_PERIOD`]).
+        // #574 backstop: a periodic resync re-runs the rebuild even when no watch
+        // event fires, so a *silently stalled watch connection* (a stream that
+        // never delivers, distinct from the store) can't leave the routing table
+        // and derived status cells stale indefinitely (see [`REBUILD_RESYNC_PERIOD`]).
+        // The trigger itself is now a lossless `watch` channel, so — unlike the
+        // former `Notify` — a *delivered* event is never dropped in favor of this
+        // tick; the resync is a true backstop, not the recovery path for a raced
+        // wake. `biased;` makes that explicit: the trigger is polled before the
+        // tick, so a pending bump is always taken first.
         let mut resync = tokio::time::interval(REBUILD_RESYNC_PERIOD);
         resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Consume the immediate first tick so the loop still blocks on the first
@@ -2169,17 +2214,25 @@ async fn spawn_tasks(
         resync.tick().await;
         loop {
             tokio::select! {
-                () = notify.notified() => {}
+                biased;
+                changed = rebuild_rx.changed() => {
+                    // Err only when every reflector trigger has been dropped —
+                    // the reconciler is shutting down; exit the rebuild task.
+                    if changed.is_err() {
+                        return;
+                    }
+                    rebuild_rx.borrow_and_update();
+                }
                 _ = resync.tick() => {}
             }
             // #513: the debounce-wait stage starts the instant the first watch
             // event of this cycle is observed (here, not before — the loop was
             // idle waiting for it) and ends when `settle` returns. This is the
-            // "notify → debounce fire" leg of the convergence pipeline,
+            // "trigger → debounce fire" leg of the convergence pipeline,
             // measured independently of rebuild() cost — #512 shrinks this
             // stage for isolated edits without changing the churn ceiling.
             let debounce_start = std::time::Instant::now();
-            super::debounce::settle(&notify, debounce).await;
+            super::debounce::settle(&mut rebuild_rx, debounce).await;
             let debounce_wait = debounce_start.elapsed();
             metrics.observe_debounce_wait(debounce_wait);
             // One VIP-Service read per rebuild (#472), shared by every builder.
