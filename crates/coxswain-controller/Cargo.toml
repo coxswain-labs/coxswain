@@ -20,7 +20,6 @@ async-trait = { workspace = true }
 coxswain-core = { workspace = true }
 coxswain-discovery = { workspace = true }
 coxswain-reflector = { workspace = true }
-futures = { workspace = true }
 k8s-openapi = { workspace = true }
 kube = { workspace = true }
 kube-leader-election = { workspace = true }
