@@ -474,16 +474,32 @@ async fn backend_policy_breaker_opens_when_upstream_errors() -> anyhow::Result<(
 
     // Trip sequence: over-shoot min-requests to guarantee the breaker opens
     // regardless of how many readiness requests remain in the 500ms window.
-    for _ in 0..8u32 {
-        raw_status(proxy, &host, "/status/500").await;
-    }
-
-    let open_status = raw_status(proxy, &host, "/status/500").await;
-    assert_eq!(
-        open_status, 503,
-        "after the trip sequence the policy circuit breaker must fail-fast with 503 \
-         (circuitBreaker.threshold=50, minRequests=4)"
-    );
+    // The burst and the fail-fast check must land inside ONE breaker stats
+    // window (500ms): on a congested runner the nine sequential round trips
+    // can outlive the window, aging the early 500s out before the check and
+    // leaving the breaker legitimately closed. Retry the whole burst via the
+    // canonical poller instead of hard-asserting a single attempt.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            format!(
+                "{host} circuit breaker to fail-fast with 503 after a 500-burst \
+                 (circuitBreaker.threshold=50, minRequests=4)"
+            )
+        },
+        || async {
+            for _ in 0..8u32 {
+                raw_status(proxy, &host, "/status/500").await;
+            }
+            if raw_status(proxy, &host, "/status/500").await == 503 {
+                Some(())
+            } else {
+                None
+            }
+        },
+    )
+    .await?;
 
     Ok(())
 }
@@ -1242,16 +1258,32 @@ async fn ingress_backend_policy_applies_circuit_breaker() -> anyhow::Result<()> 
 
     // Trip sequence: over-shoot min-requests to guarantee the breaker opens
     // regardless of how many readiness requests remain in the 500ms window.
-    for _ in 0..8u32 {
-        raw_status(proxy, &host, "/status/500").await;
-    }
-
-    let open_status = raw_status(proxy, &host, "/status/500").await;
-    assert_eq!(
-        open_status, 503,
-        "after the trip sequence the policy circuit breaker must fail-fast with 503 \
-         (circuitBreaker.threshold=50, minRequests=4)"
-    );
+    // The burst and the fail-fast check must land inside ONE breaker stats
+    // window (500ms): on a congested runner the nine sequential round trips
+    // can outlive the window, aging the early 500s out before the check and
+    // leaving the breaker legitimately closed. Retry the whole burst via the
+    // canonical poller instead of hard-asserting a single attempt.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            format!(
+                "{host} circuit breaker to fail-fast with 503 after a 500-burst \
+                 (circuitBreaker.threshold=50, minRequests=4)"
+            )
+        },
+        || async {
+            for _ in 0..8u32 {
+                raw_status(proxy, &host, "/status/500").await;
+            }
+            if raw_status(proxy, &host, "/status/500").await == 503 {
+                Some(())
+            } else {
+                None
+            }
+        },
+    )
+    .await?;
 
     Ok(())
 }
