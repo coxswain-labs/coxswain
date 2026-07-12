@@ -29,6 +29,6 @@ mod route_builder;
 pub use controller::ControllerReconciler;
 pub use debounce::{DebounceSettings, DebounceSettingsError};
 pub use proxy::{
-    IngressDefaultBackend, IngressDefaultBackendParseError, IngressEvent, ReconcilerHealth,
-    ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler, StatusStores,
+    IngressDefaultBackend, IngressDefaultBackendParseError, IngressEvent, OperatorStores,
+    ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler, StatusStores,
 };

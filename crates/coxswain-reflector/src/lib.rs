@@ -61,8 +61,8 @@ pub use metrics::{MetricsPrefix, ReflectorMetrics};
 pub use reconciler::listener_merge::{EffectiveListenerPort, effective_listener_ports};
 pub use reconciler::{
     ControllerReconciler, DebounceSettings, DebounceSettingsError, IngressDefaultBackend,
-    IngressDefaultBackendParseError, IngressEvent, ReconcilerHealth, ReconcilerOptions,
-    ReconcilerOutputs, SharedProxyReconciler, StatusStores,
+    IngressDefaultBackendParseError, IngressEvent, OperatorStores, ReconcilerHealth,
+    ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler, StatusStores,
 };
 pub use status::{
     BackendTlsPolicyStatus, BackendTlsPolicyStatusMap, ClientTrafficPolicyStatus,

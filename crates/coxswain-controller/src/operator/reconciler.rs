@@ -32,14 +32,15 @@
 //! reason=InvalidParameters` directly via the same entry point — no shared
 //! `AcceptedOverrides` map is needed because the operator is now the sole
 //! writer of `Gateway.status` on dedicated-mode Gateways (the shared-pool
-//! writer skips them via a `parametersRef` group/kind check). Health-channel
-//! retriggers wire [`SharedGatewayListenerStatus`] and
-//! [`SharedRouteStatus`] into [`Controller::reconcile_all_on`] so a
-//! cert-ref or route-resolution flip kicks every owned Gateway through the
-//! patch path within watch latency.
+//! writer skips them via a `parametersRef` group/kind check). A listener
+//! TLS-health flip is read live from [`SharedGatewayListenerStatus`] on every
+//! reconcile; under the #574 single watch fabric the reflector's rebuild pass
+//! re-enqueues the owning Gateway's status key when derived route/listener
+//! health drifts, so a cert-ref or route-resolution change reaches the patch
+//! path within watch latency without a dedicated retrigger channel.
 
 use super::{apply, params, render, render_shared, status, vip};
-use async_trait::async_trait;
+use crate::controller::StatusOutcome;
 use coxswain_core::Shared;
 use coxswain_core::crd::{CoxswainGatewayParameters, ServiceType};
 use coxswain_core::ownership::ObjectKey;
@@ -47,10 +48,7 @@ use coxswain_reflector::gw_types::ListenerSet;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::status::{
-    GatewayListenerStatus, SharedGatewayListenerStatus, SharedRouteStatus,
-};
-use futures::StreamExt;
+use coxswain_reflector::status::{GatewayListenerStatus, SharedGatewayListenerStatus};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Service, ServiceAccount};
@@ -58,24 +56,15 @@ use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::{
     Api, Client, Resource as _,
     api::{DeleteParams, ObjectMeta, Patch, PatchParams},
-    runtime::{
-        WatchStreamExt,
-        controller::{Action, Controller},
-        reflector::{self, ObjectRef, Store},
-        watcher,
-    },
+    runtime::reflector::Store,
 };
-use pingora_core::server::ShutdownWatch;
-use pingora_core::services::background::BackgroundService;
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash as _, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-
-use parking_lot::Mutex;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::task::JoinSet;
 
 /// Re-queue interval when the operator's pod isn't the leader. Long enough to
 /// avoid hot-spinning the reconcile loop, short enough that promotion to
@@ -172,13 +161,6 @@ pub struct OperatorConfig {
     /// flip (e.g. a TLS-cert resolution change) kicks every owned Gateway through
     /// [`Controller::reconcile_all_on`].
     pub listener_status: SharedGatewayListenerStatus,
-    /// Per-route ResolvedRefs/Accepted health channel. Subscribed for the
-    /// same retrigger reason as [`Self::listener_status`]; the patch builder does
-    /// not consume the snapshot directly (per-listener `ResolvedRefs`
-    /// derives from TLS health alone — see the issue-211 grilling notes),
-    /// but a route-health flip still warrants re-checking listener
-    /// `attached_routes` counts.
-    pub route_status: SharedRouteStatus,
     /// Ports reserved for the Ingress data plane via `--proxy-http-port` /
     /// `--proxy-https-port`. Forwarded to the listener-status helper so a
     /// dedicated-mode listener whose port collides with the Ingress
@@ -223,12 +205,6 @@ pub struct OperatorConfig {
     /// `coxswain-bin` and cloned into the `Controller` too, so the single
     /// serialized VIP reconciler is the writer and the status writer the reader.
     pub vip_failures: Shared<HashSet<ObjectKey>>,
-    /// Leadership watch (#531): a rising edge (standby → leader) immediately
-    /// re-drives every owned Gateway and the VIP reconciler, collapsing the
-    /// 15–20 s post-failover provisioning lag that the `NON_LEADER_REQUEUE` /
-    /// `VIP_RESYNC_INTERVAL` backstops would otherwise impose. The status
-    /// writer's lease loop is the sender. `None` in tests.
-    pub leadership_rx: Option<tokio::sync::watch::Receiver<bool>>,
     /// Connected-proxy registry with per-node bound-port reports (#531). Read
     /// to gate a dedicated Gateway's `Programmed=True` on its own proxy having
     /// actually bound the effective listener ports — pod readiness alone flips
@@ -247,35 +223,20 @@ pub struct OperatorConfig {
 /// pod's process and leader-election truth-source but owns its own kube-rs
 /// `Controller` and reflector stores.
 #[non_exhaustive]
-pub struct Operator {
-    config: OperatorConfig,
-}
-
-impl Operator {
-    /// Construct a new operator instance (does not start the watch loop).
-    #[must_use]
-    pub fn new(config: OperatorConfig) -> Self {
-        Self { config }
-    }
-}
-
-/// Reconcile context shared across all per-Gateway reconcile invocations.
-/// `parking_lot::Mutex` (not `tokio::sync::Mutex`) because the lock is held
-/// only briefly inside the reconcile body and never across `.await` — the
-/// async one would make the reconcile future `!Unpin` for no benefit, and the
-/// `parking_lot` guard's `!Send` bound makes an accidental hold-across-await a
-/// compile error.
-pub(super) struct ReconcileContext {
+pub(crate) struct ReconcileContext {
     pub(super) controller_name: String,
     controller_image: String,
     pub(super) leader: Arc<AtomicBool>,
     pub(super) client: Client,
     pub(super) class_store: Store<GatewayClass>,
     pub(super) params_store: Store<CoxswainGatewayParameters>,
-    /// Pods carrying the dedicated-proxy labels. Reads off this store drive
-    /// the `gateway.coxswain-labs.dev/DedicatedProxyReady` condition (#210)
-    /// and gate `Programmed=True` on having ≥1 Ready Pod (#211).
-    /// Cluster-wide watch narrowed by `PROXY_POD_LABEL_SELECTOR`.
+    /// The reflector's fleet Pod store (#574 fold): the shared
+    /// `app.kubernetes.io/name=coxswain` watch, a superset of the dedicated-proxy
+    /// Pods. Reads off this store drive the
+    /// `gateway.coxswain-labs.dev/DedicatedProxyReady` condition (#210) and gate
+    /// `Programmed=True` on having ≥1 Ready Pod (#211); `count_ready_proxy_pods`
+    /// filters to a specific Gateway by the GEP-1762 gateway-name label, so
+    /// non-dedicated fleet Pods (the shared proxy, the controller) are excluded.
     pods_store: Store<Pod>,
     /// Cluster `Node` snapshot. Only consulted when a dedicated Gateway's
     /// Service is `NodePort`-typed; otherwise unused. Unscoped watch
@@ -345,21 +306,58 @@ pub(super) struct ReconcileContext {
     error_attempts: Mutex<HashMap<ObjectKey, u32>>,
 }
 
+impl ReconcileContext {
+    /// Build the operator's reconcile context from the injected [`OperatorConfig`]
+    /// and the reflector's [`OperatorStores`] (#574 fold): the operator no longer
+    /// owns a `Client` or watches — it reconciles off the single controller watch
+    /// fabric. Post-failover re-drive is the controller's job: `run_controllers`
+    /// re-enqueues owned Gateways off its own leadership + `node_registry`
+    /// signals, so no leadership receiver is threaded through here.
+    pub(crate) fn from_stores(
+        config: OperatorConfig,
+        stores: coxswain_reflector::OperatorStores,
+        client: Client,
+    ) -> Self {
+        Self {
+            controller_name: config.controller_name,
+            controller_image: config.controller_image,
+            leader: config.leader,
+            client,
+            class_store: stores.gateway_classes,
+            params_store: stores.params,
+            pods_store: stores.pods,
+            nodes_store: stores.nodes,
+            listener_status: config.listener_status,
+            ingress_ports: config.ingress_ports,
+            admin_port: config.admin_port,
+            discovery_endpoint: config.discovery_endpoint,
+            discovery_bootstrap_endpoint: config.discovery_bootstrap_endpoint,
+            discovery_sa_token_path: config.discovery_sa_token_path,
+            discovery_ca_bundle_path: config.discovery_ca_bundle_path,
+            discovery_trust_domain: config.discovery_trust_domain,
+            controller_namespace: config.controller_namespace,
+            gateways_store: stores.gateways,
+            services_store: stores.services,
+            listener_sets_store: stores.listener_sets,
+            namespaces_store: stores.namespaces,
+            shared_proxy_selector: config.shared_proxy_selector,
+            shared_vip_service_type: config.shared_vip_service_type,
+            vip_trigger: Arc::new(tokio::sync::Notify::new()),
+            vip_failures: config.vip_failures,
+            node_registry: config.node_registry,
+            publish_index: config.publish_index,
+            last_hashes: Mutex::new(HashMap::new()),
+            error_attempts: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
 /// Finalizer key the operator places on every dedicated-mode Gateway. It keeps
 /// the Gateway alive across a dedicated→shared migration so the operator can
 /// hand status ownership back to the shared pool and tear the dedicated proxy
 /// resources down in order before the object is deleted; provisioned same-ns
 /// resources (Deployment/Service/SA) GC via owner-ref on a plain delete.
 const CLEANUP_FINALIZER: &str = "gateway.coxswain-labs.dev/dedicated-cleanup";
-
-/// Label selector matching every Pod the operator provisions for a
-/// dedicated-mode Gateway. The selector is the intersection of the reserved
-/// labels rendered onto each Pod (see `RESERVED_LABEL_KEYS` in
-/// [`super::render`]) — `managed-by=coxswain` alone is too narrow (some
-/// charts use it for unrelated objects), the `app.kubernetes.io/name=coxswain`
-/// pin closes that gap.
-const PROXY_POD_LABEL_SELECTOR: &str =
-    "app.kubernetes.io/managed-by=coxswain,app.kubernetes.io/name=coxswain";
 
 /// Label key identifying the owning Gateway's name on every rendered Pod.
 /// Set by `super::render::standard_labels` to match the Gateway-API
@@ -378,458 +376,39 @@ pub(super) fn gateway_key(gw: &Gateway) -> ObjectKey {
     )
 }
 
-#[async_trait]
-impl BackgroundService for Operator {
-    async fn start(&self, mut shutdown: ShutdownWatch) {
-        let client = match Client::try_default().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!(error = %e, "operator: failed to initialise Kubernetes client; will not run");
-                return;
-            }
-        };
-
-        // Spawn the cross-watched reflector stores in parallel with the
-        // Controller. Their `Store`s are shared into the reconcile Context.
-        let mut tasks = JoinSet::new();
-        let (class_reader, class_writer) = reflector::store::<GatewayClass>();
-        tasks.spawn({
-            let api = Api::<GatewayClass>::all(client.clone());
-            async move {
-                let stream = reflector::reflector(
-                    class_writer,
-                    watcher(api, watcher::Config::default()).default_backoff(),
-                );
-                tokio::pin!(stream);
-                while stream.next().await.is_some() {}
-            }
-        });
-        let (params_reader, params_writer) = reflector::store::<CoxswainGatewayParameters>();
-        tasks.spawn({
-            let api = Api::<CoxswainGatewayParameters>::all(client.clone());
-            async move {
-                let stream = reflector::reflector(
-                    params_writer,
-                    watcher(api, watcher::Config::default()).default_backoff(),
-                );
-                tokio::pin!(stream);
-                while stream.next().await.is_some() {}
-            }
-        });
-        // Pod reflector for dedicated-proxy readiness (#210). Cluster-wide
-        // scope (dedicated-proxy Pods live in each Gateway's own namespace)
-        // narrowed to our own Pods via label selector — the watch streams
-        // only the small fleet we provision, not every Pod in the cluster.
-        let (pods_reader, pods_writer) = reflector::store::<Pod>();
-        tasks.spawn({
-            let api = Api::<Pod>::all(client.clone());
-            let config = watcher::Config::default().labels(PROXY_POD_LABEL_SELECTOR);
-            async move {
-                let stream =
-                    reflector::reflector(pods_writer, watcher(api, config).default_backoff());
-                tokio::pin!(stream);
-                while stream.next().await.is_some() {}
-            }
-        });
-        // Node reflector — cluster-wide, no label scoping. Only consulted for
-        // `NodePort`-typed dedicated Services; one snapshot per reconcile.
-        // Low cardinality at the cluster sizes Coxswain targets (tens of
-        // Nodes) so an unfiltered watch is fine.
-        let (nodes_reader, nodes_writer) = reflector::store::<Node>();
-        tasks.spawn({
-            let api = Api::<Node>::all(client.clone());
-            async move {
-                let stream = reflector::reflector(
-                    nodes_writer,
-                    watcher(api, watcher::Config::default()).default_backoff(),
-                );
-                tokio::pin!(stream);
-                while stream.next().await.is_some() {}
-            }
-        });
-        // Gateway reflector — cluster-wide. Enumerated on each shared-mode
-        // reconcile to compute the global internal-port allocation (#472).
-        let (gateways_reader, gateways_writer) = reflector::store::<Gateway>();
-        tasks.spawn({
-            let api = Api::<Gateway>::all(client.clone());
-            async move {
-                let stream = reflector::reflector(
-                    gateways_writer,
-                    watcher(api, watcher::Config::default()).default_backoff(),
-                );
-                tokio::pin!(stream);
-                while stream.next().await.is_some() {}
-            }
-        });
-        // Service reflector — cluster-wide, narrowed to the per-Gateway
-        // shared-mode VIP Services we provision (#472). Their `targetPort`s are
-        // the durable source of truth for the internal-port allocation.
-        let (services_reader, services_writer) = reflector::store::<Service>();
-        tasks.spawn({
-            let api = Api::<Service>::all(client.clone());
-            let config = watcher::Config::default().labels(&format!(
-                "app.kubernetes.io/component={}",
-                render::SHARED_GATEWAY_VIP_COMPONENT
-            ));
-            async move {
-                let stream =
-                    reflector::reflector(services_writer, watcher(api, config).default_backoff());
-                tokio::pin!(stream);
-                while stream.next().await.is_some() {}
-            }
-        });
-        // ListenerSet + Namespace reflectors (GEP-1713, #93). The VIP/dedicated
-        // Service and internal-port allocation must cover a Gateway's attached
-        // ListenerSets' listeners, not just `spec.listeners`, or a ListenerSet
-        // listener on a new port is never exposed. The Namespace store backs the
-        // parent Gateway's `allowedListeners.namespaces.from: Selector` gate.
-        let (listener_sets_reader, listener_sets_writer) = reflector::store::<ListenerSet>();
-        tasks.spawn({
-            let api = Api::<ListenerSet>::all(client.clone());
-            async move {
-                let stream = reflector::reflector(
-                    listener_sets_writer,
-                    watcher(api, watcher::Config::default()).default_backoff(),
-                );
-                tokio::pin!(stream);
-                while stream.next().await.is_some() {}
-            }
-        });
-        let (namespaces_reader, namespaces_writer) = reflector::store::<Namespace>();
-        tasks.spawn({
-            let api = Api::<Namespace>::all(client.clone());
-            async move {
-                let stream = reflector::reflector(
-                    namespaces_writer,
-                    watcher(api, watcher::Config::default()).default_backoff(),
-                );
-                tokio::pin!(stream);
-                while stream.next().await.is_some() {}
-            }
-        });
-
-        // Wait for every dependency reflector to complete its initial sync
-        // before exposing the stores to the reconcile loop, so the first
-        // reconcile after pod start (or controller restart) sees populated
-        // GatewayClass/params/Pod/Node state rather than racing an empty
-        // store and producing a transient render that SSA must immediately
-        // re-apply (an unnecessary Deployment resourceVersion bump).
-        //
-        // The wait is bounded at 30 s so a misconfigured watch (e.g. one that
-        // 403s forever) doesn't hang the operator indefinitely; the controller
-        // logs and proceeds, so partial observability is preferable to a stuck
-        // reconcile loop.
-        let sync_timeout = Duration::from_secs(30);
-        let deadline = tokio::time::Instant::now() + sync_timeout;
-        async fn wait_or_name<F: std::future::Future>(
-            name: &'static str,
-            fut: F,
-            deadline: tokio::time::Instant,
-        ) -> Option<&'static str> {
-            if tokio::time::timeout_at(deadline, fut).await.is_err() {
-                Some(name)
-            } else {
-                None
-            }
-        }
-        // Errors from `wait_until_ready` mean the writer was dropped — the
-        // operator is shutting down. We treat those as "synced" because there
-        // is nothing left for this reader to deliver; the controller will
-        // exit on the next iteration anyway.
-        let (a, b, c, d, e, f, g, h) = tokio::join!(
-            wait_or_name("GatewayClass", class_reader.wait_until_ready(), deadline),
-            wait_or_name(
-                "CoxswainGatewayParameters",
-                params_reader.wait_until_ready(),
-                deadline,
-            ),
-            wait_or_name("Pod", pods_reader.wait_until_ready(), deadline),
-            wait_or_name("Node", nodes_reader.wait_until_ready(), deadline),
-            wait_or_name("Gateway", gateways_reader.wait_until_ready(), deadline),
-            wait_or_name("Service", services_reader.wait_until_ready(), deadline),
-            wait_or_name(
-                "ListenerSet",
-                listener_sets_reader.wait_until_ready(),
-                deadline
-            ),
-            wait_or_name("Namespace", namespaces_reader.wait_until_ready(), deadline),
-        );
-        let unsynced: Vec<&'static str> = [a, b, c, d, e, f, g, h].into_iter().flatten().collect();
-        if !unsynced.is_empty() {
-            tracing::warn!(
-                timeout = ?sync_timeout,
-                unsynced = ?unsynced,
-                "operator: dependency reflectors did not complete initial sync within timeout; \
-                 proceeding with partial state — first reconciles may bump resourceVersion until \
-                 watches catch up. Check RBAC if the unsynced list is non-empty."
-            );
-        }
-
-        let ctx = Arc::new(ReconcileContext {
-            controller_name: self.config.controller_name.clone(),
-            controller_image: self.config.controller_image.clone(),
-            leader: Arc::clone(&self.config.leader),
-            client: client.clone(),
-            class_store: class_reader,
-            params_store: params_reader,
-            pods_store: pods_reader,
-            nodes_store: nodes_reader,
-            listener_status: self.config.listener_status.clone(),
-            ingress_ports: self.config.ingress_ports,
-            admin_port: self.config.admin_port,
-            discovery_endpoint: self.config.discovery_endpoint.clone(),
-            discovery_bootstrap_endpoint: self.config.discovery_bootstrap_endpoint.clone(),
-            discovery_sa_token_path: self.config.discovery_sa_token_path.clone(),
-            discovery_ca_bundle_path: self.config.discovery_ca_bundle_path.clone(),
-            discovery_trust_domain: self.config.discovery_trust_domain.clone(),
-            controller_namespace: self.config.controller_namespace.clone(),
-            gateways_store: gateways_reader,
-            services_store: services_reader,
-            listener_sets_store: listener_sets_reader,
-            namespaces_store: namespaces_reader,
-            shared_proxy_selector: self.config.shared_proxy_selector.clone(),
-            shared_vip_service_type: self.config.shared_vip_service_type,
-            vip_trigger: Arc::new(tokio::sync::Notify::new()),
-            vip_failures: self.config.vip_failures.clone(),
-            node_registry: self.config.node_registry.clone(),
-            publish_index: self.config.publish_index.clone(),
-            last_hashes: Mutex::new(HashMap::new()),
-            error_attempts: Mutex::new(HashMap::new()),
-        });
-
-        // Single serialized VIP reconciler (#472): the sole writer of shared-mode
-        // per-Gateway VIP Services. Per-Gateway reconciles signal it via
-        // `ctx.vip_trigger`; it never runs on the concurrent work-queue.
-        tasks.spawn(vip::run_vip_reconciler(Arc::clone(&ctx), shutdown.clone()));
-
-        // Build the kube-rs Controller. We don't `.owns(Deployment)` yet —
-        // Step 8 writes nothing, so there are no owned Deployments to
-        // observe. Step 9 (#208) adds `.owns(api_deployments, ...)`.
-        let api_gateways: Api<Gateway> = Api::all(client.clone());
-        let api_classes: Api<GatewayClass> = Api::all(client.clone());
-        let api_params: Api<CoxswainGatewayParameters> = Api::all(client.clone());
-        let api_pods: Api<Pod> = Api::all(client.clone());
-        let api_services: Api<Service> = Api::all(client);
-        let class_store_for_watches = ctx.class_store.clone();
-
-        // Build the health-channel retrigger stream (#211). We bridge two
-        // `tokio::sync::watch::Receiver<u64>`s (which are `Send` but not
-        // `Sync`) onto a single `futures::channel::mpsc::UnboundedReceiver`
-        // (which is `Send + Sync`, the bound `Controller::reconcile_all_on`
-        // requires). Each forwarder task drops the initial value via
-        // `borrow_and_update` so operator startup doesn't spuriously fire a
-        // reconcile-all before any health flip has actually occurred.
-        let (trigger_tx, trigger_rx) = futures::channel::mpsc::unbounded::<()>();
-        {
-            let mut tls_rx = self.config.listener_status.subscribe();
-            let tx = trigger_tx.clone();
-            tasks.spawn(async move {
-                let _ = tls_rx.borrow_and_update();
-                while tls_rx.changed().await.is_ok() {
-                    if tx.unbounded_send(()).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        {
-            let mut route_rx = self.config.route_status.subscribe();
-            let tx = trigger_tx.clone();
-            tasks.spawn(async move {
-                let _ = route_rx.borrow_and_update();
-                while route_rx.changed().await.is_ok() {
-                    if tx.unbounded_send(()).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        // Bind-report re-drive (#531): a proxy's NodeStatus landing in the
-        // node registry must re-reconcile owned Gateways promptly — the
-        // dedicated Programmed bind gate waits on exactly that report, and
-        // no k8s watch event fires for it.
-        if let Some(registry) = &self.config.node_registry {
-            let mut reg_rx = registry.subscribe();
-            let tx = trigger_tx.clone();
-            tasks.spawn(async move {
-                let _ = reg_rx.borrow_and_update();
-                while reg_rx.changed().await.is_ok() {
-                    if tx.unbounded_send(()).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-
-        // Promotion re-drive (#531): a standby ingests Gateways with all writes
-        // gated off; on promotion it must act on them NOW, not at the next
-        // watch event or periodic backstop. Rising edge → re-drive the Gateway
-        // work-queue and kick the VIP reconciler.
-        if let Some(mut leader_rx) = self.config.leadership_rx.clone() {
-            let tx = trigger_tx.clone();
-            let vip_trigger = Arc::clone(&ctx.vip_trigger);
-            tasks.spawn(async move {
-                let mut was_leader = *leader_rx.borrow_and_update();
-                while leader_rx.changed().await.is_ok() {
-                    let now_leader = *leader_rx.borrow_and_update();
-                    if now_leader && !was_leader {
-                        tracing::info!(
-                            "operator: promoted to leader; re-driving Gateway and VIP reconciliation"
-                        );
-                        if tx.unbounded_send(()).is_err() {
-                            break;
-                        }
-                        vip_trigger.notify_one();
-                    }
-                    was_leader = now_leader;
-                }
-            });
-        }
-
-        // Drop the construction-site sender so the receiver closes if both
-        // forwarder tasks exit. Without this, the receiver would stay alive
-        // forever and `Controller::reconcile_all_on` would hold a permanent
-        // task slot.
-        drop(trigger_tx);
-
-        let controller = Controller::new(api_gateways, watcher::Config::default());
-        let gateway_store = controller.store();
-
-        let controller = controller
-            .watches(api_classes, watcher::Config::default(), {
-                let gateway_store = gateway_store.clone();
-                move |class: GatewayClass| -> Vec<ObjectRef<Gateway>> {
-                    let Some(class_name) = class.meta().name.clone() else {
-                        return vec![];
-                    };
-                    gateway_store
-                        .state()
-                        .into_iter()
-                        .filter(|gw| gw.spec.gateway_class_name == class_name)
-                        .map(|gw| ObjectRef::from_obj(gw.as_ref()))
-                        .collect()
-                }
-            })
-            .watches(api_params, watcher::Config::default(), {
-                // Any params change triggers reconcile for every owned
-                // Gateway. With per-Gateway tracking we could narrow this to
-                // the affected Gateways only, but the population is small by
-                // design (#218 / architecture plan: tens of dedicated
-                // Gateways at most), so re-checking all is cheaper than
-                // maintaining the cross-index.
-                let gateway_store = gateway_store.clone();
-                let class_store = class_store_for_watches.clone();
-                move |_p: CoxswainGatewayParameters| -> Vec<ObjectRef<Gateway>> {
-                    let owned_class_names: std::collections::HashSet<String> = class_store
-                        .state()
-                        .into_iter()
-                        .filter_map(|gc| gc.meta().name.clone())
-                        .collect();
-                    gateway_store
-                        .state()
-                        .into_iter()
-                        .filter(|gw| owned_class_names.contains(&gw.spec.gateway_class_name))
-                        .map(|gw| ObjectRef::from_obj(gw.as_ref()))
-                        .collect()
-                }
-            })
-            // Pod → Gateway: dedicated-proxy Pods live in the Gateway's own
-            // namespace, so the mapping is `pod.metadata.namespace` +
-            // `pod.metadata.labels[gateway.networking.k8s.io/gateway-name]`.
-            // Drives the `DedicatedProxyReady` condition: every Ready ↔
-            // NotReady flip reconciles the owning Gateway within watch
-            // latency, no polling required.
-            .watches(
-                api_pods,
-                watcher::Config::default().labels(PROXY_POD_LABEL_SELECTOR),
-                |pod: Pod| -> Vec<ObjectRef<Gateway>> {
-                    let Some(ns) = pod.metadata.namespace.as_deref() else {
-                        return vec![];
-                    };
-                    let Some(labels) = pod.metadata.labels.as_ref() else {
-                        return vec![];
-                    };
-                    let Some(name) = labels.get(POD_GATEWAY_NAME_LABEL) else {
-                        return vec![];
-                    };
-                    vec![ObjectRef::new(name).within(ns)]
-                },
-            )
-            // Service → Gateway: dedicated-proxy Services live in the
-            // Gateway's own namespace and carry the GEP-1762 gateway-name
-            // label. Drives `Programmed=False, reason=AddressNotAssigned`
-            // → `True` transitions the instant the apiserver populates
-            // `clusterIP` (ClusterIP type) or an LB controller writes
-            // `status.loadBalancer.ingress` — without this watch the status
-            // would only refresh on the next natural Gateway reconcile (#211).
-            .watches(
-                api_services,
-                watcher::Config::default().labels(PROXY_POD_LABEL_SELECTOR),
-                |svc: Service| -> Vec<ObjectRef<Gateway>> {
-                    let Some(ns) = svc.metadata.namespace.as_deref() else {
-                        return vec![];
-                    };
-                    let Some(labels) = svc.metadata.labels.as_ref() else {
-                        return vec![];
-                    };
-                    let Some(name) = labels.get(POD_GATEWAY_NAME_LABEL) else {
-                        return vec![];
-                    };
-                    vec![ObjectRef::new(name).within(ns)]
-                },
-            )
-            // Bulk retrigger on listener-TLS / route-health flips. Each tick
-            // reconciles every Gateway in the controller's store; the
-            // `dedicated_gateway_needs_status_patch` idempotence check
-            // absorbs duplicates so this is cheap even under chatty health
-            // channels.
-            .reconcile_all_on(trigger_rx);
-
-        let stream = controller.run(reconcile, error_policy, ctx);
-        // The controller stream contains `!Unpin` futures internally
-        // (kube-runtime's `applier`); pinning to the stack here lets
-        // `tokio::select!` poll it across iterations.
-        tokio::pin!(stream);
-
-        loop {
-            tokio::select! {
-                _ = shutdown.changed() => break,
-                next = stream.next() => match next {
-                    Some(Ok(_)) => {}
-                    Some(Err(e)) => tracing::debug!(error = %e, "operator: controller stream error"),
-                    None => {
-                        tracing::warn!("operator: controller stream ended; tearing down");
-                        break;
-                    }
-                },
-            }
-        }
-        tasks.shutdown().await;
-    }
-}
-
-async fn reconcile(gw: Arc<Gateway>, ctx: Arc<ReconcileContext>) -> Result<Action, ReconcileError> {
+/// Reconcile one dedicated-mode Gateway's provisioning (#574 operator fold): the
+/// entry the unified status worker's dedicated branch calls. Infallible from the
+/// worker's view — a reconcile error is folded into a per-object exponential
+/// backoff (the former `error_policy`) and returned as
+/// [`StatusOutcome::Requeue`], so the worker just re-enqueues via `add_after`.
+pub(crate) async fn reconcile_dedicated(
+    gw: Arc<Gateway>,
+    ctx: Arc<ReconcileContext>,
+) -> StatusOutcome {
     let started = std::time::Instant::now();
     let key = gateway_key(&gw);
     let res = reconcile_inner(gw, Arc::clone(&ctx)).await;
     crate::metrics::observe_reconcile("operator", started, &res);
-    if res.is_ok() {
-        // First success ends the error streak — the next error backs off
-        // from the base again. Covers deletion too: the final (deletion-path)
-        // reconcile returns Ok and drops the entry.
-        ctx.error_attempts.lock().remove(&key);
+    match res {
+        Ok(outcome) => {
+            // First success ends the error streak — the next error backs off
+            // from the base again. Covers deletion too: the final (deletion-path)
+            // reconcile returns Ok and drops the entry.
+            ctx.error_attempts.lock().remove(&key);
+            outcome
+        }
+        Err(err) => StatusOutcome::requeue(error_backoff(&err, &ctx, &key)),
     }
-    res
 }
 
 async fn reconcile_inner(
     gw: Arc<Gateway>,
     ctx: Arc<ReconcileContext>,
-) -> Result<Action, ReconcileError> {
+) -> Result<StatusOutcome, ReconcileError> {
     if !ctx.leader.load(Ordering::Acquire) {
         // Non-leader pods don't apply. Re-queue rather than `await_change()`
         // so the operator catches up promptly on leader promotion.
-        return Ok(Action::requeue(NON_LEADER_REQUEUE));
+        return Ok(StatusOutcome::requeue(NON_LEADER_REQUEUE));
     }
 
     // Any Gateway change (create/spec edit/mode switch/delete) may shift the
@@ -863,7 +442,7 @@ async fn reconcile_inner(
             ctx.last_hashes.lock().remove(&key);
             ctx.error_attempts.lock().remove(&key);
         }
-        return Ok(Action::await_change());
+        return Ok(StatusOutcome::await_change());
     }
 
     // ----- Terminating-namespace short-circuit ---------------------------
@@ -880,7 +459,7 @@ async fn reconcile_inner(
             gateway = %gateway_id(&gw),
             "operator: namespace is terminating; parking until the Gateway delete event"
         );
-        return Ok(Action::await_change());
+        return Ok(StatusOutcome::await_change());
     }
 
     let class_name = &gw.spec.gateway_class_name;
@@ -893,11 +472,11 @@ async fn reconcile_inner(
         // Class not yet observed — wait for its reflector to sync; the
         // GatewayClass cross-watch will re-queue this Gateway when the class
         // appears.
-        return Ok(Action::await_change());
+        return Ok(StatusOutcome::await_change());
     };
     if class.spec.controller_name != ctx.controller_name {
         // Different controller's Gateway; not ours to provision.
-        return Ok(Action::await_change());
+        return Ok(StatusOutcome::await_change());
     }
 
     // Resolve effective parameters. The lookup closure reads the snapshot of
@@ -956,7 +535,7 @@ async fn reconcile_inner(
                         "operator: Gateway left dedicated mode; clearing status and handing back to shared pool"
                     );
                     status::clear_dedicated_gateway_status(&ctx.client, &gw).await?;
-                    return Ok(Action::requeue(MIGRATION_HANDOFF_REQUEUE));
+                    return Ok(StatusOutcome::requeue(MIGRATION_HANDOFF_REQUEUE));
                 }
 
                 // Step 2 — wait for the shared pool to actually be serving the
@@ -967,7 +546,7 @@ async fn reconcile_inner(
                 // counterpart to shared→dedicated cut-over, which waits for the
                 // dedicated Pod to be Ready before flipping the signal.
                 if !shared_pool_is_serving(&gw) {
-                    return Ok(Action::requeue(MIGRATION_HANDOFF_REQUEUE));
+                    return Ok(StatusOutcome::requeue(MIGRATION_HANDOFF_REQUEUE));
                 }
 
                 // Step 3 — shared pool is serving: tear down the dedicated proxy.
@@ -991,7 +570,7 @@ async fn reconcile_inner(
             // Shared-mode Gateway (no parametersRef): its VIP Service is owned by
             // the serialized `run_vip_reconciler` task (signalled at the top of
             // this fn), not provisioned here — see #472. Nothing per-Gateway to do.
-            return Ok(Action::await_change());
+            return Ok(StatusOutcome::await_change());
         }
         Err(params::ParamsError::NotFound(ns, name)) => {
             tracing::warn!(
@@ -1015,7 +594,7 @@ async fn reconcile_inner(
                 proxy_bound: false,
             };
             status::patch_dedicated_gateway_status(&ctx.client, &inputs).await?;
-            return Ok(Action::requeue(ERROR_REQUEUE));
+            return Ok(StatusOutcome::requeue(ERROR_REQUEUE));
         }
     };
 
@@ -1024,7 +603,7 @@ async fn reconcile_inner(
     // patched, a delete can race past us. Add → requeue → continue.
     if !has_our_finalizer(&gw) {
         add_finalizer(&ctx.client, &gw).await?;
-        return Ok(Action::requeue(POST_FINALIZER_REQUEUE));
+        return Ok(StatusOutcome::requeue(POST_FINALIZER_REQUEUE));
     }
 
     // Effective listener ports for THIS dedicated Gateway: its own listeners plus
@@ -1228,10 +807,10 @@ async fn reconcile_inner(
     // and this backstop covers a forwarder/event race the same way the shared
     // writer's DEFERRED_PROGRAMMED_REQUEUE does.
     if !proxy_bound {
-        return Ok(Action::requeue(BIND_GATE_REQUEUE));
+        return Ok(StatusOutcome::requeue(BIND_GATE_REQUEUE));
     }
 
-    Ok(Action::await_change())
+    Ok(StatusOutcome::await_change())
 }
 
 /// Returns true iff the Gateway carries our cleanup finalizer.
@@ -1550,7 +1129,13 @@ fn pod_is_ready(pod: &Pod) -> bool {
         .is_some_and(|cs| cs.iter().any(|c| c.type_ == "Ready" && c.status == "True"))
 }
 
-fn error_policy(obj: Arc<Gateway>, err: &ReconcileError, ctx: Arc<ReconcileContext>) -> Action {
+/// Per-object exponential backoff delay for a reconcile error (#570), folded
+/// into [`reconcile_dedicated`] since the #574 fold replaced kube's `Controller`
+/// error policy with the queue's `add_after`. Persistent classes (RBAC /
+/// validation) poll flat at the cap; transient classes ramp
+/// `ERROR_BACKOFF_BASE << attempts`. The attempt counter is cleared on the next
+/// success.
+fn error_backoff(err: &ReconcileError, ctx: &ReconcileContext, key: &ObjectKey) -> Duration {
     use crate::metrics::ReconcileErrorReason as _;
     let reason = err.reason();
     let delay = if crate::metrics::reason_is_persistent(reason) {
@@ -1560,7 +1145,7 @@ fn error_policy(obj: Arc<Gateway>, err: &ReconcileError, ctx: Arc<ReconcileConte
     } else {
         let attempts = {
             let mut map = ctx.error_attempts.lock();
-            let n = map.entry(gateway_key(&obj)).or_insert(0);
+            let n = map.entry(key.clone()).or_insert(0);
             let attempts = *n;
             *n = n.saturating_add(1);
             attempts
@@ -1569,13 +1154,13 @@ fn error_policy(obj: Arc<Gateway>, err: &ReconcileError, ctx: Arc<ReconcileConte
         error_backoff_delay(attempts)
     };
     tracing::warn!(
-        gateway = %gateway_id(&obj),
+        gateway = %key,
         error = %err,
         reason,
         delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
         "operator: reconcile error; backing off"
     );
-    Action::requeue(delay)
+    delay
 }
 
 /// Delay for the `attempts`-th consecutive transient reconcile error:

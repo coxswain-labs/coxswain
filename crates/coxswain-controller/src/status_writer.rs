@@ -199,6 +199,9 @@ pub fn spawn_status_writer(
         "path_rewrite_regex",
         "basic_auth",
         "request_size_limit",
+        // #574 operator fold: the reflector now drives these two operator watches.
+        "coxswain_gateway_parameters",
+        "node",
     ];
 
     let mut controller_checks: Vec<&str> = ALWAYS_ON_CHECKS.to_vec();
@@ -324,8 +327,8 @@ pub fn spawn_status_writer(
         stores,
         status_queue,
         controller,
-        Some(ingress_event_rx),
-    );
+    )
+    .with_ingress_events(Some(ingress_event_rx));
 
     Ok(SpawnedStatusWriter {
         reconciler,

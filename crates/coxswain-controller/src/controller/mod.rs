@@ -15,6 +15,10 @@
 //! service; the shared `leader` flag gates every reconcile and is the one
 //! truth-source the dedicated-mode operator also reads.
 
+use crate::operator::{
+    OperatorConfig, ReconcileContext as OperatorReconcileContext, reconcile_dedicated,
+    run_vip_reconciler,
+};
 use async_trait::async_trait;
 use coxswain_core::Shared;
 use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
@@ -33,7 +37,9 @@ use coxswain_reflector::status::{
     SharedCoxswainBackendPolicyStatus, SharedCoxswainExternalAuthStatus,
     SharedGatewayListenerStatus, SharedRouteStatus,
 };
-use coxswain_reflector::{IngressEvent, StatusKey, StatusKind, StatusStores, StatusWorkqueue};
+use coxswain_reflector::{
+    IngressEvent, OperatorStores, StatusKey, StatusKind, StatusStores, StatusWorkqueue,
+};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::{Client, runtime::reflector::ObjectRef};
 use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
@@ -189,6 +195,12 @@ pub struct Controller {
     /// generation, not merely have its ports bound (pre-bound ports satisfy
     /// the bind gate instantly while the config is still propagating).
     publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
+    /// Dedicated-provisioning operator inputs (#574 fold): its config + the
+    /// reflector's `OperatorStores`. `run_controllers` builds the operator
+    /// reconcile context from these, spawns its VIP reconciler, and the unified
+    /// worker's Gateway branch calls `reconcile_dedicated`. `None` disables
+    /// dedicated provisioning (tests / Ingress-only).
+    operator: parking_lot::Mutex<Option<(OperatorConfig, OperatorStores)>>,
 }
 
 impl Controller {
@@ -201,7 +213,6 @@ impl Controller {
         stores: StatusStores,
         queue: StatusWorkqueue,
         config: ControllerConfig,
-        ingress_event_rx: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
     ) -> Self {
         Self {
             health,
@@ -211,12 +222,35 @@ impl Controller {
             config,
             stores: parking_lot::Mutex::new(Some(stores)),
             queue,
-            ingress_event_rx: parking_lot::Mutex::new(ingress_event_rx),
+            ingress_event_rx: parking_lot::Mutex::new(None),
             vip_failures: Shared::new(),
             leadership_watch: None,
             node_registry: None,
             publish_index: None,
+            operator: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// Wire the dedicated-provisioning operator (#574 fold): its config plus the
+    /// reflector's `OperatorStores`. `run_controllers` builds the operator
+    /// reconcile context, spawns its VIP reconciler, and the unified worker's
+    /// Gateway branch drives `reconcile_dedicated` for dedicated Gateways.
+    #[must_use]
+    pub fn with_operator(self, config: OperatorConfig, stores: OperatorStores) -> Self {
+        *self.operator.lock() = Some((config, stores));
+        self
+    }
+
+    /// Wire the Ingress diagnostic-event channel (route conflicts, annotation
+    /// parse failures) so `run_controllers` spawns the recorder that emits them
+    /// as Kubernetes Warning Events. `None` in test/dev configs.
+    #[must_use]
+    pub fn with_ingress_events(
+        self,
+        rx: Option<tokio::sync::mpsc::Receiver<IngressEvent>>,
+    ) -> Self {
+        *self.ingress_event_rx.lock() = rx;
+        self
     }
 
     /// Share the operator VIP reconciler's definitively-failed static-address set
@@ -395,10 +429,59 @@ impl Controller {
         // its `reconcile_*` handler. Replaces the 13 kube `Controller`s, their
         // lossy-fan-out triggers, and the derived-cell health forwarders — one
         // watch fabric, one trigger, one worker.
-        tasks.spawn(run_status_worker(self.queue.clone(), Arc::clone(&ctx)));
+        // Dedicated-provisioning operator (#574 fold): build its reconcile
+        // context off the reflector's OperatorStores, spawn its serialized VIP
+        // reconciler, and hand the context to the worker's Gateway branch.
+        let operator_ctx = self.operator.lock().take().map(|(config, stores)| {
+            Arc::new(OperatorReconcileContext::from_stores(
+                config,
+                stores,
+                ctx.client.clone(),
+            ))
+        });
+        if let Some(op_ctx) = &operator_ctx {
+            tasks.spawn(run_vip_reconciler(Arc::clone(op_ctx), shutdown.clone()));
+        }
+
+        tasks.spawn(run_status_worker(
+            self.queue.clone(),
+            Arc::clone(&ctx),
+            operator_ctx,
+        ));
         // Re-enqueue the whole world once at startup so the initial reconcile
         // burst runs even before the reflector's first rebuild lands.
         enqueue_all_status(&self.queue, &stores);
+
+        // #531 prompt signal (restored under #574): a connected shared-pool proxy
+        // reporting a bound-port change or a snapshot ack updates `node_registry`,
+        // which is NOT a Kubernetes watch event and so never triggers a rebuild —
+        // without this the Gateway `Programmed` bind gate would only re-check on
+        // its slow deferred requeue, stalling under churn. On every registry
+        // change, re-enqueue the Gateways so the gate flips within one worker
+        // pass. The reflector's per-object status derivation (route/listener
+        // health) already re-drives via the rebuild's enqueue, so only the
+        // registry (proxy-connection-sourced) signal needs its own forwarder.
+        if let Some(registry) = &self.node_registry {
+            let mut rx = registry.subscribe();
+            let queue = self.queue.clone();
+            let gateways = stores.gateways.clone();
+            tasks.spawn(async move {
+                // Drop the initial value so a fresh subscription doesn't fire a
+                // spurious re-drive before any bind report lands.
+                let _ = rx.borrow_and_update();
+                while rx.changed().await.is_ok() {
+                    for gw in gateways.state() {
+                        if let Some(name) = gw.metadata.name.clone() {
+                            let ns = gw.metadata.namespace.clone().unwrap_or_default();
+                            queue.add(StatusKey::new(
+                                StatusKind::Gateway,
+                                ObjectKey::new(ns, name),
+                            ));
+                        }
+                    }
+                }
+            });
+        }
 
         tracing::info!(pod = %self.config.pod_name, is_leader, "Status worker active");
 
@@ -602,7 +685,11 @@ const WORKER_CONCURRENCY: usize = 8;
 /// deferred outcome re-enqueues via `add_after`; every key is marked `done` when
 /// its handler finishes (a re-add that lands mid-reconcile is coalesced by the
 /// queue into exactly one follow-up).
-async fn run_status_worker(queue: StatusWorkqueue, ctx: Arc<ReconcileContext>) {
+async fn run_status_worker(
+    queue: StatusWorkqueue,
+    ctx: Arc<ReconcileContext>,
+    operator_ctx: Option<Arc<OperatorReconcileContext>>,
+) {
     /// Runs `queue.done(key)` on drop — including on an unwind. Without this, a
     /// panic in a handler (a bug in an `*_events` helper) would skip `done`,
     /// leaving the key stuck in the queue's `processing` set forever: every later
@@ -629,6 +716,7 @@ async fn run_status_worker(queue: StatusWorkqueue, ctx: Arc<ReconcileContext>) {
             break;
         };
         let ctx = Arc::clone(&ctx);
+        let operator_ctx = operator_ctx.clone();
         let queue = queue.clone();
         tokio::spawn(async move {
             let _permit = permit;
@@ -638,7 +726,7 @@ async fn run_status_worker(queue: StatusWorkqueue, ctx: Arc<ReconcileContext>) {
             };
             // A deferred outcome re-enqueues; on a handler panic this line is
             // skipped by the unwind and `guard` still frees the key.
-            let outcome = dispatch(&key, &ctx).await;
+            let outcome = dispatch(&key, &ctx, operator_ctx.as_ref()).await;
             if let Some(delay) = outcome.requeue_after() {
                 queue.add_after(key.clone(), delay);
             }
@@ -661,13 +749,45 @@ where
     store.get(&object_ref)
 }
 
+/// Combine two reconcile outcomes into the sooner re-drive: the min requeue
+/// delay if either defers, else `AwaitChange`. Used where the shared-pool status
+/// writer and the dedicated operator both run on one Gateway (each no-ops for
+/// the other's mode) so a deferred condition on either side re-drives promptly.
+fn sooner_requeue(a: StatusOutcome, b: StatusOutcome) -> StatusOutcome {
+    match (a.requeue_after(), b.requeue_after()) {
+        (Some(x), Some(y)) => StatusOutcome::requeue(x.min(y)),
+        (Some(d), None) | (None, Some(d)) => StatusOutcome::requeue(d),
+        (None, None) => StatusOutcome::AwaitChange,
+    }
+}
+
 /// Dispatch one drained key to its status handler. A key whose object was
 /// deleted since enqueue resolves to nothing — there is no status left to write,
 /// so it settles as [`StatusOutcome::AwaitChange`].
-async fn dispatch(key: &StatusKey, ctx: &ReconcileContext) -> StatusOutcome {
+async fn dispatch(
+    key: &StatusKey,
+    ctx: &ReconcileContext,
+    operator_ctx: Option<&Arc<OperatorReconcileContext>>,
+) -> StatusOutcome {
     match key.kind {
         StatusKind::Gateway => match resolve(&ctx.gateways, &key.object) {
-            Some(o) => reconcile_gateway(&o, ctx).await,
+            Some(o) => {
+                // Shared-pool status writer; skips dedicated Gateways (returns
+                // `AwaitChange` for them — the operator owns their status).
+                let shared = reconcile_gateway(&o, ctx).await;
+                // Dedicated provisioning + status (#574 fold). Runs for every
+                // Gateway when the operator is wired; it no-ops for pure-shared
+                // Gateways (the inverse skip), so exactly one of the two writes.
+                // Take the sooner requeue so a deferred condition on either side
+                // (bind gate / migration / backoff) re-drives promptly.
+                match operator_ctx {
+                    Some(op) => {
+                        let dedicated = reconcile_dedicated(Arc::clone(&o), Arc::clone(op)).await;
+                        sooner_requeue(shared, dedicated)
+                    }
+                    None => shared,
+                }
+            }
             None => StatusOutcome::AwaitChange,
         },
         StatusKind::GatewayClass => match resolve(&ctx.gateway_classes, &key.object) {

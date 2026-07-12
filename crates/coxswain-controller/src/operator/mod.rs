@@ -7,15 +7,17 @@
 //! server-side-apply them into the Gateway's namespace, owner-referenced to
 //! the Gateway so deletion cascades.
 //!
-//! ## Architecture
+//! ## Architecture (#574 fold)
 //!
-//! Built on `kube_runtime::controller::Controller` rather than the raw
-//! `watcher` streams the existing status writer uses ([`crate::Controller`]).
-//! The Controller pattern fits this module's "reconcile one Gateway at a time"
-//! shape; the status writer's "rebuild the whole world on any event" shape
-//! is structurally different and stays on raw streams. The two background
-//! services coexist in the controller pod, each subscribed to their own
-//! event streams.
+//! The operator no longer runs its own `kube_runtime::controller::Controller` or
+//! Kubernetes client. It reconciles off the single controller watch fabric: the
+//! reflector exposes an [`crate::reconciler`-adjacent `OperatorStores`](coxswain_reflector::OperatorStores)
+//! bundle, the [`crate::Controller`] builds the [`reconciler::ReconcileContext`]
+//! from it and spawns the serialized [`vip::run_vip_reconciler`], and the unified
+//! status worker's Gateway branch drives [`reconciler::reconcile_dedicated`] for
+//! dedicated Gateways (it no-ops for shared ones, which the shared-pool status
+//! writer owns). This removes the operator's duplicate Gateway / GatewayClass /
+//! ListenerSet / Namespace / Service watches.
 //!
 //! ## Status writing (Step 12, #211)
 //!
@@ -56,4 +58,10 @@ pub(crate) mod shared_alloc;
 pub(crate) mod status;
 pub(crate) mod vip;
 
-pub use reconciler::{Operator, OperatorConfig};
+pub use reconciler::OperatorConfig;
+// #574 fold: the operator no longer runs as its own `BackgroundService`. The
+// controller builds the reconcile context off the reflector's `OperatorStores`,
+// the unified worker's dedicated branch calls `reconcile_dedicated`, and the
+// controller spawns `run_vip_reconciler`.
+pub(crate) use reconciler::{ReconcileContext, reconcile_dedicated};
+pub(crate) use vip::run_vip_reconciler;
