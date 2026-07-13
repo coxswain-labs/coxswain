@@ -89,7 +89,7 @@ flowchart LR
     F --> G([Forward])
 ```
 
-The routing table is an immutable snapshot behind an atomic pointer; each request reads it with a single atomic load — no locks, no channels. The discovery supervisor builds a new snapshot from the wire DTO and swaps the pointer atomically; in-flight requests complete against the old snapshot, the next request sees the new routing.
+The routing table is an immutable snapshot behind an atomic pointer; each request reads it with a single atomic load — no locks, no channels. The discovery supervisor applies each pushed change — a per-resource delta, not a whole-table blob (see [Discovery protocol → wire protocol](architecture/discovery-protocol.md#the-wire-protocol)) — by recompiling only the routing partitions that changed and splicing every unchanged partition's already-compiled router straight into a fresh table, then swaps the pointer atomically; in-flight requests complete against the old snapshot, the next request sees the new routing.
 
 TLS works the same way: the TLS store is an atomic snapshot rebuilt on every push. New connections use the new certificate; connections in progress complete with the old one.
 
