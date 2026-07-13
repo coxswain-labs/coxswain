@@ -135,7 +135,7 @@ pub struct BackendTimeouts {
 /// Upstream load-balancing algorithm selector (#389).
 ///
 /// `algorithm` is a free-form string, parsed by the shared
-/// [`LoadBalance::parse_lenient`](coxswain_core_routing_load_balance) parser
+/// [`LoadBalance::parse_lenient`](crate::routing::LoadBalance::parse_lenient) parser
 /// used by every surface that selects an LB algorithm. Deliberately
 /// proprietary — Gateway API has no LB-algorithm-selection standard (upstream
 /// closed kubernetes-sigs/gateway-api#1778 "not planned"); this anchors to
@@ -146,8 +146,6 @@ pub struct BackendTimeouts {
 ///
 /// Accepted values: `round_robin` (default), `least_conn`, `ewma`, `ip_hash`,
 /// `hash:uri`, `hash:source-ip`, `hash:header=<name>`, `hash:cookie=<name>`.
-///
-/// [coxswain_core_routing_load_balance]: https://docs.rs/coxswain-core/latest/coxswain_core/routing/enum.LoadBalance.html
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]

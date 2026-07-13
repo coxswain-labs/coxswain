@@ -138,7 +138,7 @@ pub fn snapshot_build_seconds() -> &'static Histogram {
 /// Histogram: wall-clock time from a snapshot being sent to a proxy to that
 /// proxy's matching Ack arriving — the "push to proxy apply to Ack" leg of the
 /// #513 convergence pipeline in one number (network round trip plus
-/// client-side decode and apply). Observed in [`crate::server::run_stream`]'s
+/// client-side decode and apply). Observed in `server::run_stream`'s
 /// Ack handler; a Nack or a stream drop before Ack never observes — last-good
 /// is retained, and there is no completed convergence to time.
 ///

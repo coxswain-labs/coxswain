@@ -320,7 +320,7 @@ fn relist_backstop_trips(stalled_for: Option<Duration>, armed: bool, window: Dur
 
 /// Run the relist liveness backstop (#573). Controller role only.
 ///
-/// Every [`RELIST_MONITOR_TICK`] it inspects each kind. A kind that is armed
+/// Every `RELIST_MONITOR_TICK` it inspects each kind. A kind that is armed
 /// (has completed ≥1 relist) but whose in-flight relist has made no progress for
 /// [`RELIST_STUCK_WINDOW`] trips `gate`, failing `/healthz` so kubelet restarts
 /// the pod — reflectors then relist from scratch. The primary #573 fix should

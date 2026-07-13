@@ -8,14 +8,14 @@
 //! 1. [`EndpointCache::refresh`] does **one** pass over the `EndpointSlice`
 //!    store per rebuild, grouping slices by `(namespace, service)` (from the
 //!    `kubernetes.io/service-name` label) and folding each group's members
-//!    into a single [`GroupFingerprint`] — a commutative (order-independent)
+//!    into a single `GroupFingerprint` — a commutative (order-independent)
 //!    combination of each member's `(name, resourceVersion)`, so it moves on
 //!    any member add/remove/update regardless of iteration order.
 //! 2. [`EndpointCache::get`] resolves a specific `(ns, svc, port)`: if the
 //!    owning group's fingerprint is unchanged since the entry was cached, it
 //!    returns the cached `Arc` — no scan, no allocation. Otherwise it
 //!    resolves fresh, but only over that group's already-grouped slice list
-//!    (not a full store rescan) via [`super::resolve_from_group`].
+//!    (not a full store rescan) via `super::resolve_from_group`.
 //!
 //! `refresh` must run once per rebuild before any `get` calls. The cache is
 //! owned by the rebuild loop (`reconciler::cache::ReflectorCaches`) and lives
@@ -113,7 +113,7 @@ impl EndpointCache {
     ///
     /// The cache key folds in the `Service` object's own `resourceVersion`
     /// alongside the `EndpointSlice` group fingerprint: `lookup_service_port`
-    /// (inside [`resolve_from_group`]) reads `Service.spec.ports[].targetPort`
+    /// (inside `resolve_from_group`) reads `Service.spec.ports[].targetPort`
     /// / `.appProtocol`, so a port-mapping or `appProtocol` edit is a real
     /// input change even when no `EndpointSlice` is touched — without this,
     /// such an edit would go unnoticed until unrelated slice churn happened

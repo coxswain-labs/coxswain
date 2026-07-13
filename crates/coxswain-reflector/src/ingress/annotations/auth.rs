@@ -23,7 +23,7 @@ use super::AnnotationIssue;
 /// fails **closed** (503) — matching `auth-basic-secret`/`auth-jwt`.
 pub const EXT_AUTH: &str = "ingress.coxswain-labs.dev/ext-auth";
 
-/// Reference to an htpasswd [`Secret`] in `namespace/name` form, e.g.
+/// Reference to an htpasswd [`k8s_openapi::api::core::v1::Secret`] in `namespace/name` form, e.g.
 /// `"default/my-htpasswd"`.  The Secret **must** carry the label
 /// `ingress.coxswain-labs.dev/auth-basic: "true"` and store the htpasswd file
 /// under the key `auth`.  A missing Secret, an unlabeled Secret, or one without

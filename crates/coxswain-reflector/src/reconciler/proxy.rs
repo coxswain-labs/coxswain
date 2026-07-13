@@ -194,7 +194,7 @@ pub struct ReconcilerOptions {
     /// Ports on which Ingress routes are served.
     pub ingress_ports: IngressPorts,
     /// Pod role driving the metric-prefix selection (`coxswain_proxy_*` vs
-    /// `coxswain_controller_*`). Default [`MetricsPrefix::Proxy`].
+    /// `coxswain_controller_*`). Default [`crate::MetricsPrefix::Proxy`].
     pub metrics_prefix: crate::MetricsPrefix,
     /// When `true`, spawn a 12th reflector that watches `Pod` objects labelled
     /// `app.kubernetes.io/name=coxswain` and publishes a [`SharedFleet`] snapshot
@@ -242,7 +242,7 @@ pub struct ReconcilerOptions {
     pub fetch_remote_jwks: bool,
     /// Bounds for the adaptive rebuild debounce (#512). Replaces the
     /// reconciler's original fixed 500 ms coalescing timer — see
-    /// [`super::debounce::settle`].
+    /// `super::debounce::settle`.
     pub debounce: crate::DebounceSettings,
     /// When `Some`, spawn the relist liveness backstop (#573): a monitor that
     /// trips this gate — failing `/healthz` so kubelet restarts the pod — if any
@@ -481,7 +481,7 @@ pub struct ReconcilerOutputs {
     pub cluster_summary: SharedClusterSummary,
     /// Per-cut-over-Gateway routing snapshots, keyed by [`ObjectKey`].  Updated
     /// on every rebuild by the shared reconciler; read by the discovery server
-    /// when serving [`coxswain_discovery::Scope::Gateway`] subscribers (#426).
+    /// when serving `coxswain_discovery::Scope::Gateway` subscribers (#426).
     pub dedicated_registry: DedicatedRoutingRegistry,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     pub passthrough_routes: SharedTlsPassthroughTable,

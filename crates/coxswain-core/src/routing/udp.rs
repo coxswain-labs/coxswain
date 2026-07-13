@@ -1,4 +1,4 @@
-//! Port-keyed UDP routing table for [`UDPRoute`] / GEP-2645.
+//! Port-keyed UDP routing table for `UDPRoute` / GEP-2645.
 //!
 //! Like [`TcpRouteTable`], `UDPRoute` has no hostname dimension: the Standard
 //! channel allows exactly one rule with no matches, so a bound backend is

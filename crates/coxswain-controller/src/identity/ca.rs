@@ -2,7 +2,7 @@
 //!
 //! This module owns the CA lifecycle:
 //!
-//! - **Loading**: parse PEM cert+key from a Kubernetes Secret (via [`CaStore`]).
+//! - **Loading**: parse PEM cert+key from a Kubernetes Secret (via [`super::store`]).
 //! - **Signing**: produce short-lived SVIDs from a CSR (implements
 //!   [`coxswain_core::SvidIssuer`]).
 //! - **Self-issuance**: generate the controller's own server SVID (and key) so
@@ -14,8 +14,6 @@
 //!
 //! The CA cert and key are stored in a [`coxswain_core::Shared`] cell so
 //! hot-reload on Secret change is lock-free on the read path.
-//!
-//! [`CaStore`]: super::store::CaStore
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -81,7 +79,7 @@ struct CaInner {
 ///
 /// Thread-safe: `Shared<CaInner>` wraps an `ArcSwap` cell so signing and
 /// trust-bundle reads are a single atomic pointer load.  A background task
-/// (driven by [`super::store::CaStore`]) calls `reload()` when the CA
+/// (driven by [`super::store`]) calls `reload()` when the CA
 /// Secret changes; running streams see the new CA on their next sign call.
 #[non_exhaustive]
 pub struct CertAuthority {

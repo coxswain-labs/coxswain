@@ -32,7 +32,7 @@
 //! `FilterAction::Mirror` embeds an `Arc<BackendGroup>`, which itself may carry
 //! `per_backend_filters` containing further `Mirror` actions.  In practice the
 //! graph is a tree (no cycles), but the proto is untrusted: `from_wire` limits
-//! recursion through Mirror backends to [`MAX_MIRROR_DEPTH`].
+//! recursion through Mirror backends to [`crate::wire::routing::MAX_MIRROR_DEPTH`].
 //!
 //! [`RoutingTable`]: coxswain_core::routing::RoutingTable
 //! [`Snapshot`]: crate::proto::v1::Snapshot

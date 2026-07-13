@@ -476,7 +476,7 @@ message FilterAction {
     RequestRedirect request_redirect = 3;
     UrlRewrite url_rewrite = 4;
     MirrorFilter mirror = 5; // Mirror { backend, fraction }
-    CorsFilter cors = 6;     // Cors(Arc<CorsConfig>)
+    CorsFilter cors = 6;     // Cors(`Arc<CorsConfig>`)
   }
 }
 

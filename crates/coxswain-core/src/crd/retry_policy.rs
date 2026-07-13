@@ -3,7 +3,7 @@
 //! Attached to an `HTTPRouteRule` or `GRPCRouteRule` via an `ExtensionRef` filter
 //! (group `gateway.coxswain-labs.dev`, kind `RetryPolicy`). The reflector resolves
 //! the named CR and translates it into the runtime
-//! [`RetryPolicy`](crate::routing::RetryPolicy) that a
+//! [`RetryPolicyConfig`](crate::routing::RetryPolicyConfig) that a
 //! [`BackendGroup`](crate::routing::BackendGroup) carries and the proxy enforces.
 //!
 //! **Deprecation intent.** The field shape mirrors Gateway API GEP-1731

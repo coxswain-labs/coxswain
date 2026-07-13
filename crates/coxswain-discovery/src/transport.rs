@@ -13,7 +13,7 @@
 //! ## Peer SVID extraction
 //!
 //! `serve_discovery_with_tls` wraps each accepted [`tokio_rustls::server::TlsStream`]
-//! in a [`PeerSvidStream`] newtype.  `PeerSvidStream` implements
+//! in a `PeerSvidStream` newtype.  `PeerSvidStream` implements
 //! [`tonic::transport::server::Connected`] — tonic calls `connect_info()` on
 //! each stream and stores the returned [`crate::auth::PeerSvid`] in request
 //! extensions, making it available to the `stream()` gRPC handler via
@@ -103,7 +103,7 @@ impl AsyncWrite for PeerSvidStream {
 
 /// Serve a [`Discovery`] service on `addr`, wrapping every connection in `acceptor`.
 ///
-/// Each accepted TLS stream is wrapped in [`PeerSvidStream`], which implements
+/// Each accepted TLS stream is wrapped in `PeerSvidStream`, which implements
 /// [`Connected`] and injects [`PeerSvid`] into request extensions — the
 /// discovery handler uses it to enforce the Gateway scope-binding check.
 ///

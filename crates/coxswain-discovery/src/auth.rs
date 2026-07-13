@@ -75,7 +75,7 @@ impl SpiffeMatcher {
 
 /// URI SANs extracted from the mTLS peer certificate.
 ///
-/// Injected into tonic request extensions by [`crate::transport::PeerSvidStream`]
+/// Injected into tonic request extensions by `transport::PeerSvidStream`
 /// at TLS accept time.  Absent → plaintext connection (test/degraded path); the
 /// discovery server skips scope-binding checks when this is not present.
 #[non_exhaustive]

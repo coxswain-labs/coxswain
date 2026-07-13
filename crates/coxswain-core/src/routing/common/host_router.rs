@@ -84,7 +84,7 @@ pub struct RouteMatch {
 
     /// Normalized form of the request path, when it differs from the raw path.
     ///
-    /// Set by [`super::port::PortRoutingTable::find`] after applying the host's
+    /// Set by `PortRoutingTable::find` after applying the host's
     /// [`NormalizeLevel`] to the request path before the routing lookup.
     /// `None` when normalization was a no-op (the path was already canonical or
     /// the level is `None`) — the raw request path is used verbatim.  When
@@ -129,7 +129,7 @@ impl RouteMatch {
 /// This is the single entry point callers use to validate an
 /// `ImplementationSpecific`/`RegularExpression` path *before* inserting it, so an
 /// uncompilable pattern can be skipped with a WARN rather than failing the whole
-/// routing-table [`build`](HostRouterBuilder::build) (which would drop every route).
+/// routing-table `build` (`HostRouterBuilder::build`, which would drop every route).
 /// The returned [`regex::Regex`] is also what capture-group rewrites
 /// ([`PathModifier::RegexReplace`](super::filters::PathModifier::RegexReplace)) match
 /// against. The matcher itself compiles the same pattern into a

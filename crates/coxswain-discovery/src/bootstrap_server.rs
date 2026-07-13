@@ -149,7 +149,7 @@ where
     ///
     /// 1. Reject requests with a mismatched `wire_version` (clear protocol error).
     /// 2. Authenticate the SA token via [`TokenAuthenticator`] → [`SpiffeId`].
-    /// 3. Sign the CSR via [`SvidIssuer`] → [`IssuedSvid`].
+    /// 3. Sign the CSR via [`SvidIssuer`] → [`coxswain_core::identity::IssuedSvid`].
     /// 4. Return the cert PEM, trust bundle PEM, and `not_after` timestamp.
     ///
     /// Any failure invokes the reject hook before returning `Unauthenticated`.

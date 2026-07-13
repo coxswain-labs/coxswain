@@ -84,6 +84,7 @@ coxswain-bin
 | Every reflector `ReflectorEffects::new(…, "check", …)` name is registered on the controller health subsystem | `scripts/check-reflector-health-checks.sh` |
 | Tenant-supplied regexes compile via `compile_bounded` (size-limited), never bare `Regex::new` in core/reflector | `scripts/check-bounded-regex.sh` |
 | Shipped CRD manifests (coxswain's own + the pinned upstream Gateway API CRDs) pass `kubeconform -strict` | `scripts/check-crd-kubeconform.sh` |
+| `cargo doc` is warning-free (no broken or private intra-doc links) | `.github/workflows/ci.yml` `doc` job (`RUSTDOCFLAGS=-D warnings`) |
 
 `[workspace.lints]` in `Cargo.toml` is the source of truth for lint configuration. Workspace-wide opt-outs in `[workspace.lints]` are acceptable when an entire lint *group* is too broad for the project (current: `clippy::pedantic = "allow"`). For upstream-imposed names that trip a lint (e.g. `HTTPRoute` from codegen tripping `upper_case_acronyms`): re-export with a project-canonical alias at the crate boundary (`gw_types.rs`) and use the alias everywhere internally — a one-time fix; per-site annotations lock the inconsistency in forever.
 

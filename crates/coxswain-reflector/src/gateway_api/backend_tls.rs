@@ -51,7 +51,7 @@ pub type BackendTlsIndex = HashMap<(ObjectKey, Option<u16>), ResolvedPolicy>;
 /// - Losers: added to the returned health map with `Accepted: Conflicted`.
 ///
 /// Returns both the index (for data-plane routing) and the raw health map (for status
-/// writes). Call [`compute_policy_health`] to fill in ancestor lists.
+/// writes). Call `compute_policy_health` to fill in ancestor lists.
 #[must_use]
 pub fn build_backend_tls_index(
     policies: &reflector::Store<BackendTlsPolicy>,

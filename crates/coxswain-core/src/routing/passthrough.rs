@@ -1,9 +1,9 @@
-//! SNI-keyed TLS passthrough routing table for [`TLSRoute`] / GEP-2643.
+//! SNI-keyed TLS passthrough routing table for `TLSRoute` / GEP-2643.
 //!
 //! In passthrough mode the proxy **never** terminates TLS: it extracts the SNI
 //! from the raw ClientHello, picks a backend by hostname, and forwards the
 //! encrypted stream byte-for-byte. This table is intentionally simpler than the
-//! L7 [`RoutingTable`] — there are no path predicates, filters, or headers; just
+//! L7 [`RoutingTable`](crate::routing::RoutingTable) — there are no path predicates, filters, or headers; just
 //! `port → SNI → BackendGroup`.
 //!
 //! Hostname matching follows Gateway-API semantics: exact match first, then

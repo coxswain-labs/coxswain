@@ -6,9 +6,9 @@
 //! cloneable, lock-free-read handle: [`run`] is the sole writer (spawned once,
 //! controller role only — see [`crate::reconciler::ReconcilerOptions::fetch_remote_jwks`]),
 //! and the reconcile rebuild reads it synchronously via [`SharedJwksCache::get`]
-//! when resolving a `JwtAuth` CR that names a [`RemoteJwks`].
+//! when resolving a `JwtAuth` CR that names a [`coxswain_core::crd::RemoteJwks`].
 //!
-//! Inline JWKS ([`InlineJwks`]) never touches this cache — the reflector reads
+//! Inline JWKS ([`coxswain_core::crd::InlineJwks`]) never touches this cache — the reflector reads
 //! `spec.jwks.inline.jwks` directly at resolve time.
 
 use arc_swap::ArcSwap;
@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
-/// Default refetch interval when a [`RemoteJwks::refresh_interval`] is absent
+/// Default refetch interval when a [`coxswain_core::crd::RemoteJwks::refresh_interval`] is absent
 /// or unparseable. The response's `Cache-Control` header is not consulted.
 pub const DEFAULT_REFRESH: Duration = Duration::from_secs(300);
 
@@ -107,7 +107,7 @@ impl SharedJwksCache {
         self.0.tx.subscribe()
     }
 
-    /// Current cache generation — bumped by [`Self::publish`] on every fetch
+    /// Current cache generation — bumped by `Self::publish` on every fetch
     /// that changes the cache. Because the reconcile bakes resolved JWKS
     /// *text* into a route's compiled config (`jwt_auth::resolve_spec`), a
     /// key rotation moves this counter but no watched-resource `resourceVersion`;
