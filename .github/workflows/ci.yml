@@ -108,6 +108,26 @@ jobs:
           components: clippy
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  doc:
+    name: doc
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: ui/package-lock.json
+      - name: Build operator UI
+        run: npm ci && npm run build
+        working-directory: ui
+      - uses: ./.github/actions/setup-rust-with-cache
+        with:
+          cache-key-prefix: ci-doc
+      - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude coxswain-e2e --no-deps
+
   test:
     name: test
     needs: changes
