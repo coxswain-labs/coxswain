@@ -671,15 +671,9 @@ pub(crate) mod tests {
                         kind: Some(SrvKind::Snapshot(p::Snapshot {
                             version: "test-v1".into(),
                             nonce: vec![1],
-                            ingress_routing: None,
-                            gateway_routing: None,
-                            tls_store: None,
-                            client_cert_store: None,
-                            listener_status: None,
-                            tls_passthrough: None,
-                            tls_terminate: None,
-                            tcp_proxy: None,
-                            udp_proxy: None,
+                            full: true,
+                            resources: Vec::new(),
+                            removed_resources: Vec::new(),
                         })),
                     };
                     let _ = tx.send(Ok(snap)).await;

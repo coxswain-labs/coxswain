@@ -10,59 +10,148 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use coxswain_core::endpoints::{EndpointPool, empty_group_status};
 use coxswain_core::routing::{
     BackendClientCert, BackendGroup, BackendProtocol, BasicCredential, CircuitBreakerConfig,
     CompressionConfig, CorsConfig, CorsOrigin, ExtAuthConfig, ExtAuthTransport, FilterAction,
-    ForwardedForConfig, GatewayRoutingTable, GrpcExtAuthConfig, HashSource, HeaderMod,
-    HeaderPredicate, HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, IngressRoutingTable,
-    JwtConfig, JwtHeaderLoc, LoadBalance, MatchPredicates, MirrorFraction, NormalizeLevel,
-    PasswordHash, PathModifier, QueryPredicate, RateLimitConfig, RateLimitKey, RouteEntry,
-    RouteKind, RouteTimeouts, RouterError, SessionAffinity, SubjectAltName, TcpRouteTable,
-    TcpRouteTableBuilder, TlsPassthroughTable, TlsPassthroughTableBuilder, UdpRouteTable,
-    UdpRouteTableBuilder, UpstreamCa, UpstreamTls, ValueMatch, WildcardKind,
+    ForwardedForConfig, GrpcExtAuthConfig, HashSource, HeaderMod, HeaderPredicate,
+    HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, JwtConfig, JwtHeaderLoc, LoadBalance,
+    MatchPredicates, MirrorFraction, NormalizeLevel, PasswordHash, PathModifier, QueryPredicate,
+    RateLimitConfig, RateLimitKey, RouteEntry, RouteKind, RouteTimeouts, RouterError,
+    SessionAffinity, SubjectAltName, TcpRouteTable, TcpRouteTableBuilder, TlsPassthroughTable,
+    TlsPassthroughTableBuilder, UdpRouteTable, UdpRouteTableBuilder, UpstreamCa, UpstreamTls,
+    ValueMatch, WildcardKind,
 };
+// Whole-table route types + the pool-from-resources helper are used only by the
+// test-only `decode_world` route oracle (production decode is partition-wise via
+// `build_route_table`, cell-wise via the L4 decoders — see `crate::apply`).
+#[cfg(test)]
+use coxswain_core::routing::{GatewayRoutingTable, IngressRoutingTable};
 
 use super::MAX_MIRROR_DEPTH;
 use crate::error::WireError;
 use crate::proto::v1 as p;
+use crate::wire::endpoints::endpoint_key_from_wire;
+#[cfg(test)]
+use crate::wire::endpoints::endpoint_pool_from_resources;
+
+// ────────────────────────────────────────────────────────────────────────────
+// MaterializedGroup (#383)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// A [`BackendGroup`] decoded against the message's endpoint pool, plus the
+/// endpoint-derived error status the client must re-install (#383).
+///
+/// `empty_status` is `Some` only when the group referenced ≥1 endpoint resource
+/// (a keyed backendRef) yet resolved to zero routable addresses — the exact
+/// condition under which the reflector's encoder *omitted* the status (it marks
+/// keyed empties `error_status_endpoint_derived`). The value reproduces the
+/// shared rule ([`empty_group_status`]): a valid Service with zero ready
+/// endpoints → 503, an invalid/missing Service → 500. Literal-address groups and
+/// backend-less (redirect) groups leave it `None`; any endpoint-independent
+/// status the server baked rides `dto.error_status` and wins at the call site.
+#[derive(Debug)]
+pub(crate) struct MaterializedGroup {
+    /// The reconstructed backend group (hot-path routing structures).
+    pub(crate) group: BackendGroup,
+    /// Endpoint-derived error status to install when the server omitted it.
+    pub(crate) empty_status: Option<u16>,
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // Routing table: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Reconstruct an [`IngressRoutingTable`] from its wire DTO.
+/// Reconstruct an [`IngressRoutingTable`] from its whole-table wire DTO,
+/// resolving endpoint references against `pool`.
+///
+/// Test-only oracle (#383): production decode now goes partition-by-partition
+/// through [`build_route_table`] (the client's `crate::apply` splice path), so
+/// this whole-table variant survives only as the wire round-trip tests'
+/// convenience.
 ///
 /// # Errors
 ///
 /// Returns [`WireError`] if any field is invalid (bad regex, bad header name,
-/// unknown enum value, depth-exceeded mirror, etc.).
+/// unknown enum value, depth-exceeded mirror, dangling endpoint ref, etc.).
+#[cfg(test)]
 #[must_use = "the rebuilt routing table must be stored for the proxy to use it"]
-pub fn ingress_from_wire(dto: &p::RoutingTable) -> Result<IngressRoutingTable, WireError> {
-    routing_table_from_wire::<coxswain_core::routing::Ingress>(dto)
+pub(crate) fn ingress_from_wire(
+    dto: &p::RoutingTable,
+    pool: &EndpointPool,
+) -> Result<IngressRoutingTable, WireError> {
+    routing_table_from_wire::<coxswain_core::routing::Ingress>(dto, pool)
 }
 
-/// Reconstruct a [`GatewayRoutingTable`] from its wire DTO.
+/// Reconstruct a [`GatewayRoutingTable`] from its whole-table wire DTO, resolving
+/// endpoint references against `pool`. Test-only oracle — see
+/// [`ingress_from_wire`].
 ///
 /// # Errors
 ///
 /// Returns [`WireError`] if any field is invalid.
+#[cfg(test)]
 #[must_use = "the rebuilt routing table must be stored for the proxy to use it"]
-pub fn gateway_from_wire(dto: &p::RoutingTable) -> Result<GatewayRoutingTable, WireError> {
-    routing_table_from_wire::<coxswain_core::routing::Gateway>(dto)
+pub(crate) fn gateway_from_wire(
+    dto: &p::RoutingTable,
+    pool: &EndpointPool,
+) -> Result<GatewayRoutingTable, WireError> {
+    routing_table_from_wire::<coxswain_core::routing::Gateway>(dto, pool)
 }
 
+#[cfg(test)]
 fn routing_table_from_wire<Kind>(
     dto: &p::RoutingTable,
+    pool: &EndpointPool,
+) -> Result<coxswain_core::routing::RoutingTable<Kind>, WireError>
+where
+    coxswain_core::routing::RoutingTableBuilder<Kind>: Default,
+{
+    // Reshape the port-nested DTO into the borrowed per-port host map that
+    // [`build_route_table`] consumes, so this and the client's staged-cache
+    // apply path (#383) compile through one function.
+    let mut hosts_by_port: std::collections::BTreeMap<u16, Vec<&p::HostEntry>> =
+        std::collections::BTreeMap::new();
+    for port_entry in &dto.ports {
+        let entry = hosts_by_port.entry(port_entry.port as u16).or_default();
+        entry.extend(port_entry.hosts.iter());
+    }
+    build_route_table::<Kind>(&hosts_by_port, pool)
+}
+
+/// Compile a routing table of table-kind `Kind` from a per-port map of host
+/// buckets and the message's endpoint pool.
+///
+/// This is the **per-table compile seam** shared by the whole-DTO decode
+/// ([`routing_table_from_wire`], hence `decode_world`) and the client's
+/// staged-cache apply pipeline (`crate::apply`, #383). The client keys its
+/// resource cache by `(table, port, host)` partition; when the partitioned
+/// recompile lands (commit 5) it groups the staged route partitions back into
+/// this per-port shape and calls this function per table kind. Keeping one
+/// compile function means the streamed full decode and the client rebuild can
+/// never diverge in how a host bucket becomes a compiled router.
+///
+/// `hosts_by_port` is a `BTreeMap` so ports compile in a deterministic order
+/// (listener-isolation tie-breaks are order-sensitive in the builder).
+///
+/// # Errors
+///
+/// Returns [`WireError`] if any host bucket fails to decode (bad regex, bad
+/// header name, unknown enum value, depth-exceeded mirror, dangling endpoint
+/// ref, or a path pattern the `matchit` router rejects).
+#[must_use = "the compiled routing table must be stored for the proxy to use it"]
+pub(crate) fn build_route_table<Kind>(
+    hosts_by_port: &std::collections::BTreeMap<u16, Vec<&p::HostEntry>>,
+    pool: &EndpointPool,
 ) -> Result<coxswain_core::routing::RoutingTable<Kind>, WireError>
 where
     coxswain_core::routing::RoutingTableBuilder<Kind>: Default,
 {
     let mut builder = coxswain_core::routing::RoutingTableBuilder::<Kind>::new();
-    for port_entry in &dto.ports {
-        let port = port_entry.port as u16;
+    for (&port, hosts) in hosts_by_port {
         let port_builder = builder.for_port(port);
-        for host_entry in &port_entry.hosts {
-            host_entry_from_wire(host_entry, port_builder)?;
+        for host_entry in hosts {
+            host_entry_from_wire(host_entry, port_builder, pool)?;
         }
     }
     builder.build().map_err(|e| match e {
@@ -74,6 +163,7 @@ where
 fn host_entry_from_wire(
     he: &p::HostEntry,
     port_builder: &mut coxswain_core::routing::PortTableBuilder,
+    pool: &EndpointPool,
 ) -> Result<(), WireError> {
     let normalize = normalize_level_from_wire(he.normalize_level)?;
 
@@ -94,7 +184,7 @@ fn host_entry_from_wire(
     host_builder.set_path_normalize(normalize);
 
     for route_dto in &he.routes {
-        route_entry_from_wire(route_dto, host_builder)?;
+        route_entry_from_wire(route_dto, host_builder, pool)?;
     }
     Ok(())
 }
@@ -102,9 +192,10 @@ fn host_entry_from_wire(
 fn route_entry_from_wire(
     dto: &p::RouteEntry,
     host_builder: &mut HostRouterBuilder,
+    pool: &EndpointPool,
 ) -> Result<(), WireError> {
     let kind = route_kind_from_wire(dto.kind)?;
-    let entry = Arc::new(build_route_entry(dto)?);
+    let entry = Arc::new(build_route_entry(dto, pool)?);
 
     match kind {
         RouteKind::Exact => {
@@ -124,14 +215,15 @@ fn route_entry_from_wire(
     Ok(())
 }
 
-fn build_route_entry(dto: &p::RouteEntry) -> Result<RouteEntry, WireError> {
+fn build_route_entry(dto: &p::RouteEntry, pool: &EndpointPool) -> Result<RouteEntry, WireError> {
     let bg_dto = dto
         .backend_group
         .as_ref()
         .ok_or(WireError::MissingRequiredField {
             field: "route_entry.backend_group",
         })?;
-    let backend_group = Arc::new(bg_from_wire(bg_dto, 0)?);
+    let materialized = bg_from_wire(bg_dto, pool, 0)?;
+    let backend_group = Arc::new(materialized.group);
 
     let predicates = dto
         .predicates
@@ -142,7 +234,7 @@ fn build_route_entry(dto: &p::RouteEntry) -> Result<RouteEntry, WireError> {
 
     let mut filters = Vec::with_capacity(dto.filters.len());
     for f in &dto.filters {
-        filters.push(filter_from_wire(f, 0)?);
+        filters.push(filter_from_wire(f, 0, pool)?);
     }
 
     let timeouts = dto
@@ -165,7 +257,14 @@ fn build_route_entry(dto: &p::RouteEntry) -> Result<RouteEntry, WireError> {
     );
     entry = entry.with_metric_route_id(dto.metric_route_id.clone().into());
     entry = entry.with_path_pattern(dto.path_pattern.clone().into());
-    entry = entry.with_error_status(dto.error_status.map(|s| s as u16));
+    // #383 provenance split: a baked (endpoint-independent) status wins; else
+    // install the endpoint-derived status the server omitted, re-derived from the
+    // resolved pool. Reproduces the reflector's precedence exactly.
+    entry = entry.with_error_status(
+        dto.error_status
+            .map(|s| s as u16)
+            .or(materialized.empty_status),
+    );
 
     if let Some(max) = dto.max_body_size {
         entry = entry.with_max_body_size(Some(max));
@@ -221,44 +320,104 @@ fn build_route_entry(dto: &p::RouteEntry) -> Result<RouteEntry, WireError> {
 // BackendGroup: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
-pub(crate) fn bg_from_wire(dto: &p::BackendGroup, depth: usize) -> Result<BackendGroup, WireError> {
+pub(crate) fn bg_from_wire(
+    dto: &p::BackendGroup,
+    pool: &EndpointPool,
+    depth: usize,
+) -> Result<MaterializedGroup, WireError> {
     if depth > MAX_MIRROR_DEPTH {
         return Err(WireError::MirrorTooDeep {
             limit: MAX_MIRROR_DEPTH,
         });
     }
 
-    // Reconstruct (addrs, weight) pairs from BackendGroupSpec.
-    let mut pools: Vec<(Vec<SocketAddr>, u16)> = Vec::with_capacity(dto.weighted.len());
+    // Resolve each weighted backend to its (addrs, weight), tracking whether any
+    // keyed ref resolved and whether the group is a valid-but-empty Service — the
+    // inputs to the endpoint-derived status the reflector omitted (#383).
+    let mut resolved: Vec<(Vec<SocketAddr>, u16)> = Vec::with_capacity(dto.weighted.len());
+    let mut has_keyed_ref = false;
+    let mut has_valid_empty = false;
     for wb in &dto.weighted {
-        let addrs: Vec<SocketAddr> = wb
-            .addrs
-            .iter()
-            .map(|s| s.parse::<SocketAddr>().map_err(WireError::InvalidAddr))
-            .collect::<Result<_, _>>()?;
         let weight = wb.weight as u16;
-        pools.push((addrs, weight));
+        let addrs = if let Some(reference) = &wb.endpoint_ref {
+            has_keyed_ref = true;
+            // The pool is keyed by u16-narrowed `EndpointKey`s (out-of-range
+            // endpoint resources are rejected at stage), so a ref port outside the
+            // u16 range can never legitimately resolve — narrowing it would truncate
+            // (65616 → 80) and silently bind to an unrelated port's endpoints. Treat
+            // an out-of-range ref as a dangling reference (#383 review).
+            let port =
+                u16::try_from(reference.port).map_err(|_| WireError::UnknownEndpointRef {
+                    namespace: reference.namespace.clone(),
+                    service: reference.service.clone(),
+                    port: reference.port,
+                })?;
+            let key = endpoint_key_from_wire(&reference.namespace, &reference.service, port.into());
+            let ep = pool
+                .get(&key)
+                .ok_or_else(|| WireError::UnknownEndpointRef {
+                    namespace: reference.namespace.clone(),
+                    service: reference.service.clone(),
+                    port: u32::from(port),
+                })?;
+            if weight > 0 && ep.service_exists && ep.addrs.is_empty() {
+                has_valid_empty = true;
+            }
+            ep.addrs.clone()
+        } else {
+            // Literal addresses (pre-#383 form) or a structurally-invalid empty
+            // entry (no ref, no addrs) — parse whatever is present.
+            wb.addrs
+                .iter()
+                .map(|s| s.parse::<SocketAddr>().map_err(WireError::InvalidAddr))
+                .collect::<Result<_, _>>()?
+        };
+        resolved.push((addrs, weight));
     }
 
-    // Build per-backend filters (sparse; indexed by backend_index).
+    // A backend survives into the hot-path pools iff it has ≥1 address and a
+    // non-zero weight (mirrors BackendGroup::weighted's own retention). Filter
+    // here first so per-backend filters can be built in lockstep with the
+    // surviving pools — with_per_backend_filters requires index alignment with
+    // the final backend set.
+    let surviving: Vec<usize> = resolved
+        .iter()
+        .enumerate()
+        .filter(|(_, (addrs, w))| *w > 0 && !addrs.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+
+    let has_addrs = !surviving.is_empty();
+    // The endpoint-derived status the server omitted (keyed group, no routable
+    // address). A literal/backend-less group leaves this None; any baked
+    // endpoint-independent status wins at build_route_entry.
+    let empty_status = (has_keyed_ref && !has_addrs).then(|| empty_group_status(has_valid_empty));
+
+    // Build per-backend filters aligned to the SURVIVING backends (sparse input
+    // is keyed by original weighted index).
     let per_backend_filters: Option<Vec<Vec<FilterAction>>> = if dto.per_backend_filters.is_empty()
     {
         None
     } else {
-        let mut slots: Vec<Vec<FilterAction>> = vec![vec![]; pools.len()];
+        let mut by_orig: std::collections::HashMap<usize, Vec<FilterAction>> =
+            std::collections::HashMap::new();
         for entry in &dto.per_backend_filters {
-            let idx = entry.backend_index as usize;
-            if idx < slots.len() {
-                let filters: Vec<FilterAction> = entry
-                    .filters
-                    .iter()
-                    .map(|f| filter_from_wire(f, depth + 1))
-                    .collect::<Result<_, _>>()?;
-                slots[idx] = filters;
-            }
+            let filters: Vec<FilterAction> = entry
+                .filters
+                .iter()
+                .map(|f| filter_from_wire(f, depth + 1, pool))
+                .collect::<Result<_, _>>()?;
+            by_orig.insert(entry.backend_index as usize, filters);
         }
+        let slots: Vec<Vec<FilterAction>> = surviving
+            .iter()
+            .map(|&orig| by_orig.remove(&orig).unwrap_or_default())
+            .collect();
         Some(slots)
     };
+
+    let pools: Vec<(Vec<SocketAddr>, u16)> =
+        surviving.iter().map(|&i| resolved[i].clone()).collect();
 
     let protocol = protocol_from_wire(dto.protocol)?;
 
@@ -266,9 +425,7 @@ pub(crate) fn bg_from_wire(dto: &p::BackendGroup, depth: usize) -> Result<Backen
 
     let retry = dto.retry.as_ref().map(retry_from_wire).unwrap_or_default();
 
-    // weighted() accepts (addrs_ref, weight); we need to feed the pairs from the spec.
-    let pairs: Vec<(Vec<SocketAddr>, u16)> = pools;
-    let mut bg = BackendGroup::weighted(dto.name.clone(), pairs);
+    let mut bg = BackendGroup::weighted(dto.name.clone(), pools);
 
     bg = bg.with_protocol(protocol);
     if let Some(tls) = tls {
@@ -297,7 +454,10 @@ pub(crate) fn bg_from_wire(dto: &p::BackendGroup, depth: usize) -> Result<Backen
         bg = bg.with_session_affinity(Some(sa));
     }
 
-    Ok(bg)
+    Ok(MaterializedGroup {
+        group: bg,
+        empty_status,
+    })
 }
 
 pub(crate) fn upstream_tls_from_wire(dto: &p::UpstreamTls) -> Result<UpstreamTls, WireError> {
@@ -417,7 +577,11 @@ fn session_affinity_from_wire(dto: &p::SessionAffinity) -> Result<SessionAffinit
 // Filters: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
-fn filter_from_wire(dto: &p::FilterAction, depth: usize) -> Result<FilterAction, WireError> {
+fn filter_from_wire(
+    dto: &p::FilterAction,
+    depth: usize,
+    pool: &EndpointPool,
+) -> Result<FilterAction, WireError> {
     if depth > MAX_MIRROR_DEPTH {
         return Err(WireError::MirrorTooDeep {
             limit: MAX_MIRROR_DEPTH,
@@ -451,7 +615,7 @@ fn filter_from_wire(dto: &p::FilterAction, depth: usize) -> Result<FilterAction,
                 .ok_or(WireError::MissingRequiredField {
                     field: "MirrorFilter.backend",
                 })?;
-            let backend = Arc::new(bg_from_wire(bg_dto, depth + 1)?);
+            let backend = Arc::new(bg_from_wire(bg_dto, pool, depth + 1)?.group);
             let fraction = mirror_dto
                 .fraction
                 .as_ref()
@@ -839,7 +1003,7 @@ fn normalize_level_from_wire(v: i32) -> Result<NormalizeLevel, WireError> {
     }
 }
 
-fn protocol_from_wire(v: i32) -> Result<BackendProtocol, WireError> {
+pub(crate) fn protocol_from_wire(v: i32) -> Result<BackendProtocol, WireError> {
     match p::BackendProtocol::try_from(v).unwrap_or(p::BackendProtocol::Unspecified) {
         p::BackendProtocol::Unspecified | p::BackendProtocol::Http1 => Ok(BackendProtocol::Http1),
         p::BackendProtocol::H2c => Ok(BackendProtocol::H2c),
@@ -854,15 +1018,16 @@ fn protocol_from_wire(v: i32) -> Result<BackendProtocol, WireError> {
 /// Returns [`WireError`] if any backend group fails to decode (bad address,
 /// missing required field, etc.).
 #[must_use = "the rebuilt passthrough table must be stored for the proxy to use it"]
-pub fn passthrough_from_wire(
+pub(crate) fn passthrough_from_wire(
     dto: &p::TlsPassthroughTable,
+    pool: &EndpointPool,
 ) -> Result<TlsPassthroughTable, WireError> {
     let mut builder = TlsPassthroughTableBuilder::new();
     for port_entry in &dto.ports {
         let port = port_entry.port as u16;
         for entry in &port_entry.entries {
             let bg = match &entry.backend_group {
-                Some(bg) => Arc::new(bg_from_wire(bg, 0)?),
+                Some(bg) => Arc::new(bg_from_wire(bg, pool, 0)?.group),
                 None => continue,
             };
             let pattern = match &entry.pattern {
@@ -886,12 +1051,15 @@ pub fn passthrough_from_wire(
 /// Returns [`WireError`] if any backend group fails to decode (bad address,
 /// missing required field, etc.).
 #[must_use = "the rebuilt TCP route table must be stored for the proxy to use it"]
-pub fn tcp_table_from_wire(dto: &p::TcpRouteTable) -> Result<TcpRouteTable, WireError> {
+pub(crate) fn tcp_table_from_wire(
+    dto: &p::TcpRouteTable,
+    pool: &EndpointPool,
+) -> Result<TcpRouteTable, WireError> {
     let mut builder = TcpRouteTableBuilder::new();
     for port_entry in &dto.ports {
         let port = port_entry.port as u16;
         let bg = match &port_entry.backend_group {
-            Some(bg) => Arc::new(bg_from_wire(bg, 0)?),
+            Some(bg) => Arc::new(bg_from_wire(bg, pool, 0)?.group),
             None => continue,
         };
         builder = builder.add_route(port, bg);
@@ -908,15 +1076,103 @@ pub fn tcp_table_from_wire(dto: &p::TcpRouteTable) -> Result<TcpRouteTable, Wire
 /// Returns [`WireError`] if any backend group fails to decode (malformed
 /// address, missing required field, etc.).
 #[must_use = "the rebuilt UDP route table must be stored for the proxy to use it"]
-pub fn udp_table_from_wire(dto: &p::UdpRouteTable) -> Result<UdpRouteTable, WireError> {
+pub(crate) fn udp_table_from_wire(
+    dto: &p::UdpRouteTable,
+    pool: &EndpointPool,
+) -> Result<UdpRouteTable, WireError> {
     let mut builder = UdpRouteTableBuilder::new();
     for port_entry in &dto.ports {
         let port = port_entry.port as u16;
         let bg = match &port_entry.backend_group {
-            Some(bg) => Arc::new(bg_from_wire(bg, 0)?),
+            Some(bg) => Arc::new(bg_from_wire(bg, pool, 0)?.group),
             None => continue,
         };
         builder = builder.add_route(port, bg);
     }
     Ok(builder.build())
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Resource-oriented world decode (#383)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The two L7 route tables decoded from a resource set.
+///
+/// Test-only oracle (#383): production decode is now partition-wise through
+/// [`build_route_table`] (routes) and cell-wise through the L4/TLS decoders
+/// (`crate::apply`). This whole-table variant survives only for the wire round-
+/// trip tests, which assert an encode→decode fixed point on the route tables; the
+/// coarse cells (TLS, client-cert, listener-status, L4) have their own direct
+/// per-cell round-trip tests and are intentionally not reassembled here.
+#[cfg(test)]
+pub(crate) struct DecodedWorld {
+    /// Ingress L7 routing table.
+    pub(crate) ingress: IngressRoutingTable,
+    /// Gateway API L7 routing table.
+    pub(crate) gateway: GatewayRoutingTable,
+}
+
+/// Decode the route-table half of a resource set into its two L7 tables (#383).
+///
+/// Builds the message's transient [`EndpointPool`] first (referential integrity:
+/// every ref must resolve against it), reshapes the flat `route_host` resources
+/// into per-table, per-port DTOs, and replays the whole-table decoders. A
+/// resource with no payload arm — a future variant this build cannot decode — is
+/// a protocol error per invariant 7; non-route resources are ignored (each has
+/// its own direct round-trip test).
+///
+/// Test-only oracle — see [`DecodedWorld`].
+///
+/// # Errors
+///
+/// Returns the first [`WireError`] from endpoint parsing, a dangling ref, an
+/// unkeyable route resource, or any field-level decode failure.
+#[cfg(test)]
+#[must_use = "the decoded route tables are the assertion target of the wire round-trip test"]
+pub(crate) fn decode_world(resources: &[p::Resource]) -> Result<DecodedWorld, WireError> {
+    let pool = endpoint_pool_from_resources(resources)?;
+
+    let mut ingress_ports: std::collections::BTreeMap<u16, Vec<p::HostEntry>> =
+        std::collections::BTreeMap::new();
+    let mut gateway_ports: std::collections::BTreeMap<u16, Vec<p::HostEntry>> =
+        std::collections::BTreeMap::new();
+
+    for resource in resources {
+        let payload = resource
+            .payload
+            .as_ref()
+            .ok_or(WireError::UnknownResourceKey {
+                reason: "resource carries no payload arm (unknown future variant)",
+            })?;
+        if let p::resource::Payload::RouteHost(rh) = payload {
+            let host = rh.host.clone().ok_or(WireError::UnknownResourceKey {
+                reason: "route_host resource missing its host bucket",
+            })?;
+            let port = rh.port as u16;
+            match p::RouteTableKind::try_from(rh.table).unwrap_or(p::RouteTableKind::Unspecified) {
+                p::RouteTableKind::Ingress => ingress_ports.entry(port).or_default().push(host),
+                p::RouteTableKind::Gateway => gateway_ports.entry(port).or_default().push(host),
+                p::RouteTableKind::Unspecified => {
+                    return Err(WireError::UnknownResourceKey {
+                        reason: "route_host resource has an unspecified table kind",
+                    });
+                }
+            }
+        }
+    }
+
+    let to_dto = |ports: std::collections::BTreeMap<u16, Vec<p::HostEntry>>| p::RoutingTable {
+        ports: ports
+            .into_iter()
+            .map(|(port, hosts)| p::PortEntry {
+                port: u32::from(port),
+                hosts,
+            })
+            .collect(),
+    };
+
+    Ok(DecodedWorld {
+        ingress: ingress_from_wire(&to_dto(ingress_ports), &pool)?,
+        gateway: gateway_from_wire(&to_dto(gateway_ports), &pool)?,
+    })
 }

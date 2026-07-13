@@ -105,6 +105,23 @@ pub fn port_tls_to_wire(store: &PortTlsStore) -> p::PortTlsStore {
     }
 }
 
+/// Emit one [`p::Resource::TlsPort`] per bind port of a [`PortTlsStore`] (#383).
+///
+/// Each port's terminate-cert store is its own resource, so a cert rotation on
+/// one Gateway's port re-sends only that port. Reuses [`tls_to_wire`] verbatim.
+#[must_use = "TLS resources must be folded into the materialized view"]
+pub(crate) fn port_tls_resources(store: &PortTlsStore) -> Vec<p::Resource> {
+    store
+        .ports_iter()
+        .map(|(port, s)| p::Resource {
+            payload: Some(p::resource::Payload::TlsPort(p::PortTlsEntry {
+                port: u32::from(port),
+                store: Some(tls_to_wire(s)),
+            })),
+        })
+        .collect()
+}
+
 /// Reconstruct a [`PortTlsStore`] from its wire DTO (#472).
 ///
 /// # Errors
@@ -166,33 +183,62 @@ pub fn client_cert_to_wire(store: &ClientCertStore) -> p::ClientCertStore {
 
     let mut entries: Vec<p::ClientCertEntry> = Vec::new();
     for (port, configs) in ports {
-        let mut host_entries: Vec<(String, Arc<ClientCertConfigState>)> = configs
-            .iter_exact()
-            .map(|(h, s)| (h.to_string(), Arc::clone(s)))
-            .chain(
-                configs
-                    .iter_wildcard()
-                    .map(|(suffix, s)| (format!("*.{suffix}"), Arc::clone(s))),
-            )
-            .collect();
-        host_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-        for (pattern, state) in host_entries {
-            entries.push(p::ClientCertEntry {
-                host_pattern: pattern,
-                state: Some(client_cert_state_to_wire(&state)),
-                port: u32::from(port),
-            });
-        }
-        if let Some(default) = configs.default_state() {
-            entries.push(p::ClientCertEntry {
-                host_pattern: String::new(),
-                state: Some(client_cert_state_to_wire(default)),
-                port: u32::from(port),
-            });
-        }
+        entries.extend(client_cert_port_entries(port, configs));
     }
 
     p::ClientCertStore { entries }
+}
+
+/// The per-port client-cert entries (sorted by host pattern, port default last),
+/// shared by the flat [`client_cert_to_wire`] and the per-port resource emitter.
+fn client_cert_port_entries(
+    port: u16,
+    configs: &coxswain_core::tls::HostClientCertConfigs,
+) -> Vec<p::ClientCertEntry> {
+    let mut host_entries: Vec<(String, Arc<ClientCertConfigState>)> = configs
+        .iter_exact()
+        .map(|(h, s)| (h.to_string(), Arc::clone(s)))
+        .chain(
+            configs
+                .iter_wildcard()
+                .map(|(suffix, s)| (format!("*.{suffix}"), Arc::clone(s))),
+        )
+        .collect();
+    host_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+    let mut entries: Vec<p::ClientCertEntry> = host_entries
+        .into_iter()
+        .map(|(pattern, state)| p::ClientCertEntry {
+            host_pattern: pattern,
+            state: Some(client_cert_state_to_wire(&state)),
+            port: u32::from(port),
+        })
+        .collect();
+    if let Some(default) = configs.default_state() {
+        entries.push(p::ClientCertEntry {
+            host_pattern: String::new(),
+            state: Some(client_cert_state_to_wire(default)),
+            port: u32::from(port),
+        });
+    }
+    entries
+}
+
+/// Emit one [`p::Resource::ClientCertPort`] per bind port of a
+/// [`ClientCertStore`] (#383). Each port's mTLS config set is its own resource.
+#[must_use = "client-cert resources must be folded into the materialized view"]
+pub(crate) fn client_cert_resources(store: &ClientCertStore) -> Vec<p::Resource> {
+    store
+        .iter_ports()
+        .map(|(port, configs)| p::Resource {
+            payload: Some(p::resource::Payload::ClientCertPort(
+                p::ClientCertPortResource {
+                    port: u32::from(port),
+                    entries: client_cert_port_entries(port, configs),
+                },
+            )),
+        })
+        .collect()
 }
 
 fn client_cert_state_to_wire(s: &ClientCertConfigState) -> p::ClientCertConfigState {

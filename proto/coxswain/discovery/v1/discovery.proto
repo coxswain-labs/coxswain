@@ -50,14 +50,14 @@ message ClientMessage {
     Subscribe subscribe = 1;
     Ack ack = 2;
     Nack nack = 3;
-    NodeStatus node_status = 4; // node telemetry (#531); additive, WIRE_VERSION stays 1
+    NodeStatus node_status = 4; // node telemetry (#531); additive (no WIRE_VERSION bump)
   }
 }
 
 // Declares the scope and protocol version this client speaks.
 message Subscribe {
   string node_id = 1; // stable identity of the subscribing proxy (pod UID or hostname)
-  uint32 wire_version = 2; // wire protocol version integer spoken by this client (WIRE_VERSION = 1)
+  uint32 wire_version = 2; // wire protocol version integer spoken by this client (WIRE_VERSION 2)
   Scope scope = 3; // requested scope; server dispatches snapshot by scope (WIRE_VERSION 2+)
 }
 
@@ -123,39 +123,111 @@ message ServerMessage {
   }
 }
 
-// Full state-of-the-world snapshot for the subscribed scope.
+// Resource-oriented state-of-the-world (or delta) snapshot for the subscribed
+// scope (WIRE_VERSION 2).
 //
-// Determinism discipline: every `repeated` field that was a map in the runtime
-// type is emitted sorted by key in `to_wire`.  No `map<>` anywhere — proto map
-// encoding order is not guaranteed and would break the content-hash oracle.
+// The world is a flat, order-independent set of per-resource DTOs (`resources`),
+// each addressed by a canonical key (`wire::resource::canonical_key`). A `full`
+// message carries the complete world with `removed_resources` empty; a delta
+// (`full = false`) carries only the upserted resources plus a tombstone key set.
+// Full = delta with replace-all semantics, so both share one decode/apply path.
+//
+// Determinism discipline: `resources` is emitted sorted by canonical key, and
+// every `repeated` field inside a resource that was a map in the runtime type is
+// emitted sorted by key. No `map<>` anywhere — proto map encoding order is not
+// guaranteed and would break the content-hash oracle.
 //
 // Field layout:
-//   identity  1–9   : version, nonce
-//   extensions 10–29: per-resource DTOs
-//   repeated  40+   : reserved for v0.6 delta streaming removes set
+//   identity   1–3  : version, nonce, full
+//   resources  4    : per-resource DTOs (sorted by canonical key)
+//   reserved   10–18: retired v1 whole-table fields
+//   removes    40   : tombstone canonical keys (sorted; delta only)
 message Snapshot {
   // identity
-  string version = 1; // content hash of this scope's DTO (sha256 hex)
+  string version = 1; // content hash of the POST-APPLY world (sha256 hex)
   bytes nonce = 2;
-  // nested DTO extensions
-  RoutingTable ingress_routing = 10;
-  RoutingTable gateway_routing = 11;
-  // Per-port (#472): keyed by the bind port the proxy accepts HTTPS on, so each
-  // shared-mode Gateway's terminate certs are isolated to its own internal port.
-  PortTlsStore tls_store = 12;
-  ClientCertStore client_cert_store = 13;
-  GatewayListenerStatus listener_status = 14;
-  TlsPassthroughTable tls_passthrough = 15;
-  // TLSRouteModeTerminate (#481): SNI→plaintext-backend table; proxy terminates TLS
-  // on accept and L4-splices the decrypted stream. Reuses TlsPassthroughTable message.
-  TlsPassthroughTable tls_terminate = 16;
-  // TCPRoute (#505): port→backend table, no SNI/hostname dimension.
-  TcpRouteTable tcp_proxy = 17;
-  // UDPRoute (#506): port→backend table, no SNI/hostname dimension.
-  UdpRouteTable udp_proxy = 18;
-  // repeated (reserved for v0.6 delta streaming)
-  reserved 40;
-  reserved "removed_resources";
+  // true: complete world, `removed_resources` empty. false: delta.
+  bool full = 3;
+  // Per-resource DTOs, sorted by canonical key.
+  repeated Resource resources = 4;
+  // Retired v1 whole-table fields — one message per whole table. Superseded by
+  // the resource-oriented `resources` set above; never reuse these tags/names.
+  reserved 10 to 18;
+  reserved "ingress_routing", "gateway_routing", "tls_store", "client_cert_store",
+           "listener_status", "tls_passthrough", "tls_terminate", "tcp_proxy",
+           "udp_proxy";
+  // Canonical keys of resources removed since the last acked baseline (delta
+  // only; empty on a full). Sorted for hash determinism.
+  repeated string removed_resources = 40;
+}
+
+// One addressable slice of the routing world. Exactly one payload arm is set;
+// the arm both names the resource kind and carries its DTO. The canonical key
+// (`wire::resource::canonical_key`) is derived from the arm + its identity
+// fields and is NOT carried on the wire (the server owns the acked-key map).
+//
+// Field layout: the payload oneof tags mirror the retired Snapshot whole-table
+// tags (10, 12–18) plus the new EDS endpoint resource (19), so the wire reads as
+// "the same tables, now one resource at a time".
+message Resource {
+  oneof payload {
+    RouteHostResource route_host = 10;         // (table, port, host) — one HostEntry
+    PortTlsEntry tls_port = 12;                 // one bind port's terminate cert store
+    ClientCertPortResource client_cert_port = 13; // one bind port's mTLS config set
+    GatewayStatusEntry listener_status = 14;   // one Gateway's listener status
+    TlsPassthroughPort tls_passthrough_port = 15; // one port's SNI→backend table
+    TlsPassthroughPort tls_terminate_port = 16;   // one port's SNI→backend table (#481)
+    TcpRoutePort tcp_port = 17;                 // one port's TCP backend (#505)
+    UdpRoutePort udp_port = 18;                 // one port's UDP backend (#506)
+    EndpointResource endpoints = 19;            // EDS-style (ns, svc, port) endpoints
+  }
+}
+
+// Which L7 routing table a RouteHostResource belongs to. Ingress and Gateway
+// tables are keyed on the same (port, host) space but stay separate resources.
+enum RouteTableKind {
+  ROUTE_TABLE_KIND_UNSPECIFIED = 0;
+  ROUTE_TABLE_KIND_INGRESS = 1;
+  ROUTE_TABLE_KIND_GATEWAY = 2;
+}
+
+// One (table, port, host) routing bucket — a single HostEntry lifted out of the
+// v1 RoutingTable/PortEntry nesting so endpoint churn re-sends only the affected
+// host, not the whole table.
+message RouteHostResource {
+  RouteTableKind table = 1;
+  uint32 port = 2;      // u16 bind port
+  HostEntry host = 3;   // the per-host bucket (exact/wildcard/catchall + routes)
+}
+
+// One bind port's worth of client-cert (mTLS) config, lifted out of the v1
+// flat ClientCertStore so each port is its own resource. `entries` carry the
+// host_pattern + state; each entry's `port` field is redundant with `port` here
+// and is ignored on decode.
+message ClientCertPortResource {
+  uint32 port = 1;                     // u16 bind port
+  repeated ClientCertEntry entries = 2; // sorted by host pattern; default (empty pattern) last
+}
+
+// EDS-style endpoint resource keyed by (namespace, service, port). Endpoint
+// churn (rolling deploys) rewrites only this resource; the routes referencing it
+// via `WeightedBackend.endpoint_ref` are untouched. A resource with zero addrs
+// and `service_exists = true` is meaningful (a scaled-to-zero Service → 503).
+message EndpointResource {
+  string namespace = 1;
+  string service = 2;
+  uint32 port = 3;                   // u16 Service port
+  BackendProtocol app_protocol = 4;  // parsed from Service.spec.ports[].appProtocol
+  bool service_exists = 5;           // Service present in the cluster
+  repeated string addrs = 40;        // ready pod "ip:port", sorted
+}
+
+// A reference from a WeightedBackend to an EndpointResource. Resolved against
+// the message's endpoint pool at decode time; a dangling ref is a protocol error.
+message EndpointRef {
+  string namespace = 1;
+  string service = 2;
+  uint32 port = 3; // u16 Service port
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -283,10 +355,20 @@ message BackendGroup {
   repeated PerBackendFiltersEntry per_backend_filters = 41; // index-aligned with `weighted`; sorted by index
 }
 
-// One weighted backend: its pod addresses and its weight before GCD reduction.
+// One weighted backend: its pod addresses (or an endpoint reference) and its
+// weight before GCD reduction.
+//
+// Resolution (see `wire::routing::decode::bg_from_wire`):
+//   endpoint_ref set → `addrs` empty; resolve pods via the message endpoint pool
+//     (a dangling ref is a protocol error → Nack).
+//   endpoint_ref absent + `addrs` non-empty → literal addresses (pre-#383 form).
+//   endpoint_ref absent + `addrs` empty → structurally-invalid entry (weight
+//     preserved, no pods) — retained so the group's zero-weight/empty status is
+//     reproduced client-side.
 message WeightedBackend {
-  repeated string addrs = 1; // "ip:port" strings, sorted
+  repeated string addrs = 1; // "ip:port" strings, sorted (literal form only)
   uint32 weight = 2; // original pre-GCD weight
+  EndpointRef endpoint_ref = 3; // EDS reference; when set, `addrs` is empty
 }
 
 // Per-backend filter list slot.  Index identifies which WeightedBackend

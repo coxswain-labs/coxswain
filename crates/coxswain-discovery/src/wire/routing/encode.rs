@@ -4,9 +4,11 @@
 //! message in deterministic canonical order; see the [`super`] module header for
 //! the full determinism and ordering contract.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use coxswain_core::endpoints::{EndpointKey, ResolvedEndpoints};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, CircuitBreakerConfig, CompressionConfig, CorsConfig, CorsOrigin,
     ExtAuthTransport, FilterAction, ForwardedForConfig, GatewayRoutingTable, HashSource, HeaderMod,
@@ -19,35 +21,116 @@ use coxswain_core::routing::{
 use crate::proto::v1 as p;
 
 // ────────────────────────────────────────────────────────────────────────────
-// Routing table: to_wire
+// Endpoint collector (#383)
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Serialise an [`IngressRoutingTable`] to its wire DTO.
-#[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn ingress_to_wire(t: &IngressRoutingTable) -> p::RoutingTable {
-    routing_table_to_wire(t)
+/// Accumulates the EDS-style endpoint resources referenced while encoding a
+/// scope's routing tables (#383).
+///
+/// Every keyed [`BackendGroup`] backend emits an `endpoint_ref` on the wire and
+/// records its `(EndpointKey → ResolvedEndpoints)` here. First occurrence wins:
+/// if two routes reference the same `(namespace, service, port)` with transiently
+/// disagreeing resolutions (a rebuild caught mid-flight), the first-encoded value
+/// is authoritative for this snapshot — the next rebuild re-materialises both
+/// consistently. The collector emits exactly one [`p::EndpointResource`] per key.
+pub(crate) struct EndpointCollector {
+    map: HashMap<EndpointKey, Arc<ResolvedEndpoints>>,
 }
 
-/// Serialise a [`GatewayRoutingTable`] to its wire DTO.
-#[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn gateway_to_wire(t: &GatewayRoutingTable) -> p::RoutingTable {
-    routing_table_to_wire(t)
-}
+impl EndpointCollector {
+    /// Create an empty collector.
+    pub(crate) fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
 
-fn routing_table_to_wire<Kind>(t: &coxswain_core::routing::RoutingTable<Kind>) -> p::RoutingTable {
-    let mut ports: Vec<(u16, &PortRoutingTable)> = t.ports().collect();
-    ports.sort_by_key(|(p, _)| *p);
+    /// Record a referenced endpoint resource, first-occurrence-wins.
+    fn record(&mut self, key: &EndpointKey, resolved: &Arc<ResolvedEndpoints>) {
+        self.map
+            .entry(key.clone())
+            .or_insert_with(|| Arc::clone(resolved));
+    }
 
-    p::RoutingTable {
-        ports: ports
+    /// Emit one [`p::Resource`] per referenced endpoint key.
+    ///
+    /// Addresses are stringified and sorted for hash determinism. The caller
+    /// folds these into the materialized view alongside the route/TLS/L4
+    /// resources; ordering here is irrelevant (the view re-keys by canonical key).
+    pub(crate) fn into_resources(self) -> Vec<p::Resource> {
+        self.map
             .into_iter()
-            .map(|(port, pt)| port_entry_to_wire(port, pt))
-            .collect(),
+            .map(|(key, resolved)| {
+                let mut addrs: Vec<String> = resolved.addrs.iter().map(|a| a.to_string()).collect();
+                addrs.sort_unstable();
+                p::Resource {
+                    payload: Some(p::resource::Payload::Endpoints(p::EndpointResource {
+                        namespace: key.namespace.to_string(),
+                        service: key.service.to_string(),
+                        port: u32::from(key.port),
+                        app_protocol: protocol_to_wire(resolved.app_protocol) as i32,
+                        service_exists: resolved.service_exists,
+                        addrs,
+                    })),
+                }
+            })
+            .collect()
     }
 }
 
-fn port_entry_to_wire(port: u16, pt: &PortRoutingTable) -> p::PortEntry {
-    // Collect host views in canonical order: exact (sorted), wildcard (sorted by suffix), catchall.
+// ────────────────────────────────────────────────────────────────────────────
+// Routing table: per-resource emitters (#383)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Emit one [`p::Resource::RouteHost`] per `(table, port, host)` bucket of an
+/// [`IngressRoutingTable`], recording referenced endpoints into `endpoints`.
+#[must_use = "route-host resources must be folded into the materialized view"]
+pub(crate) fn ingress_route_resources(
+    t: &IngressRoutingTable,
+    endpoints: &mut EndpointCollector,
+) -> Vec<p::Resource> {
+    route_resources(t, p::RouteTableKind::Ingress, endpoints)
+}
+
+/// Emit one [`p::Resource::RouteHost`] per `(table, port, host)` bucket of a
+/// [`GatewayRoutingTable`], recording referenced endpoints into `endpoints`.
+#[must_use = "route-host resources must be folded into the materialized view"]
+pub(crate) fn gateway_route_resources(
+    t: &GatewayRoutingTable,
+    endpoints: &mut EndpointCollector,
+) -> Vec<p::Resource> {
+    route_resources(t, p::RouteTableKind::Gateway, endpoints)
+}
+
+fn route_resources<Kind>(
+    t: &coxswain_core::routing::RoutingTable<Kind>,
+    table: p::RouteTableKind,
+    endpoints: &mut EndpointCollector,
+) -> Vec<p::Resource> {
+    let mut ports: Vec<(u16, &PortRoutingTable)> = t.ports().collect();
+    ports.sort_by_key(|(p, _)| *p);
+
+    let mut out = Vec::new();
+    for (port, pt) in ports {
+        for host in port_host_entries(pt, endpoints) {
+            out.push(p::Resource {
+                payload: Some(p::resource::Payload::RouteHost(p::RouteHostResource {
+                    table: table as i32,
+                    port: u32::from(port),
+                    host: Some(host),
+                })),
+            });
+        }
+    }
+    out
+}
+
+/// Serialise every host bucket of one port in canonical order (exact sorted,
+/// wildcard sorted by suffix, catchall last), reusing [`host_entry_to_wire`].
+fn port_host_entries(
+    pt: &PortRoutingTable,
+    endpoints: &mut EndpointCollector,
+) -> Vec<p::HostEntry> {
     let mut exact_entries: Vec<(&str, &HostRouter)> = Vec::new();
     let mut wildcard_entries: Vec<(&str, WildcardKind, &HostRouter)> = Vec::new();
     let mut catchall_entry: Option<&HostRouter> = None;
@@ -68,6 +151,7 @@ fn port_entry_to_wire(port: u16, pt: &PortRoutingTable) -> p::PortEntry {
         hosts.push(host_entry_to_wire(
             p::host_entry::Pattern::Exact(hostname.to_string()),
             router,
+            endpoints,
         ));
     }
     for (suffix, kind, router) in wildcard_entries {
@@ -77,25 +161,27 @@ fn port_entry_to_wire(port: u16, pt: &PortRoutingTable) -> p::PortEntry {
                 kind: wildcard_kind_to_wire(kind) as i32,
             }),
             router,
+            endpoints,
         ));
     }
     if let Some(router) = catchall_entry {
         hosts.push(host_entry_to_wire(
             p::host_entry::Pattern::Catchall(true),
             router,
+            endpoints,
         ));
     }
-
-    p::PortEntry {
-        port: u32::from(port),
-        hosts,
-    }
+    hosts
 }
 
-fn host_entry_to_wire(pattern: p::host_entry::Pattern, router: &HostRouter) -> p::HostEntry {
+fn host_entry_to_wire(
+    pattern: p::host_entry::Pattern,
+    router: &HostRouter,
+    endpoints: &mut EndpointCollector,
+) -> p::HostEntry {
     let routes: Vec<p::RouteEntry> = router
         .wire_entries()
-        .map(|(path, kind, entry)| route_entry_to_wire(path, kind, entry))
+        .map(|(path, kind, entry)| route_entry_to_wire(path, kind, entry, endpoints))
         .collect();
 
     p::HostEntry {
@@ -105,7 +191,12 @@ fn host_entry_to_wire(pattern: p::host_entry::Pattern, router: &HostRouter) -> p
     }
 }
 
-fn route_entry_to_wire(path: &str, kind: RouteKind, e: &RouteEntry) -> p::RouteEntry {
+fn route_entry_to_wire(
+    path: &str,
+    kind: RouteKind,
+    e: &RouteEntry,
+    endpoints: &mut EndpointCollector,
+) -> p::RouteEntry {
     let mut allow_source_range: Vec<String> = e
         .allow_source_range
         .as_deref()
@@ -120,12 +211,26 @@ fn route_entry_to_wire(path: &str, kind: RouteKind, e: &RouteEntry) -> p::RouteE
         .unwrap_or_default();
     deny_source_range.sort_unstable();
 
+    // #383 provenance split: endpoint-derived statuses (503 valid-but-empty /
+    // 500 missing-Service) are omitted from the wire — the client re-derives them
+    // from its endpoint pool, so endpoint drain never rewrites this route's hash.
+    // Endpoint-independent statuses (e.g. a 502 fail-closed) stay baked.
+    let error_status = if e.error_status_endpoint_derived {
+        None
+    } else {
+        e.error_status.map(u32::from)
+    };
+
     p::RouteEntry {
         kind: route_kind_to_wire(kind) as i32,
         path: path.to_string(),
-        backend_group: Some(backend_group_to_wire(&e.backend_group, 0)),
+        backend_group: Some(backend_group_to_wire(&e.backend_group, 0, endpoints)),
         predicates: Some(predicates_to_wire(&e.predicates)),
-        filters: e.filters.iter().map(|f| filter_to_wire(f, 0)).collect(),
+        filters: e
+            .filters
+            .iter()
+            .map(|f| filter_to_wire(f, 0, endpoints))
+            .collect(),
         timeouts: Some(timeouts_to_wire(&e.timeouts)),
         route_id: e.route_id.clone(),
         metric_route_id: e.metric_route_id.to_string(),
@@ -135,7 +240,7 @@ fn route_entry_to_wire(path: &str, kind: RouteKind, e: &RouteEntry) -> p::RouteE
                 .ok()
                 .map(|d| d.as_millis() as u64)
         }),
-        error_status: e.error_status.map(u32::from),
+        error_status,
         max_body_size: e.max_body_size,
         allow_source_range,
         deny_source_range,
@@ -152,22 +257,65 @@ fn route_entry_to_wire(path: &str, kind: RouteKind, e: &RouteEntry) -> p::RouteE
 // BackendGroup
 // ────────────────────────────────────────────────────────────────────────────
 
-fn backend_group_to_wire(bg: &BackendGroup, depth: usize) -> p::BackendGroup {
+fn backend_group_to_wire(
+    bg: &BackendGroup,
+    depth: usize,
+    endpoints: &mut EndpointCollector,
+) -> p::BackendGroup {
     let spec = bg.spec();
     let weighted: Vec<p::WeightedBackend> = spec
         .weighted
         .iter()
-        .map(|(addrs, weight)| {
-            let mut addr_strs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
-            addr_strs.sort_unstable();
-            p::WeightedBackend {
-                addrs: addr_strs,
-                weight: u32::from(*weight),
+        .map(|wb| match &wb.key {
+            // #383 keyed ref: emit an `endpoint_ref` (no addrs) and record the
+            // referenced resource so the server ships it in the same message.
+            // Endpoint drain therefore rewrites only the endpoint resource, never
+            // this route's bytes. Retained even when addrs is empty — a
+            // scaled-to-zero Service still needs its ref on the wire.
+            Some(key) => {
+                endpoints.record(key, &wb.resolved);
+                p::WeightedBackend {
+                    addrs: Vec::new(),
+                    weight: u32::from(wb.weight),
+                    endpoint_ref: Some(p::EndpointRef {
+                        namespace: key.namespace.to_string(),
+                        service: key.service.to_string(),
+                        port: u32::from(key.port),
+                    }),
+                }
+            }
+            // Literal ref (pre-#383 constructors): inline the sorted addresses.
+            None => {
+                let mut addr_strs: Vec<String> =
+                    wb.resolved.addrs.iter().map(|a| a.to_string()).collect();
+                addr_strs.sort_unstable();
+                p::WeightedBackend {
+                    addrs: addr_strs,
+                    weight: u32::from(wb.weight),
+                    endpoint_ref: None,
+                }
             }
         })
         .collect();
 
-    // Per-backend filters: emit only slots with non-empty filters, indexed by position.
+    // Map pool position → spec position. `per_backend_filters()` is pool-aligned
+    // (one slot per address-bearing backend that entered the hot-path pools), but
+    // the wire contract keys each entry by its index in `weighted` — the
+    // SPEC-aligned list, which retains keyed-empty (drained) refs the pools drop.
+    // The i-th pool backend is the i-th spec entry that resolved at least one
+    // address (spec entries already carry `weight > 0`), mirroring `from_pools`'s
+    // pool construction and the decoder's `surviving` filter. Emitting the pool
+    // index verbatim would misalign every filter past a keyed-empty ref.
+    let pool_to_spec: Vec<u32> = spec
+        .weighted
+        .iter()
+        .enumerate()
+        .filter(|(_, wb)| !wb.resolved.addrs.is_empty())
+        .map(|(spec_idx, _)| spec_idx as u32)
+        .collect();
+
+    // Per-backend filters: emit only slots with non-empty filters, keyed by the
+    // backend's SPEC index (index-aligned with `weighted`).
     let per_backend_filters: Vec<p::PerBackendFiltersEntry> = bg
         .per_backend_filters()
         .unwrap_or(&[])
@@ -175,8 +323,11 @@ fn backend_group_to_wire(bg: &BackendGroup, depth: usize) -> p::BackendGroup {
         .enumerate()
         .filter_map(|(i, slot)| {
             slot.as_ref().map(|filters| p::PerBackendFiltersEntry {
-                backend_index: i as u32,
-                filters: filters.iter().map(|f| filter_to_wire(f, depth)).collect(),
+                backend_index: pool_to_spec.get(i).copied().unwrap_or(i as u32),
+                filters: filters
+                    .iter()
+                    .map(|f| filter_to_wire(f, depth, endpoints))
+                    .collect(),
             })
         })
         .collect();
@@ -306,7 +457,11 @@ fn session_affinity_to_wire(sa: &SessionAffinity) -> p::SessionAffinity {
 // Filters
 // ────────────────────────────────────────────────────────────────────────────
 
-fn filter_to_wire(f: &FilterAction, depth: usize) -> p::FilterAction {
+fn filter_to_wire(
+    f: &FilterAction,
+    depth: usize,
+    endpoints: &mut EndpointCollector,
+) -> p::FilterAction {
     let action = match f {
         FilterAction::RequestHeaderModifier(hm) => {
             p::filter_action::Action::RequestHeaderModifier(header_mod_to_wire(hm))
@@ -338,7 +493,11 @@ fn filter_to_wire(f: &FilterAction, depth: usize) -> p::FilterAction {
             // only reachable if the runtime type was built with malformed data
             // (defensive guard; from_wire is the primary enforcement site).
             p::filter_action::Action::Mirror(p::MirrorFilter {
-                backend: Some(backend_group_to_wire(backend, depth.saturating_add(1))),
+                backend: Some(backend_group_to_wire(
+                    backend,
+                    depth.saturating_add(1),
+                    endpoints,
+                )),
                 fraction: fraction.map(|f| {
                     let (numerator, denominator) = f.as_parts();
                     p::MirrorFractionProto {
@@ -691,89 +850,191 @@ fn cors_config_to_wire(cfg: &CorsConfig) -> p::CorsFilter {
 // TLS passthrough table
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Encode a [`TlsPassthroughTable`] as a protobuf DTO.
+/// Serialise one port of a [`TlsPassthroughTable`] into a [`p::TlsPassthroughPort`].
 ///
-/// Ports are emitted in ascending order for content-hash stability.
-/// Within each port, exact entries come first (sorted), then wildcard entries
+/// Within the port, exact entries come first (sorted), then wildcard entries
 /// (sorted by suffix), then the catch-all if present.
-#[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn passthrough_to_wire(t: &TlsPassthroughTable) -> p::TlsPassthroughTable {
-    let mut ports: Vec<p::TlsPassthroughPort> = t
-        .ports_iter()
+fn passthrough_port_to_wire(
+    port: u16,
+    router: &coxswain_core::routing::SniRouter,
+    endpoints: &mut EndpointCollector,
+) -> p::TlsPassthroughPort {
+    let mut exact_entries: Vec<(&str, &Arc<BackendGroup>)> = router.exact_iter().collect();
+    exact_entries.sort_by_key(|(sni, _)| *sni);
+
+    let mut wildcard_entries: Vec<(&str, &Arc<BackendGroup>)> = router.wildcard_iter().collect();
+    wildcard_entries.sort_by_key(|(suffix, _)| *suffix);
+
+    let mut entries: Vec<p::TlsPassthroughEntry> = Vec::new();
+    for (sni, bg) in exact_entries {
+        entries.push(p::TlsPassthroughEntry {
+            pattern: Some(p::tls_passthrough_entry::Pattern::Exact(sni.to_string())),
+            backend_group: Some(backend_group_to_wire(bg, 0, endpoints)),
+        });
+    }
+    for (suffix, bg) in wildcard_entries {
+        entries.push(p::TlsPassthroughEntry {
+            pattern: Some(p::tls_passthrough_entry::Pattern::WildcardSuffix(
+                suffix.to_string(),
+            )),
+            backend_group: Some(backend_group_to_wire(bg, 0, endpoints)),
+        });
+    }
+    if let Some(bg) = router.catchall() {
+        entries.push(p::TlsPassthroughEntry {
+            pattern: Some(p::tls_passthrough_entry::Pattern::Catchall(true)),
+            backend_group: Some(backend_group_to_wire(bg, 0, endpoints)),
+        });
+    }
+
+    p::TlsPassthroughPort {
+        port: u32::from(port),
+        entries,
+    }
+}
+
+/// Emit one [`p::Resource`] per port of a [`TlsPassthroughTable`].
+///
+/// `terminate` selects the [`p::resource::Payload::TlsTerminatePort`] arm (#481)
+/// vs the [`p::resource::Payload::TlsPassthroughPort`] arm (#70); the two tables
+/// share this message shape but stay distinct resources on the wire.
+#[must_use = "passthrough resources must be folded into the materialized view"]
+pub(crate) fn passthrough_resources(
+    t: &TlsPassthroughTable,
+    terminate: bool,
+    endpoints: &mut EndpointCollector,
+) -> Vec<p::Resource> {
+    t.ports_iter()
         .map(|(port, router)| {
-            let mut exact_entries: Vec<(&str, &Arc<BackendGroup>)> = router.exact_iter().collect();
-            exact_entries.sort_by_key(|(sni, _)| *sni);
-
-            let mut wildcard_entries: Vec<(&str, &Arc<BackendGroup>)> =
-                router.wildcard_iter().collect();
-            wildcard_entries.sort_by_key(|(suffix, _)| *suffix);
-
-            let mut entries: Vec<p::TlsPassthroughEntry> = Vec::new();
-
-            for (sni, bg) in exact_entries {
-                entries.push(p::TlsPassthroughEntry {
-                    pattern: Some(p::tls_passthrough_entry::Pattern::Exact(sni.to_string())),
-                    backend_group: Some(backend_group_to_wire(bg, 0)),
-                });
+            let dto = passthrough_port_to_wire(port, router, endpoints);
+            let payload = if terminate {
+                p::resource::Payload::TlsTerminatePort(dto)
+            } else {
+                p::resource::Payload::TlsPassthroughPort(dto)
+            };
+            p::Resource {
+                payload: Some(payload),
             }
-            for (suffix, bg) in wildcard_entries {
-                entries.push(p::TlsPassthroughEntry {
-                    pattern: Some(p::tls_passthrough_entry::Pattern::WildcardSuffix(
-                        suffix.to_string(),
-                    )),
-                    backend_group: Some(backend_group_to_wire(bg, 0)),
-                });
-            }
-            if let Some(bg) = router.catchall() {
-                entries.push(p::TlsPassthroughEntry {
-                    pattern: Some(p::tls_passthrough_entry::Pattern::Catchall(true)),
-                    backend_group: Some(backend_group_to_wire(bg, 0)),
-                });
-            }
+        })
+        .collect()
+}
 
-            p::TlsPassthroughPort {
+/// Emit one [`p::Resource::TcpPort`] per port of a [`TcpRouteTable`] (#505).
+#[must_use = "tcp resources must be folded into the materialized view"]
+pub(crate) fn tcp_resources(
+    t: &TcpRouteTable,
+    endpoints: &mut EndpointCollector,
+) -> Vec<p::Resource> {
+    t.ports_iter()
+        .map(|(port, bg)| p::Resource {
+            payload: Some(p::resource::Payload::TcpPort(p::TcpRoutePort {
                 port: u32::from(port),
-                entries,
-            }
+                backend_group: Some(backend_group_to_wire(bg, 0, endpoints)),
+            })),
         })
-        .collect();
-    ports.sort_by_key(|e| e.port);
-    p::TlsPassthroughTable { ports }
+        .collect()
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// TCP route table (#505)
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Encode a [`TcpRouteTable`] as a protobuf DTO.
-///
-/// Ports are emitted in ascending order for content-hash stability. No SNI
-/// dimension — each port carries exactly one backend group.
-#[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn tcp_table_to_wire(t: &TcpRouteTable) -> p::TcpRouteTable {
-    let mut ports: Vec<p::TcpRoutePort> = t
-        .ports_iter()
-        .map(|(port, bg)| p::TcpRoutePort {
-            port: u32::from(port),
-            backend_group: Some(backend_group_to_wire(bg, 0)),
+/// Emit one [`p::Resource::UdpPort`] per port of a [`UdpRouteTable`] (#506).
+#[must_use = "udp resources must be folded into the materialized view"]
+pub(crate) fn udp_resources(
+    t: &UdpRouteTable,
+    endpoints: &mut EndpointCollector,
+) -> Vec<p::Resource> {
+    t.ports_iter()
+        .map(|(port, bg)| p::Resource {
+            payload: Some(p::resource::Payload::UdpPort(p::UdpRoutePort {
+                port: u32::from(port),
+                backend_group: Some(backend_group_to_wire(bg, 0, endpoints)),
+            })),
         })
-        .collect();
-    ports.sort_by_key(|e| e.port);
-    p::TcpRouteTable { ports }
+        .collect()
 }
 
-/// Serialise a [`UdpRouteTable`] to its wire DTO (UDPRoute, GEP-2645, #506).
-///
-/// Same shape as [`tcp_table_to_wire`] — port-keyed, no SNI dimension.
-#[must_use = "wire DTO must be embedded in a Snapshot to reach the proxy"]
-pub fn udp_table_to_wire(t: &UdpRouteTable) -> p::UdpRouteTable {
-    let mut ports: Vec<p::UdpRoutePort> = t
-        .ports_iter()
-        .map(|(port, bg)| p::UdpRoutePort {
-            port: u32::from(port),
-            backend_group: Some(backend_group_to_wire(bg, 0)),
-        })
-        .collect();
-    ports.sort_by_key(|e| e.port);
-    p::UdpRouteTable { ports }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coxswain_core::endpoints::{EndpointKey, ResolvedEndpoints};
+    use std::net::SocketAddr;
+
+    fn resolved(addrs: &[&str]) -> Arc<ResolvedEndpoints> {
+        let parsed: Vec<SocketAddr> = addrs
+            .iter()
+            .map(|a| a.parse().expect("valid addr"))
+            .collect();
+        let exists = !parsed.is_empty();
+        Arc::new(ResolvedEndpoints::new(
+            parsed,
+            BackendProtocol::default(),
+            exists,
+        ))
+    }
+
+    /// #383 resource-oriented wire: a keyed backend emits an `endpoint_ref` (no
+    /// inline addrs) and records the endpoint resource in the collector, so
+    /// endpoint churn re-sends only the endpoint resource. A keyed-empty ref (a
+    /// Service scaled to zero, `service_exists = true`) still emits its ref and
+    /// records a zero-addr EndpointResource — the meaningful-503 signal.
+    #[test]
+    fn keyed_backend_emits_ref_and_records_endpoint() {
+        let addr_bearing = resolved(&["10.0.0.1:80"]);
+        let addr_key = EndpointKey::new("default", "svc-a", 80);
+        // Present-but-empty Service: service_exists=true, zero addrs.
+        let drained = Arc::new(ResolvedEndpoints::new(
+            Vec::new(),
+            BackendProtocol::default(),
+            true,
+        ));
+        let drained_key = EndpointKey::new("default", "svc-b", 80);
+
+        let bg = BackendGroup::weighted_with_endpoints(
+            "default/svc".to_string(),
+            vec![
+                (addr_bearing, Some(addr_key), 1),
+                (drained, Some(drained_key), 1),
+            ],
+        );
+
+        let mut coll = EndpointCollector::new();
+        let dto = backend_group_to_wire(&bg, 0, &mut coll);
+
+        // Both backends emit an endpoint_ref and NO inline addrs.
+        assert_eq!(dto.weighted.len(), 2, "both keyed refs ride the wire");
+        for wb in &dto.weighted {
+            assert!(wb.endpoint_ref.is_some(), "keyed backend emits a ref");
+            assert!(wb.addrs.is_empty(), "keyed backend inlines no addrs");
+        }
+
+        // Two endpoint resources recorded, one of them zero-addr + service_exists.
+        let resources = coll.into_resources();
+        assert_eq!(resources.len(), 2, "one EndpointResource per keyed ref");
+        let drained_res = resources
+            .iter()
+            .find_map(|r| match r.payload.as_ref() {
+                Some(p::resource::Payload::Endpoints(e)) if e.service == "svc-b" => Some(e),
+                _ => None,
+            })
+            .expect("drained endpoint resource emitted");
+        assert!(drained_res.addrs.is_empty(), "scaled-to-zero has no addrs");
+        assert!(
+            drained_res.service_exists,
+            "a present-but-empty Service keeps service_exists (drives client 503)"
+        );
+    }
+
+    /// A literal-address backend (pre-#383 constructor, `key: None`) inlines its
+    /// sorted addresses and emits no ref, recording no endpoint resource.
+    #[test]
+    fn literal_backend_emits_addrs_no_ref() {
+        let bg = BackendGroup::new("ns/svc".to_string(), vec!["10.0.0.2:80".parse().unwrap()]);
+        let mut coll = EndpointCollector::new();
+        let dto = backend_group_to_wire(&bg, 0, &mut coll);
+        assert_eq!(dto.weighted.len(), 1);
+        assert!(dto.weighted[0].endpoint_ref.is_none(), "literal → no ref");
+        assert_eq!(dto.weighted[0].addrs, vec!["10.0.0.2:80".to_string()]);
+        assert!(
+            coll.into_resources().is_empty(),
+            "literal backends reference no endpoint resource"
+        );
+    }
 }

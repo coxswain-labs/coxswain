@@ -149,9 +149,86 @@ pub enum WireError {
 
     /// A path pattern string was rejected by the `matchit` router.
     ///
-    /// Returned by [`crate::wire::ingress_from_wire`] / [`crate::wire::gateway_from_wire`]
-    /// when a route path in the DTO contains characters or patterns that the router
-    /// cannot insert (e.g. conflicting parameter syntax).
+    /// Returned by [`crate::wire::build_route_table`] when a route path in the DTO
+    /// contains characters or patterns that the router cannot insert
+    /// (e.g. conflicting parameter syntax).
     #[error("invalid path pattern: {0}")]
     InvalidMatchitPath(String),
+
+    /// A `WeightedBackend.endpoint_ref` named an `EndpointResource` that is not
+    /// present in the message's endpoint pool (a dangling reference).
+    ///
+    /// Referential integrity is a protocol invariant (#383): the server ships
+    /// every newly-referenced endpoint resource in the same message. A miss means
+    /// the peer sent an inconsistent world — fail the whole decode closed (Nack +
+    /// last-good) rather than fabricating a `service_exists = false` group, which
+    /// would silently drop traffic.
+    #[error("dangling endpoint reference {namespace}/{service}/{port}")]
+    UnknownEndpointRef {
+        /// Referenced Service namespace.
+        namespace: String,
+        /// Referenced Service name.
+        service: String,
+        /// Referenced Service port, as it appeared on the wire.
+        ///
+        /// `u32` (the raw proto width, not the `u16` bind-port domain) so an
+        /// out-of-range ref (e.g. 65616) is reported verbatim instead of as its
+        /// truncated alias — the exact confusion this guard exists to prevent.
+        port: u32,
+    },
+
+    /// A delta (`Snapshot.full = false`) arrived before any full snapshot on this
+    /// stream.
+    ///
+    /// Protocol invariant (#383): the first message per stream is `full = true`.
+    /// A delta-first message means the client has no baseline to apply upserts
+    /// against — Nack so the server responds with a fresh full resync.
+    #[error("delta snapshot received before any full snapshot")]
+    DeltaBeforeFullSnapshot,
+
+    /// A `Resource` payload carried an arm or identity this build cannot key.
+    ///
+    /// Either the `payload` oneof was absent, or a `RouteHostResource` carried an
+    /// unspecified `table` / absent host pattern — a resource with no canonical
+    /// key cannot be placed in the world. Also raised when a delta's
+    /// `removed_resources` carries an unparsable canonical key, or when the same
+    /// canonical key appears in both the upsert and the tombstone set of one
+    /// delta (invariant 2: the two sets are disjoint). Fail the decode closed.
+    #[error("resource carries no decodable canonical key: {reason}")]
+    UnknownResourceKey {
+        /// Human-readable reason the resource could not be keyed.
+        reason: &'static str,
+    },
+
+    /// A delta tombstoned an `EndpointResource` still referenced by a resource
+    /// that survives the same delta (a backend `EndpointRef`, directly or through
+    /// a mirror filter).
+    ///
+    /// Referential integrity is a protocol invariant (#383): the server tombstones
+    /// an endpoint only in the same message that drops its last referrer. A
+    /// residual referrer means the peer sent an inconsistent world — fail the
+    /// whole delta closed (Nack + last-good) rather than commit a cache whose
+    /// reverse index points at a pool entry the apply just deleted, which the next
+    /// recompile of that referrer would then reject as a dangling reference.
+    #[error("removed endpoint {key} is still referenced after the delta")]
+    RemovedEndpointStillReferenced {
+        /// `namespace/service/port` of the still-referenced removed endpoint.
+        key: String,
+    },
+
+    /// The global version the client recomputed from its post-apply per-resource
+    /// digests did not match the `version` the server stamped on the message.
+    ///
+    /// The version is a content hash of the whole post-apply world (F6): the
+    /// client recomputes it independently and compares. A mismatch means the two
+    /// sides disagree on what the applied world is — a lost/duplicated resource,
+    /// a coalescing bug, or wire corruption. Nack so the server self-heals with a
+    /// fresh full resync rather than let the caches silently diverge.
+    #[error("snapshot version self-check failed: server={expected}, computed={computed}")]
+    VersionMismatch {
+        /// Global version the server stamped on the message.
+        expected: String,
+        /// Global version the client recomputed from the post-apply world.
+        computed: String,
+    },
 }

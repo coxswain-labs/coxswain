@@ -8,7 +8,6 @@
 //!
 //! [`Shared`]: coxswain_core::Shared
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use coxswain_core::health::SubsystemHandle;
@@ -17,9 +16,7 @@ use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
     SharedTlsPassthroughTable, SharedUdpRouteTable,
 };
-use coxswain_core::tls::{
-    ListenerHostnamesBuilder, SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore,
-};
+use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
@@ -27,6 +24,7 @@ use tracing::{debug, warn};
 
 use tokio::sync::watch;
 
+use crate::apply::{ResourceCache, SnapshotCells, apply_message};
 use crate::auth::{DiscoveryClientTls, SpiffeMatcher};
 use crate::error::DiscoveryError;
 use crate::proto::v1::{
@@ -36,10 +34,6 @@ use crate::proto::v1::{
 use crate::subscription::Scope;
 use crate::svid::SharedSvid;
 use crate::version::WIRE_VERSION;
-use crate::wire::{
-    client_cert_from_wire, gateway_from_wire, ingress_from_wire, listener_status_from_wire,
-    passthrough_from_wire, port_tls_from_wire, tcp_table_from_wire, udp_table_from_wire,
-};
 
 /// Configuration for the discovery gRPC client supervisor.
 ///
@@ -235,6 +229,7 @@ impl DiscoveryClient {
             health,
             health_check: health_check.to_owned(),
             has_snapshot: false,
+            cache: ResourceCache::new(),
         };
 
         let client = Self {
@@ -418,6 +413,10 @@ pub struct Supervisor {
     health: SubsystemHandle,
     health_check: String,
     has_snapshot: bool,
+    /// Materialized resource cache (#383). Lives here, outside the per-session
+    /// loop, so it persists across reconnects — the invariant is
+    /// `cache ≡ what the cells serve ≡ last Acked`.
+    cache: ResourceCache,
 }
 
 /// Opaque reconnect supervisor returned by [`DiscoveryClient::spawn`].
@@ -639,6 +638,12 @@ impl Supervisor {
 
         let mut applied_this_session = false;
         let mut ended_not_leader = false;
+        // Invariant 1: the first message of every session must be a full snapshot.
+        // Reset true per session (the server's per-stream acked baseline is not
+        // replica-portable across a reconnect); cleared after the first successful
+        // apply so subsequent deltas are accepted. The cache itself persists across
+        // sessions on `self`.
+        let mut expect_full = true;
 
         loop {
             let msg = tokio::select! {
@@ -698,29 +703,38 @@ impl Supervisor {
             let version = snapshot.version.clone();
             let nonce = snapshot.nonce.clone();
 
-            // #513: proxy-apply stage — decode every wire DTO and publish the
+            // #513/#383: proxy-apply stage — stage the wire resources into the
+            // materialized cache, compile the changed world, and publish the
             // routing cells. Timed regardless of outcome: a rejected (Nack'd)
-            // decode still pays most of this cost before failing.
+            // apply still pays most of this cost before failing. `expect_full`
+            // gates the first message of the session to a full snapshot
+            // (invariant 1); it is cleared below on the first successful apply.
             let apply_start = std::time::Instant::now();
-            let apply_result = apply_snapshot(
-                &snapshot,
-                SnapshotCells {
-                    ingress: &self.ingress,
-                    gateway: &self.gateway,
-                    tls: &self.tls,
-                    client_certs: &self.client_certs,
-                    status: &self.listener_status,
-                    listener_hostnames: &self.listener_hostnames,
-                    passthrough: &self.passthrough,
-                    terminate: &self.terminate,
-                    tcp: &self.tcp,
-                    udp: &self.udp,
-                },
-            );
+            let cells = SnapshotCells {
+                ingress: &self.ingress,
+                gateway: &self.gateway,
+                tls: &self.tls,
+                client_certs: &self.client_certs,
+                status: &self.listener_status,
+                listener_hostnames: &self.listener_hostnames,
+                passthrough: &self.passthrough,
+                terminate: &self.terminate,
+                tcp: &self.tcp,
+                udp: &self.udp,
+            };
+            let apply_result = apply_message(&mut self.cache, &snapshot, cells, expect_full);
             crate::metrics::snapshot_apply_seconds().observe(apply_start.elapsed().as_secs_f64());
             match apply_result {
-                Ok(()) => {
+                // `ApplyStats` (partition recompile/reuse tallies) is mirrored
+                // into the process metrics inside `apply_message`; the stream loop
+                // only needs Ack-vs-Nack, so the stats are not threaded further.
+                Ok(_stats) => {
                     debug!(version, "discovery snapshot applied; sending Ack");
+                    // Count the applied snapshot by kind (full|delta). A healthy
+                    // steady state climbs `delta` with a near-static `full`.
+                    crate::metrics::client_snapshots_applied_total()
+                        .with_label_values(&[if snapshot.full { "full" } else { "delta" }])
+                        .inc();
                     let ack = p::ClientMessage {
                         kind: Some(CKind::Ack(p::Ack { version, nonce })),
                     };
@@ -728,6 +742,9 @@ impl Supervisor {
                         debug!("discovery client: outbound channel closed after Ack");
                         break;
                     }
+                    // Invariant 1 satisfied for this session: subsequent messages
+                    // may be deltas.
+                    expect_full = false;
                     applied_this_session = true;
                     self.has_snapshot = true;
                     // Mark Ready on every applied snapshot, not just the first:
@@ -762,125 +779,6 @@ impl Supervisor {
             not_leader: ended_not_leader,
         }
     }
-}
-
-/// Write handles for all routing [`Shared`] cells that [`apply_snapshot`] updates.
-///
-/// Groups the seven cell references into one parameter so [`apply_snapshot`]
-/// stays within the workspace's 7-argument function limit.
-///
-/// [`Shared`]: coxswain_core::Shared
-struct SnapshotCells<'a> {
-    ingress: &'a SharedIngressRoutingTable,
-    gateway: &'a SharedGatewayRoutingTable,
-    tls: &'a SharedPortTlsStore,
-    client_certs: &'a SharedClientCertStore,
-    status: &'a SharedGatewayListenerStatus,
-    listener_hostnames: &'a SharedListenerHostnames,
-    passthrough: &'a SharedTlsPassthroughTable,
-    terminate: &'a SharedTlsPassthroughTable,
-    tcp: &'a SharedTcpRouteTable,
-    udp: &'a SharedUdpRouteTable,
-}
-
-/// Decode all routing cells from a snapshot DTO and atomically publish them.
-///
-/// All DTOs are decoded first; only on total success are the [`Shared`]
-/// cells updated, preventing a partial-failure from leaving cells inconsistent.
-///
-/// # Errors
-///
-/// Returns the first [`crate::WireError`] encountered during decoding; the
-/// caller sends a `Nack` and retains the last-good snapshot.
-///
-/// [`Shared`]: coxswain_core::Shared
-fn apply_snapshot(
-    snapshot: &p::Snapshot,
-    cells: SnapshotCells<'_>,
-) -> Result<(), crate::WireError> {
-    let ingress_table = ingress_from_wire(
-        snapshot
-            .ingress_routing
-            .as_ref()
-            .unwrap_or(&p::RoutingTable::default()),
-    )?;
-    let gateway_table = gateway_from_wire(
-        snapshot
-            .gateway_routing
-            .as_ref()
-            .unwrap_or(&p::RoutingTable::default()),
-    )?;
-    let tls_store = port_tls_from_wire(
-        snapshot
-            .tls_store
-            .as_ref()
-            .unwrap_or(&p::PortTlsStore::default()),
-    )?;
-    let client_cert_store = client_cert_from_wire(
-        snapshot
-            .client_cert_store
-            .as_ref()
-            .unwrap_or(&p::ClientCertStore::default()),
-    )?;
-    let listener_status_map = listener_status_from_wire(
-        snapshot
-            .listener_status
-            .as_ref()
-            .unwrap_or(&p::GatewayListenerStatus::default()),
-    )?;
-    let passthrough_table = passthrough_from_wire(
-        snapshot
-            .tls_passthrough
-            .as_ref()
-            .unwrap_or(&p::TlsPassthroughTable::default()),
-    )?;
-    let terminate_table = passthrough_from_wire(
-        snapshot
-            .tls_terminate
-            .as_ref()
-            .unwrap_or(&p::TlsPassthroughTable::default()),
-    )?;
-    let tcp_table = tcp_table_from_wire(
-        snapshot
-            .tcp_proxy
-            .as_ref()
-            .unwrap_or(&p::TcpRouteTable::default()),
-    )?;
-    let udp_table = udp_table_from_wire(
-        snapshot
-            .udp_proxy
-            .as_ref()
-            .unwrap_or(&p::UdpRouteTable::default()),
-    )?;
-
-    // Derive the per-port HTTPS listener-hostname snapshot from the status map
-    // (same data the reflector uses in build_tls) so GEP-3567 misdirected-request
-    // detection works in the two-pod shared-proxy deployment (#96).
-    let mut lh_builder = ListenerHostnamesBuilder::new();
-    for gw_status in listener_status_map.values() {
-        for li in gw_status.listeners.values() {
-            // Keyed by BIND port (internal port for shared-mode Gateways) so the
-            // proxy's misdirected-request check matches by the accepted port (#472).
-            lh_builder.add_listener(
-                li.bind_port(),
-                &li.hostname,
-                li.readiness.is_https_terminate(),
-            );
-        }
-    }
-    cells.listener_hostnames.store(Arc::new(lh_builder.build()));
-
-    cells.ingress.store(Arc::new(ingress_table));
-    cells.gateway.store(Arc::new(gateway_table));
-    cells.tls.store(Arc::new(tls_store));
-    cells.client_certs.store(Arc::new(client_cert_store));
-    cells.status.store_and_notify(listener_status_map);
-    cells.passthrough.store(Arc::new(passthrough_table));
-    cells.terminate.store(Arc::new(terminate_table));
-    cells.tcp.store(Arc::new(tcp_table));
-    cells.udp.store(Arc::new(udp_table));
-
-    Ok(())
 }
 
 /// Build a lazy-connect [`Channel`] from the configured endpoints.
@@ -1090,12 +988,16 @@ fn splitmix64(mut x: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::proto::v1::{
-        ClientMessage, GatewayListenerStatus, HostEntry, PortEntry, PortTlsStore, RouteEntry,
-        RouteKind, RoutingTable, ServerMessage, Snapshot,
+        BackendGroup, ClientMessage, HostEntry, LoadBalance, Resource, RouteEntry,
+        RouteHostResource, RouteKind, RouteTableKind, ServerMessage, Snapshot, WeightedBackend,
         discovery_server::{Discovery, DiscoveryServer},
         host_entry::Pattern,
+        load_balance::Algorithm,
+        resource::Payload,
         server_message::Kind as SrvKind,
     };
     use coxswain_core::health::HealthRegistry;
@@ -1186,30 +1088,150 @@ mod tests {
         (addr, connect_rx)
     }
 
-    /// Minimal valid snapshot (empty routing tables).
-    fn empty_snapshot(version: &str, nonce: Vec<u8>) -> ServerMessage {
+    /// Extract a snapshot message's `version` for an Ack/Nack assertion.
+    fn snapshot_version_of(m: &ServerMessage) -> String {
+        let Some(SrvKind::Snapshot(s)) = &m.kind else {
+            unreachable!("test helper called on a non-snapshot message")
+        };
+        s.version.clone()
+    }
+
+    /// Minimal valid full snapshot (empty routing world) — WIRE_VERSION 2. The
+    /// `version` is the real content hash (F6), so the client's self-check passes;
+    /// the `_label` argument is kept only to document each call site.
+    fn empty_snapshot(_label: &str, nonce: Vec<u8>) -> ServerMessage {
+        let resources = Vec::new();
         ServerMessage {
             kind: Some(SrvKind::Snapshot(Snapshot {
-                version: version.to_owned(),
+                version: crate::bench_internals::snapshot_version(&resources),
                 nonce,
-                ingress_routing: Some(RoutingTable::default()),
-                gateway_routing: Some(RoutingTable::default()),
-                tls_store: Some(PortTlsStore::default()),
-                client_cert_store: Some(crate::proto::v1::ClientCertStore::default()),
-                listener_status: Some(GatewayListenerStatus::default()),
-                tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
-                tls_terminate: Some(crate::proto::v1::TlsPassthroughTable::default()),
-                tcp_proxy: Some(crate::proto::v1::TcpRouteTable::default()),
-                udp_proxy: Some(crate::proto::v1::UdpRouteTable::default()),
+                full: true,
+                resources,
+                removed_resources: Vec::new(),
             })),
         }
     }
 
-    /// Snapshot with an invalid regex that `from_wire` will reject with `WireError::InvalidRegex`.
+    /// A full snapshot carrying one Ingress route-host resource for `host` backed
+    /// by a keyed endpoint `ns/svc/port`, plus the matching `EndpointResource`.
+    /// Real content-hash `version`.
+    fn keyed_route_snapshot(
+        nonce: Vec<u8>,
+        host: &str,
+        ns: &str,
+        svc: &str,
+        port: u32,
+        addr: &str,
+    ) -> ServerMessage {
+        let resources = vec![
+            endpoint_resource(ns, svc, port, &[addr]),
+            keyed_route_resource(host, ns, svc, port),
+        ];
+        ServerMessage {
+            kind: Some(SrvKind::Snapshot(Snapshot {
+                version: crate::bench_internals::snapshot_version(&resources),
+                nonce,
+                full: true,
+                resources,
+                removed_resources: Vec::new(),
+            })),
+        }
+    }
+
+    /// A delta upserting one changed `EndpointResource` for `ns/svc/port`. The
+    /// `version` is computed over the whole post-apply world (`route` + the new
+    /// endpoint), matching what a real server stamps.
+    fn endpoint_delta(
+        nonce: Vec<u8>,
+        host: &str,
+        ns: &str,
+        svc: &str,
+        port: u32,
+        new_addr: &str,
+    ) -> ServerMessage {
+        let ep = endpoint_resource(ns, svc, port, &[new_addr]);
+        let post = [ep.clone(), keyed_route_resource(host, ns, svc, port)];
+        ServerMessage {
+            kind: Some(SrvKind::Snapshot(Snapshot {
+                version: crate::bench_internals::snapshot_version(&post),
+                nonce,
+                full: false,
+                resources: vec![ep],
+                removed_resources: Vec::new(),
+            })),
+        }
+    }
+
+    /// One `EndpointResource` DTO (`ns/svc/port` → `addrs`).
+    fn endpoint_resource(ns: &str, svc: &str, port: u32, addrs: &[&str]) -> Resource {
+        Resource {
+            payload: Some(Payload::Endpoints(crate::proto::v1::EndpointResource {
+                namespace: ns.to_owned(),
+                service: svc.to_owned(),
+                port,
+                app_protocol: 0,
+                service_exists: true,
+                addrs: addrs.iter().map(|s| (*s).to_owned()).collect(),
+            })),
+        }
+    }
+
+    /// One Ingress exact-host route-host resource whose single prefix route is
+    /// backed by a keyed endpoint reference.
+    fn keyed_route_resource(host: &str, ns: &str, svc: &str, port: u32) -> Resource {
+        Resource {
+            payload: Some(Payload::RouteHost(RouteHostResource {
+                table: RouteTableKind::Ingress as i32,
+                port: 80,
+                host: Some(HostEntry {
+                    pattern: Some(Pattern::Exact(host.to_owned())),
+                    routes: vec![RouteEntry {
+                        kind: RouteKind::Prefix as i32,
+                        path: "/".to_owned(),
+                        backend_group: Some(BackendGroup {
+                            name: format!("{ns}/{svc}"),
+                            weighted: vec![WeightedBackend {
+                                addrs: Vec::new(),
+                                weight: 1,
+                                endpoint_ref: Some(crate::proto::v1::EndpointRef {
+                                    namespace: ns.to_owned(),
+                                    service: svc.to_owned(),
+                                    port,
+                                }),
+                            }],
+                            load_balance: Some(LoadBalance {
+                                algorithm: Some(Algorithm::RoundRobin(true)),
+                            }),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            })),
+        }
+    }
+
+    /// Full snapshot carrying one Ingress route-host resource with an invalid
+    /// regex path; `decode_world` rejects it with `WireError::InvalidRegex`, so
+    /// the client must Nack and retain its last-good tables (#383).
     fn bad_regex_snapshot(version: &str, nonce: Vec<u8>) -> ServerMessage {
         let bad_route = RouteEntry {
             kind: RouteKind::Regex as i32,
-            path: "[unclosed".to_owned(), // invalid regex
+            path: "[unclosed".to_owned(), // invalid regex — rejected at build()
+            // A valid literal backend so decode reaches the regex-compile step.
+            backend_group: Some(BackendGroup {
+                name: "ns/svc".to_owned(),
+                weighted: vec![WeightedBackend {
+                    addrs: vec!["10.0.0.1:80".to_owned()],
+                    weight: 1,
+                    endpoint_ref: None,
+                }],
+                load_balance: Some(LoadBalance {
+                    algorithm: Some(Algorithm::RoundRobin(true)),
+                }),
+                ..Default::default()
+            }),
             ..Default::default()
         };
         let host = HostEntry {
@@ -1217,23 +1239,25 @@ mod tests {
             routes: vec![bad_route],
             ..Default::default()
         };
-        let port = PortEntry {
-            port: 80,
-            hosts: vec![host],
+        let resource = Resource {
+            payload: Some(Payload::RouteHost(RouteHostResource {
+                table: RouteTableKind::Ingress as i32,
+                port: 80,
+                host: Some(host),
+            })),
         };
+        // Real content-hash version so the F6 self-check PASSES and the failure the
+        // test exercises is the regex compile (not a version mismatch). `_label`
+        // documents the call site only.
+        let _ = version;
+        let resources = vec![resource];
         ServerMessage {
             kind: Some(SrvKind::Snapshot(Snapshot {
-                version: version.to_owned(),
+                version: crate::bench_internals::snapshot_version(&resources),
                 nonce,
-                ingress_routing: Some(RoutingTable { ports: vec![port] }),
-                gateway_routing: Some(RoutingTable::default()),
-                tls_store: Some(PortTlsStore::default()),
-                client_cert_store: Some(crate::proto::v1::ClientCertStore::default()),
-                listener_status: Some(GatewayListenerStatus::default()),
-                tls_passthrough: Some(crate::proto::v1::TlsPassthroughTable::default()),
-                tls_terminate: Some(crate::proto::v1::TlsPassthroughTable::default()),
-                tcp_proxy: Some(crate::proto::v1::TcpRouteTable::default()),
-                udp_proxy: Some(crate::proto::v1::UdpRouteTable::default()),
+                full: true,
+                resources,
+                removed_resources: Vec::new(),
             })),
         }
     }
@@ -1340,35 +1364,35 @@ mod tests {
             "expected Subscribe as first client message"
         );
 
-        // Send snapshot #1.
-        srv_tx
-            .send(Ok(empty_snapshot("v1", vec![1])))
-            .await
-            .unwrap();
+        // Send snapshot #1 (empty world) and capture its real content-hash version.
+        let snap1 = empty_snapshot("v1", vec![1]);
+        let v1 = snapshot_version_of(&snap1);
+        srv_tx.send(Ok(snap1)).await.unwrap();
 
-        // Wait for Ack #1.
+        // Wait for Ack #1 — the client echoes the applied version.
         let ack1 = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
             .await
             .expect("timed out waiting for Ack #1")
             .expect("channel closed");
         assert!(
-            matches!(&ack1.kind, Some(CKind::Ack(a)) if a.version == "v1"),
-            "expected Ack for v1, got: {ack1:?}"
+            matches!(&ack1.kind, Some(CKind::Ack(a)) if a.version == v1),
+            "expected Ack for {v1}, got: {ack1:?}"
         );
 
-        // Only now send snapshot #2 (server gates on prior Ack).
-        srv_tx
-            .send(Ok(empty_snapshot("v2", vec![2])))
-            .await
-            .unwrap();
+        // Only now send snapshot #2 (distinct content → distinct version).
+        let snap2 =
+            keyed_route_snapshot(vec![2], "svc.example.com", "ns", "svc", 80, "10.0.0.1:8080");
+        let v2 = snapshot_version_of(&snap2);
+        assert_ne!(v1, v2, "distinct content must hash to distinct versions");
+        srv_tx.send(Ok(snap2)).await.unwrap();
 
         let ack2 = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
             .await
             .expect("timed out waiting for Ack #2")
             .expect("channel closed");
         assert!(
-            matches!(&ack2.kind, Some(CKind::Ack(a)) if a.version == "v2"),
-            "expected Ack for v2, got: {ack2:?}"
+            matches!(&ack2.kind, Some(CKind::Ack(a)) if a.version == v2),
+            "expected Ack for {v2}, got: {ack2:?}"
         );
 
         // Both tables reflect the applied snapshot (non-default handle set).
@@ -1609,6 +1633,84 @@ mod tests {
         );
     }
 
+    /// A delta as the FIRST message of a *reconnected* session Nacks with
+    /// `DeltaBeforeFullSnapshot`, even though the client's resource cache still
+    /// holds the prior session's full. The server's per-stream acked baseline is
+    /// not replica-portable across a reconnect, so `expect_full` must reset to
+    /// `true` per session end-to-end — this proves the reset survives the supervisor
+    /// loop (not just the in-session flag flip).
+    #[tokio::test]
+    async fn delta_first_after_bounce_nacks_delta_before_full() {
+        let (addr, mut connect_rx) = start_server().await;
+
+        let registry = HealthRegistry::new();
+        let handle = registry.register("disc", &["conn"]);
+        let (_client, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn")
+            .expect("test endpoints are valid URIs");
+        let _task = tokio::spawn(supervisor.run());
+
+        // Session #1: establish a full baseline (so the persisted cache has_full).
+        let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(); // drain Subscribe
+        srv_tx
+            .send(Ok(empty_snapshot("v1", vec![1])))
+            .await
+            .unwrap();
+        let ack = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(&ack.kind, Some(CKind::Ack(_))));
+
+        // Bounce the stream.
+        drop(srv_tx);
+
+        // Session #2: reconnect, drain Subscribe, then send a DELTA as the very
+        // first message.
+        let (srv_tx2, mut cli_rx2) =
+            tokio::time::timeout(Duration::from_secs(5), connect_rx.recv())
+                .await
+                .expect("client did not reconnect within timeout")
+                .unwrap();
+        let sub2 = tokio::time::timeout(Duration::from_secs(2), cli_rx2.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(sub2.kind, Some(CKind::Subscribe(_))));
+
+        let delta_first = ServerMessage {
+            kind: Some(SrvKind::Snapshot(Snapshot {
+                version: "irrelevant-rejected-before-version-check".to_owned(),
+                nonce: vec![2],
+                full: false,
+                resources: Vec::new(),
+                removed_resources: Vec::new(),
+            })),
+        };
+        srv_tx2.send(Ok(delta_first)).await.unwrap();
+
+        // The client must Nack it as delta-before-full — the invariant-1 guard
+        // fires before any staging or version check.
+        let nack = tokio::time::timeout(Duration::from_secs(2), cli_rx2.recv())
+            .await
+            .expect("timed out waiting for Nack")
+            .unwrap();
+        assert!(
+            matches!(
+                &nack.kind,
+                Some(CKind::Nack(n))
+                    if n.detail == crate::error::WireError::DeltaBeforeFullSnapshot.to_string()
+            ),
+            "expected a DeltaBeforeFullSnapshot Nack on the reconnected session, got: {nack:?}"
+        );
+    }
+
     /// When a snapshot fails to rebuild, the client sends Nack and retains the
     /// last-good routing tables.
     #[tokio::test]
@@ -1645,11 +1747,12 @@ mod tests {
 
         let last_good = client.ingress_routes().load();
 
-        // Push a bad snapshot (invalid regex).
-        srv_tx
-            .send(Ok(bad_regex_snapshot("bad-v2", vec![2])))
-            .await
-            .unwrap();
+        // Push a bad snapshot (invalid regex). Its version is a real content hash,
+        // so the client passes the F6 self-check and fails at the regex compile —
+        // the Nack echoes that version.
+        let bad = bad_regex_snapshot("bad-v2", vec![2]);
+        let bad_version = snapshot_version_of(&bad);
+        srv_tx.send(Ok(bad)).await.unwrap();
 
         // Client should Nack.
         let nack = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
@@ -1657,8 +1760,8 @@ mod tests {
             .expect("timed out waiting for Nack")
             .unwrap();
         assert!(
-            matches!(&nack.kind, Some(CKind::Nack(n)) if n.version == "bad-v2"),
-            "expected Nack for bad-v2, got: {nack:?}"
+            matches!(&nack.kind, Some(CKind::Nack(n)) if n.version == bad_version),
+            "expected Nack for {bad_version}, got: {nack:?}"
         );
 
         // Routing cells must still hold the last-good snapshot.
@@ -1666,6 +1769,105 @@ mod tests {
         assert!(
             Arc::ptr_eq(&last_good, &after_nack),
             "routing cell was replaced after Nack — last-good invariant violated"
+        );
+    }
+
+    /// End-to-end delta path over the fake server: a full establishes the keyed
+    /// baseline, then a version-correct endpoint delta Acks and republishes the
+    /// ingress table (the referencing partition recompiled), and the
+    /// `{kind="delta"}` counter advances. A malformed delta then Nacks and the
+    /// last-good table is retained.
+    #[tokio::test]
+    async fn applies_endpoint_delta_then_nacks_malformed_delta() {
+        let (addr, mut connect_rx) = start_server().await;
+
+        let registry = HealthRegistry::new();
+        let handle = registry.register("disc", &["conn"]);
+        let (client, supervisor) = DiscoveryClient::spawn(test_config(addr), handle, "conn")
+            .expect("test endpoints are valid URIs");
+        let _task = tokio::spawn(supervisor.run());
+
+        let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        // Drain Subscribe.
+        tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Full baseline: route svc.example.com → keyed endpoint ns/svc/80.
+        let full =
+            keyed_route_snapshot(vec![1], "svc.example.com", "ns", "svc", 80, "10.0.0.1:8080");
+        let full_version = snapshot_version_of(&full);
+        srv_tx.send(Ok(full)).await.unwrap();
+        let ack1 = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for full Ack")
+            .unwrap();
+        assert!(
+            matches!(&ack1.kind, Some(CKind::Ack(a)) if a.version == full_version),
+            "expected Ack for the full, got: {ack1:?}"
+        );
+
+        let table_after_full = client.ingress_routes().load();
+        let deltas_before = crate::metrics::client_snapshots_applied_total()
+            .with_label_values(&["delta"])
+            .get();
+
+        // Delta: the endpoint moves to a new address. Only the endpoint resource is
+        // on the wire; the version is over the whole post-apply world.
+        let d = endpoint_delta(vec![2], "svc.example.com", "ns", "svc", 80, "10.0.0.2:8080");
+        let delta_version = snapshot_version_of(&d);
+        assert_ne!(delta_version, full_version, "the delta changes the world");
+        srv_tx.send(Ok(d)).await.unwrap();
+        let ack2 = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for delta Ack")
+            .unwrap();
+        assert!(
+            matches!(&ack2.kind, Some(CKind::Ack(a)) if a.version == delta_version),
+            "expected Ack for the delta, got: {ack2:?}"
+        );
+
+        // The referencing partition recompiled, so the ingress cell was republished.
+        let table_after_delta = client.ingress_routes().load();
+        assert!(
+            !Arc::ptr_eq(&table_after_full, &table_after_delta),
+            "the endpoint delta must republish the ingress routing table"
+        );
+        // The delta counter advanced (>= to tolerate concurrent tests).
+        let deltas_after = crate::metrics::client_snapshots_applied_total()
+            .with_label_values(&["delta"])
+            .get();
+        assert!(
+            deltas_after > deltas_before,
+            "the {{kind=delta}} counter must advance on a delta apply"
+        );
+
+        // A malformed delta (unparsable tombstone key) Nacks; last-good is retained.
+        let bad_delta = ServerMessage {
+            kind: Some(SrvKind::Snapshot(Snapshot {
+                version: "irrelevant".to_owned(),
+                nonce: vec![3],
+                full: false,
+                resources: Vec::new(),
+                removed_resources: vec!["not-a-canonical-key".to_owned()],
+            })),
+        };
+        srv_tx.send(Ok(bad_delta)).await.unwrap();
+        let nack = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for Nack")
+            .unwrap();
+        assert!(
+            matches!(&nack.kind, Some(CKind::Nack(_))),
+            "expected Nack for the malformed delta, got: {nack:?}"
+        );
+        assert!(
+            Arc::ptr_eq(&table_after_delta, &client.ingress_routes().load()),
+            "the ingress table must be retained across a rejected delta"
         );
     }
 

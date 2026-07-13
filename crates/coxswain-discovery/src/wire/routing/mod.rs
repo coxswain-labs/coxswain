@@ -51,16 +51,25 @@ pub const MAX_MIRROR_DEPTH: usize = 4;
 mod decode;
 mod encode;
 
-#[cfg(test)]
-pub(crate) use decode::{bg_from_wire, rate_limit_from_wire, upstream_tls_from_wire};
-pub use decode::{
-    gateway_from_wire, ingress_from_wire, passthrough_from_wire, tcp_table_from_wire,
+// `protocol_from_wire` is reused by `wire::endpoints`. `build_route_table` plus
+// the L4 decoders are the per-cell compile seams the client's partitioned apply
+// (`crate::apply`, #383) reuses to recompile only dirty resources.
+pub(crate) use decode::{
+    build_route_table, passthrough_from_wire, protocol_from_wire, tcp_table_from_wire,
     udp_table_from_wire,
 };
+// Backend/rate-limit/tls decoders and the whole-world `decode_world` oracle are
+// exercised directly by unit tests; production decode now goes partition- and
+// cell-wise through `crate::apply`.
+#[cfg(test)]
+pub(crate) use decode::{bg_from_wire, decode_world, rate_limit_from_wire, upstream_tls_from_wire};
+// Per-resource emitters + the endpoint collector: the server's materialize path
+// walks the tables once and folds these into the view.
 #[cfg(test)]
 pub(crate) use encode::upstream_tls_to_wire;
-pub use encode::{
-    gateway_to_wire, ingress_to_wire, passthrough_to_wire, tcp_table_to_wire, udp_table_to_wire,
+pub(crate) use encode::{
+    EndpointCollector, gateway_route_resources, ingress_route_resources, passthrough_resources,
+    tcp_resources, udp_resources,
 };
 
 #[cfg(test)]
@@ -77,14 +86,36 @@ mod tests {
     };
 
     use super::{
-        MAX_MIRROR_DEPTH, bg_from_wire, gateway_from_wire, gateway_to_wire, ingress_from_wire,
-        ingress_to_wire, rate_limit_from_wire, upstream_tls_from_wire, upstream_tls_to_wire,
+        EndpointCollector, MAX_MIRROR_DEPTH, bg_from_wire, decode_world, gateway_route_resources,
+        ingress_route_resources, rate_limit_from_wire, upstream_tls_from_wire,
+        upstream_tls_to_wire,
     };
     use crate::error::WireError;
     use crate::proto::v1 as p;
     use crate::wire::tests::*;
+    use coxswain_core::endpoints::EndpointPool;
 
     // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// Encode a routing table to its resource set (routes + any referenced
+    /// endpoints), the shape the server ships and the client applies (#383).
+    pub(super) fn ingress_resources(
+        t: &coxswain_core::routing::IngressRoutingTable,
+    ) -> Vec<p::Resource> {
+        let mut coll = EndpointCollector::new();
+        let mut resources = ingress_route_resources(t, &mut coll);
+        resources.extend(coll.into_resources());
+        resources
+    }
+
+    pub(super) fn gateway_resources(
+        t: &coxswain_core::routing::GatewayRoutingTable,
+    ) -> Vec<p::Resource> {
+        let mut coll = EndpointCollector::new();
+        let mut resources = gateway_route_resources(t, &mut coll);
+        resources.extend(coll.into_resources());
+        resources
+    }
 
     pub(super) fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap_or_else(|e| panic!("bad addr {s}: {e}"))
@@ -113,16 +144,335 @@ mod tests {
         builder: IngressRoutingTableBuilder,
     ) -> coxswain_core::routing::IngressRoutingTable {
         let t = builder.build().expect("build");
-        let dto = ingress_to_wire(&t);
-        ingress_from_wire(&dto).expect("from_wire")
+        let resources = ingress_resources(&t);
+        decode_world(&resources).expect("decode_world").ingress
     }
 
     pub(super) fn rt_gateway(
         builder: GatewayRoutingTableBuilder,
     ) -> coxswain_core::routing::GatewayRoutingTable {
         let t = builder.build().expect("build");
-        let dto = gateway_to_wire(&t);
-        gateway_from_wire(&dto).expect("from_wire")
+        let resources = gateway_resources(&t);
+        decode_world(&resources).expect("decode_world").gateway
+    }
+
+    // ── #383 endpoint refs + status provenance ────────────────────────────────
+
+    /// An Ingress route-host resource whose single backend references an endpoint
+    /// resource by `(ns, svc, svc_port)` — no inline addrs. Optionally bakes a
+    /// server-side `error_status` (the endpoint-independent path).
+    fn keyed_route_resource(
+        host: &str,
+        ns: &str,
+        svc: &str,
+        svc_port: u32,
+        baked: Option<u32>,
+    ) -> p::Resource {
+        let bg = p::BackendGroup {
+            name: format!("{ns}/{svc}"),
+            weighted: vec![p::WeightedBackend {
+                addrs: Vec::new(),
+                weight: 1,
+                endpoint_ref: Some(p::EndpointRef {
+                    namespace: ns.to_owned(),
+                    service: svc.to_owned(),
+                    port: svc_port,
+                }),
+            }],
+            load_balance: Some(p::LoadBalance {
+                algorithm: Some(p::load_balance::Algorithm::RoundRobin(true)),
+            }),
+            ..Default::default()
+        };
+        let route = p::RouteEntry {
+            kind: p::RouteKind::Prefix as i32,
+            path: "/".to_owned(),
+            backend_group: Some(bg),
+            error_status: baked,
+            ..Default::default()
+        };
+        p::Resource {
+            payload: Some(p::resource::Payload::RouteHost(p::RouteHostResource {
+                table: p::RouteTableKind::Ingress as i32,
+                port: 80,
+                host: Some(p::HostEntry {
+                    pattern: Some(p::host_entry::Pattern::Exact(host.to_owned())),
+                    normalize_level: 0,
+                    routes: vec![route],
+                }),
+            })),
+        }
+    }
+
+    fn endpoint_resource(
+        ns: &str,
+        svc: &str,
+        port: u32,
+        exists: bool,
+        addrs: &[&str],
+    ) -> p::Resource {
+        p::Resource {
+            payload: Some(p::resource::Payload::Endpoints(p::EndpointResource {
+                namespace: ns.to_owned(),
+                service: svc.to_owned(),
+                port,
+                app_protocol: 0,
+                service_exists: exists,
+                addrs: addrs.iter().map(|s| (*s).to_owned()).collect(),
+            })),
+        }
+    }
+
+    /// A keyed backend that resolves to real endpoints routes normally — the
+    /// client resolves the ref against the message pool (no inline addrs).
+    #[test]
+    fn keyed_ref_resolves_from_pool() {
+        let resources = vec![
+            keyed_route_resource("api.example.com", "default", "svc", 80, None),
+            endpoint_resource("default", "svc", 80, true, &["10.0.0.1:8080"]),
+        ];
+        let world = decode_world(&resources).expect("decode_world");
+        let bg = world
+            .ingress
+            .route(80, "api.example.com", "/", &ctx())
+            .expect("route resolves via endpoint ref");
+        assert_eq!(bg.endpoints(), &["10.0.0.1:8080".parse().unwrap()]);
+    }
+
+    /// A dangling ref (no matching endpoint resource) is a hard protocol error.
+    #[test]
+    fn dangling_ref_errors() {
+        let resources = vec![keyed_route_resource(
+            "api.example.com",
+            "default",
+            "svc",
+            80,
+            None,
+        )];
+        // DecodedWorld is not Debug (routing tables aren't), so match rather than unwrap_err.
+        let err = match decode_world(&resources) {
+            Ok(_) => panic!("expected a dangling-ref error, got a decoded world"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, WireError::UnknownEndpointRef { .. }),
+            "expected UnknownEndpointRef, got {err:?}"
+        );
+    }
+
+    /// Status parity trio (#383): the client re-derives the endpoint-derived
+    /// status the server omitted, and a server-baked status wins.
+
+    #[test]
+    fn valid_empty_installs_503() {
+        // Present Service, zero ready endpoints → 503 (endpoint-derived).
+        let resources = vec![
+            keyed_route_resource("api.example.com", "default", "svc", 80, None),
+            endpoint_resource("default", "svc", 80, true, &[]),
+        ];
+        let world = decode_world(&resources).expect("decode_world");
+        assert!(
+            matches!(
+                world.ingress.find(80, "api.example.com", "/", &ctx()),
+                RouteOutcome::Error(503)
+            ),
+            "valid-but-empty Service must re-derive 503"
+        );
+    }
+
+    #[test]
+    fn missing_service_installs_500() {
+        // Missing Service (service_exists=false), zero addrs → 500.
+        let resources = vec![
+            keyed_route_resource("api.example.com", "default", "svc", 80, None),
+            endpoint_resource("default", "svc", 80, false, &[]),
+        ];
+        let world = decode_world(&resources).expect("decode_world");
+        assert!(
+            matches!(
+                world.ingress.find(80, "api.example.com", "/", &ctx()),
+                RouteOutcome::Error(500)
+            ),
+            "missing Service must re-derive 500"
+        );
+    }
+
+    #[test]
+    fn server_baked_502_wins() {
+        // A baked 502 (endpoint-independent) overrides the client's 503 derivation.
+        let resources = vec![
+            keyed_route_resource("api.example.com", "default", "svc", 80, Some(502)),
+            endpoint_resource("default", "svc", 80, true, &[]),
+        ];
+        let world = decode_world(&resources).expect("decode_world");
+        assert!(
+            matches!(
+                world.ingress.find(80, "api.example.com", "/", &ctx()),
+                RouteOutcome::Error(502)
+            ),
+            "server-baked 502 must win over the endpoint-derived 503"
+        );
+    }
+
+    // ── #383 per-backend filter / spec-index alignment ────────────────────────
+
+    /// `per_backend_filters` is keyed by SPEC index — index-aligned with the wire
+    /// `weighted` list, which retains drained keyed-empty refs the hot-path pools
+    /// drop. A group whose spec is `[keyed-empty(drained), live-A(A), live-B(B)]`
+    /// must round-trip so filter A lands on the first surviving backend and B on
+    /// the second. Emitting the pool position instead would shift every filter
+    /// past the drained slot — A would decode onto no backend and B onto A.
+    #[test]
+    fn per_backend_filters_realign_across_drained_ref() {
+        use coxswain_core::endpoints::{EndpointKey, ResolvedEndpoints};
+        use coxswain_core::routing::{BackendGroup, BackendProtocol, HeaderMod};
+
+        let a = addr("10.0.0.1:80");
+        let b = addr("10.0.0.2:80");
+        let filter_a = FilterAction::RequestHeaderModifier(
+            HeaderMod::parse(&[("x-backend", "a")], &[], &[]).expect("hm a"),
+        );
+        let filter_b = FilterAction::RequestHeaderModifier(
+            HeaderMod::parse(&[("x-backend", "b")], &[], &[]).expect("hm b"),
+        );
+
+        // Spec order [drained@0, live-A@1, live-B@2]; pools/backends are [A, B].
+        let drained = Arc::new(ResolvedEndpoints::new(
+            Vec::new(),
+            BackendProtocol::default(),
+            true,
+        ));
+        let live_a = Arc::new(ResolvedEndpoints::new(
+            vec![a],
+            BackendProtocol::default(),
+            true,
+        ));
+        let live_b = Arc::new(ResolvedEndpoints::new(
+            vec![b],
+            BackendProtocol::default(),
+            true,
+        ));
+        let bg = Arc::new(
+            BackendGroup::weighted_with_endpoints(
+                "default/svc".to_string(),
+                vec![
+                    (
+                        drained,
+                        Some(EndpointKey::new("default", "svc-drained", 80)),
+                        1,
+                    ),
+                    (live_a, Some(EndpointKey::new("default", "svc-a", 80)), 1),
+                    (live_b, Some(EndpointKey::new("default", "svc-b", 80)), 1),
+                ],
+            )
+            .with_per_backend_filters(vec![vec![filter_a], vec![filter_b]]),
+        );
+        let entry = Arc::new(RouteEntry::path_only(bg, "ns/r".to_string(), None));
+        let mut builder = IngressRoutingTableBuilder::new();
+        builder
+            .for_port(80)
+            .exact_host("example.com")
+            .add_exact_route("/", entry);
+        let rt = builder.build().expect("build");
+
+        // Encode → decode via the full resource path (routes + referenced endpoints).
+        let world = decode_world(&ingress_resources(&rt)).expect("decode_world");
+        let group = world
+            .ingress
+            .route(80, "example.com", "/", &ctx())
+            .expect("route resolves");
+
+        // Round-robin over the two surviving backends; each must carry ITS filter.
+        let mut saw_a = false;
+        let mut saw_b = false;
+        for _ in 0..8 {
+            let (picked, filters) = group.next_endpoint_with_filters().expect("endpoint");
+            let filters = filters.expect("surviving backend keeps its per-backend filter");
+            let expected = if picked == a { "a" } else { "b" };
+            match &filters[0] {
+                FilterAction::RequestHeaderModifier(hm) => {
+                    let hdr = hm
+                        .add
+                        .iter()
+                        .find(|(name, _)| name == "x-backend")
+                        .expect("x-backend header");
+                    assert_eq!(hdr.1, expected, "each filter must ride its own backend");
+                }
+                other => panic!("unexpected filter action: {other:?}"),
+            }
+            saw_a |= picked == a;
+            saw_b |= picked == b;
+        }
+        assert!(saw_a && saw_b, "both surviving backends were selected");
+    }
+
+    /// Two-entry case `[drained, live(F)]`: the single filter must survive on the
+    /// live backend even though a drained keyed-empty ref precedes it in the spec.
+    #[test]
+    fn per_backend_filter_survives_single_drained_prefix() {
+        use coxswain_core::endpoints::{EndpointKey, ResolvedEndpoints};
+        use coxswain_core::routing::{BackendGroup, BackendProtocol, HeaderMod};
+
+        let live = addr("10.0.0.9:80");
+        let filter = FilterAction::RequestHeaderModifier(
+            HeaderMod::parse(&[("x-backend", "f")], &[], &[]).expect("hm f"),
+        );
+        let drained = Arc::new(ResolvedEndpoints::new(
+            Vec::new(),
+            BackendProtocol::default(),
+            true,
+        ));
+        let live_ep = Arc::new(ResolvedEndpoints::new(
+            vec![live],
+            BackendProtocol::default(),
+            true,
+        ));
+        let bg = Arc::new(
+            BackendGroup::weighted_with_endpoints(
+                "default/svc".to_string(),
+                vec![
+                    (
+                        drained,
+                        Some(EndpointKey::new("default", "svc-drained", 80)),
+                        1,
+                    ),
+                    (
+                        live_ep,
+                        Some(EndpointKey::new("default", "svc-live", 80)),
+                        1,
+                    ),
+                ],
+            )
+            .with_per_backend_filters(vec![vec![filter]]),
+        );
+        let entry = Arc::new(RouteEntry::path_only(bg, "ns/r".to_string(), None));
+        let mut builder = IngressRoutingTableBuilder::new();
+        builder
+            .for_port(80)
+            .exact_host("example.com")
+            .add_exact_route("/", entry);
+        let rt = builder.build().expect("build");
+
+        let world = decode_world(&ingress_resources(&rt)).expect("decode_world");
+        let group = world
+            .ingress
+            .route(80, "example.com", "/", &ctx())
+            .expect("route resolves");
+
+        let (picked, filters) = group.next_endpoint_with_filters().expect("endpoint");
+        assert_eq!(picked, live, "only the live backend routes");
+        let filters = filters.expect("the live backend keeps filter F past the drained prefix");
+        match &filters[0] {
+            FilterAction::RequestHeaderModifier(hm) => {
+                let hdr = hm
+                    .add
+                    .iter()
+                    .find(|(name, _)| name == "x-backend")
+                    .expect("x-backend header");
+                assert_eq!(hdr.1, "f", "filter F must survive on the live backend");
+            }
+            other => panic!("unexpected filter action: {other:?}"),
+        }
     }
 
     // ── UpstreamTls client cert (GEP-3155) ────────────────────────────────────
@@ -438,8 +788,14 @@ mod tests {
             .expect("hit");
         let spec = bg2.spec();
         assert_eq!(spec.weighted.len(), 2, "two backend groups");
-        assert_eq!(spec.weighted[0].1, 4, "first group weight = 4 (pre-GCD)");
-        assert_eq!(spec.weighted[1].1, 2, "second group weight = 2 (pre-GCD)");
+        assert_eq!(
+            spec.weighted[0].weight, 4,
+            "first group weight = 4 (pre-GCD)"
+        );
+        assert_eq!(
+            spec.weighted[1].weight, 2,
+            "second group weight = 2 (pre-GCD)"
+        );
     }
 
     // ── 7. Compression config ─────────────────────────────────────────────────
@@ -689,6 +1045,7 @@ mod tests {
             let addr_dto = p::WeightedBackend {
                 addrs: vec!["10.0.0.1:80".to_string()],
                 weight: 1,
+                endpoint_ref: None,
             };
             let lb = p::LoadBalance {
                 algorithm: Some(p::load_balance::Algorithm::RoundRobin(true)),
@@ -723,7 +1080,7 @@ mod tests {
         }
 
         let dto = nested_bg(MAX_MIRROR_DEPTH + 1);
-        let err = bg_from_wire(&dto, 0).unwrap_err();
+        let err = bg_from_wire(&dto, &EndpointPool::new(), 0).unwrap_err();
         assert!(
             matches!(err, WireError::MirrorTooDeep { .. }),
             "expected MirrorTooDeep, got {err:?}"
@@ -925,12 +1282,19 @@ mod tests {
         hb.add_exact_route("/", entry);
 
         let t = b.build().expect("build");
-        let dto = ingress_to_wire(&t);
-        let port_entry = dto.ports.first().expect("port");
-        let host_entry = port_entry.hosts.first().expect("host");
-        assert_ne!(host_entry.normalize_level, 0, "normalize level serialised");
+        let resources = ingress_resources(&t);
+        // Find the single route-host resource and assert its normalize level rode
+        // the wire, then confirm the full resource set decodes.
+        let host = resources
+            .iter()
+            .find_map(|r| match r.payload.as_ref() {
+                Some(p::resource::Payload::RouteHost(rh)) => rh.host.as_ref(),
+                _ => None,
+            })
+            .expect("route-host resource");
+        assert_ne!(host.normalize_level, 0, "normalize level serialised");
 
-        ingress_from_wire(&dto).expect("from_wire round-trip");
+        decode_world(&resources).expect("decode_world round-trip");
     }
 
     // ── WildcardKind Single vs Multi ──────────────────────────────────────────
@@ -1014,12 +1378,19 @@ mod tests {
             .add_exact_route("/api", entry);
 
         let t = b.build().expect("build");
-        let dto1 = ingress_to_wire(&t);
-        let dto2 = ingress_to_wire(&t);
+        // Literal-addr routes carry no endpoint resources, so the per-resource
+        // emitter is fully deterministic: repeated encodes must be byte-identical.
+        let r1: Vec<Vec<u8>> = ingress_resources(&t)
+            .iter()
+            .map(|r| r.encode_to_vec())
+            .collect();
+        let r2: Vec<Vec<u8>> = ingress_resources(&t)
+            .iter()
+            .map(|r| r.encode_to_vec())
+            .collect();
         assert_eq!(
-            dto1.encode_to_vec(),
-            dto2.encode_to_vec(),
-            "repeated to_wire calls must produce identical bytes"
+            r1, r2,
+            "repeated resource emission must produce identical bytes"
         );
     }
 
