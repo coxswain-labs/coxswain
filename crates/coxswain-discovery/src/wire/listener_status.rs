@@ -104,6 +104,7 @@ pub(crate) fn listener_status_resources(
             payload: Some(p::resource::Payload::ListenerStatus(
                 gateway_status_entry_to_wire(key, status),
             )),
+            ..Default::default()
         })
         .collect()
 }

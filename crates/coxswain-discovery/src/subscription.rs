@@ -17,4 +17,13 @@ pub enum Scope {
         /// Namespace the Gateway belongs to.
         namespace: String,
     },
+    /// Every dedicated-Gateway world in one namespace, as a single aggregate
+    /// stream (#582). Relay-tier upstream subscription only: no leaf proxy
+    /// ever sends this, and a relay's own downstream server rejects it in v1.
+    /// Every subscribe must be authorized by [`crate::server::ScopeAuthorizer`]
+    /// (default deny-all, fail-closed until provenance authorization lands).
+    Namespace {
+        /// Namespace whose dedicated Gateways are aggregated.
+        namespace: String,
+    },
 }

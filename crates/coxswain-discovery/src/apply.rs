@@ -656,6 +656,16 @@ fn stage_resource(
             let ek = EndpointKey::new(e.namespace.as_str(), e.service.as_str(), port_u16(e.port)?);
             staged.endpoints.insert(ek, Arc::new(e.clone()));
         }
+        // A `Namespace`-scope resource (#582): this client's typed maps have no
+        // per-Gateway partitioning, so only a relay (#583) can apply one. No
+        // leaf ever subscribes `Namespace`, so the server never sends this to
+        // the generic apply path in practice; fail closed rather than silently
+        // dropping the Gateway's publish-seq.
+        p::resource::Payload::GatewayMeta(_) => {
+            return Err(WireError::UnknownResourceKey {
+                reason: "GatewayMeta resource has no typed slot in this client's cache",
+            });
+        }
     }
     Ok(())
 }
@@ -744,6 +754,14 @@ fn remove_from_staged(
         } => {
             let ek = EndpointKey::new(namespace, service, port);
             staged.endpoints.remove(&ek);
+        }
+        // #582 `Namespace`-scope keys: this client's typed maps carry no
+        // per-Gateway partitioning (see the matching `stage_resource` arm), so
+        // there is nothing here to remove a tombstone from either.
+        ParsedKey::Qualified { .. } | ParsedKey::GatewayMeta { .. } => {
+            return Err(WireError::UnknownResourceKey {
+                reason: "qualified/GatewayMeta tombstone has no typed slot in this client's cache",
+            });
         }
     }
     Ok(())
@@ -1241,6 +1259,7 @@ fn wire_from_key_err(e: ResourceKeyError) -> WireError {
                 "route_host wildcard carries an unspecified kind"
             }
             ResourceKeyError::MalformedKey { reason } => reason,
+            ResourceKeyError::MissingQualifier => "resource qualifier is absent or incomplete",
         },
     }
 }
@@ -1482,6 +1501,7 @@ mod tests {
                     ..Default::default()
                 }),
             })),
+            ..Default::default()
         }
     }
 
@@ -1502,6 +1522,7 @@ mod tests {
                     ..Default::default()
                 }),
             })),
+            ..Default::default()
         }
     }
 
@@ -1515,6 +1536,7 @@ mod tests {
                 service_exists: true,
                 addrs: addrs.iter().map(|s| (*s).to_owned()).collect(),
             })),
+            ..Default::default()
         }
     }
 
@@ -1564,6 +1586,7 @@ mod tests {
                     ..Default::default()
                 }),
             })),
+            ..Default::default()
         }
     }
 
@@ -1574,6 +1597,7 @@ mod tests {
                 port,
                 backend_group: Some(bg),
             })),
+            ..Default::default()
         }
     }
 
@@ -1584,6 +1608,7 @@ mod tests {
                 port,
                 backend_group: Some(bg),
             })),
+            ..Default::default()
         }
     }
 
@@ -1612,6 +1637,7 @@ mod tests {
                     ..Default::default()
                 }),
             })),
+            ..Default::default()
         }
     }
 
@@ -1704,6 +1730,7 @@ mod tests {
                             ..Default::default()
                         }),
                     })),
+                    ..Default::default()
                 },
             ],
         );
@@ -2237,6 +2264,7 @@ mod tests {
         };
         p::Resource {
             payload: Some(payload),
+            ..Default::default()
         }
     }
 

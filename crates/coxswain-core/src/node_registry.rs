@@ -41,6 +41,13 @@ pub enum NodeScope {
         /// Name of the Gateway this proxy serves.
         name: String,
     },
+    /// A relay tier node aggregating every dedicated Gateway in one namespace
+    /// (#582). Relay-tier upstream subscription only: no leaf proxy is ever
+    /// recorded under this scope.
+    Namespace {
+        /// Namespace this relay node aggregates.
+        namespace: String,
+    },
 }
 
 // ── NodeEntry ────────────────────────────────────────────────────────────────

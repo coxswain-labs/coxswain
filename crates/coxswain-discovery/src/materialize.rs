@@ -179,7 +179,65 @@ pub fn materialize(
                 None => empty_view(),
             }
         }
+        Scope::Namespace { namespace } => build_namespace_view(source, namespace, seq),
     }
+}
+
+/// Materialize every dedicated Gateway in `namespace` into one aggregate view
+/// (#582, the relay tier's upstream subscription). Each Gateway's own
+/// resources (routes, TLS, client-certs, listener status — the same slice
+/// [`Scope::Gateway`] serves) are wrapped with the `gw|<ns>|<name>|` canonical-key
+/// qualifier via [`p::Resource::qualifier_namespace`] / `qualifier_name`, plus one
+/// [`p::resource::Payload::GatewayMeta`] resource carrying its publish sequence
+/// (already tracked per Gateway by [`crate::server::SnapshotSource::publish`]).
+/// EDS endpoint resources stay unqualified — they address a Service by
+/// `(namespace, service, port)` independent of which Gateway references it, and
+/// naturally de-duplicate via [`EndpointCollector`] when two Gateways in the
+/// same namespace share a backend.
+///
+/// A namespace with no cut-over dedicated Gateways fails closed to an empty
+/// world at seq 0, mirroring the absent-Gateway branch above.
+fn build_namespace_view(source: &SnapshotSource, namespace: &str, seq: u64) -> MaterializedView {
+    let registry = source.dedicated.load();
+    let mut endpoints = EndpointCollector::new();
+    let mut all: Vec<p::Resource> = Vec::new();
+    let mut any_gateway = false;
+
+    let mut matching: Vec<_> = registry
+        .iter()
+        .filter(|(key, _)| key.ns == namespace)
+        .collect();
+    // Deterministic iteration order (the registry is a HashMap): sort by name
+    // so repeated materializations of the same cells fold identically.
+    matching.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
+
+    for (key, snap) in matching {
+        any_gateway = true;
+        let mut gw_resources: Vec<p::Resource> = Vec::new();
+        gw_resources.extend(gateway_route_resources(&snap.gateway, &mut endpoints));
+        gw_resources.extend(port_tls_resources(&snap.tls));
+        gw_resources.extend(client_cert_resources(&snap.client_certs));
+        gw_resources.extend(listener_status_resources(&snap.listener_status));
+        for resource in &mut gw_resources {
+            resource.qualifier_namespace.clone_from(&key.ns);
+            resource.qualifier_name.clone_from(&key.name);
+        }
+        let publish_seq = source.publish.get(key).map_or(0, |stamp| stamp.seq);
+        gw_resources.push(p::Resource {
+            payload: Some(p::resource::Payload::GatewayMeta(p::GatewayMeta {
+                publish_seq,
+            })),
+            qualifier_namespace: key.ns.clone(),
+            qualifier_name: key.name.clone(),
+        });
+        all.extend(gw_resources);
+    }
+
+    if !any_gateway {
+        return empty_view();
+    }
+    all.extend(endpoints.into_resources());
+    fold_resources(all, seq)
 }
 
 /// A deliberately-empty world at seq 0 (fail-closed dedicated branches).
@@ -218,7 +276,14 @@ fn build_view(inputs: &ViewInputs<'_>, seq: u64) -> MaterializedView {
     all.extend(udp_resources(inputs.udp, &mut endpoints));
     // Endpoints last: they are populated by the route/L4 passes above.
     all.extend(endpoints.into_resources());
+    fold_resources(all, seq)
+}
 
+/// Fold a flat list of emitted resources into a canonical-key-keyed view with a
+/// global content hash. Shared by [`build_view`] (SharedPool/Gateway) and
+/// [`build_namespace_view`] (#582) so the folding + hashing discipline lives
+/// in exactly one place.
+fn fold_resources(all: Vec<p::Resource>, seq: u64) -> MaterializedView {
     let mut resources: BTreeMap<String, ResourceEntry> = BTreeMap::new();
     for resource in all {
         // canonical_key only fails for a resource we could not have emitted
@@ -269,15 +334,18 @@ fn build_view(inputs: &ViewInputs<'_>, seq: u64) -> MaterializedView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
+    use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
     use coxswain_core::listener_status::SharedGatewayListenerStatus;
     use coxswain_core::publish_index::SharedGatewayPublishIndex;
     use coxswain_core::routing::{
-        BackendGroup, IngressRoutingTableBuilder, RouteEntry, SharedGatewayRoutingTable,
-        SharedIngressRoutingTable, SharedTcpRouteTable, SharedTlsPassthroughTable,
-        SharedUdpRouteTable,
+        BackendGroup, GatewayRoutingTableBuilder, IngressRoutingTableBuilder, RouteEntry,
+        SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
+        SharedTlsPassthroughTable, SharedUdpRouteTable,
     };
-    use coxswain_core::tls::{SharedClientCertStore, SharedPortTlsStore};
+    use coxswain_core::tls::{
+        ClientCertStore, PortTlsStore, SharedClientCertStore, SharedPortTlsStore,
+    };
+    use std::collections::HashMap as StdHashMap;
 
     fn source_with_ingress(table: IngressRoutingTable) -> SnapshotSource {
         let ingress = SharedIngressRoutingTable::new();
@@ -342,5 +410,164 @@ mod tests {
         );
         assert!(view.resources.is_empty(), "fail-closed empty world");
         assert_eq!(view.seq, 0, "empty world records seq 0");
+    }
+
+    // ── #582: Namespace scope materialize ───────────────────────────────────
+
+    /// A dedicated Gateway snapshot with one Gateway-table route on `host`,
+    /// backed by `svc`.
+    fn dedicated_snapshot(host: &str, svc: &str) -> DedicatedRoutingSnapshot {
+        let bg = Arc::new(BackendGroup::new(
+            format!("prod/{svc}"),
+            vec!["10.0.0.1:80".parse().unwrap()],
+        ));
+        let entry = Arc::new(RouteEntry::path_only(bg, format!("prod/{svc}"), None));
+        let mut b = GatewayRoutingTableBuilder::new();
+        b.for_port(443).exact_host(host).add_exact_route("/", entry);
+        DedicatedRoutingSnapshot {
+            gateway: Arc::new(b.build().expect("build")),
+            tls: Arc::new(PortTlsStore::default()),
+            client_certs: Arc::new(ClientCertStore::default()),
+            listener_status: StdHashMap::new(),
+            expected_proxy_sa: format!("{svc}-coxswain"),
+        }
+    }
+
+    fn source_with_dedicated(
+        entries: Vec<(&str, &str, &str)>, // (namespace, name, host)
+    ) -> SnapshotSource {
+        let dedicated = DedicatedRoutingRegistry::new();
+        let mut map = StdHashMap::new();
+        for (ns, name, host) in &entries {
+            let key = ObjectKey::new((*ns).to_owned(), (*name).to_owned());
+            map.insert(key, Arc::new(dedicated_snapshot(host, name)));
+        }
+        dedicated.store(Arc::new(map));
+
+        // Stamp each Gateway's publish-seq via its own incremental rebuild call,
+        // always re-including every previously-stamped Gateway at the same
+        // (generation, fingerprint) so it stays sticky (per `stamp_rebuild`'s
+        // contract) — this is how sequential real-world rebuilds give each
+        // Gateway a distinct seq rather than all sharing one call's sequence.
+        let publish = SharedGatewayPublishIndex::new();
+        let mut accum: Vec<(ObjectKey, i64, u64)> = Vec::new();
+        for (ns, name, _) in &entries {
+            accum.push((ObjectKey::new((*ns).to_owned(), (*name).to_owned()), 1, 0));
+            publish.stamp_rebuild(accum.clone());
+        }
+        SnapshotSource {
+            ingress: SharedIngressRoutingTable::new(),
+            gateway: SharedGatewayRoutingTable::new(),
+            tls: SharedPortTlsStore::new(),
+            client_certs: SharedClientCertStore::new(),
+            listener_status: SharedGatewayListenerStatus::new(),
+            dedicated,
+            passthrough_routes: SharedTlsPassthroughTable::new(),
+            terminate_routes: SharedTlsPassthroughTable::new(),
+            tcp_routes: SharedTcpRouteTable::new(),
+            udp_routes: SharedUdpRouteTable::new(),
+            publish,
+        }
+    }
+
+    /// A `Namespace` view aggregates every dedicated Gateway in that namespace:
+    /// each Gateway's route resource is qualified `gw|<ns>|<name>|...`, and each
+    /// gets its own `gwmeta|<ns>|<name>` resource stamped with its own
+    /// publish-seq (not the namespace-wide `current_seq`).
+    #[test]
+    fn namespace_view_aggregates_and_qualifies_every_dedicated_gateway() {
+        let source = source_with_dedicated(vec![
+            ("prod", "gw-a", "a.example.com"),
+            ("prod", "gw-b", "b.example.com"),
+        ]);
+        let view = materialize(
+            &source,
+            &Scope::Namespace {
+                namespace: "prod".to_owned(),
+            },
+            None,
+        );
+        assert!(
+            view.resources
+                .contains_key("gw|prod|gw-a|route|gateway|443|exact|a.example.com"),
+            "gw-a's route must be qualified: {:?}",
+            view.resources.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            view.resources
+                .contains_key("gw|prod|gw-b|route|gateway|443|exact|b.example.com"),
+            "gw-b's route must be qualified: {:?}",
+            view.resources.keys().collect::<Vec<_>>()
+        );
+        // Assert the actual decoded `publish_seq` per Gateway, not just that the
+        // two `GatewayMeta` resources hash differently — their qualifiers alone
+        // (`gw-a` vs `gw-b`) would already guarantee that, so a hash-inequality
+        // check alone would not catch a bug that stamped every Gateway with the
+        // same (or the namespace-wide `current_seq()`) sequence.
+        let gwmeta_seq = |key: &str| match view.resources[key].resource.payload.as_ref() {
+            Some(p::resource::Payload::GatewayMeta(m)) => m.publish_seq,
+            other => panic!("expected GatewayMeta payload at {key}, got {other:?}"),
+        };
+        assert_eq!(
+            gwmeta_seq("gwmeta|prod|gw-a"),
+            1,
+            "gw-a was stamped at the first incremental rebuild"
+        );
+        assert_eq!(
+            gwmeta_seq("gwmeta|prod|gw-b"),
+            2,
+            "gw-b was stamped at the second incremental rebuild, distinct from gw-a's"
+        );
+    }
+
+    /// A namespace with no cut-over dedicated Gateways fails closed to an empty
+    /// world at seq 0, mirroring the absent-Gateway scope branch.
+    #[test]
+    fn empty_namespace_is_empty_seq_zero() {
+        let source = source_with_dedicated(vec![("prod", "gw-a", "a.example.com")]);
+        let view = materialize(
+            &source,
+            &Scope::Namespace {
+                namespace: "other-ns".to_owned(),
+            },
+            None,
+        );
+        assert!(view.resources.is_empty(), "fail-closed empty world");
+        assert_eq!(view.seq, 0, "empty world records seq 0");
+    }
+
+    /// Removing one Gateway from the dedicated registry changes only that
+    /// Gateway's qualified keys in the namespace view — the delta-over-qualified-
+    /// keys acceptance criterion (verified here at the materialize layer: the
+    /// surviving Gateway's key set is byte-identical across both worlds).
+    #[test]
+    fn gateway_removal_changes_only_its_own_qualified_keys() {
+        let before = source_with_dedicated(vec![
+            ("prod", "gw-a", "a.example.com"),
+            ("prod", "gw-b", "b.example.com"),
+        ]);
+        let after = source_with_dedicated(vec![("prod", "gw-a", "a.example.com")]);
+
+        let scope = Scope::Namespace {
+            namespace: "prod".to_owned(),
+        };
+        let view_before = materialize(&before, &scope, None);
+        let view_after = materialize(&after, &scope, None);
+
+        let gw_a_key = "gw|prod|gw-a|route|gateway|443|exact|a.example.com";
+        assert_eq!(
+            view_before.resources[gw_a_key].hash, view_after.resources[gw_a_key].hash,
+            "gw-a's resources are unaffected by gw-b's removal"
+        );
+        assert!(
+            !view_after
+                .resources
+                .contains_key("gw|prod|gw-b|route|gateway|443|exact|b.example.com"),
+            "gw-b's route must be gone from the post-removal view"
+        );
+        assert!(
+            !view_after.resources.contains_key("gwmeta|prod|gw-b"),
+            "gw-b's GatewayMeta must be gone from the post-removal view"
+        );
     }
 }

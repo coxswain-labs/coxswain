@@ -74,6 +74,13 @@ message Scope {
   oneof kind {
     SharedPoolScope shared_pool = 1;
     GatewayScope gateway = 2;
+    // Every dedicated-Gateway world in one namespace, as a single aggregate
+    // stream (#582). Relay-tier upstream subscription only: no leaf proxy
+    // ever sends this, and a relay's own downstream server rejects it in v1
+    // (only the controller serves this scope). Resources on this scope carry
+    // the qualifier fields on `Resource` so a relay can demux each resource
+    // back to the Gateway it belongs to.
+    NamespaceScope namespace = 3;
   }
 }
 
@@ -84,6 +91,11 @@ message SharedPoolScope {}
 message GatewayScope {
   string namespace = 1;
   string name = 2;
+}
+
+// Every dedicated-Gateway world within one namespace (#582).
+message NamespaceScope {
+  string namespace = 1;
 }
 
 // Positive acknowledgement: client has applied the snapshot at `version`.
@@ -180,7 +192,23 @@ message Resource {
     TcpRoutePort tcp_port = 17;                 // one port's TCP backend (#505)
     UdpRoutePort udp_port = 18;                 // one port's UDP backend (#506)
     EndpointResource endpoints = 19;            // EDS-style (ns, svc, port) endpoints
+    GatewayMeta gateway_meta = 20;              // one Gateway's publish-seq (#582, Namespace scope only)
   }
+  // Namespace-view qualifier (#582): which dedicated Gateway this resource
+  // belongs to. Set only inside a `Scope::Namespace` view (the relay's
+  // upstream aggregate stream); empty — proto3 default, unencoded — for every
+  // `SharedPool`/`Gateway` view, which keeps their resource bytes and hashes
+  // byte-identical to pre-#582 wire output.
+  string qualifier_namespace = 30;
+  string qualifier_name = 31;
+}
+
+// One dedicated Gateway's publish sequence (#582), carried as a resource
+// inside a `Scope::Namespace` view so the relay can re-stamp per-Gateway
+// convergence state (#531) downstream. The owning Gateway's namespace/name
+// come from the enclosing `Resource`'s qualifier fields, not this message.
+message GatewayMeta {
+  uint64 publish_seq = 1;
 }
 
 // Which L7 routing table a RouteHostResource belongs to. Ingress and Gateway

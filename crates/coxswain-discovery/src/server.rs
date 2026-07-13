@@ -49,7 +49,7 @@
 //! the admin UI convergence panel (T8) and by the controller's Gateway
 //! `Programmed` readiness gate (#531).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
@@ -157,6 +157,35 @@ impl Clone for SnapshotSource {
 
 // ── DiscoveryService ──────────────────────────────────────────────────────────
 
+/// Authorizes a [`Scope::Namespace`] subscribe (#582, the relay tier's upstream
+/// aggregation scope).
+///
+/// `Namespace` fans out every dedicated Gateway's routing world in one
+/// namespace to a single stream, so a wrongly-authorized subscriber gets a much
+/// bigger blast radius than a single `Scope::Gateway` binding — hence a
+/// dedicated seam rather than reusing [`svid_matches_dedicated_gateway`].
+/// Provisioning-backed implementations land with #584; until then every
+/// [`DiscoveryService`] defaults to [`DenyAllNamespaces`].
+pub trait ScopeAuthorizer: Send + Sync {
+    /// Returns `true` if `peer` may open a `Namespace{namespace}` subscribe.
+    fn allows_namespace(&self, peer: &PeerSvid, namespace: &str) -> bool;
+}
+
+/// Fail-closed default [`ScopeAuthorizer`]: denies every `Namespace` subscribe.
+///
+/// Safe until a provenance-backed authorizer (#584) is wired in via
+/// [`DiscoveryService::with_scope_authorizer`] — no relay can be provisioned
+/// yet, so there is no legitimate `Namespace` subscriber to allow.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DenyAllNamespaces;
+
+impl ScopeAuthorizer for DenyAllNamespaces {
+    fn allows_namespace(&self, _peer: &PeerSvid, _namespace: &str) -> bool {
+        false
+    }
+}
+
 /// Discovery gRPC service.
 ///
 /// Wired by `coxswain-bin` into a tonic server that runs as a Pingora background
@@ -175,20 +204,43 @@ pub struct DiscoveryService {
     /// watched value is `true`, and live streams are terminated on a
     /// `true → false` flip. `None`: ungated (unit tests; the bin always gates).
     leader_rx: Option<watch::Receiver<bool>>,
-    /// Per-generation [`Scope::SharedPool`] view cache (#383). Every shared-pool
-    /// stream diffs against the same world, so it is materialized once per rebuild
-    /// generation and shared here behind an `Arc`. Cloning the service (tonic
-    /// clones per connection) shares this cache; Gateway-scope views bypass it
-    /// (each carries a per-stream SVID check). See [`view_for`].
+    /// Per-generation [`Scope::SharedPool`] / [`Scope::Namespace`] view cache
+    /// (#383, #582). Every shared-pool stream diffs against the same world, and
+    /// every relay subscribing to the same namespace diffs against the same
+    /// namespace world, so each is materialized once per rebuild generation and
+    /// shared here behind an `Arc`. Cloning the service (tonic clones per
+    /// connection) shares this cache; Gateway-scope views bypass it (each
+    /// carries a per-stream SVID check). See [`view_for`].
     shared_view: SharedViewCache,
+    /// Authorizer for `Scope::Namespace` subscribes (#582). Defaults to
+    /// [`DenyAllNamespaces`]; `coxswain-bin` installs a provenance-backed
+    /// implementation once #584 provisions relays.
+    authorizer: Arc<dyn ScopeAuthorizer>,
 }
 
-/// Shared, generation-keyed [`Scope::SharedPool`] view cache. `None` before the
-/// first build; otherwise the `(generation, view)` most recently materialized.
+/// Shared, generation-keyed view cache for scopes every subscriber of the same
+/// key diffs against identically: [`Scope::SharedPool`] (single slot) and
+/// [`Scope::Namespace`] (one slot per namespace, #582). `Gateway` scope bypasses
+/// this cache entirely (per-stream SVID binding).
 ///
 /// The lock is a `parking_lot::Mutex` held only for the map read/write, never
 /// across the materialize call or an `.await`.
-type SharedViewCache = Arc<Mutex<Option<(u64, Arc<MaterializedView>)>>>;
+type SharedViewCache = Arc<Mutex<ViewCacheState>>;
+
+/// Cache contents behind [`SharedViewCache`]. Split so the two cacheable scopes
+/// don't share a single-slot cache key (`Namespace{a}` and `Namespace{b}` must
+/// coexist, unlike `SharedPool`'s single world). Each slot is `None` until its
+/// first build — rebuild generations start at 0 in production and in tests, so
+/// a sentinel generation number cannot distinguish "never built" from "built at
+/// generation 0"; `Option` is the only unambiguous representation.
+#[derive(Default)]
+struct ViewCacheState {
+    /// `(generation, view)` for `SharedPool`, most recently materialized.
+    shared_pool: Option<(u64, Arc<MaterializedView>)>,
+    /// `namespace → (generation, view)`, most recently materialized per
+    /// namespace; entries are created lazily on first subscribe.
+    namespace: HashMap<String, Option<(u64, Arc<MaterializedView>)>>,
+}
 
 /// Stream-rejection message sent by a non-leader replica (#531).
 ///
@@ -222,7 +274,8 @@ impl DiscoveryService {
             registry,
             rebuild_rx,
             leader_rx: None,
-            shared_view: Arc::new(Mutex::new(None)),
+            shared_view: Arc::new(Mutex::new(ViewCacheState::default())),
+            authorizer: Arc::new(DenyAllNamespaces),
         }
     }
 
@@ -239,6 +292,17 @@ impl DiscoveryService {
     #[must_use]
     pub fn with_leader_gate(mut self, rx: watch::Receiver<bool>) -> Self {
         self.leader_rx = Some(rx);
+        self
+    }
+
+    /// Install a [`ScopeAuthorizer`] for `Scope::Namespace` subscribes (#582).
+    ///
+    /// Replaces the [`DenyAllNamespaces`] default. `coxswain-bin` calls this
+    /// once a provenance-backed authorizer exists (#584); until then every
+    /// service denies every `Namespace` subscribe.
+    #[must_use]
+    pub fn with_scope_authorizer(mut self, authorizer: Arc<dyn ScopeAuthorizer>) -> Self {
+        self.authorizer = authorizer;
         self
     }
 }
@@ -381,6 +445,11 @@ fn build_outbound(
 ///
 /// [`Scope::Gateway`] views bypass the cache: each depends on the caller's peer
 /// SVID (the build-time binding check), so they are materialized per call.
+/// [`Scope::Namespace`] (#582) is peer-independent (authorization happens at
+/// stream open, not build time) and every relay subscribing to the same
+/// namespace diffs against the same world, so it shares the same
+/// build-outside-lock-then-recheck cache discipline as `SharedPool`, keyed by
+/// namespace rather than a single slot.
 ///
 /// **One-tick-stale tolerance:** a rebuild stores its cells BEFORE bumping the
 /// generation watch, so materializing at generation `generation` always reads content
@@ -395,29 +464,55 @@ fn view_for(
     peer_svid: Option<&PeerSvid>,
     generation: u64,
 ) -> Arc<MaterializedView> {
-    // Gateway scope: per-stream SVID binding, never cached.
-    if !matches!(scope, Scope::SharedPool) {
-        return Arc::new(build_view(source, scope, peer_svid));
+    match scope {
+        // Gateway scope: per-stream SVID binding, never cached.
+        Scope::Gateway { .. } => Arc::new(build_view(source, scope, peer_svid)),
+        Scope::SharedPool => cached_view(cache, source, scope, peer_svid, generation, |state| {
+            &mut state.shared_pool
+        }),
+        Scope::Namespace { namespace } => {
+            let namespace = namespace.clone();
+            cached_view(cache, source, scope, peer_svid, generation, move |state| {
+                state.namespace.entry(namespace.clone()).or_default()
+            })
+        }
     }
+}
 
+/// Shared build-outside-lock-then-recheck cache discipline for a single
+/// `(generation, view)` slot, addressed by `slot` inside the locked
+/// [`ViewCacheState`]. Used for both the single `SharedPool` slot and each
+/// `Namespace` map entry (#582).
+fn cached_view(
+    cache: &SharedViewCache,
+    source: &SnapshotSource,
+    scope: &Scope,
+    peer_svid: Option<&PeerSvid>,
+    generation: u64,
+    slot: impl Fn(&mut ViewCacheState) -> &mut Option<(u64, Arc<MaterializedView>)>,
+) -> Arc<MaterializedView> {
     // Fast path: a cached view for this (or a newer) generation.
-    if let Some((cached_gen, view)) = cache.lock().as_ref()
-        && *cached_gen >= generation
     {
-        return view.clone();
+        let mut guard = cache.lock();
+        if let Some((cached_gen, view)) = slot(&mut guard).as_ref()
+            && *cached_gen >= generation
+        {
+            return view.clone();
+        }
     }
 
     // Miss: build outside the lock, then re-check before storing.
     let view = Arc::new(build_view(source, scope, peer_svid));
     let mut guard = cache.lock();
-    if let Some((cached_gen, existing)) = guard.as_ref()
+    let entry = slot(&mut guard);
+    if let Some((cached_gen, existing)) = entry.as_ref()
         && *cached_gen >= generation
     {
-        // A concurrent builder cached the same-or-newer generation while we built;
-        // prefer it so all streams of a generation share one `Arc`.
+        // A concurrent builder cached the same-or-newer generation while we
+        // built; prefer it so all streams of a generation share one `Arc`.
         return existing.clone();
     }
-    *guard = Some((generation, view.clone()));
+    *entry = Some((generation, view.clone()));
     view
 }
 
@@ -535,6 +630,25 @@ impl Discovery for DiscoveryService {
                     .inc();
                 return Err(Status::permission_denied(
                     "scope claim does not match authenticated SVID identity",
+                ));
+            }
+        }
+
+        // Open-time scope authorization for `Scope::Namespace` (#582): unlike
+        // the Gateway binding check above, this does NOT fail-open on an
+        // absent PeerSvid — a Namespace subscribe fans out every dedicated
+        // Gateway in the namespace to one stream, so an unauthenticated
+        // connection must be denied by the same authorizer as an
+        // authenticated one (the default `DenyAllNamespaces` denies both; a
+        // stub-allow authorizer in tests can accept either explicitly).
+        if let Scope::Namespace { namespace } = &scope {
+            let peer = peer_svid.clone().unwrap_or_default();
+            if !self.authorizer.allows_namespace(&peer, namespace) {
+                crate::metrics::streams_total()
+                    .with_label_values(&["rejected"])
+                    .inc();
+                return Err(Status::permission_denied(
+                    "discovery: Namespace scope not authorized for this identity",
                 ));
             }
         }
@@ -673,6 +787,9 @@ fn node_scope_from(scope: &Scope) -> NodeScope {
         Scope::Gateway { name, namespace } => NodeScope::Gateway {
             namespace: namespace.clone(),
             name: name.clone(),
+        },
+        Scope::Namespace { namespace } => NodeScope::Namespace {
+            namespace: namespace.clone(),
         },
     }
 }
@@ -1186,11 +1303,25 @@ mod tests {
     }
 
     async fn start_harness_with_gate(leader_rx: Option<watch::Receiver<bool>>) -> TestHarness {
+        start_harness_with(leader_rx, Arc::new(DenyAllNamespaces)).await
+    }
+
+    /// Start the harness with a custom [`ScopeAuthorizer`] installed (#582),
+    /// ungated (leadership always granted).
+    async fn start_harness_with_authorizer(authorizer: Arc<dyn ScopeAuthorizer>) -> TestHarness {
+        start_harness_with(None, authorizer).await
+    }
+
+    async fn start_harness_with(
+        leader_rx: Option<watch::Receiver<bool>>,
+        authorizer: Arc<dyn ScopeAuthorizer>,
+    ) -> TestHarness {
         let source = empty_source();
         let registry = SharedNodeRegistry::new();
         let (rebuild_tx, rebuild_rx) = watch::channel(0u64);
 
-        let mut svc = DiscoveryService::new(source.clone(), registry.clone(), rebuild_rx);
+        let mut svc = DiscoveryService::new(source.clone(), registry.clone(), rebuild_rx)
+            .with_scope_authorizer(authorizer);
         if let Some(rx) = leader_rx {
             svc = svc.with_leader_gate(rx);
         }
@@ -1210,6 +1341,16 @@ mod tests {
             rebuild_tx,
             publish,
             source,
+        }
+    }
+
+    /// A [`ScopeAuthorizer`] test double that allows every `Namespace` subscribe
+    /// — the inverse of the production [`DenyAllNamespaces`] default.
+    struct AllowAllNamespaces;
+
+    impl ScopeAuthorizer for AllowAllNamespaces {
+        fn allows_namespace(&self, _peer: &PeerSvid, _namespace: &str) -> bool {
+            true
         }
     }
 
@@ -2307,6 +2448,58 @@ mod tests {
         h.publish_ingress(ingress_route("a.example.com", "svc-a", &["10.0.0.9:80"]));
         let d3 = recv_snapshot(&mut rx).await;
         apply_and_check(&mut world, &d3);
+        drop(tx);
+    }
+
+    // ── #582: Namespace scope authorization ─────────────────────────────────
+
+    fn namespace_subscribe(node_id: &str, namespace: &str) -> p::Subscribe {
+        p::Subscribe {
+            node_id: node_id.to_owned(),
+            wire_version: WIRE_VERSION,
+            scope: Some(crate::wire::scope_to_wire(
+                &crate::subscription::Scope::Namespace {
+                    namespace: namespace.to_owned(),
+                },
+            )),
+        }
+    }
+
+    /// The default [`DenyAllNamespaces`] authorizer rejects a `Namespace`
+    /// subscribe with `PERMISSION_DENIED`, even on the plaintext (no PeerSvid)
+    /// test path — unlike the Gateway binding check, this must NOT fail-open.
+    #[tokio::test]
+    async fn namespace_subscribe_denied_by_default() {
+        let h = start_harness().await;
+        let err = open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "prod"))
+            .await
+            .expect_err("Namespace subscribe must be denied by the default authorizer");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
+    }
+
+    /// A [`ScopeAuthorizer`] that allows the namespace lets the subscribe open
+    /// and receive a snapshot — proves the seam is wired end-to-end, not just
+    /// deny-by-default.
+    #[tokio::test]
+    async fn namespace_subscribe_allowed_by_stub_authorizer() {
+        let h = start_harness_with_authorizer(Arc::new(AllowAllNamespaces)).await;
+        let (tx, mut rx) =
+            open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "prod"))
+                .await
+                .expect("Namespace subscribe must be accepted by an allowing authorizer");
+        let snap = recv_snapshot(&mut rx).await;
+        assert!(snap.full, "first message of a session is always a full");
+        drop(tx);
+    }
+
+    /// `SharedPool`/`Gateway` subscribes are unaffected by the `ScopeAuthorizer`
+    /// seam — the default deny-all authorizer only gates `Namespace`.
+    #[tokio::test]
+    async fn shared_pool_subscribe_unaffected_by_namespace_authorizer() {
+        let h = start_harness().await;
+        let (tx, mut rx) = open_stream(h.addr, "node-shared").await;
+        let snap = recv_snapshot(&mut rx).await;
+        assert!(snap.full);
         drop(tx);
     }
 }

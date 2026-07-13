@@ -72,6 +72,7 @@ impl EndpointCollector {
                         service_exists: resolved.service_exists,
                         addrs,
                     })),
+                    ..Default::default()
                 }
             })
             .collect()
@@ -119,6 +120,7 @@ fn route_resources<Kind>(
                     port: u32::from(port),
                     host: Some(host),
                 })),
+                ..Default::default()
             });
         }
     }
@@ -914,6 +916,7 @@ pub(crate) fn passthrough_resources(
             };
             p::Resource {
                 payload: Some(payload),
+                ..Default::default()
             }
         })
         .collect()
@@ -931,6 +934,7 @@ pub(crate) fn tcp_resources(
                 port: u32::from(port),
                 backend_group: Some(backend_group_to_wire(bg, 0, endpoints)),
             })),
+            ..Default::default()
         })
         .collect()
 }
@@ -947,6 +951,7 @@ pub(crate) fn udp_resources(
                 port: u32::from(port),
                 backend_group: Some(backend_group_to_wire(bg, 0, endpoints)),
             })),
+            ..Default::default()
         })
         .collect()
 }

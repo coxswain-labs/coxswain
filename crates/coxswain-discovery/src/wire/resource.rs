@@ -52,6 +52,12 @@ pub enum ResourceKeyError {
         /// Human-readable reason the string failed to parse.
         reason: &'static str,
     },
+    /// A [`p::resource::Payload::GatewayMeta`] resource carried no qualifier, or
+    /// a resource carried exactly one of `qualifier_namespace`/`qualifier_name`
+    /// (#582). Both are required together: a `GatewayMeta` names no Gateway on
+    /// its own, and a half-qualified resource cannot be demuxed by a relay.
+    #[error("resource qualifier is absent or incomplete")]
+    MissingQualifier,
 }
 
 /// The parsed form of a canonical key — the inverse of [`canonical_key`].
@@ -97,6 +103,24 @@ pub(crate) enum ParsedKey {
         /// Referenced Service port.
         port: u16,
     },
+    /// A resource qualified to one dedicated Gateway inside a `Namespace` view
+    /// (`gw|<ns>|<name>|<inner>`, #582). `inner` is the resource's own
+    /// (unqualified) parsed key.
+    Qualified {
+        /// Owning Gateway's namespace.
+        namespace: String,
+        /// Owning Gateway's name.
+        name: String,
+        /// The wrapped resource's own key.
+        inner: Box<ParsedKey>,
+    },
+    /// A per-Gateway publish-seq resource (`gwmeta|<ns>|<name>`, #582).
+    GatewayMeta {
+        /// Gateway namespace.
+        namespace: String,
+        /// Gateway name.
+        name: String,
+    },
 }
 
 /// The host dimension of a parsed route key.
@@ -125,15 +149,25 @@ pub(crate) enum ParsedHost {
 ///   `tlsterminate|<port>`, `tcp|<port>`, `udp|<port>`
 /// - `listener|<ns>/<name>`
 /// - `endpoints|<ns>/<svc>/<port>`
+/// - `gwmeta|<ns>|<name>` (#582, `Namespace`-scope views only)
 ///
 /// For an exact route the host is the hostname; for a wildcard route it is the
 /// bare suffix (no `*.` prefix); a catchall route omits the trailing host field.
 ///
+/// Any resource above — except `GatewayMeta`, which is inherently per-Gateway —
+/// carries a `gw|<ns>|<name>|` prefix when [`p::Resource::qualifier_namespace`]
+/// / `qualifier_name` are set (#582, `Namespace`-scope views): e.g.
+/// `gw|prod|gw-a|route|gateway|443|exact|example.com`. `SharedPool`/`Gateway`
+/// views never set the qualifier, so their keys and resource bytes are
+/// byte-identical to pre-#582 wire output.
+///
 /// # Errors
 ///
-/// Returns [`ResourceKeyError`] when the resource carries no payload arm, or a
+/// Returns [`ResourceKeyError`] when the resource carries no payload arm, a
 /// route-host resource is missing its host / pattern / a concrete table or
-/// wildcard kind — none of which can be placed in the keyed world.
+/// wildcard kind, or the resource's qualifier is absent/incomplete (a
+/// `GatewayMeta` payload with no qualifier, or exactly one of
+/// `qualifier_namespace`/`qualifier_name` set).
 #[must_use = "the canonical key identifies the resource in the world; discarding it drops the resource"]
 pub fn canonical_key(resource: &p::Resource) -> Result<String, ResourceKeyError> {
     // Delimiter-safety invariant: the free-form components spliced into a key
@@ -148,6 +182,16 @@ pub fn canonical_key(resource: &p::Resource) -> Result<String, ResourceKeyError>
         .payload
         .as_ref()
         .ok_or(ResourceKeyError::MissingPayload)?;
+
+    let qualifier = match (
+        resource.qualifier_namespace.as_str(),
+        resource.qualifier_name.as_str(),
+    ) {
+        ("", "") => None,
+        (ns, name) if !ns.is_empty() && !name.is_empty() => Some((ns, name)),
+        _ => return Err(ResourceKeyError::MissingQualifier),
+    };
+
     let key = match payload {
         p::resource::Payload::RouteHost(r) => route_host_key(r)?,
         p::resource::Payload::TlsPort(e) => format!("tls|{}", e.port),
@@ -160,8 +204,18 @@ pub fn canonical_key(resource: &p::Resource) -> Result<String, ResourceKeyError>
         p::resource::Payload::Endpoints(e) => {
             format!("endpoints|{}/{}/{}", e.namespace, e.service, e.port)
         }
+        // Inherently per-Gateway: returns directly rather than falling into the
+        // shared `gw|<ns>|<name>|` wrapping below (a GatewayMeta's own key IS
+        // the qualifier, not a wrapped inner key).
+        p::resource::Payload::GatewayMeta(_) => {
+            let (ns, name) = qualifier.ok_or(ResourceKeyError::MissingQualifier)?;
+            return Ok(format!("gwmeta|{ns}|{name}"));
+        }
     };
-    Ok(key)
+    Ok(match qualifier {
+        Some((ns, name)) => format!("gw|{ns}|{name}|{key}"),
+        None => key,
+    })
 }
 
 /// Canonical key for a [`p::RouteHostResource`]: `route|<table>|<port>|<pattern>[|<host>]`.
@@ -283,6 +337,48 @@ pub(crate) fn parse_canonical_key(key: &str) -> Result<ParsedKey, ResourceKeyErr
                 }),
             }
         }
+        // `gwmeta|<ns>|<name>` (#582) — the terminal pair is `|`-separated like
+        // every other prefix (ns/name are DNS-1123, no embedded `|`).
+        "gwmeta" => {
+            let mut parts = rest.splitn(2, '|');
+            let namespace = parts.next().unwrap_or_default();
+            let name = parts.next();
+            match name {
+                Some(name) if !namespace.is_empty() && !name.is_empty() => {
+                    Ok(ParsedKey::GatewayMeta {
+                        namespace: namespace.to_owned(),
+                        name: name.to_owned(),
+                    })
+                }
+                _ => Err(ResourceKeyError::MalformedKey {
+                    reason: "gwmeta key is not ns|name",
+                }),
+            }
+        }
+        // `gw|<ns>|<name>|<inner>` (#582) — ns/name are terminal-safe fields,
+        // `<inner>` is the wrapped resource's own (unqualified) canonical key
+        // and may itself contain further `|` separators, so it is recursed on
+        // whole rather than split further here.
+        "gw" => {
+            let mut parts = rest.splitn(3, '|');
+            let namespace = parts.next().unwrap_or_default();
+            let name = parts.next();
+            let inner = parts.next();
+            match (name, inner) {
+                (Some(name), Some(inner))
+                    if !namespace.is_empty() && !name.is_empty() && !inner.is_empty() =>
+                {
+                    Ok(ParsedKey::Qualified {
+                        namespace: namespace.to_owned(),
+                        name: name.to_owned(),
+                        inner: Box::new(parse_canonical_key(inner)?),
+                    })
+                }
+                _ => Err(ResourceKeyError::MalformedKey {
+                    reason: "gw-qualified key is not ns|name|<inner>",
+                }),
+            }
+        }
         _ => Err(ResourceKeyError::MalformedKey {
             reason: "unknown canonical-key prefix",
         }),
@@ -372,6 +468,7 @@ mod tests {
                     routes: Vec::new(),
                 }),
             })),
+            ..Default::default()
         }
     }
 
@@ -425,6 +522,7 @@ mod tests {
                         port: 443,
                         store: None,
                     })),
+                    ..Default::default()
                 },
                 "tls|443",
             ),
@@ -436,6 +534,7 @@ mod tests {
                             entries: Vec::new(),
                         },
                     )),
+                    ..Default::default()
                 },
                 "clientcert|443",
             ),
@@ -447,6 +546,7 @@ mod tests {
                             status: None,
                         },
                     )),
+                    ..Default::default()
                 },
                 "listener|prod/gw-a",
             ),
@@ -458,6 +558,7 @@ mod tests {
                             entries: Vec::new(),
                         },
                     )),
+                    ..Default::default()
                 },
                 "tlspassthrough|8443",
             ),
@@ -469,6 +570,7 @@ mod tests {
                             entries: Vec::new(),
                         },
                     )),
+                    ..Default::default()
                 },
                 "tlsterminate|8443",
             ),
@@ -478,6 +580,7 @@ mod tests {
                         port: 9000,
                         backend_group: None,
                     })),
+                    ..Default::default()
                 },
                 "tcp|9000",
             ),
@@ -487,6 +590,7 @@ mod tests {
                         port: 5353,
                         backend_group: None,
                     })),
+                    ..Default::default()
                 },
                 "udp|5353",
             ),
@@ -500,6 +604,7 @@ mod tests {
                         service_exists: true,
                         addrs: Vec::new(),
                     })),
+                    ..Default::default()
                 },
                 "endpoints|default/svc/80",
             ),
@@ -617,7 +722,11 @@ mod tests {
     /// cannot be keyed.
     #[test]
     fn missing_payload_is_unkeyable() {
-        let err = canonical_key(&p::Resource { payload: None }).unwrap_err();
+        let err = canonical_key(&p::Resource {
+            payload: None,
+            ..Default::default()
+        })
+        .unwrap_err();
         assert_eq!(err, ResourceKeyError::MissingPayload);
     }
 
@@ -632,9 +741,11 @@ mod tests {
         };
         let passthrough = p::Resource {
             payload: Some(p::resource::Payload::TlsPassthroughPort(port.clone())),
+            ..Default::default()
         };
         let terminate = p::Resource {
             payload: Some(p::resource::Payload::TlsTerminatePort(port)),
+            ..Default::default()
         };
         assert_ne!(
             resource_hash(&passthrough),
@@ -661,5 +772,165 @@ mod tests {
             p::host_entry::Pattern::Exact("example.com".to_owned()),
         );
         assert_eq!(resource_hash(&a), resource_hash(&b));
+    }
+
+    // ── #582: per-Gateway qualifier + GatewayMeta ───────────────────────────
+
+    fn qualified(resource: p::Resource, namespace: &str, name: &str) -> p::Resource {
+        p::Resource {
+            qualifier_namespace: namespace.to_owned(),
+            qualifier_name: name.to_owned(),
+            ..resource
+        }
+    }
+
+    fn gateway_meta(namespace: &str, name: &str, publish_seq: u64) -> p::Resource {
+        p::Resource {
+            payload: Some(p::resource::Payload::GatewayMeta(p::GatewayMeta {
+                publish_seq,
+            })),
+            qualifier_namespace: namespace.to_owned(),
+            qualifier_name: name.to_owned(),
+        }
+    }
+
+    /// A qualified resource's canonical key is `gw|<ns>|<name>|` prepended to
+    /// its own unqualified key.
+    #[test]
+    fn qualified_resource_key_golden() {
+        let base = route_host(
+            p::RouteTableKind::Gateway,
+            443,
+            p::host_entry::Pattern::Exact("example.com".to_owned()),
+        );
+        let resource = qualified(base, "prod", "gw-a");
+        assert_eq!(
+            canonical_key(&resource).expect("keyable"),
+            "gw|prod|gw-a|route|gateway|443|exact|example.com"
+        );
+    }
+
+    /// A `GatewayMeta` resource keys to `gwmeta|<ns>|<name>` — its own key IS
+    /// the qualifier, not a wrapped inner key.
+    #[test]
+    fn gateway_meta_key_golden() {
+        let resource = gateway_meta("prod", "gw-a", 7);
+        assert_eq!(
+            canonical_key(&resource).expect("keyable"),
+            "gwmeta|prod|gw-a"
+        );
+    }
+
+    /// `parse_canonical_key` round-trips both new #582 key shapes.
+    #[test]
+    fn parse_canonical_key_round_trips_582_goldens() {
+        assert_eq!(
+            parse_canonical_key("gw|prod|gw-a|route|gateway|443|exact|example.com")
+                .expect("parseable"),
+            ParsedKey::Qualified {
+                namespace: "prod".to_owned(),
+                name: "gw-a".to_owned(),
+                inner: Box::new(ParsedKey::Route {
+                    gateway: true,
+                    port: 443,
+                    host: ParsedHost::Exact("example.com".to_owned()),
+                }),
+            }
+        );
+        assert_eq!(
+            parse_canonical_key("gwmeta|prod|gw-a").expect("parseable"),
+            ParsedKey::GatewayMeta {
+                namespace: "prod".to_owned(),
+                name: "gw-a".to_owned(),
+            }
+        );
+    }
+
+    /// A `GatewayMeta` payload with no qualifier cannot be keyed — it would
+    /// name no Gateway.
+    #[test]
+    fn gateway_meta_without_qualifier_is_unkeyable() {
+        let resource = p::Resource {
+            payload: Some(p::resource::Payload::GatewayMeta(p::GatewayMeta {
+                publish_seq: 1,
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            canonical_key(&resource).unwrap_err(),
+            ResourceKeyError::MissingQualifier
+        );
+    }
+
+    /// A resource carrying exactly one of `qualifier_namespace`/`qualifier_name`
+    /// is half-qualified and cannot be demuxed to a Gateway.
+    #[test]
+    fn half_qualified_resource_is_unkeyable() {
+        let half = p::Resource {
+            qualifier_namespace: "prod".to_owned(),
+            ..route_host(
+                p::RouteTableKind::Gateway,
+                443,
+                p::host_entry::Pattern::Exact("example.com".to_owned()),
+            )
+        };
+        assert_eq!(
+            canonical_key(&half).unwrap_err(),
+            ResourceKeyError::MissingQualifier
+        );
+    }
+
+    /// Regression guard for the #582 "byte-identical" acceptance criterion: a
+    /// resource with an empty qualifier (every `SharedPool`/`Gateway` resource)
+    /// keys and hashes exactly as it did before the qualifier fields existed.
+    #[test]
+    fn unqualified_resource_is_byte_identical_to_pre_582() {
+        let resource = route_host(
+            p::RouteTableKind::Ingress,
+            80,
+            p::host_entry::Pattern::Exact("example.com".to_owned()),
+        );
+        assert_eq!(
+            canonical_key(&resource).expect("keyable"),
+            "route|ingress|80|exact|example.com",
+            "empty qualifier must not alter the canonical key"
+        );
+
+        // A minimal resource (one scalar field, no nested message) whose encoded
+        // bytes are hand-computable: `Resource.tls_port = 12` (tag 0x62), a
+        // 3-byte embedded `PortTlsEntry { port: 443 }` (field 1, varint tag
+        // 0x08, value 443 = varint [0xBB, 0x03]), `store` omitted (None). If
+        // the #582 qualifier fields (tags 30/31) encoded even as empty proto3
+        // strings, this golden byte vector would grow — it does not.
+        use prost::Message as _;
+        let minimal = p::Resource {
+            payload: Some(p::resource::Payload::TlsPort(p::PortTlsEntry {
+                port: 443,
+                store: None,
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            minimal.encode_to_vec(),
+            vec![0x62, 0x03, 0x08, 0xBB, 0x03],
+            "an empty #582 qualifier must not add a single byte to the wire encoding"
+        );
+    }
+
+    /// Two Gateways with byte-identical resource content hash distinctly once
+    /// qualified — the qualifier fields are part of the hashed proto bytes.
+    #[test]
+    fn same_content_different_qualifier_hashes_distinctly() {
+        let base = || {
+            route_host(
+                p::RouteTableKind::Gateway,
+                443,
+                p::host_entry::Pattern::Exact("example.com".to_owned()),
+            )
+        };
+        let gw_a = qualified(base(), "prod", "gw-a");
+        let gw_b = qualified(base(), "prod", "gw-b");
+        assert_ne!(resource_hash(&gw_a), resource_hash(&gw_b));
+        assert_ne!(canonical_key(&gw_a).unwrap(), canonical_key(&gw_b).unwrap());
     }
 }
