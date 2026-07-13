@@ -159,6 +159,72 @@ pub fn ack_latency_seconds() -> &'static Histogram {
     })
 }
 
+/// Counter: cumulative snapshot messages the server pushed, by `kind`
+/// (`full` | `delta`) (#383). The per-stream delta engine sends a `full` only on
+/// the first message of a session (connect / reconnect) or a Nack-driven resync;
+/// every steady-state routing change ships as a `delta`. A healthy steady state
+/// is a climbing `delta` against a near-static `full` — a rising `full` rate
+/// signals control-plane link churn or repeated self-healing resyncs, mirroring
+/// the client-side [`client_snapshots_applied_total`] from the sending end.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn snapshot_messages_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_discovery_snapshot_messages_total",
+                "Cumulative snapshot messages the server pushed, by kind (full|delta)"
+            ),
+            &["kind"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Counter: cumulative resource DTOs the server placed in a snapshot's `resources`
+/// field — i.e. upserts (#383). A full contributes its whole world; a delta
+/// contributes only the changed resources. Divided by
+/// [`snapshot_messages_total`] it gives the average payload width; under endpoint
+/// churn a delta carries a single `endpoints|…` resource, so the average collapses
+/// toward one — the whole point of EDS-style deltas.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn snapshot_resources_sent_total() -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter!(
+            "coxswain_discovery_snapshot_resources_sent_total",
+            "Cumulative resource upserts the server placed in pushed snapshots"
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Counter: cumulative resource tombstones (`removed_resources` canonical keys)
+/// the server placed in delta snapshots (#383). A full never contributes (its
+/// `removed_resources` is empty); a delta contributes one entry per resource that
+/// left the world since the client's acked baseline. A route deletion or an
+/// endpoint's last-referrer removal shows up here.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn snapshot_resources_removed_total() -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter!(
+            "coxswain_discovery_snapshot_resources_removed_total",
+            "Cumulative resource tombstones the server placed in delta snapshots"
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
 // ── Server-side bootstrap/PKI metrics (controller process) ──────────────────
 
 /// Counter: cumulative Bootstrap RPC outcomes, by result and reason.
@@ -299,9 +365,72 @@ pub fn client_state() -> &'static IntGauge {
     })
 }
 
-/// Histogram: wall-clock cost of one `apply_snapshot` call in
+/// Counter: cumulative route partitions the client **recompiled** on the apply
+/// path (#383). A partition is recompiled when its wire DTO changed or an
+/// endpoint it references changed; unchanged partitions are spliced from the
+/// live table instead (see [`client_partitions_reused_total`]). The ratio of
+/// reused to recompiled is the payoff of the partitioned apply: under endpoint
+/// churn only the referencing partitions recompile.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn client_partitions_recompiled_total() -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter!(
+            "coxswain_discovery_client_partitions_recompiled_total",
+            "Cumulative route partitions recompiled on the discovery-client apply path"
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Counter: cumulative route partitions the client **reused** (spliced the
+/// live compiled `Arc<HostRouter>` for) on the apply path (#383) instead of
+/// recompiling. Counterpart to [`client_partitions_recompiled_total`].
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn client_partitions_reused_total() -> &'static IntCounter {
+    static COUNTER: OnceLock<IntCounter> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter!(
+            "coxswain_discovery_client_partitions_reused_total",
+            "Cumulative route partitions reused (spliced) on the discovery-client apply path"
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Counter: cumulative snapshots the client successfully applied (Ack'd),
+/// labelled by `kind` (`full` | `delta`) (#383). A healthy steady state is a
+/// climbing `delta` with a near-static `full`: fulls happen only on the first
+/// message of a session (connect / reconnect) or after a Nack-driven resync, so
+/// a rising `full` rate signals churn on the control-plane link or repeated
+/// self-healing resyncs.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn client_snapshots_applied_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_discovery_client_snapshots_applied_total",
+                "Cumulative snapshots the client applied, by kind (full|delta)"
+            ),
+            &["kind"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Histogram: wall-clock cost of one `apply::apply_message` call in
 /// [`crate::client`] — the "proxy apply" stage of the #513 convergence
-/// pipeline (decoding every wire DTO and, on success, publishing the
+/// pipeline (staging every wire DTO and, on success, publishing the
 /// [`Shared`] routing cells). Observed on every call regardless of outcome —
 /// a rejected (Nack'd) decode still pays most of the cost this histogram
 /// times before failing, and that cost is exactly what a malformed-snapshot

@@ -22,7 +22,7 @@ pub use common::auth::{
 };
 pub use common::backend::{
     BackendGroup, BackendGroupSpec, HashSource, LoadBalance, LoadBalanceParseError, Selected,
-    SessionAffinity, affinity_hash, affinity_hash_parts, affinity_token,
+    SessionAffinity, WeightedBackendSpec, affinity_hash, affinity_hash_parts, affinity_token,
 };
 pub use common::circuit_breaker::CircuitBreakerConfig;
 pub use common::compression::CompressionConfig;

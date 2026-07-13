@@ -115,3 +115,46 @@ impl ResolvedEndpoints {
 /// across rebuilds. `Arc`-wrapped values so route builders can hold a
 /// resolved entry without cloning the address list.
 pub type EndpointPool = HashMap<EndpointKey, Arc<ResolvedEndpoints>>;
+
+/// The single source of the endpoint-derived error status for a route whose
+/// backend group resolved to zero routable endpoints.
+///
+/// Mirrors the Gateway API HTTPRoute contract (Gateway API §4.3.4 / the reflector's
+/// endpoint-dependent branch in `gateway_api::reconcile`): a backendRef that names
+/// an **existing** Service with zero ready endpoints SHOULD surface `503`
+/// (service-unavailable), whereas an invalid/missing backend (no such Service, wrong
+/// kind, denied cross-namespace) or an all-zero-weight rule MUST surface `500`.
+///
+/// This function is the one place that rule lives, shared by the reflector (which
+/// bakes the status at reconcile time for the in-process path) and the discovery
+/// client (which re-derives it at delta-materialization time from its endpoint pool,
+/// so endpoint-derived statuses never ride the wire and endpoint churn cannot rewrite
+/// route hashes). `has_valid_empty` is `true` when at least one referenced Service
+/// exists but has no ready endpoints.
+///
+/// This is deliberately *only* the endpoint-derived branch: endpoint-independent
+/// statuses (e.g. a `502` fail-closed for an invalid `BackendTLSPolicy`) take
+/// precedence at the call site and are not computed here.
+#[must_use = "the derived error status must be installed on the route entry"]
+pub fn empty_group_status(has_valid_empty: bool) -> u16 {
+    if has_valid_empty { 503 } else { 500 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_group_status_maps_both_branches() {
+        assert_eq!(
+            empty_group_status(true),
+            503,
+            "existing Service, zero ready endpoints → 503"
+        );
+        assert_eq!(
+            empty_group_status(false),
+            500,
+            "missing/invalid backend or all-zero-weight → 500"
+        );
+    }
+}

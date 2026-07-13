@@ -4,16 +4,42 @@
 //! routing snapshots, and fans out `Snapshot` messages to connected proxy clients
 //! with push-after-Ack flow control.
 //!
-//! # Flow control
+//! # Flow control and the per-stream delta engine (#383)
 //!
-//! A new snapshot version is only sent after the prior one has been Ack'd.
-//! Rebuilds that arrive while a snapshot is in-flight are coalesced: after the
-//! Ack arrives the server reads the current world once and sends it if the
-//! version differs from the one just Ack'd.
+//! Each stream keeps a per-node baseline — [`StreamState::acked_resources`], the
+//! canonical-key → resource-hash map of the world the node last Ack'd. Every
+//! outbound message is a diff against that baseline:
 //!
-//! Nacks trigger a retransmit of the same snapshot content with a fresh nonce;
-//! `in_flight` is left unchanged (the retransmit awaits an Ack just like the
-//! original send).
+//! - The **first** message per session (connect, reconnect) has no baseline yet
+//!   (`acked_resources == None`), so it is a `full = true` snapshot of the whole
+//!   world. A reconnect is a fresh session — the baseline is not portable across
+//!   streams, so a redial always re-sends a full.
+//! - Every subsequent message is a `full = false` delta: resources whose hash
+//!   moved (or that are new) ride as upserts; keys that left the world ride as
+//!   `removed_resources` tombstones. The two key sets are disjoint by
+//!   construction. The delta's `version` is the global hash of the POST-APPLY
+//!   world (identical formula to a full), so the client's version self-check
+//!   passes and NodeRegistry / #531 convergence is unchanged.
+//! - A new snapshot is only sent after the prior one is Ack'd (one in-flight).
+//!   Rebuilds arriving while a snapshot is in-flight are coalesced: after the Ack
+//!   promotes the pending world into the baseline, the server reads the current
+//!   world once and sends a single delta spanning baseline → latest. An empty
+//!   delta (the world equals the baseline) is not sent — the node's convergence
+//!   stamp is advanced instead (quiet-cluster #531 liveness).
+//!
+//! Nacks trigger a **full resync** of the current world with a fresh version and
+//! nonce (self-healing — the per-stream payload retention is gone). The client's
+//! baseline is untrustworthy after a Nack, so a full re-establishes it from
+//! scratch; `in_flight`/`pending` become that fresh full.
+//!
+//! # Shared view cache
+//!
+//! [`Scope::SharedPool`] streams all diff against the same routing world, so the
+//! server materializes it at most once per rebuild generation and shares the
+//! resulting `Arc<MaterializedView>` across every shared-pool stream
+//! ([`DiscoveryService::shared_view`]). Gateway-scope views stay per-call (each
+//! carries a per-stream SVID check). The cache lock is a `parking_lot::Mutex`
+//! never held across an `.await`.
 //!
 //! # Node registry
 //!
@@ -23,11 +49,13 @@
 //! the admin UI convergence panel (T8) and by the controller's Gateway
 //! `Programmed` readiness gate (#531).
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
 
 use async_trait::async_trait;
-use prost::Message as _;
+use parking_lot::Mutex;
 use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -47,19 +75,19 @@ use coxswain_core::tls::{SharedClientCertStore, SharedPortTlsStore};
 use crate::auth::{PeerSvid, svid_matches_dedicated_gateway};
 use crate::subscription::Scope;
 
+use crate::materialize::{MaterializedView, materialize};
 use crate::proto::v1::{
     self as p, client_message::Kind as CKind, discovery_server::Discovery,
     server_message::Kind as SKind,
 };
-use crate::version::{ContentHash, WIRE_VERSION};
-use crate::wire::{
-    client_cert_to_wire, gateway_to_wire, ingress_to_wire, listener_status_to_wire,
-    passthrough_to_wire, port_tls_to_wire, scope_from_wire, tcp_table_to_wire, udp_table_to_wire,
-};
+use crate::version::WIRE_VERSION;
+use crate::wire::scope_from_wire;
 
 // ── SnapshotSource ────────────────────────────────────────────────────────────
 
-/// The five routing-table [`Shared`] cells the server reads to build snapshots.
+/// The routing-table [`Shared`] cells the server reads to build snapshots (the
+/// nine shared L7/status/L4 cells, plus the per-Gateway dedicated registry and the
+/// publish-sequence index).
 ///
 /// Populated in `coxswain-bin` from `StatusWriter::outputs`; no K8s API access
 /// happens at serve time.
@@ -80,9 +108,10 @@ pub struct SnapshotSource {
     /// Gateway listener port bind/unbind without Kubernetes API access.
     pub listener_status: SharedGatewayListenerStatus,
     /// Per-cut-over-Gateway routing snapshots, keyed by Gateway [`ObjectKey`].
-    /// Read when a client subscribes with [`Scope::Gateway`]; the five cells
-    /// above serve [`Scope::SharedPool`] (and deliberately exclude cut-over
-    /// Gateways). The shared reconciler is the sole writer.
+    /// Read when a client subscribes with [`Scope::Gateway`]; all the other
+    /// routing cells (the L7/status cells above and the four L4 tables below)
+    /// serve [`Scope::SharedPool`] and deliberately exclude cut-over Gateways. The
+    /// shared reconciler is the sole writer.
     pub dedicated: DedicatedRoutingRegistry,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     /// Only populated for [`Scope::SharedPool`] subscribers; dedicated proxies
@@ -146,7 +175,20 @@ pub struct DiscoveryService {
     /// watched value is `true`, and live streams are terminated on a
     /// `true → false` flip. `None`: ungated (unit tests; the bin always gates).
     leader_rx: Option<watch::Receiver<bool>>,
+    /// Per-generation [`Scope::SharedPool`] view cache (#383). Every shared-pool
+    /// stream diffs against the same world, so it is materialized once per rebuild
+    /// generation and shared here behind an `Arc`. Cloning the service (tonic
+    /// clones per connection) shares this cache; Gateway-scope views bypass it
+    /// (each carries a per-stream SVID check). See [`view_for`].
+    shared_view: SharedViewCache,
 }
+
+/// Shared, generation-keyed [`Scope::SharedPool`] view cache. `None` before the
+/// first build; otherwise the `(generation, view)` most recently materialized.
+///
+/// The lock is a `parking_lot::Mutex` held only for the map read/write, never
+/// across the materialize call or an `.await`.
+type SharedViewCache = Arc<Mutex<Option<(u64, Arc<MaterializedView>)>>>;
 
 /// Stream-rejection message sent by a non-leader replica (#531).
 ///
@@ -180,6 +222,7 @@ impl DiscoveryService {
             registry,
             rebuild_rx,
             leader_rx: None,
+            shared_view: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -217,263 +260,182 @@ fn next_nonce() -> Vec<u8> {
 
 // ── snapshot construction ─────────────────────────────────────────────────────
 
-/// Snapshot content built from the current routing world (without a nonce).
-///
-/// The nonce is assigned immediately before transmission so retransmits can
-/// use the same content with a fresh nonce.
-#[derive(Clone)]
-struct SnapshotContent {
+/// The world a node last confirmed (or is about to), retained per stream as the
+/// delta baseline. Replaces the v1 full-blob retention: a diff only needs the
+/// key → hash map, never the resource bytes (those stay behind the view's `Arc`s).
+struct PendingWorld {
+    /// Global content hash of this world (echoed by the node's Ack).
     version: String,
-    /// Publish sequence captured before the cells were read (never on the
-    /// wire): recorded into the node registry when this snapshot is Ack'd.
+    /// Canonical-key → per-resource-hash map — the diff baseline. Shared with the
+    /// view behind an `Arc`, so retaining it per stream is a cheap clone.
+    resources: Arc<BTreeMap<String, String>>,
+    /// Publish sequence captured before the cells were read (never on the wire);
+    /// recorded into the node registry when this world is Ack'd (#531).
     seq: u64,
-    ingress_routing: p::RoutingTable,
-    gateway_routing: p::RoutingTable,
-    tls_store: p::PortTlsStore,
-    client_cert_store: p::ClientCertStore,
-    listener_status: p::GatewayListenerStatus,
-    tls_passthrough: p::TlsPassthroughTable,
-    tls_terminate: p::TlsPassthroughTable,
-    tcp_proxy: p::TcpRouteTable,
-    udp_proxy: p::UdpRouteTable,
 }
 
-impl SnapshotContent {
-    /// Stamp a fresh nonce and produce a wire [`p::Snapshot`] ready to send.
-    fn into_message(self) -> p::Snapshot {
-        p::Snapshot {
-            version: self.version,
-            nonce: next_nonce(),
-            ingress_routing: Some(self.ingress_routing),
-            gateway_routing: Some(self.gateway_routing),
-            tls_store: Some(self.tls_store),
-            client_cert_store: Some(self.client_cert_store),
-            listener_status: Some(self.listener_status),
-            tls_passthrough: Some(self.tls_passthrough),
-            tls_terminate: Some(self.tls_terminate),
-            tcp_proxy: Some(self.tcp_proxy),
-            udp_proxy: Some(self.udp_proxy),
-        }
-    }
+/// An outbound snapshot ready to send: the wire message (nonce already stamped)
+/// paired with the post-apply world the client will hold once it Acks.
+struct Outbound {
+    /// The wire message — `full = true` for a full, `false` for a delta.
+    message: p::Snapshot,
+    /// The world this message brings the client to; retained as `pending`.
+    world: PendingWorld,
 }
 
-/// Build a [`SnapshotContent`] for the routing world the `scope` subscribes to.
+/// Diff `view` against a node's acked baseline into the message to send next.
 ///
-/// - [`Scope::SharedPool`] serialises the five shared cells verbatim (these
-///   deliberately exclude cut-over Gateways, so the shared pool never serves a
-///   migrated Gateway's routes).
-/// - [`Scope::Gateway`] looks up the Gateway's entry in the dedicated registry
-///   and serialises only that slice (empty Ingress). An absent entry yields an
-///   empty snapshot — a dedicated proxy is fail-closed and never receives
-///   another scope's routes (#426).
-///   When `peer_svid` is present (mTLS connection) and the entry's
-///   `expected_proxy_sa` does not match the peer SVID, the function also returns
-///   an empty snapshot — this is the build-time complement to the open-time
-///   `PERMISSION_DENIED` check in `stream()` and closes the race where a Gateway
-///   entry appears *after* the stream was opened (#427).
-fn build_snapshot(
-    source: &SnapshotSource,
-    scope: &Scope,
-    peer_svid: Option<&PeerSvid>,
-) -> SnapshotContent {
-    // #513: times the whole call, including every early-return (fail-closed
-    // empty-snapshot) branch inside `build_snapshot_inner` — those still pay
-    // the cell-read cost this stage measures, just not the wire-DTO assembly.
-    let start = std::time::Instant::now();
-    let content = build_snapshot_inner(source, scope, peer_svid);
-    crate::metrics::snapshot_build_seconds().observe(start.elapsed().as_secs_f64());
-    content
-}
-
-fn build_snapshot_inner(
-    source: &SnapshotSource,
-    scope: &Scope,
-    peer_svid: Option<&PeerSvid>,
-) -> SnapshotContent {
-    // Capture the publish sequence BEFORE reading any cell: every rebuild
-    // stamped at a sequence <= this value stored its cells before bumping the
-    // counter, so the content loaded below is at least that new. Capturing
-    // after the loads would claim content the snapshot may not have.
-    let seq = source.publish.current_seq();
-    let mut content = match scope {
-        Scope::SharedPool => {
-            let ingress = source.ingress.load();
-            let gateway = source.gateway.load();
-            let tls = source.tls.load();
-            let client_certs = source.client_certs.load();
-            let listener_status = source.listener_status.load();
-            let passthrough = source.passthrough_routes.load();
-            let terminate = source.terminate_routes.load();
-            let tcp_proxy = source.tcp_routes.load();
-            let udp_proxy = source.udp_routes.load();
-
-            assemble_snapshot(
-                ingress_to_wire(&ingress),
-                gateway_to_wire(&gateway),
-                port_tls_to_wire(&tls),
-                client_cert_to_wire(&client_certs),
-                listener_status_to_wire(&listener_status),
-                L4TableDtos {
-                    tls_passthrough: passthrough_to_wire(&passthrough),
-                    tls_terminate: passthrough_to_wire(&terminate),
-                    tcp_proxy: tcp_table_to_wire(&tcp_proxy),
-                    udp_proxy: udp_table_to_wire(&udp_proxy),
-                },
-            )
-        }
-        Scope::Gateway { name, namespace } => {
-            let key = ObjectKey::new(namespace.clone(), name.clone());
-            let registry = source.dedicated.load();
-            match registry.get(&key) {
-                Some(snap) => {
-                    // Build-time SVID binding check: if the peer presented an SVID
-                    // but it does not match this Gateway's expected proxy SA, return
-                    // an empty snapshot. This closes the race where the Gateway entry
-                    // appears in the registry after the open-time check in stream().
-                    if let Some(peer) = peer_svid
-                        && !svid_matches_dedicated_gateway(
-                            &peer.uri_sans,
-                            namespace,
-                            &snap.expected_proxy_sa,
-                        )
-                    {
-                        // seq 0, NOT the captured seq: this snapshot is a
-                        // deliberately-emptied world, so an Ack of it must not
-                        // advance the node's convergence stamp — a real seq
-                        // here would let the #531 ack gate certify content the
-                        // node never received. 0 is a no-op under the
-                        // registry's monotone max.
-                        return SnapshotContent {
-                            seq: 0,
-                            ..assemble_snapshot(
-                                p::RoutingTable::default(),
-                                p::RoutingTable::default(),
-                                p::PortTlsStore::default(),
-                                p::ClientCertStore::default(),
-                                p::GatewayListenerStatus::default(),
-                                // Dedicated proxies never serve TLSRoute, TCPRoute, or UDPRoute traffic.
-                                L4TableDtos {
-                                    tls_passthrough: p::TlsPassthroughTable::default(),
-                                    tls_terminate: p::TlsPassthroughTable::default(),
-                                    tcp_proxy: p::TcpRouteTable::default(),
-                                    udp_proxy: p::UdpRouteTable::default(),
-                                },
-                            )
-                        };
-                    }
-                    assemble_snapshot(
-                        // A dedicated proxy never serves Ingress resources.
-                        p::RoutingTable::default(),
-                        gateway_to_wire(&snap.gateway),
-                        port_tls_to_wire(&snap.tls),
-                        client_cert_to_wire(&snap.client_certs),
-                        listener_status_to_wire(&snap.listener_status),
-                        // Dedicated proxies never serve TLSRoute, TCPRoute, or UDPRoute traffic.
-                        L4TableDtos {
-                            tls_passthrough: p::TlsPassthroughTable::default(),
-                            tls_terminate: p::TlsPassthroughTable::default(),
-                            tcp_proxy: p::TcpRouteTable::default(),
-                            udp_proxy: p::UdpRouteTable::default(),
-                        },
-                    )
-                }
-                // Fail closed: the Gateway is not (yet) cut over, so this proxy
-                // receives an empty world rather than another scope's routes.
-                // seq 0 for the same reason as the identity-mismatch branch
-                // above: an Ack of a fail-closed empty world must not advance
-                // the node's #531 convergence stamp.
-                None => {
-                    return SnapshotContent {
-                        seq: 0,
-                        ..assemble_snapshot(
-                            p::RoutingTable::default(),
-                            p::RoutingTable::default(),
-                            p::PortTlsStore::default(),
-                            p::ClientCertStore::default(),
-                            p::GatewayListenerStatus::default(),
-                            L4TableDtos {
-                                tls_passthrough: p::TlsPassthroughTable::default(),
-                                tls_terminate: p::TlsPassthroughTable::default(),
-                                tcp_proxy: p::TcpRouteTable::default(),
-                                udp_proxy: p::UdpRouteTable::default(),
-                            },
-                        )
-                    };
-                }
-            }
-        }
+/// - `acked == None` ⇒ a **full**: every resource in canonical-key order,
+///   `full = true`, no tombstones. Used for the first message of a session.
+/// - `acked == Some(base)` ⇒ a **delta**: upserts are the view resources whose
+///   key is absent from `base` or whose hash moved; tombstones are the `base`
+///   keys absent from the view. Both lists are canonical-key sorted (the view and
+///   `base` are `BTreeMap`s), and the two key sets are disjoint by construction.
+///   An **empty** delta (no upserts, no tombstones — the world equals the
+///   baseline, so `view.version` necessarily equals the acked version) returns
+///   `None`: nothing is sent, and the caller advances the node's convergence
+///   stamp instead of pushing.
+///
+/// In every case the message `version` is `view.version` — the global hash of the
+/// POST-APPLY world (never the delta payload's own hash), so the client's
+/// per-resource version self-check reproduces it exactly.
+fn build_outbound(
+    view: &MaterializedView,
+    acked: Option<&BTreeMap<String, String>>,
+) -> Option<Outbound> {
+    // The post-apply world a client reaches once it Acks this message. Built ONLY
+    // on a send path (never on the empty-delta no-op below), and cheap regardless:
+    // the hash map is shared with the view behind an `Arc`, so this is an `Arc`
+    // clone plus the version string, not a copy of the whole key→hash map.
+    let world = || PendingWorld {
+        version: view.version.clone(),
+        resources: Arc::clone(&view.resource_hashes),
+        seq: view.seq,
     };
-    content.seq = seq;
-    content
-}
-
-/// The L4 wire DTOs [`assemble_snapshot`] groups to stay under the workspace
-/// 7-argument limit: TLS passthrough, TLS terminate (#481), and TCP proxy (#505)
-/// — the three port-keyed tables that bypass the L7 routing tables entirely.
-struct L4TableDtos {
-    tls_passthrough: p::TlsPassthroughTable,
-    tls_terminate: p::TlsPassthroughTable,
-    tcp_proxy: p::TcpRouteTable,
-    udp_proxy: p::UdpRouteTable,
-}
-
-/// Assemble a [`SnapshotContent`] from pre-built wire DTOs.
-///
-/// Derives the global content hash from the sorted per-resource hashes;
-/// identical DTO sets produce identical version strings.
-fn assemble_snapshot(
-    ingress_dto: p::RoutingTable,
-    gateway_dto: p::RoutingTable,
-    tls_dto: p::PortTlsStore,
-    client_certs_dto: p::ClientCertStore,
-    listener_status_dto: p::GatewayListenerStatus,
-    l4: L4TableDtos,
-) -> SnapshotContent {
-    let hashes = vec![
-        ContentHash::compute(&ingress_dto.encode_to_vec())
-            .as_str()
-            .to_owned(),
-        ContentHash::compute(&gateway_dto.encode_to_vec())
-            .as_str()
-            .to_owned(),
-        ContentHash::compute(&tls_dto.encode_to_vec())
-            .as_str()
-            .to_owned(),
-        ContentHash::compute(&client_certs_dto.encode_to_vec())
-            .as_str()
-            .to_owned(),
-        ContentHash::compute(&listener_status_dto.encode_to_vec())
-            .as_str()
-            .to_owned(),
-        ContentHash::compute(&l4.tls_passthrough.encode_to_vec())
-            .as_str()
-            .to_owned(),
-        ContentHash::compute(&l4.tls_terminate.encode_to_vec())
-            .as_str()
-            .to_owned(),
-        ContentHash::compute(&l4.tcp_proxy.encode_to_vec())
-            .as_str()
-            .to_owned(),
-        ContentHash::compute(&l4.udp_proxy.encode_to_vec())
-            .as_str()
-            .to_owned(),
-    ];
-    let version = ContentHash::from_per_resource(hashes).as_str().to_owned();
-
-    SnapshotContent {
-        version,
-        // Placeholder — build_snapshot overwrites with the pre-load capture.
-        seq: 0,
-        ingress_routing: ingress_dto,
-        gateway_routing: gateway_dto,
-        tls_store: tls_dto,
-        client_cert_store: client_certs_dto,
-        listener_status: listener_status_dto,
-        tls_passthrough: l4.tls_passthrough,
-        tls_terminate: l4.tls_terminate,
-        tcp_proxy: l4.tcp_proxy,
-        udp_proxy: l4.udp_proxy,
+    match acked {
+        // First message of a session: the whole world as a full.
+        None => {
+            let resources = view
+                .resources
+                .values()
+                .map(|entry| (*entry.resource).clone())
+                .collect();
+            Some(Outbound {
+                message: p::Snapshot {
+                    version: view.version.clone(),
+                    nonce: next_nonce(),
+                    full: true,
+                    resources,
+                    removed_resources: Vec::new(),
+                },
+                world: world(),
+            })
+        }
+        // Steady state: diff the view against what the node last confirmed.
+        Some(base) => {
+            // Upserts: new keys or keys whose per-resource hash moved. BTreeMap
+            // iteration is canonical-key order, so the wire list is sorted.
+            let resources: Vec<p::Resource> = view
+                .resources
+                .iter()
+                .filter(|(key, entry)| {
+                    base.get(*key).map(String::as_str) != Some(entry.hash.as_str())
+                })
+                .map(|(_, entry)| (*entry.resource).clone())
+                .collect();
+            // Tombstones: baseline keys the view no longer carries. `base` is a
+            // BTreeMap, so this is already canonical-key sorted.
+            let removed_resources: Vec<String> = base
+                .keys()
+                .filter(|key| !view.resources.contains_key(*key))
+                .cloned()
+                .collect();
+            // Empty delta: the world matches the baseline. Do not send — the
+            // caller advances the convergence stamp (quiet-cluster #531 liveness).
+            if resources.is_empty() && removed_resources.is_empty() {
+                return None;
+            }
+            Some(Outbound {
+                message: p::Snapshot {
+                    version: view.version.clone(),
+                    nonce: next_nonce(),
+                    full: false,
+                    resources,
+                    removed_resources,
+                },
+                world: world(),
+            })
+        }
     }
+}
+
+/// Materialize the routing world for `scope` at rebuild generation `generation`.
+///
+/// [`Scope::SharedPool`] hits the shared per-generation cache: every shared-pool
+/// stream diffs against the same world, so it is built once per generation and
+/// the resulting `Arc<MaterializedView>` is shared. A cache miss (or a stale
+/// generation) rebuilds; the build runs WITHOUT the lock held (materialize is
+/// synchronous but potentially non-trivial), and the store re-checks so a
+/// concurrent builder of the same-or-newer generation wins without regressing the
+/// cache.
+///
+/// [`Scope::Gateway`] views bypass the cache: each depends on the caller's peer
+/// SVID (the build-time binding check), so they are materialized per call.
+///
+/// **One-tick-stale tolerance:** a rebuild stores its cells BEFORE bumping the
+/// generation watch, so materializing at generation `generation` always reads content
+/// `>= generation`. The reverse — a view tagged `generation` that actually reflects `generation + 1`
+/// content because a store landed mid-build — is benign: the view carries its own
+/// `version`/`seq`, so a slightly-fresher world only converges faster. The
+/// generation is a cache key, not a correctness boundary.
+fn view_for(
+    cache: &SharedViewCache,
+    source: &SnapshotSource,
+    scope: &Scope,
+    peer_svid: Option<&PeerSvid>,
+    generation: u64,
+) -> Arc<MaterializedView> {
+    // Gateway scope: per-stream SVID binding, never cached.
+    if !matches!(scope, Scope::SharedPool) {
+        return Arc::new(build_view(source, scope, peer_svid));
+    }
+
+    // Fast path: a cached view for this (or a newer) generation.
+    if let Some((cached_gen, view)) = cache.lock().as_ref()
+        && *cached_gen >= generation
+    {
+        return view.clone();
+    }
+
+    // Miss: build outside the lock, then re-check before storing.
+    let view = Arc::new(build_view(source, scope, peer_svid));
+    let mut guard = cache.lock();
+    if let Some((cached_gen, existing)) = guard.as_ref()
+        && *cached_gen >= generation
+    {
+        // A concurrent builder cached the same-or-newer generation while we built;
+        // prefer it so all streams of a generation share one `Arc`.
+        return existing.clone();
+    }
+    *guard = Some((generation, view.clone()));
+    view
+}
+
+/// Materialize the world for `scope`, timing the #513 snapshot-build stage.
+///
+/// The single un-cached build path — delegates to [`materialize`] (the only seam
+/// between the controller's `Shared` cells and the discovery wire, #383) and
+/// records the build duration. Cache hits ([`view_for`]) skip this, so the
+/// histogram measures real builds, not served-from-cache reads.
+fn build_view(
+    source: &SnapshotSource,
+    scope: &Scope,
+    peer_svid: Option<&PeerSvid>,
+) -> MaterializedView {
+    let start = Instant::now();
+    let view = materialize(source, scope, peer_svid);
+    crate::metrics::snapshot_build_seconds().observe(start.elapsed().as_secs_f64());
+    view
 }
 
 // ── tonic service impl ────────────────────────────────────────────────────────
@@ -588,10 +550,13 @@ impl Discovery for DiscoveryService {
             .inc();
         crate::metrics::connected_proxies().inc();
 
-        let source = self.source.clone();
-        let registry = self.registry.clone();
-        let rebuild_rx = self.rebuild_rx.clone();
-        let leader_rx = self.leader_rx.clone();
+        let services = StreamServices {
+            source: self.source.clone(),
+            registry: self.registry.clone(),
+            rebuild_rx: self.rebuild_rx.clone(),
+            shared_view: self.shared_view.clone(),
+            leader_rx: self.leader_rx.clone(),
+        };
         let (tx, rx) = mpsc::channel::<Result<p::ServerMessage, Status>>(4);
 
         let subscription = StreamSubscription {
@@ -600,16 +565,7 @@ impl Discovery for DiscoveryService {
             peer_svid,
         };
         tokio::spawn(async move {
-            run_stream(
-                subscription,
-                source,
-                registry,
-                rebuild_rx,
-                leader_rx,
-                inbound,
-                tx,
-            )
-            .await;
+            run_stream(subscription, services, inbound, tx).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -661,20 +617,50 @@ struct StreamSubscription {
 /// Mutable per-stream flow-control state, grouped to keep helper function
 /// signatures under the 7-argument threshold.
 struct StreamState {
-    /// Version hash of the last snapshot the client Ack'd; `None` before the
-    /// first Ack.
-    last_acked: Option<String>,
+    /// The canonical-key → resource-hash world the node last Ack'd — the delta
+    /// baseline. `None` until the first Ack, which is exactly when the next
+    /// outbound must be a full: on connect (no baseline yet) and on any defensive
+    /// path that clears it. Every delta is diffed against this map.
+    acked_resources: Option<Arc<BTreeMap<String, String>>>,
     /// Version hash of the snapshot currently awaiting an Ack from the client;
     /// `None` when no snapshot is in-flight (safe to push the next one).
     in_flight: Option<String>,
-    /// Content of the last snapshot sent, retained so Nack retransmits can
-    /// replay the same payload with a fresh nonce.
-    last_sent: Option<SnapshotContent>,
-    /// When `last_sent` was transmitted (#513 ack-latency stage). Set every
-    /// time `last_sent` is set, cleared never — a Nack retransmit keeps the
-    /// original send time, so a snapshot that took a Nack round trip before
-    /// converging reports its true end-to-end latency, not just the retry leg.
+    /// The world currently in-flight, retained until its Ack promotes it into
+    /// [`Self::acked_resources`]. Replaces the v1 full-blob retention: a Nack no
+    /// longer retransmits it (it triggers a fresh full resync instead), so only
+    /// the diff baseline is kept, never the resource bytes. `Some` iff a snapshot
+    /// is in flight.
+    pending: Option<PendingWorld>,
+    /// When the in-flight snapshot was transmitted (#513 ack-latency stage). A
+    /// Nack-driven full resync of the SAME version keeps this original send time
+    /// (the snapshot took a Nack round trip before converging — its true
+    /// end-to-end latency spans both legs); a resync at a DIFFERENT version is a
+    /// new snapshot and refreshes it.
     sent_at: Option<Instant>,
+}
+
+/// Shared per-stream service handles, cloned from [`DiscoveryService`] into the
+/// stream task and passed to the Ack / Nack / rebuild handlers by reference.
+/// Grouped so those handlers stay under the 7-argument workspace limit.
+struct StreamServices {
+    source: SnapshotSource,
+    registry: SharedNodeRegistry,
+    rebuild_rx: watch::Receiver<u64>,
+    shared_view: SharedViewCache,
+    leader_rx: Option<watch::Receiver<bool>>,
+}
+
+/// Immutable references the outbound handlers need, borrowed from the stream
+/// task's owned locals. Grouped to keep [`handle_ack`] / [`handle_nack`] under the
+/// 7-argument limit. Deliberately excludes the mutable `rebuild_rx`/`leader_rx`
+/// watches (owned as `mut` locals in [`run_stream`]); the current generation is
+/// read at the select-arm call site and passed as a scalar.
+struct StreamCtx<'a> {
+    sub: &'a StreamSubscription,
+    source: &'a SnapshotSource,
+    registry: &'a SharedNodeRegistry,
+    shared_view: &'a SharedViewCache,
+    tx: &'a mpsc::Sender<Result<p::ServerMessage, Status>>,
 }
 
 /// Map a discovery [`Scope`] to the core-local [`NodeScope`] mirror.
@@ -698,26 +684,53 @@ fn node_scope_from(scope: &Scope) -> NodeScope {
 /// on exit so the registry stays consistent.
 async fn run_stream(
     sub: StreamSubscription,
-    source: SnapshotSource,
-    registry: SharedNodeRegistry,
-    mut rebuild_rx: watch::Receiver<u64>,
-    mut leader_rx: Option<watch::Receiver<bool>>,
+    services: StreamServices,
     mut inbound: Streaming<p::ClientMessage>,
     tx: mpsc::Sender<Result<p::ServerMessage, Status>>,
 ) {
-    // Send the initial snapshot immediately on stream open.
-    let initial = build_snapshot(&source, &sub.scope, sub.peer_svid.as_ref());
-    registry.record_target(&sub.node_id, initial.version.clone());
-    let mut state = StreamState {
-        last_acked: None,
-        in_flight: Some(initial.version.clone()),
-        last_sent: Some(initial.clone()),
-        sent_at: Some(Instant::now()),
+    // Destructure so the mutable watches stay as `mut` locals (they are polled in
+    // the select loop) while the rest is borrowed immutably by `ctx`.
+    let StreamServices {
+        source,
+        registry,
+        mut rebuild_rx,
+        shared_view,
+        mut leader_rx,
+    } = services;
+    let ctx = StreamCtx {
+        sub: &sub,
+        source: &source,
+        registry: &registry,
+        shared_view: &shared_view,
+        tx: &tx,
     };
-    if send_content(&tx, initial).await.is_err() {
-        registry.disconnect(&sub.node_id);
-        crate::metrics::connected_proxies().dec();
-        return;
+
+    let mut state = StreamState {
+        acked_resources: None,
+        in_flight: None,
+        pending: None,
+        sent_at: None,
+    };
+
+    // Send the initial snapshot immediately on stream open. With no baseline yet
+    // (`acked_resources == None`) this is always a full; `build_outbound`
+    // therefore always yields `Some`, so the initial send never no-ops.
+    let generation = *rebuild_rx.borrow();
+    let view = view_for(
+        &shared_view,
+        &source,
+        &sub.scope,
+        sub.peer_svid.as_ref(),
+        generation,
+    );
+    registry.record_target(&sub.node_id, view.version.clone());
+    match push_if_changed(&ctx, &view, &mut state).await {
+        Ok(_) => {}
+        Err(()) => {
+            registry.disconnect(&sub.node_id);
+            crate::metrics::connected_proxies().dec();
+            return;
+        }
     }
 
     loop {
@@ -728,18 +741,14 @@ async fn run_stream(
                     Ok(Some(client_msg)) => {
                         match client_msg.kind {
                             Some(CKind::Ack(ack)) => {
-                                if handle_ack(&sub, ack, &source, &registry, &tx, &mut state)
-                                    .await
-                                    .is_err()
-                                {
+                                let generation = *rebuild_rx.borrow();
+                                if handle_ack(&ctx, ack, &mut state, generation).await.is_err() {
                                     break;
                                 }
                             }
                             Some(CKind::Nack(nack)) => {
-                                if handle_nack(&sub.node_id, &nack, &state.last_sent, &tx)
-                                    .await
-                                    .is_err()
-                                {
+                                let generation = *rebuild_rx.borrow();
+                                if handle_nack(&ctx, &nack, &mut state, generation).await.is_err() {
                                     break;
                                 }
                             }
@@ -780,31 +789,32 @@ async fn run_stream(
                 break;
             }
 
-            // Routing world was rebuilt — check for a new snapshot to push.
+            // Routing world was rebuilt — check for a new delta to push.
             _ = rebuild_rx.changed() => {
                 if state.in_flight.is_some() {
                     // A snapshot is already awaiting Ack; coalesce this rebuild.
+                    // After its Ack promotes the baseline, `handle_ack` reads the
+                    // current world once and sends a single delta spanning
+                    // baseline → latest.
                     debug!(node_id = %sub.node_id, "discovery: rebuild while in-flight, coalescing");
                     continue;
                 }
-                let current = build_snapshot(&source, &sub.scope, sub.peer_svid.as_ref());
-                registry.record_target(&sub.node_id, current.version.clone());
-                if Some(current.version.as_str()) != state.last_acked.as_deref() {
-                    state.in_flight = Some(current.version.clone());
-                    state.last_sent = Some(current.clone());
-                    state.sent_at = Some(Instant::now());
-                    if send_content(&tx, current).await.is_err() {
-                        break;
+                let generation = *rebuild_rx.borrow();
+                let view = view_for(&shared_view, &source, &sub.scope, sub.peer_svid.as_ref(), generation);
+                registry.record_target(&sub.node_id, view.version.clone());
+                match push_if_changed(&ctx, &view, &mut state).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        // No change vs the node's acked baseline: advance its
+                        // convergence stamp to the freshly-captured sequence so
+                        // the #531 ack gate converges without a content change.
+                        debug!(
+                            node_id = %sub.node_id,
+                            "discovery: rebuild produced no change vs baseline — no push needed"
+                        );
+                        registry.advance_acked_seq(&sub.node_id, view.seq);
                     }
-                } else {
-                    debug!(
-                        node_id = %sub.node_id,
-                        "discovery: rebuild produced same version as last Ack — no push needed"
-                    );
-                    // Same content as the node's last Ack: advance its
-                    // convergence stamp to the freshly-captured sequence so
-                    // the #531 ack gate converges without a content change.
-                    registry.advance_acked_seq(&sub.node_id, current.seq);
+                    Err(()) => break,
                 }
             }
         }
@@ -814,98 +824,161 @@ async fn run_stream(
     crate::metrics::connected_proxies().dec();
 }
 
+/// Build the outbound message for `view` against the stream's acked baseline and,
+/// if it is non-empty, send it and record it as the new in-flight/pending world.
+///
+/// Returns:
+/// - `Ok(true)`  — a message was sent; `in_flight`/`pending`/`sent_at` updated.
+/// - `Ok(false)` — an empty delta (the world equals the baseline); nothing sent,
+///   caller advances the node's convergence stamp.
+/// - `Err(())`   — the outbound channel closed.
+///
+/// A full (baseline `None`) is never empty, so the initial send always returns
+/// `Ok(true)`.
+async fn push_if_changed(
+    ctx: &StreamCtx<'_>,
+    view: &MaterializedView,
+    state: &mut StreamState,
+) -> Result<bool, ()> {
+    let Some(Outbound { message, world }) = build_outbound(view, state.acked_resources.as_deref())
+    else {
+        return Ok(false);
+    };
+    state.in_flight = Some(world.version.clone());
+    state.pending = Some(world);
+    state.sent_at = Some(Instant::now());
+    send_outbound(ctx.tx, message).await?;
+    Ok(true)
+}
+
 /// Handle an `Ack` from the client.
 ///
-/// Updates the registry and last-acked state, clears `in_flight`, then checks
-/// whether the current world version differs from the just-Ack'd one and sends
-/// a new snapshot if so.
+/// An Ack that matches the in-flight world (`pending.version`) is honest: it
+/// promotes that world into the delta baseline ([`StreamState::acked_resources`]),
+/// records its publish sequence (#531), observes the #513 ack latency, and clears
+/// `in_flight`. Then — the world may have moved on while the Ack was in flight
+/// (coalesced rebuilds) — the current world is re-materialized and a single delta
+/// spanning baseline → latest is sent (or the convergence stamp advanced if the
+/// world matches the baseline).
+///
+/// A stale / duplicate Ack (no in-flight world, or a version mismatch) does NOT
+/// promote the baseline and does NOT clear `in_flight` — the honest Ack for the
+/// still-in-flight world is yet to come. It records sequence 0 (a no-op under the
+/// registry's monotone max) so the registry stays consistent with the v1 filter.
 ///
 /// Returns `Err(())` if the outbound channel is closed.
 async fn handle_ack(
-    sub: &StreamSubscription,
+    ctx: &StreamCtx<'_>,
     ack: p::Ack,
-    source: &SnapshotSource,
-    registry: &SharedNodeRegistry,
-    tx: &mpsc::Sender<Result<p::ServerMessage, Status>>,
     state: &mut StreamState,
+    generation: u64,
 ) -> Result<(), ()> {
-    debug!(node_id = %sub.node_id, version = %ack.version, "discovery: Ack received");
-    // The Ack'd snapshot's publish sequence comes from the retained last-sent
-    // content (Acks echo the version we pushed). A stale Ack for some other
-    // version records sequence 0 — a no-op under the registry's monotone max.
-    let acked_seq = state
-        .last_sent
-        .as_ref()
-        .filter(|sent| sent.version == ack.version)
-        .map_or(0, |sent| sent.seq);
-    // #513: ack-latency stage. Only observed for an Ack matching what's
-    // actually in flight — a stale/duplicate Ack (same filter as `acked_seq`
-    // above) carries no honest send timestamp to measure against.
-    if state
-        .last_sent
-        .as_ref()
-        .is_some_and(|sent| sent.version == ack.version)
-        && let Some(sent_at) = state.sent_at
-    {
-        crate::metrics::ack_latency_seconds().observe(sent_at.elapsed().as_secs_f64());
-    }
-    registry.record_ack(
-        &sub.node_id,
-        ack.version.clone(),
-        acked_seq,
-        SystemTime::now(),
-    );
-    crate::metrics::acks_total().inc();
-    state.last_acked = Some(ack.version);
-    state.in_flight = None;
+    debug!(node_id = %ctx.sub.node_id, version = %ack.version, "discovery: Ack received");
 
-    // Check current world against the just-Ack'd version.
-    let current = build_snapshot(source, &sub.scope, sub.peer_svid.as_ref());
-    registry.record_target(&sub.node_id, current.version.clone());
-    if Some(current.version.as_str()) != state.last_acked.as_deref() {
-        state.in_flight = Some(current.version.clone());
-        state.last_sent = Some(current.clone());
-        state.sent_at = Some(Instant::now());
-        send_content(tx, current).await?;
-    } else {
-        // Identical content: the node's applied snapshot is equivalent to the
-        // freshly-captured sequence, so advance its convergence stamp without
-        // a push (#531 ack gate liveness on a quiet cluster).
-        registry.advance_acked_seq(&sub.node_id, current.seq);
+    // Promote only an Ack matching the in-flight world. The nested `take()` is
+    // guarded by the same predicate, so the `Some` arm always fires when honest;
+    // a `None` there would leave `acked_seq` at 0 without panicking.
+    let mut acked_seq = 0;
+    let honest = state
+        .pending
+        .as_ref()
+        .is_some_and(|p| p.version == ack.version);
+    if honest {
+        // #513 ack-latency stage: observed only for the honest Ack — a stale one
+        // carries no send timestamp to measure against.
+        if let Some(sent_at) = state.sent_at {
+            crate::metrics::ack_latency_seconds().observe(sent_at.elapsed().as_secs_f64());
+        }
+        if let Some(pending) = state.pending.take() {
+            acked_seq = pending.seq;
+            state.acked_resources = Some(pending.resources);
+            state.in_flight = None;
+            state.sent_at = None;
+        }
+    }
+    ctx.registry
+        .record_ack(&ctx.sub.node_id, ack.version, acked_seq, SystemTime::now());
+    crate::metrics::acks_total().inc();
+
+    // Re-check the current world only once nothing is in flight. A stale Ack that
+    // did not clear `in_flight` skips this — the world genuinely in flight must
+    // Ack before the next push (one in-flight invariant).
+    if state.in_flight.is_none() {
+        let view = view_for(
+            ctx.shared_view,
+            ctx.source,
+            &ctx.sub.scope,
+            ctx.sub.peer_svid.as_ref(),
+            generation,
+        );
+        ctx.registry
+            .record_target(&ctx.sub.node_id, view.version.clone());
+        match push_if_changed(ctx, &view, state).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // World matches the baseline: advance the convergence stamp
+                // without a push (#531 ack-gate liveness on a quiet cluster).
+                ctx.registry.advance_acked_seq(&ctx.sub.node_id, view.seq);
+            }
+            Err(()) => return Err(()),
+        }
     }
     Ok(())
 }
 
-/// Handle a `Nack` from the client.
+/// Handle a `Nack` from the client → **full resync**.
 ///
-/// Logs the rejection and retransmits the last-sent snapshot content with a
-/// fresh nonce.  `in_flight` is intentionally left unchanged — the retransmit
-/// is a retry of the same logical version, not a new version.
+/// A Nack means the client rejected the last message and its baseline is now
+/// untrustworthy, so the server re-materializes the current world and sends it as
+/// a fresh `full = true` snapshot (new version + nonce). That full becomes the new
+/// in-flight/pending world; the per-stream payload retention is gone, so there is
+/// nothing to "retransmit" — the client self-heals from the full.
+///
+/// The #513 ack-latency send timestamp is refreshed only when the resync's version
+/// differs from the Nack'd one: a converged-but-transiently-Nack'd snapshot keeps
+/// its original send time so the eventual Ack measures the true end-to-end
+/// latency across both legs, not just the retry.
 ///
 /// Returns `Err(())` if the outbound channel is closed.
 async fn handle_nack(
-    node_id: &str,
+    ctx: &StreamCtx<'_>,
     nack: &p::Nack,
-    last_sent: &Option<SnapshotContent>,
-    tx: &mpsc::Sender<Result<p::ServerMessage, Status>>,
+    state: &mut StreamState,
+    generation: u64,
 ) -> Result<(), ()> {
     warn!(
-        node_id,
+        node_id = %ctx.sub.node_id,
         version = %nack.version,
         detail = %nack.detail,
-        "discovery: Nack received; retransmitting last snapshot",
+        "discovery: Nack received; sending full resync of the current world",
     );
-    match last_sent {
-        Some(content) => send_content(tx, content.clone()).await,
-        None => {
-            // Nack before any snapshot was sent — protocol violation; log and ignore.
-            warn!(
-                node_id,
-                "discovery: Nack received before any snapshot was sent"
-            );
-            Ok(())
-        }
+    let view = view_for(
+        ctx.shared_view,
+        ctx.source,
+        &ctx.sub.scope,
+        ctx.sub.peer_svid.as_ref(),
+        generation,
+    );
+    ctx.registry
+        .record_target(&ctx.sub.node_id, view.version.clone());
+    // Force a full (ignore the acked baseline — it is untrustworthy after a Nack).
+    // `build_outbound(_, None)` is always a full, hence never `None`; the else arm
+    // degrades to a no-op rather than panicking on the impossible case.
+    let Some(Outbound { message, world }) = build_outbound(&view, None) else {
+        return Ok(());
+    };
+    // Preserve #513 latency semantics: keep the original send time when the
+    // resync carries the same version the client Nack'd, refresh it otherwise.
+    if world.version != nack.version {
+        state.sent_at = Some(Instant::now());
+    } else if state.sent_at.is_none() {
+        // Same version but no prior timestamp (e.g. a Nack with no in-flight
+        // send): stamp now so the eventual Ack still observes a latency.
+        state.sent_at = Some(Instant::now());
     }
+    state.in_flight = Some(world.version.clone());
+    state.pending = Some(world);
+    send_outbound(ctx.tx, message).await
 }
 
 /// Resolve when the watched leadership value is (or becomes) `false` (#531).
@@ -951,17 +1024,31 @@ fn record_node_status(node_id: &str, status: &p::NodeStatus, registry: &SharedNo
     registry.record_bound_ports(node_id, ports);
 }
 
-/// Stamp a fresh nonce on `content`, wrap it in a `ServerMessage`, and send it.
+/// Wrap a wire snapshot in a `ServerMessage`, send it, and — only on a successful
+/// hand-off to the transport — emit the #383 send-side metrics. The nonce is
+/// already stamped by [`build_outbound`].
+///
+/// Counting after the send keeps a closed channel (stream teardown) from inflating
+/// the send-side counters with a message that was never delivered.
 ///
 /// Returns `Err(())` if the receiver has been dropped.
-async fn send_content(
+async fn send_outbound(
     tx: &mpsc::Sender<Result<p::ServerMessage, Status>>,
-    content: SnapshotContent,
+    message: p::Snapshot,
 ) -> Result<(), ()> {
+    let kind = if message.full { "full" } else { "delta" };
+    let resources_sent = message.resources.len() as u64;
+    let resources_removed = message.removed_resources.len() as u64;
     let msg = p::ServerMessage {
-        kind: Some(SKind::Snapshot(content.into_message())),
+        kind: Some(SKind::Snapshot(message)),
     };
-    tx.send(Ok(msg)).await.map_err(|_| ())
+    tx.send(Ok(msg)).await.map_err(|_| ())?;
+    crate::metrics::snapshot_messages_total()
+        .with_label_values(&[kind])
+        .inc();
+    crate::metrics::snapshot_resources_sent_total().inc_by(resources_sent);
+    crate::metrics::snapshot_resources_removed_total().inc_by(resources_removed);
+    Ok(())
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -974,15 +1061,18 @@ mod tests {
         discovery_server::DiscoveryServer, server_message::Kind as SrvKind,
     };
     use coxswain_core::dedicated_registry::DedicatedRoutingSnapshot;
+    use coxswain_core::endpoints::{EndpointKey, ResolvedEndpoints};
     use coxswain_core::listener_status::GatewayListenerStatus;
     use coxswain_core::node_registry::SharedNodeRegistry;
     use coxswain_core::routing::{
-        GatewayRoutingTable, SharedGatewayRoutingTable, SharedIngressRoutingTable,
+        BackendGroup, BackendProtocol, GatewayRoutingTable, IngressRoutingTable,
+        IngressRoutingTableBuilder, RouteEntry, SharedGatewayRoutingTable,
+        SharedIngressRoutingTable,
     };
     use coxswain_core::tls::{
         ClientCertStore, PortTlsStore, SharedClientCertStore, SharedPortTlsStore,
     };
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::time::Duration;
@@ -998,6 +1088,74 @@ mod tests {
         registry: SharedNodeRegistry,
         rebuild_tx: watch::Sender<u64>,
         publish: SharedGatewayPublishIndex,
+        /// The live routing source the server reads. Tests mutate it via
+        /// [`TestHarness::publish_ingress`] to drive deltas.
+        source: SnapshotSource,
+    }
+
+    impl TestHarness {
+        /// Store a new ingress routing world, stamp a publish rebuild, and bump
+        /// the rebuild-generation watch — the exact store-then-tick order a real
+        /// reconciler uses. The generation bump wakes every connected stream's
+        /// rebuild arm; the fresh generation invalidates the shared view cache so
+        /// the next materialize sees the new cells.
+        fn publish_ingress(&self, table: IngressRoutingTable) {
+            self.source.ingress.store(Arc::new(table));
+            self.publish.stamp_rebuild(std::iter::empty());
+            let next = self.rebuild_tx.borrow().wrapping_add(1);
+            self.rebuild_tx
+                .send(next)
+                .unwrap_or_else(|e| panic!("rebuild watch send: {e}"));
+        }
+    }
+
+    /// An ingress world: one exact `host` on port 80 routed to a single
+    /// endpoint-keyed backend `default/<svc>/80` resolving to `addrs`.
+    ///
+    /// The keyed ref means the route resource carries only an `endpoint_ref`, not
+    /// the addresses — so the route's hash is independent of `addrs`. Changing the
+    /// addresses rewrites ONLY the derived `endpoints|default/<svc>/80` resource
+    /// (EDS), leaving `route|ingress|80|exact|<host>` byte-identical.
+    fn ingress_route(host: &str, svc: &str, addrs: &[&str]) -> IngressRoutingTable {
+        let mut b = IngressRoutingTableBuilder::new();
+        add_host(&mut b, host, svc, addrs);
+        b.build().unwrap_or_else(|e| panic!("ingress build: {e}"))
+    }
+
+    /// An ingress world with two exact hosts, each routed to its own service.
+    fn ingress_two_routes(
+        host_a: &str,
+        svc_a: &str,
+        addrs_a: &[&str],
+        host_b: &str,
+        svc_b: &str,
+        addrs_b: &[&str],
+    ) -> IngressRoutingTable {
+        let mut b = IngressRoutingTableBuilder::new();
+        add_host(&mut b, host_a, svc_a, addrs_a);
+        add_host(&mut b, host_b, svc_b, addrs_b);
+        b.build().unwrap_or_else(|e| panic!("ingress build: {e}"))
+    }
+
+    /// Add one `host → default/<svc>/80` exact route to `b`. Extracted so the
+    /// single- and two-route builders share the exact same backend shape.
+    fn add_host(b: &mut IngressRoutingTableBuilder, host: &str, svc: &str, addrs: &[&str]) {
+        let parsed: Vec<SocketAddr> = addrs
+            .iter()
+            .map(|a| a.parse().unwrap_or_else(|e| panic!("addr {a}: {e}")))
+            .collect();
+        let exists = !parsed.is_empty();
+        let resolved = Arc::new(ResolvedEndpoints::new(
+            parsed,
+            BackendProtocol::default(),
+            exists,
+        ));
+        let bg = Arc::new(BackendGroup::weighted_with_endpoints(
+            format!("default/{svc}"),
+            vec![(resolved, Some(EndpointKey::new("default", svc, 80)), 1)],
+        ));
+        let entry = Arc::new(RouteEntry::path_only(bg, "default/r".to_owned(), None));
+        b.for_port(80).exact_host(host).add_exact_route("/", entry);
     }
 
     fn empty_source() -> SnapshotSource {
@@ -1046,12 +1204,12 @@ mod tests {
         );
 
         let publish = source.publish.clone();
-        let _ = source; // populated in coxswain-bin; empty for tests
         TestHarness {
             addr,
             registry,
             rebuild_tx,
             publish,
+            source,
         }
     }
 
@@ -1281,10 +1439,13 @@ mod tests {
         drop(tx);
     }
 
-    /// A Nack causes the server to retransmit a snapshot with the same version
-    /// but a different nonce.
+    /// A Nack causes the server to send a fresh `full = true` resync of the
+    /// current world with a new nonce (#383) — not a same-payload retransmit. The
+    /// client's baseline is untrustworthy after a Nack, so a full re-establishes
+    /// it. (The empty world's version is unchanged here, but that is incidental —
+    /// the contract is `full = true`, not version equality.)
     #[tokio::test]
-    async fn nack_resends_same_snapshot() {
+    async fn nack_triggers_full_resync() {
         let h = start_harness().await;
         let (tx, mut rx) = open_stream(h.addr, "node-nack").await;
 
@@ -1292,13 +1453,17 @@ mod tests {
         send_nack(&tx, &snap1).await;
 
         let snap2 = recv_snapshot(&mut rx).await;
-        assert_eq!(
-            snap1.version, snap2.version,
-            "Nack retransmit must carry the same version"
+        assert!(
+            snap2.full,
+            "a Nack must be answered with a full resync, not a delta"
+        );
+        assert!(
+            snap2.removed_resources.is_empty(),
+            "a full resync carries no tombstones"
         );
         assert_ne!(
             snap1.nonce, snap2.nonce,
-            "Nack retransmit must use a fresh nonce"
+            "the resync must use a fresh nonce"
         );
 
         drop(tx);
@@ -1409,9 +1574,9 @@ mod tests {
         // Should receive a snapshot (empty since no dedicated entry, but the
         // stream opened — the check was skipped, not denied).
         let snap = recv_snapshot(&mut inbound).await;
-        let gw_routing = snap.gateway_routing.unwrap_or_default();
+        assert!(snap.full, "the first message of a session is always a full");
         assert!(
-            gw_routing.ports.is_empty(),
+            snap.resources.is_empty(),
             "no dedicated entry → empty gateway snapshot"
         );
         drop(tx);
@@ -1539,7 +1704,7 @@ mod tests {
     async fn node_status_out_of_range_ports_are_dropped_not_fatal() {
         let h = start_harness().await;
         let (tx, mut inbound) = open_stream(h.addr, "node-1").await;
-        let _initial = recv_snapshot(&mut inbound).await;
+        let initial = recv_snapshot(&mut inbound).await;
 
         tx.send(ClientMessage {
             kind: Some(CKind::NodeStatus(p::NodeStatus {
@@ -1563,18 +1728,13 @@ mod tests {
             "the oversized value is dropped; the in-range port still lands"
         );
 
-        // The stream must remain healthy after the malformed report: a rebuild
-        // still reaches this node.
-        h.rebuild_tx.send(1).unwrap();
-        tx.send(ClientMessage {
-            kind: Some(CKind::Ack(p::Ack {
-                version: "bogus".to_owned(),
-                nonce: vec![],
-            })),
-        })
-        .await
-        .unwrap();
-        let _next = recv_snapshot(&mut inbound).await;
+        // The stream must remain healthy after the malformed report: Ack the
+        // initial, publish a real routing change, and confirm the delta still
+        // reaches this node.
+        send_ack(&tx, &initial).await;
+        h.publish_ingress(ingress_route("example.com", "svc-a", &["10.0.0.1:80"]));
+        let next = recv_snapshot(&mut inbound).await;
+        assert!(!next.full, "steady-state change ships as a delta");
         drop(tx);
     }
 
@@ -1719,7 +1879,7 @@ mod tests {
         let key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
         let source = source_with_dedicated_entry(&key);
 
-        let snap = build_snapshot(
+        let view = materialize(
             &source,
             &Scope::Gateway {
                 name: "gw-a".to_owned(),
@@ -1730,19 +1890,26 @@ mod tests {
             None,
         );
 
-        let lh = snap.listener_status;
+        let listener_keys: Vec<&String> = view
+            .resources
+            .keys()
+            .filter(|k| k.starts_with("listener|"))
+            .collect();
         assert_eq!(
-            lh.entries.len(),
+            listener_keys.len(),
             1,
-            "Gateway scope must serve exactly its own listener-health entry"
+            "Gateway scope must serve exactly its own listener-status resource"
         );
         assert_eq!(
-            lh.entries[0].object_key,
-            key.to_string(),
+            listener_keys[0],
+            &format!("listener|{key}"),
             "the served entry must be the subscribing Gateway's"
         );
         assert!(
-            snap.ingress_routing.ports.is_empty(),
+            !view
+                .resources
+                .keys()
+                .any(|k| k.starts_with("route|ingress|")),
             "a dedicated proxy never receives Ingress routes"
         );
     }
@@ -1753,7 +1920,7 @@ mod tests {
         let present = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
         let source = source_with_dedicated_entry(&present);
 
-        let snap = build_snapshot(
+        let view = materialize(
             &source,
             &Scope::Gateway {
                 name: "gw-b".to_owned(),
@@ -1763,11 +1930,9 @@ mod tests {
         );
 
         assert!(
-            snap.listener_status.entries.is_empty(),
-            "fail-closed: an absent Gateway receives no routes, not another scope's"
+            view.resources.is_empty(),
+            "fail-closed: an absent Gateway receives no resources, not another scope's"
         );
-        assert!(snap.gateway_routing.ports.is_empty());
-        assert!(snap.ingress_routing.ports.is_empty());
     }
 
     #[test]
@@ -1777,11 +1942,371 @@ mod tests {
         let key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
         let source = source_with_dedicated_entry(&key);
 
-        let snap = build_snapshot(&source, &Scope::SharedPool, None);
+        let view = materialize(&source, &Scope::SharedPool, None);
 
         assert!(
-            snap.listener_status.entries.is_empty(),
-            "SharedPool reads the shared cells, never the dedicated registry"
+            view.resources.is_empty(),
+            "SharedPool reads the shared cells (empty here), never the dedicated registry"
         );
+    }
+
+    // ── per-stream delta engine (#383) ────────────────────────────────────────
+
+    use crate::bench_internals::snapshot_version;
+    use crate::wire::resource::canonical_key;
+
+    /// Canonical keys of a snapshot's upsert resources whose key starts with
+    /// `prefix`.
+    fn upsert_keys_with(snap: &Snapshot, prefix: &str) -> Vec<String> {
+        snap.resources
+            .iter()
+            .filter_map(|r| canonical_key(r).ok())
+            .filter(|k| k.starts_with(prefix))
+            .collect()
+    }
+
+    /// The `addrs` of every `EndpointResource` upsert in a snapshot.
+    fn endpoint_addrs(snap: &Snapshot) -> Vec<Vec<String>> {
+        snap.resources
+            .iter()
+            .filter_map(|r| match &r.payload {
+                Some(p::resource::Payload::Endpoints(e)) => Some(e.addrs.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Apply one snapshot (full or delta) into a plain key→resource world, then
+    /// assert the recomputed global hash equals the message's `version` — the
+    /// replay oracle for protocol invariant 2 (delta version = POST-APPLY world
+    /// hash). Mirrors what the real client's version self-check enforces.
+    fn apply_and_check(world: &mut BTreeMap<String, p::Resource>, snap: &Snapshot) {
+        if snap.full {
+            world.clear();
+        }
+        for key in &snap.removed_resources {
+            world.remove(key);
+        }
+        for r in &snap.resources {
+            let key = canonical_key(r).unwrap_or_else(|e| panic!("upsert is keyable: {e:?}"));
+            world.insert(key, r.clone());
+        }
+        let resources: Vec<p::Resource> = world.values().cloned().collect();
+        assert_eq!(
+            snapshot_version(&resources),
+            snap.version,
+            "recomputed global hash must equal the message version (invariant 2)"
+        );
+    }
+
+    /// Assert no further server message arrives within a short settle window.
+    async fn assert_no_more(inbound: &mut tonic::Streaming<ServerMessage>) {
+        let extra = tokio::time::timeout(Duration::from_millis(200), inbound.message()).await;
+        assert!(extra.is_err(), "unexpected extra server message: {extra:?}");
+    }
+
+    /// The first message is a full snapshot whose `version` is the hash of its
+    /// sorted per-resource hashes (invariant 1 + oracle).
+    #[tokio::test]
+    async fn initial_message_is_full_with_hash_version() {
+        let h = start_harness().await;
+        h.publish_ingress(ingress_route("example.com", "svc-a", &["10.0.0.1:80"]));
+        let (tx, mut rx) = open_stream(h.addr, "node-1").await;
+
+        let snap = recv_snapshot(&mut rx).await;
+        assert!(snap.full, "first message must be full");
+        assert!(
+            snap.removed_resources.is_empty(),
+            "a full carries no tombstones"
+        );
+        assert_eq!(
+            snap.version,
+            snapshot_version(&snap.resources),
+            "full version = hash over its sorted resource hashes"
+        );
+        assert_eq!(
+            upsert_keys_with(&snap, "route|ingress|80|exact|example.com").len(),
+            1,
+            "the route resource rides the full"
+        );
+        assert_eq!(
+            upsert_keys_with(&snap, "endpoints|default/svc-a/80").len(),
+            1,
+            "the derived endpoint resource rides the full"
+        );
+        drop(tx);
+    }
+
+    /// An endpoint-only change ships a delta carrying exactly the changed
+    /// `endpoints|…` upsert and nothing else — the route bytes are untouched (EDS).
+    #[tokio::test]
+    async fn endpoint_change_yields_endpoint_only_delta() {
+        let h = start_harness().await;
+        h.publish_ingress(ingress_route("example.com", "svc-a", &["10.0.0.1:80"]));
+        let (tx, mut rx) = open_stream(h.addr, "node-1").await;
+        let initial = recv_snapshot(&mut rx).await;
+        send_ack(&tx, &initial).await;
+
+        // Same route, different endpoint addresses.
+        h.publish_ingress(ingress_route("example.com", "svc-a", &["10.0.0.9:80"]));
+        let delta = recv_snapshot(&mut rx).await;
+
+        assert!(!delta.full, "a steady-state change is a delta");
+        assert!(delta.removed_resources.is_empty(), "nothing was removed");
+        assert_eq!(delta.resources.len(), 1, "exactly one resource changed");
+        assert_eq!(
+            upsert_keys_with(&delta, "endpoints|default/svc-a/80").len(),
+            1,
+            "only the endpoint resource changed"
+        );
+        assert!(
+            upsert_keys_with(&delta, "route|").is_empty(),
+            "the route bytes are independent of endpoint addrs"
+        );
+        assert_eq!(endpoint_addrs(&delta), vec![vec!["10.0.0.9:80".to_owned()]]);
+        drop(tx);
+    }
+
+    /// Adding a host ships a delta carrying exactly that new `route|…` upsert; a
+    /// route sharing the existing service adds no new endpoint resource.
+    #[tokio::test]
+    async fn host_added_yields_route_only_delta() {
+        let h = start_harness().await;
+        h.publish_ingress(ingress_route("a.example.com", "svc-a", &["10.0.0.1:80"]));
+        let (tx, mut rx) = open_stream(h.addr, "node-1").await;
+        let initial = recv_snapshot(&mut rx).await;
+        send_ack(&tx, &initial).await;
+
+        // Add host b, same service (so no new endpoint resource).
+        h.publish_ingress(ingress_two_routes(
+            "a.example.com",
+            "svc-a",
+            &["10.0.0.1:80"],
+            "b.example.com",
+            "svc-a",
+            &["10.0.0.1:80"],
+        ));
+        let delta = recv_snapshot(&mut rx).await;
+
+        assert!(!delta.full);
+        assert!(delta.removed_resources.is_empty());
+        assert_eq!(delta.resources.len(), 1, "only the new host's route");
+        assert_eq!(
+            upsert_keys_with(&delta, "route|ingress|80|exact|b.example.com").len(),
+            1
+        );
+        drop(tx);
+    }
+
+    /// Removing a host ships a delta carrying exactly that route tombstone; the
+    /// endpoint stays (another host still references it), so it is NOT tombstoned.
+    #[tokio::test]
+    async fn host_removed_yields_tombstone_only() {
+        let h = start_harness().await;
+        h.publish_ingress(ingress_two_routes(
+            "a.example.com",
+            "svc-a",
+            &["10.0.0.1:80"],
+            "b.example.com",
+            "svc-a",
+            &["10.0.0.1:80"],
+        ));
+        let (tx, mut rx) = open_stream(h.addr, "node-1").await;
+        let initial = recv_snapshot(&mut rx).await;
+        send_ack(&tx, &initial).await;
+
+        // Drop host b; host a still references svc-a.
+        h.publish_ingress(ingress_route("a.example.com", "svc-a", &["10.0.0.1:80"]));
+        let delta = recv_snapshot(&mut rx).await;
+
+        assert!(!delta.full);
+        assert!(delta.resources.is_empty(), "nothing upserted");
+        assert_eq!(
+            delta.removed_resources,
+            vec!["route|ingress|80|exact|b.example.com".to_owned()],
+            "only host b's route is tombstoned; svc-a's endpoint survives"
+        );
+        drop(tx);
+    }
+
+    /// Contract 5 (referential integrity): switching a host's backend from svc-x
+    /// to svc-y tombstones svc-x's endpoint AND ships svc-y's endpoint AND the
+    /// rewritten route ALL in the same message; upsert/remove key sets are
+    /// disjoint (contract 3).
+    #[tokio::test]
+    async fn last_referrer_removal_tombstones_endpoint_in_same_message() {
+        let h = start_harness().await;
+        h.publish_ingress(ingress_route("a.example.com", "svc-x", &["10.0.0.1:80"]));
+        let (tx, mut rx) = open_stream(h.addr, "node-1").await;
+        let initial = recv_snapshot(&mut rx).await;
+        send_ack(&tx, &initial).await;
+
+        // Repoint host a from svc-x to svc-y (svc-x loses its last referrer).
+        h.publish_ingress(ingress_route("a.example.com", "svc-y", &["10.0.0.2:80"]));
+        let delta = recv_snapshot(&mut rx).await;
+
+        assert!(!delta.full);
+        // svc-x tombstoned the moment its last referrer left.
+        assert_eq!(
+            delta.removed_resources,
+            vec!["endpoints|default/svc-x/80".to_owned()],
+            "the no-longer-referenced endpoint is tombstoned in this message"
+        );
+        // The rewritten route AND the newly-referenced endpoint ship together.
+        assert_eq!(
+            upsert_keys_with(&delta, "route|ingress|80|exact|a.example.com").len(),
+            1,
+            "the route's ref changed (svc-x → svc-y), so its bytes moved"
+        );
+        assert_eq!(
+            upsert_keys_with(&delta, "endpoints|default/svc-y/80").len(),
+            1,
+            "the newly-referenced endpoint ships in the same message"
+        );
+        // Contract 3: the key sets are disjoint.
+        let upserts: std::collections::HashSet<String> = delta
+            .resources
+            .iter()
+            .filter_map(|r| canonical_key(r).ok())
+            .collect();
+        for removed in &delta.removed_resources {
+            assert!(
+                !upserts.contains(removed),
+                "upsert/remove key sets must be disjoint: {removed}"
+            );
+        }
+        drop(tx);
+    }
+
+    /// Coalescing: two endpoint swaps while the initial is un-Acked collapse into
+    /// ONE delta after the Ack, carrying only the LATEST world (baseline → latest).
+    #[tokio::test]
+    async fn coalesced_delta_spans_baseline_to_latest() {
+        let h = start_harness().await;
+        h.publish_ingress(ingress_route("example.com", "svc-a", &["10.0.0.1:80"]));
+        let (tx, mut rx) = open_stream(h.addr, "node-1").await;
+        let initial = recv_snapshot(&mut rx).await;
+
+        // Two swaps while the initial is still in-flight (un-Acked): both coalesce.
+        h.publish_ingress(ingress_route("example.com", "svc-a", &["10.0.0.2:80"]));
+        h.publish_ingress(ingress_route("example.com", "svc-a", &["10.0.0.3:80"]));
+
+        // Ack the initial: the server reads the current world once and sends a
+        // single delta straight to the latest (skipping the intermediate).
+        send_ack(&tx, &initial).await;
+        let delta = recv_snapshot(&mut rx).await;
+
+        assert!(!delta.full);
+        assert_eq!(
+            endpoint_addrs(&delta),
+            vec![vec!["10.0.0.3:80".to_owned()]],
+            "the coalesced delta carries the latest world, not the intermediate"
+        );
+        assert!(
+            upsert_keys_with(&delta, "route|").is_empty(),
+            "only the endpoint moved across the coalesced swaps"
+        );
+        assert_no_more(&mut rx).await;
+        drop(tx);
+    }
+
+    /// A stale Ack (version mismatch) neither promotes the baseline nor clears the
+    /// in-flight snapshot: a rebuild still coalesces, and the subsequent delta —
+    /// after the honest Ack — diffs the correct (honest) baseline.
+    #[tokio::test]
+    async fn stale_ack_does_not_promote_or_clear_in_flight() {
+        let h = start_harness().await;
+        h.publish_ingress(ingress_route("example.com", "svc-a", &["10.0.0.1:80"]));
+        let (tx, mut rx) = open_stream(h.addr, "node-1").await;
+        let initial = recv_snapshot(&mut rx).await;
+
+        // Stale/duplicate Ack for a version we never sent, while the initial is
+        // still in-flight: must NOT promote (no baseline) and must NOT clear
+        // in-flight.
+        tx.send(ClientMessage {
+            kind: Some(CKind::Ack(p::Ack {
+                version: "bogus".to_owned(),
+                nonce: vec![],
+            })),
+        })
+        .await
+        .unwrap();
+
+        // A rebuild now must coalesce (the initial is still in-flight): no push.
+        h.publish_ingress(ingress_route("example.com", "svc-a", &["10.0.0.2:80"]));
+        assert_no_more(&mut rx).await;
+
+        // The honest Ack of the initial promotes the baseline; the delta then
+        // diffs THAT baseline and reflects the latest world.
+        send_ack(&tx, &initial).await;
+        let delta = recv_snapshot(&mut rx).await;
+        assert!(!delta.full);
+        assert_eq!(endpoint_addrs(&delta), vec![vec!["10.0.0.2:80".to_owned()]]);
+        drop(tx);
+    }
+
+    /// A reconnect is a fresh session: the per-stream baseline is not portable, so
+    /// the first message on the new stream is a full (invariant 1).
+    #[tokio::test]
+    async fn reconnect_sends_full() {
+        let h = start_harness().await;
+        h.publish_ingress(ingress_route("example.com", "svc-a", &["10.0.0.1:80"]));
+
+        let (tx1, mut rx1) = open_stream(h.addr, "node-1").await;
+        let first = recv_snapshot(&mut rx1).await;
+        assert!(first.full);
+        send_ack(&tx1, &first).await;
+        drop(tx1);
+        drop(rx1);
+
+        // Reconnect (fresh stream): must re-send a full despite an identical world.
+        let (tx2, mut rx2) = open_stream(h.addr, "node-1").await;
+        let second = recv_snapshot(&mut rx2).await;
+        assert!(
+            second.full,
+            "a reconnect starts a fresh session → full resync"
+        );
+        drop(tx2);
+    }
+
+    /// Replay oracle: a full followed by N deltas, applied into a plain world,
+    /// reproduces each message's `version` as the POST-APPLY global hash — the
+    /// end-to-end proof that the server's delta stream is self-consistent.
+    #[tokio::test]
+    async fn replay_full_then_deltas_reproduces_versions() {
+        let h = start_harness().await;
+        let mut world: BTreeMap<String, p::Resource> = BTreeMap::new();
+
+        h.publish_ingress(ingress_route("a.example.com", "svc-a", &["10.0.0.1:80"]));
+        let (tx, mut rx) = open_stream(h.addr, "node-1").await;
+        let full = recv_snapshot(&mut rx).await;
+        assert!(full.full);
+        apply_and_check(&mut world, &full);
+        send_ack(&tx, &full).await;
+
+        // Delta 1: add a second host on a new service.
+        h.publish_ingress(ingress_two_routes(
+            "a.example.com",
+            "svc-a",
+            &["10.0.0.1:80"],
+            "b.example.com",
+            "svc-b",
+            &["10.0.0.2:80"],
+        ));
+        let d1 = recv_snapshot(&mut rx).await;
+        apply_and_check(&mut world, &d1);
+        send_ack(&tx, &d1).await;
+
+        // Delta 2: drop host b (route + endpoint tombstones).
+        h.publish_ingress(ingress_route("a.example.com", "svc-a", &["10.0.0.1:80"]));
+        let d2 = recv_snapshot(&mut rx).await;
+        apply_and_check(&mut world, &d2);
+        send_ack(&tx, &d2).await;
+
+        // Delta 3: endpoint-only churn on the surviving route.
+        h.publish_ingress(ingress_route("a.example.com", "svc-a", &["10.0.0.9:80"]));
+        let d3 = recv_snapshot(&mut rx).await;
+        apply_and_check(&mut world, &d3);
+        drop(tx);
     }
 }

@@ -35,7 +35,6 @@ use coxswain_core::tls::PortTlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
 use kube::runtime::reflector;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -383,149 +382,147 @@ impl GatewayApiReconciler {
                 .iter()
                 .any(|f| matches!(f.r#type, HttpRouteRulesFiltersType::RequestRedirect));
 
-            let (group, error_status, circuit_breaker): (
-                Option<Arc<BackendGroup>>,
-                Option<u16>,
-                Option<Arc<coxswain_core::routing::CircuitBreakerConfig>>,
-            ) = if has_redirect {
-                (None, None, None)
-            } else {
-                // A rule with omitted or empty `backendRefs` is not skipped: the
-                // Gateway API requires it to route with a distinct 500 response
-                // (conformance `HTTPRouteNoBackendRefs`), not fall through to a
-                // 404. Feeding an empty slice through the normal pipeline yields
-                // an empty `BackendGroup` whose `error_status` resolves to 500
-                // below (no backend ref failed to *resolve* — there simply were
-                // none — so `ResolvedRefs` stays True).
-                let backend_refs: &[HttpRouteRulesBackendRefs] =
-                    rule.backend_refs.as_deref().unwrap_or(&[]);
-
-                let resolved = resolve_weighted_backends(
-                    backend_refs,
-                    route_ns,
-                    endpoint_cache,
-                    services,
-                    grants,
-                );
-                let group_name = backend_group_name(backend_refs, route_ns);
-                let protocols: Vec<BackendProtocol> =
-                    resolved.iter().map(|(r, _)| r.app_protocol).collect();
-                let protocol = pick_route_protocol(&protocols, &group_name);
-                // Per-backend filters from `backendRefs[].filters` — index-aligned
-                // with the `resolved` list so they match the order `BackendGroup`
-                // stores backends in. Backends that were dropped from `resolved`
-                // (zero weight, missing addrs) also contribute nothing here.
-                let per_backend_filters: Vec<Vec<FilterAction>> = resolved
-                    .iter()
-                    .zip(backend_refs.iter())
-                    .filter(|((r, w), _)| *w > 0 && !r.addrs.is_empty())
-                    .map(|((_, _), bref)| {
-                        bref.filters
-                            .as_deref()
-                            .map(super::filters::build_backend_ref_filters)
-                            .unwrap_or_default()
-                    })
-                    .collect();
-                // A backendRef that points to an existing Service which currently
-                // has zero ready endpoints drives a 503; invalid refs (missing
-                // Service, wrong kind, denied cross-namespace) and all-zero-weight
-                // rules drive a 500. Computed before `resolved` is consumed below.
-                let has_valid_empty_backend = resolved
-                    .iter()
-                    .any(|(r, w)| *w > 0 && r.service_exists && r.addrs.is_empty());
-                let weighted: Vec<(Vec<SocketAddr>, u16)> = resolved
-                    .into_iter()
-                    .filter(|(r, w)| *w > 0 && !r.addrs.is_empty())
-                    .map(|(r, w)| (r.addrs, w))
-                    .collect();
-
-                // Look up BackendTLSPolicy for this rule's backends. Highest-weight ref
-                // wins on conflicts (ties break by backendRefs array order).
-                let policy_match =
-                    pick_backend_tls(backend_refs, route_ns, policy_index, &group_name);
-                let invalid_policy = matches!(policy_match, PolicyMatch::Invalid);
-                let policy_tls = match policy_match {
-                    PolicyMatch::Valid(tls) => Some(tls),
-                    PolicyMatch::None | PolicyMatch::Invalid => None,
-                };
-                // GEP-3155 fail-closed: this backend speaks upstream TLS (BackendTLSPolicy)
-                // AND an owned parent Gateway's `clientCertificateRef` is configured but
-                // unresolvable. The proxy must present the operator-configured identity or
-                // not connect at all — return 502 rather than silently dropping the cert.
-                let client_cert_fail_closed = route_client_cert_failed && policy_tls.is_some();
-
-                let mut group = BackendGroup::weighted(group_name, weighted)
-                    .with_protocol(protocol)
-                    .with_per_backend_filters(per_backend_filters);
-                if let Some(tls) = policy_tls {
-                    // Attach the gateway's GEP-3155 client cert to the policy-derived
-                    // UpstreamTls so the proxy presents it for upstream mTLS. Clones the
-                    // shared Arc'd UpstreamTls only on the rare route that has both a
-                    // BackendTLSPolicy and a gateway backend client cert.
-                    let tls = match route_client_cert {
-                        Some(cc) => Arc::new((*tls).clone().with_client_cert(Arc::clone(cc))),
-                        None => tls,
-                    };
-                    group = group.with_tls(tls);
-                }
-                // CoxswainBackendPolicy: apply per-backend connect/idle timeouts
-                // (#354), the LB algorithm (#389), and session persistence (#554)
-                // to the BackendGroup from the highest-weight backendRef's Service
-                // policy. The circuit breaker (#478) is RouteEntry-level, carried
-                // out to the RuleContext below.
-                let bp = pick_backend_policy(backend_refs, route_ns, backend_policy_index);
-                if let Some(bp) = bp {
-                    if bp.connect.is_some() {
-                        group = group.with_connect_timeout(bp.connect);
-                    }
-                    if bp.idle.is_some() {
-                        group = group.with_keepalive_timeout(bp.idle);
-                    }
-                    if let Some(lb) = &bp.load_balance {
-                        group = group.with_load_balance(lb.clone());
-                    }
-                    if bp.session_affinity.is_some() {
-                        group = group.with_session_affinity(bp.session_affinity.clone());
-                    }
-                }
-                // RetryPolicy ExtensionRef (#445): attach the resolved retry policy to the
-                // group (upstream retrying is a backend concern). Default (disabled) when no
-                // RetryPolicy ref is present or the CR is missing. HTTPRoute ⇒ `is_grpc=false`.
-                let retry = super::filters::resolve_retry_policy(
-                    rule_filters,
-                    route_ns,
-                    retry_policies,
-                    false,
-                );
-                group = group.with_retries(retry);
-                let circuit_breaker = bp.and_then(|bp| bp.circuit_breaker.clone());
-                let group = Arc::new(group);
-                if invalid_policy || client_cert_fail_closed {
-                    // GEP-1897: a backend covered by an invalid BackendTLSPolicy MUST
-                    // return 5xx, not silently fall back to plain HTTP. 502 reads as
-                    // "upstream not reachable" which matches the spec intent. GEP-3155
-                    // applies the same fail-closed 502 when the gateway client cert ref
-                    // is configured but unresolvable.
-                    (Some(group), Some(502u16), circuit_breaker)
-                } else if group.endpoints().is_empty() {
-                    // HTTPRoute spec: a valid Service with zero ready endpoints
-                    // SHOULD return 503; an invalid/missing backend or all-zero-
-                    // weight rule MUST return 500.
-                    let status = if has_valid_empty_backend {
-                        503u16
-                    } else {
-                        500u16
-                    };
-                    tracing::warn!(
-                        route = ?route.metadata.name,
-                        status,
-                        "No ready endpoints for rule — installing error route"
-                    );
-                    (Some(group), Some(status), circuit_breaker)
+            let (group, error_status, error_status_endpoint_derived, circuit_breaker): RuleBackend =
+                if has_redirect {
+                    (None, None, false, None)
                 } else {
-                    (Some(group), None, circuit_breaker)
-                }
-            };
+                    // A rule with omitted or empty `backendRefs` is not skipped: the
+                    // Gateway API requires it to route with a distinct 500 response
+                    // (conformance `HTTPRouteNoBackendRefs`), not fall through to a
+                    // 404. Feeding an empty slice through the normal pipeline yields
+                    // an empty `BackendGroup` whose `error_status` resolves to 500
+                    // below (no backend ref failed to *resolve* — there simply were
+                    // none — so `ResolvedRefs` stays True).
+                    let backend_refs: &[HttpRouteRulesBackendRefs] =
+                        rule.backend_refs.as_deref().unwrap_or(&[]);
+
+                    let resolved = resolve_weighted_backends(
+                        backend_refs,
+                        route_ns,
+                        endpoint_cache,
+                        services,
+                        grants,
+                    );
+                    let group_name = backend_group_name(backend_refs, route_ns);
+                    let protocols: Vec<BackendProtocol> =
+                        resolved.iter().map(|(r, _, _)| r.app_protocol).collect();
+                    let protocol = pick_route_protocol(&protocols, &group_name);
+                    // Per-backend filters from `backendRefs[].filters` — index-aligned
+                    // with the address-bearing backends `BackendGroup` pools (keyed-empty
+                    // refs never enter the pools, so they contribute nothing here, exactly
+                    // like structurally-dropped refs).
+                    let per_backend_filters: Vec<Vec<FilterAction>> = resolved
+                        .iter()
+                        .zip(backend_refs.iter())
+                        .filter(|((r, _, w), _)| *w > 0 && !r.addrs.is_empty())
+                        .map(|((_, _, _), bref)| {
+                            bref.filters
+                                .as_deref()
+                                .map(super::filters::build_backend_ref_filters)
+                                .unwrap_or_default()
+                        })
+                        .collect();
+                    // A backendRef that points to an existing Service which currently
+                    // has zero ready endpoints drives a 503; invalid refs (missing
+                    // Service, wrong kind, denied cross-namespace) and all-zero-weight
+                    // rules drive a 500. Computed before `resolved` is consumed below.
+                    let has_valid_empty_backend = resolved
+                        .iter()
+                        .any(|(r, _, w)| *w > 0 && r.service_exists && r.addrs.is_empty());
+                    // Whether any surviving ref carries endpoint provenance (a keyed
+                    // Service ref). Only then is an empty-group error status genuinely
+                    // *endpoint-derived* — an all-structurally-invalid or omitted-
+                    // backendRefs rule has no keyed ref and its 500 is fixed, so it must
+                    // stay baked on the wire rather than be re-derived from the pool.
+                    let has_endpoint_ref =
+                        resolved.iter().any(|(_, key, w)| *w > 0 && key.is_some());
+
+                    // Look up BackendTLSPolicy for this rule's backends. Highest-weight ref
+                    // wins on conflicts (ties break by backendRefs array order).
+                    let policy_match =
+                        pick_backend_tls(backend_refs, route_ns, policy_index, &group_name);
+                    let invalid_policy = matches!(policy_match, PolicyMatch::Invalid);
+                    let policy_tls = match policy_match {
+                        PolicyMatch::Valid(tls) => Some(tls),
+                        PolicyMatch::None | PolicyMatch::Invalid => None,
+                    };
+                    // GEP-3155 fail-closed: this backend speaks upstream TLS (BackendTLSPolicy)
+                    // AND an owned parent Gateway's `clientCertificateRef` is configured but
+                    // unresolvable. The proxy must present the operator-configured identity or
+                    // not connect at all — return 502 rather than silently dropping the cert.
+                    let client_cert_fail_closed = route_client_cert_failed && policy_tls.is_some();
+
+                    let mut group = BackendGroup::weighted_with_endpoints(group_name, resolved)
+                        .with_protocol(protocol)
+                        .with_per_backend_filters(per_backend_filters);
+                    if let Some(tls) = policy_tls {
+                        // Attach the gateway's GEP-3155 client cert to the policy-derived
+                        // UpstreamTls so the proxy presents it for upstream mTLS. Clones the
+                        // shared Arc'd UpstreamTls only on the rare route that has both a
+                        // BackendTLSPolicy and a gateway backend client cert.
+                        let tls = match route_client_cert {
+                            Some(cc) => Arc::new((*tls).clone().with_client_cert(Arc::clone(cc))),
+                            None => tls,
+                        };
+                        group = group.with_tls(tls);
+                    }
+                    // CoxswainBackendPolicy: apply per-backend connect/idle timeouts
+                    // (#354), the LB algorithm (#389), and session persistence (#554)
+                    // to the BackendGroup from the highest-weight backendRef's Service
+                    // policy. The circuit breaker (#478) is RouteEntry-level, carried
+                    // out to the RuleContext below.
+                    let bp = pick_backend_policy(backend_refs, route_ns, backend_policy_index);
+                    if let Some(bp) = bp {
+                        if bp.connect.is_some() {
+                            group = group.with_connect_timeout(bp.connect);
+                        }
+                        if bp.idle.is_some() {
+                            group = group.with_keepalive_timeout(bp.idle);
+                        }
+                        if let Some(lb) = &bp.load_balance {
+                            group = group.with_load_balance(lb.clone());
+                        }
+                        if bp.session_affinity.is_some() {
+                            group = group.with_session_affinity(bp.session_affinity.clone());
+                        }
+                    }
+                    // RetryPolicy ExtensionRef (#445): attach the resolved retry policy to the
+                    // group (upstream retrying is a backend concern). Default (disabled) when no
+                    // RetryPolicy ref is present or the CR is missing. HTTPRoute ⇒ `is_grpc=false`.
+                    let retry = super::filters::resolve_retry_policy(
+                        rule_filters,
+                        route_ns,
+                        retry_policies,
+                        false,
+                    );
+                    group = group.with_retries(retry);
+                    let circuit_breaker = bp.and_then(|bp| bp.circuit_breaker.clone());
+                    let group = Arc::new(group);
+                    if invalid_policy || client_cert_fail_closed {
+                        // GEP-1897: a backend covered by an invalid BackendTLSPolicy MUST
+                        // return 5xx, not silently fall back to plain HTTP. 502 reads as
+                        // "upstream not reachable" which matches the spec intent. GEP-3155
+                        // applies the same fail-closed 502 when the gateway client cert ref
+                        // is configured but unresolvable. Endpoint-INDEPENDENT — stays baked.
+                        (Some(group), Some(502u16), false, circuit_breaker)
+                    } else if group.endpoints().is_empty() {
+                        // HTTPRoute spec: a valid Service with zero ready endpoints
+                        // SHOULD return 503; an invalid/missing backend or all-zero-
+                        // weight rule MUST return 500 — the single shared rule.
+                        let status = endpoints::empty_group_status(has_valid_empty_backend);
+                        tracing::warn!(
+                            route = ?route.metadata.name,
+                            status,
+                            "No ready endpoints for rule — installing error route"
+                        );
+                        // Endpoint-derived only when a keyed Service ref backs it (503, or
+                        // a 500 for a missing Service). A structural 500 (no keyed ref)
+                        // does not depend on endpoint state, so leave the flag false.
+                        (Some(group), Some(status), has_endpoint_ref, circuit_breaker)
+                    } else {
+                        (Some(group), None, false, circuit_breaker)
+                    }
+                };
 
             let rate_limit =
                 super::filters::resolve_rate_limit(rule_filters, route_ns, rate_limits);
@@ -569,6 +566,7 @@ impl GatewayApiReconciler {
                 filters: rule_filters,
                 timeouts: &rule_timeouts,
                 error_status,
+                error_status_endpoint_derived,
                 route_id: &route_id,
                 metric_route_id: &metric_route_id,
                 created_at,
@@ -599,32 +597,44 @@ impl GatewayApiReconciler {
     }
 }
 
-/// Resolve each backendRef to `(pod_addresses, weight)`.
+/// Resolve each backendRef to `(resolved_endpoints, endpoint_key, weight)`.
 ///
 /// Weight defaults to 1 when absent (per the Gateway API spec). Refs with
-/// `weight: 0`, non-Service kind, denied cross-namespace access, or no ready
-/// endpoints contribute an empty entry and are naturally dropped by
-/// `Upstream::weighted`.
+/// `weight: 0`, non-Service kind, or denied cross-namespace access are
+/// structurally invalid: they carry an empty [`ResolvedEndpoints`] and
+/// `key: None`, so `BackendGroup::weighted_with_endpoints` drops them. A valid
+/// Service ref carries the `Arc<ResolvedEndpoints>` straight from the cache
+/// (no address clone) and `Some(key)` — the endpoint-resource provenance that
+/// keeps a wire reference alive even when the Service's endpoints are
+/// transiently absent (#383).
 fn resolve_weighted_backends(
     backend_refs: &[HttpRouteRulesBackendRefs],
     route_ns: &str,
     endpoint_cache: &EndpointCache,
     services: &reflector::Store<Service>,
     grants: &HashSet<ReferenceGrantKey>,
-) -> Vec<(endpoints::ResolvedEndpoints, u16)> {
+) -> Vec<(
+    Arc<endpoints::ResolvedEndpoints>,
+    Option<endpoints::EndpointKey>,
+    u16,
+)> {
     backend_refs
         .iter()
         .filter_map(|b| b.port.map(|port| (b, port)))
         .map(|(b, port)| {
             let weight = weight_of(b);
             if weight == 0 {
-                return (endpoints::ResolvedEndpoints::empty(), 0);
+                return (Arc::new(endpoints::ResolvedEndpoints::empty()), None, 0);
             }
 
             let b_kind = b.kind.as_deref().unwrap_or("Service");
             let b_group = b.group.as_deref().unwrap_or("");
             if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
-                return (endpoints::ResolvedEndpoints::empty(), weight);
+                return (
+                    Arc::new(endpoints::ResolvedEndpoints::empty()),
+                    None,
+                    weight,
+                );
             }
 
             let ns = b.namespace.as_deref().unwrap_or(route_ns);
@@ -637,21 +647,41 @@ fn resolve_weighted_backends(
                     backend_svc = %b.name,
                     "Cross-namespace backendRef denied — no matching ReferenceGrant"
                 );
-                return (endpoints::ResolvedEndpoints::empty(), weight);
+                return (
+                    Arc::new(endpoints::ResolvedEndpoints::empty()),
+                    None,
+                    weight,
+                );
             }
 
             (
-                (*endpoint_cache.get(ns, &b.name, port, services)).clone(),
+                endpoint_cache.get(ns, &b.name, port, services),
+                Some(endpoint_cache.key(ns, &b.name, port)),
                 weight,
             )
         })
         .collect()
 }
 
+/// Resolved backend outcome for one HTTPRoute rule: the group to install (`None`
+/// for a redirect-only rule), an optional immediate error status, whether that
+/// status is endpoint-derived (#383), and the rule's circuit breaker.
+type RuleBackend = (
+    Option<Arc<BackendGroup>>,
+    Option<u16>,
+    bool,
+    Option<Arc<coxswain_core::routing::CircuitBreakerConfig>>,
+);
+
 struct RuleContext<'a> {
     filters: &'a [HttpRouteRulesFilters],
     timeouts: &'a RouteTimeouts,
     error_status: Option<u16>,
+    /// Whether `error_status` was derived from the backend group's resolved
+    /// endpoints (503 valid-empty / 500 missing-Service). Threaded onto the
+    /// route entry so the wire encoder can omit it and let the client re-derive
+    /// it from its own endpoint pool (#383).
+    error_status_endpoint_derived: bool,
     route_id: &'a str,
     metric_route_id: &'a Arc<str>,
     created_at: Option<SystemTime>,
@@ -716,6 +746,7 @@ fn apply_rule(
         };
         entry
             .with_metric_route_id(Arc::clone(ctx.metric_route_id))
+            .with_error_status_endpoint_derived(ctx.error_status_endpoint_derived)
             .with_rate_limit(ctx.rate_limit.clone())
             .with_allow_source_range(ctx.allow_source_range.clone())
             .with_deny_source_range(ctx.deny_source_range.clone())
@@ -2546,6 +2577,162 @@ mod tests {
                 coxswain_core::routing::RouteOutcome::Error(500)
             ),
             "missing Service backendRef must resolve to 500"
+        );
+    }
+
+    // ── #383: endpoint + status provenance threading ─────────────────────────
+
+    /// Reconcile `route` and return the single `RouteEntry` it installs. The
+    /// endpoint-store temporaries live for the whole `reconcile` call, so callers
+    /// can pass a shared `EndpointCache`/Service store and later re-`get` the same
+    /// cached `Arc` for a `ptr_eq` proof.
+    fn reconcile_first_entry(
+        route: &HttpRoute,
+        store: &EndpointCache,
+        svcs: &reflector::Store<Service>,
+        policy_index: &BackendTlsIndex,
+    ) -> Arc<RouteEntry> {
+        let mut builder = RoutingTableBuilder::new();
+        GatewayApiReconciler::reconcile(
+            route,
+            store,
+            svcs,
+            &default_owned(),
+            &HashSet::new(),
+            crate::gateway_api::RouteResolution {
+                listener_info: &no_listener_info(),
+                policy_index,
+                backend_policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
+                path_rewrites: &empty_path_rewrite_store(),
+                ip_access: &empty_ip_access_store(),
+                basic_auths: &empty_basic_auth_store(),
+                external_auths: &empty_external_auth_store(),
+                external_auth_gateway_index: &std::collections::HashMap::new(),
+                jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
+                jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
+                auth_secrets: &empty_secret_store(),
+                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                request_size_limits: &empty_request_size_limit_store(),
+                compressions: &empty_compression_store(),
+                backend_client_certs: &HashMap::new(),
+                backend_client_cert_failures: &HashSet::new(),
+            },
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        table
+            .host_routes()
+            .into_iter()
+            .flat_map(|(_, _, hr)| {
+                hr.wire_entries()
+                    .map(|(_, _, e)| Arc::clone(e))
+                    .collect::<Vec<_>>()
+            })
+            .next()
+            .expect("exactly one route entry installed")
+    }
+
+    /// The built `BackendGroup` retains the endpoint key it was resolved under
+    /// and shares the cache's `Arc<ResolvedEndpoints>` verbatim — no address
+    /// clone (#383). `ptr_eq` proves the same allocation reaches the spec.
+    #[test]
+    fn built_group_carries_endpoint_key_and_shares_cache_arc() {
+        let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
+        let svcs = empty_svc_store();
+        let route = weighted_route("default", &[("svc", Some(1))]);
+
+        let entry = reconcile_first_entry(&route, &store, &svcs, &HashMap::new());
+        let spec = entry.backend_group.spec();
+        assert_eq!(spec.weighted.len(), 1, "one keyed backend ref survives");
+        let wb = &spec.weighted[0];
+        assert_eq!(
+            wb.key,
+            Some(endpoints::EndpointKey::new("default", "svc", 80)),
+            "the ref carries the (ns, svc, port) endpoint key"
+        );
+        let cached = store.get("default", "svc", 80, &svcs);
+        assert!(
+            Arc::ptr_eq(&wb.resolved, &cached),
+            "the spec holds the cache's Arc, not a clone"
+        );
+    }
+
+    /// Status provenance (#383): endpoint-derived error statuses (503 valid-empty,
+    /// 500 missing-Service) set the flag; endpoint-independent ones (structural
+    /// 500 for all-zero-weight, 502 fail-closed) leave it false.
+    #[test]
+    fn error_status_endpoint_derived_provenance() {
+        // 503: existing Service, zero ready endpoints → endpoint-derived.
+        let svc = k8s_openapi::api::core::v1::Service {
+            metadata: ObjectMeta {
+                name: Some("svc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let e503 = reconcile_first_entry(
+            &weighted_route("default", &[("svc", Some(1))]),
+            &endpoint_cache(vec![]),
+            &crate::tests::fixtures::make_svc_store(vec![svc]),
+            &HashMap::new(),
+        );
+        assert_eq!(e503.error_status, Some(503));
+        assert!(
+            e503.error_status_endpoint_derived,
+            "503 valid-but-empty is endpoint-derived"
+        );
+
+        // 500: missing Service (keyed ref, service_exists=false) → endpoint-derived.
+        let e500_missing = reconcile_first_entry(
+            &weighted_route("default", &[("svc", Some(1))]),
+            &endpoint_cache(vec![]),
+            &empty_svc_store(),
+            &HashMap::new(),
+        );
+        assert_eq!(e500_missing.error_status, Some(500));
+        assert!(
+            e500_missing.error_status_endpoint_derived,
+            "500 missing-Service is endpoint-derived (keyed ref)"
+        );
+
+        // 500: all-zero-weight → no keyed ref survives → structural, NOT derived.
+        let e500_structural = reconcile_first_entry(
+            &weighted_route("default", &[("svc-a", Some(0)), ("svc-b", Some(0))]),
+            &endpoint_cache(vec![
+                make_slice("default", "svc-a", "10.0.0.1"),
+                make_slice("default", "svc-b", "10.0.1.1"),
+            ]),
+            &empty_svc_store(),
+            &HashMap::new(),
+        );
+        assert_eq!(e500_structural.error_status, Some(500));
+        assert!(
+            !e500_structural.error_status_endpoint_derived,
+            "structural 500 (zero-weight) is endpoint-independent"
+        );
+
+        // 502: invalid BackendTLSPolicy fail-closed → endpoint-independent.
+        let mut policy_index: BackendTlsIndex = HashMap::new();
+        policy_index.insert(
+            (ObjectKey::new("default", "svc"), Some(80)),
+            ResolvedPolicy {
+                tls: None,
+                policy_key: ObjectKey::new("default", "policy"),
+            },
+        );
+        let e502 = reconcile_first_entry(
+            &weighted_route("default", &[("svc", Some(1))]),
+            &endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]),
+            &empty_svc_store(),
+            &policy_index,
+        );
+        assert_eq!(e502.error_status, Some(502));
+        assert!(
+            !e502.error_status_endpoint_derived,
+            "502 fail-closed is endpoint-independent"
         );
     }
 

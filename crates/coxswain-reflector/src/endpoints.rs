@@ -8,7 +8,7 @@
 
 pub mod pool;
 
-pub use coxswain_core::endpoints::ResolvedEndpoints;
+pub use coxswain_core::endpoints::{EndpointKey, ResolvedEndpoints, empty_group_status};
 
 use coxswain_core::routing::parse_app_protocol;
 use k8s_openapi::api::core::v1::Service;

@@ -83,7 +83,16 @@ The control-plane gRPC channel between controller (server) and proxies (clients)
 | `coxswain_discovery_connected_proxies` | Server | Gauge | — (proxy streams live now; a drop to `0` means the fleet lost its control-plane link) |
 | `coxswain_discovery_streams_total` | Server | Counter | `result` (`accepted`/`rejected`) — `rejected` covers wire-version mismatch, malformed scope, and SVID/scope-binding denial |
 | `coxswain_discovery_acks_total` | Server | Counter | — (snapshot Acks received; tracks fleet convergence throughput) |
+| `coxswain_discovery_snapshot_messages_total` | Server | Counter | `kind` (`full`/`delta`) — messages pushed; healthy steady state is a climbing `delta` against a near-static `full`. A rising `full` rate means control-plane link churn or repeated self-healing resyncs |
+| `coxswain_discovery_snapshot_resources_sent_total` | Server | Counter | — (resource upserts placed in pushed snapshots; ÷ `snapshot_messages_total` is the average payload width — collapses toward 1 under endpoint-only deltas) |
+| `coxswain_discovery_snapshot_resources_removed_total` | Server | Counter | — (resource tombstones placed in deltas; a route delete or an endpoint's last-referrer removal shows up here) |
+| `coxswain_discovery_snapshot_build_seconds` | Server | Histogram | — (cost of reading the routing cells and serializing one snapshot) |
+| `coxswain_discovery_ack_latency_seconds` | Server | Histogram | — (send-to-Ack round trip incl. client decode+apply; a Nack or drop before Ack never observes) |
 | `coxswain_discovery_client_reconnects_total` | Client | Counter | — (reconnect attempts; excludes the first connect — a climbing rate flags an unstable link) |
+| `coxswain_discovery_client_snapshots_applied_total` | Client | Counter | `kind` (`full`/`delta`) — snapshots the client Ack'd; mirror of the server `snapshot_messages_total` from the receiving end (same healthy shape: `delta` climbs, `full` static) |
+| `coxswain_discovery_client_partitions_recompiled_total` | Client | Counter | — (route partitions recompiled on apply — those whose DTO or referenced endpoints changed) |
+| `coxswain_discovery_client_partitions_reused_total` | Client | Counter | — (partitions spliced unchanged from the live table; the reused÷recompiled ratio is the payoff of partitioned apply — under endpoint churn only referencing partitions recompile) |
+| `coxswain_discovery_snapshot_apply_seconds` | Client | Histogram | — (cost of one client apply, wire DTO → routing cells; observed even on a Nack'd apply) |
 | `coxswain_discovery_client_state` | Client | Gauge | — (`0`=pending, `1`=ready, `2`=degraded; scalar mirror of the proxy health subsystem) |
 | `coxswain_discovery_bootstrap_total` | Server | Counter | `result` (`accepted`/`rejected`), `reason` (`ok` for accepts; `wire_version`/`sa_token`/`token_review_error`/`invalid_principal`/`ca_not_ready`/`malformed_csr`/`signing_error`/`internal` for rejects) — `sum(result="rejected")` answers "is the fleet failing to bootstrap"; the `reason` split separates a misconfigured client from a controller-side fault |
 | `coxswain_discovery_svid_issued_total` | Server | Counter | — (SVIDs the CA signed on the Bootstrap path; a flat line while SVIDs expire flags a stuck issuance path) |

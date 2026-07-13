@@ -63,23 +63,49 @@ pub fn listener_status_to_wire(
     p::GatewayListenerStatus {
         entries: entries
             .into_iter()
-            .map(|(key, status)| p::GatewayStatusEntry {
-                object_key: key.to_string(),
-                status: Some(p::ListenerStatus {
-                    // BTreeMap<ListenerStatusKey, ListenerInfo> is already sorted by (source, name).
-                    listeners: status
-                        .listeners
-                        .iter()
-                        .map(|(key, info)| p::ListenerInfoEntry {
-                            name: key.name.clone(),
-                            info: Some(listener_info_to_wire(info)),
-                            source: listener_source_to_wire(&key.source),
-                        })
-                        .collect(),
-                }),
-            })
+            .map(|(key, status)| gateway_status_entry_to_wire(key, status))
             .collect(),
     }
+}
+
+/// Serialise one `(ObjectKey, GatewayListenerStatus)` pair to its wire entry,
+/// shared by the flat [`listener_status_to_wire`] and the per-resource emitter.
+fn gateway_status_entry_to_wire(
+    key: &ObjectKey,
+    status: &GatewayListenerStatus,
+) -> p::GatewayStatusEntry {
+    p::GatewayStatusEntry {
+        object_key: key.to_string(),
+        status: Some(p::ListenerStatus {
+            // BTreeMap<ListenerStatusKey, ListenerInfo> is already sorted by (source, name).
+            listeners: status
+                .listeners
+                .iter()
+                .map(|(k, info)| p::ListenerInfoEntry {
+                    name: k.name.clone(),
+                    info: Some(listener_info_to_wire(info)),
+                    source: listener_source_to_wire(&k.source),
+                })
+                .collect(),
+        }),
+    }
+}
+
+/// Emit one [`p::Resource::ListenerStatus`] per Gateway `ObjectKey` (#383).
+///
+/// Each Gateway's listener status is its own resource, so a status change on one
+/// Gateway re-sends only that entry.
+#[must_use = "listener-status resources must be folded into the materialized view"]
+pub(crate) fn listener_status_resources(
+    map: &std::collections::HashMap<ObjectKey, GatewayListenerStatus>,
+) -> Vec<p::Resource> {
+    map.iter()
+        .map(|(key, status)| p::Resource {
+            payload: Some(p::resource::Payload::ListenerStatus(
+                gateway_status_entry_to_wire(key, status),
+            )),
+        })
+        .collect()
 }
 
 fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {

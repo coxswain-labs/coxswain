@@ -210,7 +210,7 @@ Routing tables are **never cleared** during a reconnect window. A controller out
 
 ## Wire-version skew
 
-`WIRE_VERSION = 1` (current). Every `Subscribe` message includes this version. The server rejects a client with a different version immediately with `FAILED_PRECONDITION`; the client backs off **permanently** on that status (it does not retry the stream). Recovery: roll back the mismatched component (controller or proxy) to a matching version. There is no runtime negotiation — both ends must agree.
+`WIRE_VERSION = 2` (current — the resource-oriented delta protocol; see [Discovery protocol → wire protocol](../architecture/discovery-protocol.md#the-wire-protocol)). Every `Subscribe` message includes this version. The server rejects a client with a different version immediately with `FAILED_PRECONDITION`; the client backs off **permanently** on that status (it does not retry the stream). Recovery: roll back the mismatched component (controller or proxy) to a matching version. There is no runtime negotiation — both ends must agree, and the break from `1` is hard (no back-compat: v1 sent a whole-table snapshot on every change, v2 streams per-resource deltas).
 
 ## Troubleshooting
 

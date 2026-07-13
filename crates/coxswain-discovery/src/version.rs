@@ -17,7 +17,13 @@ use sha2::{Digest, Sha256};
 /// - `1` (v0.5): initial SotW snapshot protocol; `Scope` carries a `oneof`
 ///   discriminator (`SharedPoolScope` / `GatewayScope`) so the server
 ///   dispatches per-subscriber snapshots.
-pub const WIRE_VERSION: u32 = 1;
+/// - `2` (v0.6, #383): resource-oriented snapshot. `Snapshot` carries a flat,
+///   canonical-key-addressed `repeated Resource resources` set (plus a `full`
+///   flag and a `removed_resources` tombstone set) instead of nine whole-table
+///   fields; backends reference an EDS-style `EndpointResource` by
+///   `(namespace, service, port)` so endpoint churn re-sends only the endpoint
+///   resource, not every route. Back-compat with v1 is dropped (no users).
+pub const WIRE_VERSION: u32 = 2;
 
 /// Content hash of a per-scope snapshot DTO.
 ///

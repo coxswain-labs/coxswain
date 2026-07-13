@@ -121,6 +121,73 @@ pub async fn wait_for_new_leader(
     .await
 }
 
+/// Wait until the CURRENT Lease holder reports `leader=1` plus at least one
+/// successful reconcile — the post-restart convergence gate for HA installs.
+///
+/// Re-resolves the holder and opens a fresh one-shot forward on every tick.
+/// That per-tick cost buys the two properties a held forward cannot provide:
+/// the wait survives a holder change mid-window, and it survives `kubectl
+/// port-forward` wedging permanently when it dials the admin port in the
+/// window where the pod is Ready but the admin listener isn't up yet (the
+/// forward accepts the local connection, fails the upstream dial once, and
+/// never recovers — starving the entire wait on a dead tunnel).
+///
+/// # Errors
+///
+/// Returns an error when no Ready Lease holder reports a leading, reconciled
+/// state within `timeout`.
+pub async fn wait_for_leader_reconciled(client: &Client, timeout: Duration) -> anyhow::Result<()> {
+    let lease_api: Api<Lease> = Api::namespaced(client.clone(), SYSTEM_NAMESPACE);
+    let pods_api: Api<Pod> = Api::namespaced(client.clone(), SYSTEM_NAMESPACE);
+    wait::poll_until(
+        timeout,
+        wait::POLL,
+        || {
+            let lease_api = lease_api.clone();
+            async move {
+                let holder = lease_api
+                    .get(LEASE_NAME)
+                    .await
+                    .ok()
+                    .and_then(|l| l.spec.and_then(|s| s.holder_identity));
+                format!(
+                    "the current Lease holder to report leader=1 with a successful \
+                     reconcile; holder: {holder:?}"
+                )
+            }
+        },
+        || {
+            let lease_api = lease_api.clone();
+            let pods_api = pods_api.clone();
+            async move {
+                let holder = lease_api
+                    .get(LEASE_NAME)
+                    .await
+                    .ok()?
+                    .spec?
+                    .holder_identity
+                    .filter(|h| !h.is_empty())?;
+                let pod = pods_api.get(&holder).await.ok()?;
+                if !pod_is_ready(&pod) {
+                    return None;
+                }
+                let pf = pod_admin_forward(&holder).await.ok()?;
+                let body = reqwest::get(format!("{}/metrics", pf.base_url))
+                    .await
+                    .ok()?
+                    .text()
+                    .await
+                    .ok()?;
+                let leading =
+                    wait::parse_metric_value(&body, "coxswain_controller_leader") == Some(1.0);
+                let reconciled = wait::reconcile_ok_total(&body).is_some_and(|v| v >= 1.0);
+                (leading && reconciled).then_some(())
+            }
+        },
+    )
+    .await
+}
+
 /// Whether `pod` reports the `Ready=True` pod condition.
 pub fn pod_is_ready(pod: &Pod) -> bool {
     pod.status

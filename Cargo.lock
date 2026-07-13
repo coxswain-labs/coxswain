@@ -858,6 +858,7 @@ version = "0.5.0"
 dependencies = [
  "async-trait",
  "coxswain-core",
+ "criterion",
  "http",
  "ipnet",
  "parking_lot",

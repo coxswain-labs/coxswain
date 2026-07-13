@@ -162,6 +162,22 @@ impl EndpointCache {
         self.cache_key_and_fingerprint(ns, svc, port, services).1
     }
 
+    /// The [`EndpointKey`] under which [`Self::get`] resolves `(ns, svc, port)`.
+    ///
+    /// Route builders thread this onto `BackendGroupSpec` as endpoint-resource
+    /// provenance (#383) so the discovery wire can name the endpoint resource a
+    /// backend depends on. Shares the same port clamp as the cache's own keying
+    /// (below), so the returned key is byte-identical to the one `get` pooled
+    /// under — this is the single home of that clamp.
+    #[must_use]
+    pub fn key(&self, ns: &str, svc: &str, port: i32) -> EndpointKey {
+        // K8s Service ports are API-server-validated to `1..=65535`; a value
+        // outside that range cannot come from a real cluster object and is
+        // not reachable via any watched input this cache observes — collapse
+        // it to a single degenerate key rather than propagate a bogus one.
+        EndpointKey::new(ns, svc, u16::try_from(port).unwrap_or(0))
+    }
+
     fn cache_key_and_fingerprint(
         &self,
         ns: &str,
@@ -173,12 +189,7 @@ impl EndpointCache {
         let group_fingerprint = self.groups.get(&group_key).map_or(0, |g| g.fingerprint);
         let service_fingerprint = crate::fingerprint::object_fingerprint(services, ns, svc);
         let fingerprint = group_fingerprint ^ service_fingerprint;
-        // K8s Service ports are API-server-validated to `1..=65535`; a value
-        // outside that range cannot come from a real cluster object and is
-        // not reachable via any watched input this cache observes — collapse
-        // it to a single degenerate key rather than propagate a bogus one.
-        let port_key = u16::try_from(port).unwrap_or(0);
-        (EndpointKey::new(ns, svc, port_key), fingerprint)
+        (self.key(ns, svc, port), fingerprint)
     }
 }
 
