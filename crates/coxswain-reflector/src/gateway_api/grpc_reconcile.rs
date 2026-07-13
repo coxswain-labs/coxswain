@@ -31,7 +31,6 @@ use coxswain_core::routing::{
 use k8s_openapi::api::core::v1::Service;
 use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -249,14 +248,14 @@ pub(super) fn reconcile(
             resolve_weighted_backends(backend_refs, route_ns, endpoint_cache, services, grants);
         let group_name = backend_group_name(backend_refs, route_ns);
         let protocols: Vec<BackendProtocol> =
-            resolved.iter().map(|(r, _)| r.app_protocol).collect();
+            resolved.iter().map(|(r, _, _)| r.app_protocol).collect();
         let protocol = pick_route_protocol(&protocols, &group_name);
 
         let per_backend_filters: Vec<Vec<FilterAction>> = resolved
             .iter()
             .zip(backend_refs.iter())
-            .filter(|((r, w), _)| *w > 0 && !r.addrs.is_empty())
-            .map(|((_, _), bref)| {
+            .filter(|((r, _, w), _)| *w > 0 && !r.addrs.is_empty())
+            .map(|((_, _, _), bref)| {
                 bref.filters
                     .as_deref()
                     .map(build_backend_ref_filters)
@@ -266,12 +265,10 @@ pub(super) fn reconcile(
 
         let has_valid_empty_backend = resolved
             .iter()
-            .any(|(r, w)| *w > 0 && r.service_exists && r.addrs.is_empty());
-        let weighted: Vec<(Vec<SocketAddr>, u16)> = resolved
-            .into_iter()
-            .filter(|(r, w)| *w > 0 && !r.addrs.is_empty())
-            .map(|(r, w)| (r.addrs, w))
-            .collect();
+            .any(|(r, _, w)| *w > 0 && r.service_exists && r.addrs.is_empty());
+        // Whether any surviving ref carries endpoint provenance (a keyed Service
+        // ref); only then is an empty-group error status endpoint-derived (#383).
+        let has_endpoint_ref = resolved.iter().any(|(_, key, w)| *w > 0 && key.is_some());
 
         let policy_match = pick_backend_tls(backend_refs, route_ns, policy_index, &group_name);
         let invalid_policy = matches!(policy_match, PolicyMatch::Invalid);
@@ -280,7 +277,7 @@ pub(super) fn reconcile(
             PolicyMatch::None | PolicyMatch::Invalid => None,
         };
 
-        let mut group = BackendGroup::weighted(group_name, weighted)
+        let mut group = BackendGroup::weighted_with_endpoints(group_name, resolved)
             .with_protocol(protocol)
             .with_per_backend_filters(per_backend_filters);
         if let Some(tls) = policy_tls {
@@ -313,23 +310,25 @@ pub(super) fn reconcile(
         let circuit_breaker = bp.and_then(|bp| bp.circuit_breaker.clone());
         let group = Arc::new(group);
 
-        let (group_opt, error_status): (Option<Arc<BackendGroup>>, Option<u16>) = if invalid_policy
-        {
-            (Some(group), Some(502u16))
+        let (group_opt, error_status, error_status_endpoint_derived): (
+            Option<Arc<BackendGroup>>,
+            Option<u16>,
+            bool,
+        ) = if invalid_policy {
+            // GEP-1897 fail-closed 502 — endpoint-INDEPENDENT, stays baked on the wire.
+            (Some(group), Some(502u16), false)
         } else if group.endpoints().is_empty() {
-            let status = if has_valid_empty_backend {
-                503u16
-            } else {
-                500u16
-            };
+            let status = endpoints::empty_group_status(has_valid_empty_backend);
             tracing::warn!(
                 route = ?route.metadata.name,
                 status,
                 "No ready endpoints for GRPCRoute rule — installing error route"
             );
-            (Some(group), Some(status))
+            // Endpoint-derived only when a keyed Service ref backs it (see the
+            // HTTPRoute twin); a structural 500 leaves the flag false.
+            (Some(group), Some(status), has_endpoint_ref)
         } else {
-            (Some(group), None)
+            (Some(group), None, false)
         };
 
         // `GrpcRouteRulesFilters` implements `ExtRefFilter`, so the shared HTTP
@@ -343,6 +342,7 @@ pub(super) fn reconcile(
         let ctx = GrpcRuleContext {
             filters: rule_filters,
             error_status,
+            error_status_endpoint_derived,
             route_id: &route_id,
             metric_route_id: &metric_route_id,
             created_at,
@@ -367,6 +367,10 @@ pub(super) fn reconcile(
 struct GrpcRuleContext<'a> {
     filters: &'a [GrpcRouteRulesFilters],
     error_status: Option<u16>,
+    /// Whether `error_status` was derived from the backend group's resolved
+    /// endpoints (503 valid-empty / 500 missing-Service), so the wire encoder
+    /// can omit it and let the client re-derive it from its pool (#383).
+    error_status_endpoint_derived: bool,
     route_id: &'a str,
     metric_route_id: &'a Arc<str>,
     created_at: Option<SystemTime>,
@@ -420,6 +424,7 @@ fn apply_grpc_rule(
         };
         entry
             .with_metric_route_id(Arc::clone(ctx.metric_route_id))
+            .with_error_status_endpoint_derived(ctx.error_status_endpoint_derived)
             .with_rate_limit(ctx.rate_limit.clone())
             .with_allow_source_range(ctx.allow_source_range.clone())
             .with_deny_source_range(ctx.deny_source_range.clone())
@@ -765,27 +770,40 @@ fn build_backend_ref_filters(filters: &[GrpcRouteRulesBackendRefsFilters]) -> Ve
     out
 }
 
-/// Resolve each backendRef to `(pod_addresses, weight)`.
+/// Resolve each backendRef to `(resolved_endpoints, endpoint_key, weight)`.
+///
+/// Mirrors the HTTPRoute resolver: structurally-invalid refs (`weight: 0`,
+/// non-Service kind, denied cross-namespace) carry an empty [`ResolvedEndpoints`]
+/// and `key: None`; a valid Service ref carries the cache's `Arc` (no address
+/// clone) and `Some(key)` endpoint-resource provenance (#383).
 fn resolve_weighted_backends(
     backend_refs: &[GrpcRouteRulesBackendRefs],
     route_ns: &str,
     endpoint_cache: &EndpointCache,
     services: &reflector::Store<Service>,
     grants: &HashSet<ReferenceGrantKey>,
-) -> Vec<(endpoints::ResolvedEndpoints, u16)> {
+) -> Vec<(
+    Arc<endpoints::ResolvedEndpoints>,
+    Option<endpoints::EndpointKey>,
+    u16,
+)> {
     backend_refs
         .iter()
         .filter_map(|b| b.port.map(|port| (b, port)))
         .map(|(b, port)| {
             let weight = weight_of(b);
             if weight == 0 {
-                return (endpoints::ResolvedEndpoints::empty(), 0);
+                return (Arc::new(endpoints::ResolvedEndpoints::empty()), None, 0);
             }
 
             let b_kind = b.kind.as_deref().unwrap_or("Service");
             let b_group = b.group.as_deref().unwrap_or("");
             if b_kind != "Service" || (!b_group.is_empty() && b_group != "core") {
-                return (endpoints::ResolvedEndpoints::empty(), weight);
+                return (
+                    Arc::new(endpoints::ResolvedEndpoints::empty()),
+                    None,
+                    weight,
+                );
             }
 
             let ns = b.namespace.as_deref().unwrap_or(route_ns);
@@ -798,11 +816,16 @@ fn resolve_weighted_backends(
                     backend_svc = %b.name,
                     "Cross-namespace backendRef denied — no matching ReferenceGrant"
                 );
-                return (endpoints::ResolvedEndpoints::empty(), weight);
+                return (
+                    Arc::new(endpoints::ResolvedEndpoints::empty()),
+                    None,
+                    weight,
+                );
             }
 
             (
-                (*endpoint_cache.get(ns, &b.name, port, services)).clone(),
+                endpoint_cache.get(ns, &b.name, port, services),
+                Some(endpoint_cache.key(ns, &b.name, port)),
                 weight,
             )
         })
@@ -1431,6 +1454,171 @@ mod tests {
                 coxswain_core::routing::RouteOutcome::Error(500)
             ),
             "gRPC rule with empty backendRefs must resolve to Error(500)"
+        );
+    }
+
+    // ── error-status provenance (#383) ────────────────────────────────────────
+
+    /// A GRPCRoute attached to owned Gateway `default/gw`, hostname `example.com`,
+    /// whose single rule carries the given weighted `backend_refs` (each on port 80).
+    fn grpc_weighted_route(ns: &str, refs: &[(&str, Option<i32>)]) -> GrpcRoute {
+        use crate::gw_types::v::grpcroutes::{GrpcRouteParentRefs, GrpcRouteRules, GrpcRouteSpec};
+        use kube::api::ObjectMeta;
+        GrpcRoute {
+            metadata: ObjectMeta {
+                name: Some("grpc-route".to_string()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            spec: GrpcRouteSpec {
+                parent_refs: Some(vec![GrpcRouteParentRefs {
+                    name: "gw".to_string(),
+                    ..Default::default()
+                }]),
+                hostnames: Some(vec!["example.com".to_string()]),
+                rules: Some(vec![GrpcRouteRules {
+                    backend_refs: Some(
+                        refs.iter()
+                            .map(|(svc, w)| GrpcRouteRulesBackendRefs {
+                                name: svc.to_string(),
+                                port: Some(80),
+                                weight: *w,
+                                ..Default::default()
+                            })
+                            .collect(),
+                    ),
+                    ..Default::default()
+                }]),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Reconcile `route` against a single listener on `default/gw` (port 80, any
+    /// hostname) and return the single `RouteEntry` it installs.
+    fn grpc_reconcile_first_entry(
+        route: &GrpcRoute,
+        store: &EndpointCache,
+        svcs: &reflector::Store<Service>,
+        policy_index: &BackendTlsIndex,
+    ) -> Arc<RouteEntry> {
+        use crate::gateway_api::tests::{default_owned, make_listener_info};
+        use crate::tests::fixtures::{
+            empty_ip_access_store, empty_jwks_cache, empty_jwt_auth_store, empty_rate_limit_store,
+            empty_retry_policy_store,
+        };
+        let listener_info = make_listener_info("default", "gw", &[("l1", "", 80)]);
+        let mut builder = GatewayRoutingTableBuilder::new();
+        reconcile(
+            route,
+            store,
+            svcs,
+            &default_owned(),
+            &HashSet::new(),
+            GrpcRouteResolution {
+                listener_info: &listener_info,
+                policy_index,
+                backend_policy_index: &HashMap::new(),
+                rate_limits: &empty_rate_limit_store(),
+                retry_policies: &empty_retry_policy_store(),
+                ip_access: &empty_ip_access_store(),
+                jwt_auths: &empty_jwt_auth_store(),
+                jwks_cache: &empty_jwks_cache(),
+            },
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        table
+            .host_routes()
+            .into_iter()
+            .flat_map(|(_, _, hr)| {
+                hr.wire_entries()
+                    .map(|(_, _, e)| Arc::clone(e))
+                    .collect::<Vec<_>>()
+            })
+            .next()
+            .expect("exactly one route entry installed")
+    }
+
+    /// Status provenance (#383), GRPCRoute twin of the HTTPRoute
+    /// `error_status_endpoint_derived_provenance`: endpoint-derived error statuses
+    /// (503 valid-empty, 500 missing-Service) set the flag so the wire encoder can
+    /// omit them and let the client re-derive from its pool; endpoint-independent
+    /// ones (structural 500 all-zero-weight, 502 fail-closed) leave it false and
+    /// stay baked on the wire.
+    #[test]
+    fn error_status_endpoint_derived_provenance() {
+        use crate::tests::fixtures::{empty_svc_store, endpoint_cache, make_slice, make_svc_store};
+
+        // 503: existing Service, zero ready endpoints → endpoint-derived.
+        let svc = k8s_openapi::api::core::v1::Service {
+            metadata: kube::api::ObjectMeta {
+                name: Some("svc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let e503 = grpc_reconcile_first_entry(
+            &grpc_weighted_route("default", &[("svc", Some(1))]),
+            &endpoint_cache(vec![]),
+            &make_svc_store(vec![svc]),
+            &HashMap::new(),
+        );
+        assert_eq!(e503.error_status, Some(503));
+        assert!(
+            e503.error_status_endpoint_derived,
+            "503 valid-but-empty is endpoint-derived"
+        );
+
+        // 500: missing Service (keyed ref, service_exists=false) → endpoint-derived.
+        let e500_missing = grpc_reconcile_first_entry(
+            &grpc_weighted_route("default", &[("svc", Some(1))]),
+            &endpoint_cache(vec![]),
+            &empty_svc_store(),
+            &HashMap::new(),
+        );
+        assert_eq!(e500_missing.error_status, Some(500));
+        assert!(
+            e500_missing.error_status_endpoint_derived,
+            "500 missing-Service is endpoint-derived (keyed ref)"
+        );
+
+        // 500: all-zero-weight → no keyed ref survives → structural, NOT derived.
+        let e500_structural = grpc_reconcile_first_entry(
+            &grpc_weighted_route("default", &[("svc-a", Some(0)), ("svc-b", Some(0))]),
+            &endpoint_cache(vec![
+                make_slice("default", "svc-a", "10.0.0.1"),
+                make_slice("default", "svc-b", "10.0.1.1"),
+            ]),
+            &empty_svc_store(),
+            &HashMap::new(),
+        );
+        assert_eq!(e500_structural.error_status, Some(500));
+        assert!(
+            !e500_structural.error_status_endpoint_derived,
+            "structural 500 (zero-weight) is endpoint-independent"
+        );
+
+        // 502: invalid BackendTLSPolicy fail-closed (GEP-1897) → endpoint-independent.
+        let mut policy_index: BackendTlsIndex = HashMap::new();
+        policy_index.insert(
+            (ObjectKey::new("default", "svc"), Some(80)),
+            ResolvedPolicy {
+                tls: None,
+                policy_key: ObjectKey::new("default", "policy"),
+            },
+        );
+        let e502 = grpc_reconcile_first_entry(
+            &grpc_weighted_route("default", &[("svc", Some(1))]),
+            &endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]),
+            &empty_svc_store(),
+            &policy_index,
+        );
+        assert_eq!(e502.error_status, Some(502));
+        assert!(
+            !e502.error_status_endpoint_derived,
+            "502 fail-closed is endpoint-independent"
         );
     }
 

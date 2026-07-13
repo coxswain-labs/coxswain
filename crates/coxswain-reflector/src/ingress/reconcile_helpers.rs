@@ -7,18 +7,18 @@ use super::annotations::AnnotationIssue;
 use super::annotations::auth::{SecretRef, parse_htpasswd};
 use super::annotations::traffic_policy;
 use crate::endpoints::pool::EndpointCache;
+use crate::endpoints::{EndpointKey, ResolvedEndpoints};
 use crate::gateway_api::ResolvedBackendPolicy;
 use coxswain_core::crd::{
     Compression, CoxswainExternalAuth, IpAccessControl, RateLimit, RetryPolicy,
 };
 use coxswain_core::routing::{
-    BackendGroup, BackendProtocol, BasicCredential, CompressionConfig, FilterAction,
-    HostRouterBuilder, IngressAuthConfig, IngressRoutingTableBuilder, NormalizeLevel,
-    RateLimitConfig, RetryPolicyConfig, WildcardKind,
+    BackendGroup, BasicCredential, CompressionConfig, FilterAction, HostRouterBuilder,
+    IngressAuthConfig, IngressRoutingTableBuilder, NormalizeLevel, RateLimitConfig,
+    RetryPolicyConfig, WildcardKind,
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use kube::runtime::reflector;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 // ── Backend group construction ────────────────────────────────────────────────
@@ -40,14 +40,19 @@ use std::sync::Arc;
 pub(super) fn build_ingress_backend_group(
     ns: &str,
     svc_name: &str,
-    addrs: Vec<SocketAddr>,
-    protocol: BackendProtocol,
+    resolved: Arc<ResolvedEndpoints>,
+    key: Option<EndpointKey>,
     policy: Option<&ResolvedBackendPolicy>,
     retries: &RetryPolicyConfig,
 ) -> BackendGroup {
-    let mut group = BackendGroup::new(format!("{ns}/{svc_name}"), addrs)
-        .with_protocol(protocol)
-        .with_retries(retries.clone());
+    // Backend wire protocol comes from the Service port `appProtocol` (GEP-1911),
+    // carried on the resolved endpoints. The ref threads its endpoint key so the
+    // discovery wire can name the endpoint resource this group depends on (#383).
+    let protocol = resolved.app_protocol;
+    let mut group =
+        BackendGroup::weighted_with_endpoints(format!("{ns}/{svc_name}"), vec![(resolved, key, 1)])
+            .with_protocol(protocol)
+            .with_retries(retries.clone());
     if let Some(bp) = policy {
         group = group
             .with_connect_timeout(bp.connect)
@@ -114,9 +119,12 @@ pub(super) fn resolve_mirror_filter(
             "mirror-target has no ready endpoints"
         );
     }
-    let mirror_group = Arc::new(BackendGroup::new(
+    // Carry the endpoint key (#383) so the mirror target survives a wire delta
+    // while its endpoints are transiently absent.
+    let key = endpoint_cache.key(mirror_ns, &mirror_ref.service, i32::from(mirror_ref.port));
+    let mirror_group = Arc::new(BackendGroup::weighted_with_endpoints(
         format!("{mirror_ns}/{}", mirror_ref.service),
-        resolved.addrs.clone(),
+        vec![(resolved, Some(key), 1)],
     ));
     Some(FilterAction::Mirror {
         backend: mirror_group,

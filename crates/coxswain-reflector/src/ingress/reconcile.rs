@@ -419,9 +419,11 @@ impl IngressReconciler {
                 // This mirrors the Gateway-API path, which installs an error
                 // route for the same case. (503 = Service Unavailable, the
                 // ingress-controller convention for "no ready upstreams";
-                // unresolvable backends — missing Service/port — are still
-                // skipped above, before this point.)
+                // named-port backends on a missing Service are skipped above,
+                // but numeric-port ones resolve without consulting the Service
+                // store, so a missing Service can still reach this point.)
                 let dead = resolved.addrs.is_empty();
+                let dead_service_exists = resolved.service_exists;
                 if dead {
                     tracing::warn!(
                         ingress = ?ingress.metadata.name,
@@ -435,12 +437,15 @@ impl IngressReconciler {
                 let backend_policy = auth_stores
                     .backend_policy_index
                     .get(&ObjectKey::new(ns, &svc.name));
-                // Backend wire protocol comes from the Service port `appProtocol` (GEP-1911).
+                // Thread the endpoint key (#383): the resolved `Arc` and its key go
+                // straight to the group, no address clone. A dead (endpoint-empty)
+                // Service keeps its keyed ref in the spec so a wire reference survives.
+                let key = endpoint_cache.key(ns, &svc.name, port);
                 let group = Arc::new(build_ingress_backend_group(
                     ns,
                     &svc.name,
-                    resolved.addrs.clone(),
-                    resolved.app_protocol,
+                    resolved,
+                    Some(key),
                     backend_policy,
                     &retries,
                 ));
@@ -526,7 +531,14 @@ impl IngressReconciler {
                     circuit_breaker.clone(),
                 );
                 if dead {
+                    // Flag the 503 as endpoint-derived only when the client can
+                    // reproduce it from its endpoint pool (existing Service, zero
+                    // ready endpoints ⇒ pool derives 503). A numeric-port backend
+                    // on a *missing* Service also lands here, but the ingress
+                    // convention is 503 while the pool would derive 500 — that
+                    // status must stay baked on the wire (#383).
                     base_entry.error_status = Some(503);
+                    base_entry.error_status_endpoint_derived = dead_service_exists;
                 }
                 // When ssl-redirect is active the HTTP-port entry carries an extra leading
                 // RequestRedirect filter; the HTTPS-port entry does not (the request is
@@ -545,6 +557,7 @@ impl IngressReconciler {
                     );
                     if dead {
                         entry.error_status = Some(503);
+                        entry.error_status_endpoint_derived = dead_service_exists;
                     }
                     Arc::new(entry)
                 });
@@ -603,12 +616,14 @@ impl IngressReconciler {
                         let backend_policy = auth_stores
                             .backend_policy_index
                             .get(&ObjectKey::new(ns, &default_svc.name));
-                        // Backend wire protocol comes from the Service port `appProtocol` (GEP-1911).
+                        // Endpoint key (#383) threaded from the cache; addrs non-empty
+                        // here (the empty case was skipped above).
+                        let key = endpoint_cache.key(ns, &default_svc.name, port);
                         let group = Arc::new(build_ingress_backend_group(
                             ns,
                             &default_svc.name,
-                            resolved.addrs.clone(),
-                            resolved.app_protocol,
+                            resolved,
+                            Some(key),
                             backend_policy,
                             &retries,
                         ));
@@ -1563,6 +1578,24 @@ mod tests {
         assert!(table.route(80, "other.io", "/", &ctx).is_some());
     }
 
+    /// Extract the single compiled `RouteEntry` a one-path Ingress installs.
+    /// `find()`/`route()` don't surface the error-status provenance flag, so
+    /// reach past them into the wire table (#383).
+    fn only_ingress_entry(
+        table: &coxswain_core::routing::IngressRoutingTable,
+    ) -> std::sync::Arc<coxswain_core::routing::RouteEntry> {
+        table
+            .host_routes()
+            .into_iter()
+            .flat_map(|(_, _, hr)| {
+                hr.wire_entries()
+                    .map(|(_, _, e)| std::sync::Arc::clone(e))
+                    .collect::<Vec<_>>()
+            })
+            .next()
+            .expect("exactly one route entry installed")
+    }
+
     #[test]
     fn reconcile_keeps_dead_route_when_no_endpoints() {
         let store = endpoint_cache(vec![]); // no slices → zero ready endpoints
@@ -1576,6 +1609,8 @@ mod tests {
             None,
         );
         let mut builder = RoutingTableBuilder::new();
+        // MISSING Service: the numeric-port backend resolves without consulting
+        // the (empty) Service store, so it still reaches the dead-route path.
         reconcile_no_default(
             &ingress,
             &store,
@@ -1595,6 +1630,65 @@ mod tests {
                 coxswain_core::routing::RouteOutcome::Error(503)
             ),
             "an Ingress path with zero ready endpoints must stay in the table as a 503 route"
+        );
+
+        // Provenance (#383): the ingress convention bakes 503 for a numeric-port
+        // backend on a MISSING Service, but the client's pool would derive 500 —
+        // so the status must NOT be flagged endpoint-derived (stays on the wire).
+        let entry = only_ingress_entry(&table);
+        assert_eq!(entry.error_status, Some(503));
+        assert!(
+            !entry.error_status_endpoint_derived,
+            "503 for a MISSING Service is NOT endpoint-derived (pool would derive 500)"
+        );
+    }
+
+    #[test]
+    fn reconcile_dead_route_existing_service_flags_endpoint_derived() {
+        let store = endpoint_cache(vec![]); // no slices → zero ready endpoints
+        // EXISTING Service (present in the store) with zero ready endpoints: the
+        // client's pool reproduces the same 503, so the status is endpoint-derived.
+        let svc = Service {
+            metadata: ObjectMeta {
+                name: Some("svc".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ingress = make_ingress(
+            "default",
+            Some("example.com"),
+            "/",
+            "Prefix",
+            "svc",
+            Some("coxswain"),
+            None,
+        );
+        let mut builder = RoutingTableBuilder::new();
+        reconcile_no_default(
+            &ingress,
+            &store,
+            &make_svc_store(vec![svc]),
+            &owned(&["coxswain"]),
+            &mut builder,
+        );
+        let table = builder.build().unwrap();
+        let ctx = RequestContext::default();
+
+        assert!(
+            matches!(
+                table.find(80, "example.com", "/", &ctx),
+                coxswain_core::routing::RouteOutcome::Error(503)
+            ),
+            "an existing Service with zero ready endpoints must stay a 503 route"
+        );
+
+        let entry = only_ingress_entry(&table);
+        assert_eq!(entry.error_status, Some(503));
+        assert!(
+            entry.error_status_endpoint_derived,
+            "503 for an EXISTING Service with zero endpoints is endpoint-derived"
         );
     }
 

@@ -383,10 +383,13 @@ pub(super) fn build_filters(
                     continue;
                 }
                 // Empty addrs: Service exists but has no ready endpoints. Install the
-                // filter anyway so the proxy can log the drop at dispatch time.
-                let mirror_group = Arc::new(BackendGroup::new(
+                // filter anyway so the proxy can log the drop at dispatch time. The
+                // ref carries its endpoint key (#383) so the mirror target survives a
+                // wire delta while its endpoints are transiently absent.
+                let key = stores.endpoint_cache.key(mirror_ns, &bref.name, port);
+                let mirror_group = Arc::new(BackendGroup::weighted_with_endpoints(
                     format!("{mirror_ns}/{}", bref.name),
-                    resolved.addrs.clone(),
+                    vec![(resolved, Some(key), 1)],
                 ));
                 out.push(FilterAction::Mirror {
                     backend: mirror_group,

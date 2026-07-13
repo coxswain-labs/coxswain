@@ -10,6 +10,7 @@ use super::listener_merge::{EffectiveGateway, EffectiveListener};
 use super::proxy::{
     IngressDefaultBackend, IngressEvent, Ownership, ReflectorStores, SharedOutputs,
 };
+use crate::endpoints::{EndpointKey, ResolvedEndpoints};
 use crate::gateway_api::hostnames_intersect;
 use crate::gateway_api::{
     GatewayApiReconciler, GrpcRouteReconciler, GrpcRouteResolution, ListenerBinding, RouteLike,
@@ -602,10 +603,13 @@ fn build_ingress_routes(
             );
         } else {
             let protocol = resolved.app_protocol;
+            // Thread the endpoint key (#383) so the wire can name this backend's
+            // endpoint resource; the resolved `Arc` goes straight through, no clone.
+            let key = stores.endpoint_cache.key(&db.namespace, &db.name, db.port);
             let group = Arc::new(
-                BackendGroup::new(
+                BackendGroup::weighted_with_endpoints(
                     format!("{}/{}", db.namespace, db.name),
-                    resolved.addrs.clone(),
+                    vec![(resolved, Some(key), 1)],
                 )
                 .with_protocol(protocol),
             );
@@ -1315,7 +1319,7 @@ fn build_tls_l4_routes(
                 let effective = effective_sni_patterns(&route_hostnames, listener_hostname);
 
                 for rule in &route.spec.rules {
-                    let weighted: Vec<(Vec<std::net::SocketAddr>, u16)> = rule
+                    let weighted: Vec<(Arc<ResolvedEndpoints>, Option<EndpointKey>, u16)> = rule
                         .backend_refs
                         .iter()
                         .filter_map(|b| {
@@ -1346,11 +1350,15 @@ fn build_tls_l4_routes(
                                 );
                                 return None;
                             }
+                            // Endpoint provenance (#383): the resolved `Arc` and its
+                            // key go straight to the group — no address clone; a keyed
+                            // ref survives a wire delta while its endpoints are absent.
+                            let key = stores.endpoint_cache.key(ns, &b.name, port);
                             let resolved =
                                 stores
                                     .endpoint_cache
                                     .get(ns, &b.name, port, stores.services);
-                            Some((resolved.addrs.clone(), weight as u16))
+                            Some((resolved, Some(key), weight as u16))
                         })
                         .collect();
 
@@ -1359,7 +1367,7 @@ fn build_tls_l4_routes(
                         .first()
                         .map(|b| b.name.clone())
                         .unwrap_or_default();
-                    let bg = Arc::new(BackendGroup::weighted(group_name, weighted));
+                    let bg = Arc::new(BackendGroup::weighted_with_endpoints(group_name, weighted));
 
                     for hostname in &effective {
                         builder = builder.add_route(bind_port, hostname, Arc::clone(&bg));
@@ -1529,7 +1537,7 @@ pub(super) fn build_tcp_routes(
                 // loop is last-writer-wins per port like the TLS L4 path, in case
                 // that constraint ever loosens.
                 for rule in &route.spec.rules {
-                    let weighted: Vec<(Vec<std::net::SocketAddr>, u16)> = rule
+                    let weighted: Vec<(Arc<ResolvedEndpoints>, Option<EndpointKey>, u16)> = rule
                         .backend_refs
                         .iter()
                         .filter_map(|b| {
@@ -1560,11 +1568,15 @@ pub(super) fn build_tcp_routes(
                                 );
                                 return None;
                             }
+                            // Endpoint provenance (#383): the resolved `Arc` and its
+                            // key go straight to the group — no address clone; a keyed
+                            // ref survives a wire delta while its endpoints are absent.
+                            let key = stores.endpoint_cache.key(ns, &b.name, port);
                             let resolved =
                                 stores
                                     .endpoint_cache
                                     .get(ns, &b.name, port, stores.services);
-                            Some((resolved.addrs.clone(), weight as u16))
+                            Some((resolved, Some(key), weight as u16))
                         })
                         .collect();
 
@@ -1573,7 +1585,7 @@ pub(super) fn build_tcp_routes(
                         .first()
                         .map(|b| b.name.clone())
                         .unwrap_or_default();
-                    let bg = Arc::new(BackendGroup::weighted(group_name, weighted));
+                    let bg = Arc::new(BackendGroup::weighted_with_endpoints(group_name, weighted));
 
                     builder = builder.add_route(bind_port, bg);
                 }
@@ -1737,7 +1749,7 @@ pub(super) fn build_udp_routes(
                 // loop is last-writer-wins per port like the TLS L4 path, in case
                 // that constraint ever loosens.
                 for rule in &route.spec.rules {
-                    let weighted: Vec<(Vec<std::net::SocketAddr>, u16)> = rule
+                    let weighted: Vec<(Arc<ResolvedEndpoints>, Option<EndpointKey>, u16)> = rule
                         .backend_refs
                         .iter()
                         .filter_map(|b| {
@@ -1768,11 +1780,15 @@ pub(super) fn build_udp_routes(
                                 );
                                 return None;
                             }
+                            // Endpoint provenance (#383): the resolved `Arc` and its
+                            // key go straight to the group — no address clone; a keyed
+                            // ref survives a wire delta while its endpoints are absent.
+                            let key = stores.endpoint_cache.key(ns, &b.name, port);
                             let resolved =
                                 stores
                                     .endpoint_cache
                                     .get(ns, &b.name, port, stores.services);
-                            Some((resolved.addrs.clone(), weight as u16))
+                            Some((resolved, Some(key), weight as u16))
                         })
                         .collect();
 
@@ -1781,7 +1797,7 @@ pub(super) fn build_udp_routes(
                         .first()
                         .map(|b| b.name.clone())
                         .unwrap_or_default();
-                    let bg = Arc::new(BackendGroup::weighted(group_name, weighted));
+                    let bg = Arc::new(BackendGroup::weighted_with_endpoints(group_name, weighted));
 
                     builder = builder.add_route(bind_port, bg);
                 }
