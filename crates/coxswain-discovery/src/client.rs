@@ -1173,6 +1173,7 @@ mod tests {
                 service_exists: true,
                 addrs: addrs.iter().map(|s| (*s).to_owned()).collect(),
             })),
+            ..Default::default()
         }
     }
 
@@ -1209,6 +1210,7 @@ mod tests {
                     ..Default::default()
                 }),
             })),
+            ..Default::default()
         }
     }
 
@@ -1245,6 +1247,7 @@ mod tests {
                 port: 80,
                 host: Some(host),
             })),
+            ..Default::default()
         };
         // Real content-hash version so the F6 self-check PASSES and the failure the
         // test exercises is the regex compile (not a version mismatch). `_label`

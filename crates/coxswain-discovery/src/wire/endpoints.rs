@@ -110,6 +110,7 @@ mod tests {
                 service_exists: true,
                 addrs: Vec::new(),
             })),
+            ..Default::default()
         };
         let pool = endpoint_pool_from_resources(std::slice::from_ref(&resource)).expect("pool");
         let key = endpoint_key_from_wire("default", "svc", 80);

@@ -141,12 +141,15 @@ pub(super) fn build_topology(snap: &NodeRegistry) -> serde_json::Value {
     serde_json::json!({ "nodes": nodes })
 }
 
-/// Produce a stable sort key for [`NodeScope`] (SharedPool < Gateway).
+/// Produce a stable sort key for [`NodeScope`] (SharedPool < Gateway < Namespace).
 fn scope_sort_key(scope: &NodeScope) -> (u8, &str, &str) {
     match scope {
         NodeScope::SharedPool => (0, "", ""),
         NodeScope::Gateway { namespace, name } => (1, namespace.as_str(), name.as_str()),
-        _ => (2, "", ""),
+        NodeScope::Namespace { namespace } => (2, namespace.as_str(), ""),
+        // Future `NodeScope` variants (the enum is `#[non_exhaustive]`): sort last with
+        // an empty key rather than fail to compile on every downstream addition.
+        _ => (3, "", ""),
     }
 }
 

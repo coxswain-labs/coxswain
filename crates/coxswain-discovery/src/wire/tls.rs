@@ -118,6 +118,7 @@ pub(crate) fn port_tls_resources(store: &PortTlsStore) -> Vec<p::Resource> {
                 port: u32::from(port),
                 store: Some(tls_to_wire(s)),
             })),
+            ..Default::default()
         })
         .collect()
 }
@@ -237,6 +238,7 @@ pub(crate) fn client_cert_resources(store: &ClientCertStore) -> Vec<p::Resource>
                     entries: client_cert_port_entries(port, configs),
                 },
             )),
+            ..Default::default()
         })
         .collect()
 }

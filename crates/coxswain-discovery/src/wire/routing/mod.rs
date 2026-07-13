@@ -201,6 +201,7 @@ mod tests {
                     routes: vec![route],
                 }),
             })),
+            ..Default::default()
         }
     }
 
@@ -220,6 +221,7 @@ mod tests {
                 service_exists: exists,
                 addrs: addrs.iter().map(|s| (*s).to_owned()).collect(),
             })),
+            ..Default::default()
         }
     }
 

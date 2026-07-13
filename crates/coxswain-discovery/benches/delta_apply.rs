@@ -100,6 +100,7 @@ fn host_resource(listen_port: u32, host_idx: usize, svc_idx: usize) -> p::Resour
                 ..Default::default()
             }),
         })),
+        ..Default::default()
     }
 }
 
@@ -116,6 +117,7 @@ fn endpoint(svc_idx: usize, octet: u8) -> p::Resource {
             service_exists: true,
             addrs: vec![format!("10.1.{svc}.{octet}:9090")],
         })),
+        ..Default::default()
     }
 }
 

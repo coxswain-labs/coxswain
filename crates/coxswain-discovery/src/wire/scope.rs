@@ -51,8 +51,9 @@ use crate::subscription::Scope;
 
 /// Serialise a [`Scope`] to its wire DTO.
 ///
-/// `SharedPool` → `shared_pool` oneof arm; `Gateway` → `gateway` arm.
-/// Infallible: every variant has a canonical encoding.
+/// `SharedPool` → `shared_pool` oneof arm; `Gateway` → `gateway` arm;
+/// `Namespace` → `namespace` arm. Infallible: every variant has a canonical
+/// encoding.
 #[must_use = "wire DTO must be embedded in a Subscribe to reach the server"]
 pub fn scope_to_wire(scope: &Scope) -> p::Scope {
     let kind = match scope {
@@ -60,6 +61,9 @@ pub fn scope_to_wire(scope: &Scope) -> p::Scope {
         Scope::Gateway { name, namespace } => p::scope::Kind::Gateway(p::GatewayScope {
             namespace: namespace.clone(),
             name: name.clone(),
+        }),
+        Scope::Namespace { namespace } => p::scope::Kind::Namespace(p::NamespaceScope {
+            namespace: namespace.clone(),
         }),
     };
     p::Scope { kind: Some(kind) }
@@ -81,6 +85,9 @@ pub fn scope_from_wire(dto: &p::Scope) -> Result<Scope, WireError> {
         Some(p::scope::Kind::Gateway(g)) => Ok(Scope::Gateway {
             name: g.name.clone(),
             namespace: g.namespace.clone(),
+        }),
+        Some(p::scope::Kind::Namespace(n)) => Ok(Scope::Namespace {
+            namespace: n.namespace.clone(),
         }),
         None => Err(WireError::MissingRequiredField {
             field: "scope.kind",
@@ -174,6 +181,16 @@ mod tests {
         let wire = scope_to_wire(&scope);
         let back = scope_from_wire(&wire).expect("Gateway round-trip");
         assert_eq!(scope, back, "Gateway round-trip");
+    }
+
+    #[test]
+    fn scope_namespace_round_trips() {
+        let scope = Scope::Namespace {
+            namespace: "tenant-b".to_owned(),
+        };
+        let wire = scope_to_wire(&scope);
+        let back = scope_from_wire(&wire).expect("Namespace round-trip");
+        assert_eq!(scope, back, "Namespace round-trip");
     }
 
     #[test]
