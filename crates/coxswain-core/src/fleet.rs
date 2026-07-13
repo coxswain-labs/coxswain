@@ -16,7 +16,8 @@ use std::time::Instant;
 
 // ── label / annotation keys ──────────────────────────────────────────────────
 
-/// Label key carrying the pod role (`controller` / `shared-proxy` / `dedicated-proxy`).
+/// Label key carrying the pod role (`controller` / `shared-proxy` /
+/// `dedicated-proxy` / `relay`).
 pub const COMPONENT_LABEL: &str = "app.kubernetes.io/component";
 
 /// Annotation key carrying the admin server port for this pod.
@@ -37,6 +38,9 @@ pub enum Component {
     SharedProxy,
     /// A per-Gateway dedicated proxy pod (`serve proxy --dedicated`).
     DedicatedProxy,
+    /// A relay-tier discovery cache pod (`serve relay`): subscribes upstream to
+    /// the controller and re-serves the snapshot stream downstream to proxies.
+    Relay,
 }
 
 impl Component {
@@ -45,6 +49,7 @@ impl Component {
             "controller" => Some(Self::Controller),
             "shared-proxy" => Some(Self::SharedProxy),
             "dedicated-proxy" => Some(Self::DedicatedProxy),
+            "relay" => Some(Self::Relay),
             _ => None,
         }
     }
@@ -96,6 +101,8 @@ pub struct FleetSnapshot {
     pub shared_proxies: Vec<FleetEntry>,
     /// Per-Gateway dedicated proxy pods.
     pub dedicated_proxies: Vec<FleetEntry>,
+    /// Relay-tier discovery cache pods.
+    pub relays: Vec<FleetEntry>,
 }
 
 /// Lock-free shared handle to the latest [`FleetSnapshot`].
@@ -236,6 +243,7 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
             Component::Controller => snapshot.controllers.push(entry),
             Component::SharedProxy => snapshot.shared_proxies.push(entry),
             Component::DedicatedProxy => snapshot.dedicated_proxies.push(entry),
+            Component::Relay => snapshot.relays.push(entry),
         }
     }
 

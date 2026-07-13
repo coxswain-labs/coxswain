@@ -80,6 +80,25 @@ The `coxswain_discovery_*` series expose the delta engine on both ends — serve
 - `client_partitions_reused_total` climbs far faster than `client_partitions_recompiled_total` under endpoint churn — a rolling deploy recompiles only the partitions referencing the churning Service and splices the rest.
 - `snapshot_resources_sent_total ÷ snapshot_messages_total` (average payload width) collapses toward one during endpoint-only churn — the EDS split working as intended.
 
+## The relay tier
+
+Every snapshot stream terminates on the **leader** controller pod (the discovery Service selects the leader; followers reject with `NOT_LEADER`), so fan-out scales O(nodes) on one pod. A **relay** is a zero-RBAC cache pod that subscribes upstream to the controller and re-serves the stream downstream to proxies, turning the leader's stream count into O(relays). Leaves speak the unchanged protocol and never learn they are behind a relay &mdash; only their discovery endpoint and expected-server identity differ.
+
+Two shapes:
+
+- **Shared-pool relay** subscribes `SharedPool` and re-serves it. Its client reconstructs exactly the routing cells a `SharedPool` subscriber serves, so the reconstructed cells *are* what it serves downstream.
+- **Namespace relay** subscribes a new `Namespace{ns}` scope &mdash; one stream carrying every dedicated Gateway's world in the namespace, each resource qualified with a `gw|<ns>|<name>|` key-segment prefix plus a per-Gateway `gwmeta|<ns>|<name>` resource (carrying that Gateway's publish-seq and bound proxy ServiceAccount). The relay demuxes these into a per-Gateway registry and serves leaves the unchanged `Gateway{ns,name}` world, enforcing the same SVID&harr;Gateway binding the controller does. (Namespace relays are controller-provisioned and provenance-authorized &mdash; that lands in a later slice; until then `Namespace` subscribes are denied by default.)
+
+`Namespace` is exclusively the relay's *upstream* subscription: no leaf ever uses it, and a relay's own downstream server rejects it (relay-behind-relay is out of scope in v1). Bootstrap is **not** tiered &mdash; every node, relays included, obtains its SVID directly from the controller's all-replicas bootstrap listener.
+
+The wire changes are additive over v2 (the `Namespace` scope kind and the `GatewayMeta` resource; `WIRE_VERSION` stays 2), so all of the convergence machinery above is unchanged: version and per-Gateway publish-seq propagate verbatim leader &rarr; relay &rarr; leaf.
+
+### Failure and rollout
+
+- **Controller outage** &mdash; the relay serves its last-good world (the same last-good / self-healing invariants above), degrades its health, and reconverges on reconnect. Leaves never disconnect.
+- **Relay outage** &mdash; leaves serve last-good and reconverge when the relay returns (a reconnecting leaf gets a fresh full via the `expect_full` gate). There is **no cross-tier fallback**: a leaf never dials the controller when its relay is down &mdash; that would stampede the leader under exactly the correlated failure the tier exists to absorb. Relay HA is &ge;2 replicas behind the relay's Service.
+- **Rollout order** is controller &rarr; relay &rarr; leaf, the same skew direction the wire already tolerates: a newer controller serves an older relay/leaf, and the additive `Namespace` / `GatewayMeta` resources are inert on any leaf that never subscribes them.
+
 ## How `Programmed` status is gated
 
 Each proxy reports its **actually-bound listener ports** back over the discovery stream (a `NodeStatus` message, sent on stream open and on every bind change). The leader uses these reports to decide when a Gateway's `Programmed` condition should flip to `True` — and it requires *two* independent signals to both hold, not just one:

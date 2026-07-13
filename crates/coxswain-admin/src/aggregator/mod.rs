@@ -352,6 +352,7 @@ pub(super) fn component_str(c: Component) -> &'static str {
         Component::Controller => "controller",
         Component::SharedProxy => "shared-proxy",
         Component::DedicatedProxy => "dedicated-proxy",
+        Component::Relay => "relay",
         _ => "unknown",
     }
 }

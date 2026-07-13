@@ -72,9 +72,9 @@ The dedicated proxy subscribes with `Scope::Gateway { name, namespace }` and rec
 
 Like the shared proxy, the dedicated proxy holds **zero Kubernetes API credentials**. Cross-namespace route attachment (`allowedRoutes.namespaces.from: All`/`Selector`) is resolved by the controller at reconcile time — the controller's cluster-wide reflector compiles all cross-namespace routes into the dedicated snapshot before it is pushed. No proxy-side cluster-wide reflector and no proxy-side RBAC are required.
 
-### `serve relay` (v0.6, not yet implemented)
+### `serve relay`
 
-Designed as a recursive discovery node — a relay that subscribes to an upstream discovery stream and re-publishes snapshots to downstream proxies across a network boundary. Deferred to v0.6.
+A zero-RBAC discovery **cache**: a recursive node that subscribes to an upstream discovery stream (the controller) and re-publishes snapshots to downstream proxies, so the leader's snapshot fan-out scales O(relays) instead of O(nodes). A relay holds the same zero-Kubernetes-credentials invariant as a proxy. `relay --shared` fronts the shared pool; `relay --namespace <NS>` fronts one namespace's dedicated Gateways (controller-provisioned; provenance-authorized). Leaves speak the unchanged protocol and are unaware of the tier. See [Discovery protocol → The relay tier](architecture/discovery-protocol.md#the-relay-tier).
 
 ## Request path
 

@@ -209,6 +209,14 @@ message Resource {
 // come from the enclosing `Resource`'s qualifier fields, not this message.
 message GatewayMeta {
   uint64 publish_seq = 1;
+  // GEP-1762 `{gateway-name}-{gatewayclass-name}` ServiceAccount of the
+  // dedicated proxy for this Gateway (#583). The relay stamps this into the
+  // per-Gateway `DedicatedRoutingSnapshot` it reconstructs, so its downstream
+  // `Scope::Gateway` SVID binding check enforces exactly the identity the
+  // controller would. Not derivable on the relay (it never sees the
+  // GatewayClass name), so it must ride the namespace stream. Namespace-scope
+  // only, like `publish_seq`.
+  string expected_proxy_sa = 2;
 }
 
 // Which L7 routing table a RouteHostResource belongs to. Ingress and Gateway

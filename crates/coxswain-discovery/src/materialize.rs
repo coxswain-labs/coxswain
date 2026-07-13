@@ -226,6 +226,10 @@ fn build_namespace_view(source: &SnapshotSource, namespace: &str, seq: u64) -> M
         gw_resources.push(p::Resource {
             payload: Some(p::resource::Payload::GatewayMeta(p::GatewayMeta {
                 publish_seq,
+                // The relay needs the bound proxy SA to enforce the same
+                // downstream `Scope::Gateway` SVID binding the controller does;
+                // it cannot derive it (never sees the GatewayClass name).
+                expected_proxy_sa: snap.expected_proxy_sa.clone(),
             })),
             qualifier_namespace: key.ns.clone(),
             qualifier_name: key.name.clone(),
@@ -518,6 +522,15 @@ mod tests {
             2,
             "gw-b was stamped at the second incremental rebuild, distinct from gw-a's"
         );
+        // Each GatewayMeta carries the Gateway's bound proxy SA (#583) so the
+        // relay can reconstruct the downstream `Scope::Gateway` SVID binding it
+        // cannot derive locally. `dedicated_snapshot` stamps `{svc}-coxswain`.
+        let gwmeta_sa = |key: &str| match view.resources[key].resource.payload.as_ref() {
+            Some(p::resource::Payload::GatewayMeta(m)) => m.expected_proxy_sa.clone(),
+            other => panic!("expected GatewayMeta payload at {key}, got {other:?}"),
+        };
+        assert_eq!(gwmeta_sa("gwmeta|prod|gw-a"), "gw-a-coxswain");
+        assert_eq!(gwmeta_sa("gwmeta|prod|gw-b"), "gw-b-coxswain");
     }
 
     /// A namespace with no cut-over dedicated Gateways fails closed to an empty

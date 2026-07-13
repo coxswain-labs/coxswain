@@ -24,7 +24,7 @@ use tracing::{debug, warn};
 
 use tokio::sync::watch;
 
-use crate::apply::{ResourceCache, SnapshotCells, apply_message};
+use crate::apply::{RoutingApplier, SnapshotApplier};
 use crate::auth::{DiscoveryClientTls, SpiffeMatcher};
 use crate::error::DiscoveryError;
 use crate::proto::v1::{
@@ -203,46 +203,26 @@ impl DiscoveryClient {
         // URI axis and a misconfigured endpoint fails loudly at start-up.
         validate_endpoints(&config.endpoints)?;
 
-        let ingress_routes = SharedIngressRoutingTable::new();
-        let gateway_routes = SharedGatewayRoutingTable::new();
-        let tls_store = SharedPortTlsStore::new();
-        let client_cert_store = SharedClientCertStore::new();
-        let listener_status = SharedGatewayListenerStatus::new();
-        let listener_hostnames = SharedListenerHostnames::new();
-        let passthrough_routes = SharedTlsPassthroughTable::new();
-        let terminate_routes = SharedTlsPassthroughTable::new();
-        let tcp_routes = SharedTcpRouteTable::new();
-        let udp_routes = SharedUdpRouteTable::new();
-
-        let supervisor = Supervisor {
-            config,
-            ingress: ingress_routes.clone(),
-            gateway: gateway_routes.clone(),
-            tls: tls_store.clone(),
-            client_certs: client_cert_store.clone(),
-            listener_status: listener_status.clone(),
-            listener_hostnames: listener_hostnames.clone(),
-            passthrough: passthrough_routes.clone(),
-            terminate: terminate_routes.clone(),
-            tcp: tcp_routes.clone(),
-            udp: udp_routes.clone(),
-            health,
-            health_check: health_check.to_owned(),
-            has_snapshot: false,
-            cache: ResourceCache::new(),
-        };
+        // The proxy applies received snapshots into flat routing cells; build
+        // the applier and keep clones of the same `Arc` cells for the client's
+        // read paths (proxy acceptors read via the `RoutingSource` accessors).
+        let (applier, cells) = RoutingApplier::new();
+        // The proxy ignores the rebuild-generation signal (no downstream
+        // subscriber); only a relay wires it into a `DiscoveryService`.
+        let (supervisor, _rebuild_rx) =
+            Supervisor::with_applier(config, health, health_check, Box::new(applier))?;
 
         let client = Self {
-            ingress_routes,
-            gateway_routes,
-            tls_store,
-            client_cert_store,
-            listener_status,
-            listener_hostnames,
-            passthrough_routes,
-            terminate_routes,
-            tcp_routes,
-            udp_routes,
+            ingress_routes: cells.ingress,
+            gateway_routes: cells.gateway,
+            tls_store: cells.tls,
+            client_cert_store: cells.client_certs,
+            listener_status: cells.listener_status,
+            listener_hostnames: cells.listener_hostnames,
+            passthrough_routes: cells.passthrough,
+            terminate_routes: cells.terminate,
+            tcp_routes: cells.tcp,
+            udp_routes: cells.udp,
         };
 
         Ok((client, supervisor))
@@ -400,23 +380,19 @@ impl coxswain_core::RoutingSource for DiscoveryClient {
 #[non_exhaustive]
 pub struct Supervisor {
     config: DiscoveryClientConfig,
-    ingress: SharedIngressRoutingTable,
-    gateway: SharedGatewayRoutingTable,
-    tls: SharedPortTlsStore,
-    client_certs: SharedClientCertStore,
-    listener_status: SharedGatewayListenerStatus,
-    listener_hostnames: SharedListenerHostnames,
-    passthrough: SharedTlsPassthroughTable,
-    terminate: SharedTlsPassthroughTable,
-    tcp: SharedTcpRouteTable,
-    udp: SharedUdpRouteTable,
+    /// The pluggable apply target (#583). A proxy holds a
+    /// [`RoutingApplier`] (flat routing cells); a relay holds a demux applier.
+    /// It persists across reconnects so its materialized cache stays the
+    /// last-Acked world (invariant `cache ≡ what it serves ≡ last Acked`).
+    applier: Box<dyn SnapshotApplier>,
+    /// Rebuild-generation signal (#583): bumped after every successful apply so
+    /// a downstream consumer (a relay's `DiscoveryService`) re-materializes and
+    /// pushes deltas. Inert for a proxy (no subscriber). Over-signalling on an
+    /// unchanged world is safe — the downstream diff is empty and sends nothing.
+    rebuild_tx: watch::Sender<u64>,
     health: SubsystemHandle,
     health_check: String,
     has_snapshot: bool,
-    /// Materialized resource cache (#383). Lives here, outside the per-session
-    /// loop, so it persists across reconnects — the invariant is
-    /// `cache ≡ what the cells serve ≡ last Acked`.
-    cache: ResourceCache,
 }
 
 /// Opaque reconnect supervisor returned by [`DiscoveryClient::spawn`].
@@ -435,6 +411,37 @@ impl DiscoverySupervisor {
 }
 
 impl Supervisor {
+    /// Build a supervisor around a caller-supplied [`SnapshotApplier`] (#583).
+    ///
+    /// The shared constructor behind [`DiscoveryClient::new`] (proxy, flat
+    /// [`RoutingApplier`]) and the relay glue in [`crate::relay`] (which plugs a
+    /// namespace-demux applier). Returns the supervisor plus the rebuild-
+    /// generation receiver that fires after every successful apply.
+    ///
+    /// # Errors
+    ///
+    /// [`DiscoveryError::InvalidEndpoint`] if any configured endpoint string is
+    /// not a valid URI — surfaced here so a misconfigured endpoint fails at
+    /// start-up, not inside the reconnect loop.
+    pub(crate) fn with_applier(
+        config: DiscoveryClientConfig,
+        health: SubsystemHandle,
+        health_check: &str,
+        applier: Box<dyn SnapshotApplier>,
+    ) -> Result<(Self, watch::Receiver<u64>), DiscoveryError> {
+        validate_endpoints(&config.endpoints)?;
+        let (rebuild_tx, rebuild_rx) = watch::channel(0);
+        let supervisor = Self {
+            config,
+            applier,
+            rebuild_tx,
+            health,
+            health_check: health_check.to_owned(),
+            has_snapshot: false,
+        };
+        Ok((supervisor, rebuild_rx))
+    }
+
     /// Run the reconnect/backoff loop until the process exits.
     pub async fn run(mut self) {
         // Pull the rotation + bound-ports receivers out of config so they do
@@ -710,19 +717,7 @@ impl Supervisor {
             // gates the first message of the session to a full snapshot
             // (invariant 1); it is cleared below on the first successful apply.
             let apply_start = std::time::Instant::now();
-            let cells = SnapshotCells {
-                ingress: &self.ingress,
-                gateway: &self.gateway,
-                tls: &self.tls,
-                client_certs: &self.client_certs,
-                status: &self.listener_status,
-                listener_hostnames: &self.listener_hostnames,
-                passthrough: &self.passthrough,
-                terminate: &self.terminate,
-                tcp: &self.tcp,
-                udp: &self.udp,
-            };
-            let apply_result = apply_message(&mut self.cache, &snapshot, cells, expect_full);
+            let apply_result = self.applier.apply(&snapshot, expect_full);
             crate::metrics::snapshot_apply_seconds().observe(apply_start.elapsed().as_secs_f64());
             match apply_result {
                 // `ApplyStats` (partition recompile/reuse tallies) is mirrored
@@ -754,6 +749,11 @@ impl Supervisor {
                     // re-marking on steady-state applies is a no-op.
                     self.health.ready(&self.health_check);
                     crate::metrics::client_state().set(crate::metrics::STATE_READY);
+                    // Signal downstream re-materialization (#583). Bumped on
+                    // every applied snapshot; a relay's `DiscoveryService`
+                    // re-diffs and pushes deltas to its leaves. Inert for a
+                    // proxy (no subscriber holds the receiver).
+                    self.rebuild_tx.send_modify(|g| *g = g.wrapping_add(1));
                 }
                 Err(e) => {
                     // Last-good snapshot is retained; health stays as-is because the
