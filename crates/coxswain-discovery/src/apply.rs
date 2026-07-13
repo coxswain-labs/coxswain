@@ -170,6 +170,128 @@ pub(crate) struct SnapshotCells<'a> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// SnapshotApplier seam
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The client supervisor's pluggable apply target (#583).
+///
+/// The reconnect/backoff/SVID-rotation/Ack machinery in [`crate::client`] is
+/// identical for a proxy and a relay; only what a received snapshot *becomes*
+/// differs. A proxy folds it into flat routing cells ([`RoutingApplier`]); a
+/// relay demuxes it into a per-Gateway registry ([`crate::relay`]). The
+/// supervisor holds one boxed applier and calls [`SnapshotApplier::apply`] per
+/// message, so the two shapes share one battle-tested stream loop.
+pub(crate) trait SnapshotApplier: Send {
+    /// Apply one wire message (full or delta) to this client's world.
+    ///
+    /// `expect_full` is the supervisor's per-session gate (true on every
+    /// (re)connect, cleared after the first success). On `Ok` the world is
+    /// committed; on `Err` the last-good world is retained untouched and the
+    /// supervisor Nacks.
+    ///
+    /// # Errors
+    ///
+    /// Any [`WireError`] from staging/compiling the message.
+    fn apply(&mut self, msg: &p::Snapshot, expect_full: bool) -> Result<ApplyStats, WireError>;
+}
+
+/// The proxy-side [`SnapshotApplier`]: owns the materialized [`ResourceCache`]
+/// and the ten flat routing [`coxswain_core::Shared`] cells the data plane
+/// serves from. Its `apply` is the pre-#583 supervisor inline path verbatim.
+pub(crate) struct RoutingApplier {
+    cache: ResourceCache,
+    ingress: SharedIngressRoutingTable,
+    gateway: SharedGatewayRoutingTable,
+    tls: SharedPortTlsStore,
+    client_certs: SharedClientCertStore,
+    listener_status: SharedGatewayListenerStatus,
+    listener_hostnames: SharedListenerHostnames,
+    passthrough: SharedTlsPassthroughTable,
+    terminate: SharedTlsPassthroughTable,
+    tcp: SharedTcpRouteTable,
+    udp: SharedUdpRouteTable,
+}
+
+impl RoutingApplier {
+    /// Build an applier over freshly-created routing cells, returning both the
+    /// applier and clones of every cell so the caller can wire the same `Arc`s
+    /// into its read paths (proxy acceptors, or a relay's `SnapshotSource`).
+    #[must_use]
+    pub(crate) fn new() -> (Self, RoutingCells) {
+        let cells = RoutingCells::new();
+        let applier = Self {
+            cache: ResourceCache::new(),
+            ingress: cells.ingress.clone(),
+            gateway: cells.gateway.clone(),
+            tls: cells.tls.clone(),
+            client_certs: cells.client_certs.clone(),
+            listener_status: cells.listener_status.clone(),
+            listener_hostnames: cells.listener_hostnames.clone(),
+            passthrough: cells.passthrough.clone(),
+            terminate: cells.terminate.clone(),
+            tcp: cells.tcp.clone(),
+            udp: cells.udp.clone(),
+        };
+        (applier, cells)
+    }
+}
+
+impl SnapshotApplier for RoutingApplier {
+    fn apply(&mut self, msg: &p::Snapshot, expect_full: bool) -> Result<ApplyStats, WireError> {
+        let cells = SnapshotCells {
+            ingress: &self.ingress,
+            gateway: &self.gateway,
+            tls: &self.tls,
+            client_certs: &self.client_certs,
+            status: &self.listener_status,
+            listener_hostnames: &self.listener_hostnames,
+            passthrough: &self.passthrough,
+            terminate: &self.terminate,
+            tcp: &self.tcp,
+            udp: &self.udp,
+        };
+        apply_message(&mut self.cache, msg, cells, expect_full)
+    }
+}
+
+/// The ten owned routing-cell handles a [`RoutingApplier`] publishes into.
+///
+/// Grouped so the proxy (via `DiscoveryClient`) and a shared-pool relay (via
+/// [`crate::relay`]) can each read the same `Arc`s the applier writes without a
+/// ten-argument constructor.
+// intentionally open: field-literal read by DiscoveryClient and relay glue
+pub(crate) struct RoutingCells {
+    pub(crate) ingress: SharedIngressRoutingTable,
+    pub(crate) gateway: SharedGatewayRoutingTable,
+    pub(crate) tls: SharedPortTlsStore,
+    pub(crate) client_certs: SharedClientCertStore,
+    pub(crate) listener_status: SharedGatewayListenerStatus,
+    pub(crate) listener_hostnames: SharedListenerHostnames,
+    pub(crate) passthrough: SharedTlsPassthroughTable,
+    pub(crate) terminate: SharedTlsPassthroughTable,
+    pub(crate) tcp: SharedTcpRouteTable,
+    pub(crate) udp: SharedUdpRouteTable,
+}
+
+impl RoutingCells {
+    #[must_use]
+    fn new() -> Self {
+        Self {
+            ingress: SharedIngressRoutingTable::new(),
+            gateway: SharedGatewayRoutingTable::new(),
+            tls: SharedPortTlsStore::new(),
+            client_certs: SharedClientCertStore::new(),
+            listener_status: SharedGatewayListenerStatus::new(),
+            listener_hostnames: SharedListenerHostnames::new(),
+            passthrough: SharedTlsPassthroughTable::new(),
+            terminate: SharedTlsPassthroughTable::new(),
+            tcp: SharedTcpRouteTable::new(),
+            udp: SharedUdpRouteTable::new(),
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Resource cache
 // ────────────────────────────────────────────────────────────────────────────
 

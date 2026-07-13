@@ -3,8 +3,9 @@
 //! The discovery stream Service (`coxswain-controller-discovery`) selects on
 //! [`DISCOVERY_LEADER_LABEL`] so its endpoints are exactly the current leader
 //! pod — proxy dials deterministically reach the leader instead of round-
-//! robining across standbys. The lease loop drives [`LeaderLabel::ensure`] on
-//! every leadership flip (and retries on failure each renewal tick):
+//! robining across standbys. A dedicated task drives [`LeaderLabel::ensure`] on
+//! every leadership flip, retries on failure, and re-affirms periodically while
+//! leading (so a stripped label heals without a flip — see [`run`]):
 //!
 //! - **promotion** — label own pod, strip any stale copy from other pods (a
 //!   crashed ex-leader whose pod object survived cannot un-label itself);
@@ -25,30 +26,41 @@ use tokio::sync::watch;
 /// Retry cadence for a failed label convergence.
 const RETRY: Duration = Duration::from_secs(5);
 
+/// Re-affirm cadence for a *converged* label. Even after a clean convergence the
+/// leader re-asserts its label state periodically so external tampering heals
+/// without a leadership flip — see the dual-leader race note on [`run`].
+const REAFFIRM: Duration = Duration::from_secs(15);
+
 /// Drive label convergence off the leadership watch, decoupled from the lease
 /// renewal loop (#531): label I/O (an own-pod PATCH, plus a LIST + strip
 /// PATCHes on promotion) must never delay the next renew attempt — a stalled
 /// apiserver would otherwise erode the renew-before-TTL fencing margin.
 ///
-/// Converges on every leadership flip and retries every [`RETRY`] while
-/// unconverged. Exits when the sender (the lease loop) is dropped.
+/// Converges on every leadership flip, retries every [`RETRY`] while unconverged,
+/// and re-affirms every [`REAFFIRM`] while converged. The periodic re-affirm is
+/// load-bearing, not belt-and-braces: at startup both replicas can briefly
+/// co-acquire the lease, and the transient co-leader's [`LeaderLabel::ensure`]`(true)`
+/// runs [`LeaderLabel::strip_others`], removing the *real* leader's label **after**
+/// the real leader's own one-shot convergence. The real leader's watch value
+/// never changes again (it stays leader), so without re-affirming it would never
+/// restore its label and the discovery Service would stay endpoint-less until a
+/// pod restart. `ensure` is idempotent, so re-affirming is cheap and self-healing.
+/// Exits when the sender (the lease loop) is dropped.
 pub(crate) async fn run(mut label: LeaderLabel, mut rx: watch::Receiver<bool>) {
     loop {
         let leading = *rx.borrow_and_update();
         let converged = label.ensure(leading).await;
-        if converged {
-            if rx.changed().await.is_err() {
-                return;
-            }
-        } else {
-            tokio::select! {
-                changed = rx.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
+        // Wake on either a leadership flip or the timer, then re-run `ensure`.
+        // A converged leader re-affirms on the slower cadence; an unconverged
+        // pass retries faster.
+        let wait = if converged { REAFFIRM } else { RETRY };
+        tokio::select! {
+            changed = rx.changed() => {
+                if changed.is_err() {
+                    return;
                 }
-                () = tokio::time::sleep(RETRY) => {}
             }
+            () = tokio::time::sleep(wait) => {}
         }
     }
 }

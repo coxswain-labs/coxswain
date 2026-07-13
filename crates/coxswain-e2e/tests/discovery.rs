@@ -76,7 +76,12 @@ use common::discovery::{
     fetch_topology, find_node, leader_discovery_metrics, proxy_health_state,
     scrape_metric_label_sum, set_deployment_replicas, shared_proxy_deployment, wait_for_pod_ready,
 };
+use common::relay::{
+    self, assert_pod_stays_ready, create_relay_service_account, leaf_deployment, relay_deployment,
+    relay_service,
+};
 use common::rollout::rollout_restart_deployment;
+use k8s_openapi::api::core::v1::Service;
 
 // ── Group 1 — Auth rejection (SPIFFE trust-domain mismatch) ──────────────────
 
@@ -1837,6 +1842,223 @@ async fn controller_restart_full_resync_reconverges() -> anyhow::Result<()> {
     .await?;
     // The original route still serves.
     wait::wait_for_backend(&h2.http, &host, "/", "echo-a", Duration::from_secs(30)).await?;
+
+    Ok(())
+}
+
+// ── Group 4 — Relay tier (#583) ───────────────────────────────────────────────
+//
+// A relay is `serve relay --shared`: an upstream discovery client (to the
+// controller) + a downstream discovery server (to leaf proxies), caching
+// last-good and re-serving. The relay + leaf run in a throwaway test namespace
+// and reach the controller's discovery/bootstrap Services by cross-namespace DNS
+// (`…​.coxswain-system.svc`); the leaf's upstream is the RELAY. All three tests
+// assert from the Pod `Ready` condition (readinessProbe on `/readyz`), which for
+// the relay gates on `routing_table_loaded` (upstream) AND `downstream_serving`,
+// and for the leaf gates on `routing_table_loaded` fed by the relay.
+//
+// The namespace-relay (`--namespace`) data-plane path is deny-authorized upstream
+// until the provenance authorizer + provisioning land in #584, so its live e2e
+// ships there; the demux itself is unit-covered in `coxswain-discovery`.
+
+/// Happy path: a relay bootstraps its SVID, converges upstream against the
+/// controller (visible as an in-sync `SharedPool` node in the controller
+/// topology), serves downstream, and a leaf proxy pointed at the relay converges
+/// **through** the relay to `Ready` — proving the relay re-served a
+/// self-consistent routing world (a mismatched world would Nack forever and
+/// never let the leaf go Ready).
+///
+/// Serial: co-located in the `discovery` binary with the controller-scaling
+/// tests (see the nextest config).
+#[tokio::test]
+async fn relay_fronted_proxy_converges_through_relay() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-converge").await?;
+
+    copy_trust_bundle(&h.client, &ns.name).await?;
+    create_relay_service_account(&h.client, &ns.name, relay::RELAY_SA).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // Relay + its downstream discovery Service.
+    deployments
+        .create(
+            &PostParams::default(),
+            &relay_deployment(&ns.name, "relay", relay::RELAY_SA)?,
+        )
+        .await
+        .context("create relay Deployment")?;
+    services
+        .create(&PostParams::default(), &relay_service(&ns.name, "relay")?)
+        .await
+        .context("create relay Service")?;
+
+    // Relay Ready ⟹ upstream converged AND downstream server bound.
+    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120))
+        .await
+        .context("relay pod did not become Ready (upstream converge + downstream serve)")?;
+
+    // Cross-validate from the controller's view: the relay is an ordinary
+    // `SharedPool` subscriber, so it appears in-sync in the NodeRegistry.
+    let topology_url = h.controller_admin_url("/api/v1/topology");
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || {
+            let url = topology_url.clone();
+            async move { format!("controller topology at '{url}' to show relay-* in_sync") }
+        },
+        || {
+            let url = topology_url.clone();
+            async move {
+                let topology = fetch_topology(&url).await.ok()?;
+                let node = find_node(&topology, "relay-")?;
+                (node.pointer("/scope/kind").and_then(|v| v.as_str()) == Some("SharedPool"))
+                    .then_some(())?;
+                node.get("in_sync")
+                    .and_then(|v| v.as_bool())
+                    .filter(|&b| b)
+                    .map(|_| ())
+            }
+        },
+    )
+    .await
+    .context("relay did not register as an in-sync SharedPool node on the controller")?;
+
+    // Leaf pointed at the relay (endpoint = relay Service; expected-server SA =
+    // the relay's SA; bootstrap still targets the controller).
+    deployments
+        .create(
+            &PostParams::default(),
+            &leaf_deployment(&ns.name, "leaf", "relay", relay::RELAY_SA)?,
+        )
+        .await
+        .context("create relay-fronted leaf Deployment")?;
+
+    // Leaf Ready ⟹ it received a self-consistent full world THROUGH the relay.
+    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120))
+        .await
+        .context("relay-fronted leaf did not converge to Ready through the relay")?;
+
+    Ok(())
+}
+
+/// Sad path — controller outage: with the relay + leaf converged, scaling the
+/// controller to zero must leave BOTH serving their last-good world (the relay
+/// degrades but keeps `/readyz` 200; the leaf's upstream — the relay — never
+/// drops), and both must reconverge when the controller returns. The leaf never
+/// disconnects.
+///
+/// Serial: scales the shared controller to zero.
+#[tokio::test]
+async fn relay_and_leaf_serve_last_good_during_controller_outage() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-outage").await?;
+
+    copy_trust_bundle(&h.client, &ns.name).await?;
+    create_relay_service_account(&h.client, &ns.name, relay::RELAY_SA).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    deployments
+        .create(
+            &PostParams::default(),
+            &relay_deployment(&ns.name, "relay", relay::RELAY_SA)?,
+        )
+        .await
+        .context("create relay Deployment")?;
+    services
+        .create(&PostParams::default(), &relay_service(&ns.name, "relay")?)
+        .await
+        .context("create relay Service")?;
+    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120)).await?;
+    deployments
+        .create(
+            &PostParams::default(),
+            &leaf_deployment(&ns.name, "leaf", "relay", relay::RELAY_SA)?,
+        )
+        .await
+        .context("create leaf Deployment")?;
+    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120)).await?;
+
+    // ── Controller down → both keep serving last-good ─────────────────────────
+    let ha_replicas = controller_replicas().await?.max(1);
+    scale_controller(0).await?;
+
+    // Both the relay and its leaf must hold Ready (last-good) across the outage.
+    assert_pod_stays_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(20))
+        .await
+        .context("relay dropped Ready during controller outage (last-good violated)")?;
+    assert_pod_stays_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(20))
+        .await
+        .context("relay-fronted leaf dropped Ready during controller outage (leaf disconnected)")?;
+
+    // ── Controller back → both reconverge ─────────────────────────────────────
+    scale_controller(ha_replicas).await?;
+    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120))
+        .await
+        .context("relay did not reconverge after the controller returned")?;
+    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120))
+        .await
+        .context("leaf did not reconverge after the controller returned")?;
+
+    Ok(())
+}
+
+/// Sad path — relay restart: with the leaf converged through the relay,
+/// restarting the relay Deployment must leave the leaf serving its last-good
+/// world (it never drops Ready), and the leaf must reconverge when the relay
+/// returns (a reconnecting leaf gets a fresh full via `expect_full`).
+///
+/// Serial: co-located in the `discovery` binary.
+#[tokio::test]
+async fn leaf_serves_last_good_when_relay_restarts() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-restart").await?;
+
+    copy_trust_bundle(&h.client, &ns.name).await?;
+    create_relay_service_account(&h.client, &ns.name, relay::RELAY_SA).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    deployments
+        .create(
+            &PostParams::default(),
+            &relay_deployment(&ns.name, "relay", relay::RELAY_SA)?,
+        )
+        .await
+        .context("create relay Deployment")?;
+    services
+        .create(&PostParams::default(), &relay_service(&ns.name, "relay")?)
+        .await
+        .context("create relay Service")?;
+    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120)).await?;
+    deployments
+        .create(
+            &PostParams::default(),
+            &leaf_deployment(&ns.name, "leaf", "relay", relay::RELAY_SA)?,
+        )
+        .await
+        .context("create leaf Deployment")?;
+    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120)).await?;
+
+    // ── Restart the relay → the leaf serves last-good across the gap ──────────
+    rollout_restart_deployment(&ns.name, "relay").await?;
+
+    // The leaf's upstream is briefly gone, but it never drops Ready (Degraded
+    // keeps `/readyz` 200), serving its last-good world through the relay gap.
+    assert_pod_stays_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(20))
+        .await
+        .context("leaf dropped Ready while the relay restarted (last-good violated)")?;
+
+    // ── Relay back → leaf reconverges (still Ready) ───────────────────────────
+    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120))
+        .await
+        .context("relay did not come back Ready after restart")?;
+    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120))
+        .await
+        .context("leaf did not reconverge after the relay returned")?;
 
     Ok(())
 }

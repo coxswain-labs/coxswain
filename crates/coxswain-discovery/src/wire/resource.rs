@@ -788,6 +788,7 @@ mod tests {
         p::Resource {
             payload: Some(p::resource::Payload::GatewayMeta(p::GatewayMeta {
                 publish_seq,
+                ..Default::default()
             })),
             qualifier_namespace: namespace.to_owned(),
             qualifier_name: name.to_owned(),
@@ -853,6 +854,7 @@ mod tests {
         let resource = p::Resource {
             payload: Some(p::resource::Payload::GatewayMeta(p::GatewayMeta {
                 publish_seq: 1,
+                ..Default::default()
             })),
             ..Default::default()
         };

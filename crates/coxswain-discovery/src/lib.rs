@@ -30,6 +30,7 @@ pub mod materialize;
 pub mod metrics;
 pub mod proto;
 pub mod registry;
+pub mod relay;
 pub mod server;
 pub mod subscription;
 pub mod svid;
@@ -42,7 +43,7 @@ mod tests;
 
 pub use auth::{
     DiscoveryBootstrapClientTls, DiscoveryBootstrapServerTls, DiscoveryClientTls,
-    DiscoveryServerTls, SpiffeMatcher,
+    DiscoveryServerTls, RotatingServerTls, SpiffeMatcher,
 };
 pub use bootstrap_client::{
     BootstrapClient, BootstrapClientConfig, BootstrapClientHandle, BootstrapRunner,
@@ -50,6 +51,7 @@ pub use bootstrap_client::{
 pub use bootstrap_server::{BootstrapService, NoOpRejectHook, RejectHook};
 pub use client::{DiscoveryClient, DiscoveryClientConfig, DiscoverySupervisor, Supervisor};
 pub use error::{AuthError, DiscoveryError, WireError};
+pub use relay::{RelayUpstream, namespace_relay, shared_relay};
 pub use server::{DiscoveryService, SnapshotSource};
 pub use subscription::Scope;
 pub use svid::{SharedSvid, SvidMaterial};

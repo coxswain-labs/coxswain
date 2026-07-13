@@ -149,6 +149,7 @@ canonical form for each deployment model:
 |---|---|---|
 | Shared-pool proxy | `coxswain-shared-proxy` | `spiffe://<trust-domain>/ns/<ns>/sa/coxswain-shared-proxy` |
 | Dedicated proxy (per Gateway) | `<gateway-name>-<gatewayclass-name>` | `spiffe://<trust-domain>/ns/<gateway-ns>/sa/<gateway-name>-<gatewayclass-name>` |
+| Relay (discovery cache) | `coxswain-relay` (chart) / provisioned per namespace | `spiffe://<trust-domain>/ns/<relay-ns>/sa/<relay-sa>` |
 
 The dedicated proxy SA name follows [GEP-1762](https://gateway-api.sigs.k8s.io/geps/gep-1762/):
 it is the same name the controller uses for the provisioned Deployment, Service,
@@ -180,6 +181,36 @@ If mTLS is not established (no peer certificate — test or degraded-mode paths
 only), the binding check is skipped and the stream is fail-open. In production
 there is no plaintext discovery server; `SpiffeClientCertVerifier` mandates
 client auth, so every accepted stream carries a peer cert.
+
+### Relay tier
+
+A [relay](../architecture/discovery-protocol.md#the-relay-tier) is both a
+discovery **client** (upstream, to the controller) and a discovery **server**
+(downstream, to proxies), so it sits on both sides of the trust model:
+
+- **Upstream**, the relay is an ordinary client: it bootstraps its own SVID from
+  the controller (bootstrap is never tiered) and opens the mandatory-mTLS stream
+  exactly like a proxy. Its SA holds **zero Kubernetes verbs** — the same
+  read-only invariant as a proxy, so the relay never touches the CA Secret,
+  trust-bundle ConfigMap, or `TokenReview` the controller's discovery server
+  needs.
+- **Downstream**, the relay presents that *same rotating bootstrapped SVID* as
+  its serving certificate (issued SVIDs already carry the `serverAuth` EKU) and
+  uses the mounted trust bundle as its client-CA. It enforces the identical
+  `SpiffeClientCertVerifier` trust-domain check and, for `Scope::Gateway`
+  subscribes, the identical SVID&harr;Gateway binding above — it reconstructs each
+  Gateway's expected proxy SA from the `GatewayMeta` resource on its upstream
+  stream. A relay's downstream server **rejects `Namespace` subscribes** (only
+  the controller serves that scope).
+
+A leaf placed behind a relay points its `--discovery-expected-server-sa` at the
+relay's SA so its stream verifies the relay's identity instead of the
+controller's; bootstrap still targets the controller.
+
+There is **no cross-tier fallback**: a leaf never dials the controller when its
+relay is down. That preserves a single dial identity per leaf and avoids
+stampeding the leader under correlated failure; relay availability is delivered
+by running ≥2 relay replicas behind the relay Service.
 
 ## Configuration
 

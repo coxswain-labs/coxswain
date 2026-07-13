@@ -37,6 +37,7 @@ use x509_parser::prelude::*;
 use coxswain_core::identity::SpiffeId;
 
 use crate::error::AuthError;
+use crate::svid::SharedSvid;
 
 // ── SPIFFE matcher ────────────────────────────────────────────────────────────
 
@@ -354,14 +355,7 @@ impl DiscoveryServerTls {
     #[must_use = "the TlsAcceptor must be used to wrap the TCP listener"]
     pub fn acceptor(&self) -> Result<TlsAcceptor, AuthError> {
         // Client verifier: require client cert + SPIFFE SAN check.
-        let client_roots = Arc::new(build_root_cert_store(&self.client_ca_pem)?);
-        let inner_client_verifier = WebPkiClientVerifier::builder(client_roots)
-            .build()
-            .map_err(|e| AuthError::VerifierBuild(e.to_string()))?;
-        let client_verifier = Arc::new(SpiffeClientCertVerifier {
-            inner: inner_client_verifier,
-            matcher: self.allowed_client.clone(),
-        });
+        let client_verifier = spiffe_client_verifier(&self.client_ca_pem, &self.allowed_client)?;
 
         // Server certificate and key.
         let cert_chain: Vec<CertificateDer<'static>> =
@@ -385,6 +379,137 @@ impl DiscoveryServerTls {
 
         Ok(TlsAcceptor::from(Arc::new(server_config)))
     }
+}
+
+/// Build the shared mTLS client verifier (chain + SPIFFE URI SAN match) both the
+/// static [`DiscoveryServerTls`] and the rotating [`RotatingServerTls`] present
+/// to connecting clients.
+fn spiffe_client_verifier(
+    client_ca_pem: &[u8],
+    allowed_client: &SpiffeMatcher,
+) -> Result<Arc<SpiffeClientCertVerifier>, AuthError> {
+    let client_roots = Arc::new(build_root_cert_store(client_ca_pem)?);
+    let inner = WebPkiClientVerifier::builder(client_roots)
+        .build()
+        .map_err(|e| AuthError::VerifierBuild(e.to_string()))?;
+    Ok(Arc::new(SpiffeClientCertVerifier {
+        inner,
+        matcher: allowed_client.clone(),
+    }))
+}
+
+// ── RotatingServerTls (relay downstream) ────────────────────────────────────────
+
+/// Downstream discovery-server TLS whose serving certificate is the relay's own
+/// **rotating** bootstrapped SVID (#583).
+///
+/// Unlike [`DiscoveryServerTls`] (fixed PEM, controller side), a relay presents
+/// the SVID it bootstraps from the controller — the same `serverAuth`-capable
+/// leaf its client uses upstream — and that SVID rotates on the bootstrap loop's
+/// schedule. A rustls `ResolvesServerCert` reads the live [`SharedSvid`] cell
+/// on every handshake, so a rotated SVID is picked up by every new connection
+/// with no listener rebind; established connections keep their (still-valid) cert
+/// until they naturally reconnect.
+///
+/// The client-CA and SPIFFE client matcher are the mounted trust bundle and the
+/// trust-domain prefix — the relay enforces the same peer identity the
+/// controller's `Stream` acceptor does; per-scope binding stays in the
+/// `DiscoveryService`.
+// intentionally open: field-literal constructed at the bin layer
+pub struct RotatingServerTls {
+    /// The relay's rotating bootstrapped SVID cell (serving cert source).
+    pub svid: SharedSvid,
+    /// PEM-encoded CA bundle used to verify connecting downstream proxies.
+    pub client_ca_pem: Vec<u8>,
+    /// SPIFFE identity pattern downstream proxies must satisfy.
+    pub allowed_client: SpiffeMatcher,
+}
+
+impl RotatingServerTls {
+    /// Build a [`TlsAcceptor`] whose serving cert is resolved from the SVID cell
+    /// on every handshake (mTLS, ALPN `h2`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AuthError`] if the client-CA PEM cannot be parsed or the rustls
+    /// configuration is invalid. A missing/malformed SVID is *not* an error here
+    /// — it surfaces per handshake (the resolver returns no cert, failing that
+    /// connection) so the acceptor can be built before the first SVID lands.
+    #[must_use = "the TlsAcceptor must be used to wrap the TCP listener"]
+    pub fn acceptor(&self) -> Result<TlsAcceptor, AuthError> {
+        let client_verifier = spiffe_client_verifier(&self.client_ca_pem, &self.allowed_client)?;
+        let resolver = Arc::new(SvidCertResolver {
+            svid: self.svid.clone(),
+        });
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_client_cert_verifier(client_verifier)
+            .with_cert_resolver(resolver);
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        Ok(TlsAcceptor::from(Arc::new(server_config)))
+    }
+}
+
+/// rustls server cert resolver backed by a rotating [`SharedSvid`] cell.
+///
+/// Reads the current SVID material on every handshake and builds a fresh
+/// [`CertifiedKey`]. Returns `None` (failing just that handshake, fail-closed)
+/// before the first SVID lands or if the material cannot be parsed.
+struct SvidCertResolver {
+    svid: SharedSvid,
+}
+
+impl std::fmt::Debug for SvidCertResolver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SvidCertResolver")
+    }
+}
+
+impl SvidCertResolver {
+    /// The current serving cert from the SVID cell, or `None` if no SVID has
+    /// landed yet or the material cannot be parsed. Read fresh per call so a
+    /// rotated SVID is picked up on the next handshake. Split from
+    /// [`rustls::server::ResolvesServerCert::resolve`] so it is unit-testable
+    /// without a `ClientHello`.
+    fn current(&self) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        let cell = self.svid.load();
+        let material = cell.as_ref().as_ref()?;
+        match certified_key_from_pem(&material.cert_pem, &material.key_pem) {
+            Ok(key) => Some(Arc::new(key)),
+            Err(e) => {
+                tracing::error!(error = %e, "relay: could not build serving cert from SVID; dropping handshake");
+                None
+            }
+        }
+    }
+}
+
+impl rustls::server::ResolvesServerCert for SvidCertResolver {
+    fn resolve(
+        &self,
+        _client_hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.current()
+    }
+}
+
+/// Build a rustls [`CertifiedKey`] from PEM cert-chain + private-key material.
+fn certified_key_from_pem(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<rustls::sign::CertifiedKey, AuthError> {
+    let cert_chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| AuthError::InvalidPem(e.to_string()))?;
+    if cert_chain.is_empty() {
+        return Err(AuthError::InvalidPem(
+            "no certificates found in SVID cert PEM".into(),
+        ));
+    }
+    let key =
+        PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| AuthError::InvalidPem(e.to_string()))?;
+    let signing_key =
+        rustls::crypto::ring::sign::any_supported_type(&key).map_err(AuthError::Rustls)?;
+    Ok(rustls::sign::CertifiedKey::new(cert_chain, signing_key))
 }
 
 // ── DiscoveryClientTls ────────────────────────────────────────────────────────
@@ -641,6 +766,50 @@ pub(crate) mod tests {
             client_cert_pem: client_cert.pem().into_bytes(),
             client_key_pem: client_key.serialize_pem().into_bytes(),
         }
+    }
+
+    // ── SvidCertResolver (relay downstream serving cert) ──────────────────────
+
+    /// The resolver is fail-closed before the first SVID lands, resolves a cert
+    /// once one is present, and hot-swaps to the new material after a rotation.
+    #[test]
+    fn svid_cert_resolver_resolves_and_hot_swaps() {
+        use crate::svid::{SharedSvid, SvidMaterial};
+
+        let cell = SharedSvid::new();
+        let resolver = SvidCertResolver { svid: cell.clone() };
+
+        // Before the first SVID: no cert (fail-closed).
+        assert!(
+            resolver.current().is_none(),
+            "no serving cert before the first SVID lands"
+        );
+
+        // First SVID (the server leaf) → a resolvable cert.
+        let a = gen_certs();
+        cell.store(std::sync::Arc::new(Some(SvidMaterial {
+            cert_pem: a.server_cert_pem.clone(),
+            key_pem: a.server_key_pem.clone(),
+            ca_bundle_pem: a.ca_cert_pem.clone(),
+            not_after_unix: 0,
+        })));
+        let first = resolver.current().expect("cert after first SVID");
+
+        // Rotate to a fresh SVID (a different leaf) → the resolver serves the new
+        // cert bytes, proving it re-reads the cell each call.
+        let b = gen_certs();
+        cell.store(std::sync::Arc::new(Some(SvidMaterial {
+            cert_pem: b.server_cert_pem.clone(),
+            key_pem: b.server_key_pem.clone(),
+            ca_bundle_pem: b.ca_cert_pem.clone(),
+            not_after_unix: 0,
+        })));
+        let second = resolver.current().expect("cert after rotation");
+        assert_ne!(
+            first.cert[0].as_ref(),
+            second.cert[0].as_ref(),
+            "resolver must hot-swap to the rotated SVID's cert"
+        );
     }
 
     // ── minimal no-op Discovery impl for TLS tests ────────────────────────────

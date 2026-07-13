@@ -13,6 +13,9 @@
 //! - `proxy --dedicated --gateway-name=NAME --gateway-namespace=NS`: read-only
 //!   data plane scoped to a single Gateway. Connects to the controller
 //!   discovery gRPC server.
+//! - `relay --shared` / `relay --namespace=NS`: zero-RBAC discovery cache that
+//!   subscribes upstream to the controller and re-serves the snapshot stream
+//!   downstream to proxies (#583).
 //!
 //! Bare `coxswain serve` (no role) parses with `role = None`; the dispatch in
 //! `lib.rs` rejects it, since production must pick a role explicitly.
@@ -91,6 +94,11 @@ pub(crate) enum Role {
     /// Read-only data plane pod. Use `--shared` for the shared pool or
     /// `--dedicated` for a per-Gateway pod.
     Proxy(ProxyRoleArgs),
+    /// Zero-RBAC discovery cache pod: subscribes upstream to the controller and
+    /// re-serves the snapshot stream downstream to proxies. Use `--shared` to
+    /// front the shared pool or `--namespace <NS>` to front one namespace's
+    /// dedicated Gateways.
+    Relay(RelayRoleArgs),
 }
 
 /// Flags shared by every role.
@@ -731,16 +739,26 @@ pub(crate) struct ProxyRoleArgs {
     )]
     pub gateway_namespace: Option<String>,
 
-    /// Comma-separated list of controller discovery endpoints.
+    /// Discovery-client flags (upstream endpoint, bootstrap, SVID material).
+    #[command(flatten)]
+    pub discovery: DiscoveryClientArgs,
+}
+
+/// The discovery-**client** flag set, shared by the `proxy` and `relay` roles.
+///
+/// Both roles connect to an upstream discovery server (the controller, or — for
+/// a leaf behind a relay — the relay), bootstrap an SVID, and open the mTLS
+/// `Stream`. Flattened into each role's args so the `--discovery-*` flags,
+/// env vars, and defaults stay identical across roles.
+#[derive(Args, Debug)]
+pub(crate) struct DiscoveryClientArgs {
+    /// Comma-separated list of upstream discovery endpoints.
     ///
     /// Each entry is an `http://host:port` (plaintext) or `https://host:port`
-    /// (mTLS) URI for a controller replica's discovery gRPC server. Providing
+    /// (mTLS) URI for an upstream discovery gRPC server — a controller replica,
+    /// or a relay's downstream listener for a leaf behind a relay. Providing
     /// more than one endpoint enables high-availability: the client load-balances
     /// RPCs across all listed replicas. Must not be empty.
-    ///
-    /// In production the controller operator renders this from the conventional
-    /// `coxswain-controller-discovery.<namespace>.svc:<discovery-port>` DNS
-    /// name; the value is inert until the discovery Service exists (T10).
     ///
     /// Example: `http://coxswain-controller-discovery.coxswain-system.svc:50051`
     #[arg(
@@ -754,9 +772,10 @@ pub(crate) struct ProxyRoleArgs {
     /// Bootstrap endpoint for obtaining an SVID from the controller.
     ///
     /// Must be an `https://` URI pointing to the controller's bootstrap listener
-    /// (port 50052 by default).  The proxy verifies the controller's SPIFFE cert
-    /// against the CA bundle from `--discovery-ca-bundle-path` before sending
-    /// its SA token.
+    /// (port 50052 by default). Bootstrap is **not** tiered — even a leaf behind
+    /// a relay bootstraps its SVID directly from the controller. The client
+    /// verifies the controller's SPIFFE cert against the CA bundle from
+    /// `--discovery-ca-bundle-path` before sending its SA token.
     ///
     /// Example: `https://coxswain-controller-discovery.coxswain-system.svc:50052`
     #[arg(long, env = "COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT")]
@@ -765,7 +784,7 @@ pub(crate) struct ProxyRoleArgs {
     /// Path to the projected ServiceAccount token file.
     ///
     /// The token is sent to the bootstrap listener so the controller can validate
-    /// the proxy's identity via the Kubernetes TokenReview API.
+    /// the node's identity via the Kubernetes TokenReview API.
     ///
     /// Default: `/var/run/secrets/coxswain/discovery-token/token`
     #[arg(
@@ -777,8 +796,9 @@ pub(crate) struct ProxyRoleArgs {
 
     /// Path to the CA bundle from the trust-bundle ConfigMap mount.
     ///
-    /// The proxy uses this to verify the controller's TLS certificate during
-    /// bootstrap and to build the mTLS channel for `Stream`.
+    /// Used to verify the upstream server's TLS certificate during bootstrap and
+    /// to build the mTLS channel for `Stream`. A relay reuses the same bundle as
+    /// the client-CA for the downstream proxies it serves.
     ///
     /// Default: `/var/run/secrets/coxswain/trust-bundle/ca.crt`
     #[arg(
@@ -790,7 +810,7 @@ pub(crate) struct ProxyRoleArgs {
 
     /// SPIFFE trust domain; must match the controller's `--discovery-trust-domain`.
     ///
-    /// Used to verify the controller's SPIFFE URI SAN during bootstrap and
+    /// Used to verify the upstream server's SPIFFE URI SAN during bootstrap and
     /// to construct the mTLS channel's expected server identity.
     #[arg(
         long,
@@ -798,6 +818,20 @@ pub(crate) struct ProxyRoleArgs {
         default_value = "cluster.local"
     )]
     pub discovery_trust_domain: String,
+
+    /// ServiceAccount name of the **upstream discovery server** to expect in its
+    /// SVID (`spiffe://<trust-domain>/ns/<server-ns>/sa/<this>`).
+    ///
+    /// Defaults to `coxswain-controller` (a leaf connecting straight to the
+    /// controller). A leaf placed behind a relay sets this to the relay's SA so
+    /// its mTLS `Stream` verifies the relay's identity instead. The server
+    /// namespace is derived from the discovery endpoint's service DNS.
+    #[arg(
+        long,
+        env = "COXSWAIN_DISCOVERY_EXPECTED_SERVER_SA",
+        default_value = "coxswain-controller"
+    )]
+    pub discovery_expected_server_sa: String,
 }
 
 /// Resolved scope for a `proxy` role invocation.
@@ -838,6 +872,78 @@ impl ProxyRoleArgs {
                 },
                 _ => panic!(
                     "invariant: --gateway-name and --gateway-namespace required by clap scope group when --dedicated is set"
+                ),
+            }
+        }
+    }
+}
+
+/// Arguments accepted by the `relay` role (#583).
+///
+/// A relay is a zero-RBAC discovery cache: an upstream discovery **client** and
+/// a downstream discovery **server** in one pod. Exactly one of `--shared`
+/// (front the shared pool) or `--namespace <NS>` (front one namespace's
+/// dedicated Gateways) selects the upstream subscription scope; clap's `scope`
+/// group enforces the choice at parse time.
+#[derive(Args, Debug)]
+#[command(group(ArgGroup::new("scope").required(true).multiple(false)))]
+pub(crate) struct RelayRoleArgs {
+    /// Flags shared by every role.
+    #[command(flatten)]
+    pub common: CommonArgs,
+    /// Discovery-client flags for the **upstream** subscription (to the
+    /// controller). `--discovery-endpoint` is the controller's discovery
+    /// Service; `--discovery-expected-server-sa` defaults to the controller SA.
+    #[command(flatten)]
+    pub discovery: DiscoveryClientArgs,
+
+    /// Front the shared pool: subscribe `SharedPool` upstream and re-serve it.
+    #[arg(long, group = "scope")]
+    pub shared: bool,
+
+    /// Front one namespace's dedicated Gateways: subscribe `Namespace{NS}`
+    /// upstream and re-serve each Gateway's world downstream. (Requires the
+    /// controller's provenance authorizer — provisioned relays land in #584.)
+    #[arg(long, value_name = "NS", group = "scope")]
+    pub namespace: Option<String>,
+
+    /// Port the relay's **downstream** discovery server binds, for leaf proxies
+    /// to subscribe. Mirrors the controller's `--discovery-port`.
+    #[arg(long, env = "COXSWAIN_DISCOVERY_PORT", default_value_t = 50051)]
+    pub discovery_port: u16,
+}
+
+/// Resolved upstream subscription scope for a `relay` role invocation.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RelayScope {
+    /// Front the shared pool (`SharedPool` upstream).
+    Shared,
+    /// Front one namespace's dedicated Gateways (`Namespace{ns}` upstream).
+    Namespace {
+        /// The namespace whose dedicated Gateways this relay aggregates.
+        namespace: String,
+    },
+}
+
+impl RelayRoleArgs {
+    /// Returns the resolved [`RelayScope`] without leaking the underlying
+    /// flag pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if neither `--shared` nor `--namespace` is set — statically
+    /// unreachable through the CLI (clap's `scope` ArgGroup is `required`), so a
+    /// violation indicates a bug in the argument definition.
+    pub(crate) fn scope(&self) -> RelayScope {
+        if self.shared {
+            RelayScope::Shared
+        } else {
+            match &self.namespace {
+                Some(namespace) => RelayScope::Namespace {
+                    namespace: namespace.clone(),
+                },
+                None => panic!(
+                    "invariant: clap scope group requires exactly one of --shared/--namespace"
                 ),
             }
         }
@@ -888,7 +994,7 @@ mod tests {
             panic!("expected Role::Proxy");
         };
         assert_eq!(args.scope(), ProxyScope::Shared);
-        assert_eq!(args.discovery_endpoint, vec!["http://ctrl:50051"]);
+        assert_eq!(args.discovery.discovery_endpoint, vec!["http://ctrl:50051"]);
     }
 
     /// `coxswain serve proxy --dedicated --gateway-name=NAME
@@ -941,7 +1047,7 @@ mod tests {
             panic!("expected Role::Proxy");
         };
         assert_eq!(
-            args.discovery_endpoint,
+            args.discovery.discovery_endpoint,
             vec!["http://ctrl-1:50051", "http://ctrl-2:50051"]
         );
     }
@@ -1031,6 +1137,7 @@ mod tests {
         let help = serve.render_help().to_string();
         assert!(help.contains("controller"), "help should list controller");
         assert!(help.contains("proxy"), "help should list proxy");
+        assert!(help.contains("relay"), "help should list relay");
     }
 
     /// `serve proxy --help` lists both scope flags.
