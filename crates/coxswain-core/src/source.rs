@@ -2,7 +2,7 @@
 //! proxy data plane.
 //!
 //! Moving the trait here (rather than leaving it in `coxswain-proxy`) lets
-//! `coxswain-discovery` implement it for [`crate::client::DiscoveryClient`]
+//! `coxswain-discovery` implement it for `coxswain_discovery::DiscoveryClient`
 //! without creating a circular dependency between the two crates.
 
 use crate::routing::{
@@ -39,7 +39,7 @@ pub trait RoutingSource: Send + Sync {
     /// misdirected-request detection (GEP-3567, #96).
     ///
     /// The default returns an empty snapshot (check inactive) so
-    /// [`coxswain_discovery::DiscoveryClient`] and other wire-backed
+    /// `coxswain_discovery::DiscoveryClient` and other wire-backed
     /// implementations compile unchanged until the discovery wire format is
     /// extended to carry listener-hostnames data.
     #[must_use]

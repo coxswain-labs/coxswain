@@ -45,7 +45,7 @@ use std::time::SystemTime;
 /// CR store — so the function stays under the workspace
 /// `clippy::too_many_arguments` threshold without each call site repeating the
 /// three-arg suffix. `Copy` (every field is a shared reference) so the same
-/// value can cheaply feed both [`route_fingerprint`] (planning, by reference)
+/// value can cheaply feed both `route_fingerprint` (planning, by reference)
 /// and `reconcile` (translation, by value) for #511's partitioned rebuild
 /// without constructing it twice.
 #[derive(Clone, Copy)]

@@ -198,7 +198,7 @@ pub(crate) fn merge_effective_gateways(
 /// Gateway's own listeners **and** every attached ListenerSet's listeners — not
 /// just `spec.listeners` — or a ListenerSet listener on a new port is never
 /// reachable. This carries the minimum the operator needs (`name`, `port`,
-/// `protocol`); the heavier [`EffectiveGateway`]/[`EffectiveListener`] stay
+/// `protocol`); the heavier `EffectiveGateway`/`EffectiveListener` stay
 /// crate-private.
 // intentionally open: a port-identity DTO that may gain fields (e.g. appProtocol).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,7 +218,7 @@ pub struct EffectiveListenerPort {
 /// listeners plus those merged from attached ListenerSets (GEP-1713), in
 /// precedence order, deduplicated on port and with collision-free names.
 ///
-/// Reuses [`merge_effective_gateways`] so the provisioning operator and the data
+/// Reuses `merge_effective_gateways` so the provisioning operator and the data
 /// plane derive identical port sets and can never drift. Conflicted listeners
 /// (which lost a port-compatibility conflict and are not programmed) are omitted.
 /// Precedence-first dedup means a Gateway listener's name and port survive over a

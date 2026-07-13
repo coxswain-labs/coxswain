@@ -1,4 +1,4 @@
-//! Port-keyed TCP routing table for [`TCPRoute`] / GEP-1901.
+//! Port-keyed TCP routing table for `TCPRoute` / GEP-1901.
 //!
 //! TCPRoute has no hostname dimension: the Standard channel allows exactly one
 //! rule with no matches, so a bound backend is selected purely by listener

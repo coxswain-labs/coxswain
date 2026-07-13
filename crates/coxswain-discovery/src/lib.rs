@@ -59,7 +59,7 @@ pub use wire::{scope_from_wire, scope_to_wire};
 
 /// Bench-only apply surface — exists **solely** for `benches/delta_apply.rs`,
 /// which compiles as an external crate and so cannot reach the `pub(crate)`
-/// [`apply`] pipeline directly. Deliberately `#[doc(hidden)]`; **not** public
+/// `apply` pipeline directly. Deliberately `#[doc(hidden)]`; **not** public
 /// API — nothing outside the bench may depend on it, and it is exempt from the
 /// stability guarantees the rest of the crate root carries. It exposes only a
 /// self-contained apply [`bench_internals::Harness`] (cache + the ten routing

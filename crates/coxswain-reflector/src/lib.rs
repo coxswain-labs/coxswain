@@ -5,7 +5,7 @@
 //! `IngressDefaultBackend` type, the endpoint resolution helper, the route /
 //! TLS table rebuild pipeline ([`SharedProxyReconciler`]), and the CRD-presence probe.
 //!
-//! Both [`coxswain_proxy`] and [`coxswain_controller`] depend on this crate.
+//! Both `coxswain_proxy` and `coxswain_controller` depend on this crate.
 //! Neither depends on the other — the read-only-proxy invariant is enforced at
 //! the crate dependency graph as well as at runtime: the proxy pod never
 //! invokes any code path from `coxswain-controller`, so it has no way to issue
@@ -30,7 +30,7 @@
 //! - [`port_alloc`] — internal target-port allocator for shared-mode
 //!   per-Gateway addressing (#472).
 //! - [`crds`] — startup probe for Gateway API CRD presence.
-//! - [`fingerprint`] — shared `resourceVersion`-based fingerprint primitives
+//! - `fingerprint` — shared `resourceVersion`-based fingerprint primitives
 //!   used by the partitioned rebuild below.
 //!
 //! ## Partitioned incremental rebuild (#511)

@@ -45,7 +45,7 @@ pub const FORWARDED_FOR_HEADER: &str = "ingress.coxswain-labs.dev/forwarded-for-
 pub const FORWARDED_FOR_TRUSTED_CIDRS: &str =
     "ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs";
 
-/// Parse the `trust-forwarded-for` annotation cluster into a [`ForwardedForConfig`].
+/// Parse the `trust-forwarded-for` annotation cluster into a [`coxswain_core::routing::ForwardedForConfig`].
 ///
 /// Returns `None` when `trust-forwarded-for` is absent or does not parse as
 /// `"true"` — the proxy uses the L4 peer address as the client IP (current

@@ -13,9 +13,9 @@
 /// provisions for a dedicated proxy as `<GATEWAY-NAME>-<GATEWAYCLASS-NAME>`.
 /// This is the single source of truth shared by:
 ///
-/// - [`coxswain_controller::operator::render`], which provisions the
+/// - `coxswain_controller::operator::render`, which provisions the
 ///   Deployment/Service/ServiceAccount under this name.
-/// - [`coxswain_core::dedicated_registry::DedicatedRoutingSnapshot`], which
+/// - [`crate::dedicated_registry::DedicatedRoutingSnapshot`], which
 ///   records it as the `expected_proxy_sa` field so the discovery server can
 ///   reconstruct the dedicated proxy's ServiceAccount — and thus its SVID
 ///   identity — without accessing the Kubernetes API.

@@ -113,7 +113,7 @@ impl RetryPolicyConfig {
     }
 
     /// Build an `HTTPRoute` retry policy from optional GEP-1731 parts, applying the
-    /// symmetric defaults. `http_codes == None` → [`DEFAULT_HTTP_RETRY_CODES`];
+    /// symmetric defaults. `http_codes == None` → `DEFAULT_HTTP_RETRY_CODES`;
     /// `Some([])` opts out (connection/timeout retries only). `grpc_codes` is empty
     /// (gRPC status matching is meaningless off a `GRPCRoute`).
     #[must_use]
@@ -131,7 +131,7 @@ impl RetryPolicyConfig {
     }
 
     /// Build a `GRPCRoute` retry policy. `http_codes` still applies (a real transport
-    /// 5xx can surface); `grpc_codes == None` → [`DEFAULT_GRPC_RETRY_CODES`], `Some([])`
+    /// 5xx can surface); `grpc_codes == None` → `DEFAULT_GRPC_RETRY_CODES`, `Some([])`
     /// opts out. Both lists are deduped/sorted.
     #[must_use]
     pub fn for_grpc(

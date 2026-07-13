@@ -67,8 +67,8 @@ use std::sync::Arc;
 
 /// Zero-sized handle namespacing the Gateway API reconciliation entry points for `HTTPRoute`.
 ///
-/// The actual translation logic lives in submodules ([`backend_tls`],
-/// [`reconcile`], [`status`]); this struct exposes the surfaces that consumers
+/// The actual translation logic lives in submodules (`backend_tls`,
+/// `reconcile`, `status`); this struct exposes the surfaces that consumers
 /// (the [`crate::reconciler::SharedProxyReconciler`] rebuild loop, the controller crate's
 /// status writer) call into.
 #[non_exhaustive]

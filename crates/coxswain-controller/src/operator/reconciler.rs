@@ -131,7 +131,7 @@ impl crate::metrics::ReconcileErrorReason for ReconcileError {
     }
 }
 
-/// Bundle of inputs the operator's [`BackgroundService::start`] needs from
+/// Bundle of inputs the operator's [`pingora_core::services::background::BackgroundService::start`] needs from
 /// the bin layer. Carries the leader flag so the operator shares one
 /// truth-source with the [`crate::Controller`] status writer.
 ///
@@ -159,7 +159,7 @@ pub struct OperatorConfig {
     /// maps each listener to its `(readiness, attached_routes)` snapshot) and
     /// subscribed via [`SharedGatewayListenerStatus::subscribe`] so any health
     /// flip (e.g. a TLS-cert resolution change) kicks every owned Gateway through
-    /// [`Controller::reconcile_all_on`].
+    /// [`kube::runtime::Controller::reconcile_all_on`].
     pub listener_status: SharedGatewayListenerStatus,
     /// Ports reserved for the Ingress data plane via `--proxy-http-port` /
     /// `--proxy-https-port`. Forwarded to the listener-status helper so a

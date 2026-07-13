@@ -33,7 +33,7 @@ pub struct SharedProxyConfig {
     /// Parse cache for GEP-3155 backend client certificates from
     /// `Gateway.spec.tls.backend.clientCertificateRef` (one entry per distinct cert identity).
     pub backend_client_cert_cache: Arc<BackendClientCertCache>,
-    /// Pre-built [`HandshakeCompleteHook`] cache for GEP-1897 `subjectAltNames` SAN checks
+    /// Pre-built [`pingora_core::protocols::tls::HandshakeCompleteHook`] cache for GEP-1897 `subjectAltNames` SAN checks
     /// (one entry per distinct SAN policy `group_key`).
     ///
     /// `upstream_peer` runs once per request/retry, so allocating a fresh `Arc<closure>` each

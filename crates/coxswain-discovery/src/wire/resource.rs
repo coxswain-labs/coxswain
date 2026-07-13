@@ -45,7 +45,7 @@ pub enum ResourceKeyError {
     UnspecifiedWildcardKind,
     /// A canonical-key *string* (a delta tombstone) did not match the grammar:
     /// an unknown prefix, the wrong field count for its variant, or a numeric
-    /// field (port) that did not parse. Only [`parse_canonical_key`] raises this;
+    /// field (port) that did not parse. Only `parse_canonical_key` raises this;
     /// [`canonical_key`] cannot, as it emits the grammar rather than parsing it.
     #[error("malformed canonical key string: {reason}")]
     MalformedKey {

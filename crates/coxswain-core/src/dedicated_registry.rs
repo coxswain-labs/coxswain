@@ -3,7 +3,7 @@
 //! The shared reconciler publishes one [`DedicatedRoutingSnapshot`] per
 //! cut-over Gateway into the [`DedicatedRoutingRegistry`] during every rebuild
 //! pass.  The discovery server reads from it when a proxy subscribes with
-//! [`crate::Scope::Gateway`][coxswain_discovery::Scope::Gateway] — it looks up
+//! `coxswain_discovery::Scope::Gateway` — it looks up
 //! the subscribing Gateway's entry and sends only that slice of the routing
 //! world.
 //!
@@ -78,7 +78,7 @@ pub struct DedicatedRoutingSnapshot {
 /// [`DedicatedRoutingSnapshot`].
 ///
 /// Constructed once in `coxswain-bin`'s `run_controller` and cloned into both
-/// the shared reconciler (writer) and the [`coxswain_discovery::SnapshotSource`]
+/// the shared reconciler (writer) and the `coxswain_discovery::SnapshotSource`
 /// (reader).  The discovery server looks up the subscribing Gateway's entry on
 /// every snapshot build.
 ///

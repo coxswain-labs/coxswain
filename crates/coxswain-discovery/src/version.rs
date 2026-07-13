@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 
 /// Wire protocol version spoken by this build.
 ///
-/// Encoded as [`proto::v1::Subscribe::wire_version`] on every stream open.
+/// Encoded as [`crate::proto::v1::Subscribe::wire_version`] on every stream open.
 /// The server rejects any client that presents a different value with
 /// `FAILED_PRECONDITION`; the client backs off permanently on that status.
 ///

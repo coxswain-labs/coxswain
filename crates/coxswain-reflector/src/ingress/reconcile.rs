@@ -65,7 +65,7 @@ impl<'a> IngressClassContext<'a> {
 /// [`IngressExtensionStores::new`]. `CoxswainBackendPolicy` (#554) does *not*
 /// join this family: it is a GEP-713 direct-attachment policy targeting the
 /// backend `Service` itself, not referenced by a `namespace/name` annotation —
-/// see [`IngressExtensionStores::backend_policy_index`].
+/// see `IngressExtensionStores::backend_policy_index`.
 #[non_exhaustive]
 pub struct IngressCrRefStores<'a> {
     pub(crate) compressions: &'a reflector::Store<Compression>,

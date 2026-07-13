@@ -96,7 +96,7 @@ pub struct BootstrapClientHandle {
 
 // ── BootstrapRunner ───────────────────────────────────────────────────────────
 
-/// The (not-yet-running) bootstrap loop returned by [`BootstrapClient::new`].
+/// The (not-yet-running) bootstrap loop returned by [`BootstrapClient::build`].
 ///
 /// Drive it by awaiting [`BootstrapRunner::run`] — typically from a Pingora
 /// background service so it runs on a Pingora runtime. `run` never returns under
@@ -152,7 +152,7 @@ impl BootstrapClient {
 
     /// Spawn the bootstrap loop and return a handle to the SVID cell.
     ///
-    /// Convenience wrapper over [`BootstrapClient::new`] that immediately
+    /// Convenience wrapper over [`BootstrapClient::build`] that immediately
     /// `tokio::spawn`s the loop — **requires an active Tokio runtime**.
     #[must_use]
     pub fn spawn(

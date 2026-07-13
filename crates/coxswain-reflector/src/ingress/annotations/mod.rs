@@ -2,28 +2,27 @@
 //!
 //! The module is split into domain submodules re-exported here:
 //!
-//! - [`traffic_policy`] — per-request timeout, retry, compression, and rate-limit annotations.
-//! - [`routing`] — path rewrite and regex opt-in annotations.
-//! - [`filters`] — request/response header modifiers, redirect, and ssl-redirect annotations.
-//! - [`edge_access`] — `ip-access-control` CR reference, forwarded-for trust.
-//! - [`auth`] — request authentication (`auth-*`, #24).
-//! - [`client_cert`] — per-host client-certificate mTLS (`auth-tls-*`, #267).
-//! - [`caching`] — RFC 7234 response-cache opt-in.
+//! - `traffic_policy` — per-request timeout, retry, compression, and rate-limit annotations.
+//! - `routing` — path rewrite and regex opt-in annotations.
+//! - `filters` — request/response header modifiers, redirect, and ssl-redirect annotations.
+//! - `edge_access` — `ip-access-control` CR reference, forwarded-for trust.
+//! - `auth` — request authentication (`auth-*`, #24).
+//! - `client_cert` — per-host client-certificate mTLS (`auth-tls-*`, #267).
 //!
 //! Per-backend connection policy — connect timeout, upstream keepalive, LB
 //! algorithm, circuit breaker, session persistence — is **not** an annotation
 //! family here: it converged onto `CoxswainBackendPolicy`, attached to the
 //! backend `Service` (#554). See `crate::gateway_api::backend_policy`.
 //!
-//! The top-level [`IngressAnnotations::parse`] function is called once per Ingress in
-//! [`super::reconcile`] and threads the results into every rule/path entry.
+//! The top-level `IngressAnnotations::parse` function is called once per Ingress in
+//! `super::reconcile` and threads the results into every rule/path entry.
 //!
 //! ## Structured diagnostics
 //!
 //! Parse helpers return `None` on invalid input so the annotation is treated as
 //! absent — the whole Ingress keeps its routes; only that annotation's effect is
 //! suppressed.  Callers that have the annotation-key context push an
-//! [`AnnotationIssue`] into the collector returned by [`IngressAnnotations::parse`].
+//! [`AnnotationIssue`] into the collector returned by `IngressAnnotations::parse`.
 //! The controller consumer converts those into `tracing::warn!` log lines and
 //! `Warning` Kubernetes Events; the proxy discards them silently.
 
@@ -48,7 +47,7 @@ use std::collections::BTreeMap;
 
 // ── Structured annotation diagnostic ─────────────────────────────────────────
 
-/// A structured annotation parse failure collected by [`IngressAnnotations::parse`].
+/// A structured annotation parse failure collected by `IngressAnnotations::parse`.
 ///
 /// The controller consumer converts these into `Warning` Kubernetes Events on the
 /// owning Ingress; the proxy discards them silently.  The `tracing::warn!` is emitted

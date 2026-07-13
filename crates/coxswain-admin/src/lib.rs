@@ -9,7 +9,7 @@
 //! - cross-cutting: `/api/v1/{health,problems,events,manifests/*,pods/*/logs}`.
 //!
 //! The routing list endpoints and `fleet/proxies/{name}/routes` accept the
-//! shared filter/pagination envelope (see [`page`]). Proxy pods are dumb data
+//! shared filter/pagination envelope (see `page`). Proxy pods are dumb data
 //! planes (#537): they carry no query surface of their own beyond
 //! `/api/v1/health` and `/metrics`. `fleet/proxies/{name}/routes` is served
 //! from the controller's own routing snapshot, filtered to the target proxy's
@@ -19,7 +19,7 @@
 //!
 //! The full surface (paths + response schemas) is described in
 //! `api/openapi.yaml` — an internal aid; keep it in sync with the dispatch
-//! below and the [`aggregator`] handlers.
+//! below and the `aggregator` handlers.
 
 mod aggregator;
 mod events;
@@ -81,7 +81,7 @@ const UI_HTML: &str = include_str!(concat!(
 ///
 /// The routing list endpoints and `fleet/proxies/{name}/routes` accept the
 /// shared filter/pagination envelope (`host`/`path`/`limit`/`offset`/`status`,
-/// default limit 200, max 1000; see [`page`]).
+/// default limit 200, max 1000; see `page`).
 ///
 /// Each capability is gated by an `Option` or `bool` field; missing
 /// capabilities return 404 structurally rather than by convention.

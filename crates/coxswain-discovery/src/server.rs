@@ -6,7 +6,7 @@
 //!
 //! # Flow control and the per-stream delta engine (#383)
 //!
-//! Each stream keeps a per-node baseline — [`StreamState::acked_resources`], the
+//! Each stream keeps a per-node baseline — `StreamState::acked_resources`, the
 //! canonical-key → resource-hash map of the world the node last Ack'd. Every
 //! outbound message is a diff against that baseline:
 //!
@@ -37,7 +37,7 @@
 //! [`Scope::SharedPool`] streams all diff against the same routing world, so the
 //! server materializes it at most once per rebuild generation and shares the
 //! resulting `Arc<MaterializedView>` across every shared-pool stream
-//! ([`DiscoveryService::shared_view`]). Gateway-scope views stay per-call (each
+//! (`DiscoveryService::shared_view`). Gateway-scope views stay per-call (each
 //! carries a per-stream SVID check). The cache lock is a `parking_lot::Mutex`
 //! never held across an `.await`.
 //!
@@ -230,7 +230,7 @@ impl DiscoveryService {
     ///
     /// While the watched value is `false` (standby, or leadership not yet
     /// established), new streams are rejected at accept with
-    /// `FAILED_PRECONDITION` / [`NOT_LEADER_MSG`], and a demotion terminates
+    /// `FAILED_PRECONDITION` / `NOT_LEADER_MSG`, and a demotion terminates
     /// every live stream with the same status so proxies redial immediately —
     /// their bound-port Acks must land on the leader that writes status, never
     /// in a demoted replica's registry. The Bootstrap RPC is deliberately NOT

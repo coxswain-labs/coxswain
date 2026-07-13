@@ -149,7 +149,7 @@ pub enum WireError {
 
     /// A path pattern string was rejected by the `matchit` router.
     ///
-    /// Returned by [`crate::wire::build_route_table`] when a route path in the DTO
+    /// Returned by `wire::build_route_table` when a route path in the DTO
     /// contains characters or patterns that the router cannot insert
     /// (e.g. conflicting parameter syntax).
     #[error("invalid path pattern: {0}")]

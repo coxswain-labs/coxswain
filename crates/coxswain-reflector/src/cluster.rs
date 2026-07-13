@@ -3,7 +3,7 @@
 //!
 //! Called from the reconciler's rebuild loop after the routing tables and TLS
 //! store have already been published. The summary is then `store()`d into a
-//! [`SharedClusterSummary`] for the admin server to read lock-free.
+//! [`coxswain_core::cluster::SharedClusterSummary`] for the admin server to read lock-free.
 //!
 //! Gateways and Ingresses are emitted sorted by (namespace, name) so successive
 //! snapshots are stable when nothing has changed — keeps polling diffs minimal
