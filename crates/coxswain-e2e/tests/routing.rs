@@ -2746,10 +2746,8 @@ async fn tcp_route_forwards_raw_connection_to_backend() -> anyhow::Result<()> {
 
     fixtures::apply_fixture(
         gwa::TCP_ROUTE,
-        FixtureVars::new(&ns.name).with(
-            "GATEWAY_TCP_PROXY_PORT",
-            &GATEWAY_TCP_PROXY_PORT.to_string(),
-        ),
+        FixtureVars::new(&ns.name)
+            .with("GATEWAY_TCP_PROXY_PORT", GATEWAY_TCP_PROXY_PORT.to_string()),
     )
     .await?;
 
@@ -2798,10 +2796,8 @@ async fn tcp_listener_without_route_is_programmed_but_drops() -> anyhow::Result<
     // Apply only the Gateway (no TCPRoute).
     fixtures::apply_fixture(
         gwa::TCP_ROUTE_GW_ONLY,
-        FixtureVars::new(&ns.name).with(
-            "GATEWAY_TCP_PROXY_PORT",
-            &GATEWAY_TCP_PROXY_PORT.to_string(),
-        ),
+        FixtureVars::new(&ns.name)
+            .with("GATEWAY_TCP_PROXY_PORT", GATEWAY_TCP_PROXY_PORT.to_string()),
     )
     .await?;
 
@@ -2894,10 +2890,8 @@ async fn udp_route_forwards_datagram_to_backend() -> anyhow::Result<()> {
 
     fixtures::apply_fixture(
         gwa::UDP_ROUTE,
-        FixtureVars::new(&ns.name).with(
-            "GATEWAY_UDP_PROXY_PORT",
-            &GATEWAY_UDP_PROXY_PORT.to_string(),
-        ),
+        FixtureVars::new(&ns.name)
+            .with("GATEWAY_UDP_PROXY_PORT", GATEWAY_UDP_PROXY_PORT.to_string()),
     )
     .await?;
 
@@ -2945,10 +2939,8 @@ async fn udp_listener_without_route_drops_datagram() -> anyhow::Result<()> {
     // Apply only the Gateway (no UDPRoute).
     fixtures::apply_fixture(
         gwa::UDP_ROUTE_GW_ONLY,
-        FixtureVars::new(&ns.name).with(
-            "GATEWAY_UDP_PROXY_PORT",
-            &GATEWAY_UDP_PROXY_PORT.to_string(),
-        ),
+        FixtureVars::new(&ns.name)
+            .with("GATEWAY_UDP_PROXY_PORT", GATEWAY_UDP_PROXY_PORT.to_string()),
     )
     .await?;
 

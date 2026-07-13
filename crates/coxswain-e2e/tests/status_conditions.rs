@@ -1991,7 +1991,7 @@ async fn tls_passthrough_route_counted_in_listener_attached_routes() -> anyhow::
         FixtureVars::new(&ns.name)
             .with(
                 "GATEWAY_TLS_PASSTHROUGH_PORT",
-                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
             )
             .with("PASSTHROUGH_HOSTNAME", &hostname),
     )
@@ -2043,7 +2043,7 @@ async fn tls_passthrough_listener_without_route_reports_zero_attached_routes() -
         FixtureVars::new(&ns.name)
             .with(
                 "GATEWAY_TLS_PASSTHROUGH_PORT",
-                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
             )
             .with("PASSTHROUGH_HOSTNAME", &hostname),
     )
@@ -2086,11 +2086,11 @@ async fn tls_terminate_route_counted_in_listener_attached_routes() -> anyhow::Re
         FixtureVars::new(&ns.name)
             .with(
                 "GATEWAY_TLS_PASSTHROUGH_PORT",
-                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
             )
             .with("TERMINATE_HOSTNAME", &hostname)
-            .with("GW_TLS_CRT_B64", &gw_cert.cert_b64())
-            .with("GW_TLS_KEY_B64", &gw_cert.key_b64()),
+            .with("GW_TLS_CRT_B64", gw_cert.cert_b64())
+            .with("GW_TLS_KEY_B64", gw_cert.key_b64()),
     )
     .await?;
 
@@ -2137,11 +2137,11 @@ async fn tls_terminate_listener_reports_tls_route_in_supported_kinds() -> anyhow
         FixtureVars::new(&ns.name)
             .with(
                 "GATEWAY_TLS_PASSTHROUGH_PORT",
-                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
             )
             .with("TERMINATE_HOSTNAME", &hostname)
-            .with("GW_TLS_CRT_B64", &gw_cert.cert_b64())
-            .with("GW_TLS_KEY_B64", &gw_cert.key_b64()),
+            .with("GW_TLS_CRT_B64", gw_cert.cert_b64())
+            .with("GW_TLS_KEY_B64", gw_cert.key_b64()),
     )
     .await?;
 
@@ -2177,10 +2177,8 @@ async fn tcp_route_counted_in_listener_attached_routes() -> anyhow::Result<()> {
 
     fixtures::apply_fixture(
         gwa::TCP_ROUTE,
-        FixtureVars::new(&ns.name).with(
-            "GATEWAY_TCP_PROXY_PORT",
-            &GATEWAY_TCP_PROXY_PORT.to_string(),
-        ),
+        FixtureVars::new(&ns.name)
+            .with("GATEWAY_TCP_PROXY_PORT", GATEWAY_TCP_PROXY_PORT.to_string()),
     )
     .await?;
 
@@ -2222,10 +2220,8 @@ async fn tcp_listener_reports_tcp_route_in_supported_kinds() -> anyhow::Result<(
 
     fixtures::apply_fixture(
         gwa::TCP_ROUTE,
-        FixtureVars::new(&ns.name).with(
-            "GATEWAY_TCP_PROXY_PORT",
-            &GATEWAY_TCP_PROXY_PORT.to_string(),
-        ),
+        FixtureVars::new(&ns.name)
+            .with("GATEWAY_TCP_PROXY_PORT", GATEWAY_TCP_PROXY_PORT.to_string()),
     )
     .await?;
 
@@ -2261,10 +2257,8 @@ async fn udp_route_counted_in_listener_attached_routes() -> anyhow::Result<()> {
 
     fixtures::apply_fixture(
         gwa::UDP_ROUTE,
-        FixtureVars::new(&ns.name).with(
-            "GATEWAY_UDP_PROXY_PORT",
-            &GATEWAY_UDP_PROXY_PORT.to_string(),
-        ),
+        FixtureVars::new(&ns.name)
+            .with("GATEWAY_UDP_PROXY_PORT", GATEWAY_UDP_PROXY_PORT.to_string()),
     )
     .await?;
 
@@ -2306,10 +2300,8 @@ async fn udp_listener_reports_udp_route_in_supported_kinds() -> anyhow::Result<(
 
     fixtures::apply_fixture(
         gwa::UDP_ROUTE,
-        FixtureVars::new(&ns.name).with(
-            "GATEWAY_UDP_PROXY_PORT",
-            &GATEWAY_UDP_PROXY_PORT.to_string(),
-        ),
+        FixtureVars::new(&ns.name)
+            .with("GATEWAY_UDP_PROXY_PORT", GATEWAY_UDP_PROXY_PORT.to_string()),
     )
     .await?;
 

@@ -735,7 +735,7 @@ async fn burst_absorbs_spike_then_limits() -> anyhow::Result<()> {
         statuses.push(status);
     }
     anyhow::ensure!(
-        statuses.iter().any(|&s| s == 429),
+        statuses.contains(&429),
         "expected at least one 429 after burst exhausted (rps=1, burst=5); got: {statuses:?}"
     );
     Ok(())
