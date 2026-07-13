@@ -31,8 +31,13 @@ tracing       = { workspace = true }
 x509-parser   = { workspace = true }
 
 [dev-dependencies]
+criterion     = { workspace = true }
 rcgen         = { workspace = true }
 tokio         = { workspace = true }
+
+[[bench]]
+name = "delta_apply"
+harness = false
 
 [build-dependencies]
 protox            = { workspace = true }
