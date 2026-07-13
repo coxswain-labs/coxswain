@@ -7,10 +7,12 @@
 use anyhow::Context as _;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
-use kube::api::{Api, ListParams, ObjectMeta, PostParams};
+use k8s_openapi::api::networking::v1::Ingress;
+use kube::api::{Api, ListParams, ObjectMeta, Patch, PatchParams, PostParams};
 use serde_json::json;
 use std::time::Duration;
 
+use coxswain_e2e::harness::leader::{self, PodAdminForward};
 use coxswain_e2e::harness::wait;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -345,6 +347,114 @@ pub async fn scrape_metric(metrics_url: &str, metric: &str) -> Option<f64> {
         let rest = l.strip_prefix(metric)?;
         rest.strip_prefix(' ')?.trim().parse::<f64>().ok()
     })
+}
+
+/// Value of a bare, label-less client/server discovery counter at `metrics_url`,
+/// treating an absent (lazily-registered) series as `0.0`.
+///
+/// The `#383` delta-streaming tests assert on *deltas* of these cumulative
+/// counters across a single action, so an unregistered baseline reads as zero
+/// rather than an error — mirroring the `unwrap_or(0.0)` baseline pattern the
+/// bootstrap-rejection test already uses.
+pub async fn counter(metrics_url: &str, metric: &str) -> f64 {
+    scrape_metric(metrics_url, metric).await.unwrap_or(0.0)
+}
+
+/// Value of a `{kind="…"}`-labelled discovery counter (e.g.
+/// `client_snapshots_applied_total` / `snapshot_messages_total`) at
+/// `metrics_url`, treating an absent series as `0.0`.
+pub async fn counter_kind(metrics_url: &str, metric: &str, kind: &str) -> f64 {
+    scrape_metric_label_sum(metrics_url, metric, &format!("kind=\"{kind}\""))
+        .await
+        .unwrap_or(0.0)
+}
+
+/// Open a port-forward to the **current leader** controller pod's admin port and
+/// return the forward plus its `/metrics` URL.
+///
+/// The server-side per-stream delta counters (`snapshot_messages_total`,
+/// `snapshot_resources_sent_total`, `snapshot_resources_removed_total`) are
+/// emitted by the leader process that serves the proxy's discovery stream — the
+/// `Stream` RPC is leader-gated (#531), so a standby never touches them. The
+/// harness's Service-level controller port-forward pins an *arbitrary* Ready
+/// replica, so per-stream counters must be scraped from the leader specifically.
+/// Hold the returned [`PodAdminForward`] across the poll loop (dropping it closes
+/// the tunnel) and scrape its URL with [`counter`] / [`counter_kind`].
+pub async fn leader_discovery_metrics(
+    client: &kube::Client,
+) -> anyhow::Result<(PodAdminForward, String)> {
+    let leader = leader::leader_pod_name(client).await?;
+    let pf = leader::pod_admin_forward(&leader).await?;
+    let url = format!("{}/metrics", pf.base_url);
+    Ok((pf, url))
+}
+
+/// Apply (server-side) a single-host `coxswain`-class Ingress `name` in `ns`
+/// routing `host` `/` → `service:port`. Each distinct `host` compiles to its own
+/// client-side route partition (`RoutePartitionKey{table, port, host}`), so the
+/// delta-streaming tests use one of these per host to build a multi-partition
+/// topology whose partitions can be dirtied independently.
+///
+/// # Errors
+///
+/// Returns an error if the SSA patch fails.
+pub async fn apply_host_ingress(
+    client: &kube::Client,
+    ns: &str,
+    name: &str,
+    host: &str,
+    service: &str,
+    port: i32,
+) -> anyhow::Result<()> {
+    let ingress = json!({
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "Ingress",
+        "metadata": { "name": name, "namespace": ns },
+        "spec": {
+            "ingressClassName": "coxswain",
+            "rules": [{ "host": host, "http": { "paths": [{
+                "path": "/", "pathType": "Prefix",
+                "backend": { "service": { "name": service, "port": { "number": port } } }
+            }] } }]
+        }
+    });
+    let api: Api<Ingress> = Api::namespaced(client.clone(), ns);
+    api.patch(
+        name,
+        &PatchParams::apply("e2e-discovery"),
+        &Patch::Apply(&ingress),
+    )
+    .await
+    .with_context(|| format!("apply host Ingress {ns}/{name} ({host} -> {service}:{port})"))?;
+    Ok(())
+}
+
+/// Patch `Deployment` `ns/name` to `replicas`.
+///
+/// Scaling a backend to `0` empties its EndpointSlice while the Service survives
+/// — the exact `valid-but-empty` condition that must surface a client-derived
+/// `503` (not the `500` a *missing* Service would give). Scaling back up restores
+/// endpoints. The caller gates on the data-plane effect (a `503`/`200` poll), not
+/// on Deployment status, so this only issues the merge patch.
+///
+/// # Errors
+///
+/// Returns an error if the merge patch fails.
+pub async fn set_deployment_replicas(
+    client: &kube::Client,
+    ns: &str,
+    name: &str,
+    replicas: i32,
+) -> anyhow::Result<()> {
+    let api: Api<Deployment> = Api::namespaced(client.clone(), ns);
+    api.patch(
+        name,
+        &PatchParams::default(),
+        &Patch::Merge(json!({ "spec": { "replicas": replicas } })),
+    )
+    .await
+    .with_context(|| format!("scale Deployment {ns}/{name} to {replicas} replicas"))?;
+    Ok(())
 }
 
 /// Scrape `GET <metrics_url>` and sum every sample of `metric` whose label set

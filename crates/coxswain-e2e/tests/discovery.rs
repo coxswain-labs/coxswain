@@ -57,7 +57,7 @@ use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ConfigMap, Secret};
 use k8s_openapi::api::events::v1::Event;
 use k8s_openapi::api::networking::v1::Ingress;
-use kube::api::{Api, ListParams, ObjectMeta, Patch, PatchParams, PostParams};
+use kube::api::{Api, DeleteParams, ListParams, ObjectMeta, Patch, PatchParams, PostParams};
 use serde_json::json;
 use std::collections::HashSet;
 use std::process::Command;
@@ -72,9 +72,11 @@ use coxswain_e2e::{
 mod common;
 use common::dedicated::scale_controller;
 use common::discovery::{
-    assert_pod_stays_not_ready, copy_trust_bundle, fetch_topology, find_node, proxy_health_state,
-    scrape_metric, scrape_metric_label_sum, shared_proxy_deployment, wait_for_pod_ready,
+    apply_host_ingress, assert_pod_stays_not_ready, copy_trust_bundle, counter, counter_kind,
+    fetch_topology, find_node, leader_discovery_metrics, proxy_health_state, scrape_metric,
+    scrape_metric_label_sum, set_deployment_replicas, shared_proxy_deployment, wait_for_pod_ready,
 };
+use common::rollout::rollout_restart_deployment;
 
 // ── Group 1 — Auth rejection (SPIFFE trust-domain mismatch) ──────────────────
 
@@ -1181,5 +1183,623 @@ async fn proxies_reconnect_to_new_leader_after_leader_pod_kill() -> anyhow::Resu
         Duration::from_secs(120),
     )
     .await?;
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Group 7 — Delta snapshot streaming (#383, wire v2)
+//
+// The controller's discovery server ships an initial full snapshot then
+// per-resource deltas: EDS-style endpoint resources (keyed by
+// `(namespace, service, port)`) travel independently of route resources, and the
+// proxy's client recompiles only the route partitions the delta actually dirties,
+// splicing the live `Arc<HostRouter>` for every partition it doesn't. The wire is
+// not black-box observable, so these tests assert the protocol behaviour through
+// the two ends' Prometheus counters (proxy `/metrics` for the client side,
+// leader controller `/metrics` for the server side) while pinning the data-plane
+// outcome (backend identity, status code) that the delta must have produced.
+//
+// Counter discipline. Every assertion is a *delta* of a cumulative counter across
+// this test's own single action, captured after gating on a real data-plane
+// post-condition — the client increments the counter in the same apply that
+// publishes the routing change, so once the proxy serves the new world the
+// counter has already moved. Client-side counters come from the one always-on
+// shared-proxy pod and are therefore exact for this test's stream regardless of
+// any other stream; server-side per-stream counters are asserted with `>=`
+// (own-effect lower bound) because a second connected proxy would add its own
+// sends. The `discovery` binary runs in the serial pass (`test-threads = 1`), so
+// no concurrent test mutates the shared proxy's routing while a window is open —
+// which is what makes a `{kind="full"}`-stays-static assertion meaningful.
+//
+// Route type. These use Ingress hosts, not HTTPRoute, deliberately: the client's
+// partitioned recompile keys on `RoutePartitionKey{table, port, host}` and the
+// splice/dirty machinery is route-type-agnostic, so Ingress hosts exercise the
+// exact same delta apply path without the per-Gateway VIP provisioning that would
+// add unrelated flake surface to a discovery-plane test.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Cumulative snapshots the client applied, split by kind.
+const M_CLIENT_APPLIED: &str = "coxswain_discovery_client_snapshots_applied_total";
+/// Cumulative route partitions the client recompiled on the apply path.
+const M_CLIENT_RECOMPILED: &str = "coxswain_discovery_client_partitions_recompiled_total";
+/// Cumulative route partitions the client reused (spliced) on the apply path.
+const M_CLIENT_REUSED: &str = "coxswain_discovery_client_partitions_reused_total";
+/// Cumulative snapshot messages the server pushed, split by kind.
+const M_SERVER_MESSAGES: &str = "coxswain_discovery_snapshot_messages_total";
+/// Cumulative resource upserts the server placed in pushed snapshots.
+const M_SERVER_SENT: &str = "coxswain_discovery_snapshot_resources_sent_total";
+/// Cumulative resource tombstones the server placed in delta snapshots.
+const M_SERVER_REMOVED: &str = "coxswain_discovery_snapshot_resources_removed_total";
+
+/// The four client-side apply counters, sampled together so a test can compare a
+/// before/after pair.
+#[derive(Debug, Clone, Copy)]
+struct ClientCounters {
+    /// `client_snapshots_applied_total{kind="full"}` — bumps only on connect /
+    /// reconnect / Nack-resync.
+    full: f64,
+    /// `client_snapshots_applied_total{kind="delta"}` — every steady-state change.
+    delta: f64,
+    /// `client_partitions_recompiled_total`.
+    recompiled: f64,
+    /// `client_partitions_reused_total`.
+    reused: f64,
+}
+
+/// Sample the shared proxy's four apply counters from its admin `/metrics`.
+async fn read_client_counters(metrics_url: &str) -> ClientCounters {
+    ClientCounters {
+        full: counter_kind(metrics_url, M_CLIENT_APPLIED, "full").await,
+        delta: counter_kind(metrics_url, M_CLIENT_APPLIED, "delta").await,
+        recompiled: counter(metrics_url, M_CLIENT_RECOMPILED).await,
+        reused: counter(metrics_url, M_CLIENT_REUSED).await,
+    }
+}
+
+/// Rollout-restarting a backend re-IPs its pods but leaves every route DTO byte
+/// identical: the change is a single EDS endpoint resource. Traffic must converge
+/// to the new pod, the churn must ride `{kind="delta"}` (never a `{kind="full"}`
+/// resync), and — the negative — the client must recompile only the one partition
+/// referencing the restarted Service while *splicing* (reusing) every sibling
+/// partition, proving an endpoint change does not fan out into an unrelated
+/// route's compile.
+#[tokio::test]
+async fn rolling_deploy_sends_only_endpoint_deltas() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "disc-roll").await?;
+
+    // Three independent host partitions, each on its own backend, so an echo-a
+    // rollout touches exactly one and leaves two as splice candidates.
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    let host_a = format!("a.{}.local", ns.name);
+    let host_b = format!("b.{}.local", ns.name);
+    let host_c = format!("c.{}.local", ns.name);
+    apply_host_ingress(&h.client, &ns.name, "ing-a", &host_a, "echo-a", 3000).await?;
+    apply_host_ingress(&h.client, &ns.name, "ing-b", &host_b, "echo-b", 3000).await?;
+    apply_host_ingress(&h.client, &ns.name, "ing-c", &host_c, "echo-c", 3000).await?;
+
+    let baseline = wait::wait_for_backend(&h.http, &host_a, "/", "echo-a", Duration::from_secs(60))
+        .await?
+        .pod
+        .ok_or_else(|| anyhow::anyhow!("echo-a response carried no pod name"))?;
+    wait::wait_for_backend(&h.http, &host_b, "/", "echo-b", Duration::from_secs(60)).await?;
+    wait::wait_for_backend(&h.http, &host_c, "/", "echo-c", Duration::from_secs(60)).await?;
+
+    let metrics_url = h.admin_url("/metrics");
+    let before = read_client_counters(&metrics_url).await;
+
+    // Re-IP echo-a's pod. The rollout waits for the new ReplicaSet to be Ready.
+    rollout_restart_deployment(&ns.name, "echo-a").await?;
+
+    // Gate on the data-plane effect: host a served by a *new* echo-a pod. Once
+    // this passes the client has necessarily applied the endpoint delta.
+    let new_pod = wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || {
+            let (http, host, baseline) = (&h.http, host_a.clone(), baseline.clone());
+            async move {
+                let observed = http.get(&host, "/").await.ok().and_then(|r| r.pod);
+                format!(
+                    "host {host} to be served by a NEW echo-a pod (baseline {baseline}); \
+                     observed {observed:?}"
+                )
+            }
+        },
+        || {
+            let (http, host, baseline) = (&h.http, host_a.clone(), baseline.clone());
+            async move {
+                let pod = http.get(&host, "/").await.ok()?.pod?;
+                (pod.starts_with("echo-a-") && pod != baseline).then_some(pod)
+            }
+        },
+    )
+    .await?;
+    assert_ne!(
+        new_pod, baseline,
+        "rollout must move host a to a fresh echo-a pod"
+    );
+
+    let after = read_client_counters(&metrics_url).await;
+
+    // Endpoint churn is a delta, never a full resync.
+    assert_eq!(
+        after.full, before.full,
+        "endpoint re-IP must not trigger a full resync; \
+         client {M_CLIENT_APPLIED}{{kind=\"full\"}} moved {} -> {}",
+        before.full, after.full
+    );
+    assert!(
+        after.delta > before.delta,
+        "endpoint re-IP must apply at least one delta; \
+         client {M_CLIENT_APPLIED}{{kind=\"delta\"}} moved {} -> {}",
+        before.delta,
+        after.delta
+    );
+
+    // Negative: only host a's partition recompiled; hosts b and c were spliced.
+    let recompiled = after.recompiled - before.recompiled;
+    let reused = after.reused - before.reused;
+    assert!(
+        recompiled >= 1.0,
+        "the restarted Service's partition (host a) must recompile; \
+         {M_CLIENT_RECOMPILED} moved +{recompiled}"
+    );
+    assert!(
+        reused > recompiled,
+        "unrelated partitions (hosts b, c reference echo-b/echo-c, untouched by an \
+         echo-a rollout) must be spliced, not recompiled; {M_CLIENT_REUSED} moved \
+         +{reused} vs {M_CLIENT_RECOMPILED} +{recompiled}"
+    );
+
+    // Siblings still serve their own backends unchanged.
+    wait::wait_for_backend(&h.http, &host_b, "/", "echo-b", Duration::from_secs(30)).await?;
+    wait::wait_for_backend(&h.http, &host_c, "/", "echo-c", Duration::from_secs(30)).await?;
+
+    Ok(())
+}
+
+/// Adding one route host among N pre-existing ones is a single route-resource
+/// upsert. The client must compile exactly the new partition and reuse the N
+/// existing ones — recompiled ~= 1, reused ~= N — and never resync. The negative
+/// (unrelated partitions untouched) is embedded in `reused > recompiled`.
+#[tokio::test]
+async fn structural_change_recompiles_only_affected_partition() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "disc-struct").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    let host_a = format!("a.{}.local", ns.name);
+    let host_b = format!("b.{}.local", ns.name);
+    let host_c = format!("c.{}.local", ns.name);
+    apply_host_ingress(&h.client, &ns.name, "ing-a", &host_a, "echo-a", 3000).await?;
+    apply_host_ingress(&h.client, &ns.name, "ing-b", &host_b, "echo-b", 3000).await?;
+    apply_host_ingress(&h.client, &ns.name, "ing-c", &host_c, "echo-c", 3000).await?;
+    wait::wait_for_backend(&h.http, &host_a, "/", "echo-a", Duration::from_secs(60)).await?;
+    wait::wait_for_backend(&h.http, &host_b, "/", "echo-b", Duration::from_secs(60)).await?;
+    wait::wait_for_backend(&h.http, &host_c, "/", "echo-c", Duration::from_secs(60)).await?;
+
+    let metrics_url = h.admin_url("/metrics");
+    let before = read_client_counters(&metrics_url).await;
+
+    // A fourth host, reusing an existing Service so the delta carries only the new
+    // route_host resource (echo-a's endpoint resource is already in the pool — no
+    // endpoint churn to muddy the partition attribution).
+    let host_d = format!("d.{}.local", ns.name);
+    apply_host_ingress(&h.client, &ns.name, "ing-d", &host_d, "echo-a", 3000).await?;
+    wait::wait_for_backend(&h.http, &host_d, "/", "echo-a", Duration::from_secs(60)).await?;
+
+    let after = read_client_counters(&metrics_url).await;
+
+    assert_eq!(
+        after.full, before.full,
+        "adding a host must be a delta, not a full resync; \
+         client {M_CLIENT_APPLIED}{{kind=\"full\"}} moved {} -> {}",
+        before.full, after.full
+    );
+    assert!(
+        after.delta > before.delta,
+        "adding a host must apply at least one delta; \
+         client {M_CLIENT_APPLIED}{{kind=\"delta\"}} moved {} -> {}",
+        before.delta,
+        after.delta
+    );
+
+    let recompiled = after.recompiled - before.recompiled;
+    let reused = after.reused - before.reused;
+    assert!(
+        recompiled >= 1.0,
+        "the new host d partition must compile; {M_CLIENT_RECOMPILED} moved +{recompiled}"
+    );
+    assert!(
+        reused >= 3.0,
+        "the three pre-existing host partitions (a, b, c) must be spliced; \
+         {M_CLIENT_REUSED} moved +{reused}"
+    );
+    assert!(
+        reused > recompiled,
+        "only the added partition may recompile — every pre-existing partition is \
+         reused; {M_CLIENT_REUSED} +{reused} must exceed {M_CLIENT_RECOMPILED} +{recompiled}"
+    );
+
+    // The pre-existing hosts are unchanged; the new one routes.
+    wait::wait_for_backend(&h.http, &host_a, "/", "echo-a", Duration::from_secs(30)).await?;
+    wait::wait_for_backend(&h.http, &host_b, "/", "echo-b", Duration::from_secs(30)).await?;
+    wait::wait_for_backend(&h.http, &host_c, "/", "echo-c", Duration::from_secs(30)).await?;
+
+    Ok(())
+}
+
+/// Deleting a route tombstones its partition: the host stops serving (404 — the
+/// negative), the server records a resource removal, and — the no-Nack proof —
+/// the deletion rides a clean delta with no `{kind="full"}` self-healing resync,
+/// while sibling hosts keep serving.
+#[tokio::test]
+async fn route_delete_tombstones_partition() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "disc-tomb").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    let host_a = format!("a.{}.local", ns.name);
+    let host_b = format!("b.{}.local", ns.name);
+    apply_host_ingress(&h.client, &ns.name, "ing-a", &host_a, "echo-a", 3000).await?;
+    apply_host_ingress(&h.client, &ns.name, "ing-b", &host_b, "echo-b", 3000).await?;
+    wait::wait_for_backend(&h.http, &host_a, "/", "echo-a", Duration::from_secs(60)).await?;
+    wait::wait_for_backend(&h.http, &host_b, "/", "echo-b", Duration::from_secs(60)).await?;
+
+    // Server-side removal counter is scraped from the leader (it serves the
+    // stream); hold the forward across the poll.
+    let (_leader_pf, server_url) = leader_discovery_metrics(&h.client).await?;
+    let removed_before = counter(&server_url, M_SERVER_REMOVED).await;
+
+    let client_url = h.admin_url("/metrics");
+    let before = read_client_counters(&client_url).await;
+
+    // Delete host a's route.
+    let ingresses: Api<Ingress> = Api::namespaced(h.client.clone(), &ns.name);
+    ingresses
+        .delete("ing-a", &DeleteParams::default())
+        .await
+        .context("delete ing-a")?;
+
+    // Negative: host a stops serving (tombstone applied → no compiled partition →
+    // 404). Gating on this proves the client applied the removal.
+    wait::wait_for_route_status(&h.http, &host_a, "/", 404, Duration::from_secs(60)).await?;
+
+    // Sibling host b is untouched.
+    wait::wait_for_backend(&h.http, &host_b, "/", "echo-b", Duration::from_secs(30)).await?;
+
+    let after = read_client_counters(&client_url).await;
+
+    // No-Nack proof: a Nack would force a `{kind="full"}` resync. The delete must
+    // instead ride a clean delta. (There is no dedicated Nack counter; a static
+    // full counter across a change that landed via a delta is the observable
+    // signal that the client accepted the message rather than rejecting it.)
+    assert_eq!(
+        after.full, before.full,
+        "a route delete must ride a clean delta with no Nack-driven full resync; \
+         client {M_CLIENT_APPLIED}{{kind=\"full\"}} moved {} -> {}",
+        before.full, after.full
+    );
+    assert!(
+        after.delta > before.delta,
+        "the tombstone must apply as a delta; \
+         client {M_CLIENT_APPLIED}{{kind=\"delta\"}} moved {} -> {}",
+        before.delta,
+        after.delta
+    );
+
+    // Server recorded the tombstone. `>=` because a concurrently-connected proxy
+    // (e.g. a prior test's still-terminating pod) would receive — and be counted
+    // for — the same removal; this test's own stream contributes at least one.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || {
+            let url = server_url.clone();
+            async move {
+                let now = counter(&url, M_SERVER_REMOVED).await;
+                format!(
+                    "leader {M_SERVER_REMOVED} to advance past {removed_before} \
+                     (route tombstone); currently {now}"
+                )
+            }
+        },
+        || {
+            let url = server_url.clone();
+            async move { (counter(&url, M_SERVER_REMOVED).await > removed_before).then_some(()) }
+        },
+    )
+    .await
+    .context("leader never recorded the route tombstone in snapshot_resources_removed_total")?;
+
+    Ok(())
+}
+
+/// Draining a backend to zero endpoints (Service intact) must surface a
+/// client-derived 503 — the `valid-but-empty` status, never the 500 a *missing*
+/// Service gives — carried by a single EDS endpoint resource. Route resources are
+/// not re-sent: the client recompiles only the drained partition (to bake the
+/// 503) and splices the siblings, and no full resync occurs. Scaling back up
+/// restores 200s.
+#[tokio::test]
+async fn endpoint_drain_yields_503_without_route_resend() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "disc-drain").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    let host_a = format!("a.{}.local", ns.name);
+    let host_b = format!("b.{}.local", ns.name);
+    let host_c = format!("c.{}.local", ns.name);
+    apply_host_ingress(&h.client, &ns.name, "ing-a", &host_a, "echo-a", 3000).await?;
+    apply_host_ingress(&h.client, &ns.name, "ing-b", &host_b, "echo-b", 3000).await?;
+    apply_host_ingress(&h.client, &ns.name, "ing-c", &host_c, "echo-c", 3000).await?;
+    wait::wait_for_backend(&h.http, &host_a, "/", "echo-a", Duration::from_secs(60)).await?;
+    wait::wait_for_backend(&h.http, &host_b, "/", "echo-b", Duration::from_secs(60)).await?;
+    wait::wait_for_backend(&h.http, &host_c, "/", "echo-c", Duration::from_secs(60)).await?;
+
+    let (_leader_pf, server_url) = leader_discovery_metrics(&h.client).await?;
+    let sent_before = counter(&server_url, M_SERVER_SENT).await;
+
+    let client_url = h.admin_url("/metrics");
+    let before = read_client_counters(&client_url).await;
+
+    // Drain echo-a: endpoints empty, Service survives.
+    set_deployment_replicas(&h.client, &ns.name, "echo-a", 0).await?;
+
+    // Client-derived status parity: 503 (valid-but-empty), NOT 500 (missing
+    // Service). wait_for_route_status keeps polling on any other code, so a 500
+    // would fail here rather than pass.
+    wait::wait_for_route_status(&h.http, &host_a, "/", 503, Duration::from_secs(90)).await?;
+    let status = h.http.get_status(&host_a, "/").await?;
+    assert_eq!(
+        status, 503,
+        "a drained-but-present Service must yield the valid-but-empty 503, not 500 \
+         (missing Service) or any other code; observed {status}"
+    );
+
+    // Siblings unaffected.
+    wait::wait_for_backend(&h.http, &host_b, "/", "echo-b", Duration::from_secs(30)).await?;
+    wait::wait_for_backend(&h.http, &host_c, "/", "echo-c", Duration::from_secs(30)).await?;
+
+    let after = read_client_counters(&client_url).await;
+
+    // The drain rode a delta, not a full resync.
+    assert_eq!(
+        after.full, before.full,
+        "endpoint drain must not trigger a full resync; \
+         client {M_CLIENT_APPLIED}{{kind=\"full\"}} moved {} -> {}",
+        before.full, after.full
+    );
+    assert!(
+        after.delta > before.delta,
+        "endpoint drain must apply at least one delta; \
+         client {M_CLIENT_APPLIED}{{kind=\"delta\"}} moved {} -> {}",
+        before.delta,
+        after.delta
+    );
+
+    // Route resources were NOT re-sent: only host a's partition recompiled (to
+    // bake the 503), and the sibling partitions were spliced. Had the routes been
+    // re-sent, the siblings would recompile instead of reuse.
+    let recompiled = after.recompiled - before.recompiled;
+    let reused = after.reused - before.reused;
+    assert!(
+        recompiled >= 1.0,
+        "the drained Service's partition (host a) must recompile to bake the 503; \
+         {M_CLIENT_RECOMPILED} moved +{recompiled}"
+    );
+    assert!(
+        reused > recompiled,
+        "sibling route partitions (hosts b, c) must be spliced, not rebuilt from \
+         re-sent routes; {M_CLIENT_REUSED} +{reused} must exceed {M_CLIENT_RECOMPILED} \
+         +{recompiled}"
+    );
+
+    // Server sent the endpoint resource (with empty addrs). `>=` for the same
+    // multi-stream reason as the removal counter above; the drain contributes at
+    // least one upsert on this test's stream.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || {
+            let url = server_url.clone();
+            async move {
+                let now = counter(&url, M_SERVER_SENT).await;
+                format!(
+                    "leader {M_SERVER_SENT} to advance past {sent_before} \
+                     (drained endpoint resource); currently {now}"
+                )
+            }
+        },
+        || {
+            let url = server_url.clone();
+            async move { (counter(&url, M_SERVER_SENT).await > sent_before).then_some(()) }
+        },
+    )
+    .await
+    .context(
+        "leader never re-sent the drained endpoint resource in snapshot_resources_sent_total",
+    )?;
+
+    // Scale back up → 200s return, still via deltas.
+    set_deployment_replicas(&h.client, &ns.name, "echo-a", 1).await?;
+    wait::wait_for_backend(&h.http, &host_a, "/", "echo-a", Duration::from_secs(90)).await?;
+    let restored = read_client_counters(&client_url).await;
+    assert_eq!(
+        restored.full, before.full,
+        "recovery must ride a delta too; client {M_CLIENT_APPLIED}{{kind=\"full\"}} \
+         moved {} -> {}",
+        before.full, restored.full
+    );
+    assert!(
+        restored.delta > after.delta,
+        "scaling the backend back up must apply a further delta; \
+         client {M_CLIENT_APPLIED}{{kind=\"delta\"}} moved {} -> {}",
+        after.delta,
+        restored.delta
+    );
+
+    Ok(())
+}
+
+/// Killing the controller forces the proxy's stream to drop; the data plane keeps
+/// serving its last-good snapshot throughout, and on reconnect the fresh
+/// controller sends a *full* resync (protocol invariant: first message per stream
+/// is `full=true`). Both ends must record exactly that: the client's
+/// `{kind="full"}` counter advances and the new leader's `{kind="full"}`
+/// server counter is non-zero — while traffic never drops.
+///
+/// Serial: scales the shared controller to zero (crib of
+/// `proxy_degrades_during_controller_outage_then_recovers`). This test's distinct
+/// assertion target is the full-resync *counter parity* on both ends, not the
+/// health-state transition that test already covers.
+#[tokio::test]
+async fn controller_restart_full_resync_reconverges() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    // Persistent: the second Harness::start() below runs bootstrap(), which purges
+    // coxswain-e2e=true namespaces; persistent skips that label so the route
+    // survives the restart window.
+    let ns = NamespaceGuard::create_persistent(&h.client, "disc-resync").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    let host = format!("resync.{}.local", ns.name);
+    apply_host_ingress(&h.client, &ns.name, "resync-a", &host, "echo-a", 3000).await?;
+    wait::wait_for_backend(&h.http, &host, "/", "echo-a", Duration::from_secs(60)).await?;
+
+    // Baseline the client full counter BEFORE the outage. The proxy pod is not
+    // restarted (only the controller is), so this counter is monotonic across the
+    // whole test and a post-reconnect read is directly comparable.
+    let client_full_before = counter_kind(&h.admin_url("/metrics"), M_CLIENT_APPLIED, "full").await;
+
+    // ── Phase 1: controller down → proxy degrades, keeps serving last-good ─────
+    scale_controller(0).await?;
+    let proxy_health_url = h.admin_url("/api/v1/health");
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || {
+            let url = proxy_health_url.clone();
+            async move {
+                let state = proxy_health_state(&url).await;
+                format!("shared proxy to report 'degraded' during outage; currently {state:?}")
+            }
+        },
+        || {
+            let url = proxy_health_url.clone();
+            async move { (proxy_health_state(&url).await? == "degraded").then_some(()) }
+        },
+    )
+    .await
+    .context("shared proxy did not degrade during controller downtime")?;
+    // Continuity: last-good snapshot still serves with the discovery stream down.
+    h.http
+        .get(&host, "/")
+        .await
+        .context("data plane must keep serving during controller downtime")?
+        .assert_backend("echo-a");
+
+    // ── Phase 2: controller back → proxy reconnects with a full resync ─────────
+    scale_controller(1).await?;
+    let h2 = Harness::start().await?;
+    wait::wait_for_controller_reconciled(
+        &h2.controller_admin_url("/metrics"),
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Wait for the proxy to clear Degraded, asserting per-tick that traffic never
+    // drops throughout the reconnect window.
+    let proxy_health_url2 = h2.admin_url("/api/v1/health");
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || {
+            let url = proxy_health_url2.clone();
+            async move {
+                let state = proxy_health_state(&url).await;
+                format!("shared proxy to return to 'ready' after reconnect; currently {state:?}")
+            }
+        },
+        || {
+            let (url, http, host) = (proxy_health_url2.clone(), &h.http, host.clone());
+            async move {
+                // A failed probe on any tick is a hard continuity failure.
+                http.get(&host, "/")
+                    .await
+                    .expect("data plane must keep serving during reconnect")
+                    .assert_backend("echo-a");
+                (proxy_health_state(&url).await? == "ready").then_some(())
+            }
+        },
+    )
+    .await
+    .context("shared proxy did not return to Ready after controller restart")?;
+
+    // Client end: the reconnect applied a full resync.
+    let client_full_after = counter_kind(&h2.admin_url("/metrics"), M_CLIENT_APPLIED, "full").await;
+    assert!(
+        client_full_after > client_full_before,
+        "reconnect must apply a full resync (protocol invariant: first message per \
+         stream is full=true); client {M_CLIENT_APPLIED}{{kind=\"full\"}} moved {} -> {}",
+        client_full_before,
+        client_full_after
+    );
+
+    // Server end: the fresh controller process sent a full to the reconnected
+    // proxy. Its counters start at zero on restart, so `>= 1` on the new leader
+    // is the full-resync signal. Scrape the leader specifically (leader-gated
+    // stream), and poll — the leader-metric port-forward and the reconnect are
+    // independently timed.
+    let (_leader_pf, server_url) = leader_discovery_metrics(&h2.client).await?;
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || {
+            let url = server_url.clone();
+            async move {
+                let n = counter_kind(&url, M_SERVER_MESSAGES, "full").await;
+                format!(
+                    "new leader {M_SERVER_MESSAGES}{{kind=\"full\"}} to report >= 1 \
+                     (full resync sent to the reconnected proxy); currently {n}"
+                )
+            }
+        },
+        || {
+            let url = server_url.clone();
+            async move { (counter_kind(&url, M_SERVER_MESSAGES, "full").await >= 1.0).then_some(()) }
+        },
+    )
+    .await
+    .context("new leader never recorded a full snapshot to the reconnected proxy")?;
+
+    // A route created AFTER the restart serves end-to-end — proof the reconnected
+    // stream delivers fresh snapshots, not just the pre-restart last-good.
+    let fresh_host = format!("resync-fresh.{}.local", ns.name);
+    apply_host_ingress(
+        &h2.client,
+        &ns.name,
+        "resync-fresh",
+        &fresh_host,
+        "echo-b",
+        3000,
+    )
+    .await?;
+    wait::wait_for_backend(
+        &h2.http,
+        &fresh_host,
+        "/",
+        "echo-b",
+        Duration::from_secs(120),
+    )
+    .await?;
+    // The original route still serves.
+    wait::wait_for_backend(&h2.http, &host, "/", "echo-a", Duration::from_secs(30)).await?;
+
     Ok(())
 }
