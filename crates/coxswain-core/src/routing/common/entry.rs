@@ -138,6 +138,17 @@ pub struct RouteEntry {
     /// When `Some`, the proxy returns this status code immediately without contacting upstream.
     /// Used for routes with invalid/missing/forbidden backend refs (Gateway API §4.3.4).
     pub error_status: Option<u16>,
+    /// Cold-side provenance: `true` when [`Self::error_status`] was derived from the
+    /// backend group's resolved endpoints (the reflector's endpoint-dependent branch —
+    /// an existing Service with zero ready endpoints ⇒ 503, an invalid/missing backend
+    /// or all-zero-weight rule ⇒ 500; see [`crate::endpoints::empty_group_status`]).
+    ///
+    /// Set by the reflector so the discovery wire encoder can **omit** these statuses:
+    /// the client re-derives them from its own endpoint pool at delta-materialization
+    /// time, keeping endpoint churn from rewriting route hashes (#383). Endpoint-
+    /// independent statuses (e.g. a `502` fail-closed) leave this `false` and ride the
+    /// wire baked. Never read on the request hot path — carried along only.
+    pub error_status_endpoint_derived: bool,
     /// Registered path pattern (exact value, prefix, or regex) for this rule.
     ///
     /// Shared as an `Arc<str>` so the access-log `pattern` mode can emit the rule
@@ -282,6 +293,7 @@ impl RouteEntry {
             metric_route_id: Arc::from(""),
             created_at,
             error_status: None,
+            error_status_endpoint_derived: false,
             path_pattern: Arc::from(""),
             max_body_size: None,
             allow_source_range: None,
@@ -311,6 +323,7 @@ impl RouteEntry {
             metric_route_id: Arc::from(""),
             created_at,
             error_status: None,
+            error_status_endpoint_derived: false,
             path_pattern: Arc::from(""),
             max_body_size: None,
             allow_source_range: None,
@@ -345,6 +358,7 @@ impl RouteEntry {
             metric_route_id: Arc::from(""),
             created_at,
             error_status: None,
+            error_status_endpoint_derived: false,
             path_pattern: Arc::from(""),
             max_body_size: None,
             allow_source_range: None,
@@ -382,6 +396,7 @@ impl RouteEntry {
             metric_route_id: Arc::from(""),
             created_at,
             error_status: None,
+            error_status_endpoint_derived: false,
             path_pattern: Arc::from(""),
             max_body_size: None,
             allow_source_range: None,
@@ -543,6 +558,19 @@ impl RouteEntry {
         self
     }
 
+    /// Mark [`Self::error_status`] as endpoint-derived (builder-style).
+    ///
+    /// The reflector sets this to `true` when the status came from the backend group's
+    /// resolved endpoints (Service-exists-but-empty ⇒ 503, missing/invalid ⇒ 500). The
+    /// discovery wire encoder omits such statuses so the client re-derives them from its
+    /// endpoint pool, keeping endpoint churn off the route hashes (#383). Endpoint-
+    /// independent statuses (e.g. fail-closed 502) leave this `false` (the default).
+    #[must_use]
+    pub fn with_error_status_endpoint_derived(mut self, derived: bool) -> Self {
+        self.error_status_endpoint_derived = derived;
+        self
+    }
+
     /// Set per-route response-compression config for this route (builder-style).
     ///
     /// Used by the Ingress reconciler to attach the config parsed from the
@@ -630,5 +658,21 @@ mod tests {
         // Bumped 320→328: circuit_breaker: Option<Arc<CircuitBreakerConfig>> added for circuit-breaker-* annotations (#282).
         // Bumped 328→336: auth widened Option<Arc<_>> → Arc<[Arc<_>]> (additive ext_authz chain, #23).
         static_assertions::assert_eq_size!(RouteEntry, [u8; 336]);
+    }
+
+    #[test]
+    fn error_status_endpoint_derived_defaults_false_and_setter_round_trips() {
+        let group = Arc::new(BackendGroup::new("ns/svc".to_string(), vec![]));
+        let bare = RouteEntry::path_only(Arc::clone(&group), "ns/r".to_string(), None);
+        assert!(
+            !bare.error_status_endpoint_derived,
+            "provenance flag defaults to false (endpoint-independent)"
+        );
+
+        let derived = RouteEntry::path_only(group, "ns/r".to_string(), None)
+            .with_error_status(Some(503))
+            .with_error_status_endpoint_derived(true);
+        assert!(derived.error_status_endpoint_derived);
+        assert_eq!(derived.error_status, Some(503));
     }
 }

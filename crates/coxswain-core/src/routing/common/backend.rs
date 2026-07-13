@@ -11,6 +11,7 @@
 use super::filters::FilterAction;
 use super::retry::RetryPolicyConfig;
 use super::upstream_tls::{BackendProtocol, UpstreamTls};
+use crate::endpoints::{EndpointKey, ResolvedEndpoints};
 use http::HeaderName;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -63,21 +64,49 @@ pub enum HashSource {
     Cookie(Arc<str>),
 }
 
+/// One retained backend ref: its resolved endpoints, optional endpoint-resource
+/// provenance, and pre-GCD weight.
+///
+/// The provenance `key` is the seam #383 needs on the discovery wire: when set, the
+/// backend can be emitted as an `EndpointRef` pointing at a separately-addressed
+/// endpoint resource, so endpoint churn re-sends only that resource instead of every
+/// route referencing the service. Entries built by the pre-#383 constructors carry
+/// `key: None` (addresses inlined literally, as before). Never read on the request
+/// hot path — the spec exists only for wire serialisation and admin introspection.
+#[non_exhaustive]
+pub struct WeightedBackendSpec {
+    /// Resolved pod addresses + protocol/service-existence metadata for this ref.
+    ///
+    /// May carry an empty address list when `key` is `Some` (a known Service whose
+    /// endpoints are currently absent): the ref is retained so a wire reference can
+    /// still be emitted, but such an entry never enters the hot-path selection pools.
+    pub resolved: Arc<ResolvedEndpoints>,
+    /// Endpoint-resource identity `(namespace, service, port)`, when this ref was
+    /// resolved through the EDS-style pool. `None` for literal-address refs produced
+    /// by [`BackendGroup::new`] / [`BackendGroup::weighted`].
+    pub key: Option<EndpointKey>,
+    /// Original pre-GCD weight, as passed at construction.
+    pub weight: u16,
+}
+
 /// The original construction inputs to a [`BackendGroup`], retained for wire serialisation.
 ///
 /// Preserved behind an `Arc` on [`BackendGroup`] so the discovery wire layer can
-/// faithfully reconstruct the exact per-backend (addresses, weight) grouping that was
-/// passed to [`BackendGroup::new`] or [`BackendGroup::weighted`].  The spec is never
-/// read on the request hot path — it exists only for `to_wire` and admin introspection.
+/// faithfully reconstruct the exact per-backend (addresses, provenance, weight)
+/// grouping that was passed to the constructors. The spec is never read on the
+/// request hot path — it exists only for `to_wire` and admin introspection.
 #[non_exhaustive]
 pub struct BackendGroupSpec {
-    /// Per-backend (endpoint-addresses, weight) groups, in construction order.
+    /// Per-backend refs, in construction order.
     ///
-    /// Empty when the group was constructed with all-zero or all-empty backends.
-    /// For [`BackendGroup::new`] this is always `[(all_endpoints, 1)]` (one backend,
-    /// uniform weight). For [`BackendGroup::weighted`] this mirrors the filtered
-    /// (non-zero weight, non-empty addrs) input list with the original pre-GCD weights.
-    pub weighted: Box<[(Box<[SocketAddr]>, u16)]>,
+    /// Empty when the group was constructed with all-zero-weight or all-empty
+    /// *unkeyed* backends. Retention rule (see [`BackendGroup::weighted_with_endpoints`]):
+    /// a ref survives when `weight > 0` AND (it resolved at least one address OR it
+    /// carries an endpoint `key`). Zero-weight refs and unkeyed empty refs are dropped;
+    /// keyed empty refs are retained (so a wire reference outlives transient endpoint
+    /// absence) but stay out of the hot-path pools. Weights are the original pre-GCD
+    /// values.
+    pub weighted: Box<[WeightedBackendSpec]>,
 }
 
 /// Per-route upstream load-balancing algorithm from the
@@ -435,34 +464,17 @@ impl std::fmt::Debug for BackendGroup {
 impl BackendGroup {
     /// All endpoints with equal weight (weight-1 uniform round-robin).
     /// Used by Ingress reconciler and single-backend Gateway API rules.
+    ///
+    /// Thin wrapper over [`Self::weighted_with_endpoints`]: the addresses are wrapped
+    /// in a literal [`ResolvedEndpoints`] with `key: None` (no endpoint-resource
+    /// provenance), preserving the pre-#383 inline-address behaviour exactly.
     pub fn new(name: String, endpoints: Vec<SocketAddr>) -> Self {
-        if endpoints.is_empty() {
-            return Self::empty(name);
-        }
-        let spec = Arc::new(BackendGroupSpec {
-            weighted: Box::new([(endpoints.clone().into_boxed_slice(), 1u16)]),
-        });
-        let addrs_snapshot = endpoints.clone().into_boxed_slice();
-        let slots = vec![0u16].into_boxed_slice();
-        let backends = Box::new([BackendPool::new(endpoints)]);
-        Self {
-            name,
-            spec,
-            backends,
-            slots,
-            slot_counter: AtomicUsize::new(0),
-            addrs_snapshot,
-            protocol: BackendProtocol::default(),
-            tls: None,
-            retry: RetryPolicyConfig::default(),
-            per_backend_filters: None,
-            session_affinity: None,
-            affinity_endpoints: None,
-            keepalive_timeout: None,
-            connect_timeout: None,
-            load_balance: LoadBalance::default(),
-            lb_endpoints: None,
-        }
+        let resolved = Arc::new(ResolvedEndpoints::new(
+            endpoints,
+            BackendProtocol::default(),
+            true,
+        ));
+        Self::weighted_with_endpoints(name, vec![(resolved, None, 1u16)])
     }
 
     /// Weighted constructor for multi-backend Gateway API rules.
@@ -470,23 +482,83 @@ impl BackendGroup {
     /// `weighted` is `[(pod_addrs_for_backend, weight), ...]` — one entry per
     /// `backendRef`. Backends with `weight == 0` or empty address lists are
     /// dropped. Returns an empty `BackendGroup` when all weights resolve to zero.
+    ///
+    /// Thin wrapper over [`Self::weighted_with_endpoints`]: each address list is
+    /// wrapped in a literal [`ResolvedEndpoints`] with `key: None`, preserving the
+    /// pre-#383 inline-address behaviour exactly.
     pub fn weighted(name: String, weighted: Vec<(Vec<SocketAddr>, u16)>) -> Self {
-        let pools: Vec<(Vec<SocketAddr>, u16)> = weighted
+        let entries = weighted
             .into_iter()
-            .filter(|(addrs, w)| *w > 0 && !addrs.is_empty())
+            .map(|(addrs, w)| {
+                let resolved = Arc::new(ResolvedEndpoints::new(
+                    addrs,
+                    BackendProtocol::default(),
+                    true,
+                ));
+                (resolved, None, w)
+            })
+            .collect();
+        Self::weighted_with_endpoints(name, entries)
+    }
+
+    /// Canonical weighted constructor carrying endpoint-resource provenance (#383).
+    ///
+    /// `entries` is `[(resolved, key, weight), ...]` — one per `backendRef`, in
+    /// construction order. Three retention rules shape the spec (never the hot path):
+    /// - **Zero-weight** entries are dropped entirely.
+    /// - **Unkeyed empty** entries (`key: None`, no addresses) are dropped — a literal
+    ///   ref with nothing to route contributes nothing.
+    /// - **Keyed empty** entries (`key: Some`, no addresses) are **retained** in the
+    ///   spec so the discovery wire can still emit an `EndpointRef` while the
+    ///   referenced Service's endpoints are transiently absent — but they are excluded
+    ///   from the selection pools, so a group whose entries all resolve to no addresses
+    ///   is behaviourally empty (`next_endpoint` yields `None`).
+    ///
+    /// The hot-path structures (`backends`, `slots`, `addrs_snapshot`) are built only
+    /// from entries that resolved at least one address, so request-path behaviour is
+    /// byte-identical to the pre-#383 `(addrs, weight)` construction.
+    pub fn weighted_with_endpoints(
+        name: String,
+        entries: Vec<(Arc<ResolvedEndpoints>, Option<EndpointKey>, u16)>,
+    ) -> Self {
+        let spec_entries: Vec<WeightedBackendSpec> = entries
+            .into_iter()
+            .filter(|(resolved, key, w)| *w > 0 && (!resolved.addrs.is_empty() || key.is_some()))
+            .map(|(resolved, key, weight)| WeightedBackendSpec {
+                resolved,
+                key,
+                weight,
+            })
             .collect();
 
-        if pools.is_empty() {
-            return Self::empty(name);
-        }
+        // Hot path: only refs that resolved addresses populate pools/slots. Keyed-empty
+        // refs stay in the spec (for the wire) but never enter selection.
+        let pools: Vec<(Vec<SocketAddr>, u16)> = spec_entries
+            .iter()
+            .filter(|wb| !wb.resolved.addrs.is_empty())
+            .map(|wb| (wb.resolved.addrs.clone(), wb.weight))
+            .collect();
 
-        // Capture spec BEFORE GCD reduction so original weights are preserved.
         let spec = Arc::new(BackendGroupSpec {
-            weighted: pools
-                .iter()
-                .map(|(addrs, w)| (addrs.clone().into_boxed_slice(), *w))
-                .collect(),
+            weighted: spec_entries.into_boxed_slice(),
         });
+
+        Self::from_pools(name, spec, pools)
+    }
+
+    /// Build the runtime selection structures from the (already spec-captured) pools.
+    ///
+    /// `pools` holds only address-bearing backends with their pre-GCD weights, in
+    /// order. When empty, yields a behaviourally-empty group that still carries `spec`
+    /// (so keyed-empty refs survive on the wire).
+    fn from_pools(
+        name: String,
+        spec: Arc<BackendGroupSpec>,
+        pools: Vec<(Vec<SocketAddr>, u16)>,
+    ) -> Self {
+        if pools.is_empty() {
+            return Self::empty_with_spec(name, spec);
+        }
 
         let weights: Vec<u16> = pools.iter().map(|(_, w)| *w).collect();
         let reduced = gcd_reduce(&weights);
@@ -528,12 +600,14 @@ impl BackendGroup {
         }
     }
 
-    fn empty(name: String) -> Self {
+    /// A behaviourally-empty group (no pools/slots) that nonetheless carries `spec`.
+    ///
+    /// `spec` may be non-empty when it retains keyed-empty refs whose endpoints are
+    /// transiently absent — those must still round-trip onto the discovery wire.
+    fn empty_with_spec(name: String, spec: Arc<BackendGroupSpec>) -> Self {
         Self {
             name,
-            spec: Arc::new(BackendGroupSpec {
-                weighted: Box::new([]),
-            }),
+            spec,
             backends: Box::new([]),
             slots: Box::new([]),
             slot_counter: AtomicUsize::new(0),
@@ -1764,5 +1838,116 @@ mod tests {
             LoadBalance::parse_lenient("hash:nope"),
             Err(LoadBalanceParseError::UnknownHashAttr)
         );
+    }
+
+    // ── #383: endpoint provenance in BackendGroupSpec ─────────────────────────
+
+    fn resolved(addrs: &[&str]) -> Arc<ResolvedEndpoints> {
+        let parsed: Vec<SocketAddr> = addrs.iter().map(|a| a.parse().unwrap()).collect();
+        let exists = !parsed.is_empty();
+        Arc::new(ResolvedEndpoints::new(
+            parsed,
+            BackendProtocol::default(),
+            exists,
+        ))
+    }
+
+    #[test]
+    fn wrapper_constructors_produce_key_none_and_service_exists() {
+        let a: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        // new(): single uniform-weight ref.
+        let g = BackendGroup::new("ns/svc".to_string(), vec![a]);
+        let spec = g.spec();
+        assert_eq!(spec.weighted.len(), 1);
+        assert!(spec.weighted[0].key.is_none(), "wrapper ref carries no key");
+        assert!(
+            spec.weighted[0].resolved.service_exists,
+            "wrapper marks the Service as existing"
+        );
+        assert_eq!(spec.weighted[0].weight, 1);
+        assert_eq!(&*spec.weighted[0].resolved.addrs, &[a]);
+
+        // weighted(): pre-GCD weights preserved, all key=None.
+        let b: SocketAddr = "10.0.1.1:80".parse().unwrap();
+        let g = BackendGroup::weighted("ns/svc".to_string(), vec![(vec![a], 4), (vec![b], 2)]);
+        let spec = g.spec();
+        assert_eq!(spec.weighted.len(), 2);
+        assert_eq!(spec.weighted[0].weight, 4, "pre-GCD weight retained");
+        assert_eq!(spec.weighted[1].weight, 2, "pre-GCD weight retained");
+        assert!(spec.weighted.iter().all(|w| w.key.is_none()));
+    }
+
+    #[test]
+    fn keyed_empty_ref_retained_in_spec_but_absent_from_hot_path() {
+        let key = EndpointKey::new("ns", "svc", 80);
+        let empty = Arc::new(ResolvedEndpoints::new(
+            vec![],
+            BackendProtocol::default(),
+            true,
+        ));
+        let g = BackendGroup::weighted_with_endpoints(
+            "ns/svc".to_string(),
+            vec![(empty, Some(key.clone()), 3)],
+        );
+        // Retained in the cold spec (so a wire ref can still be emitted)…
+        let spec = g.spec();
+        assert_eq!(spec.weighted.len(), 1, "keyed-empty ref kept in spec");
+        assert_eq!(spec.weighted[0].key.as_ref(), Some(&key));
+        assert!(spec.weighted[0].resolved.addrs.is_empty());
+        // …but the group is behaviourally empty on the hot path.
+        assert!(g.endpoints().is_empty(), "no addresses in the pool");
+        assert!(g.next_endpoint().is_none(), "no endpoint to select");
+    }
+
+    #[test]
+    fn keyed_empty_and_addressed_ref_mix_keeps_both_in_spec_one_in_pool() {
+        let a: SocketAddr = "10.0.0.1:80".parse().unwrap();
+        let key = EndpointKey::new("ns", "gone", 80);
+        let empty = Arc::new(ResolvedEndpoints::new(
+            vec![],
+            BackendProtocol::default(),
+            true,
+        ));
+        let g = BackendGroup::weighted_with_endpoints(
+            "ns/svc".to_string(),
+            vec![(resolved(&["10.0.0.1:80"]), None, 1), (empty, Some(key), 1)],
+        );
+        assert_eq!(g.spec().weighted.len(), 2, "both refs retained in spec");
+        assert_eq!(
+            g.endpoints(),
+            &[a],
+            "only the addressed ref enters the pool"
+        );
+    }
+
+    #[test]
+    fn zero_weight_ref_dropped_from_spec() {
+        let key = EndpointKey::new("ns", "svc", 80);
+        let g = BackendGroup::weighted_with_endpoints(
+            "ns/svc".to_string(),
+            vec![
+                (resolved(&["10.0.0.1:80"]), None, 0),
+                (resolved(&["10.0.1.1:80"]), Some(key), 0),
+            ],
+        );
+        assert!(
+            g.spec().weighted.is_empty(),
+            "zero-weight refs are dropped even when keyed"
+        );
+    }
+
+    #[test]
+    fn unkeyed_empty_ref_dropped_from_spec() {
+        let empty = Arc::new(ResolvedEndpoints::new(
+            vec![],
+            BackendProtocol::default(),
+            false,
+        ));
+        let g = BackendGroup::weighted_with_endpoints("ns/svc".to_string(), vec![(empty, None, 5)]);
+        assert!(
+            g.spec().weighted.is_empty(),
+            "unkeyed empty ref contributes nothing"
+        );
+        assert!(g.next_endpoint().is_none());
     }
 }
