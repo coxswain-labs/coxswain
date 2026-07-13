@@ -163,8 +163,8 @@ impl Clone for SnapshotSource {
 /// `Namespace` fans out every dedicated Gateway's routing world in one
 /// namespace to a single stream, so a wrongly-authorized subscriber gets a much
 /// bigger blast radius than a single `Scope::Gateway` binding — hence a
-/// dedicated seam rather than reusing [`svid_matches_dedicated_gateway`].
-/// Provisioning-backed implementations land with #584; until then every
+/// dedicated seam rather than reusing the private Gateway-scope SVID binding
+/// check. Provisioning-backed implementations land with #584; until then every
 /// [`DiscoveryService`] defaults to [`DenyAllNamespaces`].
 pub trait ScopeAuthorizer: Send + Sync {
     /// Returns `true` if `peer` may open a `Namespace{namespace}` subscribe.
