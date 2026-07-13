@@ -269,8 +269,8 @@ async fn cert_manager_http01_challenge_issues_and_serves_certificate() -> anyhow
     fixtures::apply_fixture(
         ingress::ACME_PEBBLE,
         FixtureVars::new(&ns.name)
-            .with("PEBBLE_CERT_B64", &pebble_cert.cert_b64())
-            .with("PEBBLE_KEY_B64", &pebble_cert.key_b64()),
+            .with("PEBBLE_CERT_B64", pebble_cert.cert_b64())
+            .with("PEBBLE_KEY_B64", pebble_cert.key_b64()),
     )
     .await?;
     wait::wait_for_deployments(&ns.name, &["pebble"]).await?;
@@ -280,7 +280,7 @@ async fn cert_manager_http01_challenge_issues_and_serves_certificate() -> anyhow
         ingress::ACME_HTTP01_INGRESS,
         FixtureVars::new(&ns.name)
             .with("PROXY_FQDN", PROXY_FQDN)
-            .with("PEBBLE_CA_B64", &pebble_cert.cert_b64())
+            .with("PEBBLE_CA_B64", pebble_cert.cert_b64())
             .with("SECRET_NAME", secret_name)
             .with("BACKEND_NAME", "echo-a"),
     )
@@ -2859,7 +2859,7 @@ async fn per_port_frontend_client_cert_enforced_on_second_listener() -> anyhow::
         FixtureVars::new(&ns.name)
             .with("HOSTNAME_A", &host_a)
             .with("HOSTNAME_B", &host_b)
-            .with("PORT_B", &PORT_B.to_string())
+            .with("PORT_B", PORT_B.to_string())
             .with("SECRET_A", "mtls-server-a")
             .with("SECRET_B", "mtls-server-b")
             .with("TLS_CRT_A_B64", server_a.cert_b64())
@@ -3262,7 +3262,7 @@ async fn tls_passthrough_routes_by_sni_without_termination() -> anyhow::Result<(
         FixtureVars::new(&ns.name)
             .with(
                 "GATEWAY_TLS_PASSTHROUGH_PORT",
-                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
             )
             .with("PASSTHROUGH_HOSTNAME", &hostname),
     )
@@ -3335,7 +3335,7 @@ async fn tls_passthrough_unknown_sni_is_rejected() -> anyhow::Result<()> {
         FixtureVars::new(&ns.name)
             .with(
                 "GATEWAY_TLS_PASSTHROUGH_PORT",
-                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
             )
             .with("PASSTHROUGH_HOSTNAME", &hostname),
     )
@@ -3408,7 +3408,7 @@ async fn tls_passthrough_listener_without_route_is_programmed_but_drops() -> any
         FixtureVars::new(&ns.name)
             .with(
                 "GATEWAY_TLS_PASSTHROUGH_PORT",
-                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
             )
             .with("PASSTHROUGH_HOSTNAME", &hostname),
     )
@@ -3472,11 +3472,11 @@ async fn terminate_route_decrypts_and_reaches_backend() -> anyhow::Result<()> {
         FixtureVars::new(&ns.name)
             .with(
                 "GATEWAY_TLS_PASSTHROUGH_PORT",
-                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
             )
             .with("TERMINATE_HOSTNAME", &hostname)
-            .with("GW_TLS_CRT_B64", &gw_cert.cert_b64())
-            .with("GW_TLS_KEY_B64", &gw_cert.key_b64()),
+            .with("GW_TLS_CRT_B64", gw_cert.cert_b64())
+            .with("GW_TLS_KEY_B64", gw_cert.key_b64()),
     )
     .await?;
 
@@ -3538,11 +3538,11 @@ async fn terminate_route_rejects_wrong_sni() -> anyhow::Result<()> {
         FixtureVars::new(&ns.name)
             .with(
                 "GATEWAY_TLS_PASSTHROUGH_PORT",
-                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
             )
             .with("TERMINATE_HOSTNAME", &hostname)
-            .with("GW_TLS_CRT_B64", &gw_cert.cert_b64())
-            .with("GW_TLS_KEY_B64", &gw_cert.key_b64()),
+            .with("GW_TLS_CRT_B64", gw_cert.cert_b64())
+            .with("GW_TLS_KEY_B64", gw_cert.key_b64()),
     )
     .await?;
 
@@ -3635,12 +3635,12 @@ async fn mixed_terminate_and_passthrough_isolated() -> anyhow::Result<()> {
         FixtureVars::new(&ns.name)
             .with(
                 "GATEWAY_TLS_PASSTHROUGH_PORT",
-                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
             )
             .with("TERMINATE_HOSTNAME", &terminate_hostname)
             .with("PASSTHROUGH_HOSTNAME", &passthrough_hostname)
-            .with("GW_TLS_CRT_B64", &gw_cert.cert_b64())
-            .with("GW_TLS_KEY_B64", &gw_cert.key_b64()),
+            .with("GW_TLS_CRT_B64", gw_cert.cert_b64())
+            .with("GW_TLS_KEY_B64", gw_cert.key_b64()),
     )
     .await?;
 
@@ -3787,7 +3787,7 @@ async fn tls_passthrough_proxy_protocol_via_client_traffic_policy() -> anyhow::R
         FixtureVars::new(&ns.name)
             .with(
                 "GATEWAY_TLS_PASSTHROUGH_PORT",
-                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
             )
             .with("PASSTHROUGH_HOSTNAME", &hostname),
     )
@@ -3868,7 +3868,7 @@ async fn tls_passthrough_proxy_protocol_v2_via_client_traffic_policy() -> anyhow
         FixtureVars::new(&ns.name)
             .with(
                 "GATEWAY_TLS_PASSTHROUGH_PORT",
-                &GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
             )
             .with("PASSTHROUGH_HOSTNAME", &hostname),
     )
