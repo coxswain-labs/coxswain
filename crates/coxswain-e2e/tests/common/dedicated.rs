@@ -299,3 +299,38 @@ pub async fn scale_controller(replicas: u32) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Read the controller Deployment's configured replica count (`spec.replicas`).
+///
+/// Tests that scale the controller down for an outage window MUST capture this
+/// first and restore the exact count afterwards — the shared install runs HA
+/// (two replicas by default) and the leader-election tests assert a standby
+/// exists. Restoring a hardcoded `1` silently degrades every later test in the
+/// serial pass.
+///
+/// # Errors
+///
+/// Returns an error if `kubectl get` fails or the field is not a number.
+#[must_use = "the captured count is what the outage test must restore"]
+pub async fn controller_replicas() -> anyhow::Result<u32> {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "deployment",
+            "coxswain-controller",
+            "-n",
+            "coxswain-system",
+            "-o",
+            "jsonpath={.spec.replicas}",
+        ])
+        .output()
+        .await?;
+    anyhow::ensure!(
+        out.status.success(),
+        "kubectl get controller replicas failed"
+    );
+    let raw = String::from_utf8_lossy(&out.stdout);
+    raw.trim()
+        .parse::<u32>()
+        .map_err(|e| anyhow::anyhow!("controller spec.replicas {raw:?} is not a number: {e}"))
+}

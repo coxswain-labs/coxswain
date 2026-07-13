@@ -70,10 +70,10 @@ use coxswain_e2e::{
 };
 
 mod common;
-use common::dedicated::scale_controller;
+use common::dedicated::{controller_replicas, scale_controller};
 use common::discovery::{
     apply_host_ingress, assert_pod_stays_not_ready, copy_trust_bundle, counter, counter_kind,
-    fetch_topology, find_node, leader_discovery_metrics, proxy_health_state, scrape_metric,
+    fetch_topology, find_node, leader_discovery_metrics, proxy_health_state,
     scrape_metric_label_sum, set_deployment_replicas, shared_proxy_deployment, wait_for_pod_ready,
 };
 use common::rollout::rollout_restart_deployment;
@@ -299,6 +299,9 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
 
     // ── Phase 1: take the controller down → proxy degrades, keeps serving ─────
 
+    // Capture the HA replica count so phase 2 restores it exactly (the install
+    // runs two replicas; leader-election tests in this pass assert a standby).
+    let ha_replicas = controller_replicas().await?.max(1);
     scale_controller(0).await?;
 
     // The proxy detects the dropped TCP connection within seconds of the
@@ -336,20 +339,17 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
 
     // ── Phase 2: bring the controller back → proxy reconnects, reconverges ────
 
-    scale_controller(1).await?;
+    scale_controller(ha_replicas).await?;
 
-    // Re-create the harness for fresh port-forwards to the new controller pod,
-    // then gate on the real post-condition — new leader elected + at least one
-    // successful reconcile on the fresh process — before asserting proxy
-    // recovery. wait_for_controller_reconciled polls until it sees leader=1, so
-    // the port-forward is confirmed to target the new leader pod (not an old
-    // replica lingering mid-rollout), which the metric assertion below relies on.
+    // Re-create the harness for fresh port-forwards, then gate on the real
+    // post-condition — new leader elected + at least one successful reconcile —
+    // on the LEADER pod specifically. With the HA replica count restored, an
+    // arbitrary port-forward has even odds of landing on the standby, which
+    // reports leader=0 forever; resolve the leader via the Lease (the stale
+    // pre-outage holder is filtered by the pod-Ready check) and scrape it.
     let h2 = Harness::start().await?;
-    wait::wait_for_controller_reconciled(
-        &h2.controller_admin_url("/metrics"),
-        Duration::from_secs(60),
-    )
-    .await?;
+    use coxswain_e2e::harness::leader;
+    leader::wait_for_leader_reconciled(&h.client, Duration::from_secs(60)).await?;
 
     // Gate on the proxy actually reconnecting BEFORE creating the post-restart
     // route: poll until shared-proxy health clears Degraded and returns to
@@ -431,32 +431,48 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
     // reconnected proxy. This runs last (not as a gate) precisely because the
     // gauge is lazily registered on first connect and is process-local — asserting
     // it before reconnection is proven would race both registration and a
-    // mid-rollout port-forward. After the proof above, it is guaranteed present
-    // and >= 1 on the confirmed-leader port-forward.
-    let controller_metrics_url = h2.controller_admin_url("/metrics");
+    // mid-rollout port-forward. The gauge lives only on the LEADER (streams are
+    // leader-gated, #531), and with the HA replica count restored the harness's
+    // Service-level forward can pin the standby — so resolve the leader per tick
+    // and scrape it directly, mirroring the lease-holder test's pattern.
     wait::poll_until(
         Duration::from_secs(30),
         wait::POLL,
         || {
-            let url = controller_metrics_url.clone();
+            let client = h2.client.clone();
             async move {
-                let v = scrape_metric(&url, "coxswain_discovery_connected_proxies").await;
+                let observed = match leader::leader_pod_name(&client).await {
+                    Ok(pod) => {
+                        let v = leader::pod_metric_value(
+                            &pod,
+                            "coxswain_discovery_connected_proxies",
+                        )
+                        .await
+                        .ok()
+                        .flatten();
+                        format!("leader {pod}: {v:?}")
+                    }
+                    Err(e) => format!("no leader resolvable: {e}"),
+                };
                 format!(
-                    "controller coxswain_discovery_connected_proxies >= 1 after restart; \
-                     currently: {v:?}"
+                    "leader coxswain_discovery_connected_proxies >= 1 after restart; \
+                     currently: {observed}"
                 )
             }
         },
         || {
-            let url = controller_metrics_url.clone();
+            let client = h2.client.clone();
             async move {
-                let v = scrape_metric(&url, "coxswain_discovery_connected_proxies").await?;
+                let pod = leader::leader_pod_name(&client).await.ok()?;
+                let v = leader::pod_metric_value(&pod, "coxswain_discovery_connected_proxies")
+                    .await
+                    .ok()??;
                 (v >= 1.0).then_some(())
             }
         },
     )
     .await
-    .context("controller did not report the reconnected proxy stream in coxswain_discovery_connected_proxies")?;
+    .context("leader did not report the reconnected proxy stream in coxswain_discovery_connected_proxies")?;
 
     Ok(())
 }
@@ -1346,12 +1362,27 @@ async fn rolling_deploy_sends_only_endpoint_deltas() -> anyhow::Result<()> {
         "the restarted Service's partition (host a) must recompile; \
          {M_CLIENT_RECOMPILED} moved +{recompiled}"
     );
-    assert!(
-        reused > recompiled,
-        "unrelated partitions (hosts b, c reference echo-b/echo-c, untouched by an \
-         echo-a rollout) must be spliced, not recompiled; {M_CLIENT_REUSED} moved \
-         +{reused} vs {M_CLIENT_RECOMPILED} +{recompiled}"
-    );
+    if reused <= recompiled {
+        // Self-diagnosing failure: pull the delta/full split and the server's
+        // send-side counters so a CI-only trip tells us WHAT was resent
+        // (route resources vs endpoint resources) without a rerun.
+        let server = match leader_discovery_metrics(&h.client).await {
+            Ok((_pf, url)) => {
+                let sent = counter(&url, "coxswain_discovery_snapshot_resources_sent_total").await;
+                let removed =
+                    counter(&url, "coxswain_discovery_snapshot_resources_removed_total").await;
+                format!("server resources_sent_total={sent}, resources_removed_total={removed}")
+            }
+            Err(e) => format!("server counters unavailable: {e}"),
+        };
+        panic!(
+            "unrelated partitions (hosts b, c reference echo-b/echo-c, untouched by an \
+             echo-a rollout) must be spliced, not recompiled; {M_CLIENT_REUSED} moved \
+             +{reused} vs {M_CLIENT_RECOMPILED} +{recompiled}; client applied \
+             full {} -> {}, delta {} -> {}; {server}",
+            before.full, after.full, before.delta, after.delta
+        );
+    }
 
     // Siblings still serve their own backends unchanged.
     wait::wait_for_backend(&h.http, &host_b, "/", "echo-b", Duration::from_secs(30)).await?;
@@ -1678,6 +1709,10 @@ async fn controller_restart_full_resync_reconverges() -> anyhow::Result<()> {
     let client_full_before = counter_kind(&h.admin_url("/metrics"), M_CLIENT_APPLIED, "full").await;
 
     // ── Phase 1: controller down → proxy degrades, keeps serving last-good ─────
+    // Capture the HA replica count so phase 2 restores it exactly: the install
+    // runs two replicas and `only_lease_holder_reports_connected_proxy_streams`
+    // (later in this serial pass) asserts a standby exists.
+    let ha_replicas = controller_replicas().await?.max(1);
     scale_controller(0).await?;
     let proxy_health_url = h.admin_url("/api/v1/health");
     wait::poll_until(
@@ -1705,13 +1740,15 @@ async fn controller_restart_full_resync_reconverges() -> anyhow::Result<()> {
         .assert_backend("echo-a");
 
     // ── Phase 2: controller back → proxy reconnects with a full resync ─────────
-    scale_controller(1).await?;
+    // Restore the captured count (rollout-status inside waits for ALL replicas,
+    // so the standby is back before this test returns).
+    scale_controller(ha_replicas).await?;
     let h2 = Harness::start().await?;
-    wait::wait_for_controller_reconciled(
-        &h2.controller_admin_url("/metrics"),
-        Duration::from_secs(60),
-    )
-    .await?;
+    // Gate the reconcile wait on the LEADER: with HA replicas restored, an
+    // arbitrary port-forward can land on the standby (leader=0 forever), and a
+    // held forward can wedge if it dials the admin port before it serves.
+    use coxswain_e2e::harness::leader;
+    leader::wait_for_leader_reconciled(&h.client, Duration::from_secs(60)).await?;
 
     // Wait for the proxy to clear Degraded, asserting per-tick that traffic never
     // drops throughout the reconnect window.

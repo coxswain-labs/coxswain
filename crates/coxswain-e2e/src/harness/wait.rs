@@ -1131,7 +1131,8 @@ pub fn log_measurement(label: &str, elapsed: Duration) {
 /// Sum `coxswain_controller_reconcile_total{...,result="ok"}` across all
 /// `controller` labels. Returns `None` if no `result="ok"` series is present
 /// (the metric `observe_reconcile` labels a successful reconcile `result="ok"`).
-fn reconcile_ok_total(body: &str) -> Option<f64> {
+/// `pub(crate)` so `leader::wait_for_leader_reconciled` shares the parse.
+pub(crate) fn reconcile_ok_total(body: &str) -> Option<f64> {
     let mut total = 0.0;
     let mut seen = false;
     for line in body.lines().filter(|l| !l.starts_with('#')) {
