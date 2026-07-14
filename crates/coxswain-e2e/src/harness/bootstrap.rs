@@ -251,6 +251,12 @@ pub(crate) struct HelmOverrides {
     /// Passed as `controller.ingress.enabled`. `None` leaves the chart
     /// default (`true`). Use `Some(false)` to test Gateway-API-only installs.
     pub ingress_enabled: Option<bool>,
+    /// Passed as `relay.dedicated.enabled` (#584): enables controller-provisioned
+    /// namespace relays. `false` leaves the chart default (off).
+    pub relay_dedicated_enabled: bool,
+    /// Passed as `relay.dedicated.minProxyReplicas` (#584): the break-even relay
+    /// provisioning threshold. `None` leaves the chart default (8).
+    pub relay_min_proxy_replicas: Option<u32>,
 }
 
 /// Install or upgrade the coxswain Helm release with e2e-specific overrides.
@@ -384,6 +390,14 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         args.push("--set".into());
         args.push(format!("controller.ingress.enabled={enabled}"));
     }
+    if overrides.relay_dedicated_enabled {
+        args.push("--set".into());
+        args.push("relay.dedicated.enabled=true".into());
+    }
+    if let Some(min) = overrides.relay_min_proxy_replicas {
+        args.push("--set".into());
+        args.push(format!("relay.dedicated.minProxyReplicas={min}"));
+    }
 
     let status = Command::new("helm")
         .args(&args)
@@ -426,6 +440,8 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
         discovery_svid_ttl: _,
         gateway_api_enabled: _,
         ingress_enabled: _,
+        relay_dedicated_enabled: _,
+        relay_min_proxy_replicas: _,
     } = HelmOverrides::default();
     let mut dirty = Vec::new();
     let mut check = |path: &[&str], is_dirty: bool| {
@@ -478,6 +494,14 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
     check(
         &["controller", "ingress", "enabled"],
         get(&["controller", "ingress", "enabled"]).is_some(),
+    );
+    check(
+        &["relay", "dedicated", "enabled"],
+        get(&["relay", "dedicated", "enabled"]).and_then(serde_json::Value::as_bool) == Some(true),
+    );
+    check(
+        &["relay", "dedicated", "minProxyReplicas"],
+        get(&["relay", "dedicated", "minProxyReplicas"]).is_some(),
     );
     dirty
 }

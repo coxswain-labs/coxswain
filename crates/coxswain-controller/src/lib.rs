@@ -23,6 +23,15 @@ pub use controller::{
 pub use operator::OperatorConfig;
 pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writer};
 
+/// Fixed `ServiceAccount` (and `Deployment`/`Service`) name of every
+/// controller-provisioned namespace relay (#584).
+///
+/// Public so `coxswain-bin` builds the discovery
+/// [`coxswain_discovery::ProvisionedRelayAuthorizer`] from the *same* constant the
+/// operator renders the relay `ServiceAccount` with — the provisioned identity and
+/// the authorized identity stay in lockstep by construction.
+pub const RELAY_SERVICE_ACCOUNT: &str = "coxswain-relay";
+
 // Re-export reflector primitives that bin or downstream crates expect to reach
 // from `coxswain_controller::…`. Direct re-exports keep callers compiling
 // without forcing every site to learn the new crate name.

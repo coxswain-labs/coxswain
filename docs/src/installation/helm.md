@@ -59,6 +59,31 @@ helm show values oci://ghcr.io/coxswain-labs/charts/coxswain
 
 See the [Helm chart README](https://github.com/coxswain-labs/coxswain/blob/main/charts/coxswain/README.md) for the full values reference.
 
+## Discovery relay tier
+
+The optional [relay tier](../architecture/deployment-models.md#discovery-relay-tier) scales leader fan-out by inserting zero-RBAC cache pods between the controller and the proxies. It is **off by default** — a relay-free install is byte-identical to one without the feature — and is configured under `relay.*`, split into two independent families:
+
+| Value | Default | Description |
+|-------|---------|-------------|
+| `relay.shared.enabled` | `false` | Render the shared-pool relay **and** repoint the shared proxies at it |
+| `relay.shared.replicas` | `2` | Shared-relay replica count (ignored when autoscaling) |
+| `relay.shared.autoscaling.enabled` | `false` | Enable HPA for the shared relay (it fronts the whole pool, so it can scale) |
+| `relay.shared.resources` | `{}` | Shared-relay container resources |
+| `relay.dedicated.enabled` | `false` | Enable controller-provisioned per-namespace relays (→ `--relay-enabled`) |
+| `relay.dedicated.replicas` | `2` | HA replica count for each provisioned namespace relay |
+| `relay.dedicated.minProxyReplicas` | `8` | Break-even threshold: a namespace gets a relay only once its desired dedicated-proxy replicas reach this (below it, direct-to-controller) |
+| `relay.dedicated.resources.{cpuRequest,memoryRequest,memoryLimit}` | `50m` / `64Mi` / `256Mi` | Resources for each provisioned namespace relay (CPU request only — a limit would throttle fan-out) |
+
+`relay.shared.*` renders Deployment/Service/SA/PDB/HPA directly (static install infra). `relay.dedicated.*` is passed to the controller, which provisions the per-namespace relays dynamically — there are no dedicated-relay templates to render. Only the shared relay is a raw-manifest resource; enabling the tier on a non-Helm install is a Helm-only path today.
+
+```bash
+# Enable both relay families
+helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
+  --namespace coxswain-system \
+  --set relay.shared.enabled=true \
+  --set relay.dedicated.enabled=true
+```
+
 ## Namespace-scoped install
 
 By default Coxswain watches the entire cluster. To restrict to a single namespace:

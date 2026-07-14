@@ -53,6 +53,7 @@ pub(crate) mod merge;
 pub(crate) mod params;
 pub(crate) mod reconciler;
 pub(crate) mod render;
+pub(crate) mod render_relay;
 pub(crate) mod render_shared;
 pub(crate) mod shared_alloc;
 pub(crate) mod status;

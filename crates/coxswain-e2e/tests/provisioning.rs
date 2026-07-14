@@ -126,6 +126,148 @@ async fn gateway_deletion_garbage_collects_resources() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── Namespace relay tier (#584) — controller-provisioned dedicated relays ────
+//
+// These reconfigure the ONE shared Helm release (relay.dedicated.*), so they are
+// global-config mutators: EXCLUDED from the parallel `e2e` profile and run in the
+// serial `e2e-serial` pass (see .config/nextest.toml and
+// scripts/check-e2e-mutators-serialized.sh).
+
+/// Fixed name of every controller-provisioned namespace relay (SA/Deployment/
+/// Service), from `render_relay::RELAY_NAME`.
+const RELAY_NAME: &str = "coxswain-relay";
+
+/// Happy path + GC lifecycle: with relay tiering enabled and a threshold of 1, a
+/// single dedicated Gateway provisions a namespace relay (zero-verb SA, no owner
+/// ref, namespace-relay component) that becomes Ready — proving its `Namespace`
+/// subscribe was authorized by provenance end-to-end. Deleting the last dedicated
+/// Gateway drains the namespace to zero and garbage-collects the relay
+/// (hysteresis GC-at-zero).
+#[tokio::test]
+async fn namespace_relay_provisioned_and_gcd_over_dedicated_gateway_lifecycle() -> anyhow::Result<()>
+{
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_dedicated_enabled: true,
+        relay_min_proxy_replicas: Some(1),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-ded-provision").await?;
+
+    // A dedicated Gateway (1 desired replica) crosses the threshold of 1.
+    apply_and_wait(&h, &ns).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
+
+    let relay_deploy =
+        wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
+    wait::wait_for_resource(&services, RELAY_NAME, Duration::from_secs(15)).await?;
+    let relay_sa = wait::wait_for_resource(&sas, RELAY_NAME, Duration::from_secs(15)).await?;
+
+    assert_eq!(
+        relay_sa.automount_service_account_token,
+        Some(false),
+        "relay SA must disable the default token automount (zero-verb identity)"
+    );
+    assert_eq!(
+        relay_deploy
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("app.kubernetes.io/component"))
+            .map(String::as_str),
+        Some("namespace-relay"),
+        "relay carries the namespace-relay component label"
+    );
+    assert!(
+        relay_deploy
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_none_or(|r| r.is_empty()),
+        "a namespace relay is per-namespace and must carry no owner reference"
+    );
+
+    // Becomes Ready → its Namespace subscribe was authorized (an unauthorized
+    // relay never marks routing_table_loaded, so its pod never goes Ready).
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            format!("namespace relay '{RELAY_NAME}' pod Ready (authorized Namespace subscribe)")
+        },
+        || async {
+            let ready = deployments
+                .get(RELAY_NAME)
+                .await
+                .ok()
+                .and_then(|d| d.status)
+                .and_then(|s| s.ready_replicas)
+                .unwrap_or(0);
+            (ready >= 1).then_some(())
+        },
+    )
+    .await?;
+
+    // Delete the last dedicated Gateway → namespace drains to zero → GC.
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    gateways
+        .delete(GATEWAY_NAME, &DeleteParams::default())
+        .await?;
+
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!(
+                "namespace relay '{RELAY_NAME}' garbage-collected after the last dedicated Gateway is deleted"
+            )
+        },
+        || async {
+            let gone = deployments.get(RELAY_NAME).await.is_err()
+                && services.get(RELAY_NAME).await.is_err()
+                && sas.get(RELAY_NAME).await.is_err();
+            gone.then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Sad/negative path — scale-to-zero: relay tiering enabled but with a high
+/// threshold, a single-replica dedicated Gateway stays below it, so the namespace
+/// must stay direct-to-controller with NO relay. Once the dedicated proxy is
+/// provisioned the operator has reconciled the Gateway (and run relay
+/// convergence, which is a no-op below threshold), so the relay's absence is a
+/// decided "not wanted", not "not yet looked at".
+#[tokio::test]
+async fn namespace_relay_not_provisioned_below_threshold() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_dedicated_enabled: true,
+        relay_min_proxy_replicas: Some(100),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-ded-below").await?;
+
+    // Waiting for the dedicated proxy resources proves the reconcile ran; relay
+    // convergence runs in the same `reconcile_dedicated` and, being below
+    // threshold, never creates anything — so the relay is never provisioned.
+    apply_and_wait(&h, &ns).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    assert!(
+        deployments.get(RELAY_NAME).await.is_err(),
+        "a below-threshold namespace must stay direct-to-controller (scale-to-zero), \
+         but relay '{RELAY_NAME}' was provisioned"
+    );
+
+    Ok(())
+}
+
 // ── GEP-1867 infrastructure propagation, shared mode (#482) ──────────────────
 //
 // In shared mode the proxy pod and per-Gateway VIP Service both live in the

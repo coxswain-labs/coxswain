@@ -8,8 +8,8 @@ use clap::Parser;
 use coxswain_admin::{AdminServer, EventSources, OperatorAggregator};
 use coxswain_controller::{
     BootstrapRejectHook, CaMode, ControllerConfig, IngressPorts, KubeTokenAuthenticator,
-    LeaseSettings, OperatorConfig, SharedGatewayListenerStatus, StatusWriterConfig,
-    load_or_generate, spawn_status_writer, spawn_trust_publisher,
+    LeaseSettings, OperatorConfig, RELAY_SERVICE_ACCOUNT, SharedGatewayListenerStatus,
+    StatusWriterConfig, load_or_generate, spawn_status_writer, spawn_trust_publisher,
 };
 use coxswain_core::health::{HealthRegistry, SubsystemHandle};
 use coxswain_core::identity::{SpiffeId, SvidIssuer};
@@ -20,8 +20,8 @@ use coxswain_core::shared::Shared;
 use coxswain_discovery::{
     BootstrapClient, BootstrapClientConfig, BootstrapRunner, BootstrapService,
     DiscoveryBootstrapServerTls, DiscoveryClient, DiscoveryClientConfig, DiscoveryServerTls,
-    DiscoveryService, RelayUpstream, RotatingServerTls, Scope, SpiffeMatcher, Supervisor,
-    namespace_relay, serve_discovery_with_tls, shared_relay,
+    DiscoveryService, ProvisionedRelayAuthorizer, RelayUpstream, RotatingServerTls, Scope,
+    SpiffeMatcher, Supervisor, namespace_relay, serve_discovery_with_tls, shared_relay,
 };
 use coxswain_proxy::{
     GatewayProxy, GrpcAuthChannelCache, IngressProxy, ListenerProtocol, ListenerSpec,
@@ -192,12 +192,24 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         udp_routes: status_writer.outputs.udp_routes.clone(),
         publish: publish_index.clone(),
     };
+    // Provenance source for the relay tier (#584): the set of namespaces the
+    // operator has provisioned a relay into. The operator's relay convergence is
+    // its sole writer; the discovery server's `ProvisionedRelayAuthorizer` reads
+    // it lock-free to authorize a relay's `Scope::Namespace` subscribe. Empty
+    // when relay tiering is off, so the authorizer denies every Namespace
+    // subscribe — identical to the `DenyAllNamespaces` default.
+    let provisioned_relays = Shared::<HashSet<String>>::new();
     let discovery_service = coxswain_discovery::DiscoveryService::new(
         discovery_source,
         node_registry,
         discovery_rebuild_rx,
     )
-    .with_leader_gate(leader_watch_rx.clone());
+    .with_leader_gate(leader_watch_rx.clone())
+    .with_scope_authorizer(Arc::new(ProvisionedRelayAuthorizer::new(
+        provisioned_relays.clone(),
+        RELAY_SERVICE_ACCOUNT,
+        args.controller.discovery_trust_domain.clone(),
+    )));
     let discovery_addr = SocketAddr::new(
         args.common.management_bind_address,
         args.controller.discovery_port,
@@ -267,6 +279,13 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         vip_failures: vip_failures.clone(),
         node_registry: Some(node_registry_for_operator),
         publish_index: Some(publish_index.clone()),
+        relay_enabled: args.controller.relay_enabled,
+        relay_replicas: args.controller.relay_replicas,
+        relay_min_proxy_replicas: args.controller.relay_min_proxy_replicas,
+        relay_cpu_request: args.controller.relay_cpu_request.clone(),
+        relay_memory_request: args.controller.relay_memory_request.clone(),
+        relay_memory_limit: args.controller.relay_memory_limit.clone(),
+        provisioned_relays,
     };
 
     server.add_service(background_service(

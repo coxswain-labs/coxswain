@@ -49,7 +49,7 @@
 //! the admin UI convergence panel (T8) and by the controller's Gateway
 //! `Programmed` readiness gate (#531).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime};
@@ -61,7 +61,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, warn};
 
+use coxswain_core::Shared;
 use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
+use coxswain_core::identity::SpiffeId;
 use coxswain_core::listener_status::SharedGatewayListenerStatus;
 use coxswain_core::node_registry::{NodeScope, SharedNodeRegistry};
 use coxswain_core::ownership::ObjectKey;
@@ -183,6 +185,79 @@ pub struct DenyAllNamespaces;
 impl ScopeAuthorizer for DenyAllNamespaces {
     fn allows_namespace(&self, _peer: &PeerSvid, _namespace: &str) -> bool {
         false
+    }
+}
+
+/// Provenance-backed [`ScopeAuthorizer`] (#584): authorizes a `Namespace{ns}`
+/// subscribe only for the relay ServiceAccount the controller provisioned in
+/// `ns`.
+///
+/// `provisioned` is the live set of namespaces where the operator currently has
+/// a relay — published by the controller's relay convergence from the *same*
+/// computation that drives provisioning, so the grant cannot drift from the
+/// rendered Deployment. Authorization is the conjunction of two independent
+/// facts, both deny-by-default:
+///
+/// 1. **Provenance** — `ns` is in `provisioned` (a namespace with no dedicated
+///    Gateway, hence no relay, is absent and rejected).
+/// 2. **Identity** — some peer URI SAN parses to a SPIFFE ID whose namespace and
+///    ServiceAccount are exactly `(ns, relay_sa)` in `trust_domain`.
+///
+/// A Kubernetes projected token cryptographically binds the SVID's namespace to
+/// the pod's own namespace, so the worst a forged label buys an attacker is a
+/// `Namespace` stream for **their own** namespace — never a peer tenant's.
+/// The trust domain is already enforced at the TLS handshake
+/// ([`crate::auth::SpiffeClientCertVerifier`]); re-checking it here is
+/// defense-in-depth, not the primary control.
+#[derive(Clone)]
+// intentionally open: constructed only via `new`; all fields private
+pub struct ProvisionedRelayAuthorizer {
+    /// Namespaces with a controller-provisioned relay, kept live by the operator.
+    provisioned: Shared<HashSet<String>>,
+    /// The ServiceAccount name every provisioned relay runs as (`coxswain-relay`).
+    relay_sa: String,
+    /// Trust domain the relay SVID must carry.
+    trust_domain: String,
+}
+
+impl ProvisionedRelayAuthorizer {
+    /// Build an authorizer over the operator's live provisioned-relay set.
+    ///
+    /// `provisioned` is shared with the controller's relay convergence (its
+    /// writer); `relay_sa` is the fixed relay ServiceAccount name; `trust_domain`
+    /// is the cluster SPIFFE trust domain.
+    #[must_use]
+    pub fn new(
+        provisioned: Shared<HashSet<String>>,
+        relay_sa: impl Into<String>,
+        trust_domain: impl Into<String>,
+    ) -> Self {
+        Self {
+            provisioned,
+            relay_sa: relay_sa.into(),
+            trust_domain: trust_domain.into(),
+        }
+    }
+}
+
+impl ScopeAuthorizer for ProvisionedRelayAuthorizer {
+    fn allows_namespace(&self, peer: &PeerSvid, namespace: &str) -> bool {
+        // No fail-open: an absent PeerSvid reaches the call site as empty SANs.
+        if peer.uri_sans.is_empty() {
+            return false;
+        }
+        // Provenance gate: the operator must currently have a relay in `namespace`.
+        if !self.provisioned.load().contains(namespace) {
+            return false;
+        }
+        // Identity gate: some SVID is exactly the relay SA in this namespace.
+        peer.uri_sans.iter().any(|uri| {
+            SpiffeId::parse(uri.as_str()).is_ok_and(|id| {
+                id.trust_domain() == self.trust_domain
+                    && id.namespace() == namespace
+                    && id.service_account() == self.relay_sa
+            })
+        })
     }
 }
 
@@ -1197,6 +1272,96 @@ mod tests {
     use tokio::sync::watch;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::{Endpoint, Server};
+
+    // ── ProvisionedRelayAuthorizer (#584) ─────────────────────────────────────
+
+    const AUTHZ_TD: &str = "cluster.local";
+    const AUTHZ_RELAY_SA: &str = "coxswain-relay";
+
+    fn relay_peer(ns: &str, sa: &str) -> PeerSvid {
+        PeerSvid {
+            uri_sans: vec![format!("spiffe://{AUTHZ_TD}/ns/{ns}/sa/{sa}")],
+        }
+    }
+
+    fn provenance_authorizer(provisioned: &[&str]) -> ProvisionedRelayAuthorizer {
+        let set: HashSet<String> = provisioned.iter().map(|s| (*s).to_owned()).collect();
+        ProvisionedRelayAuthorizer::new(Shared::from_value(set), AUTHZ_RELAY_SA, AUTHZ_TD)
+    }
+
+    #[test]
+    fn provenance_authorizer_allows_provisioned_relay_sa() {
+        let a = provenance_authorizer(&["team-a"]);
+        assert!(
+            a.allows_namespace(&relay_peer("team-a", AUTHZ_RELAY_SA), "team-a"),
+            "the provisioned relay SA in its own namespace must be authorized"
+        );
+    }
+
+    #[test]
+    fn provenance_authorizer_denies_unprovisioned_namespace() {
+        let a = provenance_authorizer(&["team-a"]);
+        assert!(
+            !a.allows_namespace(&relay_peer("team-b", AUTHZ_RELAY_SA), "team-b"),
+            "a namespace with no provisioned relay must be denied even for the relay SA"
+        );
+    }
+
+    #[test]
+    fn provenance_authorizer_denies_rogue_service_account() {
+        let a = provenance_authorizer(&["team-a"]);
+        assert!(
+            !a.allows_namespace(&relay_peer("team-a", "rogue"), "team-a"),
+            "a self-made SA in a provisioned namespace must be denied"
+        );
+    }
+
+    #[test]
+    fn provenance_authorizer_denies_cross_namespace_svid() {
+        // team-a's relay SVID subscribing to team-b (also provisioned): the SVID
+        // namespace must equal the requested namespace — forgery is bounded to
+        // the tenant's own namespace.
+        let a = provenance_authorizer(&["team-a", "team-b"]);
+        assert!(
+            !a.allows_namespace(&relay_peer("team-a", AUTHZ_RELAY_SA), "team-b"),
+            "an SVID from another namespace must not authorize this namespace"
+        );
+    }
+
+    #[test]
+    fn provenance_authorizer_denies_empty_sans() {
+        let a = provenance_authorizer(&["team-a"]);
+        assert!(
+            !a.allows_namespace(&PeerSvid::default(), "team-a"),
+            "an absent PeerSvid (empty SANs) must never be authorized (no fail-open)"
+        );
+    }
+
+    #[test]
+    fn provenance_authorizer_denies_wrong_trust_domain() {
+        let a = provenance_authorizer(&["team-a"]);
+        let peer = PeerSvid {
+            uri_sans: vec![format!(
+                "spiffe://evil.example/ns/team-a/sa/{AUTHZ_RELAY_SA}"
+            )],
+        };
+        assert!(
+            !a.allows_namespace(&peer, "team-a"),
+            "an SVID from a foreign trust domain must be denied"
+        );
+    }
+
+    #[test]
+    fn provenance_authorizer_denies_malformed_uri() {
+        let a = provenance_authorizer(&["team-a"]);
+        let peer = PeerSvid {
+            uri_sans: vec!["not-a-spiffe-uri".to_owned()],
+        };
+        assert!(
+            !a.allows_namespace(&peer, "team-a"),
+            "a malformed URI SAN must be denied"
+        );
+    }
 
     // ── test harness ─────────────────────────────────────────────────────────
 
@@ -2501,5 +2666,30 @@ mod tests {
         let snap = recv_snapshot(&mut rx).await;
         assert!(snap.full);
         drop(tx);
+    }
+
+    /// The **real** `ProvisionedRelayAuthorizer` (not a stub) wired into the
+    /// server fail-closes: even for a namespace that IS provisioned, an
+    /// unauthenticated (empty-SAN, plaintext-path) peer is rejected
+    /// `PERMISSION_DENIED`. This proves the composition #584 relies on — the
+    /// authorizer that denies empty SANs is actually the one the server calls.
+    /// The full identity allow/deny matrix is unit-tested on the authorizer
+    /// itself; the authorized case is exercised end-to-end (real mTLS) by the
+    /// provisioning e2e.
+    #[tokio::test]
+    async fn provenance_authorizer_denies_unauthenticated_namespace_subscribe() {
+        let provisioned = Shared::from_value(HashSet::from(["prod".to_owned()]));
+        let authz = Arc::new(ProvisionedRelayAuthorizer::new(
+            provisioned,
+            "coxswain-relay",
+            "cluster.local",
+        ));
+        let h = start_harness_with_authorizer(authz).await;
+        let err = open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "prod"))
+            .await
+            .expect_err(
+                "the real ProvisionedRelayAuthorizer must deny an unauthenticated Namespace subscribe",
+            );
+        assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
     }
 }

@@ -153,6 +153,15 @@ pub(super) struct RenderInputs<'a> {
     /// `gateway.spec.listeners` — so a ListenerSet listener on a new port is
     /// served by the dedicated proxy too.
     pub(super) effective_ports: &'a [EffectiveListenerPort],
+    /// Downstream discovery endpoint of the namespace relay when relay tiering is
+    /// enabled (#584): `Some("https://coxswain-relay.<ns>.svc:50051")`. The proxy
+    /// then subscribes for routing snapshots *through the relay* instead of
+    /// directly to the controller — its `--discovery-endpoint` is this value and
+    /// it verifies the relay's SVID via an added `--discovery-expected-server-sa`.
+    /// **Bootstrap stays the controller** (SVID issuance is never tiered), so
+    /// [`Self::discovery_bootstrap_endpoint`] is unchanged. `None` (relay tiering
+    /// off) ⇒ the proxy dials the controller directly, exactly as before.
+    pub(super) relay_endpoint: Option<&'a str>,
 }
 
 /// Name of the projected ServiceAccount-token volume mounted into every
@@ -570,13 +579,19 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         )
     };
 
+    // Relay tiering (#584): when the namespace is relay-fronted, the proxy
+    // subscribes for routing snapshots through the relay and must verify the
+    // relay's SVID (its ServiceAccount in this namespace) rather than the
+    // controller's. Bootstrap is untouched — SVID issuance is never tiered.
+    let stream_endpoint = inputs.relay_endpoint.unwrap_or(inputs.discovery_endpoint);
+
     let mut args = vec![
         "serve".to_string(),
         "proxy".to_string(),
         "--dedicated".to_string(),
         format!("--gateway-name={gw_name}"),
         format!("--gateway-namespace={}", common.namespace),
-        format!("--discovery-endpoint={}", inputs.discovery_endpoint),
+        format!("--discovery-endpoint={stream_endpoint}"),
         // SVID bootstrap (#423): the dedicated proxy authenticates with its
         // projected SA token, obtains a short-lived SVID over the server-auth
         // bootstrap listener, then opens the mTLS Stream. Without these the
@@ -596,6 +611,12 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         ),
         format!("--discovery-trust-domain={}", inputs.discovery_trust_domain),
     ];
+    if inputs.relay_endpoint.is_some() {
+        args.push(format!(
+            "--discovery-expected-server-sa={}",
+            super::render_relay::RELAY_NAME
+        ));
+    }
     args.push("--log-format=json".to_string());
     // Keepalive pool size: pass through to dedicated proxies so their pools
     // are governed by the same operator-configured default (inherited from the
@@ -667,7 +688,7 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
 /// roles bootstrap identically. The trust ConfigMap is `optional` so a pod that
 /// starts before the operator copies the bundle into its namespace still boots;
 /// the bootstrap loop re-reads until the file appears.
-fn discovery_volumes() -> Vec<Volume> {
+pub(super) fn discovery_volumes() -> Vec<Volume> {
     vec![
         Volume {
             name: DISCOVERY_TOKEN_VOLUME.to_string(),
@@ -698,7 +719,7 @@ fn discovery_volumes() -> Vec<Volume> {
 
 /// Read-only mounts pairing [`discovery_volumes`] to the paths the proxy reads
 /// (`--discovery-sa-token-path` / `--discovery-ca-bundle-path`).
-fn discovery_volume_mounts() -> Vec<VolumeMount> {
+pub(super) fn discovery_volume_mounts() -> Vec<VolumeMount> {
     vec![
         VolumeMount {
             name: DISCOVERY_TOKEN_VOLUME.to_string(),
@@ -993,6 +1014,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         let spec = result.service.spec.expect("service spec");
         assert_eq!(spec.type_.as_deref(), Some("ClusterIP"));
@@ -1017,6 +1039,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
 
         // Names per GEP-1762.
@@ -1071,6 +1094,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         assert_eq!(result.deployment.spec.unwrap().replicas, Some(5));
         assert_eq!(
@@ -1097,6 +1121,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         let container = &pod_spec.containers[0];
@@ -1164,6 +1189,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
         assert_eq!(ports.len(), 2);
@@ -1199,6 +1225,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
         assert_eq!(ports.len(), 2, "the two HTTP:80 listeners dedupe");
@@ -1232,6 +1259,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod_spec.containers.len(), 2, "coxswain + sidecar");
@@ -1279,6 +1307,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         for labels in [
             result.deployment.metadata.labels.as_ref(),
@@ -1322,6 +1351,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         assert_eq!(
@@ -1353,6 +1383,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         for meta in [
             &result.deployment.metadata,
@@ -1399,6 +1430,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         for meta in [
             &result.deployment.metadata,
@@ -1444,6 +1476,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         let labels = result.deployment.metadata.labels.as_ref().expect("labels");
         assert_eq!(
@@ -1485,6 +1518,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         for meta in [
             &result.deployment.metadata,

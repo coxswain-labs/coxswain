@@ -53,6 +53,14 @@ pub struct ControllerOptions {
     /// Sets `controller.ingress.enabled`. `None` leaves the chart default
     /// (`true`). Use `Some(false)` to test Gateway-API-only installs.
     pub ingress_enabled: Option<bool>,
+    /// Sets `relay.dedicated.enabled` (#584) — enables controller-provisioned
+    /// namespace relays. `false` leaves the chart default (off).
+    pub relay_dedicated_enabled: bool,
+    /// Sets `relay.dedicated.minProxyReplicas` (#584) — the break-even
+    /// provisioning threshold. A test sets this low (e.g. `Some(1)`) so a single
+    /// dedicated Gateway triggers a relay, or high to assert scale-to-zero.
+    /// `None` leaves the chart default (8).
+    pub relay_min_proxy_replicas: Option<u32>,
 }
 
 /// Handle to the in-cluster coxswain installation for one test.
@@ -117,6 +125,8 @@ impl ControllerProcess {
             discovery_svid_ttl: opts.discovery_svid_ttl,
             gateway_api_enabled: opts.gateway_api_enabled,
             ingress_enabled: opts.ingress_enabled,
+            relay_dedicated_enabled: opts.relay_dedicated_enabled,
+            relay_min_proxy_replicas: opts.relay_min_proxy_replicas,
         };
         if overrides != HelmOverrides::default() {
             let root = workspace_root().context("workspace root")?;

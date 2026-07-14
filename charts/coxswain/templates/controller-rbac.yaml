@@ -28,7 +28,9 @@ rules:
   # `services` and `serviceaccounts` ALSO carry write verbs because the
   # provisioning operator (#208) server-side-applies them in the Gateway's
   # namespace; the writes are bundled into the same rule to keep the
-  # ClusterRole concise.
+  # ClusterRole concise. The namespace relay tier (#584) reuses these exact
+  # verbs — it provisions a relay SA + Service + Deployment per relay-fronted
+  # namespace — so it needs no additional rows.
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]

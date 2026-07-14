@@ -1,0 +1,32 @@
+{{- if .Values.relay.shared.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "coxswain.relayShared.fullname" . }}
+  namespace: {{ include "coxswain.namespace" . }}
+  labels:
+    {{- include "coxswain.relayShared.selectorLabels" . | nindent 4 }}
+  {{- with .Values.relay.shared.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  # ClusterIP: the shared proxies dial this over the in-cluster network for
+  # routing snapshots (`coxswain.relayShared.discoveryEndpoint`).
+  type: ClusterIP
+  selector:
+    {{- include "coxswain.relayShared.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: discovery
+      port: {{ .Values.discovery.port }}
+      targetPort: discovery
+      protocol: TCP
+    - name: health
+      port: {{ .Values.health.port }}
+      targetPort: health
+      protocol: TCP
+    - name: admin
+      port: {{ .Values.admin.port }}
+      targetPort: admin
+      protocol: TCP
+{{- end }}

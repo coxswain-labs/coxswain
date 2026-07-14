@@ -253,6 +253,69 @@ discovery:
     secretName: coxswain-discovery-ca
 
 # =============================================================================
+# Discovery relay tier (#584) — leader fan-out scaling. Two independent families:
+#   relay.shared    — a chart-rendered relay in front of the shared proxy pool
+#                     (static install infra; these values render Deployment/
+#                     Service/SA/PDB/HPA directly, like the shared proxy).
+#   relay.dedicated — controller-provisioned per-namespace relays in front of
+#                     dedicated proxies (dynamic; these values are passed to the
+#                     controller as `--relay-*` flags, NOT rendered here).
+# Both default off — a relay-free install is byte-identical to before.
+# =============================================================================
+relay:
+  shared:
+    # Render the shared-pool relay AND repoint the shared proxies at it. A single
+    # switch: a relay nobody points at is useless and proxies pointed at a relay
+    # that doesn't exist break, so the two are never independent.
+    enabled: false
+    # Replica count when autoscaling is disabled. >=2 for HA (a leaf reconnecting
+    # during a rollout must always find a serving replica).
+    replicas: 2
+    autoscaling:
+      # The shared relay fronts the whole (cluster-wide, itself autoscaled) pool,
+      # so unlike the namespace relay it earns CPU autoscaling. Off by default.
+      enabled: false
+      minReplicas: 2
+      maxReplicas: 10
+      targetCPUUtilizationPercentage: 80
+      # -- Resource requests/limits for the relay container.
+    resources: {}
+    podDisruptionBudget:
+      enabled: true
+      maxUnavailable: 1
+    serviceAccount:
+      create: true
+      name: ""
+      annotations: {}
+    service:
+      annotations: {}
+    podLabels: {}
+    podAnnotations: {}
+    nodeSelector: {}
+    tolerations: []
+    affinity: {}
+    topologySpreadConstraints: []
+    priorityClassName: ""
+  dedicated:
+    # Enable controller-provisioned namespace relays (-> --relay-enabled). When
+    # on, a namespace that holds enough dedicated-proxy replicas gets its own
+    # relay and its dedicated proxies are repointed at it.
+    enabled: false
+    # HA replica count for each provisioned namespace relay (-> --relay-replicas).
+    replicas: 2
+    # Break-even threshold: a namespace gets a relay only once its desired
+    # dedicated-proxy replicas reach this (-> --relay-min-proxy-replicas). Below
+    # it, that namespace's proxies stay direct-to-controller (relay scaled to 0).
+    minProxyReplicas: 8
+    # Resource requests/limits for each provisioned relay container. CPU carries a
+    # request but no limit (a limit throttles fan-out); memory carries both.
+    # Per-namespace overrides arrive with the CoxswainRelayPolicy CRD (v0.6).
+    resources:
+      cpuRequest: 50m
+      memoryRequest: 64Mi
+      memoryLimit: 256Mi
+
+# =============================================================================
 # Proxy pod — read-only data plane.
 # =============================================================================
 proxy:

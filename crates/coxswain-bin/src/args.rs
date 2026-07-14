@@ -639,6 +639,66 @@ pub(crate) struct ControllerArgs {
     )]
     pub discovery_trust_domain: String,
 
+    /// Enable the discovery relay tier (#584).
+    ///
+    /// When set, every namespace that holds ≥1 dedicated Gateway is provisioned a
+    /// controller-managed namespace relay (SA + Deployment + Service), and that
+    /// namespace's dedicated proxies subscribe for routing snapshots through the
+    /// relay instead of directly to the controller — so the leader fans out one
+    /// stream per relay rather than one per proxy replica. Off by default: no
+    /// relays are provisioned and the install is byte-identical to a non-relay
+    /// one. The controller authorizes a relay's `Namespace` subscribe only for the
+    /// SA it provisioned in that namespace (provenance, deny-by-default).
+    #[arg(long, env = "COXSWAIN_RELAY_ENABLED", default_value_t = false)]
+    pub relay_enabled: bool,
+
+    /// Replica count for each provisioned namespace relay (#584).
+    ///
+    /// Only meaningful with `--relay-enabled`. Default 2 (HA): at replica 1 a
+    /// relay restart drops the streams of every leaf behind it until it returns,
+    /// so production keeps ≥2; a small cluster that enables tiering but wants a
+    /// single pod sets `--relay-replicas=1`. Values below 1 are clamped to 1 —
+    /// per-namespace scale-to-0 is governed by `--relay-min-proxy-replicas`,
+    /// not this flag.
+    #[arg(long, env = "COXSWAIN_RELAY_REPLICAS", default_value_t = 2)]
+    pub relay_replicas: u32,
+
+    /// Minimum downstream demand before a namespace gets its own relay (#584).
+    ///
+    /// A relay is provisioned for a namespace only once its *desired* dedicated-
+    /// proxy replica count (summed across that namespace's dedicated Gateways)
+    /// reaches this value; below it, the namespace's proxies subscribe directly to
+    /// the controller (a relay is scaled to zero). This is a break-even control:
+    /// each relay replica opens its own upstream stream to the leader, so a relay
+    /// only *reduces* leader load when it fronts more downstream streams than it
+    /// costs (`--relay-replicas`). The default (8) keeps relays off small and
+    /// medium namespaces — the tier earns its extra hop and pods only at fan-out
+    /// scale. Only meaningful with `--relay-enabled`.
+    #[arg(long, env = "COXSWAIN_RELAY_MIN_PROXY_REPLICAS", default_value_t = 8)]
+    pub relay_min_proxy_replicas: u32,
+
+    /// CPU **request** for each provisioned namespace relay container (#584).
+    ///
+    /// A relay is otherwise BestEffort (no requests) — unschedulable-priority and
+    /// first to be evicted. A request only, no CPU limit, is deliberate: a CPU
+    /// limit would throttle the delta-fan-out path. Empty omits the request.
+    /// Per-namespace overrides land with `CoxswainRelayPolicy` (v0.6).
+    #[arg(long, env = "COXSWAIN_RELAY_CPU_REQUEST", default_value = "50m")]
+    pub relay_cpu_request: String,
+
+    /// Memory **request** for each provisioned namespace relay container (#584).
+    /// Empty omits it. See [`Self::relay_cpu_request`].
+    #[arg(long, env = "COXSWAIN_RELAY_MEMORY_REQUEST", default_value = "64Mi")]
+    pub relay_memory_request: String,
+
+    /// Memory **limit** for each provisioned namespace relay container (#584).
+    ///
+    /// Memory is the OOM risk (the relay caches the namespace's routing world +
+    /// per-leaf delta baselines), so it carries a limit to protect the node.
+    /// Empty omits it. See [`Self::relay_cpu_request`].
+    #[arg(long, env = "COXSWAIN_RELAY_MEMORY_LIMIT", default_value = "256Mi")]
+    pub relay_memory_limit: String,
+
     /// Minimum trailing-edge quiet window for the reconciler's rebuild
     /// debounce (#512).
     ///

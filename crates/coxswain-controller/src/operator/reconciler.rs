@@ -39,7 +39,7 @@
 //! health drifts, so a cert-ref or route-resolution change reaches the patch
 //! path within watch latency without a dedicated retrigger channel.
 
-use super::{apply, params, render, render_shared, status, vip};
+use super::{apply, params, render, render_relay, render_shared, status, vip};
 use crate::controller::StatusOutcome;
 use coxswain_core::Shared;
 use coxswain_core::crd::{CoxswainGatewayParameters, ServiceType};
@@ -216,6 +216,37 @@ pub struct OperatorConfig {
     /// a snapshot containing the current generation, not merely hold its
     /// (possibly stale) port binds. `None` disables it (tests).
     pub publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
+    /// Relay tiering master switch (`--relay-enabled`, #584). When `true`, each
+    /// namespace holding ≥1 dedicated Gateway gets a controller-provisioned
+    /// namespace relay; when `false` (default) no relays are provisioned and the
+    /// provenance authorizer's set stays empty, so the install is byte-identical
+    /// to a non-relay one.
+    pub relay_enabled: bool,
+    /// Replica count for each provisioned namespace relay (`--relay-replicas`,
+    /// #584). Clamped to a minimum of 1 at render time. Default 2 (HA).
+    pub relay_replicas: u32,
+    /// Minimum desired downstream dedicated-proxy replicas in a namespace before
+    /// its relay is provisioned (`--relay-min-proxy-replicas`, #584). Below
+    /// this the namespace stays direct-to-controller (relay scaled to zero). A
+    /// break-even control — a relay only cuts leader load when it fronts more
+    /// streams than its own replica count costs.
+    pub relay_min_proxy_replicas: u32,
+    /// Relay container resource requests/limits, as raw quantity strings from
+    /// `--relay-cpu-request` / `--relay-memory-request` / `--relay-memory-limit`
+    /// (#584). Empty strings omit the corresponding entry. Global for now;
+    /// per-namespace overrides arrive with `CoxswainRelayPolicy` (v0.6).
+    pub relay_cpu_request: String,
+    /// See [`Self::relay_cpu_request`].
+    pub relay_memory_request: String,
+    /// See [`Self::relay_cpu_request`].
+    pub relay_memory_limit: String,
+    /// Live set of namespaces with a provisioned relay (#584). Written by the
+    /// relay convergence in [`reconcile_dedicated`] and read lock-free by
+    /// `coxswain_discovery::ProvisionedRelayAuthorizer` in `coxswain-bin` — the
+    /// single provenance source that authorizes a relay's `Scope::Namespace`
+    /// upstream subscribe. Derived from the *same* computation that drives
+    /// provisioning, so the grant cannot drift from the rendered Deployment.
+    pub provisioned_relays: Shared<HashSet<String>>,
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
@@ -298,6 +329,27 @@ pub(crate) struct ReconcileContext {
     node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
     /// Per-Gateway publish-sequence index (#531): ack half of the gate.
     publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
+    /// Relay tiering master switch (#584). See [`OperatorConfig::relay_enabled`].
+    relay_enabled: bool,
+    /// Per-relay replica count (#584). See [`OperatorConfig::relay_replicas`].
+    relay_replicas: u32,
+    /// Per-namespace downstream demand threshold (#584). See
+    /// [`OperatorConfig::relay_min_proxy_replicas`].
+    relay_min_proxy_replicas: u32,
+    /// Relay container resource quantity strings (#584). See
+    /// [`OperatorConfig::relay_cpu_request`].
+    relay_cpu_request: String,
+    relay_memory_request: String,
+    relay_memory_limit: String,
+    /// Lock-free snapshot of provisioned-relay namespaces read by the discovery
+    /// server's provenance authorizer (#584). Mirrors [`Self::relay_namespaces`];
+    /// the operator is its sole writer.
+    provisioned_relays: Shared<HashSet<String>>,
+    /// Writer-authoritative provisioned-relay namespace set (#584). Guards the
+    /// read-modify-write of [`Self::provisioned_relays`] so concurrent per-Gateway
+    /// reconciles across namespaces can't lose an update. Guard is never held
+    /// across an `.await` (same discipline as `last_hashes`).
+    relay_namespaces: Mutex<HashSet<String>>,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
     /// Consecutive reconcile-error count per Gateway, driving the per-object
     /// exponential backoff in [`error_policy`] (#570). Incremented there,
@@ -346,8 +398,36 @@ impl ReconcileContext {
             vip_failures: config.vip_failures,
             node_registry: config.node_registry,
             publish_index: config.publish_index,
+            relay_enabled: config.relay_enabled,
+            relay_replicas: config.relay_replicas,
+            relay_min_proxy_replicas: config.relay_min_proxy_replicas,
+            relay_cpu_request: config.relay_cpu_request,
+            relay_memory_request: config.relay_memory_request,
+            relay_memory_limit: config.relay_memory_limit,
+            provisioned_relays: config.provisioned_relays,
+            relay_namespaces: Mutex::new(HashSet::new()),
             last_hashes: Mutex::new(HashMap::new()),
             error_attempts: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record whether a namespace currently has a provisioned relay (#584) and
+    /// publish the resulting set for the provenance authorizer.
+    ///
+    /// The `relay_namespaces` lock serializes the read-modify-write so concurrent
+    /// per-Gateway reconciles across different namespaces can't clobber each
+    /// other's entry; the lock-free [`Self::provisioned_relays`] snapshot is
+    /// re-published only when the set actually changed. The guard is never held
+    /// across an `.await`.
+    fn set_relay_provisioned(&self, namespace: &str, provisioned: bool) {
+        let mut guard = self.relay_namespaces.lock();
+        let changed = if provisioned {
+            guard.insert(namespace.to_owned())
+        } else {
+            guard.remove(namespace)
+        };
+        if changed {
+            self.provisioned_relays.store(Arc::new(guard.clone()));
         }
     }
 }
@@ -387,8 +467,25 @@ pub(crate) async fn reconcile_dedicated(
 ) -> StatusOutcome {
     let started = std::time::Instant::now();
     let key = gateway_key(&gw);
+    let gw_namespace = gw.metadata.namespace.clone().unwrap_or_default();
     let res = reconcile_inner(gw, Arc::clone(&ctx)).await;
     crate::metrics::observe_reconcile("operator", started, &res);
+
+    // Relay-tier convergence (#584): keep the namespace's relay in sync with
+    // whether it holds ≥1 dedicated Gateway. Leader-only and orthogonal to the
+    // per-Gateway status outcome, so it runs regardless of `res` — a failure here
+    // is logged and retried on the next reconcile of any Gateway in the namespace
+    // (plus the periodic resync backstop), never folded into the Gateway status.
+    if ctx.leader.load(Ordering::Acquire)
+        && let Err(e) = converge_namespace_relay(&ctx, &gw_namespace).await
+    {
+        tracing::warn!(
+            namespace = %gw_namespace,
+            error = %e,
+            "operator: relay convergence failed; retrying on next reconcile"
+        );
+    }
+
     match res {
         Ok(outcome) => {
             // First success ends the error streak — the next error backs off
@@ -399,6 +496,182 @@ pub(crate) async fn reconcile_dedicated(
         }
         Err(err) => StatusOutcome::requeue(error_backoff(&err, &ctx, &key)),
     }
+}
+
+/// Converge the namespace relay for `namespace` (#584): provision/keep/delete it
+/// per [`relay_desired`] (break-even threshold with hysteresis). Level-triggered
+/// — recomputes the desired state from the Gateway store on every call, so it is
+/// robust to missed events and self-heals across a controller restart (the
+/// in-memory provisioned set rebuilds from reconciles).
+///
+/// The relay carries no owner reference, so its lifecycle is entirely explicit
+/// here: SSA on provision (idempotent, re-asserts image/args on upgrade), a
+/// direct delete on GC. The trust-bundle ConfigMap is deliberately *not* managed
+/// here — a relay-fronted namespace always holds ≥1 dedicated Gateway, whose
+/// reconcile already copies the bundle into the namespace (owner-ref'd to it), and
+/// the relay's trust mount is `optional` with a retrying bootstrap loop, so a
+/// second (multi-owner) SSA of the same ConfigMap is avoided.
+///
+/// Disabling relay tiering live is not a supported downgrade in v1: with the
+/// switch off this is a no-op, so relays provisioned while it was on are reclaimed
+/// only when their namespace next loses its last dedicated Gateway (with the
+/// switch still on), never by flipping the switch off.
+///
+/// # Errors
+///
+/// Returns the underlying [`kube::Error`]/[`ApplyError`](apply::ApplyError) if a
+/// relay SSA or delete fails.
+async fn converge_namespace_relay(
+    ctx: &ReconcileContext,
+    namespace: &str,
+) -> Result<(), ReconcileError> {
+    if !ctx.relay_enabled || namespace.is_empty() {
+        return Ok(());
+    }
+    // Mirror `reconcile_inner`'s terminating-namespace short-circuit: an SSA into
+    // a terminating namespace is rejected 403 `NamespaceTerminating` and would
+    // only burn warn-log churn until the namespace finishes deleting (which GCs
+    // the relay regardless).
+    if namespace_is_terminating(&ctx.namespaces_store, namespace) {
+        return Ok(());
+    }
+    let currently = ctx.relay_namespaces.lock().contains(namespace);
+    let desired = relay_desired(ctx, namespace, currently);
+    // Not wanted and not provisioned: the common case (shared-only or below-
+    // threshold namespace) — skip the delete round-trip.
+    if !desired && !currently {
+        return Ok(());
+    }
+
+    if desired {
+        let rendered = render_relay::render_relay(&render_relay::RelayRenderInputs {
+            namespace,
+            replicas: i32::try_from(ctx.relay_replicas).unwrap_or(i32::MAX),
+            controller_image: &ctx.controller_image,
+            discovery_endpoint: &ctx.discovery_endpoint,
+            discovery_bootstrap_endpoint: &ctx.discovery_bootstrap_endpoint,
+            discovery_sa_token_path: &ctx.discovery_sa_token_path,
+            discovery_ca_bundle_path: &ctx.discovery_ca_bundle_path,
+            discovery_trust_domain: &ctx.discovery_trust_domain,
+            resources: render_relay::relay_resources(
+                &ctx.relay_cpu_request,
+                &ctx.relay_memory_request,
+                &ctx.relay_memory_limit,
+            ),
+        });
+        apply::apply_relay(&ctx.client, namespace, &rendered).await?;
+        if !currently {
+            tracing::info!(namespace = %namespace, "operator: provisioned namespace relay");
+        }
+        ctx.set_relay_provisioned(namespace, true);
+    } else {
+        delete_relay_resources(&ctx.client, namespace).await?;
+        tracing::info!(namespace = %namespace, "operator: deleted namespace relay (last dedicated Gateway drained)");
+        ctx.set_relay_provisioned(namespace, false);
+    }
+    Ok(())
+}
+
+/// Whether a namespace should have a relay right now, with **hysteresis** (#584).
+///
+/// Relay state is namespace-global but reconciles are per-Gateway, so a GC that
+/// fires while sibling Gateways remain would strand them on a deleted relay
+/// Service. Hysteresis closes that gap by separating the provision and GC edges:
+///
+/// - **Provision** (not yet provisioned): only once desired downstream replicas
+///   reach the break-even threshold `--relay-min-proxy-replicas` (clamped ≥1)
+///   — a relay only cuts leader load when it fronts more streams than its own
+///   replicas open upstream, so small namespaces stay direct-to-controller.
+/// - **Keep** (already provisioned): as long as *any* active dedicated Gateway
+///   remains (`sum ≥ 1`). GC therefore fires only when the namespace drains to
+///   **zero** dedicated Gateways — the point at which no sibling can be stranded,
+///   restoring the "GC-at-zero strands nobody" property the flat threshold broke.
+///
+/// The cost is a benign over-provision tail: a namespace that spiked past the
+/// threshold then shrank keeps its relay down to its last Gateway.
+fn relay_desired(ctx: &ReconcileContext, namespace: &str, currently_provisioned: bool) -> bool {
+    let sum = namespace_desired_downstream_replicas(ctx, namespace);
+    if sum == 0 {
+        // No active dedicated Gateways: never wanted (and the GC edge).
+        return false;
+    }
+    if currently_provisioned {
+        // Keep until the namespace fully drains — no mid-range GC, no strand.
+        true
+    } else {
+        // Provision only at break-even. Clamp ≥1 so a misconfigured threshold of
+        // 0 can't provision a relay into a namespace with no dedicated Gateways.
+        sum >= ctx.relay_min_proxy_replicas.max(1)
+    }
+}
+
+/// Sum of desired dedicated-proxy replicas across a namespace's active dedicated
+/// Gateways — the downstream fan-out a relay there would absorb (#584).
+fn namespace_desired_downstream_replicas(ctx: &ReconcileContext, namespace: &str) -> u32 {
+    ctx.gateways_store
+        .state()
+        .iter()
+        .filter(|gw| gw.metadata.namespace.as_deref() == Some(namespace))
+        .filter_map(|gw| active_dedicated_replicas(ctx, gw))
+        .sum()
+}
+
+/// Desired proxy replica count for `gw` if it is an owned, dedicated-mode Gateway
+/// that is not terminating; `None` otherwise (shared, foreign, terminating, or
+/// with unresolved params). Mirrors the class-match + `params::resolve` decision
+/// in [`reconcile_inner`], applied read-only against the reflector stores.
+///
+/// The count is the same figure the renderer would set on the Deployment: the
+/// autoscaling floor (`minReplicas`, default 1) when autoscaling is enabled,
+/// otherwise the static `replicas` (default 1). Using the *desired* count — not
+/// live Ready pods — means the threshold is decidable before any proxy pod
+/// starts, so a fresh namespace does not deadlock waiting for pods that are
+/// waiting for a relay.
+fn active_dedicated_replicas(ctx: &ReconcileContext, gw: &Gateway) -> Option<u32> {
+    if gw.metadata.deletion_timestamp.is_some() {
+        return None;
+    }
+    let class_name = &gw.spec.gateway_class_name;
+    let class = ctx
+        .class_store
+        .state()
+        .into_iter()
+        .find(|gc| gc.meta().name.as_deref() == Some(class_name.as_str()))?;
+    if class.spec.controller_name != ctx.controller_name {
+        return None;
+    }
+    let effective = params::resolve(gw, &class, |r: &params::ParamsRef| {
+        ctx.params_store
+            .state()
+            .iter()
+            .find(|p| {
+                p.meta().namespace.as_deref() == Some(r.namespace.as_str())
+                    && p.meta().name.as_deref() == Some(r.name.as_str())
+            })
+            .map(|p| p.spec.clone())
+    })
+    .ok()
+    .flatten()?;
+    Some(effective.desired_replicas())
+}
+
+/// Idempotently delete a namespace relay's `Deployment` / `Service` /
+/// `ServiceAccount` (all share [`render_relay::RELAY_NAME`]). The relay has no
+/// owner reference, so GC is this explicit delete. A `NotFound` is success.
+///
+/// # Errors
+///
+/// Returns the underlying [`kube::Error`] for any delete that fails for a reason
+/// other than `NotFound`.
+async fn delete_relay_resources(client: &Client, namespace: &str) -> Result<(), kube::Error> {
+    let dp = DeleteParams::default();
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+    let service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    ignore_not_found(deployments.delete(render_relay::RELAY_NAME, &dp).await)?;
+    ignore_not_found(services.delete(render_relay::RELAY_NAME, &dp).await)?;
+    ignore_not_found(service_accounts.delete(render_relay::RELAY_NAME, &dp).await)?;
+    Ok(())
 }
 
 async fn reconcile_inner(
@@ -628,6 +901,25 @@ async fn reconcile_inner(
         .get(&gateway_key(&gw))
         .unwrap_or(&empty_effective_ports);
 
+    // Relay tiering (#584): point this proxy's Stream subscription at the
+    // namespace relay iff the namespace will have one after convergence — the
+    // *same* `relay_desired` predicate (including hysteresis) that
+    // `converge_namespace_relay` uses, so the repoint and the relay's existence
+    // never disagree. Below threshold (or tiering off), `None` renders the
+    // controller endpoint exactly as before.
+    let relay_fronted = ctx.relay_enabled && {
+        let currently = ctx.relay_namespaces.lock().contains(gw_namespace);
+        relay_desired(&ctx, gw_namespace, currently)
+    };
+    let relay_endpoint = relay_fronted.then(|| {
+        format!(
+            "https://{}.{}.svc:{}",
+            render_relay::RELAY_NAME,
+            gw_namespace,
+            render_relay::RELAY_DISCOVERY_PORT
+        )
+    });
+
     let rendered = render::render(&render::RenderInputs {
         gateway: &gw,
         params: &effective,
@@ -640,6 +932,7 @@ async fn reconcile_inner(
         discovery_trust_domain: &ctx.discovery_trust_domain,
         admin_port: ctx.admin_port,
         effective_ports: dedicated_ports,
+        relay_endpoint: relay_endpoint.as_deref(),
     });
 
     // Stage 1a — make the controller's CA trust bundle reachable from the
@@ -1437,6 +1730,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         let r_b = render::render(&render::RenderInputs {
             gateway: &gw,
@@ -1450,6 +1744,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         });
         assert_ne!(
             hash_rendered(&r_a),
@@ -1491,6 +1786,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
+            relay_endpoint: None,
         };
         let r1 = render::render(&inputs);
         let r2 = render::render(&inputs);
