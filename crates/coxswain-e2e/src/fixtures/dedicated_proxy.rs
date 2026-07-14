@@ -13,6 +13,23 @@ macro_rules! fixture {
 /// `CoxswainGatewayParameters` + dedicated-mode `Gateway` referencing it.
 pub const DEDICATED_GATEWAY: &str = fixture!("dedicated_gateway.yaml");
 
+/// `CoxswainRelayPolicy` (#589) force-enabling a namespace relay + overriding its
+/// replicas/resources. Selector-pinned to the test namespace.
+pub const RELAY_POLICY_FORCE_ON: &str = fixture!("relay_policy_force_on.yaml");
+
+/// `CoxswainRelayPolicy` (#589) force-disabling a namespace relay (`enabled: false`),
+/// vetoing automatic provisioning even above the break-even threshold.
+pub const RELAY_POLICY_FORCE_OFF: &str = fixture!("relay_policy_force_off.yaml");
+
+/// `CoxswainRelayPolicy` (#589) enabling controller-driven relay autoscaling with a
+/// mandatory `maxReplicas` cap (no HPA).
+pub const RELAY_POLICY_AUTOSCALING: &str = fixture!("relay_policy_autoscaling.yaml");
+
+/// `CoxswainRelayPolicy` (#589) whose autoscaling stanza omits `maxReplicas` — the
+/// controller refuses to autoscale and falls back to static replicas.
+pub const RELAY_POLICY_AUTOSCALING_UNCAPPED: &str =
+    fixture!("relay_policy_autoscaling_uncapped.yaml");
+
 /// Same dedicated-mode `Gateway` + an `HTTPRoute` attached to it backing a
 /// same-namespace Service. Used by the #209 e2e to verify per-namespace
 /// `RoleBinding` reconciliation.

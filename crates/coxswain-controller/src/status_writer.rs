@@ -199,8 +199,9 @@ pub fn spawn_status_writer(
         "path_rewrite_regex",
         "basic_auth",
         "request_size_limit",
-        // #574 operator fold: the reflector now drives these two operator watches.
+        // #574 operator fold: the reflector now drives these operator watches.
         "coxswain_gateway_parameters",
+        "coxswain_relay_policy",
         "node",
     ];
 

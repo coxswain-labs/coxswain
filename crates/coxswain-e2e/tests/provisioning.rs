@@ -268,6 +268,235 @@ async fn namespace_relay_not_provisioned_below_threshold() -> anyhow::Result<()>
     Ok(())
 }
 
+// ── CoxswainRelayPolicy (#589) — per-namespace relay override + tuning ────────
+//
+// Also global-config mutators (relay.dedicated.*), so they run in the serial
+// pass. Policies are cluster-scoped; each fixture's namespaceSelector pins the
+// policy to its own test namespace by the built-in `kubernetes.io/metadata.name`
+// label, and a RelayPolicyGuard deletes it on drop so it never leaks into a
+// sibling test.
+
+/// Deletes a cluster-scoped `CoxswainRelayPolicy` on drop via `kubectl`, on a
+/// joined thread so cleanup completes before the (process-per-test) test exits —
+/// the cluster-scoped analogue of `NamespaceGuard`'s independent-runtime delete.
+/// Bind it to a named local (`let _guard = …`), never `let _ = …` (which would
+/// drop it immediately).
+#[must_use = "bind the guard to a local so the cluster-scoped policy is deleted at end of scope"]
+struct RelayPolicyGuard {
+    name: String,
+}
+
+impl Drop for RelayPolicyGuard {
+    fn drop(&mut self) {
+        let name = self.name.clone();
+        // kubectl is a subprocess (no kube Client / tokio runtime to bind), so a plain
+        // blocking delete on a joined thread is sufficient and panic-safe.
+        let _ = std::thread::spawn(move || {
+            let _ = std::process::Command::new("kubectl")
+                .args(["delete", "coxswainrelaypolicy", &name, "--ignore-not-found"])
+                .status();
+        })
+        .join();
+    }
+}
+
+/// Apply a relay-policy fixture (selector-pinned to `ns`) and return a guard that
+/// deletes the resulting cluster-scoped policy. `name_prefix` must match the
+/// fixture's `metadata.name` prefix (the fixture appends `-<ns>`).
+async fn apply_relay_policy(
+    fixture: &str,
+    name_prefix: &str,
+    ns: &str,
+) -> anyhow::Result<RelayPolicyGuard> {
+    fixtures::apply_fixture(fixture, FixtureVars::new(ns)).await?;
+    Ok(RelayPolicyGuard {
+        name: format!("{name_prefix}-{ns}"),
+    })
+}
+
+/// Poll until the relay Deployment exists with exactly `expected` `spec.replicas`.
+async fn wait_for_relay_replicas(
+    deployments: &Api<Deployment>,
+    expected: i32,
+) -> anyhow::Result<()> {
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!("namespace relay '{RELAY_NAME}' Deployment at spec.replicas={expected}")
+        },
+        || async {
+            let got = deployments
+                .get(RELAY_NAME)
+                .await
+                .ok()
+                .and_then(|d| d.spec)
+                .and_then(|s| s.replicas);
+            (got == Some(expected)).then_some(())
+        },
+    )
+    .await
+}
+
+/// Assert no relay HPA exists — relay autoscaling is controller-driven, never an HPA.
+async fn assert_no_relay_hpa(h: &Harness, ns: &str) -> anyhow::Result<()> {
+    let hpas: Api<HorizontalPodAutoscaler> = Api::namespaced(h.client.clone(), ns);
+    anyhow::ensure!(
+        hpas.get(RELAY_NAME).await.is_err(),
+        "relay autoscaling is controller-driven; no HorizontalPodAutoscaler '{RELAY_NAME}' \
+         must ever be provisioned"
+    );
+    Ok(())
+}
+
+/// Happy path — `enabled: true` forces the relay on even though the break-even
+/// threshold (set high) would not provision it, and the policy's `replicas` (3) and
+/// `resources` overrides land on the rendered Deployment.
+#[tokio::test]
+async fn relay_policy_force_on_provisions_relay_with_overrides() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_dedicated_enabled: true,
+        relay_min_proxy_replicas: Some(100),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-pol-on").await?;
+    let _policy = apply_relay_policy(
+        dedicated::RELAY_POLICY_FORCE_ON,
+        "e2e-relay-force-on",
+        &ns.name,
+    )
+    .await?;
+
+    apply_and_wait(&h, &ns).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    // Forced on despite the threshold of 100, at the policy's replicas override (3),
+    // not the `--relay-replicas` default (2).
+    wait_for_relay_replicas(&deployments, 3).await?;
+
+    // Resources override landed on the relay container.
+    let d = deployments.get(RELAY_NAME).await?;
+    let container = &d
+        .spec
+        .expect("relay spec")
+        .template
+        .spec
+        .expect("relay pod spec")
+        .containers[0];
+    let cpu = container
+        .resources
+        .as_ref()
+        .and_then(|r| r.requests.as_ref())
+        .and_then(|m| m.get("cpu"));
+    assert_eq!(
+        cpu.map(|q| q.0.as_str()),
+        Some("25m"),
+        "policy resources override must land on the relay container"
+    );
+    Ok(())
+}
+
+/// Sad/veto path — a relay auto-provisions (threshold met), then an `enabled: false`
+/// policy vetoes it and the controller garbage-collects the relay, overriding the
+/// GC-at-zero hysteresis with an explicit operator intent.
+#[tokio::test]
+async fn relay_policy_force_off_gcs_provisioned_relay() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_dedicated_enabled: true,
+        relay_min_proxy_replicas: Some(1),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-pol-off").await?;
+
+    apply_and_wait(&h, &ns).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    // Auto-provisioned first: threshold of 1 is met and no policy exists yet.
+    wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
+
+    // Force-off vetoes it — the policy change re-drives the Gateway reconcile, whose
+    // relay convergence now sees `enabled: false` and GCs the relay.
+    let _policy = apply_relay_policy(
+        dedicated::RELAY_POLICY_FORCE_OFF,
+        "e2e-relay-force-off",
+        &ns.name,
+    )
+    .await?;
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!("relay '{RELAY_NAME}' garbage-collected after an enabled:false policy")
+        },
+        || async {
+            let gone = deployments.get(RELAY_NAME).await.is_err()
+                && services.get(RELAY_NAME).await.is_err();
+            gone.then_some(())
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Happy path — controller-driven autoscaling sizes the relay from the namespace
+/// fan-out. With small fan-out the relay sits at the autoscaling floor
+/// (`minReplicas` 3), distinct from the static `--relay-replicas` default (2),
+/// proving the autoscaling path set the count — and NO HPA object is ever created.
+#[tokio::test]
+async fn relay_policy_autoscaling_sizes_relay_without_hpa() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_dedicated_enabled: true,
+        relay_min_proxy_replicas: Some(100),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-pol-hpa").await?;
+    let _policy = apply_relay_policy(
+        dedicated::RELAY_POLICY_AUTOSCALING,
+        "e2e-relay-autoscale",
+        &ns.name,
+    )
+    .await?;
+
+    apply_and_wait(&h, &ns).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_relay_replicas(&deployments, 3).await?;
+    assert_no_relay_hpa(&h, &ns.name).await?;
+    Ok(())
+}
+
+/// Sad path — an autoscaling stanza missing the mandatory `maxReplicas` is refused
+/// (an uncapped relay would regrow leader fan-out): the controller falls back to the
+/// static `replicas` (3), not the autoscaling floor (`minReplicas` 2), and no HPA is
+/// created.
+#[tokio::test]
+async fn relay_policy_uncapped_autoscaling_falls_back_to_static() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_dedicated_enabled: true,
+        relay_min_proxy_replicas: Some(100),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-pol-uncapped").await?;
+    let _policy = apply_relay_policy(
+        dedicated::RELAY_POLICY_AUTOSCALING_UNCAPPED,
+        "e2e-relay-uncapped",
+        &ns.name,
+    )
+    .await?;
+
+    apply_and_wait(&h, &ns).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_relay_replicas(&deployments, 3).await?;
+    assert_no_relay_hpa(&h, &ns.name).await?;
+    Ok(())
+}
+
 // ── GEP-1867 infrastructure propagation, shared mode (#482) ──────────────────
 //
 // In shared mode the proxy pod and per-Gateway VIP Service both live in the

@@ -1,0 +1,21 @@
+# CoxswainRelayPolicy (#589) that force-enables the relay and opts it into
+# controller-driven autoscaling with a mandatory cap. With a single dedicated
+# Gateway the namespace fan-out is 1, so the relay is sized to the autoscaling
+# floor (minReplicas 3) — distinct from the static --relay-replicas default of 2,
+# which proves the autoscaling path (not the static path) set the count. No HPA is
+# ever created — the controller owns the replica count directly.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainRelayPolicy
+metadata:
+  name: e2e-relay-autoscale-${TESTNS}
+spec:
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: ${TESTNS}
+  enabled: true
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 5
+    targetProxiesPerReplica: 1

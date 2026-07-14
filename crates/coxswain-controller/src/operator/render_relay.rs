@@ -33,13 +33,14 @@ use k8s_openapi::api::core::v1::{
     Container, ContainerPort, HTTPGetAction, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
     Service, ServiceAccount, ServicePort, ServiceSpec,
 };
+use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::BTreeMap;
 
-use super::render::{discovery_volume_mounts, discovery_volumes};
+use super::render::{discovery_volume_mounts, discovery_volumes, merge_pod_template};
 
 /// Fixed name of every per-namespace relay `ServiceAccount` / `Deployment` /
 /// `Service`. One relay per namespace, so a constant name is unambiguous (no
@@ -86,15 +87,24 @@ pub(crate) struct RelayRenderInputs<'a> {
     pub discovery_ca_bundle_path: &'a str,
     /// SPIFFE trust domain (`--discovery-trust-domain`).
     pub discovery_trust_domain: &'a str,
-    /// Container resource requests/limits (#584), built from the controller's
-    /// `--relay-cpu-request` / `--relay-memory-request` / `--relay-memory-limit`
-    /// by [`relay_resources`]. `None` leaves the container BestEffort (no v1
-    /// default omits it). Per-namespace overrides arrive with `CoxswainRelayPolicy`.
+    /// Container resource requests/limits, either from a `CoxswainRelayPolicy`
+    /// override (#589) or built from the controller's `--relay-cpu-request` /
+    /// `--relay-memory-request` / `--relay-memory-limit` (#584) by [`relay_resources`].
+    /// `None` leaves the container BestEffort (no v1 default omits it).
     pub resources: Option<ResourceRequirements>,
+    /// Optional partial `PodTemplateSpec` strategic-merged onto the rendered relay pod —
+    /// the `CoxswainRelayPolicy.spec.podTemplate` scheduling escape hatch (#589). `None`
+    /// leaves the controller-rendered pod untouched.
+    pub pod_template: Option<&'a serde_json::Value>,
+    /// The replica *floor* used for the PDB decision (#589): a relay gets a
+    /// `PodDisruptionBudget` (maxUnavailable: 1) only when this is ≥2. It equals the
+    /// autoscaling `minReplicas` when autoscaling is on, otherwise the static `replicas`.
+    pub pdb_floor: i32,
 }
 
-/// The three rendered relay objects. No HPA/PDB in v1 (fixed ≥2 replicas; HA is
-/// the replica floor, not autoscaling).
+/// The rendered relay objects. No HPA — relay autoscaling is controller-driven
+/// (`Deployment.spec.replicas` is set directly; see the operator's `reconciler`). A PDB
+/// is rendered when the effective replica floor is ≥2 (#589).
 pub(crate) struct RenderedRelay {
     /// Zero-verb pod identity (no RoleBinding).
     pub service_account: ServiceAccount,
@@ -102,6 +112,10 @@ pub(crate) struct RenderedRelay {
     pub service: Service,
     /// The relay Deployment running `serve relay --namespace=<ns>`.
     pub deployment: Deployment,
+    /// `PodDisruptionBudget` protecting the relay during voluntary disruptions —
+    /// `Some` only when [`RelayRenderInputs::pdb_floor`] ≥ 2. Applied-or-deleted by
+    /// [`super::apply::apply_relay`].
+    pub pdb: Option<PodDisruptionBudget>,
 }
 
 /// The reserved label set every relay resource carries. The Service/Deployment
@@ -230,7 +244,7 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
         ..Default::default()
     };
 
-    let pod_template = PodTemplateSpec {
+    let base_pod_template = PodTemplateSpec {
         metadata: Some(ObjectMeta {
             labels: Some(relay_labels()),
             ..Default::default()
@@ -241,6 +255,15 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
             volumes: Some(discovery_volumes()),
             ..Default::default()
         }),
+    };
+
+    // Apply the operator's `CoxswainRelayPolicy.spec.podTemplate` scheduling overlay
+    // (#589) with the same strategic-merge semantics as the dedicated proxy — the base
+    // coxswain container survives, scheduling fields (nodeSelector/tolerations/affinity/
+    // topologySpreadConstraints/priorityClassName) layer on.
+    let pod_template = match inputs.pod_template {
+        Some(overlay) => merge_pod_template(&base_pod_template, overlay),
+        None => base_pod_template,
     };
 
     Deployment {
@@ -301,12 +324,37 @@ pub(crate) fn relay_resources(
     })
 }
 
-/// Render all three relay objects for `inputs.namespace`.
+/// Render a `PodDisruptionBudget` protecting the relay Deployment (#589).
+///
+/// Returns `Some` (maxUnavailable: 1) only when the effective replica floor
+/// (`inputs.pdb_floor`) is ≥ 2. A PDB with a single-replica floor either blocks node
+/// drain permanently or provides no protection — both wrong. Selector joins the relay's
+/// two-key label set, matching the Deployment/Service.
+fn render_relay_pdb(inputs: &RelayRenderInputs<'_>) -> Option<PodDisruptionBudget> {
+    if inputs.pdb_floor < 2 {
+        return None;
+    }
+    Some(PodDisruptionBudget {
+        metadata: relay_metadata(inputs.namespace),
+        spec: Some(PodDisruptionBudgetSpec {
+            max_unavailable: Some(IntOrString::Int(1)),
+            selector: Some(LabelSelector {
+                match_labels: Some(relay_selector_labels()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        status: None,
+    })
+}
+
+/// Render all relay objects for `inputs.namespace`.
 pub(crate) fn render_relay(inputs: &RelayRenderInputs<'_>) -> RenderedRelay {
     RenderedRelay {
         service_account: render_relay_service_account(inputs.namespace),
         service: render_relay_service(inputs.namespace),
         deployment: render_relay_deployment(inputs),
+        pdb: render_relay_pdb(inputs),
     }
 }
 
@@ -325,6 +373,8 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             resources: relay_resources("50m", "64Mi", "256Mi"),
+            pod_template: None,
+            pdb_floor: 2,
         }
     }
 
@@ -431,6 +481,55 @@ mod tests {
         let get = probe.http_get.as_ref().expect("http get");
         assert_eq!(get.path.as_deref(), Some("/readyz"));
         assert_eq!(get.port, IntOrString::Int(RELAY_HEALTH_PORT));
+    }
+
+    #[test]
+    fn pod_template_overlay_merges_scheduling_and_keeps_coxswain_container() {
+        let overlay = serde_json::json!({
+            "spec": {
+                "nodeSelector": {"zone": "eu-1"},
+                "tolerations": [{"key": "relay", "operator": "Exists"}],
+                "priorityClassName": "high"
+            }
+        });
+        let mut i = inputs();
+        i.pod_template = Some(&overlay);
+        let d = render_relay_deployment(&i);
+        let spec = d.spec.expect("spec").template.spec.expect("pod spec");
+        assert_eq!(
+            spec.node_selector
+                .as_ref()
+                .and_then(|n| n.get("zone"))
+                .map(String::as_str),
+            Some("eu-1"),
+            "scheduling overlay applied"
+        );
+        assert_eq!(
+            spec.priority_class_name.as_deref(),
+            Some("high"),
+            "priorityClassName overlay applied"
+        );
+        assert!(
+            spec.containers.iter().any(|c| c.name == "coxswain"),
+            "base coxswain container survives the strategic merge"
+        );
+    }
+
+    #[test]
+    fn pdb_rendered_at_floor_two_absent_below() {
+        let mut i = inputs();
+        i.pdb_floor = 2;
+        let r = render_relay(&i);
+        let pdb = r.pdb.expect("PDB at floor 2");
+        assert_eq!(
+            pdb.spec.and_then(|s| s.max_unavailable),
+            Some(IntOrString::Int(1))
+        );
+        i.pdb_floor = 1;
+        assert!(
+            render_relay(&i).pdb.is_none(),
+            "no PDB below floor 2 (single-replica PDB is counterproductive)"
+        );
     }
 
     #[test]

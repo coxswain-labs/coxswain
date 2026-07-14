@@ -110,7 +110,7 @@ rules:
   # config. Read-only; JwtAuth has no status subresource.
   - apiGroups: ["gateway.coxswain-labs.dev"]
     resources:
-      ["coxswaingatewayparameters", "clienttrafficpolicies", "coxswainbackendpolicies", "coxswainexternalauths", "ratelimits", "retrypolicies", "pathrewriteregexes", "ipaccesscontrols", "basicauths", "requestsizelimits", "compressions", "jwtauths"]
+      ["coxswaingatewayparameters", "coxswainrelaypolicies", "clienttrafficpolicies", "coxswainbackendpolicies", "coxswainexternalauths", "ratelimits", "retrypolicies", "pathrewriteregexes", "ipaccesscontrols", "basicauths", "requestsizelimits", "compressions", "jwtauths"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.coxswain-labs.dev"]
     resources: ["clienttrafficpolicies/status", "coxswainbackendpolicies/status", "coxswainexternalauths/status"]

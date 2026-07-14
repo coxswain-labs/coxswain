@@ -108,7 +108,7 @@ rules:
   # resolves it into per-route auth config and patches status.ancestors[].
   - apiGroups: ["gateway.coxswain-labs.dev"]
     resources:
-      ["coxswaingatewayparameters", "clienttrafficpolicies", "coxswainbackendpolicies", "coxswainexternalauths", "ratelimits", "retrypolicies", "pathrewriteregexes", "ipaccesscontrols", "basicauths", "requestsizelimits", "compressions", "jwtauths"]
+      ["coxswaingatewayparameters", "coxswainrelaypolicies", "clienttrafficpolicies", "coxswainbackendpolicies", "coxswainexternalauths", "ratelimits", "retrypolicies", "pathrewriteregexes", "ipaccesscontrols", "basicauths", "requestsizelimits", "compressions", "jwtauths"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["gateway.coxswain-labs.dev"]
     resources: ["clienttrafficpolicies/status", "coxswainbackendpolicies/status", "coxswainexternalauths/status"]

@@ -1,0 +1,184 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: coxswainrelaypolicies.gateway.coxswain-labs.dev
+spec:
+  group: gateway.coxswain-labs.dev
+  names:
+    categories: []
+    kind: CoxswainRelayPolicy
+    plural: coxswainrelaypolicies
+    shortNames: []
+    singular: coxswainrelaypolicy
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for CoxswainRelayPolicySpec via `CustomResource`
+        properties:
+          spec:
+            description: |-
+              Per-namespace parameters for the controller-provisioned dedicated relay.
+
+              Cluster-scoped with an optional [`Self::namespace_selector`]: a policy with no selector
+              is the cluster default applied to every relay-fronted namespace; a policy with a
+              selector overrides it for matched namespaces (most-specific wins — see the resolver in
+              `coxswain-controller`'s `operator::relay_params`). Every field is `Option` so a policy
+              overlays only the fields it sets, falling through to the cluster default and then the
+              #584 global controller-flag defaults.
+            properties:
+              autoscaling:
+                description: Opt-in, capped, controller-driven autoscaling for the relay. See [`RelayAutoscaling`].
+                nullable: true
+                properties:
+                  enabled:
+                    default: false
+                    description: |-
+                      When `true`, the controller sizes the relay to downstream fan-out (subject to a set
+                      `max_replicas`). Must be set explicitly; the `Default` is `false`.
+                    type: boolean
+                  maxReplicas:
+                    description: |-
+                      Maximum replicas the controller will scale the relay up to — the **mandatory** cap on
+                      the upstream streams the relay tier opens against the leader. Autoscaling is inert
+                      (falls back to static replicas) when this is unset.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  minReplicas:
+                    description: |-
+                      Minimum replicas the controller will scale the relay down to. When omitted, the
+                      effective static replica count (policy `replicas` or `--relay-replicas`, default 2)
+                      is the floor. Keep ≥ 2 for HA.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                  targetProxiesPerReplica:
+                    description: |-
+                      Target number of downstream dedicated proxies each relay replica should front. The
+                      controller adds a replica per this many proxies of namespace fan-out. When omitted,
+                      defaults to 8 (matching the `--relay-min-proxy-replicas` break-even default). Keep
+                      `max_replicas` well below the namespace's downstream fan-out divided by this, or the
+                      relay's own upstream streams approach the count it is meant to collapse.
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
+                type: object
+              enabled:
+                description: |-
+                  Tri-state override of the controller's automatic provisioning decision:
+                  - `None` (unset) — the controller decides automatically (the #584 break-even
+                    threshold + hysteresis); the operator does nothing.
+                  - `Some(true)` — force the relay on whenever the namespace holds ≥1 active dedicated
+                    Gateway, bypassing the threshold. Still garbage-collected when the namespace drains
+                    to zero dedicated Gateways.
+                  - `Some(false)` — force the relay off unconditionally; the namespace's proxies stay
+                    direct-to-controller. Overrides hysteresis (an explicit operator intent).
+                nullable: true
+                type: boolean
+              namespaceSelector:
+                description: |-
+                  Namespaces this policy applies to. When omitted, the policy is the **cluster
+                  default** applied to every relay-fronted namespace. When set, the policy overrides
+                  the cluster default for namespaces whose labels match — most-specific policy wins
+                  (more selector terms, then lexical by name; ambiguous ties are warn-logged).
+                nullable: true
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
+                    items:
+                      description: A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies to.
+                          type: string
+                        operator:
+                          description: operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is "key", the operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+              podTemplate:
+                description: |-
+                  Raw partial `PodTemplateSpec` strategic-merged onto the controller-rendered relay
+                  pod — the scheduling escape hatch (`nodeSelector`, `tolerations`, `affinity`,
+                  `topologySpreadConstraints`, `priorityClassName`, …). Opaque to the CRD validator
+                  (`x-kubernetes-preserve-unknown-fields`); the controller merges and validates it.
+                type: object
+                x-kubernetes-preserve-unknown-fields: true
+              replicas:
+                description: |-
+                  Static replica count for the provisioned relay Deployment. When omitted, falls back
+                  to the controller's `--relay-replicas` (default 2, HA). Ignored while
+                  [`RelayAutoscaling::enabled`] is `true` and capped, in which case the controller
+                  computes the count.
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              resources:
+                description: |-
+                  Resource requests/limits for the relay container. Supersedes the flat
+                  `--relay-cpu-request` / `--relay-memory-request` / `--relay-memory-limit` flags for
+                  matched namespaces.
+                nullable: true
+                properties:
+                  claims:
+                    description: |-
+                      Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container.
+
+                      This field depends on the DynamicResourceAllocation feature gate.
+
+                      This field is immutable. It can only be set for containers.
+                    items:
+                      description: ResourceClaim references one entry in PodSpec.ResourceClaims.
+                      properties:
+                        name:
+                          description: Name must match the name of one entry in pod.spec.resourceClaims of the Pod where this field is used. It makes that resource available inside a container.
+                          type: string
+                        request:
+                          description: Request is the name chosen for a request in the referenced claim. If empty, everything from the claim is made available, otherwise only the result of this request.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                  limits:
+                    additionalProperties:
+                      description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                      x-kubernetes-int-or-string: true
+                    description: 'Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                    type: object
+                  requests:
+                    additionalProperties:
+                      description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                      x-kubernetes-int-or-string: true
+                    description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                    type: object
+                type: object
+            type: object
+        required:
+        - spec
+        title: CoxswainRelayPolicy
+        type: object
+    served: true
+    storage: true
+    subresources: {}

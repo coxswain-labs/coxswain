@@ -808,7 +808,13 @@ fn container_ports(
 /// Apply a partial `PodTemplateSpec` overlay to a base via the strategic
 /// merge from [`super::merge`]. Round-trips through JSON because the
 /// strategic-merge primitive operates on [`serde_json::Value`].
-fn merge_pod_template(base: &PodTemplateSpec, overlay: &serde_json::Value) -> PodTemplateSpec {
+///
+/// Shared with [`super::render_relay`] so the namespace relay's `podTemplate`
+/// escape hatch (#589) merges with identical semantics to the dedicated proxy's.
+pub(super) fn merge_pod_template(
+    base: &PodTemplateSpec,
+    overlay: &serde_json::Value,
+) -> PodTemplateSpec {
     let base_json = serde_json::to_value(base)
         .unwrap_or_else(|e| panic!("invariant: PodTemplateSpec must serialize to JSON: {e}"));
     let merged = strategic_merge_pod_template(&base_json, overlay);

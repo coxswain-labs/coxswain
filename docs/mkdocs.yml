@@ -96,6 +96,7 @@ nav:
       - Troubleshooting: guides/troubleshooting.md
   - Reference:
     - Configuration: reference/configuration.md
+    - Relay policy: reference/relay-policy.md
     - Observability: reference/observability.md
     - Conformance: reference/conformance.md
   - Architecture:

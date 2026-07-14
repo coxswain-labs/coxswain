@@ -13,8 +13,10 @@
 
 use k8s_openapi::api::core::v1::ResourceRequirements;
 use kube::CustomResource;
-use schemars::{JsonSchema, Schema, SchemaGenerator};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+use super::preserve_unknown_fields_schema;
 
 /// Per-Gateway parameters consumed by the dedicated-proxy provisioner.
 ///
@@ -137,14 +139,6 @@ pub enum ServiceType {
     /// Cluster-internal only; no external address allocated.
     #[serde(rename = "ClusterIP")]
     ClusterIp,
-}
-
-fn preserve_unknown_fields_schema(_: &mut SchemaGenerator) -> Schema {
-    serde_json::from_value(serde_json::json!({
-        "type": "object",
-        "x-kubernetes-preserve-unknown-fields": true,
-    }))
-    .unwrap_or_else(|e| panic!("invariant: preserve-unknown-fields schema is a valid Schema: {e}"))
 }
 
 #[cfg(test)]

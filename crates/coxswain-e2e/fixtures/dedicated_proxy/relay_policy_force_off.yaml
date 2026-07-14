@@ -1,0 +1,13 @@
+# CoxswainRelayPolicy (#589) that force-disables the namespace relay, vetoing the
+# automatic break-even provisioning even when the threshold is met. Selector pins
+# it to the test namespace by its built-in name label.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainRelayPolicy
+metadata:
+  name: e2e-relay-force-off-${TESTNS}
+spec:
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: ${TESTNS}
+  enabled: false

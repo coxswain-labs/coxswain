@@ -260,6 +260,29 @@ pub(super) async fn apply_relay(
         .await
         .map_err(ApplyError::Deployment)?;
 
+    // PDB: apply when the effective floor warrants one (≥2), delete otherwise — the same
+    // apply-or-delete pattern `apply_rendered` uses for the dedicated proxy, so a policy
+    // change that drops the floor below 2 reclaims a stale PDB without extra bookkeeping.
+    // The relay's name is fixed (`RELAY_NAME`), so the delete target is `deploy_name`.
+    let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
+    match rendered.pdb.as_ref() {
+        Some(pdb) => {
+            let pdb_name = pdb
+                .metadata
+                .name
+                .as_deref()
+                .unwrap_or_else(|| panic!("invariant: rendered relay PDB has no name"));
+            pdb_api
+                .patch(pdb_name, &params, &Patch::Apply(pdb))
+                .await
+                .map_err(ApplyError::Pdb)?;
+        }
+        None => {
+            ignore_not_found(pdb_api.delete(deploy_name, &DeleteParams::default()).await)
+                .map_err(ApplyError::Pdb)?;
+        }
+    }
+
     Ok(())
 }
 
