@@ -206,9 +206,9 @@ impl ScopeAuthorizer for DenyAllNamespaces {
 /// A Kubernetes projected token cryptographically binds the SVID's namespace to
 /// the pod's own namespace, so the worst a forged label buys an attacker is a
 /// `Namespace` stream for **their own** namespace — never a peer tenant's.
-/// The trust domain is already enforced at the TLS handshake
-/// ([`crate::auth::SpiffeClientCertVerifier`]); re-checking it here is
-/// defense-in-depth, not the primary control.
+/// The trust domain is already enforced at the TLS handshake (the discovery
+/// server's mTLS client-cert verifier); re-checking it here is defense-in-depth,
+/// not the primary control.
 #[derive(Clone)]
 // intentionally open: constructed only via `new`; all fields private
 pub struct ProvisionedRelayAuthorizer {

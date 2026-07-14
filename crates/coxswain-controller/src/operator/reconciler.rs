@@ -241,7 +241,7 @@ pub struct OperatorConfig {
     /// See [`Self::relay_cpu_request`].
     pub relay_memory_limit: String,
     /// Live set of namespaces with a provisioned relay (#584). Written by the
-    /// relay convergence in [`reconcile_dedicated`] and read lock-free by
+    /// relay convergence in `reconcile_dedicated` and read lock-free by
     /// `coxswain_discovery::ProvisionedRelayAuthorizer` in `coxswain-bin` — the
     /// single provenance source that authorizes a relay's `Scope::Namespace`
     /// upstream subscribe. Derived from the *same* computation that drives
