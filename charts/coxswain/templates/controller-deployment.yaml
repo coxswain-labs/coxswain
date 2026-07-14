@@ -121,6 +121,25 @@ spec:
               value: {{ .Values.controller.reconcileDebounceMin | quote }}
             - name: COXSWAIN_RECONCILE_DEBOUNCE_MAX
               value: {{ .Values.controller.reconcileDebounceMax | quote }}
+            {{- if .Values.relay.dedicated.enabled }}
+            # Namespace relay tiering (#584): the controller provisions a per-
+            # namespace relay (SA + Deployment + Service) once a namespace's
+            # desired dedicated-proxy replicas cross `minProxyReplicas`, and
+            # repoints that namespace's dedicated proxies at it. These map the
+            # `relay.dedicated.*` values onto the controller's `--relay-*` flags.
+            - name: COXSWAIN_RELAY_ENABLED
+              value: "true"
+            - name: COXSWAIN_RELAY_REPLICAS
+              value: {{ .Values.relay.dedicated.replicas | quote }}
+            - name: COXSWAIN_RELAY_MIN_PROXY_REPLICAS
+              value: {{ .Values.relay.dedicated.minProxyReplicas | quote }}
+            - name: COXSWAIN_RELAY_CPU_REQUEST
+              value: {{ .Values.relay.dedicated.resources.cpuRequest | quote }}
+            - name: COXSWAIN_RELAY_MEMORY_REQUEST
+              value: {{ .Values.relay.dedicated.resources.memoryRequest | quote }}
+            - name: COXSWAIN_RELAY_MEMORY_LIMIT
+              value: {{ .Values.relay.dedicated.resources.memoryLimit | quote }}
+            {{- end }}
             {{- if .Values.controller.statusAddress }}
             - name: COXSWAIN_STATUS_ADDRESS
               value: {{ .Values.controller.statusAddress | quote }}

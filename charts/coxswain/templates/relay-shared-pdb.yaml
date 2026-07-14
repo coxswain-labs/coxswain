@@ -1,0 +1,16 @@
+{{- $autoscalingEnabled := .Values.relay.shared.autoscaling.enabled -}}
+{{- $floor := ternary (int .Values.relay.shared.autoscaling.minReplicas) (int .Values.relay.shared.replicas) $autoscalingEnabled -}}
+{{- if and .Values.relay.shared.enabled .Values.relay.shared.podDisruptionBudget.enabled (ge $floor 2) -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "coxswain.relayShared.fullname" . }}
+  namespace: {{ include "coxswain.namespace" . }}
+  labels:
+    {{- include "coxswain.relayShared.selectorLabels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.relay.shared.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      {{- include "coxswain.relayShared.selectorLabels" . | nindent 6 }}
+{{- end }}

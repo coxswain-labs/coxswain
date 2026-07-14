@@ -28,6 +28,7 @@
 //! autoscaling-off are handled on every reconcile without extra bookkeeping.
 
 use super::render::RenderedSpecs;
+use super::render_relay::RenderedRelay;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
@@ -196,6 +197,68 @@ pub(super) async fn apply_rendered(
                 .map_err(ApplyError::Pdb)?;
         }
     }
+
+    Ok(())
+}
+
+/// Server-side-apply a namespace relay's three rendered resources (#584).
+///
+/// Sequenced ServiceAccount → Service → Deployment under the same `force=true`
+/// field-manager contract as [`apply_rendered`], so it is idempotent on an
+/// unchanged relay and re-asserts image/args ownership on a controller upgrade.
+/// No HPA/PDB — a relay's HA is its fixed replica floor, not autoscaling.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::ServiceAccount`], [`ApplyError::Service`], or
+/// [`ApplyError::Deployment`] if the apiserver rejects the corresponding patch.
+///
+/// # Panics
+///
+/// Panics if a rendered relay resource has no `metadata.name` — a rendering
+/// invariant whose absence indicates a controller bug.
+pub(super) async fn apply_relay(
+    client: &Client,
+    namespace: &str,
+    rendered: &RenderedRelay,
+) -> Result<(), ApplyError> {
+    let params = PatchParams::apply(FIELD_MANAGER).force();
+
+    let sa_name = rendered
+        .service_account
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or_else(|| panic!("invariant: rendered relay ServiceAccount has no name"));
+    let sa_api: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    sa_api
+        .patch(sa_name, &params, &Patch::Apply(&rendered.service_account))
+        .await
+        .map_err(ApplyError::ServiceAccount)?;
+
+    let svc_name = rendered
+        .service
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or_else(|| panic!("invariant: rendered relay Service has no name"));
+    let svc_api: Api<Service> = Api::namespaced(client.clone(), namespace);
+    svc_api
+        .patch(svc_name, &params, &Patch::Apply(&rendered.service))
+        .await
+        .map_err(ApplyError::Service)?;
+
+    let deploy_name = rendered
+        .deployment
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or_else(|| panic!("invariant: rendered relay Deployment has no name"));
+    let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    deploy_api
+        .patch(deploy_name, &params, &Patch::Apply(&rendered.deployment))
+        .await
+        .map_err(ApplyError::Deployment)?;
 
     Ok(())
 }

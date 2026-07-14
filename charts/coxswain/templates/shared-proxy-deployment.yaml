@@ -122,10 +122,20 @@ spec:
             {{- end }}
             # Discovery control plane (#423): the proxy receives pushed routing
             # snapshots over the mTLS stream and bootstraps its SVID over the
-            # server-auth-only bootstrap listener. Both resolve to the discovery
-            # Service in the controller's namespace.
+            # server-auth-only bootstrap listener.
+            {{- if .Values.relay.shared.enabled }}
+            # Shared relay tiering (#584): the stream endpoint is repointed at the
+            # shared relay and the proxy verifies the relay's SVID identity
+            # (its ServiceAccount) instead of the controller's. Bootstrap is NOT
+            # tiered — SVID issuance still goes straight to the controller.
+            - name: COXSWAIN_DISCOVERY_ENDPOINT
+              value: {{ include "coxswain.relayShared.discoveryEndpoint" . | quote }}
+            - name: COXSWAIN_DISCOVERY_EXPECTED_SERVER_SA
+              value: {{ include "coxswain.relayShared.serviceAccountName" . | quote }}
+            {{- else }}
             - name: COXSWAIN_DISCOVERY_ENDPOINT
               value: {{ include "coxswain.controller.discoveryEndpoint" . | quote }}
+            {{- end }}
             - name: COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT
               value: {{ include "coxswain.controller.discoveryBootstrapEndpoint" . | quote }}
             - name: COXSWAIN_DISCOVERY_SA_TOKEN_PATH

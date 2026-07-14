@@ -155,3 +155,22 @@ flowchart LR
 ```
 
 See [Dedicated proxy pools](../guides/dedicated-mode.md) for the operator-facing walkthrough — opting a Gateway in, tunable fields, and RBAC.
+
+## Discovery relay tier
+
+The relay tier is **not** a third deployment model — it is optional *discovery infrastructure* that sits between the controller and the proxies to scale leader fan-out. It changes nothing about how proxies serve traffic; it only changes where they get their routing snapshots from.
+
+**The problem it solves.** Every snapshot stream terminates on the leader controller pod (the discovery `Service` selects the leader). Fan-out, per-stream delta computation, and push bandwidth all scale O(nodes) — shared replicas + dedicated Gateways × replicas — on that one pod. A relay is a zero-RBAC cache pod that subscribes *once* upstream and re-serves the **unchanged** protocol downstream, so the leader sees one stream per relay instead of one per proxy. Leaves run unmodified binaries with unmodified scopes — only their discovery endpoint and expected-server identity differ, and they never learn they are behind a relay.
+
+Two families, split along the same static-vs-dynamic line as the proxies themselves:
+
+- **Shared-pool relay** — a single, install-level relay in front of the shared proxy pool. It subscribes `SharedPool` and re-serves it verbatim (a flat passthrough cache). Because the shared pool is static Helm-managed infrastructure, so is its relay: you enable it in Helm (`relay.shared.enabled`), which both renders the relay and repoints the shared proxies at it. It can autoscale (`relay.shared.autoscaling`) because it fronts the whole, cluster-wide pool.
+- **Namespace relay** — a per-namespace relay in front of a namespace's *dedicated* proxies. It subscribes the aggregate `Namespace` scope (every dedicated Gateway's world in that namespace, key-qualified per Gateway), demuxes it back into per-Gateway worlds, and serves each dedicated proxy exactly as the controller would. Because dedicated proxies are dynamic and controller-provisioned, so are their relays: the **controller** provisions a namespace relay (and repoints that namespace's dedicated proxies) — nothing to hand-manage. Enable with `relay.dedicated.enabled`.
+
+**When a namespace relay appears (break-even + scale-to-zero).** A relay costs the leader `relay.dedicated.replicas` streams (each replica opens its own upstream stream) and saves it the namespace's downstream streams. So it only *reduces* leader load once a namespace's desired dedicated-proxy replicas exceed the relay's own cost. The controller provisions a namespace relay only when that count reaches `relay.dedicated.minProxyReplicas` (default 8); below it the namespace stays direct-to-controller — a small namespace is never handed a relay it doesn't need. Once provisioned, a relay is kept until its namespace drains to **zero** dedicated Gateways (hysteresis), so a transient dip never strands the sibling proxies still pointed at it.
+
+**Authorization.** The shared relay's `SharedPool` subscribe needs no grant. A namespace relay's `Namespace` subscribe is privileged (it aggregates a whole namespace), so the controller authorizes it **by provenance**: only the relay ServiceAccount it provisioned in that namespace, deny-by-default. A projected token cryptographically binds a pod's SVID to its own namespace, so the worst a forged label can buy is a stream for the tenant's *own* namespace — never a peer's.
+
+**Failure model.** Bootstrap is never tiered — every node, relays included, obtains its SVID straight from the controller. On relay loss a leaf serves its last-good snapshot and reconnects; there is no cross-tier fallback (a leaf never dials the controller when its relay is down). Relay HA is its replica count.
+
+The whole tier is **off by default** — a relay-free install is byte-identical to one without the feature. Per-namespace tuning of the dedicated relays (resources, scheduling, per-namespace overrides, optional autoscaling) is tracked for a future `CoxswainRelayPolicy` CRD.
