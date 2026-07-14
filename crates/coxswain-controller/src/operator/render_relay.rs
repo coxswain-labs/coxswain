@@ -120,6 +120,15 @@ pub(crate) struct RenderedRelay {
     pub pdb: Option<PodDisruptionBudget>,
 }
 
+/// Label selector matching every relay resource cluster-wide, joining
+/// `app.kubernetes.io/name` + `app.kubernetes.io/component` (the same keys the
+/// Deployment/Service select on). Single source for the startup rehydration
+/// `LIST` in [`super::reconciler`] so the query can never drift from the labels
+/// [`relay_labels`] stamps.
+pub(super) fn relay_component_label_selector() -> String {
+    format!("app.kubernetes.io/name=coxswain,app.kubernetes.io/component={RELAY_COMPONENT}")
+}
+
 /// The reserved label set every relay resource carries. The Service/Deployment
 /// selectors join on `app.kubernetes.io/name` + `app.kubernetes.io/component`,
 /// which uniquely identifies the (single) relay's pods within a namespace.
