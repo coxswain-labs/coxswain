@@ -497,6 +497,151 @@ async fn relay_policy_uncapped_autoscaling_falls_back_to_static() -> anyhow::Res
     Ok(())
 }
 
+// ── Relay-tracking rehydration across a controller restart (#593) ────────────
+//
+// Also global-config mutators (relay.dedicated.*) → serial pass. Restart mirrors
+// resilience.rs::restart_controller_does_not_bump_generation (drop + re-start +
+// wait_for_controller_reconciled) on a PERSISTENT namespace so the second
+// bootstrap purge doesn't delete it mid-test.
+
+/// Merge-patch a `CoxswainGatewayParameters` object's `spec.replicas` (#593 test
+/// support). Dropping the replica count lowers the namespace's desired
+/// dedicated-proxy fan-out below the relay break-even threshold while keeping ≥1
+/// Gateway — the hysteresis mid-range. `DynamicObject` because the CRD has no
+/// generated typed Rust struct in the e2e crate.
+async fn patch_params_replicas(
+    client: &kube::Client,
+    namespace: &str,
+    name: &str,
+    replicas: i32,
+) -> anyhow::Result<()> {
+    use kube::api::{ApiResource, DynamicObject};
+    let ar = ApiResource {
+        group: "gateway.coxswain-labs.dev".into(),
+        version: "v1alpha1".into(),
+        api_version: "gateway.coxswain-labs.dev/v1alpha1".into(),
+        kind: "CoxswainGatewayParameters".into(),
+        plural: "coxswaingatewayparameters".into(),
+    };
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
+    api.patch(
+        name,
+        &PatchParams::default(),
+        &Patch::Merge(serde_json::json!({ "spec": { "replicas": replicas } })),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Happy/regression path — a relay kept alive by hysteresis in the mid-range
+/// (provisioned, then desired fan-out dropped below `--relay-min-proxy-replicas`)
+/// survives a controller restart AND is still garbage-collected once its namespace
+/// drains to zero. Pre-#593 the restart cleared the in-memory relay-tracking set
+/// with nothing to rehydrate it, so `converge_namespace_relay` saw
+/// `currently=false, desired=false` and its `!desired && !currently` short-circuit
+/// skipped the delete forever — orphaning the relay. Startup rehydration re-adopts
+/// the orphan (`currently=true`), so GC-at-zero fires. This poll times out on `main`.
+#[tokio::test]
+async fn namespace_relay_orphan_gcd_after_controller_restart_in_hysteresis_midrange()
+-> anyhow::Result<()> {
+    // Threshold 2: one dedicated Gateway with the fixture's `replicas: 2` provisions
+    // the relay (sum 2 ≥ 2); dropping params to `replicas: 1` puts it mid-range.
+    let opts = || ControllerOptions {
+        relay_dedicated_enabled: true,
+        relay_min_proxy_replicas: Some(2),
+        ..Default::default()
+    };
+    let h = Harness::start_with_options(opts()).await?;
+    let ns = NamespaceGuard::create_persistent(&h.client, "relay-restart-orphan").await?;
+
+    apply_and_wait(&h, &ns).await?;
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
+
+    // Drop desired fan-out to 1 (< threshold 2): hysteresis KEEPS the relay
+    // (currently=true), entering the mid-range that pre-#593 orphaned on restart.
+    patch_params_replicas(&h.client, &ns.name, "dedicated-params", 1).await?;
+
+    // Restart the controller (fresh process = empty tracking set pre-fix).
+    drop(h);
+    let h2 = Harness::start_with_options(opts()).await?;
+    wait::wait_for_controller_reconciled(
+        &h2.controller_admin_url("/metrics"),
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Drain the namespace to zero dedicated Gateways.
+    let gateways: Api<Gateway> = Api::namespaced(h2.client.clone(), &ns.name);
+    gateways
+        .delete(GATEWAY_NAME, &DeleteParams::default())
+        .await?;
+
+    // Rehydration adopted the orphan, so drain-to-zero GCs it. Pre-fix: never.
+    let deployments2: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
+    let services2: Api<Service> = Api::namespaced(h2.client.clone(), &ns.name);
+    let sas2: Api<ServiceAccount> = Api::namespaced(h2.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            format!(
+                "relay '{RELAY_NAME}' GC'd after a controller restart in the hysteresis mid-range, \
+                 once the namespace drained to zero (proves startup rehydration re-adopted the orphan)"
+            )
+        },
+        || async {
+            let gone = deployments2.get(RELAY_NAME).await.is_err()
+                && services2.get(RELAY_NAME).await.is_err()
+                && sas2.get(RELAY_NAME).await.is_err();
+            gone.then_some(())
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// Sad/companion path — a below-threshold namespace with NO relay stays relay-free
+/// across a controller restart. Startup rehydration adopts only relay Deployments
+/// that actually exist (`LIST` by the namespace-relay label), so it can never
+/// fabricate tracking state and spuriously provision or resurrect a relay — the
+/// over-reach risk the fix itself introduces.
+#[tokio::test]
+async fn namespace_relay_not_provisioned_after_restart_below_threshold() -> anyhow::Result<()> {
+    let opts = || ControllerOptions {
+        relay_dedicated_enabled: true,
+        relay_min_proxy_replicas: Some(100),
+        ..Default::default()
+    };
+    let h = Harness::start_with_options(opts()).await?;
+    let ns = NamespaceGuard::create_persistent(&h.client, "relay-restart-below").await?;
+
+    // Desired fan-out 2 < threshold 100 → no relay. Waiting on the dedicated proxy
+    // proves the reconcile (and its below-threshold no-op convergence) ran.
+    apply_and_wait(&h, &ns).await?;
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    assert!(
+        deployments.get(RELAY_NAME).await.is_err(),
+        "a below-threshold namespace must have no relay '{RELAY_NAME}' before restart"
+    );
+
+    drop(h);
+    let h2 = Harness::start_with_options(opts()).await?;
+    wait::wait_for_controller_reconciled(
+        &h2.controller_admin_url("/metrics"),
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let deployments2: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
+    assert!(
+        deployments2.get(RELAY_NAME).await.is_err(),
+        "rehydration must not provision relay '{RELAY_NAME}' for a below-threshold namespace \
+         after a controller restart (it adopts only existing relay Deployments)"
+    );
+    Ok(())
+}
+
 // ── GEP-1867 infrastructure propagation, shared mode (#482) ──────────────────
 //
 // In shared mode the proxy pod and per-Gateway VIP Service both live in the

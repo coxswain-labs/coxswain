@@ -83,6 +83,13 @@ use ingress_status::ingress_lb_already_matches;
 
 const LEASE_NAME: &str = "coxswain-leader-lock";
 
+/// Wall-clock bound on the provisioned-relay rehydration `LIST` run on the
+/// leadership-promotion edge (#593). The promotion branch sits on the
+/// lease-renewal `select!` loop, so an unbounded apiserver call there could
+/// erode the renew-before-TTL fencing margin. On timeout the pass proceeds with
+/// the current tracking set (no worse than the pre-#593 empty one).
+const REHYDRATE_BOUND: Duration = Duration::from_secs(5);
+
 /// Re-queue interval for a reconcile that ran on a non-leader pod. Long enough
 /// not to hot-spin, short enough that leader promotion translates into action
 /// promptly (the lease TTL defaults to 15 s).
@@ -443,6 +450,23 @@ impl Controller {
             tasks.spawn(run_vip_reconciler(Arc::clone(op_ctx), shutdown.clone()));
         }
 
+        // Relay-tracking rehydration (#593): rebuild the operator's provisioned-relay
+        // sets from the cluster before the worker's first convergence pass. Without
+        // this a fresh leader starts with empty sets, so a relay kept alive by
+        // hysteresis (fan-out below threshold) is untracked and never GC'd. Best
+        // effort — a LIST failure logs and proceeds (no worse than the pre-#593 empty
+        // set); the next restart/promotion retries. A clone survives the
+        // `operator_ctx` move below so the promotion edge can rehydrate too.
+        let op_ctx_promotion = operator_ctx.clone();
+        if let Some(op_ctx) = &operator_ctx
+            && let Err(e) = op_ctx.rehydrate_provisioned_relays().await
+        {
+            tracing::warn!(
+                error = %e,
+                "operator: relay-tracking rehydration failed; orphaned relays may not GC until the next restart"
+            );
+        }
+
         tasks.spawn(run_status_worker(
             self.queue.clone(),
             Arc::clone(&ctx),
@@ -538,9 +562,35 @@ impl Controller {
                         crate::metrics::leader_transitions_total().inc();
                         self.publish_leadership(is_leader);
                         if is_leader {
-                            // Promotion: re-enqueue the whole world so objects
-                            // observed while we were standby (status writes gated
-                            // off) are reconciled now, not at the next rebuild.
+                            // Promotion: rehydrate the operator's provisioned-relay
+                            // sets from the cluster BEFORE re-enqueuing, so the first
+                            // post-promotion convergence pass sees real orphans
+                            // (`currently=true`) instead of the stale standby snapshot
+                            // (#593) — covers an HA standby that entered the hysteresis
+                            // mid-range while standby and is promoted without a restart.
+                            // Bounded so a hung LIST can't erode the lease-renewal
+                            // fencing margin; on timeout/error the pass proceeds with
+                            // the current set (no worse than pre-#593).
+                            if let Some(op_ctx) = &op_ctx_promotion {
+                                match tokio::time::timeout(
+                                    REHYDRATE_BOUND,
+                                    op_ctx.rehydrate_provisioned_relays(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => tracing::warn!(
+                                        error = %e,
+                                        "operator: relay-tracking rehydration on promotion failed"
+                                    ),
+                                    Err(_) => tracing::warn!(
+                                        "operator: relay-tracking rehydration on promotion timed out"
+                                    ),
+                                }
+                            }
+                            // Re-enqueue the whole world so objects observed while we
+                            // were standby (status writes gated off) are reconciled
+                            // now, not at the next rebuild.
                             enqueue_all_status(&self.queue, &stores);
                         }
                     }

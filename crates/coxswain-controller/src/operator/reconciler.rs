@@ -56,7 +56,7 @@ use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Service, Servi
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::{
     Api, Client, Resource as _,
-    api::{DeleteParams, ObjectMeta, Patch, PatchParams},
+    api::{DeleteParams, ListParams, ObjectMeta, Patch, PatchParams},
     runtime::reflector::Store,
 };
 use parking_lot::Mutex;
@@ -453,6 +453,69 @@ impl ReconcileContext {
             self.provisioned_relays.store(Arc::new(guard.clone()));
         }
     }
+
+    /// Rebuild the provisioned-relay tracking sets from the cluster (#593).
+    ///
+    /// Both [`Self::relay_namespaces`] and its lock-free [`Self::provisioned_relays`]
+    /// mirror start **empty** on every process start and are only ever grown by
+    /// reconciles. Nothing else rehydrates them, so a controller restart while a
+    /// namespace sits in the break-even **hysteresis mid-range** (relay provisioned,
+    /// but desired fan-out has since dropped below `--relay-min-proxy-replicas`)
+    /// leaves the running relay `Deployment` untracked: `converge_namespace_relay`
+    /// then sees `currently=false, desired=false` and its `!desired && !currently`
+    /// short-circuit skips the delete forever — the relay is orphaned and never GC'd,
+    /// not even when the namespace drains to zero.
+    ///
+    /// Called once before the status worker's first convergence pass (fresh leader
+    /// at startup) and again on every leadership-promotion edge (an HA standby that
+    /// entered the mid-range while standby, then promoted without a restart), so
+    /// `currently=true` for real orphans and the existing keep/GC logic resumes.
+    ///
+    /// The wholesale replace is safe against a concurrent reconcile writer at both
+    /// call sites: at startup it runs before the status worker is spawned, so no
+    /// reconcile can race it; on the promotion edge the worker is live, but the
+    /// caller re-enqueues the whole world immediately after, re-driving every
+    /// Gateway so any entry a reconcile inserted during the `LIST` is restored
+    /// within one worker pass (worst case a sub-second `provisioned_relays` authz
+    /// flap the relay's discovery client retries through).
+    ///
+    /// No-op when relay tiering is disabled — the sets are never populated then, so
+    /// the `LIST` would be wasted work.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`kube::Error`] if the relay `Deployment` `LIST`
+    /// fails; the caller logs and proceeds (the stale set is no worse than the
+    /// pre-#593 empty one, and the next restart/promotion retries).
+    pub(crate) async fn rehydrate_provisioned_relays(&self) -> Result<(), kube::Error> {
+        if !self.relay_enabled {
+            return Ok(());
+        }
+        let deployments: Api<Deployment> = Api::all(self.client.clone());
+        let lp = ListParams::default().labels(&render_relay::relay_component_label_selector());
+        let list = deployments.list(&lp).await?;
+        let set = namespaces_from_relay_deployments(&list.items);
+        let count = set.len();
+        *self.relay_namespaces.lock() = set.clone();
+        self.provisioned_relays.store(Arc::new(set));
+        tracing::info!(
+            provisioned_relays = count,
+            "operator: rehydrated relay tracking from cluster"
+        );
+        Ok(())
+    }
+}
+
+/// Collect the namespaces of a set of relay `Deployment`s (#593). Split out from
+/// [`ReconcileContext::rehydrate_provisioned_relays`] so the extraction is
+/// unit-testable without a live apiserver. A Deployment with no
+/// `metadata.namespace` (an apiserver invariant that never holds for a namespaced
+/// object) is skipped rather than panicking.
+fn namespaces_from_relay_deployments(items: &[Deployment]) -> HashSet<String> {
+    items
+        .iter()
+        .filter_map(|d| d.metadata.namespace.clone())
+        .collect()
 }
 
 /// Finalizer key the operator places on every dedicated-mode Gateway. It keeps
@@ -1747,6 +1810,46 @@ mod tests {
         let k = gateway_key(&gw);
         assert_eq!(k.ns, "tenant-a");
         assert_eq!(k.name, "my-gw");
+    }
+
+    fn relay_deployment_in(namespace: Option<&str>) -> Deployment {
+        Deployment {
+            metadata: kube::api::ObjectMeta {
+                name: Some(render_relay::RELAY_NAME.to_string()),
+                namespace: namespace.map(str::to_string),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn namespaces_from_relay_deployments_collects_and_dedups() {
+        // Two namespaces, one repeated across replicas of the LIST — the set dedups.
+        let items = vec![
+            relay_deployment_in(Some("tenant-a")),
+            relay_deployment_in(Some("tenant-b")),
+            relay_deployment_in(Some("tenant-a")),
+        ];
+        let got = namespaces_from_relay_deployments(&items);
+        assert_eq!(
+            got,
+            HashSet::from(["tenant-a".to_string(), "tenant-b".to_string()]),
+        );
+    }
+
+    #[test]
+    fn namespaces_from_relay_deployments_skips_namespaceless() {
+        // A namespaced object always carries metadata.namespace; a missing one is
+        // skipped rather than panicking (defensive against a malformed LIST item).
+        let items = vec![relay_deployment_in(None), relay_deployment_in(Some("ns"))];
+        let got = namespaces_from_relay_deployments(&items);
+        assert_eq!(got, HashSet::from(["ns".to_string()]));
+    }
+
+    #[test]
+    fn namespaces_from_relay_deployments_empty_is_empty() {
+        assert!(namespaces_from_relay_deployments(&[]).is_empty());
     }
 
     fn condition(
