@@ -1753,7 +1753,11 @@ async fn dedicated_dataplane_gauge_tracks_leaf_presence() -> anyhow::Result<()> 
     )
     .await?;
 
-    let metrics_url = h.controller_admin_url("/metrics");
+    // The gauge is emitted by the operator reconcile loop, which runs ONLY on the
+    // leader — the harness's Service-level forward pins an arbitrary replica, so
+    // scrape the leader specifically (hold the forward across the poll loops).
+    let (_leader_forward, metrics_url) =
+        common::discovery::leader_discovery_metrics(&h.client).await?;
     // Scope the label filter to THIS test's unique namespace, not the shared
     // `GATEWAY_NAME` constant: the controller is shared and parallel tests reuse
     // that Gateway name, so a `gateway="dedicated-gw"`-only filter would sum in a
