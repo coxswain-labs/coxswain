@@ -2062,3 +2062,157 @@ async fn leaf_serves_last_good_when_relay_restarts() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ── Group 5 — Relay leaf-roster telemetry (#585) ──────────────────────────────
+//
+// A relay reports its downstream leaves upstream as a `RosterReport`; the
+// controller folds each leaf into its NodeRegistry tagged with the relay as
+// `parent`, marks the relay `is_relay`, and evicts the subtree when the relay's
+// stream drops. Asserted from the controller's `/api/v1/topology`, the same
+// view the operator UI and the #531 gate read.
+
+/// Poll the controller topology until the relay-fronted leaf is folded under the
+/// relay: the relay row carries `is_relay = true`, and the leaf row's `parent`
+/// is the relay's `node_id`. Returns the relay's `node_id`.
+async fn wait_for_folded_leaf(topology_url: &str) -> anyhow::Result<String> {
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || {
+            let url = topology_url.to_owned();
+            async move { format!("controller topology at '{url}' to fold leaf-* under relay-* (is_relay + parent)") }
+        },
+        || {
+            let url = topology_url.to_owned();
+            async move {
+                let topology = fetch_topology(&url).await.ok()?;
+                let relay = find_node(&topology, "relay-")?;
+                relay.get("is_relay").and_then(|v| v.as_bool()).filter(|&b| b)?;
+                let relay_id = relay.get("node_id").and_then(|v| v.as_str())?.to_owned();
+                let leaf = find_node(&topology, "leaf-")?;
+                (leaf.get("parent").and_then(|v| v.as_str()) == Some(relay_id.as_str()))
+                    .then_some(relay_id)
+            }
+        },
+    )
+    .await
+    .context("relay-fronted leaf was not folded under its relay in the controller topology")
+}
+
+/// Happy path: a leaf behind a relay is folded into the controller's registry as
+/// a child of the relay (#585) — the controller sees real leaf state through the
+/// tier, not just the relay's own row.
+#[tokio::test]
+async fn relay_folds_leaf_roster_into_controller_topology() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-roster-fold").await?;
+
+    copy_trust_bundle(&h.client, &ns.name).await?;
+    create_relay_service_account(&h.client, &ns.name, relay::RELAY_SA).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    deployments
+        .create(
+            &PostParams::default(),
+            &relay_deployment(&ns.name, "relay", relay::RELAY_SA)?,
+        )
+        .await
+        .context("create relay Deployment")?;
+    services
+        .create(&PostParams::default(), &relay_service(&ns.name, "relay")?)
+        .await
+        .context("create relay Service")?;
+    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120))
+        .await
+        .context("relay pod did not become Ready")?;
+
+    deployments
+        .create(
+            &PostParams::default(),
+            &leaf_deployment(&ns.name, "leaf", "relay", relay::RELAY_SA)?,
+        )
+        .await
+        .context("create relay-fronted leaf Deployment")?;
+    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120))
+        .await
+        .context("relay-fronted leaf did not converge to Ready")?;
+
+    // The leaf reaches the controller only via the relay's RosterReport.
+    let topology_url = h.controller_admin_url("/api/v1/topology");
+    wait_for_folded_leaf(&topology_url).await?;
+
+    Ok(())
+}
+
+/// Sad path — relay outage: deleting the relay drops its upstream stream, so the
+/// controller evicts the whole subtree (#585). The leaf keeps serving last-good,
+/// but it must vanish from the controller's view — a new publish must not gate on
+/// a blind spot.
+#[tokio::test]
+async fn relay_outage_evicts_leaf_subtree_from_topology() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-roster-evict").await?;
+
+    copy_trust_bundle(&h.client, &ns.name).await?;
+    create_relay_service_account(&h.client, &ns.name, relay::RELAY_SA).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    deployments
+        .create(
+            &PostParams::default(),
+            &relay_deployment(&ns.name, "relay", relay::RELAY_SA)?,
+        )
+        .await
+        .context("create relay Deployment")?;
+    services
+        .create(&PostParams::default(), &relay_service(&ns.name, "relay")?)
+        .await
+        .context("create relay Service")?;
+    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120)).await?;
+    deployments
+        .create(
+            &PostParams::default(),
+            &leaf_deployment(&ns.name, "leaf", "relay", relay::RELAY_SA)?,
+        )
+        .await
+        .context("create relay-fronted leaf Deployment")?;
+    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120)).await?;
+
+    let topology_url = h.controller_admin_url("/api/v1/topology");
+    wait_for_folded_leaf(&topology_url).await?;
+
+    // ── Relay down → the controller evicts the subtree ────────────────────────
+    deployments
+        .delete("relay", &DeleteParams::default())
+        .await
+        .context("delete relay Deployment")?;
+
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || {
+            let url = topology_url.clone();
+            async move {
+                format!(
+                    "controller topology at '{url}' to evict the leaf subtree after relay outage"
+                )
+            }
+        },
+        || {
+            let url = topology_url.clone();
+            async move {
+                let topology = fetch_topology(&url).await.ok()?;
+                // Both the relay row and its folded leaf must be gone.
+                (find_node(&topology, "relay-").is_none()
+                    && find_node(&topology, "leaf-").is_none())
+                .then_some(())
+            }
+        },
+    )
+    .await
+    .context("controller did not evict the leaf subtree after the relay's stream dropped")?;
+
+    Ok(())
+}

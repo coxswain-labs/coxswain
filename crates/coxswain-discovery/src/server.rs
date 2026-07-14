@@ -52,7 +52,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -65,7 +65,7 @@ use coxswain_core::Shared;
 use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
 use coxswain_core::identity::SpiffeId;
 use coxswain_core::listener_status::SharedGatewayListenerStatus;
-use coxswain_core::node_registry::{NodeScope, SharedNodeRegistry};
+use coxswain_core::node_registry::{NodeScope, RosterChild, SharedNodeRegistry};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::publish_index::SharedGatewayPublishIndex;
 use coxswain_core::routing::{
@@ -466,6 +466,10 @@ fn build_outbound(
                     full: true,
                     resources,
                     removed_resources: Vec::new(),
+                    // Envelope seq (#585): a relay re-stamps its downstream index
+                    // from this; direct proxies ignore it (their `acked_seq` is
+                    // set server-side from the pre-build capture). Not hashed.
+                    publish_seq: view.seq,
                 },
                 world: world(),
             })
@@ -501,6 +505,10 @@ fn build_outbound(
                     full: false,
                     resources,
                     removed_resources,
+                    // Envelope seq (#585) — carried on deltas too, so a relay's
+                    // downstream counter tracks the controller across steady-state
+                    // pushes, not just fulls.
+                    publish_seq: view.seq,
                 },
                 world: world(),
             })
@@ -920,6 +928,10 @@ async fn run_stream(
         Ok(_) => {}
         Err(()) => {
             registry.disconnect(&sub.node_id);
+            // If this stream was a relay, evict its folded leaf subtree so the
+            // #531 gate fails closed on the now-invisible leaves (#585). No-op
+            // for a non-relay node (no children tagged with its id).
+            registry.evict_children(&sub.node_id);
             crate::metrics::connected_proxies().dec();
             return;
         }
@@ -946,6 +958,9 @@ async fn run_stream(
                             }
                             Some(CKind::NodeStatus(ns)) => {
                                 record_node_status(&sub.node_id, &ns, &registry);
+                            }
+                            Some(CKind::RosterReport(rr)) => {
+                                record_roster_report(&sub.node_id, rr, &registry);
                             }
                             Some(CKind::Subscribe(_)) => {
                                 // Duplicate Subscribe mid-stream; ignore (idempotent).
@@ -1013,6 +1028,8 @@ async fn run_stream(
     }
 
     registry.disconnect(&sub.node_id);
+    // Relay subtree eviction on stream exit (#585); no-op for a non-relay node.
+    registry.evict_children(&sub.node_id);
     crate::metrics::connected_proxies().dec();
 }
 
@@ -1216,6 +1233,76 @@ fn record_node_status(node_id: &str, status: &p::NodeStatus, registry: &SharedNo
     registry.record_bound_ports(node_id, ports);
 }
 
+/// Decode Unix seconds (a wire `int64` from a relay's `RosterReport`) into a
+/// [`SystemTime`], fail-safe on both ends: a negative value clamps to the epoch,
+/// and an overflowing add saturates to the epoch rather than panicking. The
+/// value is display-only (topology panel), never a gate input, and this decodes
+/// peer bytes — so it must not be a crash site under any relay input.
+fn unix_secs_to_system_time(secs: i64) -> SystemTime {
+    let offset = Duration::from_secs(u64::try_from(secs).unwrap_or(0));
+    SystemTime::UNIX_EPOCH
+        .checked_add(offset)
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// Fold a relay's `RosterReport` into the registry (#585).
+///
+/// Each `RosterEntry` is decoded into a [`RosterChild`] and handed to
+/// [`SharedNodeRegistry::apply_roster`], which wholesale-replaces this relay's
+/// subtree and marks it `is_relay`. An entry with a missing/undecodable scope or
+/// out-of-`u16` port is dropped (fail-closed: that leaf simply won't appear this
+/// round; the relay re-reports), never wedging the whole report. An empty report
+/// legitimately evicts the relay's subtree (the relay has no leaves).
+fn record_roster_report(
+    parent_node_id: &str,
+    report: p::RosterReport,
+    registry: &SharedNodeRegistry,
+) {
+    let mut children = Vec::with_capacity(report.children.len());
+    for entry in report.children {
+        let Some(wire_scope) = entry.scope.as_ref() else {
+            debug!(
+                parent_node_id,
+                node_id = %entry.node_id,
+                "discovery: RosterEntry missing scope, dropped"
+            );
+            continue;
+        };
+        let scope = match scope_from_wire(wire_scope) {
+            Ok(scope) => node_scope_from(&scope),
+            Err(e) => {
+                debug!(
+                    parent_node_id,
+                    node_id = %entry.node_id,
+                    error = %e,
+                    "discovery: RosterEntry undecodable scope, dropped"
+                );
+                continue;
+            }
+        };
+        // `bound_reported == false` ⇒ the leaf has not reported bound ports;
+        // preserve the None/Some(∅) distinction the #531 gate relies on.
+        let bound_ports = entry.bound_reported.then(|| {
+            entry
+                .bound_ports
+                .iter()
+                .filter_map(|raw| u16::try_from(*raw).ok())
+                .collect::<std::collections::BTreeSet<u16>>()
+        });
+        children.push(RosterChild {
+            node_id: entry.node_id,
+            scope,
+            last_acked_version: entry.acked_version,
+            target_version: entry.target_version,
+            last_acked_seq: entry.acked_seq,
+            bound_ports,
+            connected_since: unix_secs_to_system_time(entry.connected_since_unix),
+            last_ack_at: entry.last_ack_at_unix.map(unix_secs_to_system_time),
+        });
+    }
+    registry.apply_roster(parent_node_id, children);
+}
+
 /// Wrap a wire snapshot in a `ServerMessage`, send it, and — only on a successful
 /// hand-off to the transport — emit the #383 send-side metrics. The nonce is
 /// already stamped by [`build_outbound`].
@@ -1287,6 +1374,92 @@ mod tests {
     fn provenance_authorizer(provisioned: &[&str]) -> ProvisionedRelayAuthorizer {
         let set: HashSet<String> = provisioned.iter().map(|s| (*s).to_owned()).collect();
         ProvisionedRelayAuthorizer::new(Shared::from_value(set), AUTHZ_RELAY_SA, AUTHZ_TD)
+    }
+
+    /// #585 wire decode: `record_roster_report` folds a `RosterReport` into the
+    /// registry, preserving the scope, the `bound_reported` None/Some(∅)
+    /// distinction, the acked seq, and tagging each child with the relay parent.
+    #[test]
+    fn record_roster_report_folds_children_into_registry() {
+        let registry = SharedNodeRegistry::new();
+        registry.connect(
+            "relay-x",
+            NodeScope::Namespace {
+                namespace: "prod".to_owned(),
+            },
+            SystemTime::UNIX_EPOCH,
+        );
+        let report = p::RosterReport {
+            children: vec![
+                // A bound, acked leaf.
+                p::RosterEntry {
+                    node_id: "leaf-bound".to_owned(),
+                    scope: Some(crate::wire::scope_to_wire(&Scope::Gateway {
+                        name: "gw".to_owned(),
+                        namespace: "prod".to_owned(),
+                    })),
+                    acked_version: Some("v1".to_owned()),
+                    target_version: Some("v1".to_owned()),
+                    acked_seq: Some(9),
+                    bound_reported: true,
+                    bound_ports: vec![443, 8443],
+                    connected_since_unix: 100,
+                    last_ack_at_unix: Some(200),
+                },
+                // A leaf on a DIFFERENT Gateway that has NOT reported bound ports
+                // → None, not Some(∅) (fail-closed for its own Gateway).
+                p::RosterEntry {
+                    node_id: "leaf-unreported".to_owned(),
+                    scope: Some(crate::wire::scope_to_wire(&Scope::Gateway {
+                        name: "gw2".to_owned(),
+                        namespace: "prod".to_owned(),
+                    })),
+                    acked_version: None,
+                    target_version: Some("v1".to_owned()),
+                    acked_seq: None,
+                    bound_reported: false,
+                    bound_ports: Vec::new(),
+                    connected_since_unix: 100,
+                    last_ack_at_unix: None,
+                },
+            ],
+        };
+        record_roster_report("relay-x", report, &registry);
+
+        let snap = registry.load();
+        let bound = &snap.nodes["leaf-bound"];
+        assert_eq!(
+            bound.parent.as_deref(),
+            Some("relay-x"),
+            "child tagged with parent"
+        );
+        assert_eq!(
+            bound.scope,
+            NodeScope::Gateway {
+                namespace: "prod".to_owned(),
+                name: "gw".to_owned()
+            }
+        );
+        assert_eq!(
+            bound
+                .bound_ports
+                .as_ref()
+                .map(|s| s.iter().copied().collect::<Vec<_>>()),
+            Some(vec![443u16, 8443])
+        );
+        assert_eq!(bound.last_acked_seq, Some(9));
+        assert_eq!(
+            snap.nodes["leaf-unreported"].bound_ports, None,
+            "an unreported leaf decodes to None (fail-closed), never Some(empty)"
+        );
+        assert!(
+            snap.nodes["relay-x"].is_relay,
+            "the reporting relay is marked"
+        );
+        // The folded bound leaf satisfies its Gateway's dedicated gate...
+        assert!(snap.gateway_node_bound("prod", "gw", &[443u16].into_iter().collect()));
+        // ...while the unreported leaf holds its own Gateway's gate closed.
+        assert!(!snap.gateway_node_bound("prod", "gw2", &[443u16].into_iter().collect()));
     }
 
     #[test]

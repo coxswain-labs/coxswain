@@ -72,7 +72,13 @@ pub fn shared_relay(
     health: SubsystemHandle,
     health_check: &str,
 ) -> Result<RelayUpstream, DiscoveryError> {
+    // One publish index shared between the applier (writer: advances it to the
+    // controller's envelope seq on each apply) and the downstream `SnapshotSource`
+    // (reader: stamps that seq onto leaf Acks), so shared leaves Ack in the
+    // controller's seq space and the #531 gate can evaluate them (#585).
+    let publish = SharedGatewayPublishIndex::new();
     let (applier, cells) = RoutingApplier::new();
+    let applier = applier.with_publish_index(publish.clone());
     let (supervisor, rebuild_rx) =
         Supervisor::with_applier(config, health, health_check, Box::new(applier))?;
     let source = SnapshotSource {
@@ -81,13 +87,13 @@ pub fn shared_relay(
         tls: cells.tls,
         client_certs: cells.client_certs,
         listener_status: cells.listener_status,
-        // A shared relay serves no dedicated Gateways and no cross-tier seq.
+        // A shared relay serves no dedicated Gateways.
         dedicated: DedicatedRoutingRegistry::new(),
         passthrough_routes: cells.passthrough,
         terminate_routes: cells.terminate,
         tcp_routes: cells.tcp,
         udp_routes: cells.udp,
-        publish: SharedGatewayPublishIndex::new(),
+        publish,
     };
     Ok(RelayUpstream {
         source,
@@ -251,12 +257,17 @@ impl SnapshotApplier for NamespaceDemux {
         // a malformed world leaves the last-good registry serving untouched.
         let rebuilt = rebuild_registry(&staged)?;
 
-        // Commit (infallible from here). Store the registry first so a downstream
+        // Commit (infallible from here). Store the registry FIRST so a downstream
         // rebuild triggered by the supervisor's post-apply signal reads the new
-        // world; advance the publish counter so the downstream view seq moves.
+        // world; THEN advance the downstream publish counter to the controller's
+        // seq. Ordering is the publication fence (#585): a downstream `Scope::Gateway`
+        // build captures `current_seq()` before reading cells, so the counter must
+        // only reach `max_publish_seq` after those cells are stored — else a leaf
+        // could Ack a fresh seq over a stale world. The counter tracks the max
+        // per-Gateway `GatewayMeta.publish_seq`, so a leaf for Gateway G Acks
+        // `current_seq() >= stamp_G.seq`, exactly what `gateway_node_acked` checks.
         self.dedicated.store(Arc::new(rebuilt.registry));
-        self.publish
-            .stamp_rebuild(rebuilt.gateways.into_iter().map(|key| (key, 1, 0)));
+        self.publish.advance_to(rebuilt.max_publish_seq);
         self.resources = staged;
         self.has_full = true;
         Ok(ApplyStats::default())
@@ -266,8 +277,10 @@ impl SnapshotApplier for NamespaceDemux {
 /// The reconstructed downstream world for one namespace apply.
 struct RebuiltRegistry {
     registry: HashMap<ObjectKey, Arc<DedicatedRoutingSnapshot>>,
-    /// Every Gateway present this rebuild (drives the publish index).
-    gateways: Vec<ObjectKey>,
+    /// Max per-Gateway `GatewayMeta.publish_seq` across this rebuild — the
+    /// controller sequence the relay advances its downstream publish index to
+    /// (#585). 0 when the namespace has no cut-over Gateway (empty world).
+    max_publish_seq: u64,
 }
 
 /// Partition the de-qualified resource world into per-Gateway snapshots plus the
@@ -341,7 +354,17 @@ fn rebuild_registry(
         registry.insert(key.clone(), Arc::new(snapshot));
     }
 
-    Ok(RebuiltRegistry { registry, gateways })
+    // The controller sequence to re-stamp downstream: the max publish-seq the
+    // controller assigned any Gateway in this namespace view. Global (not
+    // per-Gateway) because the downstream `Scope::Gateway` server captures the
+    // index's global `current_seq()`; a leaf for Gateway G then Acks
+    // `>= stamp_G.seq` since `max >= stamp_G.seq` (#585).
+    let max_publish_seq = meta.values().map(|m| m.publish_seq).max().unwrap_or(0);
+
+    Ok(RebuiltRegistry {
+        registry,
+        max_publish_seq,
+    })
 }
 
 /// Reconstruct one dedicated Gateway's [`DedicatedRoutingSnapshot`] from its
@@ -377,6 +400,10 @@ fn dedicated_snapshot_from_resources(
         full: true,
         resources: all,
         removed_resources: Vec::new(),
+        // Local reconstruction only; this applier has no publish index wired, so
+        // the seq is inert (the namespace demux advances the real downstream
+        // counter from `GatewayMeta.publish_seq`, not from here).
+        publish_seq: 0,
     };
 
     let (mut applier, cells) = RoutingApplier::new();
@@ -479,6 +506,7 @@ mod tests {
                 .map(|entry| (*entry.resource).clone())
                 .collect(),
             removed_resources: Vec::new(),
+            publish_seq: view.seq,
         }
     }
 
@@ -584,6 +612,51 @@ mod tests {
         );
     }
 
+    /// #585 seq propagation: the namespace relay advances its downstream publish
+    /// index to the max controller `GatewayMeta.publish_seq`, so a downstream
+    /// `Scope::Gateway` leaf Acks a seq `>=` that Gateway's controller stamp —
+    /// exactly what `gateway_node_acked` checks. Without this the leaf would Ack
+    /// the relay's own (incomparable) counter and the #531 gate could never pass.
+    #[test]
+    fn namespace_relay_advances_downstream_seq_to_max_controller_publish_seq() {
+        let origin = source_with_dedicated(&[
+            ("prod", "gw-a", "a.example.com"),
+            ("prod", "gw-b", "b.example.com"),
+        ]);
+        // Controller stamps gw-a at seq 1, gw-b at seq 2 (two rebuilds; gw-a's
+        // sticky stamp stays at 1 across the second).
+        let key_a = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
+        let key_b = ObjectKey::new("prod".to_owned(), "gw-b".to_owned());
+        origin.publish.stamp_rebuild([(key_a.clone(), 1, 0)]);
+        origin
+            .publish
+            .stamp_rebuild([(key_a.clone(), 1, 0), (key_b.clone(), 1, 0)]);
+        assert_eq!(origin.publish.get(&key_a).map(|s| s.seq), Some(1));
+        assert_eq!(origin.publish.get(&key_b).map(|s| s.seq), Some(2));
+
+        let ns_view = materialize(
+            &origin,
+            &Scope::Namespace {
+                namespace: "prod".to_owned(),
+            },
+            None,
+        );
+        let relay = relay_source_after(&[full_snapshot(&ns_view)]);
+
+        assert_eq!(
+            relay.publish.current_seq(),
+            2,
+            "downstream counter must reach the max controller publish_seq (gw-b @ 2)"
+        );
+        // A leaf for gw-a (controller stamp 1) captures the downstream seq 2 on
+        // its build → Acks 2 >= 1, satisfying the dedicated ack gate.
+        assert_eq!(
+            materialize(&relay, &gw_scope("gw-a"), None).seq,
+            2,
+            "a gw-a leaf Acks a seq >= gw-a's controller stamp"
+        );
+    }
+
     /// A delta that adds one Gateway and removes another updates only those
     /// Gateways' registry entries; the surviving Gateway's world is unchanged.
     #[test]
@@ -641,6 +714,7 @@ mod tests {
             full: false,
             resources: upserts,
             removed_resources: removed,
+            publish_seq: target_view.seq,
         };
 
         let relay = relay_source_after(&[full, delta]);
@@ -676,6 +750,7 @@ mod tests {
                     full: false,
                     resources: Vec::new(),
                     removed_resources: Vec::new(),
+                    publish_seq: 0,
                 },
                 true,
             )

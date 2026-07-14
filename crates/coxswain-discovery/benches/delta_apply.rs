@@ -148,6 +148,7 @@ fn full_snapshot(resources: Vec<p::Resource>) -> p::Snapshot {
         full: true,
         resources,
         removed_resources: Vec::new(),
+        publish_seq: 0,
     }
 }
 
@@ -160,6 +161,7 @@ fn endpoint_delta(post_apply: &[p::Resource]) -> p::Snapshot {
         full: false,
         resources: vec![endpoint(0, 2)],
         removed_resources: Vec::new(),
+        publish_seq: 0,
     }
 }
 

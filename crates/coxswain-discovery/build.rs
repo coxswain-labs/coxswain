@@ -21,6 +21,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_include = workspace_root.join("proto");
     let proto_file = proto_include.join("coxswain/discovery/v1/discovery.proto");
 
+    // Regenerate the bindings whenever the schema changes — without this, an edit
+    // to the `.proto` (including doc comments, which become rustdoc) leaves a
+    // stale generated file behind.
+    println!("cargo:rerun-if-changed={}", proto_file.display());
+
     let fds = protox::compile([proto_file], [proto_include])?;
     tonic_prost_build::configure()
         .build_server(true)

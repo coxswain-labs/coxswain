@@ -10,7 +10,9 @@
       "last_acked_version": "sha256:aabbcc112233",
       "connected_since": "2024-06-01T00:00:00Z",
       "last_ack_at": "2024-06-01T00:00:00Z",
-      "in_sync": true
+      "in_sync": true,
+      "parent": null,
+      "is_relay": false
     },
     {
       "node_id": "coxswain-shared-proxy-66d-bk9p4",
@@ -20,7 +22,9 @@
       "last_acked_version": "sha256:001122334455",
       "connected_since": "2024-06-01T00:00:00Z",
       "last_ack_at": "2024-06-01T00:00:00Z",
-      "in_sync": false
+      "in_sync": false,
+      "parent": null,
+      "is_relay": false
     },
     {
       "node_id": "tenant-a-gw-coxswain-7db74-j8cjt",
@@ -32,7 +36,9 @@
       "last_acked_version": "sha256:aabbcc112233",
       "connected_since": "2024-06-01T00:00:00Z",
       "last_ack_at": "2024-06-01T00:00:00Z",
-      "in_sync": true
+      "in_sync": true,
+      "parent": null,
+      "is_relay": false
     },
     {
       "node_id": "tenant-a-gw-coxswain-7db74-r5tfb",
@@ -44,7 +50,9 @@
       "last_acked_version": "sha256:aabbcc112233",
       "connected_since": "2024-06-01T00:00:00Z",
       "last_ack_at": "2024-06-01T00:00:00Z",
-      "in_sync": true
+      "in_sync": true,
+      "parent": null,
+      "is_relay": false
     },
     {
       "node_id": "tenant-b-gw-coxswain-5cc91-m2qd8",
@@ -56,7 +64,86 @@
       "last_acked_version": "sha256:aabbcc112233",
       "connected_since": "2024-06-01T00:00:00Z",
       "last_ack_at": "2024-06-01T00:00:00Z",
-      "in_sync": true
+      "in_sync": true,
+      "parent": null,
+      "is_relay": false
+    },
+    {
+      "node_id": "coxswain-relay-tenant-c-7f9-x1a2b",
+      "scope": {
+        "kind": "Namespace",
+        "namespace": "tenant-c"
+      },
+      "last_acked_version": "sha256:aabbcc112233",
+      "connected_since": "2024-06-01T00:00:00Z",
+      "last_ack_at": "2024-06-01T00:00:00Z",
+      "in_sync": true,
+      "parent": null,
+      "is_relay": true
+    },
+    {
+      "node_id": "tenant-c-gw-coxswain-3aa-leaf1",
+      "scope": {
+        "kind": "Gateway",
+        "namespace": "tenant-c",
+        "name": "tenant-c-gw"
+      },
+      "last_acked_version": "sha256:aabbcc112233",
+      "connected_since": "2024-06-01T00:00:00Z",
+      "last_ack_at": "2024-06-01T00:00:00Z",
+      "in_sync": true,
+      "parent": "coxswain-relay-tenant-c-7f9-x1a2b",
+      "is_relay": false
+    },
+    {
+      "node_id": "tenant-c-gw-coxswain-3aa-leaf2",
+      "scope": {
+        "kind": "Gateway",
+        "namespace": "tenant-c",
+        "name": "tenant-c-gw"
+      },
+      "last_acked_version": "sha256:001122334455",
+      "connected_since": "2024-06-01T00:00:00Z",
+      "last_ack_at": "2024-06-01T00:00:00Z",
+      "in_sync": false,
+      "parent": "coxswain-relay-tenant-c-7f9-x1a2b",
+      "is_relay": false
+    },
+    {
+      "node_id": "coxswain-relay-shared-6d4-q7r8s",
+      "scope": {
+        "kind": "SharedPool"
+      },
+      "last_acked_version": "sha256:aabbcc112233",
+      "connected_since": "2024-06-01T00:00:00Z",
+      "last_ack_at": "2024-06-01T00:00:00Z",
+      "in_sync": true,
+      "parent": null,
+      "is_relay": true
+    },
+    {
+      "node_id": "coxswain-shared-proxy-99f-leafa",
+      "scope": {
+        "kind": "SharedPool"
+      },
+      "last_acked_version": "sha256:aabbcc112233",
+      "connected_since": "2024-06-01T00:00:00Z",
+      "last_ack_at": "2024-06-01T00:00:00Z",
+      "in_sync": true,
+      "parent": "coxswain-relay-shared-6d4-q7r8s",
+      "is_relay": false
+    },
+    {
+      "node_id": "coxswain-shared-proxy-99f-leafb",
+      "scope": {
+        "kind": "SharedPool"
+      },
+      "last_acked_version": "sha256:001122334455",
+      "connected_since": "2024-06-01T00:00:00Z",
+      "last_ack_at": "2024-06-01T00:00:00Z",
+      "in_sync": false,
+      "parent": "coxswain-relay-shared-6d4-q7r8s",
+      "is_relay": false
     }
   ]
 }

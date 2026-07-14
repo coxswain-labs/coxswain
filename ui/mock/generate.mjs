@@ -17,7 +17,8 @@
  *                  (unresolved refs) · ingress healthy · ingress dead
  *   Problems     : ingress conflict · gateway conflict · ingress/gateway dead
  *   Health       : all ready · degraded subsystem
- *   Topology     : SharedPool in-sync · SharedPool lagging · dedicated grouped · lag banner
+ *   Topology     : SharedPool in-sync · SharedPool lagging · dedicated grouped · lag banner ·
+ *                  namespace relay + leaves · shared relay + leaves (N-tier, #585)
  *
  * Fixtures are recaptured from a real controller instead with mock/capture.sh.
  */
@@ -605,34 +606,50 @@ function emitHealth() {
   });
 }
 
-// ── topology (#379) ──────────────────────────────────────────────────────────
-// discovery_active=true, one SharedPool node in-sync, one lagging,
-// two dedicated nodes (one per Gateway). Timestamps are fixed so diffs stay stable.
+// ── topology (#379, #585) ────────────────────────────────────────────────────
+// discovery_active=true. Covers: SharedPool in-sync + lagging; direct dedicated
+// grouped by Gateway; a namespace relay (#585) fronting two dedicated leaves
+// (one lagging); and a shared-pool relay fronting two shared leaves — so the
+// N-tier controller → relay → leaf render and the relay badge are reachable in
+// dev. Timestamps are fixed so diffs stay stable.
 const TOPO_CTRL_VERSION = 'sha256:aabbcc112233';
 const TOPO_OLD_VERSION  = 'sha256:001122334455';
 const TOPO_SINCE        = '2024-06-01T00:00:00Z';
+const TOPO_NS_RELAY     = 'coxswain-relay-tenant-c-7f9-x1a2b';
+const TOPO_SHARED_RELAY = 'coxswain-relay-shared-6d4-q7r8s';
+function topoNode(id, scope, { inSync = true, parent = null, isRelay = false } = {}) {
+  return {
+    node_id:            id,
+    scope,
+    last_acked_version: inSync ? TOPO_CTRL_VERSION : TOPO_OLD_VERSION,
+    connected_since:    TOPO_SINCE,
+    last_ack_at:        TOPO_SINCE,
+    in_sync:            inSync,
+    parent,
+    is_relay:           isRelay,
+  };
+}
 function emitTopology() {
   const shared = PROXIES.filter((p) => p.kind === 'shared-proxy');
   const dedicated = PROXIES.filter((p) => p.kind === 'dedicated-proxy' && p.reachable !== false);
   const nodes = [
-    // SharedPool: first node in-sync, second lagging.
-    ...shared.map((p, i) => ({
-      node_id:             p.name,
-      scope:               { kind: 'SharedPool' },
-      last_acked_version:  i === 0 ? TOPO_CTRL_VERSION : TOPO_OLD_VERSION,
-      connected_since:     TOPO_SINCE,
-      last_ack_at:         TOPO_SINCE,
-      in_sync:             i === 0,
-    })),
-    // Dedicated proxies: each in-sync (fresh start), grouped by gateway.
-    ...dedicated.map((p) => ({
-      node_id:             p.name,
-      scope:               { kind: 'Gateway', namespace: p.ns, name: p.gw },
-      last_acked_version:  TOPO_CTRL_VERSION,
-      connected_since:     TOPO_SINCE,
-      last_ack_at:         TOPO_SINCE,
-      in_sync:             true,
-    })),
+    // SharedPool direct: first node in-sync, second lagging.
+    ...shared.map((p, i) => topoNode(p.name, { kind: 'SharedPool' }, { inSync: i === 0 })),
+    // Direct dedicated proxies, grouped by Gateway.
+    ...dedicated.map((p) =>
+      topoNode(p.name, { kind: 'Gateway', namespace: p.ns, name: p.gw })),
+
+    // Namespace relay (#585) fronting two dedicated leaves in tenant-c.
+    topoNode(TOPO_NS_RELAY, { kind: 'Namespace', namespace: 'tenant-c' }, { isRelay: true }),
+    topoNode('tenant-c-gw-coxswain-3aa-leaf1', { kind: 'Gateway', namespace: 'tenant-c', name: 'tenant-c-gw' },
+      { parent: TOPO_NS_RELAY }),
+    topoNode('tenant-c-gw-coxswain-3aa-leaf2', { kind: 'Gateway', namespace: 'tenant-c', name: 'tenant-c-gw' },
+      { parent: TOPO_NS_RELAY, inSync: false }),
+
+    // Shared-pool relay fronting two shared leaves (one lagging).
+    topoNode(TOPO_SHARED_RELAY, { kind: 'SharedPool' }, { isRelay: true }),
+    topoNode('coxswain-shared-proxy-99f-leafa', { kind: 'SharedPool' }, { parent: TOPO_SHARED_RELAY }),
+    topoNode('coxswain-shared-proxy-99f-leafb', { kind: 'SharedPool' }, { parent: TOPO_SHARED_RELAY, inSync: false }),
   ];
   write('/api/v1/topology', {
     discovery_active:    true,

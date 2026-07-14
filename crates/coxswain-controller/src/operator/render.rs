@@ -69,9 +69,9 @@ use k8s_openapi::api::autoscaling::v2::{
     MetricTarget, ResourceMetricSource,
 };
 use k8s_openapi::api::core::v1::{
-    ConfigMapVolumeSource, Container, ContainerPort, PodSpec, PodTemplateSpec,
-    ProjectedVolumeSource, Service, ServiceAccount, ServiceAccountTokenProjection, ServicePort,
-    ServiceSpec, Volume, VolumeMount, VolumeProjection,
+    ConfigMapVolumeSource, Container, ContainerPort, EnvVar, EnvVarSource, ObjectFieldSelector,
+    PodSpec, PodTemplateSpec, ProjectedVolumeSource, Service, ServiceAccount,
+    ServiceAccountTokenProjection, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeProjection,
 };
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
@@ -630,6 +630,7 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         image: Some(image),
         args: Some(args),
         ports: Some(container_ports(inputs.gateway, inputs.effective_ports)),
+        env: Some(pod_identity_env()),
         resources: inputs.params.resources.clone(),
         volume_mounts: Some(discovery_volume_mounts()),
         ..Default::default()
@@ -712,6 +713,40 @@ pub(super) fn discovery_volumes() -> Vec<Volume> {
                 optional: Some(true),
                 ..Default::default()
             }),
+            ..Default::default()
+        },
+    ]
+}
+
+/// Downward-API env giving each pod a **unique** discovery `node_id` (`POD_NAME`)
+/// and its real namespace (`POD_NAMESPACE`).
+///
+/// Load-bearing for the relay tier (#585): the `node_id` defaults to
+/// `coxswain-local` when `POD_NAME` is unset (`args.rs`), so without this every
+/// replica of a controller-provisioned Deployment would share one identity —
+/// two relay replicas would then collide in the controller registry and their
+/// `RosterReport`s would clobber each other (the leaf-less replica evicting the
+/// other's folded leaf), wedging `Programmed` at `Pending`. Mirrors the
+/// `POD_NAME`/`POD_NAMESPACE` env the Helm-rendered shared proxy already sets.
+pub(super) fn pod_identity_env() -> Vec<EnvVar> {
+    let field_ref = |path: &str| {
+        Some(EnvVarSource {
+            field_ref: Some(ObjectFieldSelector {
+                field_path: path.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    };
+    vec![
+        EnvVar {
+            name: "POD_NAME".to_string(),
+            value_from: field_ref("metadata.name"),
+            ..Default::default()
+        },
+        EnvVar {
+            name: "POD_NAMESPACE".to_string(),
+            value_from: field_ref("metadata.namespace"),
             ..Default::default()
         },
     ]

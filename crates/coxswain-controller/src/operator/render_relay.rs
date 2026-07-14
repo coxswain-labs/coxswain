@@ -202,6 +202,10 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
         name: "coxswain".to_string(),
         image: Some(inputs.controller_image.to_string()),
         args: Some(args),
+        // Per-pod identity: each relay replica MUST have a unique discovery
+        // `node_id`, or their `RosterReport`s collide in the controller registry
+        // and the leaf-less replica evicts the other's folded subtree (#585).
+        env: Some(super::render::pod_identity_env()),
         ports: Some(vec![
             ContainerPort {
                 name: Some("discovery".to_string()),

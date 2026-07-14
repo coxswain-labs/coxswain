@@ -3464,3 +3464,65 @@ async fn dedicated_gateway_with_malformed_tls_secret_settles_programmed_false_in
     );
     Ok(())
 }
+
+// ── Relay-tier Programmed gate (#585) ─────────────────────────────────────────
+
+/// A dedicated Gateway in a namespace fronted by a controller-provisioned relay
+/// (#584) reaches `Programmed=True` (#585). This exercises the full relay-tier
+/// gate chain end-to-end: the dedicated proxy is repointed behind the relay
+/// (its `--discovery-endpoint` becomes the relay Service), so its bound ports +
+/// ack reach the controller ONLY via the relay's `RosterReport`; the controller
+/// folds the leaf and the #531 gate evaluates it. Without the fold the Gateway
+/// would hang at `Pending` forever.
+///
+/// Serial (helm mutator: `relay.dedicated.enabled`). The fail-closed companion —
+/// a relay outage evicting the subtree — is covered where an outage is actually
+/// controllable: the by-hand relay in
+/// `discovery::relay_outage_evicts_leaf_subtree_from_topology` and the
+/// `coxswain-core::node_registry` unit tests. A controller-provisioned relay is
+/// reconciled back up whenever it is scaled down, so its outage cannot be held
+/// here.
+#[tokio::test]
+async fn dedicated_gateway_behind_namespace_relay_becomes_programmed() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_dedicated_enabled: true,
+        relay_min_proxy_replicas: Some(1),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-relay-programmed").await?;
+
+    // A dedicated Gateway (1 desired replica) crosses the break-even threshold →
+    // the controller provisions a namespace relay AND repoints this Gateway's
+    // proxy behind it.
+    common::dedicated::apply_and_wait(&h, &ns).await?;
+
+    // The repointed proxy can only converge once the relay is serving.
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async { "controller-provisioned namespace relay pod to become Ready".to_owned() },
+        || {
+            let deployments = deployments.clone();
+            async move {
+                let ready = deployments
+                    .get("coxswain-relay")
+                    .await
+                    .ok()
+                    .and_then(|d| d.status)
+                    .and_then(|s| s.ready_replicas)
+                    .unwrap_or(0);
+                (ready >= 1).then_some(())
+            }
+        },
+    )
+    .await?;
+
+    // Programmed=True is reachable ONLY if the folded leaf (behind the relay)
+    // satisfies the #531 gate — the killer end-to-end assertion for #585.
+    wait::wait_for_gateway_programmed(&h.client, GATEWAY_NAME, &ns.name, Duration::from_secs(180))
+        .await?;
+
+    Ok(())
+}

@@ -10,8 +10,9 @@
 //! `prometheus::gather()` call picks them up automatically.
 
 use prometheus::{
-    HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, Opts, register_histogram_vec,
-    register_int_counter, register_int_counter_vec, register_int_gauge,
+    HistogramOpts, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec, Opts,
+    register_histogram_vec, register_int_counter, register_int_counter_vec, register_int_gauge,
+    register_int_gauge_vec,
 };
 use std::sync::OnceLock;
 
@@ -77,6 +78,40 @@ pub(crate) fn reconcile_total() -> &'static IntCounterVec {
                 "Cumulative reconcile-loop iterations, by controller key and outcome"
             ),
             &["controller", "result"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Gauge: count of currently-connected data-plane proxies serving a dedicated
+/// Gateway (#585), labelled `namespace` + `gateway`.
+///
+/// The **live** counterpart to the latched `Programmed` status: `Programmed`
+/// stays `True` through data-plane churn (rollouts, HPA, relay blips, leader
+/// failover) and only re-arms on a spec change, so it deliberately does NOT go
+/// `False` when every proxy behind a Gateway dies. Alert on
+/// `coxswain_gateway_dataplane_proxies == 0 for N s` to detect that total-loss
+/// blind spot; alert on `Programmed` for spec-observation, never for liveness.
+///
+/// Dedicated Gateways only — every shared proxy serves every shared Gateway, so
+/// a per-shared-Gateway series would be pool-size×Gateways cardinality for no
+/// added signal; shared-pool total loss is the existing global
+/// `coxswain_discovery_connected_proxies` gauge. The reconciler removes a
+/// Gateway's series on deprovision/delete so labels do not grow unbounded.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`leader`].
+pub(crate) fn dataplane_proxies() -> &'static IntGaugeVec {
+    static GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        register_int_gauge_vec!(
+            Opts::new(
+                "coxswain_gateway_dataplane_proxies",
+                "Count of connected data-plane proxies serving a dedicated Gateway (live; \
+                 alert on ==0, distinct from the latched Programmed status)"
+            ),
+            &["namespace", "gateway"]
         )
         .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
     })
