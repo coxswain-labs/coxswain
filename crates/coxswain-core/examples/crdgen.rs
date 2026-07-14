@@ -36,6 +36,12 @@
 //! cp deploy/manifests/crds/coxswainingressclassparameters.yaml \
 //!     charts/coxswain/crds/coxswainingressclassparameters.yaml
 //!
+//! # CoxswainRelayPolicy
+//! cargo run -p coxswain-core --example crdgen -- CoxswainRelayPolicy \
+//!     > deploy/manifests/crds/coxswainrelaypolicies.yaml
+//! cp deploy/manifests/crds/coxswainrelaypolicies.yaml \
+//!     charts/coxswain/crds/coxswainrelaypolicies.yaml
+//!
 //! # RateLimit
 //! cargo run -p coxswain-core --example crdgen -- RateLimit \
 //!     > deploy/manifests/crds/ratelimits.yaml
@@ -84,8 +90,8 @@
 
 use coxswain_core::crd::{
     BasicAuth, ClientTrafficPolicy, Compression, CoxswainBackendPolicy, CoxswainExternalAuth,
-    CoxswainGatewayParameters, CoxswainIngressClassParameters, IpAccessControl, JwtAuth,
-    PathRewriteRegex, RateLimit, RequestSizeLimit, RetryPolicy,
+    CoxswainGatewayParameters, CoxswainIngressClassParameters, CoxswainRelayPolicy,
+    IpAccessControl, JwtAuth, PathRewriteRegex, RateLimit, RequestSizeLimit, RetryPolicy,
 };
 use kube::CustomResourceExt;
 
@@ -103,6 +109,9 @@ fn main() -> Result<(), serde_yaml::Error> {
         }
         "IngressClassParameters" => {
             serde_yaml::to_writer(std::io::stdout(), &CoxswainIngressClassParameters::crd())
+        }
+        "CoxswainRelayPolicy" => {
+            serde_yaml::to_writer(std::io::stdout(), &CoxswainRelayPolicy::crd())
         }
         "RateLimit" => serde_yaml::to_writer(std::io::stdout(), &RateLimit::crd()),
         "PathRewriteRegex" => serde_yaml::to_writer(std::io::stdout(), &PathRewriteRegex::crd()),

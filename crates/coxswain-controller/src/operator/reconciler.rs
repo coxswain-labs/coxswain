@@ -39,10 +39,11 @@
 //! health drifts, so a cert-ref or route-resolution change reaches the patch
 //! path within watch latency without a dedicated retrigger channel.
 
+use super::relay_params::{self, EffectiveRelayPolicy};
 use super::{apply, params, render, render_relay, render_shared, status, vip};
 use crate::controller::StatusOutcome;
 use coxswain_core::Shared;
-use coxswain_core::crd::{CoxswainGatewayParameters, ServiceType};
+use coxswain_core::crd::{CoxswainGatewayParameters, CoxswainRelayPolicy, ServiceType};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_reflector::gw_types::ListenerSet;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
@@ -261,6 +262,10 @@ pub(crate) struct ReconcileContext {
     pub(super) client: Client,
     pub(super) class_store: Store<GatewayClass>,
     pub(super) params_store: Store<CoxswainGatewayParameters>,
+    /// `CoxswainRelayPolicy` snapshot (#589): per-namespace relay tuning overlaid onto the
+    /// #584 global relay defaults. Read on every reconcile to resolve the namespace's
+    /// effective policy.
+    relay_policies_store: Store<CoxswainRelayPolicy>,
     /// The reflector's fleet Pod store (#574 fold): the shared
     /// `app.kubernetes.io/name=coxswain` watch, a superset of the dedicated-proxy
     /// Pods. Reads off this store drive the
@@ -377,6 +382,7 @@ impl ReconcileContext {
             client,
             class_store: stores.gateway_classes,
             params_store: stores.params,
+            relay_policies_store: stores.relay_policies,
             pods_store: stores.pods,
             nodes_store: stores.nodes,
             listener_status: config.listener_status,
@@ -409,6 +415,23 @@ impl ReconcileContext {
             last_hashes: Mutex::new(HashMap::new()),
             error_attempts: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Resolve the effective [`EffectiveRelayPolicy`] for `namespace` (#589): the
+    /// cluster-default → namespace-match overlay of every `CoxswainRelayPolicy`, evaluated
+    /// against the namespace's own labels. Resolved once per reconcile and threaded into
+    /// both the relay convergence and the proxy repoint so the relay's existence and the
+    /// proxies' discovery endpoint can never disagree.
+    fn resolve_relay_policy(&self, namespace: &str) -> EffectiveRelayPolicy {
+        let labels = self
+            .namespaces_store
+            .state()
+            .into_iter()
+            .find(|ns| ns.metadata.name.as_deref() == Some(namespace))
+            .and_then(|ns| ns.metadata.labels.clone())
+            .unwrap_or_default();
+        let policies = self.relay_policies_store.state();
+        relay_params::resolve(namespace, &labels, &policies)
     }
 
     /// Record whether a namespace currently has a provisioned relay (#584) and
@@ -468,7 +491,11 @@ pub(crate) async fn reconcile_dedicated(
     let started = std::time::Instant::now();
     let key = gateway_key(&gw);
     let gw_namespace = gw.metadata.namespace.clone().unwrap_or_default();
-    let res = reconcile_inner(gw, Arc::clone(&ctx)).await;
+    // Resolve the namespace's effective relay policy once (#589) and thread it into both
+    // the per-Gateway reconcile (proxy repoint) and the relay convergence below, so the two
+    // decisions read identical policy state.
+    let relay_policy = ctx.resolve_relay_policy(&gw_namespace);
+    let res = reconcile_inner(gw, Arc::clone(&ctx), &relay_policy).await;
     crate::metrics::observe_reconcile("operator", started, &res);
 
     // Relay-tier convergence (#584): keep the namespace's relay in sync with
@@ -477,7 +504,7 @@ pub(crate) async fn reconcile_dedicated(
     // is logged and retried on the next reconcile of any Gateway in the namespace
     // (plus the periodic resync backstop), never folded into the Gateway status.
     if ctx.leader.load(Ordering::Acquire)
-        && let Err(e) = converge_namespace_relay(&ctx, &gw_namespace).await
+        && let Err(e) = converge_namespace_relay(&ctx, &gw_namespace, &relay_policy).await
     {
         tracing::warn!(
             namespace = %gw_namespace,
@@ -524,6 +551,7 @@ pub(crate) async fn reconcile_dedicated(
 async fn converge_namespace_relay(
     ctx: &ReconcileContext,
     namespace: &str,
+    policy: &EffectiveRelayPolicy,
 ) -> Result<(), ReconcileError> {
     if !ctx.relay_enabled || namespace.is_empty() {
         return Ok(());
@@ -536,28 +564,37 @@ async fn converge_namespace_relay(
         return Ok(());
     }
     let currently = ctx.relay_namespaces.lock().contains(namespace);
-    let desired = relay_desired(ctx, namespace, currently);
-    // Not wanted and not provisioned: the common case (shared-only or below-
-    // threshold namespace) — skip the delete round-trip.
+    let desired = relay_desired(ctx, namespace, currently, policy.enabled);
+    // Not wanted and not provisioned: the common case (shared-only, below-threshold, or
+    // policy-force-off namespace) — skip the delete round-trip.
     if !desired && !currently {
         return Ok(());
     }
 
     if desired {
+        // Policy overlay (#589): resources supersede the flat #584 flags; the replica count
+        // is the controller-driven autoscaling result (or the static override / global
+        // default); the PDB floor gates the disruption budget.
+        let resources = policy.resources.clone().or_else(|| {
+            render_relay::relay_resources(
+                &ctx.relay_cpu_request,
+                &ctx.relay_memory_request,
+                &ctx.relay_memory_limit,
+            )
+        });
+        let (replicas, pdb_replica_ceiling) = effective_relay_replicas(ctx, namespace, policy);
         let rendered = render_relay::render_relay(&render_relay::RelayRenderInputs {
             namespace,
-            replicas: i32::try_from(ctx.relay_replicas).unwrap_or(i32::MAX),
+            replicas,
             controller_image: &ctx.controller_image,
             discovery_endpoint: &ctx.discovery_endpoint,
             discovery_bootstrap_endpoint: &ctx.discovery_bootstrap_endpoint,
             discovery_sa_token_path: &ctx.discovery_sa_token_path,
             discovery_ca_bundle_path: &ctx.discovery_ca_bundle_path,
             discovery_trust_domain: &ctx.discovery_trust_domain,
-            resources: render_relay::relay_resources(
-                &ctx.relay_cpu_request,
-                &ctx.relay_memory_request,
-                &ctx.relay_memory_limit,
-            ),
+            resources,
+            pod_template: policy.pod_template.as_ref(),
+            pdb_replica_ceiling,
         });
         apply::apply_relay(&ctx.client, namespace, &rendered).await?;
         if !currently {
@@ -589,20 +626,107 @@ async fn converge_namespace_relay(
 ///
 /// The cost is a benign over-provision tail: a namespace that spiked past the
 /// threshold then shrank keeps its relay down to its last Gateway.
-fn relay_desired(ctx: &ReconcileContext, namespace: &str, currently_provisioned: bool) -> bool {
+///
+/// `enabled_override` is the `CoxswainRelayPolicy.spec.enabled` tri-state (#589):
+/// - `Some(true)` — force on whenever the namespace holds ≥1 active dedicated Gateway,
+///   bypassing the break-even threshold. Still GC'd at zero (a relay fronting nothing
+///   strands nobody).
+/// - `Some(false)` — force off unconditionally; overrides hysteresis (an explicit
+///   operator intent, unlike a transient dip).
+/// - `None` — the automatic threshold + hysteresis below (unchanged #584 default).
+fn relay_desired(
+    ctx: &ReconcileContext,
+    namespace: &str,
+    currently_provisioned: bool,
+    enabled_override: Option<bool>,
+) -> bool {
     let sum = namespace_desired_downstream_replicas(ctx, namespace);
     if sum == 0 {
-        // No active dedicated Gateways: never wanted (and the GC edge).
+        // No active dedicated Gateways: never wanted (and the GC edge) — applies even to a
+        // force-on policy, so an empty namespace never strands a relay.
         return false;
     }
-    if currently_provisioned {
-        // Keep until the namespace fully drains — no mid-range GC, no strand.
-        true
-    } else {
-        // Provision only at break-even. Clamp ≥1 so a misconfigured threshold of
-        // 0 can't provision a relay into a namespace with no dedicated Gateways.
-        sum >= ctx.relay_min_proxy_replicas.max(1)
+    match enabled_override {
+        Some(false) => false,
+        // sum ≥ 1 already established above.
+        Some(true) => true,
+        None if currently_provisioned => {
+            // Keep until the namespace fully drains — no mid-range GC, no strand.
+            true
+        }
+        None => {
+            // Provision only at break-even. Clamp ≥1 so a misconfigured threshold of
+            // 0 can't provision a relay into a namespace with no dedicated Gateways.
+            sum >= ctx.relay_min_proxy_replicas.max(1)
+        }
     }
+}
+
+/// Compute the relay's Deployment replica count and PDB floor for `namespace` (#589).
+///
+/// Returns `(deployment_replicas, pdb_replica_ceiling)`. Controller-driven autoscaling: when
+/// the policy enables it *and* sets `maxReplicas`, the relay is sized to the namespace's
+/// spec-derived dedicated-proxy fan-out — `clamp(ceil(fanout / targetProxiesPerReplica),
+/// minReplicas, maxReplicas)`. The spec-derived input never jitters on pod churn, so no
+/// stabilization is needed. When autoscaling is enabled but *uncapped*, the controller
+/// refuses to scale (an uncapped relay would regrow the leader fan-out the tier caps) and
+/// warn-logs, falling back to the static replica count. Otherwise the static count is the
+/// policy override or the `--relay-replicas` default.
+///
+/// The second element is the **PDB ceiling** — the *most* replicas the relay may run
+/// (autoscaling `maxReplicas`, else the static count), which gates the PDB. Gating on the
+/// ceiling, not the current/floor count, means an autoscaling relay that can reach ≥2
+/// replicas always carries a PDB even when it is momentarily scaled to 1 — otherwise a node
+/// drain could evict every replica of a scaled-up relay at once.
+fn effective_relay_replicas(
+    ctx: &ReconcileContext,
+    namespace: &str,
+    policy: &EffectiveRelayPolicy,
+) -> (i32, i32) {
+    let static_replicas = policy.replicas.unwrap_or(ctx.relay_replicas);
+    let fanout = namespace_desired_downstream_replicas(ctx, namespace);
+    compute_relay_replicas(
+        static_replicas,
+        policy.autoscaling.as_ref(),
+        fanout,
+        namespace,
+    )
+}
+
+/// Pure replica arithmetic behind [`effective_relay_replicas`], split out for unit testing.
+/// Returns `(deployment_replicas, pdb_replica_ceiling)`. See [`effective_relay_replicas`] for
+/// the contract; `namespace` is used only for the uncapped warn-log.
+fn compute_relay_replicas(
+    static_replicas: u32,
+    autoscaling: Option<&coxswain_core::crd::RelayAutoscaling>,
+    fanout: u32,
+    namespace: &str,
+) -> (i32, i32) {
+    if let Some(a) = autoscaling.filter(|a| a.enabled) {
+        if let Some(max) = a.max_replicas {
+            let min = a.min_replicas.unwrap_or(static_replicas).min(max);
+            let target = a.target_proxies_per_replica.unwrap_or(8).max(1);
+            let scaled = fanout.div_ceil(target).clamp(min, max);
+            // PDB ceiling is `max`: the relay can scale up to it, so it needs a PDB
+            // whenever max ≥ 2 even if currently (or at minimum) 1 replica.
+            return (clamp_u32_to_i32(scaled), clamp_u32_to_i32(max));
+        }
+        tracing::warn!(
+            namespace = %namespace,
+            "relay policy: autoscaling enabled without maxReplicas; falling back to static \
+             replicas (an uncapped relay would regrow the leader fan-out the tier caps)"
+        );
+    }
+    (
+        clamp_u32_to_i32(static_replicas),
+        clamp_u32_to_i32(static_replicas),
+    )
+}
+
+/// Saturating `u32 → i32` for replica counts (a count above `i32::MAX` is nonsensical but
+/// must never wrap or panic).
+fn clamp_u32_to_i32(v: u32) -> i32 {
+    i32::try_from(v).unwrap_or(i32::MAX)
 }
 
 /// Sum of desired dedicated-proxy replicas across a namespace's active dedicated
@@ -668,15 +792,20 @@ async fn delete_relay_resources(client: &Client, namespace: &str) -> Result<(), 
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
     let services: Api<Service> = Api::namespaced(client.clone(), namespace);
     let service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    // The PDB is optional (rendered only at floor ≥2); delete it unconditionally so GC is
+    // complete whether or not one was ever provisioned (NotFound is success).
+    let pdbs: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
     ignore_not_found(deployments.delete(render_relay::RELAY_NAME, &dp).await)?;
     ignore_not_found(services.delete(render_relay::RELAY_NAME, &dp).await)?;
     ignore_not_found(service_accounts.delete(render_relay::RELAY_NAME, &dp).await)?;
+    ignore_not_found(pdbs.delete(render_relay::RELAY_NAME, &dp).await)?;
     Ok(())
 }
 
 async fn reconcile_inner(
     gw: Arc<Gateway>,
     ctx: Arc<ReconcileContext>,
+    relay_policy: &EffectiveRelayPolicy,
 ) -> Result<StatusOutcome, ReconcileError> {
     if !ctx.leader.load(Ordering::Acquire) {
         // Non-leader pods don't apply. Re-queue rather than `await_change()`
@@ -911,7 +1040,7 @@ async fn reconcile_inner(
     // controller endpoint exactly as before.
     let relay_fronted = ctx.relay_enabled && {
         let currently = ctx.relay_namespaces.lock().contains(gw_namespace);
-        relay_desired(&ctx, gw_namespace, currently)
+        relay_desired(&ctx, gw_namespace, currently, relay_policy.enabled)
     };
     let relay_endpoint = relay_fronted.then(|| {
         format!(
@@ -1533,6 +1662,77 @@ fn log_rendered_change(gw: &Gateway, rendered: &render::RenderedSpecs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn autoscaling(
+        min: Option<u32>,
+        max: Option<u32>,
+        target: Option<u32>,
+    ) -> coxswain_core::crd::RelayAutoscaling {
+        serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "minReplicas": min,
+            "maxReplicas": max,
+            "targetProxiesPerReplica": target,
+        }))
+        .expect("valid RelayAutoscaling")
+    }
+
+    #[test]
+    fn compute_relay_replicas_static_when_autoscaling_off() {
+        // No autoscaling → static count for both replicas and PDB floor.
+        assert_eq!(compute_relay_replicas(2, None, 50, "ns"), (2, 2));
+    }
+
+    #[test]
+    fn compute_relay_replicas_scales_to_fanout_within_cap() {
+        // fanout 30, target 8 → ceil(30/8)=4, within [2,6]. PDB ceiling = max (6).
+        let a = autoscaling(Some(2), Some(6), Some(8));
+        assert_eq!(compute_relay_replicas(2, Some(&a), 30, "ns"), (4, 6));
+    }
+
+    #[test]
+    fn compute_relay_replicas_clamps_to_min_and_max() {
+        let a = autoscaling(Some(3), Some(5), Some(1));
+        // fanout 1 → ceil(1/1)=1, clamped up to min 3; PDB ceiling = max (5).
+        assert_eq!(compute_relay_replicas(2, Some(&a), 1, "ns"), (3, 5));
+        // fanout 100 → clamped down to max 5.
+        assert_eq!(compute_relay_replicas(2, Some(&a), 100, "ns"), (5, 5));
+    }
+
+    #[test]
+    fn compute_relay_replicas_min_above_max_cannot_panic() {
+        // Misconfigured min>max: min is pinned to max, no clamp panic; ceiling = max.
+        let a = autoscaling(Some(9), Some(4), Some(1));
+        assert_eq!(compute_relay_replicas(2, Some(&a), 100, "ns"), (4, 4));
+    }
+
+    #[test]
+    fn compute_relay_replicas_pdb_ceiling_is_max_not_floor() {
+        // An autoscaling relay with min 1 but max 10 must report a PDB ceiling of 10
+        // (so a PDB is provisioned) even though the current count is 1.
+        let a = autoscaling(Some(1), Some(10), Some(8));
+        assert_eq!(
+            compute_relay_replicas(2, Some(&a), 1, "ns"),
+            (1, 10),
+            "PDB ceiling is maxReplicas so a scaled-up relay keeps its PDB"
+        );
+    }
+
+    #[test]
+    fn compute_relay_replicas_uncapped_falls_back_to_static() {
+        // enabled but no maxReplicas → refuse to autoscale, use static replicas.
+        let a = autoscaling(Some(2), None, Some(1));
+        assert_eq!(compute_relay_replicas(3, Some(&a), 100, "ns"), (3, 3));
+    }
+
+    #[test]
+    fn compute_relay_replicas_disabled_autoscaling_is_static() {
+        let a: coxswain_core::crd::RelayAutoscaling = serde_json::from_value(serde_json::json!({
+            "enabled": false, "maxReplicas": 9,
+        }))
+        .expect("valid");
+        assert_eq!(compute_relay_replicas(2, Some(&a), 100, "ns"), (2, 2));
+    }
 
     #[test]
     fn gateway_key_uses_namespace_and_name() {

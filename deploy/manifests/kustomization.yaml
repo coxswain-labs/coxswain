@@ -21,6 +21,7 @@ resources:
   - controller-rbac.yaml
   - shared-proxy-rbac.yaml
   - crds/coxswaingatewayparameters.yaml
+  - crds/coxswainrelaypolicies.yaml
   - crds/clienttrafficpolicies.yaml
   - crds/coxswainbackendpolicies.yaml
   - crds/coxswainexternalauths.yaml

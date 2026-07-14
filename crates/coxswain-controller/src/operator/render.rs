@@ -655,7 +655,7 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
     };
 
     let pod_template = match inputs.params.pod_template.as_ref() {
-        Some(overlay) => merge_pod_template(&base_pod_template, overlay),
+        Some(overlay) => merge_pod_template(&base_pod_template, overlay, gw_name),
         None => base_pod_template,
     };
 
@@ -808,20 +808,48 @@ fn container_ports(
 /// Apply a partial `PodTemplateSpec` overlay to a base via the strategic
 /// merge from [`super::merge`]. Round-trips through JSON because the
 /// strategic-merge primitive operates on [`serde_json::Value`].
-fn merge_pod_template(base: &PodTemplateSpec, overlay: &serde_json::Value) -> PodTemplateSpec {
-    let base_json = serde_json::to_value(base)
-        .unwrap_or_else(|e| panic!("invariant: PodTemplateSpec must serialize to JSON: {e}"));
+///
+/// Shared with [`super::render_relay`] so the namespace relay's `podTemplate`
+/// escape hatch (#589) merges with identical semantics to the dedicated proxy's.
+///
+/// **Never panics.** The overlay is operator-supplied and opaque to the CRD
+/// validator (`x-kubernetes-preserve-unknown-fields`), so a malformed overlay
+/// (e.g. `containers` patched into a non-array) that makes the merged value fail
+/// to deserialize back into a `PodTemplateSpec` is a *runtime-reachable* input,
+/// not a bug-only invariant. Rather than crash the reconcile, it degrades to the
+/// un-overlaid `base` and warn-logs under `context` (the resource being rendered),
+/// so the operator's other fields still apply and the bad overlay is visible.
+pub(super) fn merge_pod_template(
+    base: &PodTemplateSpec,
+    overlay: &serde_json::Value,
+    context: &str,
+) -> PodTemplateSpec {
+    let base_json = match serde_json::to_value(base) {
+        Ok(v) => v,
+        Err(e) => {
+            // A controller-constructed PodTemplateSpec has no runtime-reachable way
+            // to fail serialization; degrade rather than crash if it somehow does.
+            tracing::warn!(
+                context = %context,
+                error = %e,
+                "podTemplate base failed to serialize; rendering without the overlay"
+            );
+            return base.clone();
+        }
+    };
     let merged = strategic_merge_pod_template(&base_json, overlay);
-    serde_json::from_value(merged).unwrap_or_else(|e| {
-        // Malformed overlay (e.g. patched `containers` into a non-array)
-        // would land here. The reconciler logs the rendering failure and
-        // skips this Gateway; we choose to surface a clear panic so the bug
-        // doesn't slip past tests.
-        panic!(
-            "invariant: merged PodTemplateSpec must deserialize cleanly; \
-             the operator's podTemplate overlay produced an invalid spec: {e}"
-        )
-    })
+    match serde_json::from_value::<PodTemplateSpec>(merged) {
+        Ok(pt) => pt,
+        Err(e) => {
+            tracing::warn!(
+                context = %context,
+                error = %e,
+                "operator podTemplate overlay produced an invalid PodTemplateSpec; \
+                 ignoring the overlay and rendering the base pod spec"
+            );
+            base.clone()
+        }
+    }
 }
 
 /// Render a `HorizontalPodAutoscaler` targeting the dedicated-proxy Deployment.
@@ -1322,6 +1350,52 @@ mod tests {
                 .expect("nodeSelector")
                 .get("tier"),
             Some(&"edge".to_string())
+        );
+    }
+
+    /// A malformed operator `podTemplate` overlay (e.g. `containers` patched into a
+    /// non-array) is runtime-reachable — the CRD preserves unknown fields — so it must
+    /// degrade to the base pod spec and NOT panic the reconcile.
+    #[test]
+    fn merge_pod_template_degrades_on_malformed_overlay_without_panic() {
+        let base: PodTemplateSpec = serde_json::from_value(json!({
+            "spec": {"containers": [{"name": "coxswain", "image": "coxswain:v0.2"}]}
+        }))
+        .expect("valid base");
+        let overlay = json!({"spec": {"containers": "not-an-array"}});
+        let merged = merge_pod_template(&base, &overlay, "test-gw");
+        let names: Vec<String> = merged
+            .spec
+            .expect("pod spec")
+            .containers
+            .iter()
+            .map(|c| c.name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["coxswain".to_string()],
+            "malformed overlay is ignored; the base coxswain container is preserved"
+        );
+    }
+
+    /// A well-formed overlay still applies (regression guard for the degrade path).
+    #[test]
+    fn merge_pod_template_applies_valid_overlay() {
+        let base: PodTemplateSpec = serde_json::from_value(json!({
+            "spec": {"containers": [{"name": "coxswain"}]}
+        }))
+        .expect("valid base");
+        let overlay = json!({"spec": {"nodeSelector": {"zone": "eu"}}});
+        let merged = merge_pod_template(&base, &overlay, "test-gw");
+        assert_eq!(
+            merged
+                .spec
+                .expect("pod spec")
+                .node_selector
+                .expect("nodeSelector")
+                .get("zone")
+                .map(String::as_str),
+            Some("eu")
         );
     }
 

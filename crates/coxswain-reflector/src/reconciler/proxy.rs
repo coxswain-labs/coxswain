@@ -55,8 +55,8 @@ use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
 use coxswain_core::crd::coxswain_backend_policy::CoxswainBackendPolicy;
 use coxswain_core::crd::{
     BasicAuth, Compression, CoxswainExternalAuth, CoxswainGatewayParameters,
-    CoxswainIngressClassParameters, IpAccessControl, JwtAuth, PathRewriteRegex, RateLimit,
-    RequestSizeLimit, RetryPolicy,
+    CoxswainIngressClassParameters, CoxswainRelayPolicy, IpAccessControl, JwtAuth,
+    PathRewriteRegex, RateLimit, RequestSizeLimit, RetryPolicy,
 };
 use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
 use coxswain_core::fleet::{self, SharedFleet};
@@ -646,6 +646,9 @@ pub struct OperatorStores {
     pub gateway_classes: reflector::Store<GatewayClass>,
     /// `CoxswainGatewayParameters` reader (operator-only watch).
     pub params: reflector::Store<CoxswainGatewayParameters>,
+    /// `CoxswainRelayPolicy` reader (operator-only watch, #589): per-namespace relay
+    /// tuning overlaid onto the #584 global relay defaults.
+    pub relay_policies: reflector::Store<CoxswainRelayPolicy>,
     /// Fleet `Pod` reader (`app.kubernetes.io/name=coxswain`); the operator
     /// filters to dedicated-proxy Pods.
     pub pods: reflector::Store<Pod>,
@@ -667,6 +670,7 @@ pub struct OperatorStores {
 /// [`OperatorStores`] readers exist at wiring time, then driven by `spawn_tasks`.
 struct OperatorStoreWriters {
     params: reflector::store::Writer<CoxswainGatewayParameters>,
+    relay_policies: reflector::store::Writer<CoxswainRelayPolicy>,
     nodes: reflector::store::Writer<Node>,
     namespaces: reflector::store::Writer<Namespace>,
     services: reflector::store::Writer<Service>,
@@ -708,93 +712,97 @@ impl SharedProxyReconciler {
         // controller's unified status worker at wiring time. Plain reflector
         // stores: the worker reads them, the rebuild pass enqueues from them, and
         // nothing fans out to back-pressure the root reflector (#574).
-        let (status_store_writers, status_stores, operator_store_writers, operator_stores) =
-            if opts.status_stores {
-                let (gateways_r, gateways_w) = reflector::store::<Gateway>();
-                let (gateway_classes_r, gateway_classes_w) = reflector::store::<GatewayClass>();
-                let (routes_r, routes_w) = reflector::store::<HttpRoute>();
-                let (grpc_routes_r, grpc_routes_w) = reflector::store::<GrpcRoute>();
-                let (ingresses_r, ingresses_w) = reflector::store::<Ingress>();
-                let (ingress_classes_r, ingress_classes_w) = reflector::store::<IngressClass>();
-                let (policies_r, policies_w) = reflector::store::<BackendTlsPolicy>();
-                let (tls_routes_r, tls_routes_w) = reflector::store::<TlsRoute>();
-                let (tcp_routes_r, tcp_routes_w) = reflector::store::<TcpRoute>();
-                let (udp_routes_r, udp_routes_w) = reflector::store::<UdpRoute>();
-                let (listener_sets_r, listener_sets_w) = reflector::store::<ListenerSet>();
-                let (client_traffic_policies_r, client_traffic_policies_w) =
-                    reflector::store::<ClientTrafficPolicy>();
-                let (coxswain_backend_policies_r, coxswain_backend_policies_w) =
-                    reflector::store::<CoxswainBackendPolicy>();
-                let (coxswain_external_auths_r, coxswain_external_auths_w) =
-                    reflector::store::<CoxswainExternalAuth>();
-                // Operator-specific + shared stores (#574 operator fold). `params` and
-                // `nodes` are watched only for the operator; `namespaces`/`services`/
-                // `pods` are shared with routing/fleet. `gateways`/`gateway_classes`/
-                // `listener_sets` reuse the status readers above (same watch, cloned
-                // handle).
-                let (params_r, params_w) = reflector::store::<CoxswainGatewayParameters>();
-                let (nodes_r, nodes_w) = reflector::store::<Node>();
-                let (namespaces_r, namespaces_w) = reflector::store::<Namespace>();
-                let (services_r, services_w) = reflector::store::<Service>();
-                let (pods_r, pods_w) = reflector::store::<Pod>();
-                let op_stores = OperatorStores {
-                    gateway_classes: gateway_classes_r.clone(),
-                    params: params_r,
-                    pods: pods_r,
-                    nodes: nodes_r,
-                    gateways: gateways_r.clone(),
-                    services: services_r,
-                    listener_sets: listener_sets_r.clone(),
-                    namespaces: namespaces_r,
-                };
-                let op_writers = OperatorStoreWriters {
-                    params: params_w,
-                    nodes: nodes_w,
-                    namespaces: namespaces_w,
-                    services: services_w,
-                    pods: pods_w,
-                };
-                let stores = StatusStores {
-                    gateways: gateways_r,
-                    gateway_classes: gateway_classes_r,
-                    routes: routes_r,
-                    grpc_routes: grpc_routes_r,
-                    ingresses: ingresses_r,
-                    ingress_classes: ingress_classes_r,
-                    policies: policies_r,
-                    tls_routes: tls_routes_r,
-                    tcp_routes: tcp_routes_r,
-                    udp_routes: udp_routes_r,
-                    listener_sets: listener_sets_r,
-                    client_traffic_policies: client_traffic_policies_r,
-                    coxswain_backend_policies: coxswain_backend_policies_r,
-                    coxswain_external_auths: coxswain_external_auths_r,
-                };
-                let writers = StatusStoreWriters {
-                    gateways: gateways_w,
-                    gateway_classes: gateway_classes_w,
-                    routes: routes_w,
-                    grpc_routes: grpc_routes_w,
-                    ingresses: ingresses_w,
-                    ingress_classes: ingress_classes_w,
-                    policies: policies_w,
-                    tls_routes: tls_routes_w,
-                    tcp_routes: tcp_routes_w,
-                    udp_routes: udp_routes_w,
-                    listener_sets: listener_sets_w,
-                    client_traffic_policies: client_traffic_policies_w,
-                    coxswain_backend_policies: coxswain_backend_policies_w,
-                    coxswain_external_auths: coxswain_external_auths_w,
-                };
-                (
-                    Some(writers),
-                    Some(stores),
-                    Some(op_writers),
-                    Some(op_stores),
-                )
-            } else {
-                (None, None, None, None)
+        let (status_store_writers, status_stores, operator_store_writers, operator_stores) = if opts
+            .status_stores
+        {
+            let (gateways_r, gateways_w) = reflector::store::<Gateway>();
+            let (gateway_classes_r, gateway_classes_w) = reflector::store::<GatewayClass>();
+            let (routes_r, routes_w) = reflector::store::<HttpRoute>();
+            let (grpc_routes_r, grpc_routes_w) = reflector::store::<GrpcRoute>();
+            let (ingresses_r, ingresses_w) = reflector::store::<Ingress>();
+            let (ingress_classes_r, ingress_classes_w) = reflector::store::<IngressClass>();
+            let (policies_r, policies_w) = reflector::store::<BackendTlsPolicy>();
+            let (tls_routes_r, tls_routes_w) = reflector::store::<TlsRoute>();
+            let (tcp_routes_r, tcp_routes_w) = reflector::store::<TcpRoute>();
+            let (udp_routes_r, udp_routes_w) = reflector::store::<UdpRoute>();
+            let (listener_sets_r, listener_sets_w) = reflector::store::<ListenerSet>();
+            let (client_traffic_policies_r, client_traffic_policies_w) =
+                reflector::store::<ClientTrafficPolicy>();
+            let (coxswain_backend_policies_r, coxswain_backend_policies_w) =
+                reflector::store::<CoxswainBackendPolicy>();
+            let (coxswain_external_auths_r, coxswain_external_auths_w) =
+                reflector::store::<CoxswainExternalAuth>();
+            // Operator-specific + shared stores (#574 operator fold). `params` and
+            // `nodes` are watched only for the operator; `namespaces`/`services`/
+            // `pods` are shared with routing/fleet. `gateways`/`gateway_classes`/
+            // `listener_sets` reuse the status readers above (same watch, cloned
+            // handle).
+            let (params_r, params_w) = reflector::store::<CoxswainGatewayParameters>();
+            let (relay_policies_r, relay_policies_w) = reflector::store::<CoxswainRelayPolicy>();
+            let (nodes_r, nodes_w) = reflector::store::<Node>();
+            let (namespaces_r, namespaces_w) = reflector::store::<Namespace>();
+            let (services_r, services_w) = reflector::store::<Service>();
+            let (pods_r, pods_w) = reflector::store::<Pod>();
+            let op_stores = OperatorStores {
+                gateway_classes: gateway_classes_r.clone(),
+                params: params_r,
+                relay_policies: relay_policies_r,
+                pods: pods_r,
+                nodes: nodes_r,
+                gateways: gateways_r.clone(),
+                services: services_r,
+                listener_sets: listener_sets_r.clone(),
+                namespaces: namespaces_r,
             };
+            let op_writers = OperatorStoreWriters {
+                params: params_w,
+                relay_policies: relay_policies_w,
+                nodes: nodes_w,
+                namespaces: namespaces_w,
+                services: services_w,
+                pods: pods_w,
+            };
+            let stores = StatusStores {
+                gateways: gateways_r,
+                gateway_classes: gateway_classes_r,
+                routes: routes_r,
+                grpc_routes: grpc_routes_r,
+                ingresses: ingresses_r,
+                ingress_classes: ingress_classes_r,
+                policies: policies_r,
+                tls_routes: tls_routes_r,
+                tcp_routes: tcp_routes_r,
+                udp_routes: udp_routes_r,
+                listener_sets: listener_sets_r,
+                client_traffic_policies: client_traffic_policies_r,
+                coxswain_backend_policies: coxswain_backend_policies_r,
+                coxswain_external_auths: coxswain_external_auths_r,
+            };
+            let writers = StatusStoreWriters {
+                gateways: gateways_w,
+                gateway_classes: gateway_classes_w,
+                routes: routes_w,
+                grpc_routes: grpc_routes_w,
+                ingresses: ingresses_w,
+                ingress_classes: ingress_classes_w,
+                policies: policies_w,
+                tls_routes: tls_routes_w,
+                tcp_routes: tcp_routes_w,
+                udp_routes: udp_routes_w,
+                listener_sets: listener_sets_w,
+                client_traffic_policies: client_traffic_policies_w,
+                coxswain_backend_policies: coxswain_backend_policies_w,
+                coxswain_external_auths: coxswain_external_auths_w,
+            };
+            (
+                Some(writers),
+                Some(stores),
+                Some(op_writers),
+                Some(op_stores),
+            )
+        } else {
+            (None, None, None, None)
+        };
         Self {
             ingress_routes,
             gateway_routes,
@@ -1707,16 +1715,17 @@ async fn spawn_tasks(
     // Operator-fold (#574): pre-created writers for the shared namespaces /
     // services / pods stores and the operator-only params / Node watches, or all
     // `None` in the proxy role (no operator there).
-    let (op_params_w, op_nodes_w, op_namespaces_w, op_services_w, op_pods_w) =
+    let (op_params_w, op_relay_policies_w, op_nodes_w, op_namespaces_w, op_services_w, op_pods_w) =
         match operator_writers {
             Some(w) => (
                 Some(w.params),
+                Some(w.relay_policies),
                 Some(w.nodes),
                 Some(w.namespaces),
                 Some(w.services),
                 Some(w.pods),
             ),
-            None => (None, None, None, None, None),
+            None => (None, None, None, None, None, None),
         };
     let (route_reader, route_writer) = reader_writer::<HttpRoute>(pre.routes);
     let (grpc_route_reader, grpc_route_writer) = reader_writer::<GrpcRoute>(pre.grpc_routes);
@@ -2123,13 +2132,15 @@ async fn spawn_tasks(
 
     // --- Operator-fold watches (#574), controller + Gateway API only ---
     //
-    // CoxswainGatewayParameters (dedicated-proxy spec source) and Node (NodePort
-    // address resolution) back OperatorStores. The reflector drives them here so
-    // the dedicated-provisioning operator no longer runs its own client/watches.
-    // Gated by Gateway API (dedicated Gateways require it) and by the presence of
-    // the pre-created operator writers (controller role).
+    // CoxswainGatewayParameters (dedicated-proxy spec source), CoxswainRelayPolicy
+    // (per-namespace relay tuning, #589), and Node (NodePort address resolution) back
+    // OperatorStores. The reflector drives them here so the dedicated-provisioning
+    // operator no longer runs its own client/watches. Gated by Gateway API (dedicated
+    // Gateways require it) and by the presence of the pre-created operator writers
+    // (controller role).
     if enable_gateway_api
-        && let (Some(params_writer), Some(nodes_writer)) = (op_params_w, op_nodes_w)
+        && let (Some(params_writer), Some(relay_policies_writer), Some(nodes_writer)) =
+            (op_params_w, op_relay_policies_w, op_nodes_w)
     {
         spawn_reflector(
             &mut set,
@@ -2143,6 +2154,21 @@ async fn spawn_tasks(
                 metrics,
             ),
             "CoxswainGatewayParameters",
+        );
+        // CoxswainRelayPolicy is cluster-scoped; a policy change re-enqueues owned
+        // Gateways via `rebuild_tx` so per-namespace relay convergence recomputes.
+        spawn_reflector(
+            &mut set,
+            relay_policies_writer,
+            Api::<CoxswainRelayPolicy>::all(watch_client(&kube_config, &client)),
+            control_watch_config(),
+            ReflectorEffects::new(
+                &rebuild_tx,
+                &controller_health,
+                "coxswain_relay_policy",
+                metrics,
+            ),
+            "CoxswainRelayPolicy",
         );
         spawn_reflector(
             &mut set,
