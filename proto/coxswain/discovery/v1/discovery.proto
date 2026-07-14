@@ -51,6 +51,7 @@ message ClientMessage {
     Ack ack = 2;
     Nack nack = 3;
     NodeStatus node_status = 4; // node telemetry (#531); additive (no WIRE_VERSION bump)
+    RosterReport roster_report = 5; // relay leaf-roster telemetry (#585); additive (no WIRE_VERSION bump)
   }
 }
 
@@ -124,6 +125,47 @@ message NodeStatus {
   repeated uint32 bound_ports = 1;
 }
 
+// Relay → controller leaf-roster telemetry (#585). A relay's downstream
+// NodeRegistry snapshot: every leaf proxy connected to this relay, with the
+// state the controller's #531 Programmed gate and topology panel need.
+//
+// Wholesale-replace, like NodeStatus: this is the relay's COMPLETE current
+// child set. The controller folds each child keyed by its `node_id`, tagged
+// with this relay's stream as parent, and evicts any prior child of this relay
+// absent from the latest report. When the relay's stream drops, the controller
+// evicts the whole subtree (fail-closed: a new publish must not flip Programmed
+// on a blind spot). The #531 quorum evaluates the folded LEAF entries — a
+// relay's own ack never satisfies the gate for its subtree.
+//
+// Coexists with #531's NodeStatus (kind 4) by construction: leaves send
+// NodeStatus to the relay, the relay aggregates and sends RosterReport upstream.
+message RosterReport {
+  repeated RosterEntry children = 1;
+}
+
+// One leaf proxy in a relay's downstream registry (#585). Mirrors the fields of
+// `coxswain_core::node_registry::NodeEntry` the controller needs to fold and
+// gate on; `target_version` is the relay's current downstream world for this
+// leaf's scope (byte-identical to the controller's, so `in_sync` derives).
+message RosterEntry {
+  string node_id = 1;
+  Scope scope = 2; // reuses the Subscribe scope message
+  optional string acked_version = 3; // content hash the leaf last Ack'd; absent = never acked
+  optional string target_version = 4; // relay's current downstream world version for this leaf
+  // Publish sequence the leaf last Ack'd, expressed in the CONTROLLER's seq
+  // space (the relay re-stamps its downstream index from the upstream
+  // publish-seq; see the relay tier docs). Absent = never acked.
+  optional uint64 acked_seq = 5;
+  // Whether the leaf has reported a bound-port set at all. Distinguishes
+  // "unreported" (fail-closed: not bound) from an affirmative empty report
+  // (an empty set) — load-bearing for the #531 gate, mirroring the optional
+  // bound-port set on NodeEntry (None vs an empty set).
+  bool bound_reported = 6;
+  repeated uint32 bound_ports = 7; // u16 values, sorted; meaningful only when bound_reported
+  int64 connected_since_unix = 8; // leaf's stream-open time at the relay (Unix seconds)
+  optional int64 last_ack_at_unix = 9; // leaf's most recent Ack time (Unix seconds); absent = never acked
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // Server → client
 // ────────────────────────────────────────────────────────────────────────────
@@ -171,6 +213,13 @@ message Snapshot {
   // Canonical keys of resources removed since the last acked baseline (delta
   // only; empty on a full). Sorted for hash determinism.
   repeated string removed_resources = 40;
+  // Controller publish sequence at which this snapshot was built (#585 relay
+  // tier). ENVELOPE metadata only — deliberately NOT part of the content hash
+  // (`version` hashes `resources`, never this field), so a fresh seq every
+  // rebuild does not churn `version` or the delta baseline. A direct proxy
+  // ignores it; a relay re-stamps its downstream publish index from it so its
+  // leaves Ack in the controller's seq space (see the relay tier docs).
+  uint64 publish_seq = 41;
 }
 
 // One addressable slice of the routing world. Exactly one payload arm is set;

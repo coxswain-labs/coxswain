@@ -104,6 +104,14 @@ pub struct DiscoveryClientConfig {
     /// open, and again on every change — feeding the controller's Gateway
     /// `Programmed` readiness gate. `None` (default) = no reporting.
     pub bound_ports_rx: Option<watch::Receiver<std::collections::BTreeSet<u16>>>,
+    /// Receives a relay's downstream leaf roster (#585).
+    ///
+    /// When `Some` (relay roles only), the supervisor pushes a `RosterReport` to
+    /// the controller immediately after `Subscribe` on every stream open, and
+    /// again whenever the roster changes — folding leaf state into the
+    /// controller's registry for the #531 gate and the topology panel. `None`
+    /// (default) = no reporting (leaf proxies and the controller never report).
+    pub roster_rx: Option<watch::Receiver<coxswain_core::node_registry::NodeRegistry>>,
 }
 
 impl DiscoveryClientConfig {
@@ -124,6 +132,7 @@ impl DiscoveryClientConfig {
             expected_server: None,
             svid_rotated: None,
             bound_ports_rx: None,
+            roster_rx: None,
         }
     }
 }
@@ -450,6 +459,8 @@ impl Supervisor {
         let mut svid_rotation_rx: Option<watch::Receiver<u64>> = self.config.svid_rotated.take();
         let mut bound_ports_rx: Option<watch::Receiver<std::collections::BTreeSet<u16>>> =
             self.config.bound_ports_rx.take();
+        let mut roster_rx: Option<watch::Receiver<coxswain_core::node_registry::NodeRegistry>> =
+            self.config.roster_rx.take();
         let mut attempt: u32 = 0;
         let mut consecutive_not_leader: u32 = 0;
 
@@ -483,7 +494,7 @@ impl Supervisor {
                     // track it separately so the backoff exponent is not bumped.
                     if let Some(ref mut rx) = svid_rotation_rx {
                         tokio::select! {
-                            result = self.stream_until_closed(&mut grpc, bound_ports_rx.as_mut()) => (result, false),
+                            result = self.stream_until_closed(&mut grpc, bound_ports_rx.as_mut(), roster_rx.as_mut()) => (result, false),
                             Ok(()) = rx.changed() => {
                                 debug!("discovery client: SVID rotated; forcing reconnect with fresh SVID");
                                 (FAILED, true)
@@ -491,8 +502,12 @@ impl Supervisor {
                         }
                     } else {
                         (
-                            self.stream_until_closed(&mut grpc, bound_ports_rx.as_mut())
-                                .await,
+                            self.stream_until_closed(
+                                &mut grpc,
+                                bound_ports_rx.as_mut(),
+                                roster_rx.as_mut(),
+                            )
+                            .await,
                             false,
                         )
                     }
@@ -581,10 +596,15 @@ impl Supervisor {
     /// bound-port set is queued right after `Subscribe` (so a reconnected
     /// leader rebuilds its readiness view immediately) and re-sent on every
     /// change of the watched set for the life of the session (#531).
+    ///
+    /// When `roster` is `Some` (relay roles), a `RosterReport` carrying the
+    /// relay's downstream leaf registry is queued after `Subscribe` and re-sent
+    /// on every roster change, on the same pre-queue + re-send rationale (#585).
     async fn stream_until_closed(
         &mut self,
         grpc: &mut TonicClient<Channel>,
         mut bound_ports: Option<&mut watch::Receiver<std::collections::BTreeSet<u16>>>,
+        mut roster: Option<&mut watch::Receiver<coxswain_core::node_registry::NodeRegistry>>,
     ) -> StreamEnd {
         const CLOSED: StreamEnd = StreamEnd {
             applied: false,
@@ -620,6 +640,17 @@ impl Supervisor {
         if let Some(rx) = bound_ports.as_mut() {
             let ports = rx.borrow_and_update().clone();
             if tx.send(node_status_message(&ports)).await.is_err() {
+                warn!("discovery client: outbound channel closed before stream open");
+                return CLOSED;
+            }
+        }
+
+        // Queue the initial leaf roster behind Subscribe (#585). On a reconnect
+        // this rebuilds the (possibly new) leader's view of this relay's subtree
+        // without waiting for a downstream registry change.
+        if let Some(rx) = roster.as_mut() {
+            let registry = rx.borrow_and_update().clone();
+            if tx.send(roster_report_message(&registry)).await.is_err() {
                 warn!("discovery client: outbound channel closed before stream open");
                 return CLOSED;
             }
@@ -696,6 +727,37 @@ impl Supervisor {
                             // stop watching; the stream will close shortly.
                             debug!("discovery client: bound-port sender dropped; no further NodeStatus reports");
                             bound_ports = None;
+                        }
+                    }
+                    continue;
+                }
+
+                // Downstream leaf roster changed mid-session — report it (#585).
+                // Inert (`pending`) when no receiver is wired (leaf/controller).
+                changed = async {
+                    match roster.as_mut() {
+                        Some(rx) => rx.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match changed {
+                        Ok(()) => {
+                            let Some(rx) = roster.as_mut() else { continue };
+                            let registry = rx.borrow_and_update().clone();
+                            debug!(
+                                children = registry.nodes.len(),
+                                "discovery client: leaf roster changed; sending RosterReport"
+                            );
+                            if tx.send(roster_report_message(&registry)).await.is_err() {
+                                debug!("discovery client: outbound channel closed after RosterReport");
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            // Roster sender dropped (relay shutting down) — stop
+                            // watching; the stream will close shortly.
+                            debug!("discovery client: roster sender dropped; no further RosterReport");
+                            roster = None;
                         }
                     }
                     continue;
@@ -862,6 +924,71 @@ fn node_status_message(ports: &std::collections::BTreeSet<u16>) -> p::ClientMess
         kind: Some(CKind::NodeStatus(p::NodeStatus {
             bound_ports: ports.iter().map(|port| u32::from(*port)).collect(),
         })),
+    }
+}
+
+/// Unix seconds for a [`SystemTime`], clamped: a pre-epoch time reads 0 and a
+/// far-future one saturates `i64` rather than panicking on the cast.
+fn system_time_to_unix(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Encode a core [`NodeScope`] as the wire [`Scope`] for a `RosterEntry` (#585).
+///
+/// [`NodeScope`] is `#[non_exhaustive]`; a future variant with no wire
+/// representation degrades to `SharedPool` (which the controller also decodes
+/// from an absent scope) rather than dropping the child — the data plane never
+/// panics on a cross-crate enum addition.
+///
+/// [`NodeScope`]: coxswain_core::node_registry::NodeScope
+/// [`Scope`]: p::Scope
+fn node_scope_to_wire(scope: &coxswain_core::node_registry::NodeScope) -> p::Scope {
+    use coxswain_core::node_registry::NodeScope;
+    let kind = match scope {
+        NodeScope::Gateway { namespace, name } => p::scope::Kind::Gateway(p::GatewayScope {
+            namespace: namespace.clone(),
+            name: name.clone(),
+        }),
+        NodeScope::Namespace { namespace } => p::scope::Kind::Namespace(p::NamespaceScope {
+            namespace: namespace.clone(),
+        }),
+        // `SharedPool`, plus any future `#[non_exhaustive]` variant we can't
+        // express on the wire, degrade to `SharedPool`.
+        _ => p::scope::Kind::SharedPool(p::SharedPoolScope {}),
+    };
+    p::Scope { kind: Some(kind) }
+}
+
+/// Build a `RosterReport` client message from a relay's downstream registry
+/// (#585): every leaf becomes a `RosterEntry`, carrying the state the
+/// controller's #531 gate and topology panel fold in.
+fn roster_report_message(
+    registry: &coxswain_core::node_registry::NodeRegistry,
+) -> p::ClientMessage {
+    let children = registry
+        .nodes
+        .values()
+        .map(|e| p::RosterEntry {
+            node_id: e.node_id.clone(),
+            scope: Some(node_scope_to_wire(&e.scope)),
+            acked_version: e.last_acked_version.clone(),
+            target_version: e.target_version.clone(),
+            acked_seq: e.last_acked_seq,
+            // Preserve the None/Some(∅) distinction the gate relies on.
+            bound_reported: e.bound_ports.is_some(),
+            bound_ports: e
+                .bound_ports
+                .as_ref()
+                .map(|s| s.iter().map(|port| u32::from(*port)).collect())
+                .unwrap_or_default(),
+            connected_since_unix: system_time_to_unix(e.connected_since),
+            last_ack_at_unix: e.last_ack_at.map(system_time_to_unix),
+        })
+        .collect();
+    p::ClientMessage {
+        kind: Some(CKind::RosterReport(p::RosterReport { children })),
     }
 }
 
@@ -1108,6 +1235,7 @@ mod tests {
                 full: true,
                 resources,
                 removed_resources: Vec::new(),
+                publish_seq: 0,
             })),
         }
     }
@@ -1134,6 +1262,7 @@ mod tests {
                 full: true,
                 resources,
                 removed_resources: Vec::new(),
+                publish_seq: 0,
             })),
         }
     }
@@ -1158,6 +1287,7 @@ mod tests {
                 full: false,
                 resources: vec![ep],
                 removed_resources: Vec::new(),
+                publish_seq: 0,
             })),
         }
     }
@@ -1261,6 +1391,7 @@ mod tests {
                 full: true,
                 resources,
                 removed_resources: Vec::new(),
+                publish_seq: 0,
             })),
         }
     }
@@ -1278,6 +1409,7 @@ mod tests {
             backoff_cap: Duration::from_millis(50),
             tls: None,
             bound_ports_rx: None,
+            roster_rx: None,
             svid_cell: None,
             expected_server: None,
             svid_rotated: None,
@@ -1694,6 +1826,7 @@ mod tests {
                 full: false,
                 resources: Vec::new(),
                 removed_resources: Vec::new(),
+                publish_seq: 0,
             })),
         };
         srv_tx2.send(Ok(delta_first)).await.unwrap();
@@ -1857,6 +1990,7 @@ mod tests {
                 full: false,
                 resources: Vec::new(),
                 removed_resources: vec!["not-a-canonical-key".to_owned()],
+                publish_seq: 0,
             })),
         };
         srv_tx.send(Ok(bad_delta)).await.unwrap();

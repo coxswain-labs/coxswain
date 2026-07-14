@@ -843,6 +843,7 @@ pub(crate) mod tests {
                             full: true,
                             resources: Vec::new(),
                             removed_resources: Vec::new(),
+                            publish_seq: 0,
                         })),
                     };
                     let _ = tx.send(Ok(snap)).await;

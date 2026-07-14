@@ -54,7 +54,7 @@ pub enum NodeScope {
 
 /// Snapshot of a single connected proxy node.
 #[non_exhaustive]
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NodeEntry {
     /// Opaque identifier supplied by the proxy in its `Subscribe` message.
     pub node_id: String,
@@ -91,6 +91,54 @@ pub struct NodeEntry {
     /// other Gateways).
     #[serde(default)]
     pub last_acked_seq: Option<u64>,
+    /// `node_id` of the relay whose `RosterReport` folded this entry into the
+    /// controller's registry (#585), or `None` for a directly-connected node
+    /// (including a relay's own stream). Set by [`SharedNodeRegistry::apply_roster`];
+    /// the whole subtree is evicted via [`SharedNodeRegistry::evict_children`]
+    /// when the relay's stream drops. Missing in JSON from pre-#585 peers →
+    /// `None` via `serde(default)`.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// Whether this node is a relay tier node — set the first time it reports a
+    /// `RosterReport` (#585). The #531 quorum queries exclude relay entries so a
+    /// relay's own ack never satisfies the gate for its subtree; the folded
+    /// leaves (`is_relay == false`) are what the gate evaluates. A namespace
+    /// relay's own [`NodeScope::Namespace`] entry is already scope-excluded, but
+    /// a shared-pool relay's own entry is [`NodeScope::SharedPool`] and needs
+    /// this flag to be skipped. Missing in JSON from pre-#585 peers → `false`.
+    #[serde(default)]
+    pub is_relay: bool,
+}
+
+/// A leaf entry from a relay's `RosterReport` (#585), folded into the registry
+/// by [`SharedNodeRegistry::apply_roster`].
+///
+/// Mirrors the subset of [`NodeEntry`] a relay knows about a downstream leaf;
+/// `parent`/`is_relay` are stamped by the registry on fold, so they are not
+/// carried here. Lives in `coxswain-core` because [`NodeEntry`] is
+/// `#[non_exhaustive]` and so cannot be constructed at the `coxswain-discovery`
+/// boundary — the server decodes a `RosterEntry` wire message into this and
+/// hands it to the registry, which owns [`NodeEntry`] construction.
+// intentionally open: field-literal built at the coxswain-discovery boundary from a RosterEntry
+pub struct RosterChild {
+    /// The leaf's `node_id` (as it reported to the relay).
+    pub node_id: String,
+    /// The leaf's discovery scope.
+    pub scope: NodeScope,
+    /// Content hash the leaf last Ack'd, or `None`.
+    pub last_acked_version: Option<String>,
+    /// Relay's current downstream world version for this leaf's scope, or `None`.
+    pub target_version: Option<String>,
+    /// Publish sequence the leaf last Ack'd, in the controller's seq space, or
+    /// `None` (see [`NodeEntry::last_acked_seq`]).
+    pub last_acked_seq: Option<u64>,
+    /// The leaf's reported bound-port set, or `None` if it has not reported —
+    /// the `None`/`Some(∅)` distinction is load-bearing for the #531 gate.
+    pub bound_ports: Option<BTreeSet<u16>>,
+    /// The leaf's stream-open time at the relay.
+    pub connected_since: SystemTime,
+    /// The leaf's most recent Ack time, or `None`.
+    pub last_ack_at: Option<SystemTime>,
 }
 
 impl NodeEntry {
@@ -113,7 +161,7 @@ impl NodeEntry {
 /// [`SharedNodeRegistry::load`] and hold it briefly; do not cache it across
 /// reconcile cycles.
 #[non_exhaustive]
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NodeRegistry {
     /// Map of `node_id` → per-node entry.
     pub nodes: HashMap<String, NodeEntry>,
@@ -133,7 +181,7 @@ impl NodeRegistry {
     pub fn controller_version(&self) -> Option<String> {
         self.nodes
             .values()
-            .filter(|e| e.scope == NodeScope::SharedPool)
+            .filter(|e| e.scope == NodeScope::SharedPool && !e.is_relay)
             .min_by(|a, b| a.node_id.cmp(&b.node_id))
             .and_then(|e| e.target_version.clone())
     }
@@ -150,8 +198,10 @@ impl NodeRegistry {
     }
 
     /// #531 shared-mode quorum: whether **every** currently-connected
-    /// [`NodeScope::SharedPool`] node has reported a bound-port set covering
-    /// `required`, with at least one such node connected.
+    /// [`NodeScope::SharedPool`] **leaf** node has reported a bound-port set
+    /// covering `required`, with at least one such node connected. Relay entries
+    /// (`is_relay`) are excluded — a shared-pool relay caches but binds nothing;
+    /// its folded leaves (`is_relay == false`) are what the gate evaluates (#585).
     ///
     /// Fails closed on the two dark states: an empty pool (`false` — a VIP with
     /// no data plane behind it must not be `Programmed`) and a connected node
@@ -160,7 +210,10 @@ impl NodeRegistry {
     /// (a Gateway with no allocated internal ports has nothing to await).
     #[must_use]
     pub fn all_shared_nodes_bound(&self, required: &BTreeSet<u16>) -> bool {
-        self.nodes_bound(|e| e.scope == NodeScope::SharedPool, required)
+        self.nodes_bound(
+            |e| e.scope == NodeScope::SharedPool && !e.is_relay,
+            required,
+        )
     }
 
     /// #531 dedicated-mode quorum: whether a connected
@@ -189,15 +242,16 @@ impl NodeRegistry {
     }
 
     /// #531 shared-mode content convergence: whether **every**
-    /// currently-connected [`NodeScope::SharedPool`] node has Ack'd a snapshot
-    /// whose captured publish sequence is `>= min_seq`, with at least one such
-    /// node connected.
+    /// currently-connected [`NodeScope::SharedPool`] **leaf** node has Ack'd a
+    /// snapshot whose captured publish sequence is `>= min_seq`, with at least
+    /// one such node connected. Relay entries (`is_relay`) are excluded (#585);
+    /// behind a shared relay the leaves Ack the controller's re-stamped seq.
     ///
     /// Fails closed like [`Self::all_shared_nodes_bound`]: an empty pool or a
     /// node that has not Ack'd yet (`last_acked_seq == None`) holds the gate.
     #[must_use]
     pub fn all_shared_nodes_acked(&self, min_seq: u64) -> bool {
-        self.nodes_acked(|e| e.scope == NodeScope::SharedPool, min_seq)
+        self.nodes_acked(|e| e.scope == NodeScope::SharedPool && !e.is_relay, min_seq)
     }
 
     /// #531 dedicated-mode content convergence: whether every connected
@@ -212,6 +266,24 @@ impl NodeRegistry {
             },
             min_seq,
         )
+    }
+
+    /// Count of currently-connected leaf nodes serving the dedicated Gateway
+    /// `namespace`/`name` — folded-behind-relay or directly connected (#585).
+    ///
+    /// Feeds the non-latched `coxswain_gateway_dataplane_proxies` gauge: an
+    /// operator alerts on `== 0` for a live-data-plane blind spot, distinct from
+    /// the latched `Programmed` status. Relay entries are never `Gateway`-scoped,
+    /// so no `is_relay` filter is needed here.
+    #[must_use]
+    pub fn gateway_node_count(&self, namespace: &str, name: &str) -> usize {
+        self.nodes
+            .values()
+            .filter(|e| {
+                matches!(&e.scope, NodeScope::Gateway { namespace: ns, name: n }
+                    if ns == namespace && n == name)
+            })
+            .count()
     }
 
     /// Shared quorum core for both gates: every node matching `scope_pred` has
@@ -324,6 +396,8 @@ impl SharedNodeRegistry {
             connected_since: now,
             bound_ports: None,
             last_acked_seq: None,
+            parent: None,
+            is_relay: false,
         };
         self.0.map.lock().nodes.insert(node_id.to_owned(), entry);
         self.bump();
@@ -390,6 +464,84 @@ impl SharedNodeRegistry {
         entry.bound_ports = Some(ports);
         drop(guard);
         self.bump();
+    }
+
+    /// Fold a relay's `RosterReport` into the registry (#585): wholesale-replace
+    /// every child of `parent_node_id` with `children`, and mark the parent as a
+    /// relay so the #531 quorum excludes its own ack.
+    ///
+    /// Each entry in `children` is (re-)stamped `parent = Some(parent_node_id)`
+    /// and keyed by its own `node_id`; any prior child of this relay absent from
+    /// `children` is dropped (a leaf that disconnected at the relay). No-op on
+    /// the `is_relay` marker if the parent stream is not (yet) in the registry —
+    /// the children are still folded, and the parent's own `connect` will have
+    /// inserted its row first in the normal stream lifecycle.
+    ///
+    /// Bumps the change watch: folded leaves change the bound-port / ack quorum
+    /// inputs, so the #531 gate consumers must re-evaluate.
+    ///
+    /// A roster child whose `node_id` collides with a **directly-connected** row
+    /// (`parent == None` — a leaf that dials the controller itself, or the relay
+    /// parent's own row) is skipped, never overwritten: `node_id`s are globally
+    /// unique (pod UID / hostname), so a collision is only a transient during a
+    /// repoint, and a live direct stream stays authoritative. Without this, a
+    /// stale roster copy would displace the direct row and — worse — `parent`
+    /// would flip to this relay, so the relay's later disconnect would
+    /// [`Self::evict_children`] a healthy direct node.
+    pub fn apply_roster(&self, parent_node_id: &str, children: Vec<RosterChild>) {
+        let mut guard = self.0.map.lock();
+        if let Some(parent) = guard.nodes.get_mut(parent_node_id) {
+            parent.is_relay = true;
+        }
+        // Drop the relay's prior children not present in the new report.
+        guard
+            .nodes
+            .retain(|_, e| e.parent.as_deref() != Some(parent_node_id));
+        for child in children {
+            // Never let a roster entry displace a directly-connected row.
+            if guard
+                .nodes
+                .get(&child.node_id)
+                .is_some_and(|e| e.parent.is_none())
+            {
+                continue;
+            }
+            let node_id = child.node_id.clone();
+            let entry = NodeEntry {
+                node_id: child.node_id,
+                scope: child.scope,
+                last_acked_version: child.last_acked_version,
+                target_version: child.target_version,
+                last_ack_at: child.last_ack_at,
+                connected_since: child.connected_since,
+                bound_ports: child.bound_ports,
+                last_acked_seq: child.last_acked_seq,
+                parent: Some(parent_node_id.to_owned()),
+                is_relay: false,
+            };
+            guard.nodes.insert(node_id, entry);
+        }
+        drop(guard);
+        self.bump();
+    }
+
+    /// Evict a relay's entire subtree (#585): remove every entry whose `parent`
+    /// is `parent_node_id`. Called when the relay's upstream stream drops so the
+    /// #531 gate fails closed on the now-invisible leaves rather than gating a
+    /// new publish on stale roster state. The relay's own row is removed
+    /// separately by [`Self::disconnect`]. Bumps the watch only if a row was
+    /// actually removed.
+    pub fn evict_children(&self, parent_node_id: &str) {
+        let mut guard = self.0.map.lock();
+        let before = guard.nodes.len();
+        guard
+            .nodes
+            .retain(|_, e| e.parent.as_deref() != Some(parent_node_id));
+        let removed = guard.nodes.len() != before;
+        drop(guard);
+        if removed {
+            self.bump();
+        }
     }
 
     /// Whether all currently-connected nodes have Ack'd the controller's current
@@ -964,6 +1116,182 @@ mod tests {
         assert!(
             !rx.has_changed().unwrap_or(true),
             "no-op disconnect must not fire"
+        );
+    }
+
+    // ── roster fold / subtree eviction / relay exclusion (#585) ──────────────────
+
+    fn leaf(node_id: &str, scope: NodeScope, seq: u64, bound: &[u16]) -> RosterChild {
+        RosterChild {
+            node_id: node_id.to_owned(),
+            scope,
+            last_acked_version: Some("v1".to_owned()),
+            target_version: Some("v1".to_owned()),
+            last_acked_seq: Some(seq),
+            bound_ports: Some(ports(bound)),
+            connected_since: now(),
+            last_ack_at: Some(now()),
+        }
+    }
+
+    #[test]
+    fn apply_roster_folds_children_tagged_with_parent() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect(
+            "relay-a",
+            NodeScope::Namespace {
+                namespace: "ns".to_owned(),
+            },
+            now(),
+        );
+        reg.apply_roster(
+            "relay-a",
+            vec![
+                leaf("leaf-1", gw("ns", "gw1"), 5, &[443]),
+                leaf("leaf-2", gw("ns", "gw2"), 6, &[8443]),
+            ],
+        );
+        let snap = reg.load();
+        assert_eq!(snap.nodes["leaf-1"].parent.as_deref(), Some("relay-a"));
+        assert_eq!(snap.nodes["leaf-2"].parent.as_deref(), Some("relay-a"));
+        assert!(
+            snap.nodes["relay-a"].is_relay,
+            "reporting a roster marks the parent as a relay"
+        );
+    }
+
+    #[test]
+    fn apply_roster_wholesale_replaces_prior_children() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect(
+            "relay-a",
+            NodeScope::Namespace {
+                namespace: "ns".to_owned(),
+            },
+            now(),
+        );
+        reg.apply_roster("relay-a", vec![leaf("leaf-1", gw("ns", "gw1"), 5, &[443])]);
+        // Second report drops leaf-1, adds leaf-2 (leaf-1 disconnected at the relay).
+        reg.apply_roster("relay-a", vec![leaf("leaf-2", gw("ns", "gw2"), 6, &[8443])]);
+        let snap = reg.load();
+        assert!(
+            !snap.nodes.contains_key("leaf-1"),
+            "a child absent from the latest report is evicted"
+        );
+        assert!(snap.nodes.contains_key("leaf-2"));
+    }
+
+    #[test]
+    fn apply_roster_does_not_touch_other_relays_children() {
+        let reg = SharedNodeRegistry::new();
+        reg.apply_roster("relay-a", vec![leaf("leaf-a", gw("ns", "gw1"), 5, &[443])]);
+        reg.apply_roster("relay-b", vec![leaf("leaf-b", gw("ns", "gw2"), 6, &[8443])]);
+        // Re-report relay-a with a new child; relay-b's subtree is untouched.
+        reg.apply_roster("relay-a", vec![leaf("leaf-a2", gw("ns", "gw1"), 7, &[443])]);
+        let snap = reg.load();
+        assert!(
+            snap.nodes.contains_key("leaf-b"),
+            "relay-b subtree preserved"
+        );
+        assert!(!snap.nodes.contains_key("leaf-a"));
+        assert!(snap.nodes.contains_key("leaf-a2"));
+    }
+
+    #[test]
+    fn apply_roster_never_displaces_a_directly_connected_row() {
+        let reg = SharedNodeRegistry::new();
+        // A directly-connected node dials the controller itself.
+        reg.connect("dup", shared(), now());
+        reg.record_bound_ports("dup", ports(&[30001]));
+        // A relay reports a child with the SAME node_id (repoint transient).
+        reg.apply_roster("relay-a", vec![leaf("dup", gw("ns", "gw"), 9, &[443])]);
+        let snap = reg.load();
+        // The direct row is authoritative: still parent-less, still SharedPool.
+        assert_eq!(snap.nodes["dup"].parent, None, "direct row not hijacked");
+        assert_eq!(snap.nodes["dup"].scope, NodeScope::SharedPool);
+        // And a relay disconnect must NOT evict the healthy direct node.
+        reg.evict_children("relay-a");
+        assert!(
+            reg.load().nodes.contains_key("dup"),
+            "relay eviction must not remove a directly-connected node"
+        );
+    }
+
+    #[test]
+    fn evict_children_removes_only_the_named_relays_subtree() {
+        let reg = SharedNodeRegistry::new();
+        reg.apply_roster("relay-a", vec![leaf("leaf-a", gw("ns", "gw1"), 5, &[443])]);
+        reg.apply_roster("relay-b", vec![leaf("leaf-b", gw("ns", "gw2"), 6, &[8443])]);
+        reg.evict_children("relay-a");
+        let snap = reg.load();
+        assert!(
+            !snap.nodes.contains_key("leaf-a"),
+            "relay-a subtree evicted"
+        );
+        assert!(
+            snap.nodes.contains_key("leaf-b"),
+            "relay-b subtree untouched"
+        );
+    }
+
+    #[test]
+    fn folded_gateway_leaf_satisfies_the_dedicated_gate() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect(
+            "relay-a",
+            NodeScope::Namespace {
+                namespace: "ns".to_owned(),
+            },
+            now(),
+        );
+        reg.apply_roster("relay-a", vec![leaf("leaf-1", gw("ns", "gw"), 9, &[443])]);
+        let snap = reg.load();
+        assert!(
+            snap.gateway_node_bound("ns", "gw", &ports(&[443])),
+            "the folded leaf's bound ports satisfy the dedicated quorum"
+        );
+        assert!(
+            snap.gateway_node_acked("ns", "gw", 9),
+            "the folded leaf's acked seq satisfies the dedicated ack gate"
+        );
+    }
+
+    #[test]
+    fn relay_outage_eviction_fails_the_dedicated_gate_closed() {
+        let reg = SharedNodeRegistry::new();
+        reg.apply_roster("relay-a", vec![leaf("leaf-1", gw("ns", "gw"), 9, &[443])]);
+        assert!(reg.load().gateway_node_bound("ns", "gw", &ports(&[443])));
+        reg.evict_children("relay-a");
+        assert!(
+            !reg.load().gateway_node_bound("ns", "gw", &ports(&[443])),
+            "with the subtree evicted, no connected node serves the Gateway — fail closed"
+        );
+    }
+
+    #[test]
+    fn shared_relay_own_entry_excluded_from_shared_quorum() {
+        let reg = SharedNodeRegistry::new();
+        // A shared-pool relay connects (SharedPool scope) and reports two leaves.
+        reg.connect("relay-shared", shared(), now());
+        reg.apply_roster(
+            "relay-shared",
+            vec![
+                leaf("leaf-1", shared(), 4, &[30001]),
+                leaf("leaf-2", shared(), 4, &[30001]),
+            ],
+        );
+        let snap = reg.load();
+        // The relay itself never reported bound ports; without exclusion it would
+        // fail the quorum forever. The leaves cover the required set.
+        assert!(
+            snap.all_shared_nodes_bound(&ports(&[30001])),
+            "the relay's own (unbound) entry must be excluded; its leaves satisfy the gate"
+        );
+        assert!(snap.all_shared_nodes_acked(4), "leaves acked the seq");
+        assert_eq!(
+            snap.controller_version().as_deref(),
+            Some("v1"),
+            "controller_version derives from a folded leaf, not the excluded relay entry"
         );
     }
 

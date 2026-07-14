@@ -154,6 +154,11 @@ fn scope_sort_key(scope: &NodeScope) -> (u8, &str, &str) {
 }
 
 /// Serialise a [`NodeEntry`] into the topology wire shape.
+///
+/// `parent` and `is_relay` (#585) let the UI render N tiers: a node with a
+/// `parent` is a leaf folded from that relay's `RosterReport`, and an
+/// `is_relay` node is a relay tier node. Both absent/false for a directly
+/// connected proxy, which the UI draws one hop below the controller as before.
 fn node_json(entry: &NodeEntry) -> serde_json::Value {
     serde_json::json!({
         "node_id": entry.node_id,
@@ -162,6 +167,8 @@ fn node_json(entry: &NodeEntry) -> serde_json::Value {
         "connected_since": fmt_time(entry.connected_since),
         "last_ack_at": entry.last_ack_at.map(fmt_time),
         "in_sync": entry.in_sync(),
+        "parent": entry.parent,
+        "is_relay": entry.is_relay,
     })
 }
 
@@ -247,6 +254,47 @@ mod tests {
         assert_eq!(nodes[1]["scope"]["kind"], "Gateway");
         assert_eq!(nodes[1]["scope"]["namespace"], "default");
         assert_eq!(nodes[1]["scope"]["name"], "my-gw");
+    }
+
+    #[test]
+    fn build_topology_exposes_relay_and_folded_leaf_tiers() {
+        use coxswain_core::node_registry::RosterChild;
+        let reg = SharedNodeRegistry::new();
+        // A namespace relay connects and folds one dedicated leaf.
+        reg.connect(
+            "relay-a",
+            NodeScope::Namespace {
+                namespace: "prod".to_owned(),
+            },
+            epoch(),
+        );
+        reg.apply_roster(
+            "relay-a",
+            vec![RosterChild {
+                node_id: "leaf-1".to_owned(),
+                scope: NodeScope::Gateway {
+                    namespace: "prod".to_owned(),
+                    name: "gw".to_owned(),
+                },
+                last_acked_version: Some("v1".to_owned()),
+                target_version: Some("v1".to_owned()),
+                last_acked_seq: Some(3),
+                bound_ports: None,
+                connected_since: epoch(),
+                last_ack_at: None,
+            }],
+        );
+        let v = build_topology(&reg.load());
+        let nodes = v["nodes"].as_array().unwrap();
+        let relay = nodes.iter().find(|n| n["node_id"] == "relay-a").unwrap();
+        let leaf = nodes.iter().find(|n| n["node_id"] == "leaf-1").unwrap();
+        assert_eq!(relay["is_relay"], true, "the relay is flagged for the UI");
+        assert_eq!(relay["parent"], serde_json::Value::Null);
+        assert_eq!(
+            leaf["parent"], "relay-a",
+            "the folded leaf points at its relay for the N-tier render"
+        );
+        assert_eq!(leaf["is_relay"], false);
     }
 
     #[tokio::test]

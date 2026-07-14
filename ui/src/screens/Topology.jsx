@@ -59,18 +59,6 @@ export function Topology() {
     degraded:  (c.degraded_checks?.length ?? 0) > 0 || c.health === 'degraded',
   }));
 
-  const sharedNodes = nodes.filter((n) => n.scope?.kind === 'SharedPool');
-
-  // Group gateway proxies: namespace → gatewayName → nodes[]
-  const nsMap = new Map();
-  for (const n of nodes.filter((n) => n.scope?.kind === 'Gateway')) {
-    const { namespace, name } = n.scope;
-    if (!nsMap.has(namespace)) nsMap.set(namespace, new Map());
-    const gwMap = nsMap.get(namespace);
-    if (!gwMap.has(name)) gwMap.set(name, []);
-    gwMap.get(name).push(n);
-  }
-
   const notice = discovery_active && !allInSync
     ? "A proxy hasn't Ack'd the latest snapshot — re-converging…"
     : null;
@@ -89,14 +77,59 @@ export function Topology() {
             <TopoGraph
               controllerVersion={controller_version}
               controllers={controllers}
-              sharedNodes={sharedNodes}
-              nsMap={nsMap}
+              nodes={nodes}
             />
           </ZoomCanvas>
         )}
       </div>
     </div>
   );
+}
+
+/**
+ * Partition the flat node list into the N-tier shape the graph renders (#585).
+ *
+ * A node with `parent == null` sits one hop below the controller — a directly
+ * connected proxy OR a relay (`is_relay`). A node with a `parent` is a leaf
+ * folded from that relay's RosterReport and hangs under the relay's card. No
+ * scope kind is dropped: unrecognised kinds land in an "Other" column so a new
+ * scope always stays visible.
+ */
+function tierModel(nodes) {
+  const childrenByParent = new Map();
+  for (const n of nodes) {
+    if (n.parent) {
+      if (!childrenByParent.has(n.parent)) childrenByParent.set(n.parent, []);
+      childrenByParent.get(n.parent).push(n);
+    }
+  }
+  const topLevel = nodes.filter((n) => !n.parent);
+
+  // Direct (non-relay) proxies keep the pre-#585 grouping.
+  const sharedDirect = topLevel.filter((n) => !n.is_relay && n.scope?.kind === 'SharedPool');
+  const nsMap = new Map(); // namespace → gatewayName → nodes[]
+  for (const n of topLevel.filter((n) => !n.is_relay && n.scope?.kind === 'Gateway')) {
+    const { namespace, name } = n.scope;
+    if (!nsMap.has(namespace)) nsMap.set(namespace, new Map());
+    const gwMap = nsMap.get(namespace);
+    if (!gwMap.has(name)) gwMap.set(name, []);
+    gwMap.get(name).push(n);
+  }
+  // Relays each become their own column, children nested below.
+  const relays = topLevel.filter((n) => n.is_relay);
+  // Anything else (a future scope kind) — surfaced, never silently dropped.
+  const other = topLevel.filter(
+    (n) => !n.is_relay && n.scope?.kind !== 'SharedPool' && n.scope?.kind !== 'Gateway',
+  );
+
+  return { childrenByParent, sharedDirect, nsMap, relays, other };
+}
+
+/** Human label for a relay column, from its subscription scope. */
+function relayLabel(node) {
+  if (node.scope?.kind === 'Namespace') return `Relay · ${node.scope.namespace}`;
+  if (node.scope?.kind === 'SharedPool') return 'Relay · Shared pool';
+  return 'Relay';
 }
 
 const PAN_STEP = 80;
@@ -218,12 +251,14 @@ function ZoomCanvas({ children, notice }) {
  * Edge coordinates use offsetLeft/offsetTop (CSS pixels, transform-agnostic)
  * so they stay accurate at any zoom level without knowing the current scale.
  */
-function TopoGraph({ controllerVersion, controllers, sharedNodes, nsMap }) {
+function TopoGraph({ controllerVersion, controllers, nodes }) {
   const graphRef  = useRef(null);
   const ctrlRef   = useRef(null);
   const proxyRefs = useRef({});
   const lastStr   = useRef('');
   const [edges, setEdges] = useState([]);
+
+  const { childrenByParent, sharedDirect, nsMap, relays, other } = tierModel(nodes);
 
   // The leader is the sole snapshot source — edges originate there. Fall back to
   // a single synthetic "Controller" when the fleet list is empty (dev mode).
@@ -238,6 +273,9 @@ function TopoGraph({ controllerVersion, controllers, sharedNodes, nsMap }) {
     .filter((c) => !c.leader)
     .sort((a, b) => (a.name ?? '').localeCompare(b.name ?? ''));
 
+  // Edges: controller → every top-level node (direct proxy or relay), and each
+  // relay → each of its folded leaves (#585). A leaf therefore hangs off its
+  // relay, not the controller — the visual proof of the tier.
   const recompute = () => {
     const graph = graphRef.current;
     const ctrl  = ctrlRef.current;
@@ -245,14 +283,24 @@ function TopoGraph({ controllerVersion, controllers, sharedNodes, nsMap }) {
     const ctrlX = elOffsetLeft(ctrl, graph) + ctrl.offsetWidth  / 2;
     const ctrlY = elOffsetTop(ctrl, graph)  + ctrl.offsetHeight;
     const next = [];
-    for (const [id, el] of Object.entries(proxyRefs.current)) {
+    for (const n of nodes) {
+      const el = proxyRefs.current[n.node_id];
       if (!el) continue;
-      next.push({
-        id,
-        x1: ctrlX, y1: ctrlY,
-        x2: elOffsetLeft(el, graph) + el.offsetWidth / 2,
-        y2: elOffsetTop(el, graph),
-      });
+      const x2 = elOffsetLeft(el, graph) + el.offsetWidth / 2;
+      const y2 = elOffsetTop(el, graph);
+      if (!n.parent) {
+        next.push({ id: n.node_id, x1: ctrlX, y1: ctrlY, x2, y2 });
+      } else {
+        const pel = proxyRefs.current[n.parent];
+        if (!pel) continue;
+        next.push({
+          id: n.node_id,
+          x1: elOffsetLeft(pel, graph) + pel.offsetWidth / 2,
+          y1: elOffsetTop(pel, graph) + pel.offsetHeight,
+          x2,
+          y2,
+        });
+      }
     }
     const s = JSON.stringify(next);
     if (s !== lastStr.current) { lastStr.current = s; setEdges(next); }
@@ -315,12 +363,12 @@ function TopoGraph({ controllerVersion, controllers, sharedNodes, nsMap }) {
 
       {/* Scope groups — horizontal row */}
       <div class="topo-groups-row">
-        {/* Shared pool in the cluster group */}
-        {sharedNodes.length > 0 && (
+        {/* Shared pool — direct proxies */}
+        {sharedDirect.length > 0 && (
           <div class="topo-ns-group topo-ns-group--cluster">
             <div class="topo-ns-label">Cluster · Shared pool</div>
             <div class="topo-nodes-row">
-              {sharedNodes.map((n) => (
+              {sharedDirect.map((n) => (
                 <div key={n.node_id} ref={setRef(n.node_id)}>
                   <ProxyCard node={n} />
                 </div>
@@ -329,7 +377,7 @@ function TopoGraph({ controllerVersion, controllers, sharedNodes, nsMap }) {
           </div>
         )}
 
-        {/* Per-namespace groups */}
+        {/* Per-namespace groups — direct dedicated proxies */}
         {[...nsMap.entries()].map(([ns, gwMap]) => (
           <div key={ns} class="topo-ns-group">
             <div class="topo-ns-label">{ns}</div>
@@ -347,6 +395,47 @@ function TopoGraph({ controllerVersion, controllers, sharedNodes, nsMap }) {
             ))}
           </div>
         ))}
+
+        {/* Relay columns — the relay card, then its folded leaves nested below */}
+        {relays.map((relay) => {
+          const leaves = childrenByParent.get(relay.node_id) ?? [];
+          return (
+            <div key={relay.node_id} class="topo-ns-group topo-ns-group--relay">
+              <div class="topo-ns-label">{relayLabel(relay)}</div>
+              <div class="topo-relay-row">
+                <div ref={setRef(relay.node_id)}>
+                  <ProxyCard node={relay} />
+                </div>
+              </div>
+              <div class="topo-scope-section topo-relay-leaves">
+                <div class="topo-scope-label">
+                  {leaves.length > 0 ? 'Leaves' : 'No leaves connected'}
+                </div>
+                <div class="topo-nodes-row">
+                  {leaves.map((n) => (
+                    <div key={n.node_id} ref={setRef(n.node_id)}>
+                      <ProxyCard node={n} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+
+        {/* Any unrecognised scope kind — surfaced so it is never silently dropped */}
+        {other.length > 0 && (
+          <div class="topo-ns-group">
+            <div class="topo-ns-label">Other</div>
+            <div class="topo-nodes-row">
+              {other.map((n) => (
+                <div key={n.node_id} ref={setRef(n.node_id)}>
+                  <ProxyCard node={n} />
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -384,15 +473,16 @@ function ControllerCard({ ctrl, version, cardRef }) {
   );
 }
 
-/** A single proxy node card. Deep-links to its Fleet detail on click. */
+/** A single proxy or relay node card. Deep-links to its Fleet detail on click. */
 function ProxyCard({ node }) {
   const ok = node.in_sync;
+  const kind = node.is_relay ? 'Relay' : 'Proxy';
   const link = linkProps(() => nav.proxy(node.node_id), `Open ${node.node_id} in Fleet`);
   return (
-    <div class={`topo-proxy-card topo-card--link ${ok ? 'topo-proxy-card--ok' : 'topo-proxy-card--warn'}`} {...link}>
+    <div class={`topo-proxy-card topo-card--link ${node.is_relay ? 'topo-proxy-card--relay ' : ''}${ok ? 'topo-proxy-card--ok' : 'topo-proxy-card--warn'}`} {...link}>
       <div class="topo-card-kind">
         <span class={`topo-sync-dot ${ok ? 'ok' : 'warn'}`} aria-hidden="true" />
-        Proxy
+        {kind}
       </div>
       <div class="topo-proxy-id">{node.node_id}</div>
       <div class="topo-proxy-status">{ok ? 'In sync' : 'Lagging'}</div>

@@ -714,6 +714,7 @@ async fn reconcile_inner(
             // owner-ref driven; nothing else to do here.
             ctx.last_hashes.lock().remove(&key);
             ctx.error_attempts.lock().remove(&key);
+            clear_dataplane_gauge(&gw); // #585: drop the live gauge series
         }
         return Ok(StatusOutcome::await_change());
     }
@@ -839,6 +840,7 @@ async fn reconcile_inner(
                 remove_finalizer(&ctx.client, &gw).await?;
                 ctx.last_hashes.lock().remove(&key);
                 ctx.error_attempts.lock().remove(&key);
+                clear_dataplane_gauge(&gw); // #585: no longer a dedicated Gateway
             }
             // Shared-mode Gateway (no parametersRef): its VIP Service is owned by
             // the serialized `run_vip_reconciler` task (signalled at the top of
@@ -1061,6 +1063,15 @@ async fn reconcile_inner(
             }
             None => true,
         };
+    // Live per-Gateway data-plane gauge (#585): the count of connected proxies
+    // (folded-behind-relay or direct) serving this Gateway. Non-latched, unlike
+    // `Programmed` — operators alert on `== 0` for a total-loss blind spot.
+    if let Some(registry) = &ctx.node_registry {
+        let count = registry.load().gateway_node_count(gw_namespace, gw_name);
+        crate::metrics::dataplane_proxies()
+            .with_label_values(&[gw_namespace, gw_name])
+            .set(i64::try_from(count).unwrap_or(i64::MAX));
+    }
     let inputs = status::DedicatedGatewayStatusInputs {
         gw: &gw,
         service: service.as_ref(),
@@ -1338,6 +1349,19 @@ async fn delete_dedicated_resources(
     ignore_not_found(hpas.delete(name, &dp).await)?;
     ignore_not_found(pdbs.delete(name, &dp).await)?;
     Ok(())
+}
+
+/// Drop a Gateway's live data-plane gauge series (#585) so labels do not grow
+/// unbounded across deprovisions and deletes. Keyed on the Gateway's **own**
+/// `namespace`/`name` (the gauge labels), not the GEP-1762 resource name. `Err`
+/// = the series was never emitted (no connected proxies); ignore it.
+fn clear_dataplane_gauge(gw: &Gateway) {
+    if let (Some(ns), Some(name)) = (
+        gw.metadata.namespace.as_deref(),
+        gw.metadata.name.as_deref(),
+    ) {
+        let _ = crate::metrics::dataplane_proxies().remove_label_values(&[ns, name]);
+    }
 }
 
 /// Delete the per-Gateway shared-mode identity `ServiceAccount` (#482) for a

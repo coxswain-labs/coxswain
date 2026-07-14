@@ -1471,6 +1471,13 @@ input[type=checkbox] { accent-color: var(--blue); }
 }
 .topo-proxy-card--ok   { border-left-color: var(--green); }
 .topo-proxy-card--warn { border-left-color: var(--amber); }
+/* Relay tier cards (#585): a distinct accent so a relay reads apart from a leaf. */
+.topo-proxy-card--relay { border-left-color: var(--blue); background: color-mix(in srgb, var(--blue) 6%, var(--surface)); }
+.topo-proxy-card--relay .topo-card-kind { color: var(--blue); }
+
+/* A relay column: the relay card, then its folded leaves indented below it. */
+.topo-relay-row { display: flex; }
+.topo-relay-leaves { margin-left: 18px; border-left: 1px dashed var(--border); padding-left: 14px; }
 
 /* Clickable cards deep-link to the Fleet detail. */
 .topo-card--link { cursor: pointer; transition: border-color 0.12s, background 0.12s, transform 0.12s; }

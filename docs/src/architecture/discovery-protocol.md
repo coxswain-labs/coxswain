@@ -80,6 +80,8 @@ The `coxswain_discovery_*` series expose the delta engine on both ends — serve
 - `client_partitions_reused_total` climbs far faster than `client_partitions_recompiled_total` under endpoint churn — a rolling deploy recompiles only the partitions referencing the churning Service and splices the rest.
 - `snapshot_resources_sent_total ÷ snapshot_messages_total` (average payload width) collapses toward one during endpoint-only churn — the EDS split working as intended.
 
+The operator UI **Topology** panel (`GET /api/v1/topology`) renders the live tree — controller &rarr; proxies, and controller &rarr; relay &rarr; leaf where a relay tier is present (a leaf's `parent` names its relay; a relay row is flagged `is_relay`). Per-node in-sync state comes from the same `NodeRegistry` the gate reads, so a lagging leaf is visible there before any alert fires.
+
 ## The relay tier
 
 Every snapshot stream terminates on the **leader** controller pod (the discovery Service selects the leader; followers reject with `NOT_LEADER`), so fan-out scales O(nodes) on one pod. A **relay** is a zero-RBAC cache pod that subscribes upstream to the controller and re-serves the stream downstream to proxies, turning the leader's stream count into O(relays). Leaves speak the unchanged protocol and never learn they are behind a relay &mdash; only their discovery endpoint and expected-server identity differ.
@@ -87,11 +89,21 @@ Every snapshot stream terminates on the **leader** controller pod (the discovery
 Two shapes:
 
 - **Shared-pool relay** subscribes `SharedPool` and re-serves it. Its client reconstructs exactly the routing cells a `SharedPool` subscriber serves, so the reconstructed cells *are* what it serves downstream.
-- **Namespace relay** subscribes a new `Namespace{ns}` scope &mdash; one stream carrying every dedicated Gateway's world in the namespace, each resource qualified with a `gw|<ns>|<name>|` key-segment prefix plus a per-Gateway `gwmeta|<ns>|<name>` resource (carrying that Gateway's publish-seq and bound proxy ServiceAccount). The relay demuxes these into a per-Gateway registry and serves leaves the unchanged `Gateway{ns,name}` world, enforcing the same SVID&harr;Gateway binding the controller does. (Namespace relays are controller-provisioned and provenance-authorized &mdash; that lands in a later slice; until then `Namespace` subscribes are denied by default.)
+- **Namespace relay** subscribes a new `Namespace{ns}` scope &mdash; one stream carrying every dedicated Gateway's world in the namespace, each resource qualified with a `gw|<ns>|<name>|` key-segment prefix plus a per-Gateway `gwmeta|<ns>|<name>` resource (carrying that Gateway's publish-seq and bound proxy ServiceAccount). The relay demuxes these into a per-Gateway registry and serves leaves the unchanged `Gateway{ns,name}` world, enforcing the same SVID&harr;Gateway binding the controller does. Namespace relays are controller-provisioned and provenance-authorized: the controller authorizes a `Namespace{ns}` subscription only for a relay ServiceAccount it manages in that namespace, so the grant cannot drift and a forged subscription is bounded to the tenant's own namespace.
 
 `Namespace` is exclusively the relay's *upstream* subscription: no leaf ever uses it, and a relay's own downstream server rejects it (relay-behind-relay is out of scope in v1). Bootstrap is **not** tiered &mdash; every node, relays included, obtains its SVID directly from the controller's all-replicas bootstrap listener.
 
-The wire changes are additive over v2 (the `Namespace` scope kind and the `GatewayMeta` resource; `WIRE_VERSION` stays 2), so all of the convergence machinery above is unchanged: version and per-Gateway publish-seq propagate verbatim leader &rarr; relay &rarr; leaf.
+The wire changes are additive over v2 (the `Namespace` scope kind, the `GatewayMeta` resource, the `RosterReport` client message, and an envelope `publish_seq` on `Snapshot`; `WIRE_VERSION` stays 2), so all of the convergence machinery above is unchanged: version and per-Gateway publish-seq propagate verbatim leader &rarr; relay &rarr; leaf.
+
+### Leaf roster reporting (`RosterReport`)
+
+A relay's leaves connect to the relay, not the controller, so without extra plumbing the controller would see only the relay — and its `Programmed` gate and topology panel would be blind to the actual data plane behind it. Each relay closes that gap by reporting its downstream registry upstream.
+
+- **The report.** A relay keeps a downstream `NodeRegistry` (populated by its own downstream server as leaves connect, ack, and report bound ports, exactly as the controller's does). A debounced reporter republishes it to the controller as a `RosterReport` client message — immediately after `Subscribe` on every (re)connect, and again whenever the roster changes. A periodic backstop tick catches ack-only changes, which by design do not fire the registry's change signal. The report is **wholesale-replace**: it is the relay's complete current child set.
+- **The fold.** The controller folds each child into its own registry keyed by the child's `node_id`, tagged with the reporting relay as `parent`, and marks the relay's own row `is_relay`. A child absent from the latest report is dropped; when the relay's stream drops, the controller **evicts the entire subtree**. A `RosterReport` never displaces a directly-connected row (unique `node_id`s make a collision only a brief repoint transient, and a live direct stream stays authoritative).
+- **Seq across the tier.** For a leaf's ack to satisfy the gate, its acked publish-seq must be in the **controller's** seq space. A namespace relay re-stamps its downstream publish index to the max `GatewayMeta.publish_seq` it has applied; a shared-pool relay re-stamps to the envelope `Snapshot.publish_seq`. Either way a leaf acks a seq `>=` its Gateway's controller stamp, and the fence — advance the counter only after storing the rebuilt cells — guarantees a leaf never acks a fresh seq over stale content.
+
+The `Programmed` gate then evaluates the folded **leaf** entries, never the relay's own ack (a relay caches but binds nothing; its own row is excluded from the shared quorum by the `is_relay` flag, and it is never `Gateway`-scoped). Relay outage evicts the subtree, so a re-arming gate fails closed rather than gating a new publish on a blind spot.
 
 ### Failure and rollout
 
@@ -110,7 +122,11 @@ Why both are needed: bind alone isn't enough when the ports were already open fr
 
 Mechanically: snapshot versions are content hashes (not sequential), so "does this snapshot contain generation N" is tracked separately — each routing rebuild stamps, per Gateway, the publish sequence number at which its current generation first appeared, and each proxy's acknowledgment records the sequence number it had seen as of that ack. Comparing the two tells the leader whether a given proxy is caught up.
 
-Until both bind and ack hold, `Programmed` stays `False/Pending`, `observedGeneration` stays one behind the current generation, and the condition's message names specifically what's still being waited on. Once a generation reaches `Programmed=True`, ordinary pool churn — rollouts, leader failover — never flips it back to `False`; only an actual spec change re-arms the gate.
+Until both bind and ack hold, `Programmed` stays `False/Pending`, `observedGeneration` stays one behind the current generation, and the condition's message names specifically what's still being waited on. Once a generation reaches `Programmed=True`, ordinary pool churn — rollouts, HPA scale-up, leader failover emptying the registry, a relay blip — never flips it back to `False`; only an actual spec change re-arms the gate.
+
+Behind a relay, the gate evaluates the **folded leaf** entries (via [`RosterReport`](#leaf-roster-reporting-rosterreport)), never the relay's own ack — a relay caches but binds nothing. Both the bind and ack signals a leaf reports to its relay ride the roster to the controller in the controller's own seq space, so the gate is indistinguishable from the direct-proxy path.
+
+`Programmed` is a **spec-observation** signal, and its latch is deliberate: it is not a data-plane liveness switch. If *every* proxy behind a Gateway dies while its spec is unchanged, `Programmed` stays `True` (downgrading on transient total-loss would flap it on every leader failover, since the registry starts empty and repopulates over the reconnect window). For live "is the data plane actually behind this Gateway right now" — including the total-loss blind spot — alert on the non-latched [`coxswain_gateway_dataplane_proxies`](../reference/observability.md#gateway-data-plane-liveness) gauge (`== 0` for a dedicated Gateway) or the global `coxswain_discovery_connected_proxies` (shared pool), **never** on `Programmed`.
 
 ## RBAC by mode
 

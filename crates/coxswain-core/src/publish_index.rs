@@ -124,6 +124,22 @@ impl SharedGatewayPublishIndex {
     pub fn current_seq(&self) -> u64 {
         self.0.counter.load(Ordering::Acquire)
     }
+
+    /// Advance the counter to at least `seq`, monotonically (never regresses).
+    ///
+    /// The relay tier lever (#585): a relay does not run the reflector's rebuild
+    /// loop, so it never calls [`Self::stamp_rebuild`]. Instead it drives its
+    /// **downstream** publish index to the controller's sequence — the max
+    /// per-Gateway `publish_seq` from the upstream `GatewayMeta` (namespace
+    /// relay) or the envelope `Snapshot.publish_seq` (shared relay) — so its
+    /// downstream leaves Ack in the controller's seq space and the #531 gate can
+    /// evaluate them. `AcqRel` `fetch_max` keeps the same publication fence as
+    /// `stamp_rebuild`'s bump: **call this only after storing the rebuilt cells**,
+    /// so a downstream build that captures [`Self::current_seq`] never reads
+    /// stale cells under a fresh seq.
+    pub fn advance_to(&self, seq: u64) {
+        self.0.counter.fetch_max(seq, Ordering::AcqRel);
+    }
 }
 
 #[cfg(test)]
@@ -224,5 +240,29 @@ mod tests {
         let idx = SharedGatewayPublishIndex::new();
         assert_eq!(idx.get(&key("gw")), None);
         assert_eq!(idx.current_seq(), 0);
+    }
+
+    #[test]
+    fn advance_to_moves_counter_forward_monotonically() {
+        let idx = SharedGatewayPublishIndex::new();
+        idx.advance_to(7);
+        assert_eq!(idx.current_seq(), 7, "advance_to raises the counter");
+        idx.advance_to(3);
+        assert_eq!(
+            idx.current_seq(),
+            7,
+            "advance_to is monotone: a lower value must not regress the counter"
+        );
+        idx.advance_to(9);
+        assert_eq!(idx.current_seq(), 9);
+    }
+
+    #[test]
+    fn advance_to_does_not_stamp_gateways() {
+        // The relay drives only the counter; it holds no per-Gateway stamps.
+        let idx = SharedGatewayPublishIndex::new();
+        idx.advance_to(42);
+        assert_eq!(idx.get(&key("gw")), None);
+        assert_eq!(idx.current_seq(), 42);
     }
 }

@@ -37,15 +37,17 @@
 //!   credential triggers an `InvalidAnnotation` Warning Event naming the username; a
 //!   bcrypt-only secret emits none.
 
+use anyhow::Context as _;
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, Harness, IngressClassGuard, NamespaceGuard,
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::wait,
 };
+use gateway_api_types::apis::standard::gateways::Gateway;
 use k8s_openapi::api::events::v1::Event as K8sEvent;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::Api;
-use kube::api::{Patch, PatchParams};
+use kube::api::{DeleteParams, Patch, PatchParams};
 use std::time::Duration;
 
 mod common;
@@ -1721,6 +1723,85 @@ async fn topology_reconverges_after_routing_change() -> anyhow::Result<()> {
         serde_json::Value::Bool(true),
         "fleet/summary.all_in_sync must be true after re-convergence; got {summary}"
     );
+
+    Ok(())
+}
+
+// ── Gateway data-plane liveness gauge (#585) ──────────────────────────────────
+
+/// The live per-Gateway data-plane gauge tracks connected dedicated proxies
+/// (#585): it reads `>= 1` while the Gateway's proxy is connected, and its
+/// series is removed on deprovision (reads absent → 0). This is the non-latched
+/// liveness signal operators alert on for a total-loss blind spot — distinct
+/// from the latched `Programmed` status, which by design stays `True` through
+/// churn.
+///
+/// Plane: **observability** — the primary assertion is on the metric series.
+#[tokio::test]
+async fn dedicated_dataplane_gauge_tracks_leaf_presence() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-dataplane-gauge").await?;
+
+    // Provision a dedicated Gateway; cut-over means its proxy is connected as a
+    // `Gateway`-scoped node the gauge counts.
+    common::dedicated::apply_and_wait(&h, &ns).await?;
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    common::dedicated::wait_for_cut_over(
+        &gateways,
+        common::dedicated::GATEWAY_NAME,
+        Duration::from_secs(90),
+    )
+    .await?;
+
+    let metrics_url = h.controller_admin_url("/metrics");
+    // Scope the label filter to THIS test's unique namespace, not the shared
+    // `GATEWAY_NAME` constant: the controller is shared and parallel tests reuse
+    // that Gateway name, so a `gateway="dedicated-gw"`-only filter would sum in a
+    // sibling test's series and flake the sad-path `== 0` assertion.
+    let label = format!("namespace=\"{}\"", ns.name);
+    const GAUGE: &str = "coxswain_gateway_dataplane_proxies";
+
+    // Happy: the gauge reads >= 1 while the dedicated proxy is connected.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || {
+            let label = label.clone();
+            async move { format!("{GAUGE}{{{label}}} to reach >= 1 for the connected dedicated proxy") }
+        },
+        || {
+            let (url, label) = (metrics_url.clone(), label.clone());
+            async move {
+                let v = common::discovery::scrape_metric_label_sum(&url, GAUGE, &label).await?;
+                (v >= 1.0).then_some(())
+            }
+        },
+    )
+    .await
+    .context("dataplane gauge never reached >= 1 for the connected dedicated proxy")?;
+
+    // Sad: deprovision the Gateway → the controller drops the series (reads 0).
+    gateways
+        .delete(common::dedicated::GATEWAY_NAME, &DeleteParams::default())
+        .await
+        .context("delete dedicated Gateway")?;
+
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("{GAUGE} series removed after Gateway deprovision") },
+        || {
+            let (url, label) = (metrics_url.clone(), label.clone());
+            async move {
+                let v = common::discovery::scrape_metric_label_sum(&url, GAUGE, &label)
+                    .await
+                    .unwrap_or(0.0);
+                (v == 0.0).then_some(())
+            }
+        },
+    )
+    .await
+    .context("dataplane gauge series was not removed after Gateway deprovision")?;
 
     Ok(())
 }

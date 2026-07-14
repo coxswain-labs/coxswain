@@ -543,11 +543,23 @@ fn run_relay(args: RelayRoleArgs) -> Result<()> {
     let health = HealthRegistry::new();
     let relay_handle = health.register("relay", &["routing_table_loaded", "downstream_serving"]);
 
-    // Upstream discovery client config (bootstrap + SVID + expected-server).
-    // The relay reports no bound ports upstream in v1 — leaf state reaches the
-    // controller via `RosterReport` in #585, not the relay's own NodeStatus.
-    let (config, bootstrap_runner) =
+    // The relay's downstream registry (populated by its downstream server as
+    // leaves connect/ack/bind) is the SOURCE of the upstream `RosterReport`
+    // (#585). It is retained here — unlike the controller, whose registry is the
+    // gate's source of truth — precisely so the reporter below can watch it.
+    let node_registry = coxswain_core::node_registry::SharedNodeRegistry::new();
+
+    // Roster channel: the reporter publishes the downstream registry snapshot;
+    // the upstream client forwards it to the controller as a `RosterReport`.
+    let (roster_tx, roster_rx) =
+        tokio::sync::watch::channel(coxswain_core::node_registry::NodeRegistry::default());
+
+    // Upstream discovery client config (bootstrap + SVID + expected-server). The
+    // relay reports no bound ports of its own (#531) — leaf state reaches the
+    // controller via `RosterReport` (#585), wired here as the roster receiver.
+    let (mut config, bootstrap_runner) =
         build_discovery_client_config(&args.discovery, &args.common, scope, None);
+    config.roster_rx = Some(roster_rx);
 
     // The relay's downstream serving cert IS its rotating bootstrapped SVID, so a
     // bootstrap endpoint is mandatory — without it there is no serving identity.
@@ -574,8 +586,46 @@ fn run_relay(args: RelayRoleArgs) -> Result<()> {
     // Downstream discovery service over the relay's own `SnapshotSource`. No
     // leader gate (the relay is not leader-elected) and the default
     // `DenyAllNamespaces` authorizer (a leaf never subscribes `Namespace`).
-    let node_registry = coxswain_core::node_registry::SharedNodeRegistry::new();
-    let discovery_service = DiscoveryService::new(source, node_registry, rebuild_rx);
+    let discovery_service = DiscoveryService::new(source, node_registry.clone(), rebuild_rx);
+
+    // Debounced roster reporter: watch the downstream registry and republish it
+    // to the upstream client whenever it changes (#585). A periodic backstop
+    // tick catches ack-only changes — `record_ack` deliberately does NOT fire
+    // the registry's change watch (per #531, to avoid re-driving gate consumers
+    // on every push), yet acks carry the `acked_seq` the controller's gate needs.
+    // The content dedup suppresses redundant sends so an idle relay stays quiet.
+    {
+        let registry = node_registry.clone();
+        server.add_service(background_service(
+            "relay-roster-reporter",
+            FutureService::new(async move {
+                let mut change = registry.subscribe();
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut last_sent: Option<coxswain_core::node_registry::NodeRegistry> = None;
+                loop {
+                    tokio::select! {
+                        res = change.changed() => {
+                            if res.is_err() {
+                                break; // registry dropped (process shutdown)
+                            }
+                        }
+                        _ = tick.tick() => {}
+                    }
+                    // Coalesce a burst of changes into one send.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    let snapshot = registry.load();
+                    if last_sent.as_ref() == Some(&snapshot) {
+                        continue;
+                    }
+                    if roster_tx.send(snapshot.clone()).is_err() {
+                        break; // upstream client gone
+                    }
+                    last_sent = Some(snapshot);
+                }
+            }),
+        ));
+    }
 
     // Downstream mTLS acceptor: serving cert resolved from the rotating SVID
     // cell, client-CA = the mounted trust bundle, client identity = any SVID in

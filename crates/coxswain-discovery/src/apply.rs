@@ -210,6 +210,11 @@ pub(crate) struct RoutingApplier {
     terminate: SharedTlsPassthroughTable,
     tcp: SharedTcpRouteTable,
     udp: SharedUdpRouteTable,
+    /// A shared-pool relay's downstream publish index (#585), or `None` for the
+    /// proxy's own applier and the namespace-relay's per-Gateway reconstruction.
+    /// When set, `apply` advances it to the envelope `Snapshot.publish_seq` so
+    /// the relay's downstream leaves Ack in the controller's seq space.
+    publish: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
 }
 
 impl RoutingApplier {
@@ -231,8 +236,23 @@ impl RoutingApplier {
             terminate: cells.terminate.clone(),
             tcp: cells.tcp.clone(),
             udp: cells.udp.clone(),
+            publish: None,
         };
         (applier, cells)
+    }
+
+    /// Drive `publish` to the controller's seq on every apply (#585 shared relay).
+    ///
+    /// Wired only by [`crate::relay::shared_relay`], sharing the same index the
+    /// downstream `SnapshotSource` serves from, so a leaf's Ack of the re-served
+    /// world lands in the controller's seq space for the #531 gate.
+    #[must_use]
+    pub(crate) fn with_publish_index(
+        mut self,
+        publish: coxswain_core::publish_index::SharedGatewayPublishIndex,
+    ) -> Self {
+        self.publish = Some(publish);
+        self
     }
 }
 
@@ -250,7 +270,15 @@ impl SnapshotApplier for RoutingApplier {
             tcp: &self.tcp,
             udp: &self.udp,
         };
-        apply_message(&mut self.cache, msg, cells, expect_full)
+        let stats = apply_message(&mut self.cache, msg, cells, expect_full)?;
+        // Publication fence: advance the downstream publish counter only after
+        // the cells are committed (apply_message returned Ok), so a downstream
+        // build that captures `current_seq()` never reads stale cells under a
+        // fresh seq (#585). No-op for the proxy's own applier (`publish == None`).
+        if let Some(publish) = &self.publish {
+            publish.advance_to(msg.publish_seq);
+        }
+        Ok(stats)
     }
 }
 
@@ -1673,6 +1701,7 @@ mod tests {
             full: true,
             resources,
             removed_resources: Vec::new(),
+            publish_seq: 0,
         }
     }
 
@@ -1692,6 +1721,7 @@ mod tests {
             full: false,
             resources: upserts,
             removed_resources: removed.iter().map(|s| (*s).to_owned()).collect(),
+            publish_seq: 0,
         }
     }
 
@@ -1797,6 +1827,35 @@ mod tests {
         assert!(
             cache.routes.contains_key(&key),
             "the route partition is keyed"
+        );
+    }
+
+    /// #585 shared relay: a `RoutingApplier` wired with a publish index advances
+    /// it to the envelope `Snapshot.publish_seq` on each successful apply, and
+    /// monotonically (a lower seq never regresses). The proxy's own applier has
+    /// no index wired, so this is inert there.
+    #[test]
+    fn routing_applier_advances_publish_index_from_envelope_seq() {
+        let publish = coxswain_core::publish_index::SharedGatewayPublishIndex::new();
+        let (applier, _cells) = RoutingApplier::new();
+        let mut applier = applier.with_publish_index(publish.clone());
+
+        let mut first = full("v1", vec![]);
+        first.publish_seq = 7;
+        applier.apply(&first, true).expect("first apply");
+        assert_eq!(
+            publish.current_seq(),
+            7,
+            "index advances to the envelope seq"
+        );
+
+        let mut lower = full("v1", vec![]);
+        lower.publish_seq = 3;
+        applier.apply(&lower, false).expect("second apply");
+        assert_eq!(
+            publish.current_seq(),
+            7,
+            "advance is monotone: a lower envelope seq must not regress the counter"
         );
     }
 
