@@ -81,8 +81,9 @@ pub struct CoxswainRelayPolicySpec {
     /// Static replica count for the provisioned relay Deployment. When omitted, falls back
     /// to the controller's `--relay-replicas` (default 2, HA). Ignored while
     /// [`RelayAutoscaling::enabled`] is `true` and capped, in which case the controller
-    /// computes the count.
+    /// computes the count. Must be ≥ 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub replicas: Option<u32>,
 
     /// Resource requests/limits for the relay container. Supersedes the flat
@@ -124,22 +125,25 @@ pub struct RelayAutoscaling {
 
     /// Minimum replicas the controller will scale the relay down to. When omitted, the
     /// effective static replica count (policy `replicas` or `--relay-replicas`, default 2)
-    /// is the floor. Keep ≥ 2 for HA.
+    /// is the floor. Keep ≥ 2 for HA. Must be ≥ 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub min_replicas: Option<u32>,
 
     /// Maximum replicas the controller will scale the relay up to — the **mandatory** cap on
     /// the upstream streams the relay tier opens against the leader. Autoscaling is inert
-    /// (falls back to static replicas) when this is unset.
+    /// (falls back to static replicas) when this is unset. Must be ≥ 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub max_replicas: Option<u32>,
 
     /// Target number of downstream dedicated proxies each relay replica should front. The
     /// controller adds a replica per this many proxies of namespace fan-out. When omitted,
     /// defaults to 8 (matching the `--relay-min-proxy-replicas` break-even default). Keep
     /// `max_replicas` well below the namespace's downstream fan-out divided by this, or the
-    /// relay's own upstream streams approach the count it is meant to collapse.
+    /// relay's own upstream streams approach the count it is meant to collapse. Must be ≥ 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1))]
     pub target_proxies_per_replica: Option<u32>,
 }
 

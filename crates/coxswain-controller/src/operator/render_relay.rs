@@ -96,10 +96,12 @@ pub(crate) struct RelayRenderInputs<'a> {
     /// the `CoxswainRelayPolicy.spec.podTemplate` scheduling escape hatch (#589). `None`
     /// leaves the controller-rendered pod untouched.
     pub pod_template: Option<&'a serde_json::Value>,
-    /// The replica *floor* used for the PDB decision (#589): a relay gets a
-    /// `PodDisruptionBudget` (maxUnavailable: 1) only when this is ≥2. It equals the
-    /// autoscaling `minReplicas` when autoscaling is on, otherwise the static `replicas`.
-    pub pdb_floor: i32,
+    /// The replica *ceiling* used for the PDB decision (#589): a relay gets a
+    /// `PodDisruptionBudget` (maxUnavailable: 1) when the most replicas it may run is ≥2.
+    /// It equals the autoscaling `maxReplicas` when autoscaling is on, otherwise the static
+    /// `replicas`. Gating on the ceiling (not the current/floor count) means an autoscaling
+    /// relay that can reach ≥2 replicas keeps its PDB even while momentarily scaled to 1.
+    pub pdb_replica_ceiling: i32,
 }
 
 /// The rendered relay objects. No HPA — relay autoscaling is controller-driven
@@ -113,7 +115,7 @@ pub(crate) struct RenderedRelay {
     /// The relay Deployment running `serve relay --namespace=<ns>`.
     pub deployment: Deployment,
     /// `PodDisruptionBudget` protecting the relay during voluntary disruptions —
-    /// `Some` only when [`RelayRenderInputs::pdb_floor`] ≥ 2. Applied-or-deleted by
+    /// `Some` only when [`RelayRenderInputs::pdb_replica_ceiling`] ≥ 2. Applied-or-deleted by
     /// [`super::apply::apply_relay`].
     pub pdb: Option<PodDisruptionBudget>,
 }
@@ -262,7 +264,7 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
     // coxswain container survives, scheduling fields (nodeSelector/tolerations/affinity/
     // topologySpreadConstraints/priorityClassName) layer on.
     let pod_template = match inputs.pod_template {
-        Some(overlay) => merge_pod_template(&base_pod_template, overlay),
+        Some(overlay) => merge_pod_template(&base_pod_template, overlay, inputs.namespace),
         None => base_pod_template,
     };
 
@@ -326,12 +328,12 @@ pub(crate) fn relay_resources(
 
 /// Render a `PodDisruptionBudget` protecting the relay Deployment (#589).
 ///
-/// Returns `Some` (maxUnavailable: 1) only when the effective replica floor
-/// (`inputs.pdb_floor`) is ≥ 2. A PDB with a single-replica floor either blocks node
-/// drain permanently or provides no protection — both wrong. Selector joins the relay's
-/// two-key label set, matching the Deployment/Service.
+/// Returns `Some` (maxUnavailable: 1) only when the relay's replica ceiling
+/// (`inputs.pdb_replica_ceiling`) is ≥ 2. A PDB over a relay that can only ever run a
+/// single replica either blocks node drain permanently or provides no protection — both
+/// wrong. Selector joins the relay's two-key label set, matching the Deployment/Service.
 fn render_relay_pdb(inputs: &RelayRenderInputs<'_>) -> Option<PodDisruptionBudget> {
-    if inputs.pdb_floor < 2 {
+    if inputs.pdb_replica_ceiling < 2 {
         return None;
     }
     Some(PodDisruptionBudget {
@@ -374,7 +376,7 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             resources: relay_resources("50m", "64Mi", "256Mi"),
             pod_template: None,
-            pdb_floor: 2,
+            pdb_replica_ceiling: 2,
         }
     }
 
@@ -516,19 +518,35 @@ mod tests {
     }
 
     #[test]
-    fn pdb_rendered_at_floor_two_absent_below() {
+    fn malformed_pod_template_overlay_degrades_to_base_without_panic() {
+        // `containers` patched into a non-array can't deserialize back into a
+        // PodTemplateSpec; the relay must render its base pod (coxswain container
+        // intact) rather than crash the reconcile.
+        let overlay = serde_json::json!({"spec": {"containers": "not-an-array"}});
         let mut i = inputs();
-        i.pdb_floor = 2;
+        i.pod_template = Some(&overlay);
+        let d = render_relay_deployment(&i);
+        let spec = d.spec.expect("spec").template.spec.expect("pod spec");
+        assert!(
+            spec.containers.iter().any(|c| c.name == "coxswain"),
+            "malformed overlay is ignored; the base relay container survives"
+        );
+    }
+
+    #[test]
+    fn pdb_rendered_at_ceiling_two_absent_below() {
+        let mut i = inputs();
+        i.pdb_replica_ceiling = 2;
         let r = render_relay(&i);
-        let pdb = r.pdb.expect("PDB at floor 2");
+        let pdb = r.pdb.expect("PDB at ceiling 2");
         assert_eq!(
             pdb.spec.and_then(|s| s.max_unavailable),
             Some(IntOrString::Int(1))
         );
-        i.pdb_floor = 1;
+        i.pdb_replica_ceiling = 1;
         assert!(
             render_relay(&i).pdb.is_none(),
-            "no PDB below floor 2 (single-replica PDB is counterproductive)"
+            "no PDB when the relay can only ever run a single replica (counterproductive)"
         );
     }
 

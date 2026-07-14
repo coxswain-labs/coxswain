@@ -582,7 +582,7 @@ async fn converge_namespace_relay(
                 &ctx.relay_memory_limit,
             )
         });
-        let (replicas, pdb_floor) = effective_relay_replicas(ctx, namespace, policy);
+        let (replicas, pdb_replica_ceiling) = effective_relay_replicas(ctx, namespace, policy);
         let rendered = render_relay::render_relay(&render_relay::RelayRenderInputs {
             namespace,
             replicas,
@@ -594,7 +594,7 @@ async fn converge_namespace_relay(
             discovery_trust_domain: &ctx.discovery_trust_domain,
             resources,
             pod_template: policy.pod_template.as_ref(),
-            pdb_floor,
+            pdb_replica_ceiling,
         });
         apply::apply_relay(&ctx.client, namespace, &rendered).await?;
         if !currently {
@@ -664,15 +664,20 @@ fn relay_desired(
 
 /// Compute the relay's Deployment replica count and PDB floor for `namespace` (#589).
 ///
-/// Returns `(deployment_replicas, pdb_floor)`. Controller-driven autoscaling: when the
-/// policy enables it *and* sets `maxReplicas`, the relay is sized to the namespace's
+/// Returns `(deployment_replicas, pdb_replica_ceiling)`. Controller-driven autoscaling: when
+/// the policy enables it *and* sets `maxReplicas`, the relay is sized to the namespace's
 /// spec-derived dedicated-proxy fan-out — `clamp(ceil(fanout / targetProxiesPerReplica),
 /// minReplicas, maxReplicas)`. The spec-derived input never jitters on pod churn, so no
 /// stabilization is needed. When autoscaling is enabled but *uncapped*, the controller
 /// refuses to scale (an uncapped relay would regrow the leader fan-out the tier caps) and
 /// warn-logs, falling back to the static replica count. Otherwise the static count is the
-/// policy override or the `--relay-replicas` default. The PDB floor is the minimum the
-/// relay runs at (autoscaling `minReplicas`, else the static count).
+/// policy override or the `--relay-replicas` default.
+///
+/// The second element is the **PDB ceiling** — the *most* replicas the relay may run
+/// (autoscaling `maxReplicas`, else the static count), which gates the PDB. Gating on the
+/// ceiling, not the current/floor count, means an autoscaling relay that can reach ≥2
+/// replicas always carries a PDB even when it is momentarily scaled to 1 — otherwise a node
+/// drain could evict every replica of a scaled-up relay at once.
 fn effective_relay_replicas(
     ctx: &ReconcileContext,
     namespace: &str,
@@ -689,8 +694,8 @@ fn effective_relay_replicas(
 }
 
 /// Pure replica arithmetic behind [`effective_relay_replicas`], split out for unit testing.
-/// Returns `(deployment_replicas, pdb_floor)`. See [`effective_relay_replicas`] for the
-/// contract; `namespace` is used only for the uncapped warn-log.
+/// Returns `(deployment_replicas, pdb_replica_ceiling)`. See [`effective_relay_replicas`] for
+/// the contract; `namespace` is used only for the uncapped warn-log.
 fn compute_relay_replicas(
     static_replicas: u32,
     autoscaling: Option<&coxswain_core::crd::RelayAutoscaling>,
@@ -702,7 +707,9 @@ fn compute_relay_replicas(
             let min = a.min_replicas.unwrap_or(static_replicas).min(max);
             let target = a.target_proxies_per_replica.unwrap_or(8).max(1);
             let scaled = fanout.div_ceil(target).clamp(min, max);
-            return (clamp_u32_to_i32(scaled), clamp_u32_to_i32(min));
+            // PDB ceiling is `max`: the relay can scale up to it, so it needs a PDB
+            // whenever max ≥ 2 even if currently (or at minimum) 1 replica.
+            return (clamp_u32_to_i32(scaled), clamp_u32_to_i32(max));
         }
         tracing::warn!(
             namespace = %namespace,
@@ -1678,25 +1685,37 @@ mod tests {
 
     #[test]
     fn compute_relay_replicas_scales_to_fanout_within_cap() {
-        // fanout 30, target 8 → ceil(30/8)=4, within [2,6].
+        // fanout 30, target 8 → ceil(30/8)=4, within [2,6]. PDB ceiling = max (6).
         let a = autoscaling(Some(2), Some(6), Some(8));
-        assert_eq!(compute_relay_replicas(2, Some(&a), 30, "ns"), (4, 2));
+        assert_eq!(compute_relay_replicas(2, Some(&a), 30, "ns"), (4, 6));
     }
 
     #[test]
     fn compute_relay_replicas_clamps_to_min_and_max() {
         let a = autoscaling(Some(3), Some(5), Some(1));
-        // fanout 1 → ceil(1/1)=1, clamped up to min 3.
-        assert_eq!(compute_relay_replicas(2, Some(&a), 1, "ns"), (3, 3));
+        // fanout 1 → ceil(1/1)=1, clamped up to min 3; PDB ceiling = max (5).
+        assert_eq!(compute_relay_replicas(2, Some(&a), 1, "ns"), (3, 5));
         // fanout 100 → clamped down to max 5.
-        assert_eq!(compute_relay_replicas(2, Some(&a), 100, "ns"), (5, 3));
+        assert_eq!(compute_relay_replicas(2, Some(&a), 100, "ns"), (5, 5));
     }
 
     #[test]
     fn compute_relay_replicas_min_above_max_cannot_panic() {
-        // Misconfigured min>max: min is pinned to max, no clamp panic.
+        // Misconfigured min>max: min is pinned to max, no clamp panic; ceiling = max.
         let a = autoscaling(Some(9), Some(4), Some(1));
         assert_eq!(compute_relay_replicas(2, Some(&a), 100, "ns"), (4, 4));
+    }
+
+    #[test]
+    fn compute_relay_replicas_pdb_ceiling_is_max_not_floor() {
+        // An autoscaling relay with min 1 but max 10 must report a PDB ceiling of 10
+        // (so a PDB is provisioned) even though the current count is 1.
+        let a = autoscaling(Some(1), Some(10), Some(8));
+        assert_eq!(
+            compute_relay_replicas(2, Some(&a), 1, "ns"),
+            (1, 10),
+            "PDB ceiling is maxReplicas so a scaled-up relay keeps its PDB"
+        );
     }
 
     #[test]
