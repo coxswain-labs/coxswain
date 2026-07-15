@@ -56,7 +56,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::{debug, warn};
@@ -77,6 +77,7 @@ use coxswain_core::tls::{SharedClientCertStore, SharedPortTlsStore};
 use crate::auth::{PeerSvid, svid_matches_dedicated_gateway};
 use crate::subscription::Scope;
 
+use crate::bootstrap_server::UpstreamResolverConfig;
 use crate::materialize::{MaterializedView, materialize};
 use crate::proto::v1::{
     self as p, client_message::Kind as CKind, discovery_server::Discovery,
@@ -291,6 +292,23 @@ pub struct DiscoveryService {
     /// [`DenyAllNamespaces`]; `coxswain-bin` installs a provenance-backed
     /// implementation once #584 provisions relays.
     authorizer: Arc<dyn ScopeAuthorizer>,
+    /// Best-upstream resolver for live repoint directives (#601). When `Some`,
+    /// a dedicated (Gateway/Namespace-scope) stream is sent a `PreferredUpstream`
+    /// directive whenever its namespace's best upstream changes (a relay is
+    /// provisioned or torn down). `None` = no live repoint (unit tests / roles
+    /// that don't front leaves).
+    upstream_resolver: Option<Arc<UpstreamResolverConfig>>,
+    /// Wakes each stream's send loop when relay provisioning changes (#601),
+    /// bumped by the operator's `set_relay_provisioned`. Distinct from
+    /// `rebuild_rx` (routing changes): a relay provision/teardown is not itself a
+    /// routing rebuild, so it needs its own signal to trigger a repoint push.
+    relay_changed_rx: Option<watch::Receiver<u64>>,
+    /// Relay directive-forwarding fan-out (#601). Set only on a **relay's**
+    /// downstream server: its upstream client fans controller-originated
+    /// `PreferredUpstream` directives here, and each downstream leaf stream
+    /// subscribes and forwards the ones targeting its Gateway. `None` on the
+    /// controller's own server (it originates directives, never forwards them).
+    directive_tx: Option<broadcast::Sender<p::PreferredUpstream>>,
 }
 
 /// Shared, generation-keyed view cache for scopes every subscriber of the same
@@ -351,6 +369,9 @@ impl DiscoveryService {
             leader_rx: None,
             shared_view: Arc::new(Mutex::new(ViewCacheState::default())),
             authorizer: Arc::new(DenyAllNamespaces),
+            upstream_resolver: None,
+            relay_changed_rx: None,
+            directive_tx: None,
         }
     }
 
@@ -378,6 +399,39 @@ impl DiscoveryService {
     #[must_use]
     pub fn with_scope_authorizer(mut self, authorizer: Arc<dyn ScopeAuthorizer>) -> Self {
         self.authorizer = authorizer;
+        self
+    }
+
+    /// Enable live upstream-repoint directives (#601).
+    ///
+    /// `resolver` computes each dedicated leaf's current best upstream (its
+    /// namespace's relay if provisioned, else the controller). `relay_changed_rx`
+    /// wakes every live stream's send loop when relay provisioning changes, so a
+    /// leaf is repointed the moment its namespace gains or loses a relay — without
+    /// recycling any data-plane listener. Both must be installed together.
+    #[must_use]
+    pub fn with_upstream_directives(
+        mut self,
+        resolver: Arc<UpstreamResolverConfig>,
+        relay_changed_rx: watch::Receiver<u64>,
+    ) -> Self {
+        self.upstream_resolver = Some(resolver);
+        self.relay_changed_rx = Some(relay_changed_rx);
+        self
+    }
+
+    /// Enable relay directive-forwarding on a **relay's** downstream server (#601).
+    ///
+    /// The relay's upstream client fans controller-originated `PreferredUpstream`
+    /// directives into `directive_tx`; each downstream leaf stream subscribes and
+    /// forwards the ones targeting its Gateway. Only a relay installs this — the
+    /// controller originates directives from its resolver instead.
+    #[must_use]
+    pub fn with_directive_forwarding(
+        mut self,
+        directive_tx: broadcast::Sender<p::PreferredUpstream>,
+    ) -> Self {
+        self.directive_tx = Some(directive_tx);
         self
     }
 }
@@ -753,6 +807,9 @@ impl Discovery for DiscoveryService {
             rebuild_rx: self.rebuild_rx.clone(),
             shared_view: self.shared_view.clone(),
             leader_rx: self.leader_rx.clone(),
+            upstream_resolver: self.upstream_resolver.clone(),
+            relay_changed_rx: self.relay_changed_rx.clone(),
+            directive_tx: self.directive_tx.clone(),
         };
         let (tx, rx) = mpsc::channel::<Result<p::ServerMessage, Status>>(4);
 
@@ -845,6 +902,14 @@ struct StreamServices {
     rebuild_rx: watch::Receiver<u64>,
     shared_view: SharedViewCache,
     leader_rx: Option<watch::Receiver<bool>>,
+    /// Best-upstream resolver for live repoint directives (#601); `None` disables
+    /// the push (unit tests / non-leaf-fronting roles).
+    upstream_resolver: Option<Arc<UpstreamResolverConfig>>,
+    /// Relay-provisioning change signal (#601); `None` when directives are off.
+    relay_changed_rx: Option<watch::Receiver<u64>>,
+    /// Relay directive-forwarding fan-out (#601); `Some` only on a relay's
+    /// downstream server. Each stream subscribes a receiver from it.
+    directive_tx: Option<broadcast::Sender<p::PreferredUpstream>>,
 }
 
 /// Immutable references the outbound handlers need, borrowed from the stream
@@ -896,7 +961,14 @@ async fn run_stream(
         mut rebuild_rx,
         shared_view,
         mut leader_rx,
+        upstream_resolver,
+        mut relay_changed_rx,
+        directive_tx,
     } = services;
+    // Relay directive-forwarding (#601): a relay's downstream leaf subscribes to
+    // the fan-out its upstream client feeds, and forwards directives targeting
+    // this leaf's Gateway. `None` on the controller (it originates, never forwards).
+    let mut directive_rx = directive_tx.as_ref().map(broadcast::Sender::subscribe);
     let ctx = StreamCtx {
         sub: &sub,
         source: &source,
@@ -911,6 +983,20 @@ async fn run_stream(
         pending: None,
         sent_at: None,
     };
+
+    // Live upstream-repoint baseline (#601): the last `(endpoint, sa)` this stream
+    // was told to use. Seeded (without pushing) on stream open — the client just
+    // bootstrapped to exactly this upstream — then a `PreferredUpstream` is pushed
+    // only when it changes (a relay is provisioned or torn down).
+    let mut last_upstream: Option<(String, String)> = None;
+    // Seeds the baseline on open (no send); the returned Ok is expected.
+    let _ = seed_or_push_upstream(
+        &sub.scope,
+        upstream_resolver.as_ref(),
+        &mut last_upstream,
+        &tx,
+    )
+    .await;
 
     // Send the initial snapshot immediately on stream open. With no baseline yet
     // (`acked_resources == None`) this is always a full; `build_outbound`
@@ -1024,6 +1110,62 @@ async fn run_stream(
                     Err(()) => break,
                 }
             }
+
+            // Relay provisioning changed (#601) — repoint this leaf if its
+            // namespace's best upstream moved (relay provisioned or torn down).
+            // Inert (`pending`) when directives are disabled (no receiver wired).
+            changed = wait_relay_changed(&mut relay_changed_rx) => {
+                if changed.is_err() {
+                    // Sender dropped (controller shutting down): stop watching.
+                    relay_changed_rx = None;
+                    continue;
+                }
+                if seed_or_push_upstream(
+                    &sub.scope,
+                    upstream_resolver.as_ref(),
+                    &mut last_upstream,
+                    &tx,
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
+
+            // Relay directive-forwarding (#601): the upstream client fanned a
+            // controller directive here — forward it to this leaf if it targets
+            // this leaf's Gateway. Inert (`pending`) when not a relay.
+            directive = recv_directive(&mut directive_rx) => {
+                match directive {
+                    Ok(directive) if directive_targets_leaf(&directive, &sub.scope) => {
+                        debug!(
+                            node_id = %sub.node_id,
+                            endpoint = %directive.endpoint,
+                            "discovery: relay forwarding PreferredUpstream to leaf"
+                        );
+                        if tx
+                            .send(Ok(p::ServerMessage {
+                                kind: Some(SKind::PreferredUpstream(directive)),
+                            }))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    // Directive for a different Gateway, or the fan-out lagged
+                    // (dropped messages): ignore. A dropped forward is not stuck —
+                    // the only live forward case is a relay teardown, which also
+                    // drops this leaf's stream, so the leaf reconnects and (via the
+                    // re-bootstrap fallback) converges onto the controller anyway.
+                    // A fresh controller-originated directive re-drives the rest.
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => {
+                        directive_rx = None;
+                    }
+                }
+            }
         }
     }
 
@@ -1031,6 +1173,116 @@ async fn run_stream(
     // Relay subtree eviction on stream exit (#585); no-op for a non-relay node.
     registry.evict_children(&sub.node_id);
     crate::metrics::connected_proxies().dec();
+}
+
+/// Await a relay-provisioning change on an optional watch (#601), standing in a
+/// never-resolving future when directives are disabled so it can share `select!`.
+async fn wait_relay_changed(
+    rx: &mut Option<watch::Receiver<u64>>,
+) -> Result<(), watch::error::RecvError> {
+    match rx.as_mut() {
+        Some(r) => r.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Await a forwarded directive on an optional broadcast receiver (#601), standing
+/// in a never-resolving future when this stream is not a relay leaf.
+async fn recv_directive(
+    rx: &mut Option<broadcast::Receiver<p::PreferredUpstream>>,
+) -> Result<p::PreferredUpstream, broadcast::error::RecvError> {
+    match rx.as_mut() {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether a relay-forwarded directive targets the leaf on this stream (#601).
+///
+/// The controller tags a directive it pushes on a relay's Namespace stream with
+/// the target `namespace` (and optionally a specific Gateway `name`); the relay
+/// forwards it to every leaf whose Gateway scope matches. An empty `target_name`
+/// matches every Gateway in the namespace. A `SharedPool` leaf is never a relay
+/// forward target (shared-pool live repoint is #605).
+fn directive_targets_leaf(directive: &p::PreferredUpstream, scope: &Scope) -> bool {
+    match scope {
+        Scope::Gateway { namespace, name } => {
+            directive.target_namespace == *namespace
+                && (directive.target_name.is_empty() || directive.target_name == *name)
+        }
+        Scope::Namespace { .. } | Scope::SharedPool => false,
+    }
+}
+
+/// Seed or push this stream's live upstream-repoint directive (#601).
+///
+/// `last` tracks the upstream this stream's client(s) currently use. On the FIRST
+/// call (`last` is `None`) it seeds that baseline from **where the client is
+/// connected right now**, not from the desired best-upstream — a Gateway-scope
+/// client whose stream is served here is, by definition, streaming from the
+/// controller (it may have bootstrapped to the controller *before* its namespace
+/// gained a relay), while a Namespace-scope relay's leaves stream from the relay.
+/// Then, on the seed call and every later relay-provisioning tick, it sends a
+/// `PreferredUpstream` whenever the desired best-upstream diverges from `last`
+/// (a relay was provisioned, or torn down). Seeding from the connected upstream
+/// — rather than the desired one — is what makes a fresh proxy that landed on the
+/// controller get repointed onto a relay provisioned in the same reconcile.
+///
+/// A `SharedPool` stream is never repointed here (shared-pool live repoint is
+/// #605); a resolver-less service is a no-op.
+///
+/// For a `Gateway` scope (dedicated leaf streaming directly from the controller)
+/// the directive is untargeted — the leaf is the sole recipient. For a `Namespace`
+/// scope (a relay's aggregate stream) the directive carries `target_namespace` so
+/// the relay forwards it to its downstream leaves in that namespace.
+///
+/// Returns `Err(())` if the outbound channel closed.
+async fn seed_or_push_upstream(
+    scope: &Scope,
+    resolver: Option<&Arc<UpstreamResolverConfig>>,
+    last: &mut Option<(String, String)>,
+    tx: &mpsc::Sender<Result<p::ServerMessage, Status>>,
+) -> Result<(), ()> {
+    let Some(resolver) = resolver else {
+        return Ok(());
+    };
+    let (namespace, forward_target) = match scope {
+        Scope::Gateway { namespace, .. } => (namespace.clone(), String::new()),
+        Scope::Namespace { namespace } => (namespace.clone(), namespace.clone()),
+        Scope::SharedPool => return Ok(()),
+    };
+    // Seed from the CURRENTLY-CONNECTED upstream: a Gateway-scope client is
+    // connected to the controller (its stream is here), a Namespace-scope relay's
+    // leaves are behind the relay.
+    if last.is_none() {
+        *last = Some(match scope {
+            Scope::Gateway { .. } => resolver.controller_target(),
+            _ => resolver.resolve_namespace(&namespace),
+        });
+    }
+    let target = resolver.resolve_namespace(&namespace);
+    if last.as_ref() == Some(&target) {
+        return Ok(());
+    }
+    *last = Some(target.clone());
+    let (endpoint, expected_server_sa) = target;
+    debug!(
+        %endpoint,
+        %expected_server_sa,
+        forward_namespace = %forward_target,
+        "discovery: pushing PreferredUpstream directive (relay provisioning changed)"
+    );
+    let directive = p::PreferredUpstream {
+        endpoint,
+        expected_server_sa,
+        target_namespace: forward_target,
+        target_name: String::new(),
+    };
+    tx.send(Ok(p::ServerMessage {
+        kind: Some(SKind::PreferredUpstream(directive)),
+    }))
+    .await
+    .map_err(|_| ())
 }
 
 /// Build the outbound message for `view` against the stream's acked baseline and,
@@ -2864,5 +3116,195 @@ mod tests {
                 "the real ProvisionedRelayAuthorizer must deny an unauthenticated Namespace subscribe",
             );
         assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
+    }
+
+    // ── live upstream-repoint push (#601) ──────────────────────────────────────
+
+    fn upstream_resolver(provisioned: &[&str]) -> Arc<UpstreamResolverConfig> {
+        let set: HashSet<String> = provisioned.iter().map(|s| (*s).to_owned()).collect();
+        Arc::new(UpstreamResolverConfig {
+            controller_endpoint: "https://coxswain-controller-discovery.coxswain-system.svc:50051"
+                .to_owned(),
+            controller_sa: "coxswain-controller".to_owned(),
+            shared_relay_endpoint: None,
+            relay_service_name: "coxswain-relay".to_owned(),
+            relay_port: 50051,
+            relay_sa: "coxswain-relay".to_owned(),
+            provisioned_relays: Shared::from_value(set),
+        })
+    }
+
+    /// Drain any directive currently queued on the receiver without blocking.
+    fn try_recv_directive(
+        rx: &mut mpsc::Receiver<Result<ServerMessage, Status>>,
+    ) -> Option<p::PreferredUpstream> {
+        match rx.try_recv() {
+            Ok(Ok(ServerMessage {
+                kind: Some(SrvKind::PreferredUpstream(d)),
+            })) => Some(d),
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_does_not_push_then_provisioning_change_repoints_gateway_leaf() {
+        // Not yet provisioned: seeding a Gateway-scope leaf records the controller
+        // baseline and sends nothing (the client already bootstrapped to it).
+        let resolver = upstream_resolver(&[]);
+        let (tx, mut rx) = mpsc::channel::<Result<ServerMessage, Status>>(4);
+        let scope = Scope::Gateway {
+            namespace: "team-a".to_owned(),
+            name: "my-gw".to_owned(),
+        };
+        let mut last = None;
+        seed_or_push_upstream(&scope, Some(&resolver), &mut last, &tx)
+            .await
+            .expect("seed must not fail");
+        assert!(
+            try_recv_directive(&mut rx).is_none(),
+            "seeding must not push a directive"
+        );
+
+        // Namespace becomes provisioned → the leaf is repointed to the relay,
+        // untargeted (it is the sole recipient of its own direct stream).
+        resolver
+            .provisioned_relays
+            .store(Arc::new(HashSet::from(["team-a".to_owned()])));
+        seed_or_push_upstream(&scope, Some(&resolver), &mut last, &tx)
+            .await
+            .expect("push must not fail");
+        let directive = try_recv_directive(&mut rx).expect("a repoint directive must be pushed");
+        assert_eq!(
+            directive.endpoint,
+            "https://coxswain-relay.team-a.svc:50051"
+        );
+        assert_eq!(directive.expected_server_sa, "coxswain-relay");
+        assert_eq!(
+            directive.target_namespace, "",
+            "a direct Gateway-scope directive is untargeted"
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_leaf_is_repointed_on_seed_when_relay_already_provisioned() {
+        // Race the real provisioning flow reproduces: the proxy bootstrapped to the
+        // controller (its stream is served HERE), but its namespace's relay was
+        // provisioned before this stream opened. The seed baseline is therefore the
+        // controller (where the proxy is actually connected), NOT the already-desired
+        // relay — so the very first call pushes the repoint instead of silently
+        // seeding `relay` and never moving the proxy off the controller.
+        let resolver = upstream_resolver(&["team-a"]);
+        let (tx, mut rx) = mpsc::channel::<Result<ServerMessage, Status>>(4);
+        let scope = Scope::Gateway {
+            namespace: "team-a".to_owned(),
+            name: "my-gw".to_owned(),
+        };
+        let mut last = None;
+        seed_or_push_upstream(&scope, Some(&resolver), &mut last, &tx)
+            .await
+            .expect("push must not fail");
+        let directive = try_recv_directive(&mut rx)
+            .expect("a Gateway leaf whose relay is already provisioned must be repointed on open");
+        assert_eq!(
+            directive.endpoint,
+            "https://coxswain-relay.team-a.svc:50051"
+        );
+        assert_eq!(directive.expected_server_sa, "coxswain-relay");
+    }
+
+    #[tokio::test]
+    async fn namespace_relay_stream_forwards_targeted_directive_on_deprovision() {
+        // Relay's Namespace stream, provisioned: seed the relay baseline, no push.
+        let resolver = upstream_resolver(&["team-a"]);
+        let (tx, mut rx) = mpsc::channel::<Result<ServerMessage, Status>>(4);
+        let scope = Scope::Namespace {
+            namespace: "team-a".to_owned(),
+        };
+        let mut last = None;
+        seed_or_push_upstream(&scope, Some(&resolver), &mut last, &tx)
+            .await
+            .expect("seed must not fail");
+        assert!(try_recv_directive(&mut rx).is_none());
+
+        // Deprovision → forward a controller-repoint directive tagged with the
+        // namespace so the relay routes it to its downstream leaves.
+        resolver.provisioned_relays.store(Arc::new(HashSet::new()));
+        seed_or_push_upstream(&scope, Some(&resolver), &mut last, &tx)
+            .await
+            .expect("push must not fail");
+        let directive = try_recv_directive(&mut rx).expect("a forward directive must be pushed");
+        assert_eq!(
+            directive.endpoint,
+            "https://coxswain-controller-discovery.coxswain-system.svc:50051"
+        );
+        assert_eq!(directive.expected_server_sa, "coxswain-controller");
+        assert_eq!(
+            directive.target_namespace, "team-a",
+            "a Namespace-scope directive carries the target namespace for relay forwarding"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_pool_stream_is_never_repointed_here() {
+        let resolver = upstream_resolver(&[]);
+        let (tx, mut rx) = mpsc::channel::<Result<ServerMessage, Status>>(4);
+        let mut last = None;
+        seed_or_push_upstream(&Scope::SharedPool, Some(&resolver), &mut last, &tx)
+            .await
+            .expect("no-op must not fail");
+        resolver
+            .provisioned_relays
+            .store(Arc::new(HashSet::from(["team-a".to_owned()])));
+        seed_or_push_upstream(&Scope::SharedPool, Some(&resolver), &mut last, &tx)
+            .await
+            .expect("no-op must not fail");
+        assert!(
+            try_recv_directive(&mut rx).is_none(),
+            "shared-pool live repoint is #605, never pushed here"
+        );
+    }
+
+    #[test]
+    fn directive_targeting_matches_gateway_in_namespace_only() {
+        let directive = |ns: &str, name: &str| p::PreferredUpstream {
+            endpoint: "https://x".to_owned(),
+            expected_server_sa: "coxswain-controller".to_owned(),
+            target_namespace: ns.to_owned(),
+            target_name: name.to_owned(),
+        };
+        let gw = |ns: &str, name: &str| Scope::Gateway {
+            namespace: ns.to_owned(),
+            name: name.to_owned(),
+        };
+        // Namespace-wide directive (empty target_name) hits every Gateway in ns.
+        assert!(directive_targets_leaf(
+            &directive("team-a", ""),
+            &gw("team-a", "gw-1")
+        ));
+        // Gateway-specific directive hits only that Gateway.
+        assert!(directive_targets_leaf(
+            &directive("team-a", "gw-1"),
+            &gw("team-a", "gw-1")
+        ));
+        assert!(!directive_targets_leaf(
+            &directive("team-a", "gw-1"),
+            &gw("team-a", "gw-2")
+        ));
+        // Different namespace never matches.
+        assert!(!directive_targets_leaf(
+            &directive("team-b", ""),
+            &gw("team-a", "gw-1")
+        ));
+        // A relay/shared leaf is never a forward target.
+        assert!(!directive_targets_leaf(
+            &directive("team-a", ""),
+            &Scope::Namespace {
+                namespace: "team-a".to_owned()
+            }
+        ));
+        assert!(!directive_targets_leaf(
+            &directive("team-a", ""),
+            &Scope::SharedPool
+        ));
     }
 }

@@ -21,16 +21,19 @@
 //! **never zeroed**: the last-good snapshot continues to be served until a
 //! fresh SVID allows the supervisor to reconnect.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use rcgen::{CertificateParams, KeyPair};
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
 use tonic::transport::Endpoint;
 use tracing::{debug, info, warn};
 
 use crate::auth::{DiscoveryBootstrapClientTls, SpiffeMatcher};
 use crate::proto::v1::{BootstrapRequest, discovery_client::DiscoveryClient as TonicClient};
+use crate::subscription::Scope;
 use crate::svid::{SharedSvid, SvidMaterial};
+use crate::upstream::{SharedUpstream, UpstreamTarget, expected_server_matcher};
 use crate::version::WIRE_VERSION;
 
 // ── BootstrapClientConfig ─────────────────────────────────────────────────────
@@ -55,6 +58,14 @@ pub struct BootstrapClientConfig {
     pub trust_domain: String,
     /// Pod namespace; used to form the controller's expected SPIFFE ID.
     pub controller_namespace: String,
+    /// This client's subscription scope (#601). Sent in the bootstrap request so
+    /// the controller computes the client's best routing upstream (a relay if the
+    /// scope is relay-fronted, else the controller) and returns it on the
+    /// response.
+    pub scope: Scope,
+    /// Namespace to attribute an upstream whose endpoint is not cluster service
+    /// DNS (test loopback) when building the returned upstream's matcher (#601).
+    pub fallback_namespace: String,
     /// Initial backoff duration (default: 250 ms).
     pub backoff_base: Duration,
     /// Maximum backoff ceiling (default: 30 s).
@@ -70,6 +81,8 @@ impl BootstrapClientConfig {
         ca_bundle_path: impl Into<std::path::PathBuf>,
         trust_domain: impl Into<String>,
         controller_namespace: impl Into<String>,
+        scope: Scope,
+        fallback_namespace: impl Into<String>,
     ) -> Self {
         Self {
             endpoint: endpoint.into(),
@@ -77,6 +90,8 @@ impl BootstrapClientConfig {
             ca_bundle_path: ca_bundle_path.into(),
             trust_domain: trust_domain.into(),
             controller_namespace: controller_namespace.into(),
+            scope,
+            fallback_namespace: fallback_namespace.into(),
             backoff_base: Duration::from_millis(250),
             backoff_cap: Duration::from_secs(30),
         }
@@ -92,6 +107,16 @@ pub struct BootstrapClientHandle {
     pub svid: SharedSvid,
     /// Receives a new generation counter each time the SVID is refreshed.
     pub rotation_rx: watch::Receiver<u64>,
+    /// The current routing-stream upstream, or `None` until the first bootstrap
+    /// delivers one (#601). Wired into `DiscoveryClientConfig.upstream_cell`.
+    pub upstream: SharedUpstream,
+    /// Receives a new generation counter each time the bootstrap loop delivers a
+    /// fresh upstream (#601). Wired into `DiscoveryClientConfig.upstream_changed`
+    /// so the supervisor force-reconnects to the new target.
+    pub upstream_rx: watch::Receiver<u64>,
+    /// Poked by the supervisor to force an immediate re-bootstrap after repeated
+    /// failed reconnects to the current upstream (#601 fallback).
+    pub re_bootstrap: Arc<Notify>,
 }
 
 // ── BootstrapRunner ───────────────────────────────────────────────────────────
@@ -106,13 +131,35 @@ pub struct BootstrapRunner {
     config: BootstrapClientConfig,
     svid_cell: SharedSvid,
     rotation_tx: watch::Sender<u64>,
+    upstream_cell: SharedUpstream,
+    upstream_tx: watch::Sender<u64>,
+    re_bootstrap: Arc<Notify>,
 }
 
 impl BootstrapRunner {
     /// Run the bootstrap/refresh loop until the process exits.
     pub async fn run(self) {
-        run_bootstrap(self.config, self.svid_cell, self.rotation_tx).await;
+        run_bootstrap(BootstrapLoop {
+            config: self.config,
+            svid_cell: self.svid_cell,
+            rotation_tx: self.rotation_tx,
+            upstream_cell: self.upstream_cell,
+            upstream_tx: self.upstream_tx,
+            re_bootstrap: self.re_bootstrap,
+        })
+        .await;
     }
+}
+
+/// The mutable state threaded through [`run_bootstrap`] — grouped into one
+/// struct to stay under the argument-count limit.
+struct BootstrapLoop {
+    config: BootstrapClientConfig,
+    svid_cell: SharedSvid,
+    rotation_tx: watch::Sender<u64>,
+    upstream_cell: SharedUpstream,
+    upstream_tx: watch::Sender<u64>,
+    re_bootstrap: Arc<Notify>,
 }
 
 // ── BootstrapClient ───────────────────────────────────────────────────────────
@@ -137,15 +184,24 @@ impl BootstrapClient {
     pub fn build(config: BootstrapClientConfig) -> (BootstrapClientHandle, BootstrapRunner) {
         let svid = SharedSvid::new();
         let (rotation_tx, rotation_rx) = watch::channel(0u64);
+        let upstream = SharedUpstream::new();
+        let (upstream_tx, upstream_rx) = watch::channel(0u64);
+        let re_bootstrap = Arc::new(Notify::new());
 
         let handle = BootstrapClientHandle {
             svid: svid.clone(),
             rotation_rx,
+            upstream: upstream.clone(),
+            upstream_rx,
+            re_bootstrap: re_bootstrap.clone(),
         };
         let runner = BootstrapRunner {
             config,
             svid_cell: svid,
             rotation_tx,
+            upstream_cell: upstream,
+            upstream_tx,
+            re_bootstrap,
         };
         (handle, runner)
     }
@@ -166,11 +222,15 @@ impl BootstrapClient {
 
 // ── private: bootstrap loop ───────────────────────────────────────────────────
 
-async fn run_bootstrap(
-    config: BootstrapClientConfig,
-    svid_cell: SharedSvid,
-    rotation_tx: watch::Sender<u64>,
-) {
+async fn run_bootstrap(state: BootstrapLoop) {
+    let BootstrapLoop {
+        config,
+        svid_cell,
+        rotation_tx,
+        upstream_cell,
+        upstream_tx,
+        re_bootstrap,
+    } = state;
     // Generate a process-lifetime keypair. This keypair is reused across every
     // bootstrap call; only the cert changes (signed by the controller CA).
     let keypair = match KeyPair::generate() {
@@ -182,14 +242,24 @@ async fn run_bootstrap(
     };
 
     let mut generation: u64 = 0;
+    let mut upstream_generation: u64 = 0;
     let mut attempt: u32 = 0;
     let mut refresh_after = Duration::ZERO; // first iteration fires immediately
 
     loop {
-        tokio::time::sleep(refresh_after).await;
+        // Wake on the scheduled refresh OR a supervisor re-bootstrap poke (#601):
+        // a torn-down relay makes the supervisor request a fresh pointer, which
+        // re-resolves to the controller (the always-up anchor) well before the
+        // ~50%-TTL refresh would.
+        tokio::select! {
+            _ = tokio::time::sleep(refresh_after) => {}
+            () = re_bootstrap.notified() => {
+                debug!("bootstrap: re-bootstrap poked by supervisor; re-resolving upstream now");
+            }
+        }
 
         let not_after = match do_bootstrap(&config, &keypair).await {
-            Ok((material, not_after_unix)) => {
+            Ok((material, not_after_unix, upstream)) => {
                 crate::metrics::client_bootstrap_total()
                     .with_label_values(&["success"])
                     .inc();
@@ -197,6 +267,16 @@ async fn run_bootstrap(
                 svid_cell.store(std::sync::Arc::new(Some(material)));
                 // Ignore send errors: if all receivers are gone, this task is orphaned.
                 let _ = rotation_tx.send(generation);
+                // Deliver the best routing upstream (#601). An absent pointer
+                // (empty endpoint) leaves the current target untouched — the
+                // client keeps its configured fallback. A present pointer swaps
+                // the cell and ticks `upstream_changed` so the supervisor
+                // reconnects to it without recycling any data-plane listener.
+                if let Some(target) = upstream {
+                    upstream_cell.store(std::sync::Arc::new(Some(target)));
+                    upstream_generation = upstream_generation.saturating_add(1);
+                    let _ = upstream_tx.send(upstream_generation);
+                }
                 attempt = 0;
                 not_after_unix
             }
@@ -237,7 +317,7 @@ async fn run_bootstrap(
 async fn do_bootstrap(
     config: &BootstrapClientConfig,
     keypair: &KeyPair,
-) -> Result<(SvidMaterial, i64), ()> {
+) -> Result<(SvidMaterial, i64, Option<UpstreamTarget>), ()> {
     // Read SA token.
     let sa_token = match tokio::fs::read_to_string(&config.sa_token_path).await {
         Ok(t) => t.trim().to_owned(),
@@ -300,6 +380,9 @@ async fn do_bootstrap(
         sa_token: sa_token.clone(),
         csr_pem: csr_pem.clone(),
         wire_version: WIRE_VERSION,
+        // Carry this client's scope so the controller can resolve the best
+        // routing upstream for it (#601).
+        scope: Some(crate::wire::scope_to_wire(&config.scope)),
     };
 
     let resp = match grpc.bootstrap(tonic::Request::new(req)).await {
@@ -312,6 +395,7 @@ async fn do_bootstrap(
 
     info!(
         not_after = resp.not_after_unix,
+        upstream = %resp.upstream_endpoint,
         "bootstrap: SVID issued by controller"
     );
 
@@ -324,7 +408,20 @@ async fn do_bootstrap(
         not_after_unix: resp.not_after_unix,
     };
 
-    Ok((material, resp.not_after_unix))
+    // Resolve the delivered upstream pointer (#601). An empty endpoint means the
+    // controller sent no directive (additive field, or a plaintext test path) —
+    // the client keeps its configured fallback endpoint.
+    let upstream = (!resp.upstream_endpoint.is_empty()).then(|| {
+        let matcher = expected_server_matcher(
+            &config.trust_domain,
+            &resp.upstream_endpoint,
+            &resp.expected_server_sa,
+            &config.fallback_namespace,
+        );
+        UpstreamTarget::new(resp.upstream_endpoint, matcher)
+    });
+
+    Ok((material, resp.not_after_unix, upstream))
 }
 
 /// Build a minimal CSR PEM from the process-lifetime keypair.

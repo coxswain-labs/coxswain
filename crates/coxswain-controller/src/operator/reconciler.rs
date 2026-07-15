@@ -66,6 +66,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::watch;
 
 /// Re-queue interval when the operator's pod isn't the leader. Long enough to
 /// avoid hot-spinning the reconcile loop, short enough that promotion to
@@ -172,10 +173,6 @@ pub struct OperatorConfig {
     /// annotation on every dedicated-proxy pod. Propagated from the
     /// `--admin-port` / `COXSWAIN_ADMIN_PORT` CLI argument.
     pub admin_port: u16,
-    /// gRPC discovery endpoint the dedicated proxy connects to for routing
-    /// snapshots. Rendered as `--discovery-endpoint=<endpoint>`. Since #423 the
-    /// Stream listener is mTLS-only, so this is an `https://` URL.
-    pub discovery_endpoint: String,
     /// Server-auth-only bootstrap endpoint rendered as
     /// `--discovery-bootstrap-endpoint=<endpoint>` so the dedicated proxy can
     /// obtain its SVID (projected token + trust mount, #423).
@@ -248,6 +245,12 @@ pub struct OperatorConfig {
     /// upstream subscribe. Derived from the *same* computation that drives
     /// provisioning, so the grant cannot drift from the rendered Deployment.
     pub provisioned_relays: Shared<HashSet<String>>,
+    /// Bumped whenever [`Self::provisioned_relays`] changes (#601), waking the
+    /// discovery server's live streams so a leaf is repointed the moment its
+    /// namespace gains or loses a relay. `None` disables live repoint (the
+    /// authorizer still works off the set). The discovery server holds the paired
+    /// receiver (`DiscoveryService::with_upstream_directives`).
+    pub relay_changed_tx: Option<watch::Sender<u64>>,
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
@@ -288,9 +291,6 @@ pub(crate) struct ReconcileContext {
     /// Admin server port injected as `gateway.coxswain-labs.dev/admin-port` on
     /// every rendered dedicated-proxy pod.
     admin_port: u16,
-    /// gRPC discovery endpoint rendered as `--discovery-endpoint=<endpoint>`
-    /// in every dedicated-proxy Deployment.
-    discovery_endpoint: String,
     /// Bootstrap endpoint + token/bundle paths + trust domain rendered into the
     /// dedicated-proxy Deployment so it can obtain an SVID (#423).
     discovery_bootstrap_endpoint: String,
@@ -355,6 +355,9 @@ pub(crate) struct ReconcileContext {
     /// reconciles across namespaces can't lose an update. Guard is never held
     /// across an `.await` (same discipline as `last_hashes`).
     relay_namespaces: Mutex<HashSet<String>>,
+    /// Bumped on every provisioned-relay set change (#601) to wake the discovery
+    /// server's live streams for a repoint push. `None` disables live repoint.
+    relay_changed_tx: Option<watch::Sender<u64>>,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
     /// Consecutive reconcile-error count per Gateway, driving the per-object
     /// exponential backoff in [`error_policy`] (#570). Incremented there,
@@ -388,7 +391,6 @@ impl ReconcileContext {
             listener_status: config.listener_status,
             ingress_ports: config.ingress_ports,
             admin_port: config.admin_port,
-            discovery_endpoint: config.discovery_endpoint,
             discovery_bootstrap_endpoint: config.discovery_bootstrap_endpoint,
             discovery_sa_token_path: config.discovery_sa_token_path,
             discovery_ca_bundle_path: config.discovery_ca_bundle_path,
@@ -411,6 +413,7 @@ impl ReconcileContext {
             relay_memory_request: config.relay_memory_request,
             relay_memory_limit: config.relay_memory_limit,
             provisioned_relays: config.provisioned_relays,
+            relay_changed_tx: config.relay_changed_tx,
             relay_namespaces: Mutex::new(HashSet::new()),
             last_hashes: Mutex::new(HashMap::new()),
             error_attempts: Mutex::new(HashMap::new()),
@@ -444,6 +447,11 @@ impl ReconcileContext {
         };
         if changed {
             self.provisioned_relays.store(Arc::new(guard.clone()));
+            // Wake the discovery server's live streams (#601): a namespace just
+            // gained or lost a relay, so its leaves may need repointing.
+            if let Some(tx) = &self.relay_changed_tx {
+                tx.send_modify(|g| *g = g.wrapping_add(1));
+            }
         }
     }
 
@@ -547,11 +555,12 @@ pub(crate) async fn reconcile_dedicated(
     let started = std::time::Instant::now();
     let key = gateway_key(&gw);
     let gw_namespace = gw.metadata.namespace.clone().unwrap_or_default();
-    // Resolve the namespace's effective relay policy once (#589) and thread it into both
-    // the per-Gateway reconcile (proxy repoint) and the relay convergence below, so the two
-    // decisions read identical policy state.
+    // Resolve the namespace's effective relay policy once (#589) for the relay
+    // convergence below. The per-Gateway reconcile no longer needs it: since #601
+    // the proxy's upstream is bootstrap-delivered + runtime-directed, so the
+    // render is relay-agnostic and never repoints via a re-render.
     let relay_policy = ctx.resolve_relay_policy(&gw_namespace);
-    let res = reconcile_inner(gw, Arc::clone(&ctx), &relay_policy).await;
+    let res = reconcile_inner(gw, Arc::clone(&ctx)).await;
     crate::metrics::observe_reconcile("operator", started, &res);
 
     // Relay-tier convergence (#584): keep the namespace's relay in sync with
@@ -643,7 +652,6 @@ async fn converge_namespace_relay(
             namespace,
             replicas,
             controller_image: &ctx.controller_image,
-            discovery_endpoint: &ctx.discovery_endpoint,
             discovery_bootstrap_endpoint: &ctx.discovery_bootstrap_endpoint,
             discovery_sa_token_path: &ctx.discovery_sa_token_path,
             discovery_ca_bundle_path: &ctx.discovery_ca_bundle_path,
@@ -861,7 +869,6 @@ async fn delete_relay_resources(client: &Client, namespace: &str) -> Result<(), 
 async fn reconcile_inner(
     gw: Arc<Gateway>,
     ctx: Arc<ReconcileContext>,
-    relay_policy: &EffectiveRelayPolicy,
 ) -> Result<StatusOutcome, ReconcileError> {
     if !ctx.leader.load(Ordering::Acquire) {
         // Non-leader pods don't apply. Re-queue rather than `await_change()`
@@ -1088,38 +1095,24 @@ async fn reconcile_inner(
         .get(&gateway_key(&gw))
         .unwrap_or(&empty_effective_ports);
 
-    // Relay tiering (#584): point this proxy's Stream subscription at the
-    // namespace relay iff the namespace will have one after convergence — the
-    // *same* `relay_desired` predicate (including hysteresis) that
-    // `converge_namespace_relay` uses, so the repoint and the relay's existence
-    // never disagree. Below threshold (or tiering off), `None` renders the
-    // controller endpoint exactly as before.
-    let relay_fronted = ctx.relay_enabled && {
-        let currently = ctx.relay_namespaces.lock().contains(gw_namespace);
-        relay_desired(&ctx, gw_namespace, currently, relay_policy.enabled)
-    };
-    let relay_endpoint = relay_fronted.then(|| {
-        format!(
-            "https://{}.{}.svc:{}",
-            render_relay::RELAY_NAME,
-            gw_namespace,
-            render_relay::RELAY_DISCOVERY_PORT
-        )
-    });
-
+    // Relay tiering (#601): the dedicated proxy no longer takes a rendered
+    // `--discovery-endpoint`. It learns its routing upstream — the controller, or
+    // this namespace's relay if `converge_namespace_relay` provisions one — from
+    // the bootstrap response, and is repointed live by a `PreferredUpstream`
+    // directive when provisioning changes. So provisioning a relay for this
+    // namespace never re-renders (nor rolls) this Deployment; the render is
+    // relay-agnostic.
     let rendered = render::render(&render::RenderInputs {
         gateway: &gw,
         params: &effective,
         controller_image: &ctx.controller_image,
         gateway_class_name: class_name,
-        discovery_endpoint: &ctx.discovery_endpoint,
         discovery_bootstrap_endpoint: &ctx.discovery_bootstrap_endpoint,
         discovery_sa_token_path: &ctx.discovery_sa_token_path,
         discovery_ca_bundle_path: &ctx.discovery_ca_bundle_path,
         discovery_trust_domain: &ctx.discovery_trust_domain,
         admin_port: ctx.admin_port,
         effective_ports: dedicated_ports,
-        relay_endpoint: relay_endpoint.as_deref(),
     });
 
     // Stage 1a — make the controller's CA trust bundle reachable from the
@@ -2048,28 +2041,24 @@ mod tests {
             params: &params_a,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         let r_b = render::render(&render::RenderInputs {
             gateway: &gw,
             params: &params_b,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         assert_ne!(
             hash_rendered(&r_a),
@@ -2104,14 +2093,12 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         };
         let r1 = render::render(&inputs);
         let r2 = render::render(&inputs);

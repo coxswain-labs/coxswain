@@ -29,6 +29,12 @@ message BootstrapRequest {
   string sa_token = 1;      // Kubernetes projected ServiceAccount token
   bytes csr_pem = 2;        // PEM-encoded PKCS#10 CSR with SPIFFE URI-SAN
   uint32 wire_version = 3;  // wire protocol version (WIRE_VERSION constant)
+  // The routing scope this client will subscribe with (#601). The controller
+  // uses it — with the authenticated SA's namespace — to compute the client's
+  // best routing upstream (a relay if this scope is relay-fronted, else the
+  // controller) and returns it on the response. Additive; a client that omits
+  // it (absent → SharedPool default) still bootstraps, just resolved as shared.
+  Scope scope = 4;
 }
 
 // Returned on success.  The proxy uses svid_cert_pem + its local private key
@@ -39,6 +45,17 @@ message BootstrapResponse {
   bytes svid_cert_pem = 1;      // PEM-encoded SVID cert signed by the controller CA
   bytes trust_bundle_pem = 2;   // PEM-encoded CA bundle (one or more roots for overlap during rotation)
   int64 not_after_unix = 3;     // SVID expiry as Unix seconds (UTC)
+  // The routing-stream upstream the client should dial for this scope (#601),
+  // computed live at bootstrap: the relay fronting this scope if one is
+  // provisioned, else the controller's own Stream endpoint. Never stale — it
+  // reflects the relay-provisioning state at the instant of bootstrap.
+  // Additive: absent (empty string) means "the client keeps its configured
+  // fallback endpoint" (the no-bootstrap/unit-test path).
+  string upstream_endpoint = 4;   // e.g. https://coxswain-relay.ns.svc:50051
+  // ServiceAccount short-name the client must expect in the upstream server's
+  // SVID (`spiffe://<td>/ns/<endpoint-ns>/sa/<this>`): `coxswain-controller`
+  // when pointing at the controller, `coxswain-relay` when pointing at a relay.
+  string expected_server_sa = 5;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -173,8 +190,33 @@ message RosterEntry {
 message ServerMessage {
   oneof kind {
     Snapshot snapshot = 1;
-    // reserved 2..: Command (drain / dump-config) — DEFERRED
+    // Live upstream-repoint directive (#601): tells the client to swap its
+    // routing-stream upstream without recycling any data-plane listener. Sent
+    // by the controller when a scope becomes (or stops being) relay-fronted; a
+    // relay forwards a controller-originated directive to the matching
+    // downstream leaf. Additive oneof arm — a pre-#601 client's stream loop
+    // ignores unknown arms, so this is safe on the wire (no WIRE_VERSION bump).
+    PreferredUpstream preferred_upstream = 2;
+    // reserved 3..: Command (drain / dump-config) — DEFERRED
   }
+}
+
+// Server → client upstream-repoint directive (#601). The client rebuilds its
+// mTLS routing channel to `endpoint`, verifying the server's SVID against
+// `spiffe://<trust-domain>/ns/<endpoint-ns>/sa/<expected_server_sa>` (the
+// client derives the trust domain from its own config and the namespace from
+// the endpoint's service DNS, exactly as it does for its bootstrapped
+// upstream). Applying it forces one control-stream reconnect only; the data
+// plane keeps serving the last-good routing snapshot throughout.
+message PreferredUpstream {
+  string endpoint = 1;            // e.g. https://coxswain-relay.ns.svc:50051
+  string expected_server_sa = 2;  // `coxswain-controller` or `coxswain-relay`
+  // Target Gateway this directive addresses, set only when a relay forwards a
+  // controller directive downstream (Namespace-relay demux): the relay routes
+  // the directive to the leaf whose Gateway scope matches. Empty on a directive
+  // the controller sends directly to a client (that client is the sole target).
+  string target_namespace = 3;
+  string target_name = 4;
 }
 
 // Resource-oriented state-of-the-world (or delta) snapshot for the subscribed

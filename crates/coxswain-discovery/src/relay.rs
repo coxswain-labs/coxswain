@@ -28,10 +28,10 @@ use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRouti
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::publish_index::SharedGatewayPublishIndex;
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
 
 use crate::apply::{ApplyStats, RoutingApplier, SnapshotApplier};
-use crate::client::{DiscoveryClientConfig, Supervisor};
+use crate::client::{DiscoveryClientConfig, Supervisor, UpstreamDirectiveHandler};
 use crate::error::{DiscoveryError, WireError};
 use crate::proto::v1 as p;
 use crate::server::SnapshotSource;
@@ -52,6 +52,10 @@ pub struct RelayUpstream {
     /// Rebuild-generation receiver: bumped after every successful upstream
     /// apply, drives the downstream `DiscoveryService` re-materialization.
     pub rebuild_rx: watch::Receiver<u64>,
+    /// Directive-forwarding fan-out (#601): the upstream client fans controller
+    /// `PreferredUpstream` directives here; hand it to the downstream
+    /// `DiscoveryService::with_directive_forwarding` so leaves get repointed.
+    pub directive_tx: broadcast::Sender<p::PreferredUpstream>,
 }
 
 /// Assemble a **shared-pool** relay's upstream (subscribes `Scope::SharedPool`).
@@ -68,10 +72,16 @@ pub struct RelayUpstream {
 /// [`DiscoveryError::InvalidEndpoint`] if any upstream endpoint is malformed.
 #[must_use = "the returned supervisor + source must be driven and served, or the relay caches nothing"]
 pub fn shared_relay(
-    config: DiscoveryClientConfig,
+    mut config: DiscoveryClientConfig,
     health: SubsystemHandle,
     health_check: &str,
 ) -> Result<RelayUpstream, DiscoveryError> {
+    // Directive forwarding (#601): the upstream client fans controller
+    // `PreferredUpstream` directives into this broadcast; the caller wires the
+    // sender into the downstream `DiscoveryService` so leaves get repointed. A
+    // relay never repoints its own upstream (it always streams from the controller).
+    let (directive_tx, _) = broadcast::channel(DIRECTIVE_FANOUT_CAPACITY);
+    config.upstream_directive_handler = UpstreamDirectiveHandler::Forward(directive_tx.clone());
     // One publish index shared between the applier (writer: advances it to the
     // controller's envelope seq on each apply) and the downstream `SnapshotSource`
     // (reader: stamps that seq onto leaf Acks), so shared leaves Ack in the
@@ -99,8 +109,14 @@ pub fn shared_relay(
         source,
         supervisor,
         rebuild_rx,
+        directive_tx,
     })
 }
+
+/// Broadcast buffer for forwarded repoint directives (#601). Repoints are
+/// level-triggered — a lagged leaf that drops a directive re-derives its target
+/// on the next relay-provisioning tick — so a small buffer is ample.
+const DIRECTIVE_FANOUT_CAPACITY: usize = 16;
 
 /// Assemble a **namespace** relay's upstream (subscribes `Scope::Namespace`).
 ///
@@ -116,10 +132,13 @@ pub fn shared_relay(
 /// [`DiscoveryError::InvalidEndpoint`] if any upstream endpoint is malformed.
 #[must_use = "the returned supervisor + source must be driven and served, or the relay caches nothing"]
 pub fn namespace_relay(
-    config: DiscoveryClientConfig,
+    mut config: DiscoveryClientConfig,
     health: SubsystemHandle,
     health_check: &str,
 ) -> Result<RelayUpstream, DiscoveryError> {
+    // Directive forwarding (#601) — see `shared_relay` for the rationale.
+    let (directive_tx, _) = broadcast::channel(DIRECTIVE_FANOUT_CAPACITY);
+    config.upstream_directive_handler = UpstreamDirectiveHandler::Forward(directive_tx.clone());
     let demux = NamespaceDemux::new();
     // Share the registry + publish index into the downstream-serving source
     // before the demux is boxed into the supervisor (both are cheap `Shared`
@@ -147,6 +166,7 @@ pub fn namespace_relay(
         source,
         supervisor,
         rebuild_rx,
+        directive_tx,
     })
 }
 
