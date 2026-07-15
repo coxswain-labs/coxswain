@@ -654,6 +654,18 @@ pub(crate) struct ControllerArgs {
     #[arg(long, env = "COXSWAIN_RELAY_ENABLED", default_value_t = false)]
     pub relay_enabled: bool,
 
+    /// Routing (Stream) endpoint of the **shared** relay, when one fronts the
+    /// shared proxy pool (#601).
+    ///
+    /// A static Helm toggle in v0.6 (the shared relay is not controller-managed
+    /// like namespace relays). When set, the controller hands shared-pool proxies
+    /// this endpoint as their best upstream at bootstrap instead of the controller's
+    /// own Stream endpoint. Unset (default) → shared proxies stream from the
+    /// controller. Example:
+    /// `https://coxswain-relay-shared.coxswain-system.svc:50051`.
+    #[arg(long, env = "COXSWAIN_SHARED_RELAY_ENDPOINT")]
+    pub shared_relay_endpoint: Option<String>,
+
     /// Replica count for each provisioned namespace relay (#584).
     ///
     /// Only meaningful with `--relay-enabled`. Default 2 (HA): at replica 1 a
@@ -814,34 +826,22 @@ pub(crate) struct ProxyRoleArgs {
 /// env vars, and defaults stay identical across roles.
 #[derive(Args, Debug)]
 pub(crate) struct DiscoveryClientArgs {
-    /// Comma-separated list of upstream discovery endpoints.
-    ///
-    /// Each entry is an `http://host:port` (plaintext) or `https://host:port`
-    /// (mTLS) URI for an upstream discovery gRPC server — a controller replica,
-    /// or a relay's downstream listener for a leaf behind a relay. Providing
-    /// more than one endpoint enables high-availability: the client load-balances
-    /// RPCs across all listed replicas. Must not be empty.
-    ///
-    /// Example: `http://coxswain-controller-discovery.coxswain-system.svc:50051`
-    #[arg(
-        long,
-        env = "COXSWAIN_DISCOVERY_ENDPOINT",
-        value_delimiter = ',',
-        required = true
-    )]
-    pub discovery_endpoint: Vec<String>,
-
-    /// Bootstrap endpoint for obtaining an SVID from the controller.
+    /// Bootstrap endpoint — the sole endpoint anchor and fallback (#601).
     ///
     /// Must be an `https://` URI pointing to the controller's bootstrap listener
-    /// (port 50052 by default). Bootstrap is **not** tiered — even a leaf behind
-    /// a relay bootstraps its SVID directly from the controller. The client
-    /// verifies the controller's SPIFFE cert against the CA bundle from
-    /// `--discovery-ca-bundle-path` before sending its SA token.
+    /// (port 50052 by default). Bootstrap is **not** tiered — even a leaf behind a
+    /// relay bootstraps its SVID directly from the controller. The bootstrap
+    /// response also carries this client's current best **routing** upstream
+    /// (`(endpoint, expected_server_sa)`): the relay fronting its scope if one is
+    /// provisioned, else the controller. The client then dials that upstream for
+    /// its mTLS `Stream` — there is no separate stream-endpoint flag. A live
+    /// `PreferredUpstream` directive on the stream repoints it at runtime without
+    /// a pod restart; if the upstream becomes unreachable the client re-bootstraps
+    /// here to re-resolve it (this endpoint is the always-up anchor).
     ///
     /// Example: `https://coxswain-controller-discovery.coxswain-system.svc:50052`
-    #[arg(long, env = "COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT")]
-    pub discovery_bootstrap_endpoint: Option<String>,
+    #[arg(long, env = "COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT", required = true)]
+    pub discovery_bootstrap_endpoint: String,
 
     /// Path to the projected ServiceAccount token file.
     ///
@@ -872,28 +872,15 @@ pub(crate) struct DiscoveryClientArgs {
 
     /// SPIFFE trust domain; must match the controller's `--discovery-trust-domain`.
     ///
-    /// Used to verify the upstream server's SPIFFE URI SAN during bootstrap and
-    /// to construct the mTLS channel's expected server identity.
+    /// Used to verify the controller's SPIFFE URI SAN during bootstrap and to
+    /// construct the mTLS `Stream` channel's expected server identity from the
+    /// bootstrap-delivered upstream `(endpoint, expected_server_sa)` pointer.
     #[arg(
         long,
         env = "COXSWAIN_DISCOVERY_TRUST_DOMAIN",
         default_value = "cluster.local"
     )]
     pub discovery_trust_domain: String,
-
-    /// ServiceAccount name of the **upstream discovery server** to expect in its
-    /// SVID (`spiffe://<trust-domain>/ns/<server-ns>/sa/<this>`).
-    ///
-    /// Defaults to `coxswain-controller` (a leaf connecting straight to the
-    /// controller). A leaf placed behind a relay sets this to the relay's SA so
-    /// its mTLS `Stream` verifies the relay's identity instead. The server
-    /// namespace is derived from the discovery endpoint's service DNS.
-    #[arg(
-        long,
-        env = "COXSWAIN_DISCOVERY_EXPECTED_SERVER_SA",
-        default_value = "coxswain-controller"
-    )]
-    pub discovery_expected_server_sa: String,
 }
 
 /// Resolved scope for a `proxy` role invocation.
@@ -954,8 +941,9 @@ pub(crate) struct RelayRoleArgs {
     #[command(flatten)]
     pub common: CommonArgs,
     /// Discovery-client flags for the **upstream** subscription (to the
-    /// controller). `--discovery-endpoint` is the controller's discovery
-    /// Service; `--discovery-expected-server-sa` defaults to the controller SA.
+    /// controller). `--discovery-bootstrap-endpoint` is the sole anchor (#601):
+    /// the relay bootstraps its SVID there and learns its own routing upstream
+    /// (always the controller — relays never tier) from the bootstrap response.
     #[command(flatten)]
     pub discovery: DiscoveryClientArgs,
 
@@ -1048,7 +1036,7 @@ mod tests {
             "serve",
             "proxy",
             "--shared",
-            "--discovery-endpoint=http://ctrl:50051",
+            "--discovery-bootstrap-endpoint=https://ctrl:50052",
         ])
         .expect("parses");
         let Commands::Serve(serve) = cli.command;
@@ -1056,7 +1044,10 @@ mod tests {
             panic!("expected Role::Proxy");
         };
         assert_eq!(args.scope(), ProxyScope::Shared);
-        assert_eq!(args.discovery.discovery_endpoint, vec!["http://ctrl:50051"]);
+        assert_eq!(
+            args.discovery.discovery_bootstrap_endpoint,
+            "https://ctrl:50052"
+        );
     }
 
     /// `coxswain serve proxy --dedicated --gateway-name=NAME
@@ -1070,7 +1061,7 @@ mod tests {
             "--dedicated",
             "--gateway-name=my-gw",
             "--gateway-namespace=tenant-a",
-            "--discovery-endpoint=http://ctrl:50051",
+            "--discovery-bootstrap-endpoint=https://ctrl:50052",
         ])
         .expect("parses");
         let Commands::Serve(serve) = cli.command;
@@ -1086,32 +1077,13 @@ mod tests {
         );
     }
 
-    /// `--discovery-endpoint` is required for the proxy role.
+    /// `--discovery-bootstrap-endpoint` is the sole required endpoint anchor for
+    /// the proxy role (#601): with `--discovery-endpoint` removed, a proxy that
+    /// omits the bootstrap endpoint cannot resolve any upstream.
     #[test]
-    fn serve_proxy_requires_discovery_endpoint() {
+    fn serve_proxy_requires_bootstrap_endpoint() {
         let err = Cli::try_parse_from(["coxswain", "serve", "proxy", "--shared"]).unwrap_err();
         assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
-    }
-
-    /// `--discovery-endpoint` accepts a comma-separated list of multiple endpoints.
-    #[test]
-    fn discovery_endpoint_parses_multi_value() {
-        let cli = Cli::try_parse_from([
-            "coxswain",
-            "serve",
-            "proxy",
-            "--shared",
-            "--discovery-endpoint=http://ctrl-1:50051,http://ctrl-2:50051",
-        ])
-        .expect("parses");
-        let Commands::Serve(serve) = cli.command;
-        let Some(Role::Proxy(args)) = serve.role else {
-            panic!("expected Role::Proxy");
-        };
-        assert_eq!(
-            args.discovery.discovery_endpoint,
-            vec!["http://ctrl-1:50051", "http://ctrl-2:50051"]
-        );
     }
 
     /// `serve proxy` with no scope flag fails the ArgGroup `required` rule.
@@ -1244,7 +1216,7 @@ mod tests {
             "serve",
             "proxy",
             "--shared",
-            "--discovery-endpoint=http://ctrl:50051",
+            "--discovery-bootstrap-endpoint=https://ctrl:50052",
         ])
         .expect("proxy parses");
         let Commands::Serve(serve) = cli.command;
@@ -1268,7 +1240,7 @@ mod tests {
                 "serve",
                 "proxy",
                 "--shared",
-                "--discovery-endpoint=http://ctrl:50051",
+                "--discovery-bootstrap-endpoint=https://ctrl:50052",
             ];
             args.extend_from_slice(extra);
             Cli::try_parse_from(args).expect("parses")
@@ -1328,7 +1300,7 @@ mod tests {
             "serve",
             "proxy",
             "--shared",
-            "--discovery-endpoint=http://ctrl:50051",
+            "--discovery-bootstrap-endpoint=https://ctrl:50052",
         ])
         .expect("parses");
         let Commands::Serve(serve) = cli.command;
@@ -1343,7 +1315,7 @@ mod tests {
             "serve",
             "proxy",
             "--shared",
-            "--discovery-endpoint=http://ctrl:50051",
+            "--discovery-bootstrap-endpoint=https://ctrl:50052",
             "--proxy-upstream-keepalive-pool-size=256",
         ])
         .expect("parses with explicit value");

@@ -99,12 +99,11 @@ spec:
             # shared proxies dial `coxswain.relayShared.discoveryEndpoint` here.
             - name: COXSWAIN_DISCOVERY_PORT
               value: {{ .Values.discovery.port | quote }}
-            # Upstream discovery (to the controller). The relay subscribes for
-            # snapshots over the mTLS stream and bootstraps its SVID over the
-            # server-auth bootstrap listener — bootstrap is never tiered, so both
-            # resolve to the controller's Services, exactly like a proxy.
-            - name: COXSWAIN_DISCOVERY_ENDPOINT
-              value: {{ include "coxswain.controller.discoveryEndpoint" . | quote }}
+            # Upstream discovery (to the controller). Since #601 there is no
+            # COXSWAIN_DISCOVERY_ENDPOINT: the relay bootstraps its SVID over the
+            # server-auth bootstrap listener and learns its own routing upstream
+            # (always the controller — relays never tier) from the bootstrap
+            # response, exactly like a proxy.
             - name: COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT
               value: {{ include "coxswain.controller.discoveryBootstrapEndpoint" . | quote }}
             - name: COXSWAIN_DISCOVERY_SA_TOKEN_PATH

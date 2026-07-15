@@ -132,7 +132,6 @@ alongside it:
 cargo run --bin coxswain -- serve proxy --dedicated \
   --gateway-name coxswain-test \
   --gateway-namespace default \
-  --discovery-endpoint https://localhost:50051 \
   --discovery-bootstrap-endpoint https://localhost:50052 \
   --log-format console
 ```

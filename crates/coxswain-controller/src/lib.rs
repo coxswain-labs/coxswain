@@ -32,6 +32,14 @@ pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writ
 /// the authorized identity stay in lockstep by construction.
 pub const RELAY_SERVICE_ACCOUNT: &str = "coxswain-relay";
 
+/// The dedicated relay's downstream routing (Stream) port.
+///
+/// Public so `coxswain-bin` builds the discovery best-upstream resolver (#601)
+/// with the *same* port the operator renders the relay Service with — a leaf's
+/// bootstrap-delivered relay endpoint stays in lockstep with the rendered
+/// Service by construction.
+pub const RELAY_DISCOVERY_PORT: u16 = 50051;
+
 // Re-export reflector primitives that bin or downstream crates expect to reach
 // from `coxswain_controller::…`. Direct re-exports keep callers compiling
 // without forcing every site to learn the new crate name.

@@ -35,6 +35,7 @@ pub mod server;
 pub mod subscription;
 pub mod svid;
 pub mod transport;
+pub mod upstream;
 pub mod version;
 pub mod wire;
 
@@ -48,14 +49,20 @@ pub use auth::{
 pub use bootstrap_client::{
     BootstrapClient, BootstrapClientConfig, BootstrapClientHandle, BootstrapRunner,
 };
-pub use bootstrap_server::{BootstrapService, NoOpRejectHook, RejectHook};
-pub use client::{DiscoveryClient, DiscoveryClientConfig, DiscoverySupervisor, Supervisor};
+pub use bootstrap_server::{BootstrapService, NoOpRejectHook, RejectHook, UpstreamResolverConfig};
+pub use client::{
+    DiscoveryClient, DiscoveryClientConfig, DiscoverySupervisor, Supervisor,
+    UpstreamDirectiveHandler,
+};
 pub use error::{AuthError, DiscoveryError, WireError};
 pub use relay::{RelayUpstream, namespace_relay, shared_relay};
 pub use server::{DiscoveryService, ProvisionedRelayAuthorizer, ScopeAuthorizer, SnapshotSource};
 pub use subscription::Scope;
 pub use svid::{SharedSvid, SvidMaterial};
 pub use transport::serve_discovery_with_tls;
+pub use upstream::{
+    SharedUpstream, UpstreamTarget, expected_server_matcher, namespace_from_service_dns,
+};
 pub use version::{ContentHash, WIRE_VERSION};
 pub use wire::{scope_from_wire, scope_to_wire};
 

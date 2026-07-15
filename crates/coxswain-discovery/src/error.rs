@@ -43,6 +43,17 @@ pub enum DiscoveryError {
     /// retries on the next rotation rather than crashing the data plane.
     #[error("discovery channel TLS config: {0}")]
     TlsConfig(#[from] AuthError),
+
+    /// No routing-stream upstream is known yet (#601).
+    ///
+    /// Reachable at runtime on a bootstrap-anchored client whose
+    /// `upstream_cell` has not been populated (the first bootstrap has not
+    /// completed, or a live repoint arrived with an empty target). Not a
+    /// misconfiguration: the reconnect supervisor treats it like a failed
+    /// connect — degrade to the last-good snapshot, back off, and reconnect the
+    /// instant the `upstream_changed` watch fires with a target.
+    #[error("discovery routing-stream upstream not yet known")]
+    NoUpstream,
 }
 
 /// Errors produced by the mTLS authentication layer during TLS config

@@ -24,11 +24,13 @@
 //! - Port 50051: `DiscoveryServer::new(DiscoveryService)` — mTLS mandatory.
 //! - Port 50052: `DiscoveryServer::new(BootstrapService)` — server-auth-only.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
 
+use coxswain_core::Shared;
 use coxswain_core::identity::{
     AuthnError, CsrPem, IssuerError, SpiffeId, SvidIssuer, TokenAuthenticator,
 };
@@ -36,7 +38,99 @@ use coxswain_core::identity::{
 use crate::proto::v1::{
     BootstrapRequest, BootstrapResponse, ClientMessage, ServerMessage, discovery_server::Discovery,
 };
+use crate::subscription::Scope;
 use crate::version::WIRE_VERSION;
+use crate::wire::scope_from_wire;
+
+// ── UpstreamResolverConfig ──────────────────────────────────────────────────────
+
+/// Inputs the controller injects so the bootstrap handler can resolve each
+/// client's best routing upstream at bootstrap time (#601).
+///
+/// Kept as plain data (no controller dependency): `coxswain-controller` depends
+/// on this crate, not the reverse, so the endpoint templates and relay/controller
+/// ServiceAccount names are passed in from `coxswain-bin`, which knows both sides.
+/// The `provisioned_relays` set is the same lock-free cell the discovery server's
+/// `ScopeAuthorizer` reads — the single source of truth for "which namespaces are
+/// relay-fronted right now".
+// intentionally open: field-literal constructed in coxswain-bin
+pub struct UpstreamResolverConfig {
+    /// The controller's own routing (Stream) endpoint — the always-up fallback.
+    pub controller_endpoint: String,
+    /// The controller's ServiceAccount short-name (expected in its SVID).
+    pub controller_sa: String,
+    /// The shared relay's routing endpoint, when a shared relay fronts the pool
+    /// (a static Helm toggle in v0.6). `None` = shared proxies stream from the
+    /// controller.
+    pub shared_relay_endpoint: Option<String>,
+    /// The dedicated relay's Service name (e.g. `coxswain-relay`); the per-namespace
+    /// endpoint is `https://{relay_service_name}.{namespace}.svc:{relay_port}`.
+    pub relay_service_name: String,
+    /// The dedicated relay's routing (Stream) port.
+    pub relay_port: u16,
+    /// The relay ServiceAccount short-name (expected in a relay's SVID, and the
+    /// discriminator for the relays-never-tier rule).
+    pub relay_sa: String,
+    /// Namespaces that currently have a provisioned dedicated relay.
+    pub provisioned_relays: Shared<HashSet<String>>,
+}
+
+impl UpstreamResolverConfig {
+    /// Resolve `(endpoint, expected_server_sa)` for a client with the given
+    /// authenticated identity and subscription scope (#601).
+    ///
+    /// Rules, in order:
+    /// - A **relay** (its SA matches `relay_sa`) always streams from the
+    ///   controller — relays never tier.
+    /// - A **shared-pool** client streams from the shared relay if one is
+    ///   configured, else the controller.
+    /// - A **dedicated** (Gateway/Namespace) client streams from its namespace's
+    ///   relay if that namespace is provisioned, else the controller.
+    #[must_use]
+    pub fn resolve(&self, spiffe: &SpiffeId, scope: &Scope) -> (String, String) {
+        if spiffe.service_account() == self.relay_sa {
+            return self.controller_target();
+        }
+        match scope {
+            Scope::SharedPool => match &self.shared_relay_endpoint {
+                Some(endpoint) => (endpoint.clone(), self.relay_sa.clone()),
+                None => self.controller_target(),
+            },
+            Scope::Gateway { namespace, .. } | Scope::Namespace { namespace } => {
+                self.resolve_namespace(namespace)
+            }
+        }
+    }
+
+    /// Resolve `(endpoint, expected_server_sa)` for a dedicated (namespace-scoped)
+    /// client: its namespace's relay if provisioned, else the controller (#601).
+    ///
+    /// Used by the controller's stream server to compute a leaf's current best
+    /// upstream when deciding whether to push a live repoint directive. Unlike
+    /// [`Self::resolve`] it takes no identity — the stream push only ever targets
+    /// dedicated leaves, never a relay (the relays-never-tier rule is enforced at
+    /// bootstrap, where the SA is authenticated).
+    #[must_use]
+    pub fn resolve_namespace(&self, namespace: &str) -> (String, String) {
+        if self.provisioned_relays.load().contains(namespace) {
+            let endpoint = format!(
+                "https://{}.{}.svc:{}",
+                self.relay_service_name, namespace, self.relay_port
+            );
+            (endpoint, self.relay_sa.clone())
+        } else {
+            self.controller_target()
+        }
+    }
+
+    /// The controller's own `(endpoint, sa)` — the always-up fallback anchor, and
+    /// the upstream every Gateway-scope client connected directly to the
+    /// controller is currently streaming from (#601 seed baseline).
+    #[must_use]
+    pub fn controller_target(&self) -> (String, String) {
+        (self.controller_endpoint.clone(), self.controller_sa.clone())
+    }
+}
 
 // ── RejectHook ────────────────────────────────────────────────────────────────
 
@@ -86,6 +180,10 @@ pub struct BootstrapService<I, A, H = NoOpRejectHook> {
     issuer: Arc<I>,
     authenticator: Arc<A>,
     reject_hook: Arc<H>,
+    /// Best-upstream resolver (#601). `None` in tests / plaintext paths, in which
+    /// case the response carries an empty upstream pointer (the client keeps its
+    /// configured fallback).
+    upstream: Option<Arc<UpstreamResolverConfig>>,
 }
 
 impl<I, A> BootstrapService<I, A, NoOpRejectHook>
@@ -100,6 +198,7 @@ where
             issuer,
             authenticator,
             reject_hook: Arc::new(NoOpRejectHook),
+            upstream: None,
         }
     }
 }
@@ -117,7 +216,16 @@ where
             issuer,
             authenticator,
             reject_hook,
+            upstream: None,
         }
+    }
+
+    /// Attach the best-upstream resolver (#601) so bootstrap responses carry the
+    /// client's current best routing upstream `(endpoint, expected_server_sa)`.
+    #[must_use]
+    pub fn with_upstream_resolver(mut self, resolver: Arc<UpstreamResolverConfig>) -> Self {
+        self.upstream = Some(resolver);
+        self
     }
 }
 
@@ -247,9 +355,26 @@ where
 
         let trust_bundle = self.issuer.trust_bundle();
 
+        // Resolve the client's best routing upstream (#601). An absent resolver
+        // (tests/plaintext) or an unparseable scope degrades to an empty pointer,
+        // so the client keeps its configured fallback rather than being dialled
+        // at a bogus endpoint.
+        let (upstream_endpoint, expected_server_sa) = match &self.upstream {
+            Some(resolver) => {
+                let scope = req
+                    .scope
+                    .as_ref()
+                    .and_then(|dto| scope_from_wire(dto).ok())
+                    .unwrap_or(Scope::SharedPool);
+                resolver.resolve(&spiffe_id, &scope)
+            }
+            None => (String::new(), String::new()),
+        };
+
         info!(
             spiffe_id = %spiffe_id,
             not_after = svid.not_after_unix,
+            upstream = %upstream_endpoint,
             "bootstrap: SVID issued"
         );
 
@@ -257,6 +382,8 @@ where
             svid_cert_pem: svid.cert_pem,
             trust_bundle_pem: trust_bundle,
             not_after_unix: svid.not_after_unix,
+            upstream_endpoint,
+            expected_server_sa,
         }))
     }
 }
@@ -354,6 +481,21 @@ mod tests {
             sa_token: sa_token.to_owned(),
             csr_pem: csr.to_vec(),
             wire_version: WIRE_VERSION,
+            scope: None,
+        })
+    }
+
+    fn resolver(shared_relay: Option<&str>, provisioned: &[&str]) -> Arc<UpstreamResolverConfig> {
+        let set: HashSet<String> = provisioned.iter().map(|s| (*s).to_owned()).collect();
+        Arc::new(UpstreamResolverConfig {
+            controller_endpoint: "https://coxswain-controller-discovery.coxswain-system.svc:50051"
+                .to_owned(),
+            controller_sa: "coxswain-controller".to_owned(),
+            shared_relay_endpoint: shared_relay.map(str::to_owned),
+            relay_service_name: "coxswain-relay".to_owned(),
+            relay_port: 50051,
+            relay_sa: "coxswain-relay".to_owned(),
+            provisioned_relays: Shared::from_value(set),
         })
     }
 
@@ -386,16 +528,19 @@ mod tests {
         assert_eq!(body.trust_bundle_pem, bundle);
         assert_eq!(body.not_after_unix, 9999);
 
-        assert_eq!(
+        // `>=`, not exact: `accepted,ok` and `svid_issued_total` are process-global
+        // counters other bootstrap tests (e.g. the resolver test) also increment
+        // when the in-process test runner schedules them concurrently. A monotone
+        // counter still proves this accepted bootstrap incremented it.
+        assert!(
             crate::metrics::bootstrap_total()
                 .with_label_values(&["accepted", "ok"])
-                .get(),
-            accepted_before + 1,
+                .get()
+                > accepted_before,
             "an accepted bootstrap must increment bootstrap_total{{accepted,ok}}"
         );
-        assert_eq!(
-            crate::metrics::svid_issued_total().get(),
-            issued_before + 1,
+        assert!(
+            crate::metrics::svid_issued_total().get() > issued_before,
             "an accepted bootstrap must increment svid_issued_total"
         );
     }
@@ -481,6 +626,7 @@ mod tests {
             sa_token: "tok".into(),
             csr_pem: vec![],
             wire_version: WIRE_VERSION + 99,
+            scope: None,
         });
         let rejected_before = crate::metrics::bootstrap_total()
             .with_label_values(&["rejected", "wire_version"])
@@ -501,4 +647,119 @@ mod tests {
     // NOTE: BootstrapService::stream is a one-line stub returning Status::unimplemented.
     // It cannot be easily unit-tested without constructing tonic::Streaming (an opaque type),
     // so coverage is provided by the integration tests that wire both listeners end-to-end.
+
+    // ── best-upstream resolver (#601) ──────────────────────────────────────────
+
+    fn dedicated_id(namespace: &str) -> SpiffeId {
+        SpiffeId::from_parts("cluster.local", namespace, "my-gw-coxswain")
+    }
+
+    fn relay_id(namespace: &str) -> SpiffeId {
+        SpiffeId::from_parts("cluster.local", namespace, "coxswain-relay")
+    }
+
+    #[test]
+    fn dedicated_client_in_provisioned_namespace_points_at_relay() {
+        let cfg = resolver(None, &["team-a"]);
+        let (endpoint, sa) = cfg.resolve(
+            &dedicated_id("team-a"),
+            &Scope::Gateway {
+                namespace: "team-a".to_owned(),
+                name: "my-gw".to_owned(),
+            },
+        );
+        assert_eq!(endpoint, "https://coxswain-relay.team-a.svc:50051");
+        assert_eq!(sa, "coxswain-relay");
+    }
+
+    #[test]
+    fn dedicated_client_without_relay_points_at_controller() {
+        let cfg = resolver(None, &[]);
+        let (endpoint, sa) = cfg.resolve(
+            &dedicated_id("team-a"),
+            &Scope::Gateway {
+                namespace: "team-a".to_owned(),
+                name: "my-gw".to_owned(),
+            },
+        );
+        assert_eq!(
+            endpoint,
+            "https://coxswain-controller-discovery.coxswain-system.svc:50051"
+        );
+        assert_eq!(sa, "coxswain-controller");
+    }
+
+    #[test]
+    fn relay_never_tiers_even_in_its_own_provisioned_namespace() {
+        // A relay bootstraps in a namespace that is itself provisioned; it must
+        // still be pointed at the controller, never at itself.
+        let cfg = resolver(None, &["team-a"]);
+        let (endpoint, sa) = cfg.resolve(
+            &relay_id("team-a"),
+            &Scope::Namespace {
+                namespace: "team-a".to_owned(),
+            },
+        );
+        assert_eq!(
+            endpoint,
+            "https://coxswain-controller-discovery.coxswain-system.svc:50051"
+        );
+        assert_eq!(sa, "coxswain-controller");
+    }
+
+    #[test]
+    fn shared_pool_client_uses_shared_relay_when_present_else_controller() {
+        let with_relay = resolver(
+            Some("https://coxswain-relay-shared.coxswain-system.svc:50051"),
+            &[],
+        );
+        let (endpoint, sa) = with_relay.resolve(&proxy_id(), &Scope::SharedPool);
+        assert_eq!(
+            endpoint,
+            "https://coxswain-relay-shared.coxswain-system.svc:50051"
+        );
+        assert_eq!(sa, "coxswain-relay");
+
+        let without = resolver(None, &[]);
+        let (endpoint, sa) = without.resolve(&proxy_id(), &Scope::SharedPool);
+        assert_eq!(
+            endpoint,
+            "https://coxswain-controller-discovery.coxswain-system.svc:50051"
+        );
+        assert_eq!(sa, "coxswain-controller");
+    }
+
+    #[tokio::test]
+    async fn bootstrap_response_carries_resolved_upstream() {
+        let svc = BootstrapService::new(
+            Arc::new(OkIssuer {
+                cert: b"cert".to_vec(),
+                bundle: b"bundle".to_vec(),
+                not_after: 9999,
+            }),
+            Arc::new(OkAuthenticator(dedicated_id("team-a"))),
+        )
+        .with_upstream_resolver(resolver(None, &["team-a"]));
+
+        let req = Request::new(BootstrapRequest {
+            sa_token: "tok".to_owned(),
+            csr_pem: b"csr".to_vec(),
+            wire_version: WIRE_VERSION,
+            scope: Some(crate::wire::scope_to_wire(&Scope::Gateway {
+                namespace: "team-a".to_owned(),
+                name: "my-gw".to_owned(),
+            })),
+        });
+
+        let body = svc
+            .bootstrap(req)
+            .await
+            .expect("should succeed")
+            .into_inner();
+        assert_eq!(
+            body.upstream_endpoint,
+            "https://coxswain-relay.team-a.svc:50051"
+        );
+        assert_eq!(body.expected_server_sa, "coxswain-relay");
+    }
 }

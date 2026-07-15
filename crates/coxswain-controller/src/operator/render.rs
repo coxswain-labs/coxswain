@@ -36,11 +36,13 @@
 //! ## Container args
 //!
 //! `serve proxy --dedicated --gateway-name=<name> --gateway-namespace=<ns>
-//! --discovery-endpoint=<endpoint> --discovery-bootstrap-endpoint=<endpoint>
-//! --discovery-sa-token-path=<path> --discovery-ca-bundle-path=<path>
-//! --discovery-trust-domain=<domain> --log-format=json`. The discovery endpoint
-//! is the controller's mTLS gRPC Stream service (`https://…:50051`); the
-//! bootstrap endpoint is its server-auth-only SVID issuer (`https://…:50052`).
+//! --discovery-bootstrap-endpoint=<endpoint> --discovery-sa-token-path=<path>
+//! --discovery-ca-bundle-path=<path> --discovery-trust-domain=<domain>
+//! --log-format=json`. There is no `--discovery-endpoint` (#601): the bootstrap
+//! endpoint is the sole anchor — the controller's server-auth-only SVID issuer
+//! (`https://…:50052`) — and its response carries the proxy's routing-stream
+//! upstream (the controller's `https://…:50051`, or its namespace's relay if one
+//! is provisioned), repointed live thereafter without re-rendering this Deployment.
 //! The pod mounts a projected SA token + the CA trust bundle (#423) so it can
 //! obtain an SVID and open the mTLS Stream — the same wiring the shared proxy
 //! gets from the Helm chart. The proxy subscribes with `Scope::Gateway { name,
@@ -124,13 +126,13 @@ pub(super) struct RenderInputs<'a> {
     /// Name of the Gateway's GatewayClass (i.e. `gateway.spec.gatewayClassName`).
     /// Used in the GEP-1762 `<NAME>-<GATEWAY CLASS>` resource naming.
     pub(super) gateway_class_name: &'a str,
-    /// gRPC endpoint the dedicated proxy connects to for routing snapshots.
-    /// Rendered as `--discovery-endpoint=<endpoint>`. Since #423 the Stream
-    /// listener is mTLS-only, so this is an `https://` URL.
-    pub(super) discovery_endpoint: &'a str,
     /// Server-auth-only bootstrap endpoint the dedicated proxy calls to obtain
     /// its SVID before opening the mTLS Stream. Rendered as
-    /// `--discovery-bootstrap-endpoint=<endpoint>` (`https://`).
+    /// `--discovery-bootstrap-endpoint=<endpoint>` (`https://`). This is the sole
+    /// endpoint anchor (#601): the proxy learns its routing-stream upstream — the
+    /// controller, or its namespace's relay if provisioned — from the bootstrap
+    /// response, and is repointed at runtime by a `PreferredUpstream` directive,
+    /// never by re-rendering this Deployment.
     pub(super) discovery_bootstrap_endpoint: &'a str,
     /// Filesystem path of the projected ServiceAccount token the proxy presents
     /// to the controller's TokenReview during bootstrap. Rendered as
@@ -153,15 +155,6 @@ pub(super) struct RenderInputs<'a> {
     /// `gateway.spec.listeners` — so a ListenerSet listener on a new port is
     /// served by the dedicated proxy too.
     pub(super) effective_ports: &'a [EffectiveListenerPort],
-    /// Downstream discovery endpoint of the namespace relay when relay tiering is
-    /// enabled (#584): `Some("https://coxswain-relay.<ns>.svc:50051")`. The proxy
-    /// then subscribes for routing snapshots *through the relay* instead of
-    /// directly to the controller — its `--discovery-endpoint` is this value and
-    /// it verifies the relay's SVID via an added `--discovery-expected-server-sa`.
-    /// **Bootstrap stays the controller** (SVID issuance is never tiered), so
-    /// [`Self::discovery_bootstrap_endpoint`] is unchanged. `None` (relay tiering
-    /// off) ⇒ the proxy dials the controller directly, exactly as before.
-    pub(super) relay_endpoint: Option<&'a str>,
 }
 
 /// Name of the projected ServiceAccount-token volume mounted into every
@@ -579,24 +572,23 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         )
     };
 
-    // Relay tiering (#584): when the namespace is relay-fronted, the proxy
-    // subscribes for routing snapshots through the relay and must verify the
-    // relay's SVID (its ServiceAccount in this namespace) rather than the
-    // controller's. Bootstrap is untouched — SVID issuance is never tiered.
-    let stream_endpoint = inputs.relay_endpoint.unwrap_or(inputs.discovery_endpoint);
-
+    // Runtime-controlled upstream (#601): the dedicated proxy no longer takes a
+    // `--discovery-endpoint`. It bootstraps its SVID over the server-auth
+    // bootstrap listener, and the bootstrap response carries its current best
+    // routing upstream — the controller, or its namespace's relay if one is
+    // provisioned. A live `PreferredUpstream` directive repoints it at runtime, so
+    // provisioning a relay for this namespace never re-renders (and never rolls)
+    // this Deployment. The expected server SA arrives with the upstream pointer,
+    // not as a flag.
     let mut args = vec![
         "serve".to_string(),
         "proxy".to_string(),
         "--dedicated".to_string(),
         format!("--gateway-name={gw_name}"),
         format!("--gateway-namespace={}", common.namespace),
-        format!("--discovery-endpoint={stream_endpoint}"),
-        // SVID bootstrap (#423): the dedicated proxy authenticates with its
-        // projected SA token, obtains a short-lived SVID over the server-auth
-        // bootstrap listener, then opens the mTLS Stream. Without these the
-        // proxy can reach the https Stream endpoint but has no client cert and
-        // can never become Ready.
+        // SVID bootstrap (#423) + the sole endpoint anchor (#601): the dedicated
+        // proxy authenticates with its projected SA token, obtains a short-lived
+        // SVID, learns its routing upstream, then opens the mTLS Stream to it.
         format!(
             "--discovery-bootstrap-endpoint={}",
             inputs.discovery_bootstrap_endpoint
@@ -611,12 +603,6 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         ),
         format!("--discovery-trust-domain={}", inputs.discovery_trust_domain),
     ];
-    if inputs.relay_endpoint.is_some() {
-        args.push(format!(
-            "--discovery-expected-server-sa={}",
-            super::render_relay::RELAY_NAME
-        ));
-    }
     args.push("--log-format=json".to_string());
     // Keepalive pool size: pass through to dedicated proxies so their pools
     // are governed by the same operator-configured default (inherited from the
@@ -1070,14 +1056,12 @@ mod tests {
             params: &EffectiveParams::default(),
             controller_image: "ghcr.io/coxswain-labs/coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://d.default.svc:50051",
             discovery_bootstrap_endpoint: "http://d.default.svc:50052",
             discovery_sa_token_path: "/t",
             discovery_ca_bundle_path: "/ca",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         let spec = result.service.spec.expect("service spec");
         assert_eq!(spec.type_.as_deref(), Some("ClusterIP"));
@@ -1095,14 +1079,12 @@ mod tests {
             params: &params,
             controller_image: "ghcr.io/coxswain-labs/coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
 
         // Names per GEP-1762.
@@ -1150,14 +1132,12 @@ mod tests {
             params: &params,
             controller_image: "irrelevant",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         assert_eq!(result.deployment.spec.unwrap().replicas, Some(5));
         assert_eq!(
@@ -1177,18 +1157,18 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.tenant-a.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.tenant-a.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         let container = &pod_spec.containers[0];
         let args = container.args.as_ref().expect("args set");
+        // No `--discovery-endpoint` (#601): the routing upstream is delivered by
+        // the bootstrap response, and repointed live — bootstrap is the sole anchor.
         assert_eq!(
             args,
             &vec![
@@ -1197,8 +1177,6 @@ mod tests {
                 "--dedicated".to_string(),
                 "--gateway-name=team-gw".to_string(),
                 "--gateway-namespace=tenant-a".to_string(),
-                "--discovery-endpoint=http://coxswain-controller-discovery.tenant-a.svc:50051"
-                    .to_string(),
                 "--discovery-bootstrap-endpoint=http://coxswain-controller-discovery.tenant-a.svc:50052"
                     .to_string(),
                 "--discovery-sa-token-path=/var/run/secrets/coxswain/discovery-token/token"
@@ -1245,14 +1223,12 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
         assert_eq!(ports.len(), 2);
@@ -1281,14 +1257,12 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
         assert_eq!(ports.len(), 2, "the two HTTP:80 listeners dedupe");
@@ -1315,14 +1289,12 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod_spec.containers.len(), 2, "coxswain + sidecar");
@@ -1409,14 +1381,12 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         for labels in [
             result.deployment.metadata.labels.as_ref(),
@@ -1453,14 +1423,12 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
         assert_eq!(
@@ -1485,14 +1453,12 @@ mod tests {
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         for meta in [
             &result.deployment.metadata,
@@ -1532,14 +1498,12 @@ mod tests {
             params: &EffectiveParams::default(),
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         for meta in [
             &result.deployment.metadata,
@@ -1578,14 +1542,12 @@ mod tests {
             params: &EffectiveParams::default(),
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         let labels = result.deployment.metadata.labels.as_ref().expect("labels");
         assert_eq!(
@@ -1620,14 +1582,12 @@ mod tests {
             params: &EffectiveParams::default(),
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
-            discovery_endpoint: "http://coxswain-controller-discovery.default.svc:50051",
             discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
             effective_ports: &[],
-            relay_endpoint: None,
         });
         for meta in [
             &result.deployment.metadata,

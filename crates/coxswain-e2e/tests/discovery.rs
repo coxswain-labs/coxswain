@@ -64,24 +64,24 @@ use std::process::Command;
 use std::time::Duration;
 
 use coxswain_e2e::{
-    FixtureVars, Harness, NamespaceGuard,
-    fixtures::{self, backends, gateway_api as gwa, ingress},
-    harness::wait,
+    ControllerOptions, FixtureVars, Harness, NamespaceGuard,
+    fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress},
+    harness::{HttpClient, wait},
 };
 
 mod common;
-use common::dedicated::{controller_replicas, scale_controller};
+use common::dedicated::{
+    GATEWAY_NAME, RESOURCE_NAME, controller_replicas, scale_controller, wait_for_cut_over,
+};
 use common::discovery::{
     apply_host_ingress, assert_pod_stays_not_ready, copy_trust_bundle, counter, counter_kind,
     fetch_topology, find_node, leader_discovery_metrics, proxy_health_state,
     scrape_metric_label_sum, set_deployment_replicas, shared_proxy_deployment, wait_for_pod_ready,
 };
-use common::relay::{
-    self, assert_pod_stays_ready, create_relay_service_account, leaf_deployment, relay_deployment,
-    relay_service,
-};
+use common::relay::assert_pod_stays_ready;
 use common::rollout::rollout_restart_deployment;
-use k8s_openapi::api::core::v1::Service;
+use gateway_api_types::apis::standard::gateways::Gateway;
+use k8s_openapi::api::core::v1::{Pod, Service};
 
 // ── Group 1 — Auth rejection (SPIFFE trust-domain mismatch) ──────────────────
 
@@ -206,7 +206,7 @@ async fn fresh_proxy_converges_and_registers_in_node_registry() -> anyhow::Resul
     // The node_id is the pod name (POD_NAME downward API = metadata.name), which
     // for a Deployment called "disc-converge" is "disc-converge-<rs>-<pod>".
     let topology_url = h.controller_admin_url("/api/v1/topology");
-    wait::poll_until(
+    let node = wait::poll_until(
         Duration::from_secs(30),
         wait::POLL,
         || {
@@ -230,20 +230,11 @@ async fn fresh_proxy_converges_and_registers_in_node_registry() -> anyhow::Resul
     .await
     .context("topology did not converge for disc-converge-* node")?;
 
-    // Re-fetch to run the full set of assertions now that we know the node exists.
-    let topology = fetch_topology(&topology_url).await?;
-    let node = find_node(&topology, "disc-converge-").ok_or_else(|| {
-        anyhow::anyhow!(
-            "topology node for 'disc-converge-*' absent after convergence poll passed; \
-             topology: {topology}"
-        )
-    })?;
-
-    assert_eq!(
-        topology.get("discovery_active").and_then(|v| v.as_bool()),
-        Some(true),
-        "topology discovery_active must be true; topology: {topology}"
-    );
+    // Assert on the node captured BY the convergence poll — the snapshot in which
+    // it was in_sync. Re-fetching and re-asserting `in_sync` would be a TOCTOU
+    // flake: a churn-driven snapshot (e.g. the serial pass's controller rollout)
+    // can transiently flip a converged node to in_sync=false until it re-Acks, and
+    // reaching in_sync once is the convergence proof this test needs.
     assert_eq!(
         node.pointer("/scope/kind").and_then(|v| v.as_str()),
         Some("SharedPool"),
@@ -257,6 +248,15 @@ async fn fresh_proxy_converges_and_registers_in_node_registry() -> anyhow::Resul
         node.get("in_sync").and_then(|v| v.as_bool()),
         Some(true),
         "node must be in_sync after convergence; node: {node}"
+    );
+
+    // `discovery_active` is a stable top-level flag (true whenever any proxy is
+    // connected), so a fresh fetch for it carries no TOCTOU risk.
+    let topology = fetch_topology(&topology_url).await?;
+    assert_eq!(
+        topology.get("discovery_active").and_then(|v| v.as_bool()),
+        Some(true),
+        "topology discovery_active must be true; topology: {topology}"
     );
 
     Ok(())
@@ -1846,373 +1846,416 @@ async fn controller_restart_full_resync_reconverges() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Group 4 — Relay tier (#583) ───────────────────────────────────────────────
+// ── Relay tier (#583, #585) over the runtime-repoint model (#601) ─────────────
 //
-// A relay is `serve relay --shared`: an upstream discovery client (to the
-// controller) + a downstream discovery server (to leaf proxies), caching
-// last-good and re-serving. The relay + leaf run in a throwaway test namespace
-// and reach the controller's discovery/bootstrap Services by cross-namespace DNS
-// (`…​.coxswain-system.svc`); the leaf's upstream is the RELAY. All three tests
-// assert from the Pod `Ready` condition (readinessProbe on `/readyz`), which for
-// the relay gates on `routing_table_loaded` (upstream) AND `downstream_serving`,
-// and for the leaf gates on `routing_table_loaded` fed by the relay.
+// Since #601 a leaf is no longer hand-pinned at a relay via a static
+// `--discovery-endpoint`; the controller delivers each proxy's routing upstream
+// at bootstrap and repoints it live. These tests therefore drive the **real**
+// controller-provisioned namespace-relay path: relay tiering on with a threshold
+// of 1, so a single servable dedicated Gateway both provisions a namespace relay
+// AND has its dedicated proxy repointed onto that relay — with the data plane
+// never recycled. All assert from the dedicated proxy's Pod `Ready` condition,
+// live traffic through its VIP, and the controller `/api/v1/topology` fold view.
 //
-// The namespace-relay (`--namespace`) data-plane path is deny-authorized upstream
-// until the provenance authorizer + provisioning land in #584, so its live e2e
-// ships there; the demux itself is unit-covered in `coxswain-discovery`.
+// Execution: these use `start_with_options` (a `relay.dedicated.*` Helm mutator);
+// the `discovery` binary is always-serial, so the mutator-serialization invariant
+// (scripts/check-e2e-mutators-serialized.sh) is satisfied by the binary itself.
 
-/// Happy path: a relay bootstraps its SVID, converges upstream against the
-/// controller (visible as an in-sync `SharedPool` node in the controller
-/// topology), serves downstream, and a leaf proxy pointed at the relay converges
-/// **through** the relay to `Ready` — proving the relay re-served a
-/// self-consistent routing world (a mismatched world would Nack forever and
-/// never let the leaf go Ready).
-///
-/// Serial: co-located in the `discovery` binary with the controller-scaling
-/// tests (see the nextest config).
-#[tokio::test]
-async fn relay_fronted_proxy_converges_through_relay() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-converge").await?;
+/// Fixed name of every controller-provisioned namespace relay
+/// (`render_relay::RELAY_NAME`).
+const RELAY_NAME: &str = "coxswain-relay";
+/// GEP-1762 label every dedicated-proxy pod carries; selects the leaf pod.
+const GATEWAY_NAME_LABEL: &str = "gateway.networking.k8s.io/gateway-name";
+/// Selects the namespace-relay pod (`render_relay::RELAY_COMPONENT`).
+const RELAY_POD_SELECTOR: &str = "app.kubernetes.io/component=namespace-relay";
 
-    copy_trust_bundle(&h.client, &ns.name).await?;
-    create_relay_service_account(&h.client, &ns.name, relay::RELAY_SA).await?;
+/// Controller options that provision a namespace relay for any namespace with a
+/// single servable dedicated Gateway (threshold 1).
+fn relay_tiering_threshold_1() -> ControllerOptions {
+    ControllerOptions {
+        relay_dedicated_enabled: true,
+        relay_min_proxy_replicas: Some(1),
+        ..Default::default()
+    }
+}
 
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+/// The dedicated proxy's container `restartCount` (0 when it has never restarted).
+fn restart_count(pod: &Pod) -> i32 {
+    pod.status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .and_then(|cs| cs.first())
+        .map(|c| c.restart_count)
+        .unwrap_or(0)
+}
 
-    // Relay + its downstream discovery Service.
-    deployments
-        .create(
-            &PostParams::default(),
-            &relay_deployment(&ns.name, "relay", relay::RELAY_SA)?,
-        )
+/// The single dedicated-proxy pod for `GATEWAY_NAME` in `ns`.
+async fn dedicated_proxy_pod(client: &kube::Client, ns: &str) -> anyhow::Result<Pod> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let sel = format!("{GATEWAY_NAME_LABEL}={GATEWAY_NAME}");
+    let list = pods
+        .list(&ListParams::default().labels(&sel))
         .await
-        .context("create relay Deployment")?;
-    services
-        .create(&PostParams::default(), &relay_service(&ns.name, "relay")?)
-        .await
-        .context("create relay Service")?;
+        .with_context(|| format!("listing dedicated-proxy pods '{sel}' in '{ns}'"))?;
+    list.items
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("no dedicated-proxy pod matching '{sel}' in '{ns}'"))
+}
 
-    // Relay Ready ⟹ upstream converged AND downstream server bound.
-    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120))
-        .await
-        .context("relay pod did not become Ready (upstream converge + downstream serve)")?;
-
-    // Cross-validate from the controller's view: the relay is an ordinary
-    // `SharedPool` subscriber, so it appears in-sync in the NodeRegistry.
-    let topology_url = h.controller_admin_url("/api/v1/topology");
+/// Wait until the namespace relay's Deployment reports at least one ready replica.
+async fn wait_for_relay_ready(deployments: &Api<Deployment>) -> anyhow::Result<()> {
+    wait::wait_for_resource(deployments, RELAY_NAME, Duration::from_secs(60)).await?;
     wait::poll_until(
-        Duration::from_secs(30),
+        Duration::from_secs(150),
         wait::POLL,
-        || {
-            let url = topology_url.clone();
-            async move { format!("controller topology at '{url}' to show relay-* in_sync") }
-        },
-        || {
-            let url = topology_url.clone();
-            async move {
-                let topology = fetch_topology(&url).await.ok()?;
-                let node = find_node(&topology, "relay-")?;
-                (node.pointer("/scope/kind").and_then(|v| v.as_str()) == Some("SharedPool"))
-                    .then_some(())?;
-                node.get("in_sync")
-                    .and_then(|v| v.as_bool())
-                    .filter(|&b| b)
-                    .map(|_| ())
-            }
+        || async { format!("namespace relay '{RELAY_NAME}' to report a ready replica") },
+        || async {
+            let ready = deployments
+                .get(RELAY_NAME)
+                .await
+                .ok()
+                .and_then(|d| d.status)
+                .and_then(|s| s.ready_replicas)
+                .unwrap_or(0);
+            (ready >= 1).then_some(())
         },
     )
     .await
-    .context("relay did not register as an in-sync SharedPool node on the controller")?;
-
-    // Leaf pointed at the relay (endpoint = relay Service; expected-server SA =
-    // the relay's SA; bootstrap still targets the controller).
-    deployments
-        .create(
-            &PostParams::default(),
-            &leaf_deployment(&ns.name, "leaf", "relay", relay::RELAY_SA)?,
-        )
-        .await
-        .context("create relay-fronted leaf Deployment")?;
-
-    // Leaf Ready ⟹ it received a self-consistent full world THROUGH the relay.
-    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120))
-        .await
-        .context("relay-fronted leaf did not converge to Ready through the relay")?;
-
-    Ok(())
 }
 
-/// Sad path — controller outage: with the relay + leaf converged, scaling the
-/// controller to zero must leave BOTH serving their last-good world (the relay
-/// degrades but keeps `/readyz` 200; the leaf's upstream — the relay — never
-/// drops), and both must reconverge when the controller returns. The leaf never
-/// disconnects.
-///
-/// Serial: scales the shared controller to zero.
-#[tokio::test]
-async fn relay_and_leaf_serve_last_good_during_controller_outage() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-outage").await?;
-
-    copy_trust_bundle(&h.client, &ns.name).await?;
-    create_relay_service_account(&h.client, &ns.name, relay::RELAY_SA).await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
-    deployments
-        .create(
-            &PostParams::default(),
-            &relay_deployment(&ns.name, "relay", relay::RELAY_SA)?,
-        )
-        .await
-        .context("create relay Deployment")?;
-    services
-        .create(&PostParams::default(), &relay_service(&ns.name, "relay")?)
-        .await
-        .context("create relay Service")?;
-    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120)).await?;
-    deployments
-        .create(
-            &PostParams::default(),
-            &leaf_deployment(&ns.name, "leaf", "relay", relay::RELAY_SA)?,
-        )
-        .await
-        .context("create leaf Deployment")?;
-    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120)).await?;
-
-    // ── Controller down → both keep serving last-good ─────────────────────────
-    let ha_replicas = controller_replicas().await?.max(1);
-    scale_controller(0).await?;
-
-    // Both the relay and its leaf must hold Ready (last-good) across the outage.
-    assert_pod_stays_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(20))
-        .await
-        .context("relay dropped Ready during controller outage (last-good violated)")?;
-    assert_pod_stays_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(20))
-        .await
-        .context("relay-fronted leaf dropped Ready during controller outage (leaf disconnected)")?;
-
-    // ── Controller back → both reconverge ─────────────────────────────────────
-    scale_controller(ha_replicas).await?;
-    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120))
-        .await
-        .context("relay did not reconverge after the controller returned")?;
-    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120))
-        .await
-        .context("leaf did not reconverge after the controller returned")?;
-
-    Ok(())
+/// The `node_id`s of every `is_relay` Namespace-relay node in `ns`. There may be
+/// more than one (`--relay-replicas` defaults to 2), and a repointed leaf's
+/// `parent` is whichever replica its stream landed on — so a fold assertion must
+/// accept ANY of them, not the lexicographically-first. Namespace-scoped so a
+/// serial test never matches another namespace's identically-named relay.
+fn relay_ids_in(topology: &serde_json::Value, ns: &str) -> Vec<String> {
+    topology
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter(|n| {
+                    n.pointer("/scope/kind").and_then(|v| v.as_str()) == Some("Namespace")
+                        && n.pointer("/scope/namespace").and_then(|v| v.as_str()) == Some(ns)
+                        && n.get("is_relay").and_then(|v| v.as_bool()) == Some(true)
+                })
+                .filter_map(|n| n.get("node_id").and_then(|v| v.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-/// Sad path — relay restart: with the leaf converged through the relay,
-/// restarting the relay Deployment must leave the leaf serving its last-good
-/// world (it never drops Ready), and the leaf must reconverge when the relay
-/// returns (a reconnecting leaf gets a fresh full via `expect_full`).
-///
-/// Serial: co-located in the `discovery` binary.
-#[tokio::test]
-async fn leaf_serves_last_good_when_relay_restarts() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-restart").await?;
-
-    copy_trust_bundle(&h.client, &ns.name).await?;
-    create_relay_service_account(&h.client, &ns.name, relay::RELAY_SA).await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
-    deployments
-        .create(
-            &PostParams::default(),
-            &relay_deployment(&ns.name, "relay", relay::RELAY_SA)?,
-        )
-        .await
-        .context("create relay Deployment")?;
-    services
-        .create(&PostParams::default(), &relay_service(&ns.name, "relay")?)
-        .await
-        .context("create relay Service")?;
-    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120)).await?;
-    deployments
-        .create(
-            &PostParams::default(),
-            &leaf_deployment(&ns.name, "leaf", "relay", relay::RELAY_SA)?,
-        )
-        .await
-        .context("create leaf Deployment")?;
-    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120)).await?;
-
-    // ── Restart the relay → the leaf serves last-good across the gap ──────────
-    rollout_restart_deployment(&ns.name, "relay").await?;
-
-    // The leaf's upstream is briefly gone, but it never drops Ready (Degraded
-    // keeps `/readyz` 200), serving its last-good world through the relay gap.
-    assert_pod_stays_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(20))
-        .await
-        .context("leaf dropped Ready while the relay restarted (last-good violated)")?;
-
-    // ── Relay back → leaf reconverges (still Ready) ───────────────────────────
-    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120))
-        .await
-        .context("relay did not come back Ready after restart")?;
-    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120))
-        .await
-        .context("leaf did not reconverge after the relay returned")?;
-
-    Ok(())
+/// The dedicated-proxy node for `ns` (scope `Gateway` in `ns`, `dedicated-gw`).
+/// Namespace-scoped: every test uses the same Gateway name, so a bare node-id
+/// prefix match would collide across the serial suite's namespaces.
+fn dedicated_proxy_node<'a>(
+    topology: &'a serde_json::Value,
+    ns: &str,
+) -> Option<&'a serde_json::Value> {
+    topology.get("nodes")?.as_array()?.iter().find(|n| {
+        n.pointer("/scope/kind").and_then(|v| v.as_str()) == Some("Gateway")
+            && n.pointer("/scope/namespace").and_then(|v| v.as_str()) == Some(ns)
+            && n.get("node_id")
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| id.starts_with(RESOURCE_NAME))
+    })
 }
 
-// ── Group 5 — Relay leaf-roster telemetry (#585) ──────────────────────────────
-//
-// A relay reports its downstream leaves upstream as a `RosterReport`; the
-// controller folds each leaf into its NodeRegistry tagged with the relay as
-// `parent`, marks the relay `is_relay`, and evicts the subtree when the relay's
-// stream drops. Asserted from the controller's `/api/v1/topology`, the same
-// view the operator UI and the #531 gate read.
-
-/// Poll the controller topology until the relay-fronted leaf is folded under the
-/// relay: the relay row carries `is_relay = true`, and the leaf row's `parent`
-/// is the relay's `node_id`. Returns the relay's `node_id`.
-async fn wait_for_folded_leaf(topology_url: &str) -> anyhow::Result<String> {
+/// Poll the controller topology until the `ns` dedicated proxy is folded UNDER a
+/// relay: the proxy row's `parent` is one of the namespace's `is_relay` relay
+/// nodes. This is the observable proof the proxy repointed from the controller
+/// onto the relay.
+async fn wait_for_proxy_under_relay(topology_url: &str, ns: &str) -> anyhow::Result<()> {
     wait::poll_until(
-        Duration::from_secs(30),
+        Duration::from_secs(150),
         wait::POLL,
         || {
             let url = topology_url.to_owned();
-            async move { format!("controller topology at '{url}' to fold leaf-* under relay-* (is_relay + parent)") }
-        },
-        || {
-            let url = topology_url.to_owned();
-            async move {
-                let topology = fetch_topology(&url).await.ok()?;
-                let relay = find_node(&topology, "relay-")?;
-                relay.get("is_relay").and_then(|v| v.as_bool()).filter(|&b| b)?;
-                let relay_id = relay.get("node_id").and_then(|v| v.as_str())?.to_owned();
-                let leaf = find_node(&topology, "leaf-")?;
-                (leaf.get("parent").and_then(|v| v.as_str()) == Some(relay_id.as_str()))
-                    .then_some(relay_id)
-            }
-        },
-    )
-    .await
-    .context("relay-fronted leaf was not folded under its relay in the controller topology")
-}
-
-/// Happy path: a leaf behind a relay is folded into the controller's registry as
-/// a child of the relay (#585) — the controller sees real leaf state through the
-/// tier, not just the relay's own row.
-#[tokio::test]
-async fn relay_folds_leaf_roster_into_controller_topology() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-roster-fold").await?;
-
-    copy_trust_bundle(&h.client, &ns.name).await?;
-    create_relay_service_account(&h.client, &ns.name, relay::RELAY_SA).await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
-    deployments
-        .create(
-            &PostParams::default(),
-            &relay_deployment(&ns.name, "relay", relay::RELAY_SA)?,
-        )
-        .await
-        .context("create relay Deployment")?;
-    services
-        .create(&PostParams::default(), &relay_service(&ns.name, "relay")?)
-        .await
-        .context("create relay Service")?;
-    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120))
-        .await
-        .context("relay pod did not become Ready")?;
-
-    deployments
-        .create(
-            &PostParams::default(),
-            &leaf_deployment(&ns.name, "leaf", "relay", relay::RELAY_SA)?,
-        )
-        .await
-        .context("create relay-fronted leaf Deployment")?;
-    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120))
-        .await
-        .context("relay-fronted leaf did not converge to Ready")?;
-
-    // The leaf reaches the controller only via the relay's RosterReport.
-    let topology_url = h.controller_admin_url("/api/v1/topology");
-    wait_for_folded_leaf(&topology_url).await?;
-
-    Ok(())
-}
-
-/// Sad path — relay outage: deleting the relay drops its upstream stream, so the
-/// controller evicts the whole subtree (#585). The leaf keeps serving last-good,
-/// but it must vanish from the controller's view — a new publish must not gate on
-/// a blind spot.
-#[tokio::test]
-async fn relay_outage_evicts_leaf_subtree_from_topology() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-roster-evict").await?;
-
-    copy_trust_bundle(&h.client, &ns.name).await?;
-    create_relay_service_account(&h.client, &ns.name, relay::RELAY_SA).await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
-    deployments
-        .create(
-            &PostParams::default(),
-            &relay_deployment(&ns.name, "relay", relay::RELAY_SA)?,
-        )
-        .await
-        .context("create relay Deployment")?;
-    services
-        .create(&PostParams::default(), &relay_service(&ns.name, "relay")?)
-        .await
-        .context("create relay Service")?;
-    wait_for_pod_ready(&h.client, &ns.name, "app=relay", Duration::from_secs(120)).await?;
-    deployments
-        .create(
-            &PostParams::default(),
-            &leaf_deployment(&ns.name, "leaf", "relay", relay::RELAY_SA)?,
-        )
-        .await
-        .context("create relay-fronted leaf Deployment")?;
-    wait_for_pod_ready(&h.client, &ns.name, "app=leaf", Duration::from_secs(120)).await?;
-
-    let topology_url = h.controller_admin_url("/api/v1/topology");
-    wait_for_folded_leaf(&topology_url).await?;
-
-    // ── Relay down → the controller evicts the subtree ────────────────────────
-    deployments
-        .delete("relay", &DeleteParams::default())
-        .await
-        .context("delete relay Deployment")?;
-
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || {
-            let url = topology_url.clone();
             async move {
                 format!(
-                    "controller topology at '{url}' to evict the leaf subtree after relay outage"
+                    "controller topology at '{url}' to fold the dedicated proxy under its relay"
                 )
             }
         },
         || {
-            let url = topology_url.clone();
+            let url = topology_url.to_owned();
+            let ns = ns.to_owned();
             async move {
                 let topology = fetch_topology(&url).await.ok()?;
-                // Both the relay row and its folded leaf must be gone.
-                (find_node(&topology, "relay-").is_none()
-                    && find_node(&topology, "leaf-").is_none())
-                .then_some(())
+                let relay_ids = relay_ids_in(&topology, &ns);
+                if relay_ids.is_empty() {
+                    return None;
+                }
+                let proxy = dedicated_proxy_node(&topology, &ns)?;
+                let parent = proxy.get("parent").and_then(|v| v.as_str())?;
+                relay_ids.iter().any(|r| r == parent).then_some(())
             }
         },
     )
     .await
-    .context("controller did not evict the leaf subtree after the relay's stream dropped")?;
+    .context("dedicated proxy was never folded under its relay in the controller topology")
+}
+
+/// Provision a servable dedicated Gateway in `ns` (echo backend + HTTPRoute),
+/// wait for cut-over, and confirm traffic flows through the dedicated proxy.
+/// Returns the traffic client, the route host, and the proxy pod's UID (to prove
+/// later that a repoint never recreates the pod).
+async fn converge_dedicated_proxy(
+    h: &Harness,
+    ns: &str,
+) -> anyhow::Result<(HttpClient, String, Option<String>)> {
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(ns)).await?;
+    wait::wait_for_backends(ns).await?;
+    fixtures::apply_fixture(dedicated::TRAFFIC, FixtureVars::new(ns)).await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), ns);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(120)).await?;
+
+    let host = format!("dedicated.{ns}.local");
+    let addr =
+        wait::wait_for_dedicated_proxy_endpoint(ns, GATEWAY_NAME, Duration::from_secs(60)).await?;
+    let http = HttpClient::new(addr)?;
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(90))
+        .await?
+        .assert_backend("echo-a");
+
+    let uid = dedicated_proxy_pod(&h.client, ns).await?.metadata.uid;
+    Ok((http, host, uid))
+}
+
+/// Happy path (#601): with relay tiering on, a servable dedicated Gateway
+/// provisions a namespace relay AND its dedicated proxy is repointed from the
+/// controller onto the relay — **live, without a pod restart**. Traffic keeps
+/// flowing throughout, and the proxy is folded under the relay in the controller
+/// topology (proving it now streams through the relay, not the controller).
+///
+/// Serial: `relay.dedicated.enabled` Helm mutator, in the always-serial
+/// `discovery` binary.
+#[tokio::test]
+async fn dedicated_proxy_repoints_to_relay_without_dropping_traffic() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(relay_tiering_threshold_1()).await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-repoint").await?;
+
+    // Dedicated proxy converged and serving traffic (initially from the controller).
+    let (http, host, proxy_uid) = converge_dedicated_proxy(&h, &ns.name).await?;
+
+    // The relay is provisioned (threshold 1) and becomes Ready.
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_relay_ready(&deployments).await?;
+
+    // The dedicated proxy repoints onto the relay: it appears folded under the
+    // relay in the controller topology.
+    let topology_url = h.controller_admin_url("/api/v1/topology");
+    wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
+
+    // Data plane untouched by the repoint: traffic still flows to the same backend,
+    // the proxy pod was never recreated, and its container never restarted.
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(30))
+        .await
+        .context("dedicated proxy stopped serving traffic across the relay repoint")?
+        .assert_backend("echo-a");
+
+    let after = dedicated_proxy_pod(&h.client, &ns.name).await?;
+    assert_eq!(
+        after.metadata.uid, proxy_uid,
+        "the relay repoint must NOT recreate the dedicated-proxy pod (the upstream \
+         swap is an in-process control-stream reconnect, not a rollout)"
+    );
+    assert_eq!(
+        restart_count(&after),
+        0,
+        "the dedicated-proxy container must not restart across the relay repoint"
+    );
+
+    Ok(())
+}
+
+/// Sad path — controller outage: with the dedicated proxy converged **through**
+/// the relay, scaling the controller to zero must leave both the relay and the
+/// proxy serving their last-good world (neither drops Ready), and the proxy must
+/// keep serving live traffic throughout. Both reconverge when the controller
+/// returns.
+///
+/// Serial: scales the shared controller to zero + `relay.dedicated.*` mutator.
+#[tokio::test]
+async fn relay_and_dedicated_proxy_serve_last_good_during_controller_outage() -> anyhow::Result<()>
+{
+    let h = Harness::start_with_options(relay_tiering_threshold_1()).await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-outage").await?;
+
+    let (http, host, _uid) = converge_dedicated_proxy(&h, &ns.name).await?;
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_relay_ready(&deployments).await?;
+    let topology_url = h.controller_admin_url("/api/v1/topology");
+    wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
+
+    // ── Controller down → relay + proxy hold last-good, traffic uninterrupted ──
+    let ha_replicas = controller_replicas().await?.max(1);
+    scale_controller(0).await?;
+
+    assert_pod_stays_ready(
+        &h.client,
+        &ns.name,
+        RELAY_POD_SELECTOR,
+        Duration::from_secs(20),
+    )
+    .await
+    .context("relay dropped Ready during controller outage (last-good violated)")?;
+    assert_pod_stays_ready(
+        &h.client,
+        &ns.name,
+        &format!("{GATEWAY_NAME_LABEL}={GATEWAY_NAME}"),
+        Duration::from_secs(20),
+    )
+    .await
+    .context("relay-fronted dedicated proxy dropped Ready during controller outage")?;
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(20))
+        .await
+        .context("dedicated proxy stopped serving last-good traffic during controller outage")?
+        .assert_backend("echo-a");
+
+    // ── Controller back → both reconverge ─────────────────────────────────────
+    scale_controller(ha_replicas).await?;
+    wait_for_relay_ready(&deployments).await?;
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(90))
+        .await?
+        .assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// Sad path — relay restart: with the dedicated proxy converged through the
+/// relay, rolling-restarting the relay Deployment must leave the proxy serving
+/// its last-good world (it never drops Ready) and keeping live traffic flowing,
+/// then reconverge onto the fresh relay pod.
+///
+/// Serial: `relay.dedicated.*` mutator, always-serial binary.
+#[tokio::test]
+async fn dedicated_proxy_serves_last_good_while_relay_restarts() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(relay_tiering_threshold_1()).await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-restart").await?;
+
+    let (http, host, proxy_uid) = converge_dedicated_proxy(&h, &ns.name).await?;
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_relay_ready(&deployments).await?;
+    let topology_url = h.controller_admin_url("/api/v1/topology");
+    wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
+
+    // ── Restart the relay → proxy holds last-good across the gap ──────────────
+    rollout_restart_deployment(&ns.name, RELAY_NAME).await?;
+    assert_pod_stays_ready(
+        &h.client,
+        &ns.name,
+        &format!("{GATEWAY_NAME_LABEL}={GATEWAY_NAME}"),
+        Duration::from_secs(20),
+    )
+    .await
+    .context("dedicated proxy dropped Ready while its relay restarted (last-good violated)")?;
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(20))
+        .await
+        .context("dedicated proxy stopped serving last-good traffic during the relay restart")?
+        .assert_backend("echo-a");
+
+    // ── Relay back → proxy reconverges onto the fresh relay pod, same proxy pod ─
+    wait_for_relay_ready(&deployments).await?;
+    wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
+    assert_eq!(
+        dedicated_proxy_pod(&h.client, &ns.name).await?.metadata.uid,
+        proxy_uid,
+        "the dedicated-proxy pod must survive a relay restart untouched (only its \
+         control stream reconnected)"
+    );
+
+    Ok(())
+}
+
+/// Sad path — relay deprovisioned: with the dedicated proxy converged through the
+/// relay, a `CoxswainRelayPolicy{enabled:false}` vetoes the relay and the
+/// controller garbage-collects it. The proxy must fall back to the controller —
+/// re-bootstrapping to the always-up anchor once its relay stream drops — while
+/// serving its last-good world uninterrupted (same pod, live traffic), and the
+/// controller topology must show the relay gone and the proxy no longer folded
+/// under it (the subtree is evicted and the proxy re-attaches directly).
+///
+/// Serial: `relay.dedicated.*` mutator, always-serial binary.
+#[tokio::test]
+async fn dedicated_proxy_falls_back_to_controller_when_relay_deprovisioned() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(relay_tiering_threshold_1()).await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-deprovision").await?;
+
+    let (http, host, proxy_uid) = converge_dedicated_proxy(&h, &ns.name).await?;
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_relay_ready(&deployments).await?;
+    let topology_url = h.controller_admin_url("/api/v1/topology");
+    wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
+
+    // ── Veto the relay → the controller GCs it ────────────────────────────────
+    fixtures::apply_fixture(
+        dedicated::RELAY_POLICY_FORCE_OFF,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("relay '{RELAY_NAME}' garbage-collected after enabled:false policy") },
+        || async {
+            let gone = deployments.get(RELAY_NAME).await.is_err()
+                && services.get(RELAY_NAME).await.is_err();
+            gone.then_some(())
+        },
+    )
+    .await?;
+
+    // ── Proxy falls back to the controller, uninterrupted ─────────────────────
+    // The proxy re-attaches directly: the relay row is gone from topology and the
+    // proxy no longer has a relay parent.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || {
+            let url = topology_url.clone();
+            async move {
+                format!("topology at '{url}' to drop the relay and re-attach the proxy directly")
+            }
+        },
+        || {
+            let url = topology_url.clone();
+            let ns = ns.name.clone();
+            async move {
+                let topology = fetch_topology(&url).await.ok()?;
+                // This namespace's relay is gone AND its proxy re-attached directly.
+                if !relay_ids_in(&topology, &ns).is_empty() {
+                    return None;
+                }
+                let proxy = dedicated_proxy_node(&topology, &ns)?;
+                let reattached = proxy
+                    .get("parent")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(str::is_empty);
+                reattached.then_some(())
+            }
+        },
+    )
+    .await
+    .context(
+        "dedicated proxy did not fall back to the controller after the relay was deprovisioned",
+    )?;
+
+    // The data plane never noticed: live traffic still flows to the same backend,
+    // and the proxy pod was never recreated.
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(30))
+        .await
+        .context("dedicated proxy stopped serving traffic across the relay deprovision")?
+        .assert_backend("echo-a");
+    assert_eq!(
+        dedicated_proxy_pod(&h.client, &ns.name).await?.metadata.uid,
+        proxy_uid,
+        "the fallback to the controller must NOT recreate the dedicated-proxy pod"
+    );
 
     Ok(())
 }

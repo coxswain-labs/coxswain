@@ -140,6 +140,16 @@ spec:
             - name: COXSWAIN_RELAY_MEMORY_LIMIT
               value: {{ .Values.relay.dedicated.resources.memoryLimit | quote }}
             {{- end }}
+            {{- if .Values.relay.shared.enabled }}
+            # Shared relay (#601): the shared relay is a static Helm toggle, not
+            # controller-managed like namespace relays, so the controller cannot
+            # discover it. This tells the controller the shared relay's Stream
+            # endpoint so it hands shared-pool proxies this upstream at bootstrap
+            # instead of its own — keeping shared-relay fronting working now that
+            # the proxy has no COXSWAIN_DISCOVERY_ENDPOINT of its own.
+            - name: COXSWAIN_SHARED_RELAY_ENDPOINT
+              value: {{ include "coxswain.relayShared.discoveryEndpoint" . | quote }}
+            {{- end }}
             {{- if .Values.controller.statusAddress }}
             - name: COXSWAIN_STATUS_ADDRESS
               value: {{ .Values.controller.statusAddress | quote }}

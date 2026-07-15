@@ -78,9 +78,9 @@ Shared-proxy pod fullname: "<release>-coxswain-shared-proxy".
 {{- end }}
 
 {{/*
-Discovery Service name. Fixed (not release-prefixed) because the controller's
-operator renders this exact DNS name into dedicated-proxy `--discovery-endpoint`
-args, and the shared-proxy endpoint env is derived from the same helper so both
+Discovery Service name. Fixed (not release-prefixed) because the controller hands
+this exact DNS name to proxies as their routing-stream upstream at bootstrap
+(#601), and the same helper builds the controller's own Stream endpoint so both
 agree. The Service is namespaced, so distinct installs in distinct namespaces do
 not collide.
 */}}
@@ -156,9 +156,9 @@ app.kubernetes.io/component: relay-shared
 
 {{/*
 Shared-pool relay ServiceAccount name. This is the SA half of the relay's SVID
-(`spiffe://<trust-domain>/ns/<ns>/sa/<this>`); when the shared proxies are
-repointed at the relay they set `--discovery-expected-server-sa` to this exact
-name so they verify the relay's identity instead of the controller's.
+(`spiffe://<trust-domain>/ns/<ns>/sa/<this>`); the controller hands it to
+shared-pool proxies alongside the shared relay endpoint at bootstrap (#601) so
+they verify the relay's identity instead of the controller's.
 */}}
 {{- define "coxswain.relayShared.serviceAccountName" -}}
 {{- if .Values.relay.shared.serviceAccount.create }}

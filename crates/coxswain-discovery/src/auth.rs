@@ -51,7 +51,7 @@ use crate::svid::SharedSvid;
 ///   the role: `spiffe://cluster.local/ns/coxswain-system/sa/coxswain-proxy`
 ///   matches any SVID whose URI SAN starts with that string.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpiffeMatcher {
     /// The URI SAN must be exactly this string.
     Exact(String),

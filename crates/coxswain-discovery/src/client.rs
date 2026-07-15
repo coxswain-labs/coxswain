@@ -8,6 +8,7 @@
 //!
 //! [`Shared`]: coxswain_core::Shared
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use coxswain_core::health::SubsystemHandle;
@@ -17,7 +18,7 @@ use coxswain_core::routing::{
     SharedTlsPassthroughTable, SharedUdpRouteTable,
 };
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, warn};
@@ -33,6 +34,7 @@ use crate::proto::v1::{
 };
 use crate::subscription::Scope;
 use crate::svid::SharedSvid;
+use crate::upstream::{SharedUpstream, UpstreamTarget, expected_server_matcher};
 use crate::version::WIRE_VERSION;
 
 /// Configuration for the discovery gRPC client supervisor.
@@ -112,6 +114,53 @@ pub struct DiscoveryClientConfig {
     /// controller's registry for the #531 gate and the topology panel. `None`
     /// (default) = no reporting (leaf proxies and the controller never report).
     pub roster_rx: Option<watch::Receiver<coxswain_core::node_registry::NodeRegistry>>,
+    /// Runtime-swappable routing-stream upstream (#601).
+    ///
+    /// When `Some`, `build_channel` reads the current target (endpoints +
+    /// expected-server matcher) from this cell on every connect attempt, taking
+    /// precedence over the static `endpoints`/`expected_server`. Populated by the
+    /// bootstrap loop (the upstream pointer rides the bootstrap response) and by a
+    /// live `PreferredUpstream` directive on the stream. Empty until the first
+    /// bootstrap → `build_channel` returns [`DiscoveryError::NoUpstream`] and the
+    /// supervisor backs off until `upstream_changed` fires.
+    pub upstream_cell: Option<SharedUpstream>,
+    /// Fires when the bootstrap loop writes a fresh upstream into `upstream_cell`
+    /// (#601). Mirrors `svid_rotated`: the supervisor forces a clean reconnect to
+    /// the new target on the next tick. A live `PreferredUpstream` directive is
+    /// handled inline by the stream loop (no watch tick needed) — this watch is
+    /// only the bootstrap-delivered path.
+    pub upstream_changed: Option<watch::Receiver<u64>>,
+    /// Pokes the bootstrap loop to re-bootstrap immediately (#601 fallback).
+    ///
+    /// When `Some`, the supervisor notifies it after repeated failed reconnects
+    /// to the current upstream (e.g. a relay torn down in a race), so a fresh
+    /// bootstrap re-resolves the best upstream (now the controller). `None` =
+    /// no re-bootstrap poke (static/no-bootstrap path).
+    pub re_bootstrap: Option<Arc<Notify>>,
+    /// SPIFFE trust domain, used to rebuild the expected-server matcher when a
+    /// live `PreferredUpstream` directive names a new `(endpoint, sa)` (#601).
+    pub trust_domain: String,
+    /// Namespace to attribute an upstream whose endpoint is not cluster service
+    /// DNS (test loopback) when rebuilding a matcher from a directive (#601).
+    pub fallback_namespace: String,
+    /// How this client handles a `PreferredUpstream` directive (#601): a leaf
+    /// repoints its own upstream; a relay forwards it downstream. Defaults to
+    /// [`UpstreamDirectiveHandler::RepointSelf`].
+    pub upstream_directive_handler: UpstreamDirectiveHandler,
+}
+
+/// How a client reacts to a server-pushed `PreferredUpstream` directive (#601).
+#[non_exhaustive]
+pub enum UpstreamDirectiveHandler {
+    /// Leaf proxy: apply the directive to this client's own upstream — write the
+    /// new target into `upstream_cell` and force a reconnect to it.
+    RepointSelf,
+    /// Relay: fan the controller-originated directive to the relay's downstream
+    /// `DiscoveryService` instead of repointing the relay's own upstream (a relay
+    /// always streams from the controller). Each downstream leaf stream subscribes
+    /// to this broadcast and forwards the directive to the leaf whose Gateway scope
+    /// matches the directive's target.
+    Forward(broadcast::Sender<p::PreferredUpstream>),
 }
 
 impl DiscoveryClientConfig {
@@ -133,6 +182,12 @@ impl DiscoveryClientConfig {
             svid_rotated: None,
             bound_ports_rx: None,
             roster_rx: None,
+            upstream_cell: None,
+            upstream_changed: None,
+            re_bootstrap: None,
+            trust_domain: "cluster.local".to_owned(),
+            fallback_namespace: String::new(),
+            upstream_directive_handler: UpstreamDirectiveHandler::RepointSelf,
         }
     }
 }
@@ -457,6 +512,16 @@ impl Supervisor {
         // not conflict with the mutable borrow of `self` inside
         // `stream_until_closed`.
         let mut svid_rotation_rx: Option<watch::Receiver<u64>> = self.config.svid_rotated.take();
+        // Upstream-repoint watch (#601): fires when the bootstrap loop delivers a
+        // fresh upstream. A live directive on the stream is handled inline (it
+        // returns `repoint`), so this watch covers only the bootstrap-delivered
+        // path — but it force-reconnects the same way SVID rotation does.
+        let mut upstream_changed_rx: Option<watch::Receiver<u64>> =
+            self.config.upstream_changed.take();
+        // Fallback re-bootstrap trigger (#601): pokes the bootstrap loop after
+        // repeated failed reconnects to the current upstream (a relay torn down
+        // in a race), so a fresh bootstrap re-resolves the best upstream.
+        let re_bootstrap: Option<Arc<Notify>> = self.config.re_bootstrap.take();
         let mut bound_ports_rx: Option<watch::Receiver<std::collections::BTreeSet<u16>>> =
             self.config.bound_ports_rx.take();
         let mut roster_rx: Option<watch::Receiver<coxswain_core::node_registry::NodeRegistry>> =
@@ -486,37 +551,35 @@ impl Supervisor {
             const FAILED: StreamEnd = StreamEnd {
                 applied: false,
                 not_leader: false,
+                repoint: false,
             };
-            let (end, svid_rotated) = match build_channel(&self.config) {
+            let end = match build_channel(&self.config) {
                 Ok(channel) => {
                     let mut grpc = TonicClient::new(channel);
-                    // `svid_rotated` is an intentional reconnect, not a failure;
-                    // track it separately so the backoff exponent is not bumped.
-                    if let Some(ref mut rx) = svid_rotation_rx {
-                        tokio::select! {
-                            result = self.stream_until_closed(&mut grpc, bound_ports_rx.as_mut(), roster_rx.as_mut()) => (result, false),
-                            Ok(()) = rx.changed() => {
-                                debug!("discovery client: SVID rotated; forcing reconnect with fresh SVID");
-                                (FAILED, true)
-                            }
+                    // Both the SVID-rotation and the bootstrap-delivered-upstream
+                    // watches force a clean reconnect; a `pending` future stands in
+                    // for an unwired receiver so the select shape is uniform.
+                    tokio::select! {
+                        result = self.stream_until_closed(&mut grpc, bound_ports_rx.as_mut(), roster_rx.as_mut()) => result,
+                        Ok(()) = wait_changed(&mut svid_rotation_rx) => {
+                            debug!("discovery client: SVID rotated; forcing reconnect with fresh SVID");
+                            FAILED.forced()
                         }
-                    } else {
-                        (
-                            self.stream_until_closed(
-                                &mut grpc,
-                                bound_ports_rx.as_mut(),
-                                roster_rx.as_mut(),
-                            )
-                            .await,
-                            false,
-                        )
+                        Ok(()) = wait_changed(&mut upstream_changed_rx) => {
+                            debug!("discovery client: upstream repointed at bootstrap; forcing reconnect to new target");
+                            FAILED.forced()
+                        }
                     }
                 }
                 Err(e) => {
                     warn!(error = %e, "discovery client: channel build failed; backing off");
-                    (FAILED, false)
+                    FAILED
                 }
             };
+            // A forced reconnect (SVID rotation, a bootstrap-delivered upstream,
+            // or an inline `PreferredUpstream` directive) is intentional, not a
+            // failure — it must not bump the backoff exponent.
+            let forced_reconnect = end.repoint;
 
             if self.has_snapshot {
                 self.health.degraded(
@@ -533,7 +596,7 @@ impl Supervisor {
             // expected routing outcome (#531): it neither resets nor bumps the
             // exponent, and takes the fast-retry band instead of the
             // exponential delay.
-            if end.applied || svid_rotated {
+            if end.applied || forced_reconnect {
                 attempt = 0;
             } else if !end.not_leader {
                 attempt = attempt.saturating_add(1);
@@ -542,6 +605,22 @@ impl Supervisor {
                 consecutive_not_leader = consecutive_not_leader.saturating_add(1);
             } else {
                 consecutive_not_leader = 0;
+            }
+
+            // Fallback re-bootstrap (#601): repeated failed reconnects to the
+            // current upstream mean it is gone (a relay torn down in a race). Poke
+            // the bootstrap loop so a fresh bootstrap re-resolves the best upstream
+            // — now the controller, the always-up anchor. Fires only on genuine
+            // failures (not forced reconnects or not-leader fast-retries) once the
+            // exponent crosses the threshold; the bootstrap loop coalesces pokes.
+            if attempt >= REBOOTSTRAP_AFTER_ATTEMPTS
+                && let Some(notify) = re_bootstrap.as_ref()
+            {
+                debug!(
+                    attempt,
+                    "discovery client: upstream unreachable; poking re-bootstrap to re-resolve upstream"
+                );
+                notify.notify_one();
             }
 
             // While serving a last-good snapshot, clamp the exponential
@@ -570,18 +649,19 @@ impl Supervisor {
                 delay_ms = delay.as_millis(),
                 "discovery client backing off before reconnect"
             );
-            // Make the backoff interruptible by SVID rotation: a fresh cert
-            // wakes the supervisor immediately instead of sleeping the full
-            // exponential delay (which at cap is 30 s).
-            if let Some(ref mut rx) = svid_rotation_rx {
-                tokio::select! {
-                    _ = tokio::time::sleep(delay) => {}
-                    Ok(()) = rx.changed() => {
-                        debug!("discovery client: SVID arrived during backoff; reconnecting immediately");
-                    }
+            // Make the backoff interruptible by a fresh SVID or a repointed
+            // upstream: either wakes the supervisor immediately instead of
+            // sleeping the full exponential delay (which at cap is 30 s). A
+            // re-bootstrap poked above delivers a fresh upstream through
+            // `upstream_changed`, so this same arm cuts the backoff short.
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                Ok(()) = wait_changed(&mut svid_rotation_rx) => {
+                    debug!("discovery client: SVID arrived during backoff; reconnecting immediately");
                 }
-            } else {
-                tokio::time::sleep(delay).await;
+                Ok(()) = wait_changed(&mut upstream_changed_rx) => {
+                    debug!("discovery client: upstream repointed during backoff; reconnecting immediately");
+                }
             }
         }
     }
@@ -609,6 +689,7 @@ impl Supervisor {
         const CLOSED: StreamEnd = StreamEnd {
             applied: false,
             not_leader: false,
+            repoint: false,
         };
         let (tx, rx) = mpsc::channel::<p::ClientMessage>(4);
 
@@ -665,6 +746,7 @@ impl Supervisor {
                 return StreamEnd {
                     applied: false,
                     not_leader: true,
+                    repoint: false,
                 };
             }
             Err(e) => {
@@ -766,6 +848,34 @@ impl Supervisor {
 
             let snapshot = match msg.kind {
                 Some(SKind::Snapshot(s)) => s,
+                // Live upstream-repoint directive (#601).
+                Some(SKind::PreferredUpstream(directive)) => {
+                    match &self.config.upstream_directive_handler {
+                        // Leaf: repoint this client's own upstream and break the
+                        // stream so the supervisor reconnects to the new target.
+                        // The data-plane cells are untouched — routing keeps
+                        // serving the last-good snapshot across the reconnect.
+                        UpstreamDirectiveHandler::RepointSelf => {
+                            if self.apply_repoint(&directive) {
+                                return StreamEnd {
+                                    applied: applied_this_session,
+                                    not_leader: false,
+                                    repoint: true,
+                                };
+                            }
+                            continue;
+                        }
+                        // Relay: fan the controller-originated directive to the
+                        // downstream leaf streams; the relay itself always streams
+                        // from the controller, so it never repoints here. A send
+                        // error means no leaf is currently subscribed — nothing to
+                        // forward to, which is fine.
+                        UpstreamDirectiveHandler::Forward(tx) => {
+                            let _ = tx.send(directive);
+                            continue;
+                        }
+                    }
+                }
                 _ => continue,
             };
 
@@ -839,7 +949,40 @@ impl Supervisor {
         StreamEnd {
             applied: applied_this_session,
             not_leader: ended_not_leader,
+            repoint: false,
         }
+    }
+
+    /// Apply a `PreferredUpstream` directive to this client's own upstream cell
+    /// (#601). Returns `true` when the directive was applied (the caller then
+    /// breaks the stream to reconnect to the new target), `false` when it was
+    /// ignored (no cell wired, or an empty endpoint) so the caller keeps the
+    /// current session.
+    fn apply_repoint(&self, directive: &p::PreferredUpstream) -> bool {
+        let Some(cell) = self.config.upstream_cell.as_ref() else {
+            warn!(
+                "discovery client: received PreferredUpstream but no upstream cell is wired; ignoring"
+            );
+            return false;
+        };
+        if directive.endpoint.is_empty() {
+            warn!("discovery client: received PreferredUpstream with empty endpoint; ignoring");
+            return false;
+        }
+        let matcher = expected_server_matcher(
+            &self.config.trust_domain,
+            &directive.endpoint,
+            &directive.expected_server_sa,
+            &self.config.fallback_namespace,
+        );
+        let target = UpstreamTarget::new(directive.endpoint.clone(), matcher);
+        debug!(
+            endpoint = %directive.endpoint,
+            expected_server_sa = %directive.expected_server_sa,
+            "discovery client: applying PreferredUpstream directive; repointing routing upstream"
+        );
+        cell.store(Arc::new(Some(target)));
+        true
     }
 }
 
@@ -863,14 +1006,36 @@ impl Supervisor {
 ///   The supervisor treats this like a failed connect: degrade to the last-good
 ///   snapshot, back off, and retry on the next rotation.
 fn build_channel(config: &DiscoveryClientConfig) -> Result<Channel, DiscoveryError> {
-    // Resolve which TLS config to use for this connection attempt.
+    // Resolve the current upstream target (#601): the runtime cell — populated by
+    // the bootstrap loop or a live directive — wins; otherwise the static
+    // `endpoints` + `expected_server` (no-bootstrap/unit-test path).
+    let runtime_target: Option<UpstreamTarget> = config
+        .upstream_cell
+        .as_ref()
+        .and_then(|cell| (*cell.load()).clone());
+    let (endpoints, expected_server): (&[String], Option<SpiffeMatcher>) = match &runtime_target {
+        Some(target) => (&target.endpoints, Some(target.expected_server.clone())),
+        None => (config.endpoints.as_slice(), config.expected_server.clone()),
+    };
+
+    // A bootstrap-anchored client whose cell is not yet populated has no target;
+    // surface it as a distinct, non-crashing error so the supervisor backs off
+    // and reconnects the instant `upstream_changed` fires (mirrors the empty-SVID
+    // path). Never build an endpoint-less `Channel::balance_list`.
+    if endpoints.is_empty() {
+        return Err(DiscoveryError::NoUpstream);
+    }
+
+    // Resolve which TLS config to use for this connection attempt. The SPIFFE
+    // matcher comes from the resolved upstream target (relay vs controller
+    // identity), not a fixed config value.
     let resolved_tls: Option<DiscoveryClientTls> = config
         .svid_cell
         .as_ref()
         .and_then(|cell| {
             let svid = cell.load();
             let material = svid.as_ref().as_ref()?;
-            let matcher = config.expected_server.clone()?;
+            let matcher = expected_server.clone()?;
             Some(DiscoveryClientTls {
                 client_cert_pem: material.cert_pem.clone(),
                 client_key_pem: material.key_pem.clone(),
@@ -903,11 +1068,10 @@ fn build_channel(config: &DiscoveryClientConfig) -> Result<Channel, DiscoveryErr
         }
     };
 
-    if config.endpoints.len() == 1 {
-        Ok(configure(&config.endpoints[0])?.connect_lazy())
+    if endpoints.len() == 1 {
+        Ok(configure(&endpoints[0])?.connect_lazy())
     } else {
-        let endpoints = config
-            .endpoints
+        let endpoints = endpoints
             .iter()
             .map(|u| configure(u))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1047,7 +1211,41 @@ struct StreamEnd {
     /// The session ended with the server's not-leader rejection (at accept or
     /// via mid-stream demotion) — retry fast instead of backing off.
     not_leader: bool,
+    /// The session ended because a `PreferredUpstream` directive repointed this
+    /// client (#601), or a forced-reconnect watch fired. An intentional
+    /// reconnect: reset the backoff exponent and dial the new target.
+    repoint: bool,
 }
+
+impl StreamEnd {
+    /// Mark an end as a forced (intentional) reconnect — used when a
+    /// force-reconnect watch (SVID rotation, bootstrap-delivered upstream) wins
+    /// the connect select.
+    const fn forced(self) -> Self {
+        Self {
+            applied: self.applied,
+            not_leader: self.not_leader,
+            repoint: true,
+        }
+    }
+}
+
+/// Await a change on an optional watch receiver, standing in a never-resolving
+/// future for an unwired receiver so it can share a `select!` arm (#601, #531).
+async fn wait_changed(
+    rx: &mut Option<watch::Receiver<u64>>,
+) -> Result<(), watch::error::RecvError> {
+    match rx.as_mut() {
+        Some(r) => r.changed().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Failed reconnects to the current upstream before the supervisor pokes a
+/// re-bootstrap to re-resolve it (#601). Three attempts ≈ the first
+/// second of backoff — long enough to ride out a transient blip, short enough
+/// that a genuinely-gone relay is abandoned for the controller promptly.
+const REBOOTSTRAP_AFTER_ATTEMPTS: u32 = 3;
 
 /// Whether a stream error is the leader gate's rejection (#531).
 ///
@@ -1413,6 +1611,12 @@ mod tests {
             svid_cell: None,
             expected_server: None,
             svid_rotated: None,
+            upstream_cell: None,
+            upstream_changed: None,
+            re_bootstrap: None,
+            trust_domain: "cluster.local".to_owned(),
+            fallback_namespace: String::new(),
+            upstream_directive_handler: UpstreamDirectiveHandler::RepointSelf,
         }
     }
 

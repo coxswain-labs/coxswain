@@ -73,11 +73,10 @@ spec:
               value: "443"
             - name: COXSWAIN_CONTROLLER_NAME
               value: "coxswain-labs.dev/gateway-controller"
-            # Discovery control plane (#423): receive routing snapshots over the
-            # mTLS stream and bootstrap the SVID over the server-auth-only
-            # bootstrap listener.
-            - name: COXSWAIN_DISCOVERY_ENDPOINT
-              value: "https://coxswain-controller-discovery.coxswain-system.svc:50051"
+            # Discovery control plane (#423, #601): bootstrap the SVID over the
+            # server-auth-only bootstrap listener. There is no
+            # COXSWAIN_DISCOVERY_ENDPOINT — the proxy learns its routing-stream
+            # upstream from the bootstrap response and is repointed live.
             - name: COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT
               value: "https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052"
             - name: COXSWAIN_DISCOVERY_SA_TOKEN_PATH

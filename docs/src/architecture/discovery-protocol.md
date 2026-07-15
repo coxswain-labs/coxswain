@@ -108,7 +108,7 @@ The `Programmed` gate then evaluates the folded **leaf** entries, never the rela
 ### Failure and rollout
 
 - **Controller outage** &mdash; the relay serves its last-good world (the same last-good / self-healing invariants above), degrades its health, and reconverges on reconnect. Leaves never disconnect.
-- **Relay outage** &mdash; leaves serve last-good and reconverge when the relay returns (a reconnecting leaf gets a fresh full via the `expect_full` gate). There is **no cross-tier fallback**: a leaf never dials the controller when its relay is down &mdash; that would stampede the leader under exactly the correlated failure the tier exists to absorb. Relay HA is &ge;2 replicas behind the relay's Service.
+- **Relay outage** &mdash; leaves serve last-good and reconverge when the relay returns (a reconnecting leaf gets a fresh full via the `expect_full` gate). Relay HA is &ge;2 replicas behind the relay's Service, so a single-replica bounce is transparent. If a relay is genuinely unreachable (e.g. torn down in a rebalance race), the leaf **re-bootstraps** to the controller &mdash; the always-up anchor &mdash; and is re-pointed at whatever upstream is current (#601). This is a bounded, last-resort SVID handshake per affected leaf, not a routing-snapshot stampede; the data plane keeps serving its last-good snapshot throughout the control-stream reconnect.
 - **Rollout order** is controller &rarr; relay &rarr; leaf, the same skew direction the wire already tolerates: a newer controller serves an older relay/leaf, and the additive `Namespace` / `GatewayMeta` resources are inert on any leaf that never subscribes them.
 
 ## How `Programmed` status is gated

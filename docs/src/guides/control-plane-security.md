@@ -203,14 +203,20 @@ discovery **client** (upstream, to the controller) and a discovery **server**
   stream. A relay's downstream server **rejects `Namespace` subscribes** (only
   the controller serves that scope).
 
-A leaf placed behind a relay points its `--discovery-expected-server-sa` at the
-relay's SA so its stream verifies the relay's identity instead of the
-controller's; bootstrap still targets the controller.
+A leaf placed behind a relay verifies the relay's identity instead of the
+controller's — but it is not configured with a static endpoint or expected SA.
+Since the routing upstream is **bootstrap-delivered and runtime-directed**
+(#601), the controller hands the leaf its upstream `(endpoint, expected_server_sa)`
+in the bootstrap response — the relay's Service and the relay's SA when the
+namespace is relay-fronted — and the leaf verifies that identity on its stream.
+Bootstrap itself always targets the controller (never tiered).
 
-There is **no cross-tier fallback**: a leaf never dials the controller when its
-relay is down. That preserves a single dial identity per leaf and avoids
-stampeding the leader under correlated failure; relay availability is delivered
-by running ≥2 relay replicas behind the relay Service.
+Relay availability is delivered by running ≥2 relay replicas behind the relay
+Service. If a relay is nonetheless unreachable (e.g. torn down in a rebalance
+race), the leaf **re-bootstraps** to the controller — the always-up anchor — and
+is re-pointed at whatever upstream is current. This fallback repoints the
+control stream only; the data plane keeps serving its last-good routing snapshot
+throughout, so a relay rebalance never disrupts live traffic.
 
 ## Configuration
 
@@ -257,9 +263,10 @@ an SVID and received its first snapshot. Check, in order:
 - **`external` Secret absent.** In `external` mode the controller logs
   `CA Secret absent and mode=external` and does not serve discovery. Supply the
   Secret (cert-manager or `kubectl create secret tls`).
-- **Wrong `--discovery-endpoint`.** The proxy logs a connection error if it cannot
-  reach the controller's Stream listener. Verify the endpoint URI and that the
-  discovery `Service` exists in the controller namespace.
+- **Wrong `--discovery-bootstrap-endpoint`.** This is the proxy's sole endpoint
+  anchor: if it cannot reach the controller's bootstrap listener it never obtains
+  an SVID (nor learns its routing upstream) and stays NotReady. Verify the URI and
+  that the discovery bootstrap `Service` exists in the controller namespace.
 
 **Proxy `Degraded` after restart.** Normal — the proxy starts `NotReady` until it reconnects and receives its first snapshot from the new controller. If it stays `Degraded` indefinitely, check connectivity to the discovery endpoint.
 

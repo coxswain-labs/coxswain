@@ -54,8 +54,9 @@ const RELAY_COMPONENT: &str = "namespace-relay";
 
 /// Downstream discovery port the relay serves leaves on (mirrors the controller
 /// discovery Stream port). Dedicated proxies in a relay-fronted namespace dial
-/// `coxswain-relay.<ns>.svc:<RELAY_DISCOVERY_PORT>`.
-pub(crate) const RELAY_DISCOVERY_PORT: i32 = 50051;
+/// `coxswain-relay.<ns>.svc:<RELAY_DISCOVERY_PORT>`. The `i32` k8s-manifest form
+/// of the crate-root [`crate::RELAY_DISCOVERY_PORT`] — one source of truth.
+pub(crate) const RELAY_DISCOVERY_PORT: i32 = crate::RELAY_DISCOVERY_PORT as i32;
 
 /// Health port the relay's `/readyz` (readiness) and `/healthz` (liveness)
 /// probes target. Matches the binary's `--health-port` default (8081); the relay
@@ -74,12 +75,11 @@ pub(crate) struct RelayRenderInputs<'a> {
     pub replicas: i32,
     /// Container image (the controller's own image, version-pinned).
     pub controller_image: &'a str,
-    /// Controller discovery Stream endpoint the relay subscribes upstream to
-    /// (`https://…:50051`, mTLS).
-    pub discovery_endpoint: &'a str,
     /// Controller bootstrap endpoint for SVID issuance (`https://…:50052`).
     /// Bootstrap is never tiered — the relay bootstraps directly from the
-    /// controller like any other node.
+    /// controller like any other node, and (#601) learns its own routing upstream
+    /// (always the controller — relays never tier) from the bootstrap response, so
+    /// no `--discovery-endpoint` is rendered.
     pub discovery_bootstrap_endpoint: &'a str,
     /// Projected SA-token path (`--discovery-sa-token-path`).
     pub discovery_sa_token_path: &'a str,
@@ -205,7 +205,8 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
         "serve".to_string(),
         "relay".to_string(),
         format!("--namespace={}", inputs.namespace),
-        format!("--discovery-endpoint={}", inputs.discovery_endpoint),
+        // No `--discovery-endpoint` (#601): the relay learns its own routing
+        // upstream (always the controller) from its bootstrap response.
         format!(
             "--discovery-bootstrap-endpoint={}",
             inputs.discovery_bootstrap_endpoint
@@ -378,7 +379,6 @@ mod tests {
             namespace: "team-a",
             replicas: 2,
             controller_image: "ghcr.io/coxswain-labs/coxswain:test",
-            discovery_endpoint: "https://coxswain-controller-discovery.coxswain-system.svc:50051",
             discovery_bootstrap_endpoint: "https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052",
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",

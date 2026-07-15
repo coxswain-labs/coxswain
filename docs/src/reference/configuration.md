@@ -50,13 +50,13 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL` | `--controller-lease-renew-interval` | `5s` | How often the leader renews its lease; must be ≤ 1/3 of the TTL |
 | `COXSWAIN_CONTROLLER_LEASE_TTL` | `--controller-lease-ttl` | `15s` | How long a lease stays valid without renewal; must be ≥ 3× the renew interval |
 | `COXSWAIN_CONTROLLER_NAME` | `--controller-name` | `coxswain-labs.dev/gateway-controller` | GatewayClass `spec.controllerName` to claim |
-| `COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT` | `--discovery-bootstrap-endpoint` | _(none)_ | _(proxy)_ `https://` URI of the controller bootstrap listener; where the proxy exchanges its SA token + CSR for an SVID. See [Control-plane security](../guides/control-plane-security.md) |
+| `COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT` | `--discovery-bootstrap-endpoint` | _(none; **required** for proxy/relay)_ | _(proxy/relay)_ `https://` URI of the controller bootstrap listener — the **sole endpoint anchor**. The proxy exchanges its SA token + CSR for an SVID here, and the response carries its routing-stream upstream (the controller, or its namespace's relay if provisioned), repointed live thereafter. See [Control-plane security](../guides/control-plane-security.md) |
 | `COXSWAIN_DISCOVERY_BOOTSTRAP_PORT` | `--discovery-bootstrap-port` | `50052` | _(controller)_ Port for the server-auth-only bootstrap gRPC listener |
 | `COXSWAIN_DISCOVERY_CA_BUNDLE_PATH` | `--discovery-ca-bundle-path` | `/var/run/secrets/coxswain/trust-bundle/ca.crt` | _(proxy)_ Path to the mounted trust-bundle ConfigMap used to verify the controller |
 | `COXSWAIN_DISCOVERY_CA_MODE` | `--discovery-ca-mode` | `auto` | _(controller)_ `auto` self-generates the CA Secret if absent; `external` requires a pre-existing Secret (fail closed) |
 | `COXSWAIN_DISCOVERY_CA_SECRET` | `--discovery-ca-secret` | `coxswain-discovery-ca` | _(controller)_ Name of the CA Secret (`tls.crt`/`tls.key`) in the controller namespace |
-| `COXSWAIN_DISCOVERY_ENDPOINT` | `--discovery-endpoint` | _(none; required for proxy)_ | _(proxy)_ Comma-separated controller discovery (Stream) endpoints; `https://host:port` for mTLS |
 | `COXSWAIN_DISCOVERY_PORT` | `--discovery-port` | `50051` | _(controller)_ Port for the mTLS Stream gRPC listener (routing snapshots) |
+| `COXSWAIN_SHARED_RELAY_ENDPOINT` | `--shared-relay-endpoint` | _(none)_ | _(controller)_ `https://` Stream endpoint of the shared relay when one fronts the shared proxy pool (a static Helm toggle). Set, the controller hands shared-pool proxies this upstream at bootstrap instead of itself; unset, they stream from the controller |
 | `COXSWAIN_DISCOVERY_SA_TOKEN_PATH` | `--discovery-sa-token-path` | `/var/run/secrets/coxswain/discovery-token/token` | _(proxy)_ Path to the projected ServiceAccount token presented at bootstrap |
 | `COXSWAIN_DISCOVERY_SVID_TTL` | `--discovery-svid-ttl` | `24h` | _(controller)_ Lifetime of SVIDs issued to proxies; proxies refresh at ~50 % |
 | `COXSWAIN_DISCOVERY_TRUST_DOMAIN` | `--discovery-trust-domain` | `cluster.local` | SPIFFE trust domain; must match across the controller and all proxies |
@@ -87,7 +87,7 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `POD_NAMESPACE` | `--pod-namespace` | `coxswain-system` | Pod namespace used to scope the leader-election Lease |
 
 !!! note
-    The dedicated proxy scope flags (`--dedicated`, `--gateway-name`, `--gateway-namespace`) are set by the controller on the proxy Deployments it provisions, or passed by hand when running a dedicated proxy manually. The discovery flags (`--discovery-endpoint`, `--discovery-bootstrap-endpoint`) are also set by the controller on provisioned Deployments. See [Dedicated proxy pools](../guides/dedicated-mode.md).
+    The dedicated proxy scope flags (`--dedicated`, `--gateway-name`, `--gateway-namespace`) are set by the controller on the proxy Deployments it provisions, or passed by hand when running a dedicated proxy manually. The discovery anchor (`--discovery-bootstrap-endpoint`) is likewise set by the controller on provisioned Deployments; there is no `--discovery-endpoint` — the routing-stream upstream is delivered by the bootstrap response and repointed live, so a relay rebalance never re-renders (nor rolls) a proxy Deployment. See [Dedicated proxy pools](../guides/dedicated-mode.md).
 
 ## Ports summary
 

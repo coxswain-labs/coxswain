@@ -24,9 +24,6 @@ pub const DISCOVERY_NAMESPACE: &str = "coxswain-system";
 /// image built by the e2e bootstrap step.
 const E2E_IMAGE: &str = "coxswain:e2e";
 
-/// mTLS discovery endpoint inside the cluster.
-const DISCOVERY_ENDPOINT: &str = "https://coxswain-controller-discovery.coxswain-system.svc:50051";
-
 /// Bootstrap endpoint (server-auth-only TLS; issues SVIDs to fresh proxies).
 const BOOTSTRAP_ENDPOINT: &str =
     "https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052";
@@ -120,10 +117,6 @@ pub fn shared_proxy_deployment(
                             {
                                 "name": "POD_NAMESPACE",
                                 "valueFrom": { "fieldRef": { "fieldPath": "metadata.namespace" } }
-                            },
-                            {
-                                "name": "COXSWAIN_DISCOVERY_ENDPOINT",
-                                "value": DISCOVERY_ENDPOINT
                             },
                             {
                                 "name": "COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT",

@@ -24,7 +24,7 @@
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, Harness, NamespaceGuard,
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress as ing},
-    harness::{HttpClient, wait},
+    harness::{HttpClient, leader, wait},
 };
 use gateway_api_types::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
@@ -512,11 +512,11 @@ async fn namespace_relay_orphan_gcd_after_controller_restart_in_hysteresis_midra
     // Restart the controller (fresh process = empty tracking set pre-fix).
     drop(h);
     let h2 = Harness::start_with_options(opts()).await?;
-    wait::wait_for_controller_reconciled(
-        &h2.controller_admin_url("/metrics"),
-        Duration::from_secs(60),
-    )
-    .await?;
+    // Scrape the LEADER specifically, not an arbitrary Service replica: after a
+    // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
+    // races (#601 CI flake). `wait_for_leader_reconciled` re-resolves the Lease
+    // holder each tick.
+    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
 
     // Drain the namespace to zero dedicated Gateways.
     let gateways: Api<Gateway> = Api::namespaced(h2.client.clone(), &ns.name);
@@ -574,11 +574,11 @@ async fn namespace_relay_not_provisioned_after_restart_below_threshold() -> anyh
 
     drop(h);
     let h2 = Harness::start_with_options(opts()).await?;
-    wait::wait_for_controller_reconciled(
-        &h2.controller_admin_url("/metrics"),
-        Duration::from_secs(60),
-    )
-    .await?;
+    // Scrape the LEADER specifically, not an arbitrary Service replica: after a
+    // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
+    // races (#601 CI flake). `wait_for_leader_reconciled` re-resolves the Lease
+    // holder each tick.
+    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
 
     let deployments2: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
     assert!(
