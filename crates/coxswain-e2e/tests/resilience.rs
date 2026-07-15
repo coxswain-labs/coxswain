@@ -21,7 +21,7 @@ use anyhow::Context as _;
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, Harness, HttpClient, NamespaceGuard,
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress as ing},
-    harness::wait,
+    harness::{leader, wait},
 };
 use gateway_api_types::apis::standard::gateways::Gateway;
 use gateway_api_types::apis::standard::httproutes::HttpRoute;
@@ -579,11 +579,10 @@ async fn restart_controller_does_not_bump_generation() -> anyhow::Result<()> {
     // on identical content is deterministic — it never bumps `.generation` — so
     // one confirmed post-restart reconcile is sufficient to then assert
     // generation stability.
-    wait::wait_for_controller_reconciled(
-        &h2.controller_admin_url("/metrics"),
-        Duration::from_secs(60),
-    )
-    .await?;
+    // Scrape the LEADER specifically, not an arbitrary Service replica: after a
+    // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
+    // races. `wait_for_leader_reconciled` re-resolves the Lease holder each tick.
+    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
 
     let deploy_after: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
     let d2 = deploy_after.get(RESOURCE_NAME).await?;
@@ -772,11 +771,10 @@ async fn lifecycle_controller_restart_is_idempotent() -> anyhow::Result<()> {
 
     // Wait for the real post-condition — new leader elected + at least one
     // successful reconcile on the fresh process — instead of blind-sleeping.
-    wait::wait_for_controller_reconciled(
-        &h2.controller_admin_url("/metrics"),
-        Duration::from_secs(60),
-    )
-    .await?;
+    // Scrape the LEADER specifically, not an arbitrary Service replica: after a
+    // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
+    // races. `wait_for_leader_reconciled` re-resolves the Lease holder each tick.
+    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
 
     let deployments_after: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
     let deploy_after = deployments_after.get(RESOURCE_NAME).await?;
@@ -822,11 +820,10 @@ async fn catch_up_reconciles_gateway_created_during_controller_downtime() -> any
     // elected + at least one successful reconcile on the fresh process.
     scale_controller(1).await?;
     let h2 = Harness::start().await?;
-    wait::wait_for_controller_reconciled(
-        &h2.controller_admin_url("/metrics"),
-        Duration::from_secs(60),
-    )
-    .await?;
+    // Scrape the LEADER specifically, not an arbitrary Service replica: after a
+    // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
+    // races. `wait_for_leader_reconciled` re-resolves the Lease holder each tick.
+    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
 
     // Catch-up: the Gateway created during downtime reaches Programmed=True,
     // which only happens if the controller reconciled an object it never received
@@ -954,11 +951,10 @@ async fn catch_up_reconciles_ingress_mutations_and_deletes_during_controller_dow
     let h2 = Harness::start().await?;
     // Poll the real post-condition: new leader elected + at least one successful
     // reconcile on the fresh process.
-    wait::wait_for_controller_reconciled(
-        &h2.controller_admin_url("/metrics"),
-        Duration::from_secs(60),
-    )
-    .await?;
+    // Scrape the LEADER specifically, not an arbitrary Service replica: after a
+    // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
+    // races. `wait_for_leader_reconciled` re-resolves the Lease holder each tick.
+    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
 
     // Mutated route: proxy must serve echo-b (not stale echo-a).
     wait::wait_for_backend(&h2.http, &host_a, "/", "echo-b", Duration::from_secs(60)).await?;
