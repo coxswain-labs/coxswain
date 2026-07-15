@@ -1,4 +1,5 @@
 use super::*;
+use crate::MergedStore;
 pub(super) use coxswain_core::routing::IngressRoutingTableBuilder;
 pub(super) use coxswain_core::tls::{
     ClientCertStoreBuilder, PortTlsStore, PortTlsStoreBuilder, TlsCert,
@@ -18,7 +19,6 @@ pub(super) use k8s_openapi::api::networking::v1::{
     IngressServiceBackend, IngressSpec, ServiceBackendPort,
 };
 pub(super) use kube::api::ObjectMeta;
-pub(super) use kube::runtime::reflector;
 pub(super) use std::collections::{BTreeMap, HashMap, HashSet};
 
 pub(super) use crate::tests::fixtures::{
@@ -42,7 +42,7 @@ pub(super) fn owned(names: &[&str]) -> HashSet<String> {
 pub(super) fn reconcile_no_default(
     ing: &Ingress,
     endpoint_cache: &crate::endpoints::pool::EndpointCache,
-    svcs: &reflector::Store<Service>,
+    svcs: &MergedStore<Service>,
     owned: &HashSet<String>,
     b: &mut IngressRoutingTableBuilder,
 ) {
@@ -76,7 +76,7 @@ pub(super) fn reconcile_no_default(
 pub(super) fn reconcile_with_class_defaults(
     ing: &Ingress,
     endpoint_cache: &crate::endpoints::pool::EndpointCache,
-    svcs: &reflector::Store<Service>,
+    svcs: &MergedStore<Service>,
     owned: &HashSet<String>,
     defaults: &HashMap<String, crate::ingress::ResolvedClassParams>,
     b: &mut IngressRoutingTableBuilder,
@@ -107,7 +107,7 @@ pub(super) fn reconcile_with_class_defaults(
 
 pub(super) fn reconcile_tls_no_default(
     ing: &Ingress,
-    secrets: &reflector::Store<Secret>,
+    secrets: &MergedStore<Secret>,
     owned: &HashSet<String>,
     b: &mut PortTlsStoreBuilder,
 ) {
@@ -116,7 +116,7 @@ pub(super) fn reconcile_tls_no_default(
 
 pub(super) fn reconcile_client_certs_no_default(
     ing: &Ingress,
-    auth_tls_secrets: &reflector::Store<Secret>,
+    auth_tls_secrets: &MergedStore<Secret>,
     owned: &HashSet<String>,
     b: &mut ClientCertStoreBuilder,
 ) {

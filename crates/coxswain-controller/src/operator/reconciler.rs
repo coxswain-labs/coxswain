@@ -45,6 +45,7 @@ use crate::controller::StatusOutcome;
 use coxswain_core::Shared;
 use coxswain_core::crd::{CoxswainGatewayParameters, CoxswainRelayPolicy, ServiceType};
 use coxswain_core::ownership::ObjectKey;
+use coxswain_reflector::MergedStore;
 use coxswain_reflector::gw_types::ListenerSet;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
@@ -57,7 +58,6 @@ use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::{
     Api, Client, Resource as _,
     api::{DeleteParams, ListParams, ObjectMeta, Patch, PatchParams},
-    runtime::reflector::Store,
 };
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -260,12 +260,12 @@ pub(crate) struct ReconcileContext {
     controller_image: String,
     pub(super) leader: Arc<AtomicBool>,
     pub(super) client: Client,
-    pub(super) class_store: Store<GatewayClass>,
-    pub(super) params_store: Store<CoxswainGatewayParameters>,
+    pub(super) class_store: MergedStore<GatewayClass>,
+    pub(super) params_store: MergedStore<CoxswainGatewayParameters>,
     /// `CoxswainRelayPolicy` snapshot (#589): per-namespace relay tuning overlaid onto the
     /// #584 global relay defaults. Read on every reconcile to resolve the namespace's
     /// effective policy.
-    relay_policies_store: Store<CoxswainRelayPolicy>,
+    relay_policies_store: MergedStore<CoxswainRelayPolicy>,
     /// The reflector's fleet Pod store (#574 fold): the shared
     /// `app.kubernetes.io/name=coxswain` watch, a superset of the dedicated-proxy
     /// Pods. Reads off this store drive the
@@ -273,11 +273,11 @@ pub(crate) struct ReconcileContext {
     /// `Programmed=True` on having ≥1 Ready Pod (#211); `count_ready_proxy_pods`
     /// filters to a specific Gateway by the GEP-1762 gateway-name label, so
     /// non-dedicated fleet Pods (the shared proxy, the controller) are excluded.
-    pods_store: Store<Pod>,
+    pods_store: MergedStore<Pod>,
     /// Cluster `Node` snapshot. Only consulted when a dedicated Gateway's
     /// Service is `NodePort`-typed; otherwise unused. Unscoped watch
     /// (Nodes are cluster-wide and low-cardinality).
-    nodes_store: Store<Node>,
+    nodes_store: MergedStore<Node>,
     /// Shared per-listener TLS-health channel — read-only snapshot at each
     /// reconcile.
     listener_status: SharedGatewayListenerStatus,
@@ -303,18 +303,18 @@ pub(crate) struct ReconcileContext {
     /// All Gateways, cluster-wide. Enumerated on a shared-mode reconcile to
     /// compute the *global* internal-port allocation (#472) so concurrent
     /// per-Gateway reconciles agree on the same deterministic map.
-    pub(super) gateways_store: Store<Gateway>,
+    pub(super) gateways_store: MergedStore<Gateway>,
     /// The per-Gateway shared-mode VIP Services we provision, label-scoped to
     /// the shared-VIP component. Their `targetPort`s are the durable source of
     /// truth for the internal-port allocation across reconciles/restarts (#472).
-    pub(super) services_store: Store<Service>,
+    pub(super) services_store: MergedStore<Service>,
     /// All ListenerSets, cluster-wide (GEP-1713, #93). Merged into each owned
     /// Gateway's effective listener set so the VIP/dedicated Service and
     /// internal-port allocation cover ListenerSet listener ports.
-    pub(super) listener_sets_store: Store<ListenerSet>,
+    pub(super) listener_sets_store: MergedStore<ListenerSet>,
     /// All Namespaces, cluster-wide. Backs the parent Gateway's
     /// `allowedListeners.namespaces.from: Selector` gate during the merge (#93).
-    pub(super) namespaces_store: Store<Namespace>,
+    pub(super) namespaces_store: MergedStore<Namespace>,
     /// Shared proxy pod selector + VIP service type for shared-mode Service
     /// provisioning (#472). See [`OperatorConfig::shared_proxy_selector`].
     pub(super) shared_proxy_selector: BTreeMap<String, String>,
@@ -418,20 +418,13 @@ impl ReconcileContext {
     }
 
     /// Resolve the effective [`EffectiveRelayPolicy`] for `namespace` (#589): the
-    /// cluster-default → namespace-match overlay of every `CoxswainRelayPolicy`, evaluated
-    /// against the namespace's own labels. Resolved once per reconcile and threaded into
-    /// both the relay convergence and the proxy repoint so the relay's existence and the
-    /// proxies' discovery endpoint can never disagree.
+    /// `CoxswainRelayPolicy` that lives in `namespace` (namespaced CRD), or an all-`None`
+    /// policy when it has none. Resolved once per reconcile and threaded into both the relay
+    /// convergence and the proxy repoint so the relay's existence and the proxies' discovery
+    /// endpoint can never disagree.
     fn resolve_relay_policy(&self, namespace: &str) -> EffectiveRelayPolicy {
-        let labels = self
-            .namespaces_store
-            .state()
-            .into_iter()
-            .find(|ns| ns.metadata.name.as_deref() == Some(namespace))
-            .and_then(|ns| ns.metadata.labels.clone())
-            .unwrap_or_default();
         let policies = self.relay_policies_store.state();
-        relay_params::resolve(namespace, &labels, &policies)
+        relay_params::resolve(namespace, &policies)
     }
 
     /// Record whether a namespace currently has a provisioned relay (#584) and
@@ -1467,7 +1460,7 @@ fn has_dedicated_proxy_ready_condition(gw: &Gateway) -> bool {
 pub(super) fn is_owned_shared_mode(
     gw: &Gateway,
     classes: &[Arc<GatewayClass>],
-    params_store: &Store<CoxswainGatewayParameters>,
+    params_store: &MergedStore<CoxswainGatewayParameters>,
     controller_name: &str,
 ) -> bool {
     if gw.metadata.deletion_timestamp.is_some() {
@@ -1599,7 +1592,11 @@ pub(super) fn ignore_not_found<T>(result: Result<T, kube::Error>) -> Result<(), 
 /// `gateway.networking.k8s.io/gateway-name` label matching `gw_name`, has
 /// no `deletionTimestamp` (a terminating Pod is not serving traffic), and
 /// carries a `Ready=True` condition in its `status.conditions`.
-fn count_ready_proxy_pods(pods_store: &Store<Pod>, gw_namespace: &str, gw_name: &str) -> usize {
+fn count_ready_proxy_pods(
+    pods_store: &MergedStore<Pod>,
+    gw_namespace: &str,
+    gw_name: &str,
+) -> usize {
     pods_store
         .state()
         .iter()
@@ -1622,7 +1619,7 @@ fn count_ready_proxy_pods(pods_store: &Store<Pod>, gw_namespace: &str, gw_name: 
 /// not applied yet reads as "not terminating" — callers must treat this as a
 /// fast-path skip, not a guarantee; the race that slips through still fails
 /// with a classified `NamespaceTerminating` error and short backoff.
-fn namespace_is_terminating(namespaces: &Store<Namespace>, namespace: &str) -> bool {
+fn namespace_is_terminating(namespaces: &MergedStore<Namespace>, namespace: &str) -> bool {
     namespaces.state().iter().any(|ns| {
         ns.metadata.name.as_deref() == Some(namespace) && ns.metadata.deletion_timestamp.is_some()
     })
@@ -1924,6 +1921,7 @@ mod tests {
         writer.apply_watcher_event(&watcher::Event::InitDone);
         writer.apply_watcher_event(&watcher::Event::Apply(ns("alive", false)));
         writer.apply_watcher_event(&watcher::Event::Apply(ns("dying", true)));
+        let reader = MergedStore::single(reader);
 
         assert!(namespace_is_terminating(&reader, "dying"));
         assert!(!namespace_is_terminating(&reader, "alive"));

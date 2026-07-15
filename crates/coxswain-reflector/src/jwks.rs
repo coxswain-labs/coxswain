@@ -11,8 +11,10 @@
 //! Inline JWKS ([`coxswain_core::crd::InlineJwks`]) never touches this cache — the reflector reads
 //! `spec.jwks.inline.jwks` directly at resolve time.
 
+use crate::MergedStore;
 use arc_swap::ArcSwap;
 use coxswain_core::crd::JwtAuth;
+#[cfg(test)]
 use kube::runtime::reflector;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -135,11 +137,7 @@ impl SharedJwksCache {
 /// [`crate::reconciler::ReconcilerOptions::fetch_remote_jwks`]) — the proxy
 /// never runs this task, so the read-only data plane never egresses to an
 /// identity provider.
-pub async fn run(
-    cache: SharedJwksCache,
-    jwt_auths: reflector::Store<JwtAuth>,
-    client: reqwest::Client,
-) {
+pub async fn run(cache: SharedJwksCache, jwt_auths: MergedStore<JwtAuth>, client: reqwest::Client) {
     let mut local: HashMap<Box<str>, CacheEntry> = HashMap::new();
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     loop {
@@ -153,7 +151,7 @@ pub async fn run(
 /// anything changed.
 async fn tick(
     cache: &SharedJwksCache,
-    jwt_auths: &reflector::Store<JwtAuth>,
+    jwt_auths: &MergedStore<JwtAuth>,
     client: &reqwest::Client,
     local: &mut HashMap<Box<str>, CacheEntry>,
 ) {
@@ -317,9 +315,9 @@ mod tests {
         assert!(local.is_empty(), "stale entry must be pruned");
     }
 
-    fn empty_store() -> reflector::Store<JwtAuth> {
+    fn empty_store() -> MergedStore<JwtAuth> {
         let (reader, mut writer) = reflector::store();
         writer.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
-        reader
+        MergedStore::single(reader)
     }
 }

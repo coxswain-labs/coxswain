@@ -20,6 +20,7 @@
 //! WARNs and degrades to the default behaviour rather than erroring the
 //! connection or rejecting the resource.
 
+use crate::MergedStore;
 use crate::duration::parse_duration;
 use crate::k8s_utils::metadata_created_at;
 use crate::status::CoxswainBackendPolicyStatusMap;
@@ -29,7 +30,6 @@ use coxswain_core::crd::coxswain_backend_policy::{
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{CircuitBreakerConfig, LoadBalance, SessionAffinity};
 use http::HeaderName;
-use kube::runtime::reflector;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,7 +82,7 @@ fn is_service_ref(group: &str, kind: &str) -> bool {
 /// entry (default `Accepted`); conflict losers are marked `Conflicted`.
 #[must_use = "caller must wire the index into route building and publish the status map"]
 pub fn build_backend_policy_index(
-    policies: &reflector::Store<CoxswainBackendPolicy>,
+    policies: &MergedStore<CoxswainBackendPolicy>,
 ) -> (BackendPolicyIndex, CoxswainBackendPolicyStatusMap) {
     // Group competing policies by their target Service so conflict resolution is
     // per-Service.
@@ -436,13 +436,13 @@ mod tests {
         serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("bad yaml: {e}\n---\n{yaml}"))
     }
 
-    fn store_from(policies: Vec<CoxswainBackendPolicy>) -> reflector::Store<CoxswainBackendPolicy> {
+    fn store_from(policies: Vec<CoxswainBackendPolicy>) -> MergedStore<CoxswainBackendPolicy> {
         let (reader, mut writer) = reflector::store();
         writer.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
         for p in policies {
             writer.apply_watcher_event(&kube::runtime::watcher::Event::Apply(p));
         }
-        reader
+        MergedStore::single(reader)
     }
 
     #[test]

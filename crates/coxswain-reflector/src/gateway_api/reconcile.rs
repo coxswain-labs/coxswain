@@ -8,6 +8,7 @@ use super::bindings::{ListenerBinding, compute_listener_bindings};
 use super::reconcile_tls::{
     GatewayTlsTarget, grants_for_source, resolve_listener_tls, resolve_route_client_cert,
 };
+use crate::MergedStore;
 use crate::endpoints;
 use crate::endpoints::pool::EndpointCache;
 use crate::gw_types::{
@@ -33,6 +34,7 @@ use coxswain_core::routing::{
 };
 use coxswain_core::tls::PortTlsStoreBuilder;
 use k8s_openapi::api::core::v1::{Secret, Service};
+#[cfg(test)]
 use kube::runtime::reflector;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -64,26 +66,26 @@ pub struct RouteResolution<'a> {
     /// `RateLimit` CR store for resolving `ExtensionRef` filters on
     /// `HTTPRouteRule`s. Looked up by `(namespace, name)` from the filter;
     /// missing CRs produce a WARN and fail-open (route is not limited).
-    pub rate_limits: &'a reflector::Store<RateLimit>,
+    pub rate_limits: &'a MergedStore<RateLimit>,
     /// `RetryPolicy` CR store for resolving `ExtensionRef` filters on `HTTPRouteRule`s
     /// (#445). The resolved policy is attached to the rule's `BackendGroup`s; a missing
     /// CR fails open (no retries). Protocol-agnostic — GRPCRoute uses the same store.
-    pub retry_policies: &'a reflector::Store<RetryPolicy>,
+    pub retry_policies: &'a MergedStore<RetryPolicy>,
     /// `PathRewriteRegex` CR store for resolving `ExtensionRef` filters on
     /// `HTTPRouteRule`s.
-    pub path_rewrites: &'a reflector::Store<PathRewriteRegex>,
+    pub path_rewrites: &'a MergedStore<PathRewriteRegex>,
     /// `IpAccessControl` CR store for resolving `ExtensionRef` filters on
     /// `HTTPRouteRule`s into per-route `allow`/`deny` source-IP CIDR sets (#479).
     /// Looked up by `(namespace, name)`; a missing CR fails open (no filtering).
-    pub ip_access: &'a reflector::Store<IpAccessControl>,
+    pub ip_access: &'a MergedStore<IpAccessControl>,
     /// `BasicAuth` CR store for resolving `ExtensionRef` filters on `HTTPRouteRule`s
     /// (#442). HTTPRoute-only — not supported on GRPCRoute.
-    pub basic_auths: &'a reflector::Store<BasicAuth>,
+    pub basic_auths: &'a MergedStore<BasicAuth>,
     /// `CoxswainExternalAuth` CR store for resolving `ExternalAuth` `ExtensionRef`
     /// filters on `HTTPRouteRule`s into per-route ext_authz config (#23).
     /// HTTPRoute-only. The auth-service `backendRef` is resolved to endpoints
     /// against `services`/`endpoint_cache`, gated by the same backend `grants`.
-    pub external_auths: &'a reflector::Store<CoxswainExternalAuth>,
+    pub external_auths: &'a MergedStore<CoxswainExternalAuth>,
     /// Per-Gateway ext-auth mandate from `CoxswainExternalAuth` policies attached
     /// via `targetRefs` (#23, GEP-713). A route bound to a Gateway present here has
     /// the mandate **prepended** to every rule's auth chain — additive precedence:
@@ -91,7 +93,7 @@ pub struct RouteResolution<'a> {
     pub external_auth_gateway_index: &'a super::ExternalAuthGatewayIndex,
     /// `JwtAuth` CR store for resolving `ExtensionRef` filters on `HTTPRouteRule`s
     /// into per-route JWT (JWKS bearer-token) validation config (#441).
-    pub jwt_auths: &'a reflector::Store<JwtAuth>,
+    pub jwt_auths: &'a MergedStore<JwtAuth>,
     /// Controller-fetched remote-JWKS cache, read synchronously when resolving a
     /// `JwtAuth` CR that names a `jwks.remote` (#441). Never populated by the
     /// proxy — see [`crate::jwks`].
@@ -99,7 +101,7 @@ pub struct RouteResolution<'a> {
     /// Label-scoped htpasswd Secrets (`ingress.coxswain-labs.dev/auth-basic=true`)
     /// consumed by a resolved `BasicAuth` CR's `secretRef` (#442). The same store
     /// the Ingress `auth-basic-secret` annotation reads — no duplicate watcher.
-    pub auth_secrets: &'a reflector::Store<Secret>,
+    pub auth_secrets: &'a MergedStore<Secret>,
     /// `BasicAuth → Secret` ReferenceGrants (#520). A `BasicAuth` CR whose
     /// `secretRef.namespace` differs from the route namespace requires a matching
     /// grant; without one the cross-namespace ref fails closed, so a tenant cannot
@@ -110,10 +112,10 @@ pub struct RouteResolution<'a> {
     /// mid-stream body cap on HTTP/2 deadlocks the client under pingora, and gRPC
     /// sends no `Content-Length` for the up-front check; gRPC relies on the backend's
     /// own `max_recv_msg_size` until pingora ships request-body buffering (#816/#780).
-    pub request_size_limits: &'a reflector::Store<RequestSizeLimit>,
+    pub request_size_limits: &'a MergedStore<RequestSizeLimit>,
     /// `Compression` CR store for resolving `ExtensionRef` filters on
     /// `HTTPRouteRule`s (#446). HTTPRoute-only — not supported on GRPCRoute.
-    pub compressions: &'a reflector::Store<Compression>,
+    pub compressions: &'a MergedStore<Compression>,
     /// `ObjectKey(gw_ns, gw_name) → BackendClientCert` for Gateways that resolved a
     /// `spec.tls.backend.clientCertificateRef` (GEP-3155). A route's effective client
     /// cert comes from its owned parent Gateway; it is attached to any `UpstreamTls`
@@ -160,7 +162,7 @@ pub struct RouteResolution<'a> {
 pub(crate) fn route_fingerprint(
     route: &HttpRoute,
     endpoint_cache: &EndpointCache,
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
     resolution: &RouteResolution<'_>,
 ) -> u64 {
     // Combination policy (wrapping_add, never XOR) lives in the accumulator;
@@ -224,7 +226,7 @@ impl GatewayApiReconciler {
     pub fn reconcile(
         route: &HttpRoute,
         endpoint_cache: &EndpointCache,
-        services: &reflector::Store<Service>,
+        services: &MergedStore<Service>,
         owned_gateways: &HashSet<ObjectKey>,
         grants: &HashSet<ReferenceGrantKey>,
         resolution: RouteResolution<'_>,
@@ -611,7 +613,7 @@ fn resolve_weighted_backends(
     backend_refs: &[HttpRouteRulesBackendRefs],
     route_ns: &str,
     endpoint_cache: &EndpointCache,
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
     grants: &HashSet<ReferenceGrantKey>,
 ) -> Vec<(
     Arc<endpoints::ResolvedEndpoints>,
@@ -706,9 +708,9 @@ struct RuleContext<'a> {
     /// `ExtensionRef` (#446).
     compression: Option<Arc<CompressionConfig>>,
     route_ns: &'a str,
-    path_rewrites: &'a reflector::Store<PathRewriteRegex>,
+    path_rewrites: &'a MergedStore<PathRewriteRegex>,
     endpoint_cache: &'a EndpointCache,
-    services: &'a reflector::Store<Service>,
+    services: &'a MergedStore<Service>,
     grants: &'a HashSet<ReferenceGrantKey>,
 }
 
@@ -1059,7 +1061,7 @@ impl GatewayApiReconciler {
     /// Cross-namespace `certificateRefs` require a matching entry in `cert_grants`.
     pub(crate) fn reconcile_tls(
         target: &GatewayTlsTarget<'_>,
-        secrets: &reflector::Store<Secret>,
+        secrets: &MergedStore<Secret>,
         cert_grants: &HashSet<ReferenceGrantKey>,
         ls_cert_grants: &HashSet<ReferenceGrantKey>,
         builder: &mut PortTlsStoreBuilder,
@@ -1253,7 +1255,7 @@ mod tests {
 
         let mut secrets_w = reflector::store::Writer::<Secret>::default();
         secrets_w.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
-        let secrets = secrets_w.as_reader();
+        let secrets = MergedStore::single(secrets_w.as_reader());
 
         // The grant lives in the WRONG set (Gateway-from). The cross-namespace
         // check must ignore it → RefNotPermitted.
@@ -1396,10 +1398,10 @@ mod tests {
         }
     }
 
-    fn empty_secrets() -> kube::runtime::reflector::Store<Secret> {
+    fn empty_secrets() -> MergedStore<Secret> {
         let mut w = reflector::store::Writer::<Secret>::default();
         w.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
-        w.as_reader()
+        MergedStore::single(w.as_reader())
     }
 
     /// TLS/Passthrough with no VIP Service yet → VipPending (not TlsPassthrough).
@@ -2589,7 +2591,7 @@ mod tests {
     fn reconcile_first_entry(
         route: &HttpRoute,
         store: &EndpointCache,
-        svcs: &reflector::Store<Service>,
+        svcs: &MergedStore<Service>,
         policy_index: &BackendTlsIndex,
     ) -> Arc<RouteEntry> {
         let mut builder = RoutingTableBuilder::new();

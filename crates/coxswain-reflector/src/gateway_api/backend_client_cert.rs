@@ -18,13 +18,13 @@
 //! **Core support**: a `core/Secret` of type `kubernetes.io/tls`. Other kinds and
 //! Secret types (e.g. `Opaque`) are implementation-specific and not accepted here.
 
+use crate::MergedStore;
 use crate::gw_types::v::gateways::Gateway;
 use crate::tls::load_tls_cert;
 use coxswain_core::listener_status::BackendClientCertOutcome;
 use coxswain_core::reference_grants::{ReferenceGrantKey, backend_ref_allowed};
 use coxswain_core::routing::BackendClientCert;
 use k8s_openapi::api::core::v1::Secret;
-use kube::runtime::reflector;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -35,7 +35,7 @@ use std::sync::Arc;
 /// on success, the resolved [`BackendClientCert`] for the data plane.
 pub(crate) fn reconcile_backend_client_cert(
     gw: &Gateway,
-    secrets: &reflector::Store<Secret>,
+    secrets: &MergedStore<Secret>,
     cert_grants: &HashSet<ReferenceGrantKey>,
 ) -> Option<(BackendClientCertOutcome, Option<Arc<BackendClientCert>>)> {
     let cref = gw
@@ -153,12 +153,12 @@ mod tests {
         }
     }
 
-    fn secret_store(secrets: Vec<Secret>) -> reflector::Store<Secret> {
+    fn secret_store(secrets: Vec<Secret>) -> MergedStore<Secret> {
         let mut writer = reflector::store::Writer::<Secret>::default();
         for secret in secrets {
             writer.apply_watcher_event(&kube::runtime::watcher::Event::Apply(secret));
         }
-        writer.as_reader()
+        MergedStore::single(writer.as_reader())
     }
 
     fn tls_secret(ns: &str, name: &str) -> Secret {

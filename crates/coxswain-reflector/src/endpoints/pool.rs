@@ -23,10 +23,10 @@
 //! partitioned-rebuild architecture note in this crate's module docs).
 
 use super::resolve_from_group;
+use crate::MergedStore;
 use coxswain_core::endpoints::{EndpointKey, ResolvedEndpoints};
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
-use kube::runtime::reflector;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -70,7 +70,7 @@ impl EndpointCache {
     /// Regroups the `EndpointSlice` store by `(namespace, service)` and
     /// recomputes each group's fingerprint. Call once per rebuild, before any
     /// [`Self::get`] calls this cycle.
-    pub fn refresh(&mut self, slices: &reflector::Store<EndpointSlice>) {
+    pub fn refresh(&mut self, slices: &MergedStore<EndpointSlice>) {
         let mut groups: HashMap<(Arc<str>, Arc<str>), EndpointGroup> = HashMap::new();
         for slice in slices.state() {
             let Some(ns) = slice.metadata.namespace.as_deref() else {
@@ -123,7 +123,7 @@ impl EndpointCache {
         ns: &str,
         svc: &str,
         port: i32,
-        services: &reflector::Store<Service>,
+        services: &MergedStore<Service>,
     ) -> Arc<ResolvedEndpoints> {
         let (key, fingerprint) = self.cache_key_and_fingerprint(ns, svc, port, services);
 
@@ -157,7 +157,7 @@ impl EndpointCache {
         ns: &str,
         svc: &str,
         port: i32,
-        services: &reflector::Store<Service>,
+        services: &MergedStore<Service>,
     ) -> u64 {
         self.cache_key_and_fingerprint(ns, svc, port, services).1
     }
@@ -183,7 +183,7 @@ impl EndpointCache {
         ns: &str,
         svc: &str,
         port: i32,
-        services: &reflector::Store<Service>,
+        services: &MergedStore<Service>,
     ) -> (EndpointKey, GroupFingerprint) {
         let group_key = (Arc::<str>::from(ns), Arc::<str>::from(svc));
         let group_fingerprint = self.groups.get(&group_key).map_or(0, |g| g.fingerprint);

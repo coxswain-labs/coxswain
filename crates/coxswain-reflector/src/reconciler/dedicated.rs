@@ -20,6 +20,7 @@ use super::route_builder::{
     BackendClientCertResolution, GatewayTableIo, build_client_certs, build_gateway_routes,
     build_tls, merge_backend_client_cert_health,
 };
+use crate::MergedStore;
 use crate::gw_types::GrpcRoute;
 use crate::gw_types::HttpRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
@@ -33,7 +34,6 @@ use coxswain_core::routing::SharedGatewayRoutingTable;
 use coxswain_core::shared::Shared;
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
-use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -191,9 +191,9 @@ pub(super) struct OwnedResources {
 /// Compute which IngressClasses, GatewayClasses, and Gateways are owned by this controller.
 /// Publishes the owned-gateways snapshot to `owned_gateways_handle` as a side effect.
 pub(super) fn compute_ownership(
-    class_store: &reflector::Store<IngressClass>,
-    gateway_class_store: &reflector::Store<GatewayClass>,
-    gateway_store: &reflector::Store<Gateway>,
+    class_store: &MergedStore<IngressClass>,
+    gateway_class_store: &MergedStore<GatewayClass>,
+    gateway_store: &MergedStore<Gateway>,
     controller_name: &str,
     owned_gateways_handle: &OwnedGateways,
 ) -> OwnedResources {

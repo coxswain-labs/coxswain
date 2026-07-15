@@ -21,6 +21,7 @@
 //! - cross-namespace without a grant → `RefNotPermitted`
 //! - missing ConfigMap / no `ca.crt` / not PEM → `InvalidCACertificateRef`
 
+use crate::MergedStore;
 use crate::gw_types::v::gateways::{
     Gateway, GatewayTlsFrontend, GatewayTlsFrontendDefaultValidationMode,
     GatewayTlsFrontendPerPortTlsValidationMode,
@@ -74,7 +75,7 @@ enum CaResolution {
 /// - No HTTPS listener has an effective validation config.
 pub(crate) fn reconcile_frontend_validation(
     gateway: &Gateway,
-    configmaps: &reflector::Store<ConfigMap>,
+    configmaps: &MergedStore<ConfigMap>,
     ca_grants: &HashSet<ReferenceGrantKey>,
     builder: &mut ClientCertStoreBuilder,
     health: &mut GatewayListenerStatus,
@@ -242,7 +243,7 @@ fn resolve_ca(
     gw_ns: &str,
     gw_name: &str,
     refs: &[NormalizedRef<'_>],
-    configmaps: &reflector::Store<ConfigMap>,
+    configmaps: &MergedStore<ConfigMap>,
     ca_grants: &HashSet<ReferenceGrantKey>,
 ) -> CaResolution {
     let Some(ca_ref) = refs.first() else {
@@ -308,7 +309,7 @@ mod tests {
     use super::*;
     use coxswain_core::tls::ClientCertStoreBuilder;
     use k8s_openapi::api::core::v1::ConfigMap;
-    use kube::runtime::reflector::{self, store};
+    use kube::runtime::reflector::store;
     use std::collections::{BTreeMap, HashSet};
 
     fn make_gateway(
@@ -367,12 +368,12 @@ mod tests {
         }
     }
 
-    fn empty_cm_store() -> reflector::Store<ConfigMap> {
+    fn empty_cm_store() -> MergedStore<ConfigMap> {
         let (reader, _writer) = store::store::<ConfigMap>();
-        reader
+        MergedStore::single(reader)
     }
 
-    fn cm_store_with(ns: &str, name: &str, ca_pem: &str) -> reflector::Store<ConfigMap> {
+    fn cm_store_with(ns: &str, name: &str, ca_pem: &str) -> MergedStore<ConfigMap> {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
         let (reader, mut writer) = store::store::<ConfigMap>();
         let mut data = BTreeMap::new();
@@ -387,7 +388,7 @@ mod tests {
             data: Some(data),
             ..Default::default()
         }));
-        reader
+        MergedStore::single(reader)
     }
 
     /// Health pre-seeded with a listener entry carrying an allocated bind

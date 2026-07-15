@@ -116,10 +116,10 @@ spec:
             {{- end }}
             - name: COXSWAIN_CONTROLLER_NAME
               value: {{ .Values.controllerName | quote }}
-            {{- if .Values.watchNamespace }}
-            - name: COXSWAIN_WATCH_NAMESPACE
-              value: {{ .Values.watchNamespace | quote }}
-            {{- end }}
+            # `watchNamespace` is intentionally NOT set on the proxy: the proxy
+            # does not watch Kubernetes (it receives pushed routing from the
+            # controller over the discovery stream), so the watch scope is a
+            # controller-only concern (#59).
             # Discovery control plane (#423): the proxy receives pushed routing
             # snapshots over the mTLS stream and bootstraps its SVID over the
             # server-auth-only bootstrap listener.

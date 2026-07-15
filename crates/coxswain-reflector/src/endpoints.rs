@@ -10,6 +10,7 @@ pub mod pool;
 
 pub use coxswain_core::endpoints::{EndpointKey, ResolvedEndpoints, empty_group_status};
 
+use crate::MergedStore;
 use coxswain_core::routing::parse_app_protocol;
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::discovery::v1::EndpointSlice;
@@ -30,7 +31,7 @@ fn lookup_service_port(
     ns: &str,
     svc: &str,
     service_port: i32,
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
 ) -> Option<ServicePortInfo> {
     let key = reflector::ObjectRef::<Service>::new(svc).within(ns);
     let service = services.get(&key)?;
@@ -57,7 +58,7 @@ pub(crate) fn port_for_name(
     ns: &str,
     svc: &str,
     port_name: &str,
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
 ) -> Option<i32> {
     let key = reflector::ObjectRef::<Service>::new(svc).within(ns);
     let service = services.get(&key)?;
@@ -92,8 +93,8 @@ pub fn resolve(
     ns: &str,
     svc: &str,
     port: i32,
-    slices: &reflector::Store<EndpointSlice>,
-    services: &reflector::Store<Service>,
+    slices: &MergedStore<EndpointSlice>,
+    services: &MergedStore<Service>,
 ) -> ResolvedEndpoints {
     let matching: Vec<Arc<EndpointSlice>> = slices
         .state()
@@ -127,7 +128,7 @@ pub(crate) fn resolve_from_group(
     svc: &str,
     port: i32,
     group_slices: &[Arc<EndpointSlice>],
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
 ) -> ResolvedEndpoints {
     let port_info = lookup_service_port(ns, svc, port, services);
     let pod_port = port_info

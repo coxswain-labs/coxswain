@@ -55,13 +55,13 @@ pub(crate) const COXSWAIN_GROUP: &str = "gateway.coxswain-labs.dev";
 #[cfg(test)]
 mod tests;
 
+use crate::MergedStore;
 use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::{GrpcRoute, HttpRoute, TcpRoute, TlsRoute, UdpRoute};
 use crate::status::{BackendTlsPolicyStatusMap, RouteStatusMap};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::ReferenceGrantKey;
 use k8s_openapi::api::core::v1::Service;
-use kube::runtime::reflector;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -86,7 +86,7 @@ impl GatewayApiReconciler {
             crate::reconciler::listener_merge::EffectiveGateway,
         >,
         backend_grants: &HashSet<ReferenceGrantKey>,
-        service_store: &reflector::Store<Service>,
+        service_store: &MergedStore<Service>,
     ) -> RouteStatusMap {
         route_status::compute_route_health(
             routes,
@@ -102,7 +102,7 @@ impl GatewayApiReconciler {
     /// Compute per-policy status from the pre-built index and the policy reflector.
     pub fn compute_policy_health(
         index: &BackendTlsIndex,
-        policies: &kube::runtime::reflector::Store<crate::gw_types::BackendTlsPolicy>,
+        policies: &MergedStore<crate::gw_types::BackendTlsPolicy>,
         routes: &[Arc<HttpRoute>],
         owned_gateways: &HashSet<ObjectKey>,
     ) -> BackendTlsPolicyStatusMap {
@@ -132,7 +132,7 @@ impl GrpcRouteReconciler {
     pub fn reconcile(
         route: &GrpcRoute,
         endpoint_cache: &crate::endpoints::pool::EndpointCache,
-        services: &reflector::Store<Service>,
+        services: &MergedStore<Service>,
         owned_gateways: &HashSet<ObjectKey>,
         grants: &HashSet<ReferenceGrantKey>,
         resolution: GrpcRouteResolution<'_>,
@@ -163,7 +163,7 @@ impl GrpcRouteReconciler {
             crate::reconciler::listener_merge::EffectiveGateway,
         >,
         backend_grants: &HashSet<ReferenceGrantKey>,
-        service_store: &reflector::Store<Service>,
+        service_store: &MergedStore<Service>,
     ) -> RouteStatusMap {
         route_status::compute_route_health(
             routes,
@@ -201,7 +201,7 @@ impl TlsRouteReconciler {
             crate::reconciler::listener_merge::EffectiveGateway,
         >,
         backend_grants: &HashSet<ReferenceGrantKey>,
-        service_store: &reflector::Store<Service>,
+        service_store: &MergedStore<Service>,
     ) -> RouteStatusMap {
         route_status::compute_route_health(
             routes,
@@ -239,7 +239,7 @@ impl TcpRouteReconciler {
             crate::reconciler::listener_merge::EffectiveGateway,
         >,
         backend_grants: &HashSet<ReferenceGrantKey>,
-        service_store: &reflector::Store<Service>,
+        service_store: &MergedStore<Service>,
     ) -> RouteStatusMap {
         route_status::compute_route_health(
             routes,
@@ -277,7 +277,7 @@ impl UdpRouteReconciler {
             crate::reconciler::listener_merge::EffectiveGateway,
         >,
         backend_grants: &HashSet<ReferenceGrantKey>,
-        service_store: &reflector::Store<Service>,
+        service_store: &MergedStore<Service>,
     ) -> RouteStatusMap {
         route_status::compute_route_health(
             routes,

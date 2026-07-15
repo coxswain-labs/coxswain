@@ -1,15 +1,13 @@
 # CoxswainRelayPolicy (#589) that force-enables the namespace relay and overrides
-# its replica count. Cluster-scoped; the selector pins it to the test namespace by
-# its built-in name label so it can never affect a sibling test's namespace.
+# its replica count. Namespaced: it lives in the test namespace and governs only
+# that namespace's relay, so it can never affect a sibling test's namespace.
 ---
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
 kind: CoxswainRelayPolicy
 metadata:
-  name: e2e-relay-force-on-${TESTNS}
+  name: e2e-relay-force-on
+  namespace: ${TESTNS}
 spec:
-  namespaceSelector:
-    matchLabels:
-      kubernetes.io/metadata.name: ${TESTNS}
   enabled: true
   replicas: 3
   resources:

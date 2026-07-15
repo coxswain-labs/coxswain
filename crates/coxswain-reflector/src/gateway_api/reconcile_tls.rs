@@ -12,6 +12,7 @@
 //! - [`resolve_route_client_cert`] — resolve the GEP-3155 backend client cert a
 //!   route inherits from its owned parent Gateways.
 
+use crate::MergedStore;
 use crate::gw_types::v::httproutes::HttpRouteParentRefs;
 use crate::reconciler::listener_merge::EffectiveListener;
 use crate::status::{ListenerReadiness, ListenerSource};
@@ -21,7 +22,6 @@ use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::BackendClientCert;
 use coxswain_core::tls::PortTlsStoreBuilder;
 use k8s_openapi::api::core::v1::Secret;
-use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -119,7 +119,7 @@ pub(super) fn grants_for_source<'g>(
 pub(super) fn resolve_listener_tls(
     gw_name: &str,
     listener: &EffectiveListener,
-    secrets: &reflector::Store<Secret>,
+    secrets: &MergedStore<Secret>,
     cert_grants: &HashSet<ReferenceGrantKey>,
     builder: &mut PortTlsStoreBuilder,
     bind_port: u16,

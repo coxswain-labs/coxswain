@@ -12,13 +12,13 @@
 //! - Among two policies at the same scope targeting the same listener, the
 //!   older `creationTimestamp` wins; the newer one receives `Conflicted=True`.
 
+use crate::MergedStore;
 use crate::k8s_utils::metadata_created_at;
 use crate::status::{ClientTrafficPolicyStatus, ClientTrafficPolicyStatusMap};
 use coxswain_core::crd::client_traffic_policy::ClientTrafficPolicy;
 use coxswain_core::listener_status::ProxyProtocolListenerConfig;
 use coxswain_core::ownership::ObjectKey;
 use ipnet::IpNet;
-use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
 use std::time::SystemTime;
 
@@ -55,7 +55,7 @@ pub type ClientTrafficPolicyIndex =
 /// skipped with a `warn!` log and an empty `trusted_sources` list.
 #[must_use = "caller must wire the index into ListenerInfo and publish the status map"]
 pub fn resolve_client_traffic_policies(
-    policies: &reflector::Store<ClientTrafficPolicy>,
+    policies: &MergedStore<ClientTrafficPolicy>,
     owned_gateways: &HashSet<ObjectKey>,
 ) -> (ClientTrafficPolicyIndex, ClientTrafficPolicyStatusMap) {
     // Candidate map: (gw_key, section_name) → (timestamp, policy_key, config).
@@ -253,13 +253,13 @@ mod tests {
         s
     }
 
-    fn store_from(policies: Vec<ClientTrafficPolicy>) -> reflector::Store<ClientTrafficPolicy> {
+    fn store_from(policies: Vec<ClientTrafficPolicy>) -> MergedStore<ClientTrafficPolicy> {
         let (reader, mut writer) = reflector::store();
         writer.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
         for p in policies {
             writer.apply_watcher_event(&kube::runtime::watcher::Event::Apply(p));
         }
-        reader
+        MergedStore::single(reader)
     }
 
     #[test]

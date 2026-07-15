@@ -18,6 +18,7 @@
 //! after a change re-run with `-- --baseline <name>` (criterion persists
 //! results under `target/criterion/`, gitignored — no numbers land in git).
 
+use coxswain_reflector::MergedStore;
 use coxswain_reflector::endpoints::pool::EndpointCache;
 use coxswain_reflector::endpoints::resolve;
 use criterion::{Criterion, criterion_group, criterion_main};
@@ -99,7 +100,7 @@ fn make_slice(svc: &str, n: usize) -> EndpointSlice {
 fn build_stores(
     services: usize,
     endpoints_per_service: usize,
-) -> (reflector::Store<EndpointSlice>, reflector::Store<Service>) {
+) -> (MergedStore<EndpointSlice>, MergedStore<Service>) {
     let mut slice_writer = reflector::store::Writer::<EndpointSlice>::default();
     let mut svc_writer = reflector::store::Writer::<Service>::default();
     for i in 0..services {
@@ -110,7 +111,10 @@ fn build_stores(
         )));
         svc_writer.apply_watcher_event(&watcher::Event::Apply(make_service(&name)));
     }
-    (slice_writer.as_reader(), svc_writer.as_reader())
+    (
+        MergedStore::single(slice_writer.as_reader()),
+        MergedStore::single(svc_writer.as_reader()),
+    )
 }
 
 /// Simulates one rebuild's worth of endpoint resolution: `routes` backend
@@ -213,7 +217,7 @@ fn build_stores_with_churn(
     endpoints_per_service: usize,
     churned: &str,
     generation: u32,
-) -> (reflector::Store<EndpointSlice>, reflector::Store<Service>) {
+) -> (MergedStore<EndpointSlice>, MergedStore<Service>) {
     let mut slice_writer = reflector::store::Writer::<EndpointSlice>::default();
     let mut svc_writer = reflector::store::Writer::<Service>::default();
     for i in 0..services {
@@ -226,7 +230,10 @@ fn build_stores_with_churn(
         slice_writer.apply_watcher_event(&watcher::Event::Apply(slice));
         svc_writer.apply_watcher_event(&watcher::Event::Apply(make_service(&name)));
     }
-    (slice_writer.as_reader(), svc_writer.as_reader())
+    (
+        MergedStore::single(slice_writer.as_reader()),
+        MergedStore::single(svc_writer.as_reader()),
+    )
 }
 
 /// [`make_slice`], but the resourceVersion (and one address octet) vary with

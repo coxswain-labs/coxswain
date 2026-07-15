@@ -8,6 +8,7 @@
 //! change since the fingerprint was last computed" without re-deriving or
 //! deep-comparing the object itself.
 
+use crate::MergedStore;
 use kube::Resource;
 use kube::api::ObjectMeta;
 use kube::runtime::reflector;
@@ -99,7 +100,7 @@ impl FingerprintAccumulator {
 /// name)` — O(1) via the store's index, not a scan. Object absent (deleted,
 /// or never existed) is a stable fingerprint distinct from any real version
 /// string, so a ref target's deletion is itself a fingerprint-moving event.
-pub(crate) fn object_fingerprint<K>(store: &reflector::Store<K>, ns: &str, name: &str) -> u64
+pub(crate) fn object_fingerprint<K>(store: &MergedStore<K>, ns: &str, name: &str) -> u64
 where
     K: Resource<DynamicType = ()> + Clone + Send + Sync + 'static,
 {
@@ -130,7 +131,7 @@ where
 /// cluster whose Gateways/policies the controller is actively status-writing —
 /// see the `RouteResolution`-adjacent doc on `route_fingerprint` for exactly
 /// which inputs fall into this bucket.
-pub(crate) fn store_epoch<K>(store: &reflector::Store<K>) -> u64
+pub(crate) fn store_epoch<K>(store: &MergedStore<K>) -> u64
 where
     K: Resource<DynamicType = ()> + Clone + Send + Sync + 'static,
 {
@@ -162,17 +163,15 @@ where
 /// go stale until unrelated churn. The sentinel is only safe for kinds no
 /// translator reads.
 pub(crate) struct ExtRefStores<'a> {
-    pub(crate) rate_limits: &'a reflector::Store<coxswain_core::crd::RateLimit>,
-    pub(crate) retry_policies: &'a reflector::Store<coxswain_core::crd::RetryPolicy>,
-    pub(crate) ip_access: &'a reflector::Store<coxswain_core::crd::IpAccessControl>,
-    pub(crate) jwt_auths: &'a reflector::Store<coxswain_core::crd::JwtAuth>,
-    pub(crate) path_rewrites: Option<&'a reflector::Store<coxswain_core::crd::PathRewriteRegex>>,
-    pub(crate) basic_auths: Option<&'a reflector::Store<coxswain_core::crd::BasicAuth>>,
-    pub(crate) external_auths:
-        Option<&'a reflector::Store<coxswain_core::crd::CoxswainExternalAuth>>,
-    pub(crate) request_size_limits:
-        Option<&'a reflector::Store<coxswain_core::crd::RequestSizeLimit>>,
-    pub(crate) compressions: Option<&'a reflector::Store<coxswain_core::crd::Compression>>,
+    pub(crate) rate_limits: &'a MergedStore<coxswain_core::crd::RateLimit>,
+    pub(crate) retry_policies: &'a MergedStore<coxswain_core::crd::RetryPolicy>,
+    pub(crate) ip_access: &'a MergedStore<coxswain_core::crd::IpAccessControl>,
+    pub(crate) jwt_auths: &'a MergedStore<coxswain_core::crd::JwtAuth>,
+    pub(crate) path_rewrites: Option<&'a MergedStore<coxswain_core::crd::PathRewriteRegex>>,
+    pub(crate) basic_auths: Option<&'a MergedStore<coxswain_core::crd::BasicAuth>>,
+    pub(crate) external_auths: Option<&'a MergedStore<coxswain_core::crd::CoxswainExternalAuth>>,
+    pub(crate) request_size_limits: Option<&'a MergedStore<coxswain_core::crd::RequestSizeLimit>>,
+    pub(crate) compressions: Option<&'a MergedStore<coxswain_core::crd::Compression>>,
 }
 
 impl ExtRefStores<'_> {
@@ -201,12 +200,7 @@ impl ExtRefStores<'_> {
 /// translator consumes the kind), the stable `(kind, name)` sentinel when it
 /// is `None` (the translator ignores the ref, so the output can't depend on
 /// the CR).
-fn opt_fingerprint<K>(
-    store: Option<&reflector::Store<K>>,
-    route_ns: &str,
-    kind: &str,
-    name: &str,
-) -> u64
+fn opt_fingerprint<K>(store: Option<&MergedStore<K>>, route_ns: &str, kind: &str, name: &str) -> u64
 where
     K: Resource<DynamicType = ()> + Clone + Send + Sync + 'static,
 {
@@ -221,12 +215,12 @@ mod tests {
     use super::*;
     use coxswain_core::crd::RateLimit;
 
-    fn store_with(objs: Vec<RateLimit>) -> reflector::Store<RateLimit> {
+    fn store_with(objs: Vec<RateLimit>) -> MergedStore<RateLimit> {
         let mut writer = reflector::store::Writer::<RateLimit>::default();
         for o in objs {
             writer.apply_watcher_event(&kube::runtime::watcher::Event::Apply(o));
         }
-        writer.as_reader()
+        MergedStore::single(writer.as_reader())
     }
 
     fn rate_limit(ns: &str, name: &str, resource_version: &str) -> RateLimit {

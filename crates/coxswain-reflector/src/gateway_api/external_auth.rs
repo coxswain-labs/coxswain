@@ -9,6 +9,7 @@
 //! An endpoint-less or ungranted ref fails **closed**
 //! ([`IngressAuthConfig::Unavailable`] → 503).
 
+use crate::MergedStore;
 use crate::duration::parse_duration;
 use crate::endpoints::pool::EndpointCache;
 use crate::k8s_utils::metadata_created_at;
@@ -20,6 +21,7 @@ use coxswain_core::routing::{
     ExtAuthConfig, ExtAuthTransport, GrpcExtAuthConfig, HttpExtAuthConfig, IngressAuthConfig,
 };
 use k8s_openapi::api::core::v1::Service;
+#[cfg(test)]
 use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -49,7 +51,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) fn resolve_spec(
     spec: &CoxswainExternalAuthSpec,
     policy_ns: &str,
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
     endpoint_cache: &EndpointCache,
     grants: &HashSet<ReferenceGrantKey>,
 ) -> IngressAuthConfig {
@@ -110,7 +112,7 @@ pub(crate) fn resolve_spec(
 fn resolve_backend(
     spec: &CoxswainExternalAuthSpec,
     policy_ns: &str,
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
     endpoint_cache: &EndpointCache,
     grants: &HashSet<ReferenceGrantKey>,
 ) -> Option<Arc<[SocketAddr]>> {
@@ -189,9 +191,9 @@ fn earlier(a: Option<SystemTime>, b: Option<SystemTime>) -> bool {
 /// contributes nothing to either map.
 #[must_use = "caller must wire the index into route building and publish the status map"]
 pub fn resolve_gateway_policies(
-    policies: &reflector::Store<CoxswainExternalAuth>,
+    policies: &MergedStore<CoxswainExternalAuth>,
     owned_gateways: &HashSet<ObjectKey>,
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
     endpoint_cache: &EndpointCache,
     grants: &HashSet<ReferenceGrantKey>,
 ) -> (ExternalAuthGatewayIndex, CoxswainExternalAuthStatusMap) {
@@ -318,19 +320,19 @@ mod tests {
         serde_yaml::from_str(&yaml).unwrap_or_else(|e| panic!("bad yaml: {e}\n---\n{yaml}"))
     }
 
-    fn store_from(policies: Vec<CoxswainExternalAuth>) -> reflector::Store<CoxswainExternalAuth> {
+    fn store_from(policies: Vec<CoxswainExternalAuth>) -> MergedStore<CoxswainExternalAuth> {
         let (reader, mut writer) = reflector::store();
         writer.apply_watcher_event(&watcher::Event::InitDone);
         for p in policies {
             writer.apply_watcher_event(&watcher::Event::Apply(p));
         }
-        reader
+        MergedStore::single(reader)
     }
 
-    fn empty_svc() -> reflector::Store<Service> {
+    fn empty_svc() -> MergedStore<Service> {
         let (reader, mut writer) = reflector::store();
         writer.apply_watcher_event(&watcher::Event::InitDone);
-        reader
+        MergedStore::single(reader)
     }
 
     fn empty_endpoint_cache() -> EndpointCache {

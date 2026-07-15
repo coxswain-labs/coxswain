@@ -28,7 +28,7 @@ use coxswain_proxy::{
     PassthroughConfig, ProxyAcceptor, RateLimiterRegistry, RoutingEngine, RoutingSource,
     SharedProxyConfig, SniCertSelector, UpstreamCaCache,
 };
-use coxswain_reflector::{DebounceSettings, GatewayListenerStatus, ListenerReadiness};
+use coxswain_reflector::{DebounceSettings, GatewayListenerStatus, ListenerReadiness, WatchScope};
 use pingora_core::apps::HttpServerOptions;
 use pingora_core::server::Server;
 use pingora_core::server::ShutdownWatch;
@@ -117,7 +117,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     let status_writer = spawn_status_writer(
         StatusWriterConfig {
             controller: controller_config,
-            watch_namespace: args.common.watch_namespace.clone(),
+            watch_scope: WatchScope::parse(args.common.watch_namespace.as_deref())?,
             controller_name: args.common.controller_name.clone(),
             ingress_default_backend: None,
             ingress_ports: IngressPorts::new(
@@ -1610,7 +1610,7 @@ fn build_controller_config(
             controller.controller_lease_ttl,
             controller.controller_lease_renew_interval,
         ),
-        common.watch_namespace.clone(),
+        WatchScope::parse(common.watch_namespace.as_deref())?,
         controller.status_address.clone(),
         IngressPorts::new(common.ingress_http_port, common.ingress_https_port),
     )

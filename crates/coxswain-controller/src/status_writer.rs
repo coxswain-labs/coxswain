@@ -43,9 +43,10 @@ use thiserror::Error;
 pub struct StatusWriterConfig {
     /// Identity, leader-election parameters, and status-write address.
     pub controller: ControllerConfig,
-    /// Optional cluster scope: when `Some`, namespace-scoped reflectors watch
-    /// only the named namespace. `None` means cluster-wide.
-    pub watch_namespace: Option<String>,
+    /// Which namespaces the namespaced reflectors watch (multi-namespace watch,
+    /// #59): `WatchScope::ClusterWide` watches every namespace, otherwise one
+    /// reflector per listed namespace.
+    pub watch_scope: coxswain_reflector::WatchScope,
     /// Controller-name string this instance claims on `GatewayClass`,
     /// `HTTPRoute`, and `BackendTLSPolicy` `controllerName` fields.
     pub controller_name: String,
@@ -119,7 +120,7 @@ pub fn spawn_status_writer(
 ) -> Result<SpawnedStatusWriter, StatusWriterError> {
     let StatusWriterConfig {
         controller,
-        watch_namespace,
+        watch_scope,
         controller_name,
         ingress_default_backend,
         ingress_ports,
@@ -269,7 +270,10 @@ pub fn spawn_status_writer(
         controller_name.clone(),
         {
             let mut opts = ReconcilerOptions::default();
-            opts.watch_namespace = watch_namespace;
+            opts.watch_scope = watch_scope;
+            // The install namespace: widens the fleet-Pod / params watches to
+            // `watch_scope ∪ {pod_namespace}` so they stay namespaced (#59).
+            opts.pod_namespace = controller.pod_namespace.clone();
             opts.ingress_default_backend = ingress_default_backend;
             opts.ingress_ports = ingress_ports;
             opts.metrics_prefix = coxswain_reflector::MetricsPrefix::Controller;

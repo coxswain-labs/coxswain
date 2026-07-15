@@ -39,8 +39,11 @@ namespace:
 # -- GatewayClass controllerName this install claims.
 controllerName: coxswain-labs.dev/gateway-controller
 
-# -- Kubernetes namespace to watch. Empty = cluster-wide. Both pods receive
-# the same value via env var.
+# -- Kubernetes namespace(s) the controller watches. Empty = cluster-wide; a
+# single name scopes to one namespace; a comma-separated list (`ns1,ns2,ns3`)
+# scopes to several. Only the controller watches Kubernetes; the proxy is
+# unaffected. A namespace list enables a least-privilege namespaced-Role RBAC
+# lockdown — see deploy/manifests/controller-rbac-namespaced.yaml.
 watchNamespace: ""
 
 # -- COXSWAIN_LOG_FORMAT — "json" for production; "console" for development.

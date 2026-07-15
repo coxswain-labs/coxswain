@@ -6,6 +6,7 @@
 use super::annotations::AnnotationIssue;
 use super::annotations::auth::{SecretRef, parse_htpasswd};
 use super::annotations::traffic_policy;
+use crate::MergedStore;
 use crate::endpoints::pool::EndpointCache;
 use crate::endpoints::{EndpointKey, ResolvedEndpoints};
 use crate::gateway_api::ResolvedBackendPolicy;
@@ -81,7 +82,7 @@ pub(super) fn resolve_mirror_filter(
     ns: &str,
     route_id: &str,
     endpoint_cache: &EndpointCache,
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
 ) -> Option<FilterAction> {
     if mirror_ref.namespace != ns {
         tracing::warn!(
@@ -145,7 +146,7 @@ pub(super) fn resolve_mirror_filter(
 /// (no basic-auth check configured).
 pub(super) fn resolve_basic_auth_config(
     annotation: Option<&SecretRef>,
-    auth_secrets: &reflector::Store<Secret>,
+    auth_secrets: &MergedStore<Secret>,
     route_id: &str,
     ingress_ns: &str,
     diag: &mut Vec<AnnotationIssue>,
@@ -235,8 +236,8 @@ pub(super) fn resolve_basic_auth_config(
 /// resolved relative to where the CR lives, not the Ingress.
 pub(super) fn resolve_ext_auth_config(
     annotation: Option<&SecretRef>,
-    external_auths: &reflector::Store<CoxswainExternalAuth>,
-    services: &reflector::Store<Service>,
+    external_auths: &MergedStore<CoxswainExternalAuth>,
+    services: &MergedStore<Service>,
     endpoint_cache: &EndpointCache,
     backend_grants: &crate::reference_grants::GrantSet,
     route_id: &str,
@@ -276,7 +277,7 @@ pub(super) fn resolve_ext_auth_config(
 /// with an unresolved JWKS also fails **closed** inside `resolve_spec`.
 pub(super) fn resolve_jwt_auth_config(
     annotation: Option<&super::annotations::auth::SecretRef>,
-    jwt_auths: &reflector::Store<coxswain_core::crd::JwtAuth>,
+    jwt_auths: &MergedStore<coxswain_core::crd::JwtAuth>,
     jwks_cache: &crate::jwks::SharedJwksCache,
     route_id: &str,
 ) -> Option<IngressAuthConfig> {
@@ -313,7 +314,7 @@ pub(super) fn resolve_jwt_auth_config(
 /// uncompressed responses, not a 503.
 pub(super) fn resolve_compression_config(
     annotation: Option<&SecretRef>,
-    compressions: &reflector::Store<Compression>,
+    compressions: &MergedStore<Compression>,
     route_id: &str,
 ) -> Option<Arc<CompressionConfig>> {
     let r = annotation?;
@@ -346,7 +347,7 @@ pub(super) fn resolve_compression_config(
 /// posture: a broken retry reference degrades to no retries, not a 503.
 pub(super) fn resolve_retry_config(
     annotation: Option<&SecretRef>,
-    retry_policies: &reflector::Store<RetryPolicy>,
+    retry_policies: &MergedStore<RetryPolicy>,
     route_id: &str,
 ) -> RetryPolicyConfig {
     let Some(r) = annotation else {
@@ -384,7 +385,7 @@ pub(super) fn resolve_retry_config(
 /// suppresses the advisory when an auth check is also configured on the route.
 pub(super) fn resolve_rate_limit_config(
     annotation: Option<&SecretRef>,
-    rate_limits: &reflector::Store<RateLimit>,
+    rate_limits: &MergedStore<RateLimit>,
     route_id: &str,
     has_auth: bool,
     diag: &mut Vec<AnnotationIssue>,
@@ -430,7 +431,7 @@ pub(super) fn resolve_rate_limit_config(
 /// unfiltered traffic rather than blocking every request.
 pub(super) fn resolve_ip_access_control_config(
     annotation: Option<&SecretRef>,
-    ip_access_controls: &reflector::Store<IpAccessControl>,
+    ip_access_controls: &MergedStore<IpAccessControl>,
     route_id: &str,
 ) -> (
     crate::gateway_api::ip_access_control::CidrSet,

@@ -3,10 +3,11 @@
 //!
 //! #584 shipped namespace-relay provisioning with **global** operator control only
 //! (the `--relay-*` controller flags): every provisioned relay across every namespace
-//! is identical. This cluster-scoped CRD overlays per-namespace structured control —
+//! is identical. This **namespaced** CRD overlays per-namespace structured control —
 //! resources, scheduling, HA, and opt-in autoscaling — on top of those global defaults,
-//! following the [`super::gateway_parameters`] precedent for dedicated-**proxy**
-//! provisioning.
+//! keyed by the object's own namespace exactly like the [`super::gateway_parameters`]
+//! precedent for dedicated-**proxy** provisioning. Structured defaults are per namespace;
+//! the only cluster-wide default is the flat `--relay-*` flags.
 //!
 //! ## Enablement is override, not activation
 //!
@@ -34,7 +35,6 @@
 //! `examples/crdgen.rs` and pinned by a snapshot test.
 
 use k8s_openapi::api::core::v1::ResourceRequirements;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -43,30 +43,24 @@ use super::preserve_unknown_fields_schema;
 
 /// Per-namespace parameters for the controller-provisioned dedicated relay.
 ///
-/// Cluster-scoped with an optional [`Self::namespace_selector`]: a policy with no selector
-/// is the cluster default applied to every relay-fronted namespace; a policy with a
-/// selector overrides it for matched namespaces (most-specific wins — see the resolver in
-/// `coxswain-controller`'s `operator::relay_params`). Every field is `Option` so a policy
-/// overlays only the fields it sets, falling through to the cluster default and then the
-/// #584 global controller-flag defaults.
+/// Namespaced: the `CoxswainRelayPolicy` in a namespace governs that namespace's relay,
+/// keyed by the object's own namespace (the `CoxswainGatewayParameters` model). Every
+/// field is `Option` so a policy overlays only the fields it sets, falling through to the
+/// #584 global controller-flag defaults (`--relay-*`) for the rest. At most one policy per
+/// namespace is expected; if several exist the resolver in `coxswain-controller`'s
+/// `operator::relay_params` picks the lexically-first by name and warn-logs the ambiguity.
 #[derive(CustomResource, Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[kube(
     group = "gateway.coxswain-labs.dev",
     version = "v1alpha1",
     kind = "CoxswainRelayPolicy",
-    plural = "coxswainrelaypolicies"
+    plural = "coxswainrelaypolicies",
+    namespaced
 )]
 #[serde(rename_all = "camelCase")]
 #[non_exhaustive]
 #[derive(Default)]
 pub struct CoxswainRelayPolicySpec {
-    /// Namespaces this policy applies to. When omitted, the policy is the **cluster
-    /// default** applied to every relay-fronted namespace. When set, the policy overrides
-    /// the cluster default for namespaces whose labels match — most-specific policy wins
-    /// (more selector terms, then lexical by name; ambiguous ties are warn-logged).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub namespace_selector: Option<LabelSelector>,
-
     /// Tri-state override of the controller's automatic provisioning decision:
     /// - `None` (unset) — the controller decides automatically (the #584 break-even
     ///   threshold + hysteresis); the operator does nothing.
@@ -199,18 +193,17 @@ mod tests {
     }
 
     #[test]
-    fn crd_is_cluster_scoped() {
+    fn crd_is_namespaced() {
         let crd = CoxswainRelayPolicy::crd();
         assert_eq!(
-            crd.spec.scope, "Cluster",
-            "CoxswainRelayPolicy must be cluster-scoped (a policy can target any namespace)"
+            crd.spec.scope, "Namespaced",
+            "CoxswainRelayPolicy is namespaced — the policy in a namespace governs that namespace"
         );
     }
 
     #[test]
     fn empty_spec_leaves_all_fields_unset() {
         let cr = parse_cr("{}");
-        assert!(cr.spec.namespace_selector.is_none());
         assert!(cr.spec.enabled.is_none());
         assert!(cr.spec.replicas.is_none());
         assert!(cr.spec.resources.is_none());
@@ -223,30 +216,6 @@ mod tests {
         assert_eq!(parse_cr("enabled: true").spec.enabled, Some(true));
         assert_eq!(parse_cr("enabled: false").spec.enabled, Some(false));
         assert_eq!(parse_cr("{}").spec.enabled, None);
-    }
-
-    #[test]
-    fn namespace_selector_round_trips() {
-        let cr = parse_cr(
-            "namespaceSelector:\n  \
-             matchLabels:\n    tier: platform\n  \
-             matchExpressions:\n  - key: env\n    operator: In\n    values: [prod]",
-        );
-        let sel = cr
-            .spec
-            .namespace_selector
-            .as_ref()
-            .expect("namespaceSelector present");
-        assert_eq!(
-            sel.match_labels
-                .as_ref()
-                .and_then(|m| m.get("tier"))
-                .map(String::as_str),
-            Some("platform")
-        );
-        let expr = &sel.match_expressions.as_ref().expect("matchExpressions")[0];
-        assert_eq!(expr.key, "env");
-        assert_eq!(expr.operator, "In");
     }
 
     #[test]
@@ -329,8 +298,8 @@ mod tests {
         let parsed: CoxswainRelayPolicy = serde_yaml::from_str(SAMPLE_FIXTURE_YAML)
             .unwrap_or_else(|e| panic!("dev sample fixture must deserialize: {e}"));
         assert!(
-            parsed.spec.namespace_selector.is_some(),
-            "sample targets a namespace by selector"
+            parsed.metadata.namespace.is_some(),
+            "sample is a namespaced policy governing its own namespace"
         );
         assert_eq!(parsed.spec.enabled, Some(true));
     }

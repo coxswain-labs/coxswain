@@ -2157,7 +2157,7 @@ mod tests {
             kube::runtime::reflector::store::Writer::<k8s_openapi::api::core::v1::Service>::default(
             );
         svc.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
-        let services = svc.as_reader();
+        let services = crate::MergedStore::single(svc.as_reader());
 
         let map = TlsRouteReconciler::compute_route_health(
             &[route],

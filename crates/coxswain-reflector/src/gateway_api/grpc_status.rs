@@ -161,7 +161,7 @@ mod tests {
             },
             ..Default::default()
         }));
-        let services = w.as_reader();
+        let services = crate::MergedStore::single(w.as_reader());
 
         let owned: HashSet<ObjectKey> = std::iter::once(ObjectKey::new("default", "gw")).collect();
         let map = compute_route_health(

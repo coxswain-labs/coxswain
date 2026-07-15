@@ -4,6 +4,7 @@
 use super::IngressReconciler;
 use super::annotations::client_cert::{ClientCertAnnotation, parse_client_cert};
 use super::class::claimed_ingress_class;
+use crate::MergedStore;
 use crate::tls::load_tls_cert;
 use coxswain_core::tls::{
     ClientCertConfig, ClientCertConfigState, ClientCertStoreBuilder, PortTlsStoreBuilder,
@@ -28,7 +29,7 @@ impl IngressReconciler {
     /// addressing). The proxy's per-port `SniCertSelector` on that port finds them.
     pub fn reconcile_tls(
         ingress: &Ingress,
-        secrets: &reflector::Store<Secret>,
+        secrets: &MergedStore<Secret>,
         owned_classes: &HashSet<String>,
         owned_default_class: Option<&str>,
         builder: &mut PortTlsStoreBuilder,
@@ -127,7 +128,7 @@ impl IngressReconciler {
     /// listeners (which key their own internal ports).
     pub fn reconcile_client_certs(
         ingress: &Ingress,
-        auth_tls_secrets: &reflector::Store<Secret>,
+        auth_tls_secrets: &MergedStore<Secret>,
         owned_classes: &HashSet<String>,
         owned_default_class: Option<&str>,
         builder: &mut ClientCertStoreBuilder,
@@ -213,7 +214,7 @@ impl IngressReconciler {
 /// - PEM bytes not parseable as at least one X.509 certificate.
 fn resolve_client_cert_config(
     ann: &ClientCertAnnotation,
-    auth_tls_secrets: &reflector::Store<Secret>,
+    auth_tls_secrets: &MergedStore<Secret>,
     route_id: &str,
     ingress_ns: &str,
 ) -> ClientCertConfigState {
@@ -330,12 +331,12 @@ mod tests {
     use kube::runtime::{reflector, watcher};
     use std::collections::BTreeMap;
 
-    fn secret_store(secrets: Vec<Secret>) -> reflector::Store<Secret> {
+    fn secret_store(secrets: Vec<Secret>) -> MergedStore<Secret> {
         let mut writer = reflector::store::Writer::<Secret>::default();
         for secret in secrets {
             writer.apply_watcher_event(&watcher::Event::Apply(secret));
         }
-        writer.as_reader()
+        MergedStore::single(writer.as_reader())
     }
 
     fn make_tls_secret(ns: &str, name: &str) -> Secret {

@@ -61,6 +61,11 @@ pub struct ControllerOptions {
     /// dedicated Gateway triggers a relay, or high to assert scale-to-zero.
     /// `None` leaves the chart default (8).
     pub relay_min_proxy_replicas: Option<u32>,
+    /// Sets `watchNamespace` (#59) — the controller's namespaced watch scope.
+    /// A comma-separated list (`ns1,ns2`) scopes the controller to those
+    /// namespaces; resources elsewhere are ignored. `None` leaves the chart
+    /// default (cluster-wide).
+    pub watch_namespace: Option<String>,
 }
 
 /// Handle to the in-cluster coxswain installation for one test.
@@ -127,6 +132,7 @@ impl ControllerProcess {
             ingress_enabled: opts.ingress_enabled,
             relay_dedicated_enabled: opts.relay_dedicated_enabled,
             relay_min_proxy_replicas: opts.relay_min_proxy_replicas,
+            watch_namespace: opts.watch_namespace,
         };
         if overrides != HelmOverrides::default() {
             let root = workspace_root().context("workspace root")?;
