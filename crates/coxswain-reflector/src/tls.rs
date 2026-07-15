@@ -1,5 +1,6 @@
 //! TLS certificate load helpers for Gateway listener Secrets.
 
+use crate::MergedStore;
 use coxswain_core::tls::{KeyAlgorithm, TlsCert};
 use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::reflector;
@@ -34,7 +35,7 @@ pub(crate) enum TlsLoadError {
 pub(crate) fn load_tls_cert(
     ns: &str,
     name: &str,
-    store: &reflector::Store<Secret>,
+    store: &MergedStore<Secret>,
 ) -> Result<TlsCert, TlsLoadError> {
     let key = reflector::ObjectRef::<Secret>::new(name).within(ns);
     let secret = store.get(&key).ok_or(TlsLoadError::NotFound)?;

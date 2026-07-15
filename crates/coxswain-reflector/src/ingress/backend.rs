@@ -1,9 +1,9 @@
 //! Resolves Ingress backend service port numbers from `Service.spec.ports`.
 
+use crate::MergedStore;
 use crate::endpoints;
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::api::networking::v1::IngressServiceBackend;
-use kube::runtime::reflector;
 
 /// Resolves a backend port to its numeric value.
 ///
@@ -13,7 +13,7 @@ use kube::runtime::reflector;
 pub(super) fn resolve_backend_port(
     ns: &str,
     svc: &IngressServiceBackend,
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
 ) -> Option<i32> {
     let port = svc.port.as_ref()?;
     if let Some(n) = port.number {

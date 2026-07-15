@@ -8,11 +8,9 @@
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
 kind: CoxswainRelayPolicy
 metadata:
-  name: e2e-relay-autoscale-${TESTNS}
+  name: e2e-relay-autoscale
+  namespace: ${TESTNS}
 spec:
-  namespaceSelector:
-    matchLabels:
-      kubernetes.io/metadata.name: ${TESTNS}
   enabled: true
   autoscaling:
     enabled: true

@@ -24,6 +24,7 @@
 //! changes nothing about *what* gets routed, only *when* the work happens.
 
 use super::cache::{PartitionCache, PartitionKey};
+use crate::MergedStore;
 use crate::endpoints::pool::EndpointCache;
 use crate::gateway_api::{
     self, GrpcRouteResolution, ListenerBinding, RouteResolution, compute_grpc_listener_bindings,
@@ -32,7 +33,6 @@ use crate::gateway_api::{
 use crate::gw_types::{GrpcRoute, HttpRoute};
 use crate::keys::ListenerKey;
 use k8s_openapi::api::core::v1::Service;
-use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -43,7 +43,7 @@ pub(crate) struct GatewayPartitionInputs<'a> {
     pub(crate) grpc_routes: &'a [Arc<GrpcRoute>],
     pub(crate) listener_info: &'a HashMap<ListenerKey, ListenerBinding>,
     pub(crate) endpoint_cache: &'a EndpointCache,
-    pub(crate) services: &'a reflector::Store<Service>,
+    pub(crate) services: &'a MergedStore<Service>,
     pub(crate) resolution: &'a RouteResolution<'a>,
     pub(crate) grpc_resolution: &'a GrpcRouteResolution<'a>,
     pub(crate) global_epoch: u64,

@@ -174,32 +174,40 @@ impl ReflectorMetrics {
         watch_errors_total().with_label_values(&[kind]).inc();
     }
 
-    /// Record relist *progress* for `kind` — an `Event::Init` (relist began) or
-    /// `Event::InitApply` (an object streamed in during the list phase).
+    /// Record relist *progress* for one `(kind, namespace)` reflector — an
+    /// `Event::Init` (relist began) or `Event::InitApply` (an object streamed in
+    /// during the list phase). `ns` is the watched namespace, or `""` for a
+    /// cluster-wide / cluster-scoped watch (multi-namespace watch, #59, spawns
+    /// one reflector per namespace under a shared `kind`).
     ///
-    /// Controller-only. Marks the kind's relist in-flight and (re)starts its
-    /// stall timer at now, so the liveness backstop (#573) measures time since
-    /// the *last* progress, not since the relist began. A relist that keeps
-    /// streaming objects — or keeps retrying its LIST — never looks stalled; only
-    /// one truly frozen mid-relist (no further progress, no `InitDone`) does.
-    pub fn observe_relist_progress(&self, kind: &'static str) {
+    /// Controller-only. Marks that namespace's relist in-flight and (re)starts
+    /// its stall timer at now, so the liveness backstop (#573) measures time
+    /// since the *last* progress, not since the relist began. A relist that
+    /// keeps streaming objects — or keeps retrying its LIST — never looks
+    /// stalled; only one truly frozen mid-relist (no further progress, no
+    /// `InitDone`) does. The per-kind wedge signal rolls up across namespaces:
+    /// a kind is in flight while *any* of its namespaces is relisting.
+    pub fn observe_relist_progress(&self, kind: &'static str, ns: &str) {
         if !matches!(self.prefix, MetricsPrefix::Controller) {
             return;
         }
-        relist_registry().progress(kind, tokio::time::Instant::now());
+        relist_registry().progress(kind, ns, tokio::time::Instant::now());
     }
 
-    /// Record that a watch relist *completed* (`Event::InitDone`) for `kind`.
+    /// Record that a watch relist *completed* (`Event::InitDone`) for one
+    /// `(kind, namespace)` reflector. `ns` is the watched namespace, or `""` for
+    /// a cluster-wide / cluster-scoped watch.
     ///
-    /// Controller-only. Clears the in-flight state (`watch_relists_pending{kind}`
-    /// → 0) and arms the backstop for that kind — a kind is only eligible to trip
-    /// liveness once it has completed at least one relist, so a slow cold-start
-    /// initial sync is never mistaken for a wedge.
-    pub fn observe_relist_completed(&self, kind: &'static str) {
+    /// Controller-only. Clears that namespace's in-flight state and arms it — a
+    /// namespace is only eligible to trip liveness once it has completed at
+    /// least one relist, so a slow cold-start initial sync is never mistaken for
+    /// a wedge. The per-kind gauge (`watch_relists_pending{kind}`) drops to 0
+    /// only once *every* watched namespace of the kind has left in-flight.
+    pub fn observe_relist_completed(&self, kind: &'static str, ns: &str) {
         if !matches!(self.prefix, MetricsPrefix::Controller) {
             return;
         }
-        relist_registry().completed(kind);
+        relist_registry().completed(kind, ns);
     }
 }
 
@@ -218,7 +226,7 @@ pub const RELIST_STUCK_WINDOW: Duration = Duration::from_secs(150);
 /// Poll cadence of the relist liveness monitor.
 const RELIST_MONITOR_TICK: Duration = Duration::from_secs(15);
 
-/// Per-kind relist state.
+/// Per-`(kind, namespace)` relist state.
 ///
 /// The wedge signal is deliberately **not** a cumulative `started - completed`
 /// diff: kube's watcher emits an `Event::Init` on every relist *attempt* but an
@@ -228,59 +236,97 @@ const RELIST_MONITOR_TICK: Duration = Duration::from_secs(15);
 /// instant, refreshed on every progress event and cleared on `InitDone`. A
 /// frozen relist stops refreshing it; a retrying or streaming one keeps it
 /// current.
+///
+/// Multi-namespace watch (#59) runs one reflector per watched namespace under a
+/// shared `kind`, so state is keyed by `(kind, namespace)` and rolled up to a
+/// per-kind verdict in [`RelistRegistry::snapshot`]: a kind is in flight while
+/// *any* namespace is relisting, armed only once *every* namespace has completed
+/// one relist, and trips liveness if *any* armed namespace stalls.
 #[derive(Default, Clone, Copy)]
 struct KindRelist {
     /// When the current in-flight relist last made progress, or `None` once the
     /// relist has completed (`InitDone`). `Some` and old = stalled.
     in_flight_since: Option<tokio::time::Instant>,
-    /// A kind is "armed" once it has completed at least one relist. Until then a
-    /// slow cold-start initial sync would look identical to a wedge, so the
-    /// backstop ignores it.
+    /// This namespace is "armed" once it has completed at least one relist.
+    /// Until then a slow cold-start initial sync would look identical to a
+    /// wedge, so the backstop ignores it.
     armed: bool,
 }
 
-/// Process-global relist accounting, keyed by the reflector `kind` label.
+/// Process-global relist accounting, keyed by `(kind, namespace)`. `namespace`
+/// is the watched namespace, or `""` for a cluster-wide / cluster-scoped watch
+/// (the single-store case, where there is exactly one entry per kind and the
+/// rollup is a no-op).
 struct RelistRegistry {
-    kinds: parking_lot::Mutex<std::collections::HashMap<&'static str, KindRelist>>,
+    entries: parking_lot::Mutex<std::collections::HashMap<(&'static str, String), KindRelist>>,
 }
 
 fn relist_registry() -> &'static RelistRegistry {
     static R: OnceLock<RelistRegistry> = OnceLock::new();
     R.get_or_init(|| RelistRegistry {
-        kinds: parking_lot::Mutex::new(std::collections::HashMap::new()),
+        entries: parking_lot::Mutex::new(std::collections::HashMap::new()),
     })
 }
 
 impl RelistRegistry {
-    /// A relist made progress (`Init` or `InitApply`) for `kind` at `now`.
-    fn progress(&self, kind: &'static str, now: tokio::time::Instant) {
-        let mut kinds = self.kinds.lock();
-        kinds.entry(kind).or_default().in_flight_since = Some(now);
-        drop(kinds);
-        set_relist_in_flight(kind, true);
+    /// A relist made progress (`Init` or `InitApply`) for `(kind, ns)` at `now`.
+    fn progress(&self, kind: &'static str, ns: &str, now: tokio::time::Instant) {
+        let mut entries = self.entries.lock();
+        entries
+            .entry((kind, ns.to_string()))
+            .or_default()
+            .in_flight_since = Some(now);
+        let any_in_flight = Self::any_in_flight(&entries, kind);
+        drop(entries);
+        set_relist_in_flight(kind, any_in_flight);
     }
 
-    /// A relist completed (`InitDone`) for `kind`: clears in-flight and arms it.
-    fn completed(&self, kind: &'static str) {
-        let mut kinds = self.kinds.lock();
-        let entry = kinds.entry(kind).or_default();
+    /// A relist completed (`InitDone`) for `(kind, ns)`: clears that namespace's
+    /// in-flight state and arms it. The kind's gauge drops to 0 only once every
+    /// watched namespace has left in-flight.
+    fn completed(&self, kind: &'static str, ns: &str) {
+        let mut entries = self.entries.lock();
+        let entry = entries.entry((kind, ns.to_string())).or_default();
         entry.in_flight_since = None;
         entry.armed = true;
-        drop(kinds);
-        set_relist_in_flight(kind, false);
+        let any_in_flight = Self::any_in_flight(&entries, kind);
+        drop(entries);
+        set_relist_in_flight(kind, any_in_flight);
     }
 
-    /// `(kind, stalled_for, armed)` for every kind: `stalled_for` is how long the
-    /// kind's in-flight relist has gone without progress, or `None` if no relist
-    /// is in flight.
-    fn snapshot(&self, now: tokio::time::Instant) -> Vec<(&'static str, Option<Duration>, bool)> {
-        self.kinds
-            .lock()
+    /// Whether any namespace of `kind` currently has a relist in flight.
+    fn any_in_flight(
+        entries: &std::collections::HashMap<(&'static str, String), KindRelist>,
+        kind: &'static str,
+    ) -> bool {
+        entries
             .iter()
-            .map(|(kind, r)| {
-                let stalled_for = r.in_flight_since.map(|since| now.duration_since(since));
-                (*kind, stalled_for, r.armed)
-            })
+            .filter(|((k, _), _)| *k == kind)
+            .any(|(_, r)| r.in_flight_since.is_some())
+    }
+
+    /// `(kind, stalled_for, armed)` for every kind, rolled up across its watched
+    /// namespaces: `stalled_for` is the *longest* any in-flight namespace has
+    /// gone without progress (`None` if none is in flight), and `armed` is true
+    /// only once *every* namespace of the kind has completed one relist. This
+    /// makes the backstop trip on the worst-stalled namespace while a large
+    /// multi-namespace cold start never trips before all namespaces sync.
+    fn snapshot(&self, now: tokio::time::Instant) -> Vec<(&'static str, Option<Duration>, bool)> {
+        let entries = self.entries.lock();
+        let mut by_kind: std::collections::HashMap<&'static str, (Option<Duration>, bool)> =
+            std::collections::HashMap::new();
+        for ((kind, _ns), r) in entries.iter() {
+            let stalled_for = r.in_flight_since.map(|since| now.duration_since(since));
+            let slot = by_kind.entry(kind).or_insert((None, true));
+            slot.0 = match (slot.0, stalled_for) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (existing, incoming) => existing.or(incoming),
+            };
+            slot.1 = slot.1 && r.armed;
+        }
+        by_kind
+            .into_iter()
+            .map(|(kind, (stalled_for, armed))| (kind, stalled_for, armed))
             .collect()
     }
 }
@@ -569,7 +615,7 @@ mod tests {
 
     fn fresh_registry() -> RelistRegistry {
         RelistRegistry {
-            kinds: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            entries: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -588,14 +634,14 @@ mod tests {
         let now = tokio::time::Instant::now();
         // Cold start: a relist begins, none completed → in flight, NOT armed. A
         // slow initial sync must not look like a wedge to the backstop.
-        reg.progress("k", now);
+        reg.progress("k", "", now);
         assert_eq!(
             state(&reg, "k", now),
             (true, false),
             "an uncompleted first relist is in flight but not yet armed"
         );
         // Relist completes → not in flight, now armed.
-        reg.completed("k");
+        reg.completed("k", "");
         assert_eq!(
             state(&reg, "k", now),
             (false, true),
@@ -603,7 +649,7 @@ mod tests {
         );
         // A second relist starts and never completes → in flight again, still armed.
         // This is the #573 wedge shape the monitor watches for.
-        reg.progress("k", now);
+        reg.progress("k", "", now);
         assert_eq!(
             state(&reg, "k", now),
             (true, true),
@@ -620,11 +666,11 @@ mod tests {
         // clear cleanly once the retry finally completes.
         let reg = fresh_registry();
         let now = tokio::time::Instant::now();
-        reg.progress("k", now); // Init (attempt 1)
-        reg.completed("k"); // arm
-        reg.progress("k", now); // Init (attempt 2 — LIST fails before InitDone)
-        reg.progress("k", now); // Init (attempt 3 — retry)
-        reg.completed("k"); // InitDone at last
+        reg.progress("k", "", now); // Init (attempt 1)
+        reg.completed("k", ""); // arm
+        reg.progress("k", "", now); // Init (attempt 2 — LIST fails before InitDone)
+        reg.progress("k", "", now); // Init (attempt 3 — retry)
+        reg.completed("k", ""); // InitDone at last
         assert_eq!(
             state(&reg, "k", now),
             (false, true),

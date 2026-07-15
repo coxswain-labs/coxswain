@@ -1,5 +1,6 @@
 //! Translates `HTTPRouteRule` filter specs into [`FilterAction`][coxswain_core::routing::FilterAction]s.
 
+use crate::MergedStore;
 use crate::endpoints::pool::EndpointCache;
 use crate::gw_types::v::grpcroutes::{GrpcRouteRulesFilters, GrpcRouteRulesFiltersType};
 use crate::gw_types::v::httproutes::{
@@ -32,7 +33,7 @@ pub(super) use super::ip_access_control::CidrSet;
 /// `RequestMirror`).
 pub(super) struct BackendStores<'a> {
     pub(super) endpoint_cache: &'a EndpointCache,
-    pub(super) services: &'a reflector::Store<Service>,
+    pub(super) services: &'a MergedStore<Service>,
     pub(super) grants: &'a HashSet<ReferenceGrantKey>,
 }
 
@@ -130,7 +131,7 @@ pub(super) fn build_filters(
     matched_prefix: &str,
     is_prefix_match: bool,
     route_ns: &str,
-    path_rewrites: &reflector::Store<coxswain_core::crd::PathRewriteRegex>,
+    path_rewrites: &MergedStore<coxswain_core::crd::PathRewriteRegex>,
     stores: &BackendStores<'_>,
 ) -> Vec<FilterAction> {
     let mut out = Vec::new();
@@ -706,7 +707,7 @@ pub(super) fn build_backend_ref_filters(
 pub(super) fn resolve_rate_limit<F: ExtRefFilter>(
     filters: &[F],
     route_ns: &str,
-    rate_limits: &reflector::Store<RateLimit>,
+    rate_limits: &MergedStore<RateLimit>,
 ) -> Option<Arc<RateLimitConfig>> {
     ext_refs(filters)
         .find_map(
@@ -733,7 +734,7 @@ pub(super) fn resolve_rate_limit_ref(
     ext_kind: &str,
     ext_name: &str,
     route_ns: &str,
-    rate_limits: &reflector::Store<RateLimit>,
+    rate_limits: &MergedStore<RateLimit>,
 ) -> RefResolution<Arc<RateLimitConfig>> {
     if ext_group != super::COXSWAIN_GROUP || ext_kind != "RateLimit" {
         return RefResolution::NotMine;
@@ -771,7 +772,7 @@ pub(super) fn resolve_rate_limit_ref(
 pub(super) fn resolve_retry_policy<F: ExtRefFilter>(
     filters: &[F],
     route_ns: &str,
-    retry_policies: &reflector::Store<RetryPolicy>,
+    retry_policies: &MergedStore<RetryPolicy>,
     is_grpc: bool,
 ) -> RetryPolicyConfig {
     ext_refs(filters)
@@ -793,7 +794,7 @@ fn resolve_retry_policy_ref(
     ext_kind: &str,
     ext_name: &str,
     route_ns: &str,
-    retry_policies: &reflector::Store<RetryPolicy>,
+    retry_policies: &MergedStore<RetryPolicy>,
     is_grpc: bool,
 ) -> RefResolution<RetryPolicyConfig> {
     if ext_group != super::COXSWAIN_GROUP || ext_kind != "RetryPolicy" {
@@ -827,7 +828,7 @@ fn resolve_retry_policy_ref(
 pub(super) fn resolve_ip_access<F: ExtRefFilter>(
     filters: &[F],
     route_ns: &str,
-    ip_access: &reflector::Store<IpAccessControl>,
+    ip_access: &MergedStore<IpAccessControl>,
 ) -> (CidrSet, CidrSet) {
     ext_refs(filters)
         .find_map(
@@ -854,7 +855,7 @@ pub(super) fn resolve_ip_access_ref(
     ext_kind: &str,
     ext_name: &str,
     route_ns: &str,
-    ip_access: &reflector::Store<IpAccessControl>,
+    ip_access: &MergedStore<IpAccessControl>,
 ) -> RefResolution<(CidrSet, CidrSet)> {
     if ext_group != super::COXSWAIN_GROUP || ext_kind != "IpAccessControl" {
         return RefResolution::NotMine;
@@ -889,8 +890,8 @@ pub(super) fn resolve_ip_access_ref(
 pub(super) fn resolve_basic_auth<F: ExtRefFilter>(
     filters: &[F],
     route_ns: &str,
-    basic_auths: &reflector::Store<BasicAuth>,
-    auth_secrets: &reflector::Store<Secret>,
+    basic_auths: &MergedStore<BasicAuth>,
+    auth_secrets: &MergedStore<Secret>,
     secret_grants: &HashSet<ReferenceGrantKey>,
 ) -> Option<Arc<IngressAuthConfig>> {
     // `FailOpen` (missing CR) maps to `None` — unlike the other resolvers, basic-auth
@@ -916,8 +917,8 @@ pub(super) fn resolve_basic_auth<F: ExtRefFilter>(
 pub(super) fn resolve_external_auth<F: ExtRefFilter>(
     filters: &[F],
     route_ns: &str,
-    external_auths: &reflector::Store<CoxswainExternalAuth>,
-    services: &reflector::Store<Service>,
+    external_auths: &MergedStore<CoxswainExternalAuth>,
+    services: &MergedStore<Service>,
     endpoint_cache: &EndpointCache,
     grants: &HashSet<ReferenceGrantKey>,
 ) -> Option<Arc<IngressAuthConfig>> {
@@ -956,7 +957,7 @@ pub(super) fn resolve_external_auth<F: ExtRefFilter>(
 pub(super) fn resolve_jwt_auth<F: ExtRefFilter>(
     filters: &[F],
     route_ns: &str,
-    jwt_auths: &reflector::Store<coxswain_core::crd::JwtAuth>,
+    jwt_auths: &MergedStore<coxswain_core::crd::JwtAuth>,
     jwks_cache: &crate::jwks::SharedJwksCache,
 ) -> Option<Arc<IngressAuthConfig>> {
     ext_refs(filters).find_map(|(g, k, n)| {
@@ -994,8 +995,8 @@ pub(super) fn resolve_basic_auth_ref(
     ext_kind: &str,
     ext_name: &str,
     route_ns: &str,
-    basic_auths: &reflector::Store<BasicAuth>,
-    auth_secrets: &reflector::Store<Secret>,
+    basic_auths: &MergedStore<BasicAuth>,
+    auth_secrets: &MergedStore<Secret>,
     secret_grants: &HashSet<ReferenceGrantKey>,
 ) -> RefResolution<Arc<IngressAuthConfig>> {
     if ext_group != super::COXSWAIN_GROUP || ext_kind != "BasicAuth" {
@@ -1095,7 +1096,7 @@ pub(super) fn resolve_basic_auth_ref(
 pub(super) fn resolve_request_size_limit<F: ExtRefFilter>(
     filters: &[F],
     route_ns: &str,
-    request_size_limits: &reflector::Store<RequestSizeLimit>,
+    request_size_limits: &MergedStore<RequestSizeLimit>,
 ) -> Option<u64> {
     ext_refs(filters)
         .find_map(|(g, k, n)| {
@@ -1120,7 +1121,7 @@ pub(super) fn resolve_request_size_limit_ref(
     ext_kind: &str,
     ext_name: &str,
     route_ns: &str,
-    request_size_limits: &reflector::Store<RequestSizeLimit>,
+    request_size_limits: &MergedStore<RequestSizeLimit>,
 ) -> RefResolution<u64> {
     if ext_group != super::COXSWAIN_GROUP || ext_kind != "RequestSizeLimit" {
         return RefResolution::NotMine;
@@ -1161,7 +1162,7 @@ pub(super) fn resolve_request_size_limit_ref(
 pub(super) fn resolve_compression<F: ExtRefFilter>(
     filters: &[F],
     route_ns: &str,
-    compressions: &reflector::Store<Compression>,
+    compressions: &MergedStore<Compression>,
 ) -> Option<Arc<CompressionConfig>> {
     ext_refs(filters)
         .find_map(
@@ -1186,7 +1187,7 @@ pub(super) fn resolve_compression_ref(
     ext_kind: &str,
     ext_name: &str,
     route_ns: &str,
-    compressions: &reflector::Store<Compression>,
+    compressions: &MergedStore<Compression>,
 ) -> RefResolution<Arc<CompressionConfig>> {
     if ext_group != super::COXSWAIN_GROUP || ext_kind != "Compression" {
         return RefResolution::NotMine;

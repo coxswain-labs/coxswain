@@ -86,6 +86,7 @@ pub mod ingress;
 pub mod jwks;
 pub mod k8s_utils;
 pub mod keys;
+pub mod merged_store;
 pub mod metrics;
 pub mod port_alloc;
 pub mod reconciler;
@@ -102,6 +103,8 @@ pub use coxswain_core::fleet::SharedFleet;
 pub use crds::gateway_api_crds_present;
 pub use ingress::IngressPorts;
 pub use jwks::SharedJwksCache;
+pub use k8s_utils::{WatchScope, WatchScopeError};
+pub use merged_store::MergedStore;
 pub use metrics::{MetricsPrefix, ReflectorMetrics};
 pub use reconciler::listener_merge::{EffectiveListenerPort, effective_listener_ports};
 pub use reconciler::{

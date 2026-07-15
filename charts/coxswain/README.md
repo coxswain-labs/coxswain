@@ -49,7 +49,7 @@ All values can be overridden with `--set key=value` or a custom `values.yaml`.
 | `controller.podDisruptionBudget.enabled` | `true` | Provision a PDB for the controller (effective when `replicas ≥ 2`) |
 | `controller.podDisruptionBudget.maxUnavailable` | `1` | Maximum disrupted controller pods during voluntary disruptions |
 | `controller.name` | `coxswain-labs.dev/gateway-controller` | GatewayClass controllerName to claim |
-| `controller.watchNamespace` | `""` (cluster-wide) | Restrict to a single namespace |
+| `watchNamespace` | `""` (cluster-wide) | Restrict the controller to one namespace, or a comma-separated list (`ns1,ns2,ns3`). Enables namespaced-Role RBAC lockdown |
 | `controller.statusAddress` | `""` | External IP/hostname written to Ingress/Gateway status |
 | `controller.ingressDefaultBackend` | `""` | Fallback backend (`<ns>/<svc>:<port>`) |
 | `controller.gatewayApi.enabled` | `true` | Enable Gateway API surface (HTTPRoute, GatewayClass, etc.) |

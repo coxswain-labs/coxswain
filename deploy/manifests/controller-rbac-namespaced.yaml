@@ -1,0 +1,201 @@
+# Least-privilege RBAC for a namespace-scoped controller (issue #59).
+#
+# Use this pattern when the controller runs with
+# `--watch-namespace=<ns1>,<ns2>,...` (Helm: `controller.watchNamespace`). It
+# replaces the cluster-wide read rules of `controller-rbac.yaml` with a
+# namespaced `Role` + `RoleBinding` in EACH watched namespace, so the
+# controller's ServiceAccount cannot read Secrets, routes, or policies outside
+# the listed namespaces. Verify with:
+#
+#   kubectl auth can-i list secrets -A \
+#     --as=system:serviceaccount:coxswain-system:coxswain-controller
+#   # -> "no" outside the watched namespaces
+#
+# This file shows the split for ONE watched namespace, `team-a`. Replicate the
+# Role + RoleBinding (only) for every additional watched namespace; the
+# ServiceAccount and ClusterRole are created once. Do NOT also apply
+# `controller-rbac.yaml` — its cluster-wide `ClusterRole` would defeat the
+# lockdown.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: coxswain-controller
+  namespace: coxswain-system
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+
+---
+# Cluster-scoped reads the controller ALWAYS needs, regardless of watch scope:
+# these resources are cluster-scoped (no namespace) or deliberately watched
+# cluster-wide (their objects may live outside any watched namespace).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: coxswain-controller-cluster
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+rules:
+  # Namespace labels back the GEP-1713 `allowedListeners` cross-namespace gate.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  # Cluster-scoped Nodes: the dedicated Gateway status writer reads Node IPs for
+  # NodePort-typed dedicated Services (#211).
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  # TokenReview is cluster-scoped and write-only (SVID bootstrap, #423).
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+  # Cluster-scoped IngressClass.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingressclasses"]
+    verbs: ["get", "list", "watch"]
+  # Cluster-scoped GatewayClass (+ its status subresource).
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gatewayclasses/status"]
+    verbs: ["patch", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: coxswain-controller-cluster
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+subjects:
+  - kind: ServiceAccount
+    name: coxswain-controller
+    namespace: coxswain-system
+roleRef:
+  kind: ClusterRole
+  name: coxswain-controller-cluster
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Namespaced reads + status writes + provisioning writes, granted PER watched
+# namespace. Replicate this Role and the RoleBinding below for every namespace
+# in `--watch-namespace` (here: `team-a`) AND for `coxswain-system` itself — the
+# controller also watches `services`, `pods`, and the params CRs there
+# (`--watch-namespace` is widened by the controller's own namespace for those
+# resources): the per-Gateway shared-VIP Services (#472) and shared-proxy fleet
+# pods live in `coxswain-system`, and a GatewayClass-default `parametersRef`
+# commonly does too.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: coxswain-controller
+  namespace: team-a
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+rules:
+  # Backend existence + endpoint resolution + TLS/CA material. `services`,
+  # `serviceaccounts`, `configmaps` carry write verbs because the provisioning
+  # operator and trust-bundle publisher server-side-apply them in this namespace
+  # (#208, #423). `secrets` is read-only.
+  - apiGroups: [""]
+    resources: ["services", "serviceaccounts", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  # Dedicated-proxy Pods + logs (#210, #211, #285). The controller watches Pods
+  # only in the watched namespaces + `coxswain-system` (the fleet/shared-proxy
+  # pods), so this is a namespaced read — no cluster-wide `pods` grant.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  # Ingress surface (+ status).
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses/status"]
+    verbs: ["patch", "update"]
+  # Gateway API routes/policies (read) + Gateway finalizer management (#209).
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      ["httproutes", "grpcroutes", "tlsroutes", "tcproutes", "udproutes", "referencegrants", "backendtlspolicies", "listenersets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["gateways"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      ["gateways/status", "httproutes/status", "grpcroutes/status", "tlsroutes/status", "tcproutes/status", "udproutes/status", "backendtlspolicies/status", "listenersets/status"]
+    verbs: ["patch", "update"]
+  # coxswain CRDs: route-scoped ExtensionRef filters + attached policies (read),
+  # plus status writes for the policy CRDs that carry `status.ancestors[]`.
+  # `coxswainrelaypolicies` is namespaced and watched only in the tenant namespaces
+  # (a relay policy governs its own namespace) — so, unlike `coxswaingatewayparameters`
+  # / `coxswainingressclassparameters`, it does NOT need a grant in `coxswain-system`.
+  - apiGroups: ["gateway.coxswain-labs.dev"]
+    resources:
+      ["coxswaingatewayparameters", "coxswainrelaypolicies", "clienttrafficpolicies", "coxswainbackendpolicies", "coxswainexternalauths", "ratelimits", "retrypolicies", "pathrewriteregexes", "ipaccesscontrols", "basicauths", "requestsizelimits", "compressions", "jwtauths"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["ingress.coxswain-labs.dev"]
+    resources: ["coxswainingressclassparameters"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.coxswain-labs.dev"]
+    resources: ["clienttrafficpolicies/status", "coxswainbackendpolicies/status", "coxswainexternalauths/status"]
+    verbs: ["patch", "update"]
+  # Dedicated-proxy provisioning: Deployments, HPA, PDB (server-side-applied /
+  # deleted per reconcile, #208/#497).
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Conflict / invalid-annotation diagnostics as Warning Events (#390, #401).
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: coxswain-controller
+  namespace: team-a
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/component: controller
+subjects:
+  - kind: ServiceAccount
+    name: coxswain-controller
+    namespace: coxswain-system
+roleRef:
+  kind: Role
+  name: coxswain-controller
+  apiGroup: rbac.authorization.k8s.io
+
+---
+# Apply the Role + RoleBinding above once per watched namespace, and once in
+# `coxswain-system` (for the `services`, `pods`, and params the controller reads
+# and provisions there). In `coxswain-system` you may trim the Role to just
+# `services` (needs the create/update/patch/delete verbs — the operator
+# provisions the shared-VIP Services here), `pods`, `pods/log`,
+# `coxswaingatewayparameters`, and `coxswainingressclassparameters` if no tenant
+# workloads live there.
+#
+# Leader-election Leases + leader pod-label management also live in
+# `coxswain-system` (unchanged from `controller-rbac.yaml`): apply that file's
+# `coxswain-controller-leader-election` Role + RoleBinding alongside this one.

@@ -271,47 +271,14 @@ async fn namespace_relay_not_provisioned_below_threshold() -> anyhow::Result<()>
 // ── CoxswainRelayPolicy (#589) — per-namespace relay override + tuning ────────
 //
 // Also global-config mutators (relay.dedicated.*), so they run in the serial
-// pass. Policies are cluster-scoped; each fixture's namespaceSelector pins the
-// policy to its own test namespace by the built-in `kubernetes.io/metadata.name`
-// label, and a RelayPolicyGuard deletes it on drop so it never leaks into a
-// sibling test.
+// pass. `CoxswainRelayPolicy` is namespaced (#59): each fixture applies the policy
+// into its own test namespace, so it governs only that namespace's relay and is
+// cleaned up by the `NamespaceGuard`'s cascade delete — no separate policy guard.
 
-/// Deletes a cluster-scoped `CoxswainRelayPolicy` on drop via `kubectl`, on a
-/// joined thread so cleanup completes before the (process-per-test) test exits —
-/// the cluster-scoped analogue of `NamespaceGuard`'s independent-runtime delete.
-/// Bind it to a named local (`let _guard = …`), never `let _ = …` (which would
-/// drop it immediately).
-#[must_use = "bind the guard to a local so the cluster-scoped policy is deleted at end of scope"]
-struct RelayPolicyGuard {
-    name: String,
-}
-
-impl Drop for RelayPolicyGuard {
-    fn drop(&mut self) {
-        let name = self.name.clone();
-        // kubectl is a subprocess (no kube Client / tokio runtime to bind), so a plain
-        // blocking delete on a joined thread is sufficient and panic-safe.
-        let _ = std::thread::spawn(move || {
-            let _ = std::process::Command::new("kubectl")
-                .args(["delete", "coxswainrelaypolicy", &name, "--ignore-not-found"])
-                .status();
-        })
-        .join();
-    }
-}
-
-/// Apply a relay-policy fixture (selector-pinned to `ns`) and return a guard that
-/// deletes the resulting cluster-scoped policy. `name_prefix` must match the
-/// fixture's `metadata.name` prefix (the fixture appends `-<ns>`).
-async fn apply_relay_policy(
-    fixture: &str,
-    name_prefix: &str,
-    ns: &str,
-) -> anyhow::Result<RelayPolicyGuard> {
-    fixtures::apply_fixture(fixture, FixtureVars::new(ns)).await?;
-    Ok(RelayPolicyGuard {
-        name: format!("{name_prefix}-{ns}"),
-    })
+/// Apply a relay-policy fixture into `ns` (the fixture's `metadata.namespace` is
+/// `${TESTNS}`). The policy is namespaced, so it dies with the namespace.
+async fn apply_relay_policy(fixture: &str, ns: &str) -> anyhow::Result<()> {
+    fixtures::apply_fixture(fixture, FixtureVars::new(ns)).await
 }
 
 /// Poll until the relay Deployment exists with exactly `expected` `spec.replicas`.
@@ -361,12 +328,7 @@ async fn relay_policy_force_on_provisions_relay_with_overrides() -> anyhow::Resu
     })
     .await?;
     let ns = NamespaceGuard::create(&h.client, "relay-pol-on").await?;
-    let _policy = apply_relay_policy(
-        dedicated::RELAY_POLICY_FORCE_ON,
-        "e2e-relay-force-on",
-        &ns.name,
-    )
-    .await?;
+    apply_relay_policy(dedicated::RELAY_POLICY_FORCE_ON, &ns.name).await?;
 
     apply_and_wait(&h, &ns).await?;
 
@@ -419,12 +381,7 @@ async fn relay_policy_force_off_gcs_provisioned_relay() -> anyhow::Result<()> {
 
     // Force-off vetoes it — the policy change re-drives the Gateway reconcile, whose
     // relay convergence now sees `enabled: false` and GCs the relay.
-    let _policy = apply_relay_policy(
-        dedicated::RELAY_POLICY_FORCE_OFF,
-        "e2e-relay-force-off",
-        &ns.name,
-    )
-    .await?;
+    apply_relay_policy(dedicated::RELAY_POLICY_FORCE_OFF, &ns.name).await?;
     wait::poll_until(
         Duration::from_secs(60),
         wait::POLL,
@@ -454,12 +411,7 @@ async fn relay_policy_autoscaling_sizes_relay_without_hpa() -> anyhow::Result<()
     })
     .await?;
     let ns = NamespaceGuard::create(&h.client, "relay-pol-hpa").await?;
-    let _policy = apply_relay_policy(
-        dedicated::RELAY_POLICY_AUTOSCALING,
-        "e2e-relay-autoscale",
-        &ns.name,
-    )
-    .await?;
+    apply_relay_policy(dedicated::RELAY_POLICY_AUTOSCALING, &ns.name).await?;
 
     apply_and_wait(&h, &ns).await?;
 
@@ -482,12 +434,7 @@ async fn relay_policy_uncapped_autoscaling_falls_back_to_static() -> anyhow::Res
     })
     .await?;
     let ns = NamespaceGuard::create(&h.client, "relay-pol-uncapped").await?;
-    let _policy = apply_relay_policy(
-        dedicated::RELAY_POLICY_AUTOSCALING_UNCAPPED,
-        "e2e-relay-uncapped",
-        &ns.name,
-    )
-    .await?;
+    apply_relay_policy(dedicated::RELAY_POLICY_AUTOSCALING_UNCAPPED, &ns.name).await?;
 
     apply_and_wait(&h, &ns).await?;
 
@@ -1538,6 +1485,96 @@ async fn ingress_disabled_skips_ingress_reconcile() -> anyhow::Result<()> {
         ..Default::default()
     })
     .await?;
+
+    Ok(())
+}
+
+// ── #59 — Multi-namespace watch scope ────────────────────────────────────────
+
+/// #59 — `--watch-namespace=ns1,ns2` scopes the controller's namespaced watches
+/// to exactly the listed namespaces: HTTPRoutes in a listed namespace serve, an
+/// identical HTTPRoute in an *unlisted* namespace is never observed and never
+/// programs.
+///
+/// Global-config mutator (reconfigures the shared controller via
+/// `start_with_options`), so it runs in the serial pass. The three namespaces
+/// are created BEFORE the controller starts (their names feed `watchNamespace`)
+/// and use `create_persistent` so the `start_with_options` bootstrap purge does
+/// not delete them mid-test.
+///
+/// Happy + sad in one test on the shared (expensive) reconfigure: the same
+/// Gateway + HTTPRoute + echo backend is applied to all three namespaces; the
+/// two listed ones must serve (backend identity asserted), the unlisted one must
+/// 404. Waiting for the listed routes to serve first proves the controller has
+/// completed a full reconcile over its watched set — so the unlisted namespace's
+/// 404 is proof of *ignored*, not merely *not-yet-ready*.
+///
+/// At the end the chart default (cluster-wide) is restored so later serial tests
+/// run with stock config.
+#[tokio::test]
+async fn watch_namespace_list_serves_listed_and_ignores_unlisted() -> anyhow::Result<()> {
+    // Namespaces must exist — and their names be known — before the controller
+    // is configured to watch them, so create them on a standalone client first.
+    let bootstrap_client = kube::Client::try_default().await?;
+    let watched_a = NamespaceGuard::create_persistent(&bootstrap_client, "prov-watch-a").await?;
+    let watched_b = NamespaceGuard::create_persistent(&bootstrap_client, "prov-watch-b").await?;
+    let unwatched = NamespaceGuard::create_persistent(&bootstrap_client, "prov-watch-c").await?;
+
+    // Scope the controller to two of the three namespaces.
+    let h = Harness::start_with_options(ControllerOptions {
+        watch_namespace: Some(format!("{},{}", watched_a.name, watched_b.name)),
+        ..Default::default()
+    })
+    .await?;
+
+    // Apply the same Gateway + HTTPRoute + echo backend into all three namespaces.
+    // The `path_matching` fixture derives its hostname from the namespace
+    // (`echo.${TESTNS}.local`), so each namespace gets a distinct host.
+    for ns in [&watched_a, &watched_b, &unwatched] {
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    }
+
+    // Happy path: routes in the two watched namespaces serve. Each shared-mode
+    // Gateway advertises its OWN per-Gateway VIP (#472), so reach it via
+    // `gateway_http` (the fixed Ingress `proxy_addr` behind `h.http` would not
+    // hit a Gateway listener). Confirm backend identity.
+    for ns in [&watched_a, &watched_b] {
+        let host = format!("echo.{}.local", ns.name);
+        let gw = h.gateway_http(&ns.name).await?;
+        wait::wait_for_route_status(&gw, &host, "/a", 200, Duration::from_secs(60)).await?;
+        gw.get(&host, "/a").await?.assert_backend("echo-a");
+    }
+
+    // Sad path: the Gateway in the unlisted namespace is never observed by the
+    // namespace-scoped controller, so it is never reconciled — asserted on the
+    // control plane (a Gateway in an unwatched namespace has no per-Gateway VIP
+    // to serve from, so serving isn't the signal here). The Gateway API admission
+    // webhook injects initial `Accepted/Programmed=Unknown` conditions with
+    // `observedGeneration=None`; coxswain always sets `observedGeneration` when it
+    // writes, so the absence of any condition with `observedGeneration` set proves
+    // coxswain never touched it (the same probe `gateway_api_disabled_*` uses).
+    // The happy-path waits above prove the controller completed a full reconcile
+    // over its watched set, so this is proof of *ignored*, not *not-yet-processed*.
+    let unwatched_gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &unwatched.name);
+    let gw = unwatched_gateways.get("coxswain-test").await?;
+    let conditions = gw
+        .status
+        .as_ref()
+        .and_then(|s| s.conditions.as_deref())
+        .unwrap_or(&[]);
+    let coxswain_reconciled = conditions.iter().any(|c| c.observed_generation.is_some());
+    assert!(
+        !coxswain_reconciled,
+        "Gateway in the unlisted namespace {} must be ignored by the namespace-scoped \
+         controller; initial 'Unknown' conditions from the admission webhook are expected, \
+         but none with observedGeneration set should appear. Got: {conditions:?}",
+        unwatched.name
+    );
+
+    // Restore the chart default (cluster-wide) so later serial tests run stock.
+    Harness::start_with_options(ControllerOptions::default()).await?;
 
     Ok(())
 }

@@ -1,26 +1,23 @@
 # Sample CoxswainRelayPolicy resource.
 #
-# Demonstrates every field of the v1alpha1 schema. Cluster-scoped: a policy with
-# a namespaceSelector overrides the controller's automatic relay decision for the
-# namespaces it matches; a policy with no selector is the cluster default.
+# Demonstrates every field of the v1alpha1 schema. Namespaced: the policy governs
+# the relay for its OWN namespace, overlaying the #584 global `--relay-*` defaults.
+# Place one in each namespace whose relay you want to tune.
 #
 # Apply:
 #   kubectl apply -f deploy/dev/sample-relay-policy.yaml
 #
 # Inspect:
-#   kubectl get coxswainrelaypolicies
-#   kubectl describe coxswainrelaypolicy/sample
+#   kubectl -n team-a get coxswainrelaypolicies
+#   kubectl -n team-a describe coxswainrelaypolicy/sample
 ---
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
 kind: CoxswainRelayPolicy
 metadata:
   name: sample
+  namespace: team-a
 spec:
-  # Only apply to namespaces labelled for high-scale dedicated tenancy.
-  namespaceSelector:
-    matchLabels:
-      coxswain-labs.dev/relay-tier: high-scale
-  # Force the relay on for matched namespaces regardless of the break-even threshold.
+  # Force the relay on for this namespace regardless of the break-even threshold.
   enabled: true
   # Static floor when autoscaling is off (or uncapped).
   replicas: 2

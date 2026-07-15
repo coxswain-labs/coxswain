@@ -10,7 +10,7 @@ spec:
     plural: coxswainrelaypolicies
     shortNames: []
     singular: coxswainrelaypolicy
-  scope: Cluster
+  scope: Namespaced
   versions:
   - additionalPrinterColumns: []
     name: v1alpha1
@@ -22,12 +22,12 @@ spec:
             description: |-
               Per-namespace parameters for the controller-provisioned dedicated relay.
 
-              Cluster-scoped with an optional [`Self::namespace_selector`]: a policy with no selector
-              is the cluster default applied to every relay-fronted namespace; a policy with a
-              selector overrides it for matched namespaces (most-specific wins — see the resolver in
-              `coxswain-controller`'s `operator::relay_params`). Every field is `Option` so a policy
-              overlays only the fields it sets, falling through to the cluster default and then the
-              #584 global controller-flag defaults.
+              Namespaced: the `CoxswainRelayPolicy` in a namespace governs that namespace's relay,
+              keyed by the object's own namespace (the `CoxswainGatewayParameters` model). Every
+              field is `Option` so a policy overlays only the fields it sets, falling through to the
+              #584 global controller-flag defaults (`--relay-*`) for the rest. At most one policy per
+              namespace is expected; if several exist the resolver in `coxswain-controller`'s
+              `operator::relay_params` picks the lexically-first by name and warn-logs the ambiguity.
             properties:
               autoscaling:
                 description: Opt-in, capped, controller-driven autoscaling for the relay. See [`RelayAutoscaling`].
@@ -81,41 +81,6 @@ spec:
                     direct-to-controller. Overrides hysteresis (an explicit operator intent).
                 nullable: true
                 type: boolean
-              namespaceSelector:
-                description: |-
-                  Namespaces this policy applies to. When omitted, the policy is the **cluster
-                  default** applied to every relay-fronted namespace. When set, the policy overrides
-                  the cluster default for namespaces whose labels match — most-specific policy wins
-                  (more selector terms, then lexical by name; ambiguous ties are warn-logged).
-                nullable: true
-                properties:
-                  matchExpressions:
-                    description: matchExpressions is a list of label selector requirements. The requirements are ANDed.
-                    items:
-                      description: A label selector requirement is a selector that contains values, a key, and an operator that relates the key and values.
-                      properties:
-                        key:
-                          description: key is the label key that the selector applies to.
-                          type: string
-                        operator:
-                          description: operator represents a key's relationship to a set of values. Valid operators are In, NotIn, Exists and DoesNotExist.
-                          type: string
-                        values:
-                          description: values is an array of string values. If the operator is In or NotIn, the values array must be non-empty. If the operator is Exists or DoesNotExist, the values array must be empty. This array is replaced during a strategic merge patch.
-                          items:
-                            type: string
-                          type: array
-                      required:
-                      - key
-                      - operator
-                      type: object
-                    type: array
-                  matchLabels:
-                    additionalProperties:
-                      type: string
-                    description: matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels map is equivalent to an element of matchExpressions, whose key field is "key", the operator is "In", and the values array contains only "value". The requirements are ANDed.
-                    type: object
-                type: object
               podTemplate:
                 description: |-
                   Raw partial `PodTemplateSpec` strategic-merged onto the controller-rendered relay

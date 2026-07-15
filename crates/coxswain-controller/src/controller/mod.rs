@@ -38,7 +38,7 @@ use coxswain_reflector::status::{
     SharedGatewayListenerStatus, SharedRouteStatus,
 };
 use coxswain_reflector::{
-    IngressEvent, OperatorStores, StatusKey, StatusKind, StatusStores, StatusWorkqueue,
+    IngressEvent, MergedStore, OperatorStores, StatusKey, StatusKind, StatusStores, StatusWorkqueue,
 };
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::{Client, runtime::reflector::ObjectRef};
@@ -787,7 +787,7 @@ async fn run_status_worker(
 
 /// Resolve a `StatusKey`'s object from its store, tolerating cluster-scoped
 /// resources (empty namespace) and objects deleted since enqueue.
-fn resolve<K>(store: &kube::runtime::reflector::Store<K>, key: &ObjectKey) -> Option<Arc<K>>
+fn resolve<K>(store: &MergedStore<K>, key: &ObjectKey) -> Option<Arc<K>>
 where
     K: kube::Resource + Clone + 'static,
     K::DynamicType: Eq + std::hash::Hash + Clone + Default,
@@ -907,7 +907,7 @@ async fn dispatch(
 /// rather than waiting for the reflector's next rebuild. The reflector enqueues
 /// the same set after each rebuild; the queue de-duplicates.
 fn enqueue_all_status(queue: &StatusWorkqueue, stores: &StatusStores) {
-    fn enq<K>(queue: &StatusWorkqueue, kind: StatusKind, store: &kube::runtime::reflector::Store<K>)
+    fn enq<K>(queue: &StatusWorkqueue, kind: StatusKind, store: &MergedStore<K>)
     where
         K: kube::Resource + Clone + 'static,
         K::DynamicType: Eq + std::hash::Hash + Clone + Default,
@@ -973,28 +973,28 @@ struct ReconcileContext {
     cbp_status: SharedCoxswainBackendPolicyStatus,
     external_auth_status: SharedCoxswainExternalAuthStatus,
     /// Synced GatewayClass store, read for Gateway ownership at reconcile time.
-    gateway_classes: kube::runtime::reflector::Store<GatewayClass>,
+    gateway_classes: MergedStore<GatewayClass>,
     /// Synced IngressClass store, read for Ingress ownership at reconcile time.
-    ingress_classes: kube::runtime::reflector::Store<IngressClass>,
+    ingress_classes: MergedStore<IngressClass>,
     /// Synced Gateway store, read by the ListenerSet reconciler to resolve a
     /// ListenerSet's parent Gateway and its ownership/mode (GEP-1713).
-    gateways: kube::runtime::reflector::Store<Gateway>,
+    gateways: MergedStore<Gateway>,
     /// Synced stores the unified worker (#574) resolves each drained
     /// [`StatusKey`] to its live object through, before dispatching to the
     /// matching `reconcile_*` handler. The three above (`gateways`,
     /// `gateway_classes`, `ingress_classes`) double as cross-lookup stores; the
     /// rest exist solely so the worker can fetch the primary object by key.
-    routes: kube::runtime::reflector::Store<HttpRoute>,
-    grpc_routes: kube::runtime::reflector::Store<GrpcRoute>,
-    tls_routes: kube::runtime::reflector::Store<TlsRoute>,
-    tcp_routes: kube::runtime::reflector::Store<TcpRoute>,
-    udp_routes: kube::runtime::reflector::Store<UdpRoute>,
-    ingresses: kube::runtime::reflector::Store<Ingress>,
-    listener_sets: kube::runtime::reflector::Store<ListenerSet>,
-    policies: kube::runtime::reflector::Store<BackendTlsPolicy>,
-    client_traffic_policies: kube::runtime::reflector::Store<ClientTrafficPolicy>,
-    coxswain_backend_policies: kube::runtime::reflector::Store<CoxswainBackendPolicy>,
-    coxswain_external_auths: kube::runtime::reflector::Store<CoxswainExternalAuth>,
+    routes: MergedStore<HttpRoute>,
+    grpc_routes: MergedStore<GrpcRoute>,
+    tls_routes: MergedStore<TlsRoute>,
+    tcp_routes: MergedStore<TcpRoute>,
+    udp_routes: MergedStore<UdpRoute>,
+    ingresses: MergedStore<Ingress>,
+    listener_sets: MergedStore<ListenerSet>,
+    policies: MergedStore<BackendTlsPolicy>,
+    client_traffic_policies: MergedStore<ClientTrafficPolicy>,
+    coxswain_backend_policies: MergedStore<CoxswainBackendPolicy>,
+    coxswain_external_auths: MergedStore<CoxswainExternalAuth>,
     /// Definitively-failed static-address VIP set (#533), published by the
     /// operator VIP reconciler; read to hold a still-provisioning Gateway at
     /// `Pending` instead of a premature `AddressNotUsable`.

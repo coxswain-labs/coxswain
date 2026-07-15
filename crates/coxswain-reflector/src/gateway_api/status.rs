@@ -88,6 +88,7 @@ impl RouteLike for HttpRoute {
 
 #[cfg(test)]
 mod tests {
+    use crate::MergedStore;
     use crate::gateway_api::route_status::compute_route_health;
     use crate::gateway_api::tests::*;
     use crate::gw_types::v::gateways::{Gateway, GatewayListeners, GatewaySpec};
@@ -167,7 +168,7 @@ mod tests {
         })
     }
 
-    fn service_store_with(ns: &str, name: &str) -> reflector::Store<Service> {
+    fn service_store_with(ns: &str, name: &str) -> MergedStore<Service> {
         let mut w = reflector::store::Writer::<Service>::default();
         w.apply_watcher_event(&watcher::Event::Apply(Service {
             metadata: ObjectMeta {
@@ -177,7 +178,7 @@ mod tests {
             },
             ..Default::default()
         }));
-        w.as_reader()
+        MergedStore::single(w.as_reader())
     }
 
     fn run(
@@ -185,7 +186,7 @@ mod tests {
         gateways: &[Arc<Gateway>],
         owned: &[(&str, &str)],
         grants: &HashSet<ReferenceGrantKey>,
-        services: &reflector::Store<Service>,
+        services: &MergedStore<Service>,
     ) -> RouteStatusMap {
         let owned_set: HashSet<ObjectKey> = owned
             .iter()

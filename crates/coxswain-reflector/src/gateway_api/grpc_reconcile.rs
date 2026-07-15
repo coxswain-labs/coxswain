@@ -7,6 +7,7 @@
 use super::backend_policy::{BackendPolicyIndex, ResolvedBackendPolicy};
 use super::backend_tls::{BackendTlsIndex, ResolvedPolicy};
 use super::bindings::{ListenerBinding, compute_grpc_listener_bindings};
+use crate::MergedStore;
 use crate::endpoints;
 use crate::endpoints::pool::EndpointCache;
 use crate::gw_types::{
@@ -29,7 +30,6 @@ use coxswain_core::routing::{
     RouteTimeouts, UpstreamTls, ValueMatch, WildcardKind, compile_bounded,
 };
 use k8s_openapi::api::core::v1::Service;
-use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -60,18 +60,18 @@ pub struct GrpcRouteResolution<'a> {
     pub backend_policy_index: &'a BackendPolicyIndex,
     /// `RateLimit` CR store for resolving `ExtensionRef` filters into per-route
     /// rate-limiting config (#25). A missing CR fails open (route not limited).
-    pub rate_limits: &'a reflector::Store<RateLimit>,
+    pub rate_limits: &'a MergedStore<RateLimit>,
     /// `RetryPolicy` CR store for resolving `ExtensionRef` filters into the per-route
     /// retry policy (#445). A missing CR fails open (no retries). `GRPCRoute` also
     /// honours `grpcCodes` (trailers-only retry on retriable `grpc-status`).
-    pub retry_policies: &'a reflector::Store<RetryPolicy>,
+    pub retry_policies: &'a MergedStore<RetryPolicy>,
     /// `IpAccessControl` CR store for resolving `ExtensionRef` filters into per-route
     /// source-IP allow/deny CIDR sets (#479). A missing CR fails open (no filtering).
-    pub ip_access: &'a reflector::Store<IpAccessControl>,
+    pub ip_access: &'a MergedStore<IpAccessControl>,
     /// `JwtAuth` CR store for resolving `ExtensionRef` filters into per-route JWT
     /// (JWKS bearer-token) validation config (#441). A missing CR fails open (no
     /// JWT check); a present-but-unresolved JWKS fails closed (`Unavailable`, 503).
-    pub jwt_auths: &'a reflector::Store<JwtAuth>,
+    pub jwt_auths: &'a MergedStore<JwtAuth>,
     /// Controller-fetched remote-JWKS cache (#441), read synchronously when
     /// resolving a `JwtAuth` CR that names a `jwks.remote`. See [`crate::jwks`].
     pub jwks_cache: &'a crate::jwks::SharedJwksCache,
@@ -91,7 +91,7 @@ enum PolicyMatch {
 pub(crate) fn route_fingerprint(
     route: &GrpcRoute,
     endpoint_cache: &EndpointCache,
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
     resolution: &GrpcRouteResolution<'_>,
 ) -> u64 {
     // Combination policy (wrapping_add, never XOR) lives in the accumulator;
@@ -147,7 +147,7 @@ impl GrpcRouteResolution<'_> {
 pub(super) fn reconcile(
     route: &GrpcRoute,
     endpoint_cache: &EndpointCache,
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
     owned_gateways: &HashSet<ObjectKey>,
     grants: &HashSet<ReferenceGrantKey>,
     resolution: GrpcRouteResolution<'_>,
@@ -780,7 +780,7 @@ fn resolve_weighted_backends(
     backend_refs: &[GrpcRouteRulesBackendRefs],
     route_ns: &str,
     endpoint_cache: &EndpointCache,
-    services: &reflector::Store<Service>,
+    services: &MergedStore<Service>,
     grants: &HashSet<ReferenceGrantKey>,
 ) -> Vec<(
     Arc<endpoints::ResolvedEndpoints>,
@@ -1499,7 +1499,7 @@ mod tests {
     fn grpc_reconcile_first_entry(
         route: &GrpcRoute,
         store: &EndpointCache,
-        svcs: &reflector::Store<Service>,
+        svcs: &MergedStore<Service>,
         policy_index: &BackendTlsIndex,
     ) -> Arc<RouteEntry> {
         use crate::gateway_api::tests::{default_owned, make_listener_info};

@@ -1,6 +1,7 @@
 //! IngressClass ownership checks, the `is-default-class` annotation helper, and
 //! resolution of per-class annotation defaults from `IngressClass.spec.parameters`.
 
+use crate::MergedStore;
 use coxswain_core::crd::CoxswainIngressClassParameters;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
 use kube::runtime::reflector;
@@ -78,9 +79,9 @@ pub(crate) struct ResolvedClassParams {
 ///
 /// Reads only from the supplied stores; never queries the API server.
 pub(crate) fn resolve_class_params(
-    class_store: &reflector::Store<IngressClass>,
+    class_store: &MergedStore<IngressClass>,
     owned: &HashSet<String>,
-    params_store: &reflector::Store<CoxswainIngressClassParameters>,
+    params_store: &MergedStore<CoxswainIngressClassParameters>,
 ) -> HashMap<String, ResolvedClassParams> {
     let mut out = HashMap::new();
     for ic in class_store.state() {
@@ -306,12 +307,12 @@ mod tests {
         }
     }
 
-    fn class_store(classes: Vec<IngressClass>) -> reflector::Store<IngressClass> {
+    fn class_store(classes: Vec<IngressClass>) -> MergedStore<IngressClass> {
         let mut writer = reflector::store::Writer::<IngressClass>::default();
         for ic in classes {
             writer.apply_watcher_event(&watcher::Event::Apply(ic));
         }
-        writer.as_reader()
+        MergedStore::single(writer.as_reader())
     }
 
     fn make_params_cr(
@@ -332,12 +333,12 @@ mod tests {
 
     fn params_store(
         crs: Vec<CoxswainIngressClassParameters>,
-    ) -> reflector::Store<CoxswainIngressClassParameters> {
+    ) -> MergedStore<CoxswainIngressClassParameters> {
         let mut writer = reflector::store::Writer::<CoxswainIngressClassParameters>::default();
         for cr in crs {
             writer.apply_watcher_event(&watcher::Event::Apply(cr));
         }
-        writer.as_reader()
+        MergedStore::single(writer.as_reader())
     }
 
     const GROUP: &str = "ingress.coxswain-labs.dev";

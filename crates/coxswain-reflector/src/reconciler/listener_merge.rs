@@ -14,9 +14,11 @@
 //! namespace its `certificateRefs` resolve in (the Gateway's own namespace for a
 //! Gateway listener, the ListenerSet's namespace for a ListenerSet listener).
 
+use crate::MergedStore;
 use std::collections::HashMap;
 
 use k8s_openapi::api::core::v1::Namespace;
+#[cfg(test)]
 use kube::runtime::reflector;
 
 use crate::gw_types::ListenerSet;
@@ -106,7 +108,7 @@ pub(crate) fn merge_effective_gateways(
     gateways: &[std::sync::Arc<Gateway>],
     listener_sets: &[std::sync::Arc<ListenerSet>],
     owned_gateway_classes: &std::collections::HashSet<String>,
-    namespaces: &reflector::Store<Namespace>,
+    namespaces: &MergedStore<Namespace>,
 ) -> HashMap<ObjectKey, EffectiveGateway> {
     // 1. Seed owned Gateways with their own listeners.
     let mut effective: HashMap<ObjectKey, EffectiveGateway> = HashMap::new();
@@ -229,7 +231,7 @@ pub fn effective_listener_ports(
     gateways: &[std::sync::Arc<Gateway>],
     listener_sets: &[std::sync::Arc<ListenerSet>],
     owned_gateway_classes: &std::collections::HashSet<String>,
-    namespaces: &reflector::Store<Namespace>,
+    namespaces: &MergedStore<Namespace>,
 ) -> HashMap<ObjectKey, Vec<EffectiveListenerPort>> {
     let effective =
         merge_effective_gateways(gateways, listener_sets, owned_gateway_classes, namespaces);
@@ -298,7 +300,7 @@ fn ls_key(ls: &ListenerSet) -> String {
 fn listener_set_allowed(
     parent: &Gateway,
     ls_ns: &str,
-    namespaces: &reflector::Store<Namespace>,
+    namespaces: &MergedStore<Namespace>,
 ) -> bool {
     let from = parent
         .spec
@@ -334,7 +336,7 @@ fn listener_set_allowed(
 
 /// Read the labels of namespace `ns` from the cluster-wide Namespace store.
 fn namespace_labels(
-    namespaces: &reflector::Store<Namespace>,
+    namespaces: &MergedStore<Namespace>,
     ns: &str,
 ) -> std::collections::BTreeMap<String, String> {
     namespaces
@@ -418,7 +420,7 @@ fn resolve_route_namespaces(
     match_labels: Option<&std::collections::BTreeMap<String, String>>,
     match_expressions: &[(&str, &str, &[String])],
     owning_ns: &str,
-    namespaces: &reflector::Store<Namespace>,
+    namespaces: &MergedStore<Namespace>,
 ) -> RouteNamespaceSet {
     match from {
         RouteNsFrom::All => RouteNamespaceSet::All,
@@ -445,7 +447,7 @@ fn resolve_route_namespaces(
 fn from_gateway_listener(
     l: &GatewayListeners,
     gw_ns: &str,
-    namespaces: &reflector::Store<Namespace>,
+    namespaces: &MergedStore<Namespace>,
 ) -> EffectiveListener {
     let tls = l.tls.as_ref().map(|t| EffectiveTls {
         passthrough: matches!(t.mode, Some(GatewayListenersTlsMode::Passthrough)),
@@ -492,7 +494,7 @@ fn from_listenerset_listener(
     l: &ListenerSetListeners,
     ls_ns: &str,
     ls_key: &ObjectKey,
-    namespaces: &reflector::Store<Namespace>,
+    namespaces: &MergedStore<Namespace>,
 ) -> EffectiveListener {
     let tls = l.tls.as_ref().map(|t| EffectiveTls {
         passthrough: matches!(t.mode, Some(ListenerSetListenersTlsMode::Passthrough)),
@@ -537,7 +539,7 @@ fn from_listenerset_listener(
 fn gw_route_namespaces(
     l: &GatewayListeners,
     gw_ns: &str,
-    namespaces: &reflector::Store<Namespace>,
+    namespaces: &MergedStore<Namespace>,
 ) -> RouteNamespaceSet {
     use crate::gw_types::v::gateways::GatewayListenersAllowedRoutesNamespacesFrom as F;
     let cfg = l
@@ -571,7 +573,7 @@ fn gw_route_namespaces(
 fn ls_route_namespaces(
     l: &ListenerSetListeners,
     ls_ns: &str,
-    namespaces: &reflector::Store<Namespace>,
+    namespaces: &MergedStore<Namespace>,
 ) -> RouteNamespaceSet {
     use crate::gw_types::v::listenersets::ListenerSetListenersAllowedRoutesNamespacesFrom as F;
     let cfg = l
@@ -747,12 +749,12 @@ mod tests {
         HashSet::from(["cox".to_string()])
     }
 
-    fn empty_ns_store() -> reflector::Store<Namespace> {
-        reflector::store::<Namespace>().0
+    fn empty_ns_store() -> MergedStore<Namespace> {
+        MergedStore::single(reflector::store::<Namespace>().0)
     }
 
     /// A populated Namespace store: `(name, &[(label_key, label_val)])`.
-    fn ns_store_with(specs: &[(&str, &[(&str, &str)])]) -> reflector::Store<Namespace> {
+    fn ns_store_with(specs: &[(&str, &[(&str, &str)])]) -> MergedStore<Namespace> {
         let (reader, mut writer) = reflector::store::<Namespace>();
         for (name, labels) in specs {
             let ns = Namespace {
@@ -770,7 +772,7 @@ mod tests {
             };
             writer.apply_watcher_event(&kube::runtime::watcher::Event::Apply(ns));
         }
-        reader
+        MergedStore::single(reader)
     }
 
     /// Build a Gateway listener with `allowedRoutes.namespaces.{from,selector}`.

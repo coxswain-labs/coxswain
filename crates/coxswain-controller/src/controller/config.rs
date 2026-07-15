@@ -1,5 +1,6 @@
 //! Validated configuration for the leader-election controller.
 
+use coxswain_reflector::WatchScope;
 use coxswain_reflector::ingress::IngressPorts;
 use std::net::IpAddr;
 use std::time::Duration;
@@ -81,8 +82,9 @@ pub struct ControllerConfig {
     pub pod_namespace: String,
     /// Leader-election lease TTL and renewal cadence.
     pub lease: LeaseSettings,
-    /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
-    pub watch_namespace: Option<String>,
+    /// Which namespaces the namespaced watches are scoped to (multi-namespace
+    /// watch, #59): `WatchScope::ClusterWide` or a specific namespace list.
+    pub watch_scope: WatchScope,
     /// When set, the leader writes this address to every owned
     /// `Ingress.status.loadBalancer.ingress[0]` and `Gateway.status.addresses[0]`
     /// after each watch event.
@@ -117,7 +119,7 @@ impl ControllerConfig {
         pod_name: String,
         pod_namespace: String,
         lease: LeaseSettings,
-        watch_namespace: Option<String>,
+        watch_scope: WatchScope,
         status_address: Option<String>,
         ingress_ports: IngressPorts,
     ) -> Result<Self, ControllerConfigError> {
@@ -144,7 +146,7 @@ impl ControllerConfig {
             pod_name,
             pod_namespace,
             lease,
-            watch_namespace,
+            watch_scope,
             status_address,
             ingress_ports,
             // Off by default; the bin layer opts in via
@@ -165,6 +167,7 @@ impl ControllerConfig {
 #[cfg(test)]
 mod tests {
     use super::{ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress};
+    use coxswain_reflector::WatchScope;
     use coxswain_reflector::ingress::IngressPorts;
     use std::time::Duration;
 
@@ -177,7 +180,7 @@ mod tests {
                 Duration::from_secs(ttl_secs),
                 Duration::from_secs(renew_secs),
             ),
-            None,
+            WatchScope::ClusterWide,
             None,
             IngressPorts::new(Some(80), Some(443)),
         )
@@ -207,7 +210,7 @@ mod tests {
             "pod".to_string(),
             "ns".to_string(),
             LeaseSettings::new(Duration::from_secs(15), Duration::from_secs(5)),
-            None,
+            WatchScope::ClusterWide,
             Some("  ".to_string()),
             IngressPorts::new(Some(80), Some(443)),
         )
@@ -222,7 +225,7 @@ mod tests {
             "pod".to_string(),
             "ns".to_string(),
             LeaseSettings::new(Duration::from_secs(15), Duration::from_secs(5)),
-            None,
+            WatchScope::ClusterWide,
             Some("127.0.0.1".to_string()),
             IngressPorts::new(Some(80), Some(443)),
         )
@@ -237,7 +240,7 @@ mod tests {
             "pod".to_string(),
             "ns".to_string(),
             LeaseSettings::new(Duration::from_secs(15), Duration::from_secs(5)),
-            None,
+            WatchScope::ClusterWide,
             Some("my-host.example.com".to_string()),
             IngressPorts::new(Some(80), Some(443)),
         )
@@ -255,7 +258,7 @@ mod tests {
             "pod".to_string(),
             "ns".to_string(),
             LeaseSettings::new(Duration::from_secs(15), Duration::from_secs(5)),
-            None,
+            WatchScope::ClusterWide,
             None,
             IngressPorts::new(Some(80), Some(443)),
         )

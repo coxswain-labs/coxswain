@@ -1,3 +1,4 @@
+use crate::MergedStore;
 use coxswain_core::crd::{
     BasicAuth, Compression, IpAccessControl, PathRewriteRegex, RateLimit, RequestSizeLimit,
     RetryPolicy,
@@ -54,12 +55,12 @@ pub(crate) fn make_slice_with_all_conditions(
     }
 }
 
-pub(crate) fn slice_store(slices: Vec<EndpointSlice>) -> reflector::Store<EndpointSlice> {
+pub(crate) fn slice_store(slices: Vec<EndpointSlice>) -> MergedStore<EndpointSlice> {
     let mut writer = reflector::store::Writer::<EndpointSlice>::default();
     for slice in slices {
         writer.apply_watcher_event(&watcher::Event::Apply(slice));
     }
-    writer.as_reader()
+    MergedStore::single(writer.as_reader())
 }
 
 /// Builds a ready-to-use [`crate::endpoints::pool::EndpointCache`] from a set of
@@ -74,125 +75,128 @@ pub(crate) fn endpoint_cache(slices: Vec<EndpointSlice>) -> crate::endpoints::po
     cache
 }
 
-pub(crate) fn empty_svc_store() -> reflector::Store<Service> {
-    reflector::store::Writer::<Service>::default().as_reader()
+pub(crate) fn empty_svc_store() -> MergedStore<Service> {
+    MergedStore::single(reflector::store::Writer::<Service>::default().as_reader())
 }
 
-pub(crate) fn empty_rate_limit_store() -> reflector::Store<RateLimit> {
-    reflector::store::Writer::<RateLimit>::default().as_reader()
+pub(crate) fn empty_rate_limit_store() -> MergedStore<RateLimit> {
+    MergedStore::single(reflector::store::Writer::<RateLimit>::default().as_reader())
 }
 
-pub(crate) fn empty_retry_policy_store() -> reflector::Store<RetryPolicy> {
-    reflector::store::Writer::<RetryPolicy>::default().as_reader()
+pub(crate) fn empty_retry_policy_store() -> MergedStore<RetryPolicy> {
+    MergedStore::single(reflector::store::Writer::<RetryPolicy>::default().as_reader())
 }
 
-pub(crate) fn make_retry_policy_store(crs: Vec<RetryPolicy>) -> reflector::Store<RetryPolicy> {
+pub(crate) fn make_retry_policy_store(crs: Vec<RetryPolicy>) -> MergedStore<RetryPolicy> {
     let mut writer = reflector::store::Writer::<RetryPolicy>::default();
     for cr in crs {
         writer.apply_watcher_event(&watcher::Event::Apply(cr));
     }
-    writer.as_reader()
+    MergedStore::single(writer.as_reader())
 }
 
-pub(crate) fn empty_path_rewrite_store() -> reflector::Store<PathRewriteRegex> {
-    reflector::store::Writer::<PathRewriteRegex>::default().as_reader()
+pub(crate) fn empty_path_rewrite_store() -> MergedStore<PathRewriteRegex> {
+    MergedStore::single(reflector::store::Writer::<PathRewriteRegex>::default().as_reader())
 }
 
-pub(crate) fn empty_ip_access_store() -> reflector::Store<IpAccessControl> {
-    reflector::store::Writer::<IpAccessControl>::default().as_reader()
+pub(crate) fn empty_ip_access_store() -> MergedStore<IpAccessControl> {
+    MergedStore::single(reflector::store::Writer::<IpAccessControl>::default().as_reader())
 }
 
-pub(crate) fn make_rate_limit_store(crs: Vec<RateLimit>) -> reflector::Store<RateLimit> {
+pub(crate) fn make_rate_limit_store(crs: Vec<RateLimit>) -> MergedStore<RateLimit> {
     let mut writer = reflector::store::Writer::<RateLimit>::default();
     for cr in crs {
         writer.apply_watcher_event(&watcher::Event::Apply(cr));
     }
-    writer.as_reader()
+    MergedStore::single(writer.as_reader())
 }
 
-pub(crate) fn make_ip_access_store(crs: Vec<IpAccessControl>) -> reflector::Store<IpAccessControl> {
+pub(crate) fn make_ip_access_store(crs: Vec<IpAccessControl>) -> MergedStore<IpAccessControl> {
     let mut writer = reflector::store::Writer::<IpAccessControl>::default();
     for cr in crs {
         writer.apply_watcher_event(&watcher::Event::Apply(cr));
     }
-    writer.as_reader()
+    MergedStore::single(writer.as_reader())
 }
 
-pub(crate) fn empty_secret_store() -> reflector::Store<Secret> {
-    reflector::store::Writer::<Secret>::default().as_reader()
+pub(crate) fn empty_secret_store() -> MergedStore<Secret> {
+    MergedStore::single(reflector::store::Writer::<Secret>::default().as_reader())
 }
 
-pub(crate) fn make_secret_store(secrets: Vec<Secret>) -> reflector::Store<Secret> {
+pub(crate) fn make_secret_store(secrets: Vec<Secret>) -> MergedStore<Secret> {
     let mut writer = reflector::store::Writer::<Secret>::default();
     for secret in secrets {
         writer.apply_watcher_event(&watcher::Event::Apply(secret));
     }
-    writer.as_reader()
+    MergedStore::single(writer.as_reader())
 }
 
-pub(crate) fn empty_basic_auth_store() -> reflector::Store<BasicAuth> {
-    reflector::store::Writer::<BasicAuth>::default().as_reader()
+pub(crate) fn empty_basic_auth_store() -> MergedStore<BasicAuth> {
+    MergedStore::single(reflector::store::Writer::<BasicAuth>::default().as_reader())
 }
 
-pub(crate) fn empty_external_auth_store()
--> reflector::Store<coxswain_core::crd::CoxswainExternalAuth> {
-    reflector::store::Writer::<coxswain_core::crd::CoxswainExternalAuth>::default().as_reader()
+pub(crate) fn empty_external_auth_store() -> MergedStore<coxswain_core::crd::CoxswainExternalAuth> {
+    MergedStore::single(
+        reflector::store::Writer::<coxswain_core::crd::CoxswainExternalAuth>::default().as_reader(),
+    )
 }
 
-pub(crate) fn make_basic_auth_store(crs: Vec<BasicAuth>) -> reflector::Store<BasicAuth> {
+pub(crate) fn make_basic_auth_store(crs: Vec<BasicAuth>) -> MergedStore<BasicAuth> {
     let mut writer = reflector::store::Writer::<BasicAuth>::default();
     for cr in crs {
         writer.apply_watcher_event(&watcher::Event::Apply(cr));
     }
-    writer.as_reader()
+    MergedStore::single(writer.as_reader())
 }
 
-pub(crate) fn empty_request_size_limit_store() -> reflector::Store<RequestSizeLimit> {
-    reflector::store::Writer::<RequestSizeLimit>::default().as_reader()
+pub(crate) fn empty_request_size_limit_store() -> MergedStore<RequestSizeLimit> {
+    MergedStore::single(reflector::store::Writer::<RequestSizeLimit>::default().as_reader())
 }
 
 pub(crate) fn make_request_size_limit_store(
     crs: Vec<RequestSizeLimit>,
-) -> reflector::Store<RequestSizeLimit> {
+) -> MergedStore<RequestSizeLimit> {
     let mut writer = reflector::store::Writer::<RequestSizeLimit>::default();
     for cr in crs {
         writer.apply_watcher_event(&watcher::Event::Apply(cr));
     }
-    writer.as_reader()
+    MergedStore::single(writer.as_reader())
 }
 
-pub(crate) fn empty_compression_store() -> reflector::Store<Compression> {
-    reflector::store::Writer::<Compression>::default().as_reader()
+pub(crate) fn empty_compression_store() -> MergedStore<Compression> {
+    MergedStore::single(reflector::store::Writer::<Compression>::default().as_reader())
 }
 
-pub(crate) fn make_compression_store(crs: Vec<Compression>) -> reflector::Store<Compression> {
+pub(crate) fn make_compression_store(crs: Vec<Compression>) -> MergedStore<Compression> {
     let mut writer = reflector::store::Writer::<Compression>::default();
     for cr in crs {
         writer.apply_watcher_event(&watcher::Event::Apply(cr));
     }
-    writer.as_reader()
+    MergedStore::single(writer.as_reader())
 }
 
-pub(crate) fn make_svc_store(services: Vec<Service>) -> reflector::Store<Service> {
+pub(crate) fn make_svc_store(services: Vec<Service>) -> MergedStore<Service> {
     let mut writer = reflector::store::Writer::<Service>::default();
     for svc in services {
         writer.apply_watcher_event(&watcher::Event::Apply(svc));
     }
-    writer.as_reader()
+    MergedStore::single(writer.as_reader())
 }
 
-pub(crate) fn empty_jwt_auth_store() -> reflector::Store<coxswain_core::crd::JwtAuth> {
-    reflector::store::Writer::<coxswain_core::crd::JwtAuth>::default().as_reader()
+pub(crate) fn empty_jwt_auth_store() -> MergedStore<coxswain_core::crd::JwtAuth> {
+    MergedStore::single(
+        reflector::store::Writer::<coxswain_core::crd::JwtAuth>::default().as_reader(),
+    )
 }
 
 pub(crate) fn make_jwt_auth_store(
     crs: Vec<coxswain_core::crd::JwtAuth>,
-) -> reflector::Store<coxswain_core::crd::JwtAuth> {
+) -> MergedStore<coxswain_core::crd::JwtAuth> {
     let mut writer = reflector::store::Writer::<coxswain_core::crd::JwtAuth>::default();
     for cr in crs {
         writer.apply_watcher_event(&watcher::Event::Apply(cr));
     }
-    writer.as_reader()
+    MergedStore::single(writer.as_reader())
 }
 
 /// Empty JWKS cache — every `JwtAuth` resolving a remote JWKS fails closed

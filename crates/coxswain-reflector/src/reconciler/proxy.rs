@@ -38,7 +38,8 @@ use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
 use crate::gw_types::v::referencegrants::ReferenceGrant;
 use crate::ingress::IngressPorts;
-use crate::k8s_utils::scoped_api;
+use crate::k8s_utils::{WatchScope, scoped_api};
+use crate::merged_store::MergedStore;
 use crate::reference_grants::{
     GrantSet, flatten_basic_auth_secret_grants, flatten_ca_grants, flatten_grants,
     flatten_ls_cert_grants, flatten_tcp_backend_grants, flatten_udp_backend_grants,
@@ -82,7 +83,7 @@ use pingora_core::server::ShutdownWatch;
 use pingora_core::services::background::BackgroundService;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::watch;
@@ -187,8 +188,21 @@ pub enum IngressEvent {
 /// Optional configuration for a [`SharedProxyReconciler`].
 #[non_exhaustive]
 pub struct ReconcilerOptions {
-    /// When set, scope namespaced watches to this namespace. When `None`, watch cluster-wide.
-    pub watch_namespace: Option<String>,
+    /// Which namespaces the namespaced watches are scoped to (multi-namespace
+    /// watch, #59). [`WatchScope::ClusterWide`] watches every namespace
+    /// (`Api::all`); [`WatchScope::Namespaces`] spawns one namespaced watch per
+    /// listed namespace, merged into a single logical store. Built once at the
+    /// argument boundary via [`WatchScope::parse`].
+    pub watch_scope: WatchScope,
+    /// The controller's own namespace (its pod's namespace). Namespaced infra
+    /// resources that can live in the install namespace as well as the watched
+    /// tenant namespaces — the fleet `Pod` watch and the
+    /// `CoxswainGatewayParameters` / `CoxswainIngressClassParameters` `parametersRef`
+    /// sources — are scoped to `watch_scope ∪ {pod_namespace}` via
+    /// [`WatchScope::with_namespace`] rather than cluster-wide, so the least-privilege
+    /// lockdown needs no cluster-wide read on them (#59). Empty by default (an
+    /// unset value widens nothing when the scope is [`WatchScope::ClusterWide`]).
+    pub pod_namespace: String,
     /// Controller-wide default backend for Ingress traffic with no matching rule.
     pub ingress_default_backend: Option<IngressDefaultBackend>,
     /// Ports on which Ingress routes are served.
@@ -255,7 +269,8 @@ pub struct ReconcilerOptions {
 impl Default for ReconcilerOptions {
     fn default() -> Self {
         Self {
-            watch_namespace: None,
+            watch_scope: WatchScope::ClusterWide,
+            pod_namespace: String::new(),
             ingress_default_backend: None,
             ingress_ports: IngressPorts::default(),
             metrics_prefix: crate::MetricsPrefix::Proxy,
@@ -515,33 +530,33 @@ pub struct ReconcilerOutputs {
 #[derive(Clone)]
 pub struct StatusStores {
     /// `Gateway` store reader.
-    pub gateways: reflector::Store<Gateway>,
+    pub gateways: MergedStore<Gateway>,
     /// `GatewayClass` store reader.
-    pub gateway_classes: reflector::Store<GatewayClass>,
+    pub gateway_classes: MergedStore<GatewayClass>,
     /// `HTTPRoute` store reader.
-    pub routes: reflector::Store<HttpRoute>,
+    pub routes: MergedStore<HttpRoute>,
     /// `GRPCRoute` store reader.
-    pub grpc_routes: reflector::Store<GrpcRoute>,
+    pub grpc_routes: MergedStore<GrpcRoute>,
     /// `Ingress` store reader.
-    pub ingresses: reflector::Store<Ingress>,
+    pub ingresses: MergedStore<Ingress>,
     /// `IngressClass` store reader.
-    pub ingress_classes: reflector::Store<IngressClass>,
+    pub ingress_classes: MergedStore<IngressClass>,
     /// `BackendTLSPolicy` store reader.
-    pub policies: reflector::Store<BackendTlsPolicy>,
+    pub policies: MergedStore<BackendTlsPolicy>,
     /// `TLSRoute` store reader.
-    pub tls_routes: reflector::Store<TlsRoute>,
+    pub tls_routes: MergedStore<TlsRoute>,
     /// `TCPRoute` store reader.
-    pub tcp_routes: reflector::Store<TcpRoute>,
+    pub tcp_routes: MergedStore<TcpRoute>,
     /// `UDPRoute` store reader.
-    pub udp_routes: reflector::Store<UdpRoute>,
+    pub udp_routes: MergedStore<UdpRoute>,
     /// `XListenerSet` store reader (GEP-1713).
-    pub listener_sets: reflector::Store<ListenerSet>,
+    pub listener_sets: MergedStore<ListenerSet>,
     /// `ClientTrafficPolicy` store reader (#327).
-    pub client_traffic_policies: reflector::Store<ClientTrafficPolicy>,
+    pub client_traffic_policies: MergedStore<ClientTrafficPolicy>,
     /// `CoxswainBackendPolicy` store reader (#354).
-    pub coxswain_backend_policies: reflector::Store<CoxswainBackendPolicy>,
+    pub coxswain_backend_policies: MergedStore<CoxswainBackendPolicy>,
     /// `CoxswainExternalAuth` store reader (#23).
-    pub coxswain_external_auths: reflector::Store<CoxswainExternalAuth>,
+    pub coxswain_external_auths: MergedStore<CoxswainExternalAuth>,
 }
 
 /// Pre-created reflector-store writers for the status-relevant types.
@@ -551,20 +566,22 @@ pub struct StatusStores {
 /// moved into [`spawn_tasks`] on `start` to drive the reflectors — the worker
 /// reads the very stores these writers fill.
 struct StatusStoreWriters {
-    gateways: reflector::store::Writer<Gateway>,
+    // Namespaced types carry one writer per watched namespace (#59); the
+    // cluster-scoped `gateway_classes` / `ingress_classes` carry a single writer.
+    gateways: Vec<reflector::store::Writer<Gateway>>,
     gateway_classes: reflector::store::Writer<GatewayClass>,
-    routes: reflector::store::Writer<HttpRoute>,
-    grpc_routes: reflector::store::Writer<GrpcRoute>,
-    ingresses: reflector::store::Writer<Ingress>,
+    routes: Vec<reflector::store::Writer<HttpRoute>>,
+    grpc_routes: Vec<reflector::store::Writer<GrpcRoute>>,
+    ingresses: Vec<reflector::store::Writer<Ingress>>,
     ingress_classes: reflector::store::Writer<IngressClass>,
-    policies: reflector::store::Writer<BackendTlsPolicy>,
-    tls_routes: reflector::store::Writer<TlsRoute>,
-    tcp_routes: reflector::store::Writer<TcpRoute>,
-    udp_routes: reflector::store::Writer<UdpRoute>,
-    listener_sets: reflector::store::Writer<ListenerSet>,
-    client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
-    coxswain_backend_policies: reflector::store::Writer<CoxswainBackendPolicy>,
-    coxswain_external_auths: reflector::store::Writer<CoxswainExternalAuth>,
+    policies: Vec<reflector::store::Writer<BackendTlsPolicy>>,
+    tls_routes: Vec<reflector::store::Writer<TlsRoute>>,
+    tcp_routes: Vec<reflector::store::Writer<TcpRoute>>,
+    udp_routes: Vec<reflector::store::Writer<UdpRoute>>,
+    listener_sets: Vec<reflector::store::Writer<ListenerSet>>,
+    client_traffic_policies: Vec<reflector::store::Writer<ClientTrafficPolicy>>,
+    coxswain_backend_policies: Vec<reflector::store::Writer<CoxswainBackendPolicy>>,
+    coxswain_external_auths: Vec<reflector::store::Writer<CoxswainExternalAuth>>,
 }
 
 /// `Option`-wrapped form of [`StatusStoreWriters`] produced by
@@ -572,20 +589,20 @@ struct StatusStoreWriters {
 ///
 /// Named to avoid a `clippy::type_complexity` violation on the method's return type.
 struct StatusStoreOptionWriters {
-    routes: Option<reflector::store::Writer<HttpRoute>>,
-    grpc_routes: Option<reflector::store::Writer<GrpcRoute>>,
-    ingresses: Option<reflector::store::Writer<Ingress>>,
+    routes: Option<Vec<reflector::store::Writer<HttpRoute>>>,
+    grpc_routes: Option<Vec<reflector::store::Writer<GrpcRoute>>>,
+    ingresses: Option<Vec<reflector::store::Writer<Ingress>>>,
     ingress_classes: Option<reflector::store::Writer<IngressClass>>,
-    gateways: Option<reflector::store::Writer<Gateway>>,
+    gateways: Option<Vec<reflector::store::Writer<Gateway>>>,
     gateway_classes: Option<reflector::store::Writer<GatewayClass>>,
-    policies: Option<reflector::store::Writer<BackendTlsPolicy>>,
-    tls_routes: Option<reflector::store::Writer<TlsRoute>>,
-    tcp_routes: Option<reflector::store::Writer<TcpRoute>>,
-    udp_routes: Option<reflector::store::Writer<UdpRoute>>,
-    listener_sets: Option<reflector::store::Writer<ListenerSet>>,
-    client_traffic_policies: Option<reflector::store::Writer<ClientTrafficPolicy>>,
-    coxswain_backend_policies: Option<reflector::store::Writer<CoxswainBackendPolicy>>,
-    coxswain_external_auths: Option<reflector::store::Writer<CoxswainExternalAuth>>,
+    policies: Option<Vec<reflector::store::Writer<BackendTlsPolicy>>>,
+    tls_routes: Option<Vec<reflector::store::Writer<TlsRoute>>>,
+    tcp_routes: Option<Vec<reflector::store::Writer<TcpRoute>>>,
+    udp_routes: Option<Vec<reflector::store::Writer<UdpRoute>>>,
+    listener_sets: Option<Vec<reflector::store::Writer<ListenerSet>>>,
+    client_traffic_policies: Option<Vec<reflector::store::Writer<ClientTrafficPolicy>>>,
+    coxswain_backend_policies: Option<Vec<reflector::store::Writer<CoxswainBackendPolicy>>>,
+    coxswain_external_auths: Option<Vec<reflector::store::Writer<CoxswainExternalAuth>>>,
 }
 
 impl StatusStoreWriters {
@@ -593,7 +610,8 @@ impl StatusStoreWriters {
     ///
     /// `None` maps every field to `None`; `Some(w)` wraps each field in `Some`.
     /// Used in [`spawn_tasks`] to feed the optional pre-created writers into
-    /// [`reader_writer`] without repeating the `None×9` arm.
+    /// [`scoped_reader_writers`] / [`cluster_reader_writer`] without repeating the
+    /// `None` arm at every site.
     fn into_option_writers(opt: Option<Self>) -> StatusStoreOptionWriters {
         match opt {
             Some(w) => StatusStoreOptionWriters {
@@ -643,25 +661,25 @@ impl StatusStoreWriters {
 #[derive(Clone)]
 pub struct OperatorStores {
     /// `GatewayClass` reader (shared with [`StatusStores`]).
-    pub gateway_classes: reflector::Store<GatewayClass>,
+    pub gateway_classes: MergedStore<GatewayClass>,
     /// `CoxswainGatewayParameters` reader (operator-only watch).
-    pub params: reflector::Store<CoxswainGatewayParameters>,
+    pub params: MergedStore<CoxswainGatewayParameters>,
     /// `CoxswainRelayPolicy` reader (operator-only watch, #589): per-namespace relay
     /// tuning overlaid onto the #584 global relay defaults.
-    pub relay_policies: reflector::Store<CoxswainRelayPolicy>,
+    pub relay_policies: MergedStore<CoxswainRelayPolicy>,
     /// Fleet `Pod` reader (`app.kubernetes.io/name=coxswain`); the operator
     /// filters to dedicated-proxy Pods.
-    pub pods: reflector::Store<Pod>,
+    pub pods: MergedStore<Pod>,
     /// `Node` reader (operator-only watch; consulted for NodePort Services).
-    pub nodes: reflector::Store<Node>,
+    pub nodes: MergedStore<Node>,
     /// `Gateway` reader (shared with [`StatusStores`]).
-    pub gateways: reflector::Store<Gateway>,
+    pub gateways: MergedStore<Gateway>,
     /// Bulk `Service` reader; the operator filters to the per-Gateway VIP Services.
-    pub services: reflector::Store<Service>,
+    pub services: MergedStore<Service>,
     /// `XListenerSet` reader (shared with [`StatusStores`], GEP-1713).
-    pub listener_sets: reflector::Store<ListenerSet>,
+    pub listener_sets: MergedStore<ListenerSet>,
     /// `Namespace` reader (shared with routing's `allowedListeners` gate).
-    pub namespaces: reflector::Store<Namespace>,
+    pub namespaces: MergedStore<Namespace>,
 }
 
 /// Pre-created writers for the operator-specific stores (`params`, `nodes`) and
@@ -669,12 +687,18 @@ pub struct OperatorStores {
 /// `pods`) — created in [`SharedProxyReconciler::new`] so the matching
 /// [`OperatorStores`] readers exist at wiring time, then driven by `spawn_tasks`.
 struct OperatorStoreWriters {
-    params: reflector::store::Writer<CoxswainGatewayParameters>,
-    relay_policies: reflector::store::Writer<CoxswainRelayPolicy>,
+    // `nodes` and `namespaces` are genuinely cluster-scoped resources, watched
+    // cluster-wide (single writer). The namespaced watches fan out one writer per
+    // scope namespace (#59): `relay_policies` over the tenant `watch_scope` (a relay
+    // policy governs its own tenant namespace); `params`, `services`, and the fleet
+    // `pods` over the wider infra scope (`watch_scope ∪ {pod_namespace}`) so they
+    // also see the install namespace (VIP Services, params defaults, fleet pods).
+    params: Vec<reflector::store::Writer<CoxswainGatewayParameters>>,
+    relay_policies: Vec<reflector::store::Writer<CoxswainRelayPolicy>>,
     nodes: reflector::store::Writer<Node>,
     namespaces: reflector::store::Writer<Namespace>,
-    services: reflector::store::Writer<Service>,
-    pods: reflector::store::Writer<Pod>,
+    services: Vec<reflector::store::Writer<Service>>,
+    pods: Vec<reflector::store::Writer<Pod>>,
 }
 
 impl SharedProxyReconciler {
@@ -715,34 +739,62 @@ impl SharedProxyReconciler {
         let (status_store_writers, status_stores, operator_store_writers, operator_stores) = if opts
             .status_stores
         {
-            let (gateways_r, gateways_w) = reflector::store::<Gateway>();
-            let (gateway_classes_r, gateway_classes_w) = reflector::store::<GatewayClass>();
-            let (routes_r, routes_w) = reflector::store::<HttpRoute>();
-            let (grpc_routes_r, grpc_routes_w) = reflector::store::<GrpcRoute>();
-            let (ingresses_r, ingresses_w) = reflector::store::<Ingress>();
-            let (ingress_classes_r, ingress_classes_w) = reflector::store::<IngressClass>();
-            let (policies_r, policies_w) = reflector::store::<BackendTlsPolicy>();
-            let (tls_routes_r, tls_routes_w) = reflector::store::<TlsRoute>();
-            let (tcp_routes_r, tcp_routes_w) = reflector::store::<TcpRoute>();
-            let (udp_routes_r, udp_routes_w) = reflector::store::<UdpRoute>();
-            let (listener_sets_r, listener_sets_w) = reflector::store::<ListenerSet>();
+            // Pre-create one reflector store per watched namespace for namespaced
+            // types (#59); cluster-scoped types (and those deliberately watched
+            // cluster-wide) get a single store wrapped in a one-element
+            // `MergedStore`. The readers stay a uniform `MergedStore<K>` either
+            // way; the writers are `Vec` (namespaced) or single (cluster).
+            let scope = &opts.watch_scope;
+            // Infra scope for namespaced resources that also live in the install
+            // namespace (fleet `Pod`, `CoxswainGatewayParameters`): the tenant
+            // watch set widened with the controller's own namespace (#59). Under
+            // `ClusterWide` this is unchanged (still `Api::all`).
+            let infra_scope = opts.watch_scope.with_namespace(&opts.pod_namespace);
+            let (gateways_r, gateways_w) = scoped_reader_writers::<Gateway>(None, scope);
+            let (gateway_classes_r, gateway_classes_w) =
+                cluster_reader_writer::<GatewayClass>(None);
+            let (routes_r, routes_w) = scoped_reader_writers::<HttpRoute>(None, scope);
+            let (grpc_routes_r, grpc_routes_w) = scoped_reader_writers::<GrpcRoute>(None, scope);
+            let (ingresses_r, ingresses_w) = scoped_reader_writers::<Ingress>(None, scope);
+            let (ingress_classes_r, ingress_classes_w) =
+                cluster_reader_writer::<IngressClass>(None);
+            let (policies_r, policies_w) = scoped_reader_writers::<BackendTlsPolicy>(None, scope);
+            let (tls_routes_r, tls_routes_w) = scoped_reader_writers::<TlsRoute>(None, scope);
+            let (tcp_routes_r, tcp_routes_w) = scoped_reader_writers::<TcpRoute>(None, scope);
+            let (udp_routes_r, udp_routes_w) = scoped_reader_writers::<UdpRoute>(None, scope);
+            let (listener_sets_r, listener_sets_w) =
+                scoped_reader_writers::<ListenerSet>(None, scope);
             let (client_traffic_policies_r, client_traffic_policies_w) =
-                reflector::store::<ClientTrafficPolicy>();
+                scoped_reader_writers::<ClientTrafficPolicy>(None, scope);
             let (coxswain_backend_policies_r, coxswain_backend_policies_w) =
-                reflector::store::<CoxswainBackendPolicy>();
+                scoped_reader_writers::<CoxswainBackendPolicy>(None, scope);
             let (coxswain_external_auths_r, coxswain_external_auths_w) =
-                reflector::store::<CoxswainExternalAuth>();
+                scoped_reader_writers::<CoxswainExternalAuth>(None, scope);
             // Operator-specific + shared stores (#574 operator fold). `params` and
             // `nodes` are watched only for the operator; `namespaces`/`services`/
             // `pods` are shared with routing/fleet. `gateways`/`gateway_classes`/
             // `listener_sets` reuse the status readers above (same watch, cloned
-            // handle).
-            let (params_r, params_w) = reflector::store::<CoxswainGatewayParameters>();
-            let (relay_policies_r, relay_policies_w) = reflector::store::<CoxswainRelayPolicy>();
-            let (nodes_r, nodes_w) = reflector::store::<Node>();
-            let (namespaces_r, namespaces_w) = reflector::store::<Namespace>();
-            let (services_r, services_w) = reflector::store::<Service>();
-            let (pods_r, pods_w) = reflector::store::<Pod>();
+            // handle). `Node` / `Namespace` are genuinely cluster-scoped, so those stay
+            // cluster-wide. The namespaced watches fan out per scope (#59):
+            // `CoxswainRelayPolicy` over the tenant `scope` (governs its own tenant
+            // namespace); `params`, `services`, and fleet `pods` over `infra_scope`
+            // (tenant ∪ install namespace) so the lockdown needs no cluster-wide read.
+            let (params_r, params_w) =
+                scoped_reader_writers::<CoxswainGatewayParameters>(None, &infra_scope);
+            let (relay_policies_r, relay_policies_w) =
+                scoped_reader_writers::<CoxswainRelayPolicy>(None, scope);
+            let (nodes_r, nodes_w) = cluster_reader_writer::<Node>(None);
+            let (namespaces_r, namespaces_w) = cluster_reader_writer::<Namespace>(None);
+            // `Service` fans over `infra_scope` (tenant ∪ install namespace), NOT
+            // the plain tenant scope: besides tenant backend Services, the rebuild
+            // reads the per-Gateway shared-VIP Services (#472) — which the operator
+            // provisions in the controller's own namespace — to resolve each
+            // Gateway listener's internal bind port. Scoping Services to tenants
+            // only would leave that `(gateway, port) → internal_port` map empty, so
+            // the proxy would bind the listener port instead of the VIP-mapped
+            // internal port and the Gateway VIP would be unreachable.
+            let (services_r, services_w) = scoped_reader_writers::<Service>(None, &infra_scope);
+            let (pods_r, pods_w) = scoped_reader_writers::<Pod>(None, &infra_scope);
             let op_stores = OperatorStores {
                 gateway_classes: gateway_classes_r.clone(),
                 params: params_r,
@@ -970,7 +1022,9 @@ impl SharedProxyReconciler {
 
 struct ReconcilerConfig {
     controller_name: String,
-    watch_namespace: Option<String>,
+    watch_scope: WatchScope,
+    /// See [`ReconcilerOptions::pod_namespace`].
+    pod_namespace: String,
     ingress_default_backend: Option<IngressDefaultBackend>,
     ingress_ports: IngressPorts,
     metrics: crate::ReflectorMetrics,
@@ -993,27 +1047,27 @@ struct ReconcilerConfig {
 }
 
 pub(super) struct ReflectorStores<'a> {
-    pub(super) routes: &'a reflector::Store<HttpRoute>,
-    pub(super) grpc_routes: &'a reflector::Store<GrpcRoute>,
-    pub(super) tls_routes: &'a reflector::Store<TlsRoute>,
-    pub(super) tcp_routes: &'a reflector::Store<TcpRoute>,
-    pub(super) udp_routes: &'a reflector::Store<UdpRoute>,
-    pub(super) ingresses: &'a reflector::Store<Ingress>,
-    pub(super) ingress_classes: &'a reflector::Store<IngressClass>,
+    pub(super) routes: &'a MergedStore<HttpRoute>,
+    pub(super) grpc_routes: &'a MergedStore<GrpcRoute>,
+    pub(super) tls_routes: &'a MergedStore<TlsRoute>,
+    pub(super) tcp_routes: &'a MergedStore<TcpRoute>,
+    pub(super) udp_routes: &'a MergedStore<UdpRoute>,
+    pub(super) ingresses: &'a MergedStore<Ingress>,
+    pub(super) ingress_classes: &'a MergedStore<IngressClass>,
     /// `CoxswainIngressClassParameters` CRs in scope — the per-class annotation
     /// default sources resolved from `IngressClass.spec.parameters` (#190).
-    pub(super) ingress_class_parameters: &'a reflector::Store<CoxswainIngressClassParameters>,
-    pub(super) gateways: &'a reflector::Store<Gateway>,
-    pub(super) gateway_classes: &'a reflector::Store<GatewayClass>,
+    pub(super) ingress_class_parameters: &'a MergedStore<CoxswainIngressClassParameters>,
+    pub(super) gateways: &'a MergedStore<Gateway>,
+    pub(super) gateway_classes: &'a MergedStore<GatewayClass>,
     /// `ListenerSet` resources in scope (GEP-1713). Merged into each parent
     /// Gateway's effective listener set during rebuild, gated by the parent's
     /// `spec.allowedListeners`.
-    pub(super) listener_sets: &'a reflector::Store<ListenerSet>,
+    pub(super) listener_sets: &'a MergedStore<ListenerSet>,
     /// All `Namespace` objects (cluster-wide). Read only to evaluate a Gateway's
     /// `allowedListeners.namespaces.from: Selector` against the ListenerSet's
     /// namespace labels; nothing else consumes it.
-    pub(super) namespaces: &'a reflector::Store<Namespace>,
-    pub(super) services: &'a reflector::Store<Service>,
+    pub(super) namespaces: &'a MergedStore<Namespace>,
+    pub(super) services: &'a MergedStore<Service>,
     /// Incrementally-maintained `(namespace, service, port)` endpoint-resolution
     /// cache (#511) — every route builder reads through this instead of
     /// scanning the `EndpointSlice` store directly. `refresh()`'d once per
@@ -1025,50 +1079,50 @@ pub(super) struct ReflectorStores<'a> {
     /// all agree on one Service snapshot. A per-builder re-read could observe a
     /// mid-rebuild Service mutation and disagree (bound on port X, routed under Y).
     pub(super) vip_internal: &'a super::route_builder::VipInternalPorts,
-    pub(super) grants: &'a reflector::Store<ReferenceGrant>,
-    pub(super) secrets: &'a reflector::Store<Secret>,
+    pub(super) grants: &'a MergedStore<ReferenceGrant>,
+    pub(super) secrets: &'a MergedStore<Secret>,
     /// Label-scoped htpasswd Secrets (`ingress.coxswain-labs.dev/auth-basic=true`) used
     /// by the `auth-basic-secret` Ingress annotation (#24).  Separate from `secrets`
     /// (which watches TLS secrets) to bound memory — Opaque Secrets are not filtered
     /// by type, only by label.  Fail-closed: absent/unlabeled → 503 on the route.
-    pub(super) auth_secrets: &'a reflector::Store<Secret>,
+    pub(super) auth_secrets: &'a MergedStore<Secret>,
     /// Label-scoped CA Secrets (`ingress.coxswain-labs.dev/auth-tls=true`) used by the
     /// `auth-tls-secret` Ingress annotation (#267).  Separate from `secrets` (TLS certs)
     /// and `auth_secrets` (htpasswd) to bound memory.  Fail-closed: absent/unlabeled →
     /// handshake abort for that host.
-    pub(super) auth_tls_secrets: &'a reflector::Store<Secret>,
-    /// `BackendTLSPolicy` resources in scope (namespaced per `watch_namespace`).
-    pub(super) policies: &'a reflector::Store<BackendTlsPolicy>,
+    pub(super) auth_tls_secrets: &'a MergedStore<Secret>,
+    /// `BackendTLSPolicy` resources in scope (namespaced per `watch_scope`).
+    pub(super) policies: &'a MergedStore<BackendTlsPolicy>,
     /// All ConfigMaps in scope — used to resolve `caCertificateRefs`.
     /// Unlike the `Secret` reflector (which uses a type= field selector), ConfigMaps
     /// have no equivalent filter; all CMs in scope are watched. A follow-up will
     /// switch to per-policy informers to bound memory use in large clusters.
-    pub(super) configmaps: &'a reflector::Store<ConfigMap>,
+    pub(super) configmaps: &'a MergedStore<ConfigMap>,
     /// `RateLimit` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters during Gateway API reconciliation.
-    pub(super) rate_limits: &'a reflector::Store<RateLimit>,
+    pub(super) rate_limits: &'a MergedStore<RateLimit>,
     /// `RetryPolicy` CRs in scope — resolved from `HTTPRouteRule`/`GRPCRouteRule`
     /// `ExtensionRef` filters into the per-route retry policy (#445).
-    pub(super) retry_policies: &'a reflector::Store<RetryPolicy>,
+    pub(super) retry_policies: &'a MergedStore<RetryPolicy>,
     /// `PathRewriteRegex` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters during Gateway API reconciliation.
-    pub(super) path_rewrites: &'a reflector::Store<PathRewriteRegex>,
+    pub(super) path_rewrites: &'a MergedStore<PathRewriteRegex>,
     /// `IpAccessControl` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters into per-route source-IP allow/deny CIDR sets (#479).
-    pub(super) ip_access: &'a reflector::Store<IpAccessControl>,
+    pub(super) ip_access: &'a MergedStore<IpAccessControl>,
     /// `BasicAuth` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters, HTTPRoute-only (#442).
-    pub(super) basic_auths: &'a reflector::Store<BasicAuth>,
+    pub(super) basic_auths: &'a MergedStore<BasicAuth>,
     /// `CoxswainExternalAuth` CRs in scope — resolved from `HTTPRouteRule`
     /// `ExternalAuth` `ExtensionRef` filters (and, later, Gateway policies) into
     /// per-route ext_authz config, HTTPRoute-only (#23).
-    pub(super) external_auths: &'a reflector::Store<CoxswainExternalAuth>,
+    pub(super) external_auths: &'a MergedStore<CoxswainExternalAuth>,
     /// `JwtAuth` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters into per-route JWT (JWKS bearer-token) validation config (#441).
     /// No status subresource (unlike `CoxswainExternalAuth`) — `JwtAuth` has no
     /// `targetRefs`/Gateway-attachment surface, so a plain (non-status-relevant)
     /// store is enough; diagnosability is WARN logs + the route's fail-closed 503.
-    pub(super) jwt_auths: &'a reflector::Store<JwtAuth>,
+    pub(super) jwt_auths: &'a MergedStore<JwtAuth>,
     /// Controller-fetched remote-JWKS cache (#441), read synchronously when
     /// resolving a `JwtAuth` CR that names a `jwks.remote`. Grouped alongside
     /// `jwt_auths` here (rather than `Ownership`) so `rebuild()` stays within
@@ -1076,18 +1130,18 @@ pub(super) struct ReflectorStores<'a> {
     pub(super) jwks_cache: &'a crate::jwks::SharedJwksCache,
     /// `RequestSizeLimit` CRs in scope — resolved from `HTTPRouteRule`/`GRPCRouteRule`
     /// `ExtensionRef` filters into a per-route body-size cap (#443).
-    pub(super) request_size_limits: &'a reflector::Store<RequestSizeLimit>,
+    pub(super) request_size_limits: &'a MergedStore<RequestSizeLimit>,
     /// `Compression` CRs in scope — resolved from `HTTPRouteRule` `ExtensionRef`
     /// filters (HTTPRoute-only, #446) and the Ingress `compression` annotation
     /// (#550); both surfaces resolve the same store through
     /// [`crate::gateway_api::compression::resolve_spec`].
-    pub(super) compressions: &'a reflector::Store<Compression>,
+    pub(super) compressions: &'a MergedStore<Compression>,
     /// `ClientTrafficPolicy` CRs in scope — resolved per Gateway/listener to set
     /// `ListenerInfo.proxy_protocol` during rebuild (#327).
-    pub(super) client_traffic_policies: &'a reflector::Store<ClientTrafficPolicy>,
+    pub(super) client_traffic_policies: &'a MergedStore<ClientTrafficPolicy>,
     /// `CoxswainBackendPolicy` CRs in scope — resolved per target Service to set
     /// per-backend connect/idle timeouts during route building (#354).
-    pub(super) coxswain_backend_policies: &'a reflector::Store<CoxswainBackendPolicy>,
+    pub(super) coxswain_backend_policies: &'a MergedStore<CoxswainBackendPolicy>,
 }
 
 pub(super) struct SharedOutputs<'a> {
@@ -1188,9 +1242,22 @@ pub(super) struct Ownership<'a> {
 pub(super) struct ReflectorEffects {
     trigger: watch::Sender<u64>,
     controller_health: SubsystemHandle,
-    /// Health-check name to flip Ready on first `Event::InitDone`. Also used
-    /// as the `kind` metric label for `watch_events_total` / `watch_errors_total`.
+    /// Health-check name to flip Ready once every watched namespace of the check
+    /// has completed its first `Event::InitDone`. Also the `kind` metric label
+    /// for `watch_events_total` / `watch_errors_total`.
     check: &'static str,
+    /// Watched namespace for this reflector, or `""` for a cluster-wide /
+    /// cluster-scoped watch. Labels the per-`(kind, ns)` relist accounting so
+    /// the #573 liveness backstop tracks each namespace's relist independently
+    /// under a shared `check` (multi-namespace watch, #59).
+    ns: String,
+    /// Shared per-check readiness barrier: the count of the check's watched
+    /// namespaces whose *first* relist has not yet completed. Every reflector of
+    /// the check holds a clone; the one that drops it to 0 flips the check Ready,
+    /// so a multi-namespace check reports Ready only once *all* its namespaces
+    /// have synced. A single-store check starts at 1 — identical to the
+    /// pre-#59 single-`InitDone` behaviour.
+    readiness: Arc<AtomicUsize>,
     metrics: crate::ReflectorMetrics,
 }
 
@@ -1200,11 +1267,15 @@ impl ReflectorEffects {
         health: &SubsystemHandle,
         check: &'static str,
         metrics: crate::ReflectorMetrics,
+        ns: String,
+        readiness: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             trigger: trigger.clone(),
             controller_health: health.clone(),
             check,
+            ns,
+            readiness,
             metrics,
         }
     }
@@ -1243,9 +1314,14 @@ pub(super) fn spawn_reflector<T>(
         trigger,
         controller_health,
         check,
+        ns,
+        readiness,
         metrics,
     } = effects;
     set.spawn(async move {
+        // Guards the shared readiness barrier so only this reflector's *first*
+        // relist decrements it; later re-lists (further `InitDone`s) must not.
+        let mut first_relist_done = false;
         let stream = reflector::reflector(writer, watcher(api, config).default_backoff());
         tokio::pin!(stream);
         while let Some(event) = stream.next().await {
@@ -1256,16 +1332,23 @@ pub(super) fn spawn_reflector<T>(
                     // re-derives (routing + status) from the fresh post-relist
                     // world; the rebuild pass enqueues the status keys.
                     bump_rebuild(&trigger);
-                    controller_health.ready(check);
+                    // Flip the check Ready only once every watched namespace of
+                    // the check has completed its first relist (barrier → 0).
+                    if !first_relist_done {
+                        first_relist_done = true;
+                        if readiness.fetch_sub(1, Ordering::AcqRel) == 1 {
+                            controller_health.ready(check);
+                        }
+                    }
                     metrics.observe_watch_event(check, "init_done");
-                    metrics.observe_relist_completed(check);
+                    metrics.observe_relist_completed(check, &ns);
                 }
                 Ok(watcher::Event::Init) => {
                     // A relist began: mark it in flight and (re)start its stall
                     // clock.
                     bump_rebuild(&trigger);
                     metrics.observe_watch_event(check, "restart");
-                    metrics.observe_relist_progress(check);
+                    metrics.observe_relist_progress(check, &ns);
                 }
                 Ok(watcher::Event::InitApply(_)) => {
                     // An object streamed in during the list phase: relist
@@ -1275,7 +1358,7 @@ pub(super) fn spawn_reflector<T>(
                     // liveness backstop.
                     bump_rebuild(&trigger);
                     metrics.observe_watch_event(check, "restart");
-                    metrics.observe_relist_progress(check);
+                    metrics.observe_relist_progress(check, &ns);
                 }
                 Ok(watcher::Event::Apply(_)) => {
                     // The store already holds the object (applied before this
@@ -1321,7 +1404,8 @@ impl BackgroundService for SharedProxyReconciler {
         };
         let config = ReconcilerConfig {
             controller_name: self.controller_name.clone(),
-            watch_namespace: self.opts.watch_namespace.clone(),
+            watch_scope: self.opts.watch_scope.clone(),
+            pod_namespace: self.opts.pod_namespace.clone(),
             ingress_default_backend: self.opts.ingress_default_backend.clone(),
             ingress_ports: self.opts.ingress_ports,
             metrics: crate::ReflectorMetrics::new(self.opts.metrics_prefix),
@@ -1436,16 +1520,176 @@ struct SharedHandles {
 /// [`reflector::store::Writer`] from [`SharedProxyReconciler::new`] (its reader
 /// is the same synced store the controller's status worker reads), or create a
 /// fresh store when status stores are disabled (the proxy role).
-fn reader_writer<K>(
-    pre: Option<reflector::store::Writer<K>>,
-) -> (reflector::Store<K>, reflector::store::Writer<K>)
+/// Create (or adopt) one reflector store **per watched namespace** for a
+/// namespaced resource, returning the merged reader and the per-namespace
+/// writers, index-aligned with [`WatchScope::api_scopes`] (multi-namespace
+/// watch, #59).
+///
+/// `pre` adopts a status-relevant type's pre-created writers (from
+/// [`SharedProxyReconciler::new`]) so the controller's status worker and the
+/// reflector's rebuild pass read the *same* stores; those writers were made from
+/// the same `scope`, so they realign with `api_scopes` here. `None` mints fresh
+/// stores. Cluster-scoped resources use [`cluster_reader_writer`] instead.
+fn scoped_reader_writers<K>(
+    pre: Option<Vec<reflector::store::Writer<K>>>,
+    scope: &WatchScope,
+) -> (MergedStore<K>, Vec<reflector::store::Writer<K>>)
 where
     K: kube::Resource + Clone + 'static,
     K::DynamicType: Eq + std::hash::Hash + Clone + Default,
 {
-    match pre {
+    let namespaces = scope.api_scopes();
+    let writers = pre.unwrap_or_else(|| {
+        namespaces
+            .iter()
+            .map(|_| reflector::store::<K>().1)
+            .collect()
+    });
+    // Re-pair each writer's reader handle with the namespace it watches, so the
+    // merged store can route `get` by namespace.
+    let readers = writers
+        .iter()
+        .zip(namespaces)
+        .map(|(writer, ns)| (ns.map(str::to_string), writer.as_reader()))
+        .collect();
+    (MergedStore::new(readers), writers)
+}
+
+/// Create (or adopt) a single cluster-wide reflector store for a cluster-scoped
+/// resource (e.g. `GatewayClass`, `Namespace`) — or one deliberately watched
+/// cluster-wide regardless of `--watch-namespace` (e.g. `IngressClass`).
+///
+/// Returns a single-element [`MergedStore`] so reader fields stay a uniform
+/// `MergedStore<K>` whether the resource is namespaced or cluster-scoped.
+fn cluster_reader_writer<K>(
+    pre: Option<reflector::store::Writer<K>>,
+) -> (MergedStore<K>, reflector::store::Writer<K>)
+where
+    K: kube::Resource + Clone + 'static,
+    K::DynamicType: Eq + std::hash::Hash + Clone + Default,
+{
+    let (reader, writer) = match pre {
         Some(writer) => (writer.as_reader(), writer),
         None => reflector::store::<K>(),
+    };
+    (MergedStore::single(reader), writer)
+}
+
+/// Shared context for spawning per-namespace reflector fans (#59). Groups the
+/// values every spawn needs so the fan-out — a shared readiness barrier plus one
+/// reflector per watched namespace — lives in one place instead of at ~30 call
+/// sites, and the per-type methods stay under the argument ceiling.
+struct ScopedSpawn<'a> {
+    set: &'a mut JoinSet<()>,
+    clients: WatchClientSource<'a>,
+    scope: &'a WatchScope,
+    trigger: &'a watch::Sender<u64>,
+    health: &'a SubsystemHandle,
+    metrics: crate::ReflectorMetrics,
+}
+
+impl ScopedSpawn<'_> {
+    /// Spawn one reflector per watched namespace for a **namespaced** resource,
+    /// each on its own client (own connection), sharing a readiness barrier so
+    /// `check` flips Ready only once every namespace has synced. `writers` must
+    /// align by index with [`WatchScope::api_scopes`] — both come from
+    /// [`scoped_reader_writers`] over the same scope.
+    fn namespaced<K>(
+        &mut self,
+        writers: Vec<reflector::store::Writer<K>>,
+        config: watcher::Config,
+        check: &'static str,
+        label: &'static str,
+    ) where
+        K: kube::Resource<Scope = kube::core::NamespaceResourceScope>
+            + serde::de::DeserializeOwned
+            + Clone
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + 'static,
+        K::DynamicType: Default + Clone + std::hash::Hash + Eq + Send + Sync + 'static,
+    {
+        // Copy the `&WatchScope` out first: `namespaced_in` takes `&mut self`, so
+        // the scope arg must not alias a live borrow of `self`.
+        let scope = self.scope;
+        self.namespaced_in(scope, writers, config, check, label);
+    }
+
+    /// Like [`Self::namespaced`], but fans over the **passed** `scope` rather than
+    /// `self.scope` — for namespaced resources watched on a *widened* scope (the
+    /// tenant set plus the controller's own namespace, [`WatchScope::with_namespace`]):
+    /// the fleet `Pod` watch and the `CoxswainGatewayParameters` /
+    /// `CoxswainIngressClassParameters` `parametersRef` sources (#59). `writers`
+    /// must align by index with `scope.api_scopes()` — both derive from the same
+    /// scope via [`scoped_reader_writers`].
+    fn namespaced_in<K>(
+        &mut self,
+        scope: &WatchScope,
+        writers: Vec<reflector::store::Writer<K>>,
+        config: watcher::Config,
+        check: &'static str,
+        label: &'static str,
+    ) where
+        K: kube::Resource<Scope = kube::core::NamespaceResourceScope>
+            + serde::de::DeserializeOwned
+            + Clone
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + 'static,
+        K::DynamicType: Default + Clone + std::hash::Hash + Eq + Send + Sync + 'static,
+    {
+        let readiness = Arc::new(AtomicUsize::new(writers.len().max(1)));
+        for (writer, ns) in writers.into_iter().zip(scope.api_scopes()) {
+            let effects = ReflectorEffects::new(
+                self.trigger,
+                self.health,
+                check,
+                self.metrics,
+                ns.unwrap_or("").to_string(),
+                Arc::clone(&readiness),
+            );
+            spawn_reflector(
+                self.set,
+                writer,
+                scoped_api::<K>(self.clients.client(), ns),
+                config.clone(),
+                effects,
+                label,
+            );
+        }
+    }
+
+    /// Spawn a single cluster-wide reflector for a **cluster-scoped** resource
+    /// (or one deliberately watched cluster-wide). The caller supplies the
+    /// `Api::all` handle since cluster-scoped types cannot use [`scoped_api`].
+    fn cluster<K>(
+        &mut self,
+        writer: reflector::store::Writer<K>,
+        api: Api<K>,
+        config: watcher::Config,
+        check: &'static str,
+        label: &'static str,
+    ) where
+        K: kube::Resource
+            + serde::de::DeserializeOwned
+            + Clone
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + 'static,
+        K::DynamicType: Default + Clone + std::hash::Hash + Eq + Send + Sync + 'static,
+    {
+        let effects = ReflectorEffects::new(
+            self.trigger,
+            self.health,
+            check,
+            self.metrics,
+            String::new(),
+            Arc::new(AtomicUsize::new(1)),
+        );
+        spawn_reflector(self.set, writer, api, config, effects, label);
     }
 }
 
@@ -1453,39 +1697,35 @@ where
 /// [`add_gateway_api_reflectors`]. Gathered here so the callers
 /// don't exceed the 7-argument function threshold.
 struct GatewayApiStoreWriters {
-    routes: reflector::store::Writer<HttpRoute>,
-    grpc_routes: reflector::store::Writer<GrpcRoute>,
-    tls_routes: reflector::store::Writer<TlsRoute>,
-    tcp_routes: reflector::store::Writer<TcpRoute>,
-    udp_routes: reflector::store::Writer<UdpRoute>,
-    gateways: reflector::store::Writer<Gateway>,
+    // Namespaced types carry one writer per watched namespace (#59); the
+    // cluster-scoped `gateway_classes` and cluster-wide `namespaces` are single.
+    routes: Vec<reflector::store::Writer<HttpRoute>>,
+    grpc_routes: Vec<reflector::store::Writer<GrpcRoute>>,
+    tls_routes: Vec<reflector::store::Writer<TlsRoute>>,
+    tcp_routes: Vec<reflector::store::Writer<TcpRoute>>,
+    udp_routes: Vec<reflector::store::Writer<UdpRoute>>,
+    gateways: Vec<reflector::store::Writer<Gateway>>,
     gateway_classes: reflector::store::Writer<GatewayClass>,
-    grants: reflector::store::Writer<ReferenceGrant>,
-    policies: reflector::store::Writer<BackendTlsPolicy>,
-    configmaps: reflector::store::Writer<ConfigMap>,
-    path_rewrites: reflector::store::Writer<PathRewriteRegex>,
-    basic_auths: reflector::store::Writer<BasicAuth>,
-    request_size_limits: reflector::store::Writer<RequestSizeLimit>,
-    listener_sets: reflector::store::Writer<ListenerSet>,
+    grants: Vec<reflector::store::Writer<ReferenceGrant>>,
+    policies: Vec<reflector::store::Writer<BackendTlsPolicy>>,
+    configmaps: Vec<reflector::store::Writer<ConfigMap>>,
+    path_rewrites: Vec<reflector::store::Writer<PathRewriteRegex>>,
+    basic_auths: Vec<reflector::store::Writer<BasicAuth>>,
+    request_size_limits: Vec<reflector::store::Writer<RequestSizeLimit>>,
+    listener_sets: Vec<reflector::store::Writer<ListenerSet>>,
     namespaces: reflector::store::Writer<Namespace>,
-    client_traffic_policies: reflector::store::Writer<ClientTrafficPolicy>,
-    coxswain_backend_policies: reflector::store::Writer<CoxswainBackendPolicy>,
+    client_traffic_policies: Vec<reflector::store::Writer<ClientTrafficPolicy>>,
+    coxswain_backend_policies: Vec<reflector::store::Writer<CoxswainBackendPolicy>>,
 }
 
-/// Spawn all Gateway API reflectors into `set`.
+/// Spawn all Gateway API reflectors through `scoped` — one reflector per watched
+/// namespace for namespaced types, a single cluster-wide watch for the
+/// cluster-scoped `GatewayClass` / `Namespace` (#59).
 ///
 /// Called either immediately at startup (CRDs present) or from the self-heal
 /// probe task once the CRDs appear. Consumes the writer bundle so each
 /// underlying `reflector::store::Writer` is owned by exactly one task.
-fn add_gateway_api_reflectors(
-    set: &mut JoinSet<()>,
-    clients: WatchClientSource<'_>,
-    ns: Option<&str>,
-    writers: GatewayApiStoreWriters,
-    trigger: &watch::Sender<u64>,
-    health: &SubsystemHandle,
-    metrics: crate::ReflectorMetrics,
-) {
+fn add_gateway_api_reflectors(scoped: &mut ScopedSpawn<'_>, writers: GatewayApiStoreWriters) {
     let GatewayApiStoreWriters {
         routes,
         grpc_routes,
@@ -1505,121 +1745,68 @@ fn add_gateway_api_reflectors(
         client_traffic_policies,
         coxswain_backend_policies,
     } = writers;
+    // Cluster-scoped `Api::all` handles built up front (Copy `clients` snapshot),
+    // so the `&mut scoped` spawns below don't alias an immutable `scoped` borrow.
+    let clients = scoped.clients;
 
-    spawn_reflector(
-        set,
-        routes,
-        scoped_api::<HttpRoute>(clients.client(), ns),
-        control_watch_config(),
-        ReflectorEffects::new(trigger, health, "httproute", metrics),
-        "HttpRoute",
-    );
-    spawn_reflector(
-        set,
+    scoped.namespaced::<HttpRoute>(routes, control_watch_config(), "httproute", "HttpRoute");
+    scoped.namespaced::<GrpcRoute>(
         grpc_routes,
-        scoped_api::<GrpcRoute>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(trigger, health, "grpcroute", metrics),
+        "grpcroute",
         "GrpcRoute",
     );
-    spawn_reflector(
-        set,
-        tls_routes,
-        scoped_api::<TlsRoute>(clients.client(), ns),
-        control_watch_config(),
-        ReflectorEffects::new(trigger, health, "tls_route", metrics),
-        "TlsRoute",
-    );
-    spawn_reflector(
-        set,
-        tcp_routes,
-        scoped_api::<TcpRoute>(clients.client(), ns),
-        control_watch_config(),
-        ReflectorEffects::new(trigger, health, "tcp_route", metrics),
-        "TcpRoute",
-    );
-    spawn_reflector(
-        set,
-        udp_routes,
-        scoped_api::<UdpRoute>(clients.client(), ns),
-        control_watch_config(),
-        ReflectorEffects::new(trigger, health, "udp_route", metrics),
-        "UdpRoute",
-    );
-    spawn_reflector(
-        set,
-        gateways,
-        scoped_api::<Gateway>(clients.client(), ns),
-        control_watch_config(),
-        ReflectorEffects::new(trigger, health, "gateway", metrics),
-        "Gateway",
-    );
-    spawn_reflector(
-        set,
+    scoped.namespaced::<TlsRoute>(tls_routes, control_watch_config(), "tls_route", "TlsRoute");
+    scoped.namespaced::<TcpRoute>(tcp_routes, control_watch_config(), "tcp_route", "TcpRoute");
+    scoped.namespaced::<UdpRoute>(udp_routes, control_watch_config(), "udp_route", "UdpRoute");
+    scoped.namespaced::<Gateway>(gateways, control_watch_config(), "gateway", "Gateway");
+    // GatewayClass is cluster-scoped: always one cluster-wide watch.
+    scoped.cluster::<GatewayClass>(
         gateway_classes,
         Api::<GatewayClass>::all(clients.client()),
         control_watch_config(),
-        ReflectorEffects::new(trigger, health, "gateway_class", metrics),
+        "gateway_class",
         "GatewayClass",
     );
-    spawn_reflector(
-        set,
+    scoped.namespaced::<ReferenceGrant>(
         grants,
-        scoped_api::<ReferenceGrant>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(trigger, health, "reference_grant", metrics),
+        "reference_grant",
         "ReferenceGrant",
     );
-    spawn_reflector(
-        set,
+    scoped.namespaced::<BackendTlsPolicy>(
         policies,
-        scoped_api::<BackendTlsPolicy>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(trigger, health, "backend_tls_policy", metrics),
+        "backend_tls_policy",
         "BackendTlsPolicy",
     );
     // ConfigMaps have no type= field selector equivalent; all CMs in scope are
     // watched so BackendTLSPolicy caCertificateRefs can be resolved.
-    spawn_reflector(
-        set,
-        configmaps,
-        scoped_api::<ConfigMap>(clients.client(), ns),
-        bulk_watch_config(),
-        ReflectorEffects::new(trigger, health, "config_map", metrics),
-        "ConfigMap",
-    );
-    spawn_reflector(
-        set,
+    scoped.namespaced::<ConfigMap>(configmaps, bulk_watch_config(), "config_map", "ConfigMap");
+    scoped.namespaced::<PathRewriteRegex>(
         path_rewrites,
-        scoped_api::<PathRewriteRegex>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(trigger, health, "path_rewrite_regex", metrics),
+        "path_rewrite_regex",
         "PathRewriteRegex",
     );
-    spawn_reflector(
-        set,
+    scoped.namespaced::<BasicAuth>(
         basic_auths,
-        scoped_api::<BasicAuth>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(trigger, health, "basic_auth", metrics),
+        "basic_auth",
         "BasicAuth",
     );
-    spawn_reflector(
-        set,
+    scoped.namespaced::<RequestSizeLimit>(
         request_size_limits,
-        scoped_api::<RequestSizeLimit>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(trigger, health, "request_size_limit", metrics),
+        "request_size_limit",
         "RequestSizeLimit",
     );
     // GEP-1713: ListenerSets are namespaced and merged into their parent Gateway's
     // effective listener set during rebuild.
-    spawn_reflector(
-        set,
+    scoped.namespaced::<ListenerSet>(
         listener_sets,
-        scoped_api::<ListenerSet>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(trigger, health, "listener_set", metrics),
+        "listener_set",
         "ListenerSet",
     );
     // Namespaces are cluster-scoped and watched only so a Gateway's
@@ -1627,31 +1814,26 @@ fn add_gateway_api_reflectors(
     // ListenerSet's namespace labels (GEP-1713). Must be cluster-wide — a
     // `--watch-namespace` scope can't observe label changes on a ListenerSet's
     // namespace object. Read-only; the proxy SA holds no write verb.
-    spawn_reflector(
-        set,
+    scoped.cluster::<Namespace>(
         namespaces,
         Api::<Namespace>::all(clients.client()),
         control_watch_config(),
-        ReflectorEffects::new(trigger, health, "namespace", metrics),
+        "namespace",
         "Namespace",
     );
     // `ClientTrafficPolicy` CRs — per-listener PROXY-protocol opt-in (#327).
     // Namespaced and watched alongside other Gateway API policy resources.
-    spawn_reflector(
-        set,
+    scoped.namespaced::<ClientTrafficPolicy>(
         client_traffic_policies,
-        scoped_api::<ClientTrafficPolicy>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(trigger, health, "client_traffic_policy", metrics),
+        "client_traffic_policy",
         "ClientTrafficPolicy",
     );
     // `CoxswainBackendPolicy` CRs — per-backend connect/idle timeouts (#354).
-    spawn_reflector(
-        set,
+    scoped.namespaced::<CoxswainBackendPolicy>(
         coxswain_backend_policies,
-        scoped_api::<CoxswainBackendPolicy>(clients.client(), ns),
         control_watch_config(),
-        ReflectorEffects::new(trigger, health, "coxswain_backend_policy", metrics),
+        "coxswain_backend_policy",
         "CoxswainBackendPolicy",
     );
 }
@@ -1695,7 +1877,8 @@ async fn spawn_tasks(
     } = handles;
     let ReconcilerConfig {
         controller_name,
-        watch_namespace,
+        watch_scope,
+        pod_namespace,
         ingress_default_backend,
         ingress_ports,
         metrics,
@@ -1727,58 +1910,87 @@ async fn spawn_tasks(
             ),
             None => (None, None, None, None, None, None),
         };
-    let (route_reader, route_writer) = reader_writer::<HttpRoute>(pre.routes);
-    let (grpc_route_reader, grpc_route_writer) = reader_writer::<GrpcRoute>(pre.grpc_routes);
-    let (ingress_reader, ingress_writer) = reader_writer::<Ingress>(pre.ingresses);
-    let (class_reader, class_writer) = reader_writer::<IngressClass>(pre.ingress_classes);
-    let (class_params_reader, class_params_writer) =
-        reflector::store::<CoxswainIngressClassParameters>();
-    let (gateway_reader, gateway_writer) = reader_writer::<Gateway>(pre.gateways);
+    // Per-namespace stores for namespaced types (#59): the reader is a
+    // `MergedStore` folding every watched namespace; the writers are one per
+    // namespace, fed to `ScopedSpawn::namespaced` below. Status-relevant types
+    // adopt their pre-created writers so the controller's status worker reads the
+    // same synced stores. Cluster-scoped types (`IngressClass`,
+    // `CoxswainIngressClassParameters`, `Namespace`) use `cluster_reader_writer`.
+    let scope = &watch_scope;
+    // Widened scope for namespaced infra resources that also live in the install
+    // namespace — the fleet `Pod`, `CoxswainGatewayParameters`, and
+    // `CoxswainIngressClassParameters` watches (#59). Derived identically to the
+    // `infra_scope` in `new()` (same `watch_scope` + `pod_namespace`), so the
+    // pre-created writers realign here index-for-index with `api_scopes()`.
+    let infra_scope = watch_scope.with_namespace(&pod_namespace);
+    let (route_reader, route_writers) = scoped_reader_writers::<HttpRoute>(pre.routes, scope);
+    let (grpc_route_reader, grpc_route_writers) =
+        scoped_reader_writers::<GrpcRoute>(pre.grpc_routes, scope);
+    let (ingress_reader, ingress_writers) = scoped_reader_writers::<Ingress>(pre.ingresses, scope);
+    let (class_reader, class_writer) = cluster_reader_writer::<IngressClass>(pre.ingress_classes);
+    // Scoped to `infra_scope` (tenant ∪ install namespace): an IngressClass's
+    // `spec.parameters.namespace` must now resolve within the watch set or the
+    // controller's own namespace, so the lockdown needs no cluster-wide read (#59).
+    let (class_params_reader, class_params_writers) =
+        scoped_reader_writers::<CoxswainIngressClassParameters>(None, &infra_scope);
+    let (gateway_reader, gateway_writers) = scoped_reader_writers::<Gateway>(pre.gateways, scope);
     let (gateway_class_reader, gateway_class_writer) =
-        reader_writer::<GatewayClass>(pre.gateway_classes);
-    let (slice_reader, slice_writer) = reflector::store::<EndpointSlice>();
-    let (grant_reader, grant_writer) = reflector::store::<ReferenceGrant>();
-    let (secret_reader, secret_writer) = reflector::store::<Secret>();
-    let (auth_secret_reader, auth_secret_writer) = reflector::store::<Secret>();
-    let (auth_tls_secret_reader, auth_tls_secret_writer) = reflector::store::<Secret>();
-    let (service_reader, service_writer) = reader_writer::<Service>(op_services_w);
-    let (policy_reader, policy_writer) = reader_writer::<BackendTlsPolicy>(pre.policies);
-    let (configmap_reader, configmap_writer) = reflector::store::<ConfigMap>();
-    let (rate_limit_reader, rate_limit_writer) = reflector::store::<RateLimit>();
-    let (retry_policy_reader, retry_policy_writer) = reflector::store::<RetryPolicy>();
-    let (path_rewrite_reader, path_rewrite_writer) = reflector::store::<PathRewriteRegex>();
-    let (ip_access_reader, ip_access_writer) = reflector::store::<IpAccessControl>();
-    let (basic_auth_reader, basic_auth_writer) = reflector::store::<BasicAuth>();
+        cluster_reader_writer::<GatewayClass>(pre.gateway_classes);
+    let (slice_reader, slice_writers) = scoped_reader_writers::<EndpointSlice>(None, scope);
+    let (grant_reader, grant_writers) = scoped_reader_writers::<ReferenceGrant>(None, scope);
+    let (secret_reader, secret_writers) = scoped_reader_writers::<Secret>(None, scope);
+    let (auth_secret_reader, auth_secret_writers) = scoped_reader_writers::<Secret>(None, scope);
+    let (auth_tls_secret_reader, auth_tls_secret_writers) =
+        scoped_reader_writers::<Secret>(None, scope);
+    // See `new()`: Services fan over `infra_scope` so the rebuild sees the
+    // per-Gateway shared-VIP Services in the install namespace (#472/#59).
+    let (service_reader, service_writers) =
+        scoped_reader_writers::<Service>(op_services_w, &infra_scope);
+    let (policy_reader, policy_writers) =
+        scoped_reader_writers::<BackendTlsPolicy>(pre.policies, scope);
+    let (configmap_reader, configmap_writers) = scoped_reader_writers::<ConfigMap>(None, scope);
+    let (rate_limit_reader, rate_limit_writers) = scoped_reader_writers::<RateLimit>(None, scope);
+    let (retry_policy_reader, retry_policy_writers) =
+        scoped_reader_writers::<RetryPolicy>(None, scope);
+    let (path_rewrite_reader, path_rewrite_writers) =
+        scoped_reader_writers::<PathRewriteRegex>(None, scope);
+    let (ip_access_reader, ip_access_writers) =
+        scoped_reader_writers::<IpAccessControl>(None, scope);
+    let (basic_auth_reader, basic_auth_writers) = scoped_reader_writers::<BasicAuth>(None, scope);
     // JwtAuth has no status subresource (#441) — a plain, non-shared store is
     // enough; unlike CoxswainExternalAuth it has no targetRefs/Gateway-attachment
     // surface for the controller's status-writer to react to.
-    let (jwt_auth_reader, jwt_auth_writer) = reflector::store::<JwtAuth>();
+    let (jwt_auth_reader, jwt_auth_writers) = scoped_reader_writers::<JwtAuth>(None, scope);
     // CoxswainExternalAuth is a status-relevant store: the controller role
     // subscribes to it via `StatusSubscriptions.coxswain_external_auths` (#23) to
     // write `status.ancestors[]`, and the data-plane reader resolves both the
     // route-level ExtensionRef filter and the Gateway-attached policy index.
-    let (external_auth_reader, external_auth_writer) =
-        reader_writer::<CoxswainExternalAuth>(pre.coxswain_external_auths);
-    let (request_size_limit_reader, request_size_limit_writer) =
-        reflector::store::<RequestSizeLimit>();
-    let (compression_reader, compression_writer) = reflector::store::<Compression>();
-    let (tls_route_reader, tls_route_writer) = reader_writer::<TlsRoute>(pre.tls_routes);
-    let (tcp_route_reader, tcp_route_writer) = reader_writer::<TcpRoute>(pre.tcp_routes);
-    let (udp_route_reader, udp_route_writer) = reader_writer::<UdpRoute>(pre.udp_routes);
+    let (external_auth_reader, external_auth_writers) =
+        scoped_reader_writers::<CoxswainExternalAuth>(pre.coxswain_external_auths, scope);
+    let (request_size_limit_reader, request_size_limit_writers) =
+        scoped_reader_writers::<RequestSizeLimit>(None, scope);
+    let (compression_reader, compression_writers) =
+        scoped_reader_writers::<Compression>(None, scope);
+    let (tls_route_reader, tls_route_writers) =
+        scoped_reader_writers::<TlsRoute>(pre.tls_routes, scope);
+    let (tcp_route_reader, tcp_route_writers) =
+        scoped_reader_writers::<TcpRoute>(pre.tcp_routes, scope);
+    let (udp_route_reader, udp_route_writers) =
+        scoped_reader_writers::<UdpRoute>(pre.udp_routes, scope);
     // ListenerSet is a status-relevant store: in the controller role its writer is
     // the shared one pre-created in `new`, so the status-writer's subscription and
     // the data-plane reader observe the same synced store (GEP-1713).
-    let (listener_set_reader, listener_set_writer) =
-        reader_writer::<ListenerSet>(pre.listener_sets);
+    let (listener_set_reader, listener_set_writers) =
+        scoped_reader_writers::<ListenerSet>(pre.listener_sets, scope);
     // ClientTrafficPolicy is a status-relevant store: the controller role subscribes
     // to it via `StatusSubscriptions.client_traffic_policies` (#327).
-    let (ctp_reader, ctp_writer) =
-        reader_writer::<ClientTrafficPolicy>(pre.client_traffic_policies);
+    let (ctp_reader, ctp_writers) =
+        scoped_reader_writers::<ClientTrafficPolicy>(pre.client_traffic_policies, scope);
     // CoxswainBackendPolicy is a status-relevant store: the controller role
     // subscribes to it via `StatusSubscriptions.coxswain_backend_policies` (#354).
-    let (cbp_reader, cbp_writer) =
-        reader_writer::<CoxswainBackendPolicy>(pre.coxswain_backend_policies);
-    let (namespace_reader, namespace_writer) = reader_writer::<Namespace>(op_namespaces_w);
+    let (cbp_reader, cbp_writers) =
+        scoped_reader_writers::<CoxswainBackendPolicy>(pre.coxswain_backend_policies, scope);
+    let (namespace_reader, namespace_writer) = cluster_reader_writer::<Namespace>(op_namespaces_w);
     // Lossless rebuild trigger (#574): a `watch::Sender<u64>` generation counter,
     // not a `Notify`. Every watch event bumps it via `bump_rebuild`; the rebuild
     // loop reads it with `changed()`/`borrow_and_update()`, which never miss a
@@ -1793,38 +2005,52 @@ async fn spawn_tasks(
     if let Some(gate) = liveness_gate {
         set.spawn(crate::metrics::run_relist_liveness_monitor(gate));
     }
-    let ns = watch_namespace.as_deref();
+    // Shared context for the per-namespace reflector fans (#59): each namespaced
+    // watch spawns one reflector per watched namespace via `scoped.namespaced`
+    // (sharing a readiness barrier so the check flips Ready only once every
+    // namespace has synced), and each cluster-scoped watch a single reflector via
+    // `scoped.cluster`. `clients` is a Copy handle reused for the cluster-scoped
+    // `Api::all` sites. `scoped` borrows `set` mutably; its last use is the
+    // operator block below, after which the raw `set` is free again for the
+    // JWKS/rebuild tasks (which move `controller_health` and cannot coexist with
+    // `scoped`'s immutable borrow of it).
+    let clients = WatchClientSource {
+        config: &kube_config,
+        fallback: &client,
+    };
+    let mut scoped = ScopedSpawn {
+        set: &mut set,
+        clients,
+        scope: &watch_scope,
+        trigger: &rebuild_tx,
+        health: &controller_health,
+        metrics,
+    };
 
     // --- Always-on reflectors (both surfaces) ---
     //
     // EndpointSlice, Secret (TLS), and Service are needed whether Gateway API,
     // Ingress, or both are enabled: backends require port resolution (Service +
     // EndpointSlice) and TLS certs are shared across surfaces.
-
-    spawn_reflector(
-        &mut set,
-        slice_writer,
-        scoped_api::<EndpointSlice>(watch_client(&kube_config, &client), ns),
+    scoped.namespaced::<EndpointSlice>(
+        slice_writers,
         bulk_watch_config(),
-        ReflectorEffects::new(&rebuild_tx, &controller_health, "endpoint_slice", metrics),
+        "endpoint_slice",
         "EndpointSlice",
     );
     // Field-selector scoped to `type=kubernetes.io/tls` to avoid pulling every Secret into memory.
-    spawn_reflector(
-        &mut set,
-        secret_writer,
-        scoped_api::<Secret>(watch_client(&kube_config, &client), ns),
+    scoped.namespaced::<Secret>(
+        secret_writers,
         bulk_watch_config().fields("type=kubernetes.io/tls"),
-        ReflectorEffects::new(&rebuild_tx, &controller_health, "secret", metrics),
+        "secret",
         "Secret",
     );
     // Used to resolve targetPort for backends where servicePort ≠ targetPort.
-    spawn_reflector(
-        &mut set,
-        service_writer,
-        scoped_api::<Service>(watch_client(&kube_config, &client), ns),
+    scoped.namespaced_in::<Service>(
+        &infra_scope,
+        service_writers,
         bulk_watch_config(),
-        ReflectorEffects::new(&rebuild_tx, &controller_health, "service", metrics),
+        "service",
         "Service",
     );
     // Label-scoped to `ingress.coxswain-labs.dev/auth-basic=true` — only opt-in
@@ -1832,12 +2058,10 @@ async fn spawn_tasks(
     // bounded: Opaque Secrets without this label are never loaded (#24). Always-on
     // (not gated by `enable_ingress`): the Gateway-API `BasicAuth` ExtensionRef
     // (#442) consumes the same label-scoped store — no duplicate watcher.
-    spawn_reflector(
-        &mut set,
-        auth_secret_writer,
-        scoped_api::<Secret>(watch_client(&kube_config, &client), ns),
+    scoped.namespaced::<Secret>(
+        auth_secret_writers,
         control_watch_config().labels("ingress.coxswain-labs.dev/auth-basic=true"),
-        ReflectorEffects::new(&rebuild_tx, &controller_health, "auth_secret", metrics),
+        "auth_secret",
         "AuthSecret",
     );
     // Always-on (not gated by `enable_gateway_api`): the Ingress `auth-jwt`
@@ -1846,12 +2070,10 @@ async fn spawn_tasks(
     // `enable_gateway_api` would leave `auth-jwt` permanently unresolvable
     // (fail-open, no auth enforced) on an Ingress-only install. Mirrors the
     // `auth_secret` fix above for the identical cross-surface-store mistake.
-    spawn_reflector(
-        &mut set,
-        jwt_auth_writer,
-        scoped_api::<JwtAuth>(watch_client(&kube_config, &client), ns),
+    scoped.namespaced::<JwtAuth>(
+        jwt_auth_writers,
         control_watch_config(),
-        ReflectorEffects::new(&rebuild_tx, &controller_health, "jwt_auth", metrics),
+        "jwt_auth",
         "JwtAuth",
     );
     // Always-on (not gated by `enable_gateway_api`): the Ingress `ext-auth`
@@ -1863,17 +2085,10 @@ async fn spawn_tasks(
     // permanently unresolvable (fail-closed 503 on every route) on an
     // Ingress-only install. Mirrors the `jwt_auth` fix above for the
     // identical cross-surface-store mistake.
-    spawn_reflector(
-        &mut set,
-        external_auth_writer,
-        scoped_api::<CoxswainExternalAuth>(watch_client(&kube_config, &client), ns),
+    scoped.namespaced::<CoxswainExternalAuth>(
+        external_auth_writers,
         control_watch_config(),
-        ReflectorEffects::new(
-            &rebuild_tx,
-            &controller_health,
-            "coxswain_external_auth",
-            metrics,
-        ),
+        "coxswain_external_auth",
         "CoxswainExternalAuth",
     );
     // Always-on (not gated by `enable_gateway_api`): the Ingress `compression`
@@ -1884,48 +2099,35 @@ async fn spawn_tasks(
     // leave `compression` permanently fail-open (silently no compression) on
     // an Ingress-only install. Mirrors the `jwt_auth`/`external_auth` fixes
     // above for the identical cross-surface-store mistake.
-    spawn_reflector(
-        &mut set,
-        compression_writer,
-        scoped_api::<Compression>(watch_client(&kube_config, &client), ns),
+    scoped.namespaced::<Compression>(
+        compression_writers,
         control_watch_config(),
-        ReflectorEffects::new(&rebuild_tx, &controller_health, "compression", metrics),
+        "compression",
         "Compression",
     );
     // Always-on (not gated by `enable_gateway_api`): same fix, same rationale,
     // for the Ingress `retry` annotation (#551) and the `RetryPolicy` CR store.
-    spawn_reflector(
-        &mut set,
-        retry_policy_writer,
-        scoped_api::<RetryPolicy>(watch_client(&kube_config, &client), ns),
+    scoped.namespaced::<RetryPolicy>(
+        retry_policy_writers,
         control_watch_config(),
-        ReflectorEffects::new(&rebuild_tx, &controller_health, "retry_policy", metrics),
+        "retry_policy",
         "RetryPolicy",
     );
     // Always-on (not gated by `enable_gateway_api`): same fix, same rationale,
     // for the Ingress `rate-limit` annotation (#552) and the `RateLimit` CR store.
-    spawn_reflector(
-        &mut set,
-        rate_limit_writer,
-        scoped_api::<RateLimit>(watch_client(&kube_config, &client), ns),
+    scoped.namespaced::<RateLimit>(
+        rate_limit_writers,
         control_watch_config(),
-        ReflectorEffects::new(&rebuild_tx, &controller_health, "rate_limit", metrics),
+        "rate_limit",
         "RateLimit",
     );
     // Always-on (not gated by `enable_gateway_api`): same fix, same rationale,
     // for the Ingress `ip-access-control` annotation (#553) and the
     // `IpAccessControl` CR store.
-    spawn_reflector(
-        &mut set,
-        ip_access_writer,
-        scoped_api::<IpAccessControl>(watch_client(&kube_config, &client), ns),
+    scoped.namespaced::<IpAccessControl>(
+        ip_access_writers,
         control_watch_config(),
-        ReflectorEffects::new(
-            &rebuild_tx,
-            &controller_health,
-            "ip_access_control",
-            metrics,
-        ),
+        "ip_access_control",
         "IpAccessControl",
     );
 
@@ -1935,49 +2137,40 @@ async fn spawn_tasks(
     // watch moved to the always-on block above since Gateway API's `BasicAuth`
     // ExtensionRef (#442) consumes it too.
     if enable_ingress {
-        spawn_reflector(
-            &mut set,
-            ingress_writer,
-            scoped_api::<Ingress>(watch_client(&kube_config, &client), ns),
+        scoped.namespaced::<Ingress>(
+            ingress_writers,
             control_watch_config(),
-            ReflectorEffects::new(&rebuild_tx, &controller_health, "ingress", metrics),
+            "ingress",
             "Ingress",
         );
-        spawn_reflector(
-            &mut set,
+        scoped.cluster::<IngressClass>(
             class_writer,
-            Api::<IngressClass>::all(watch_client(&kube_config, &client)),
+            Api::<IngressClass>::all(clients.client()),
             control_watch_config(),
-            ReflectorEffects::new(&rebuild_tx, &controller_health, "ingress_class", metrics),
+            "ingress_class",
             "IngressClass",
         );
-        // Watched cluster-wide (like IngressClass): an IngressClass is cluster-scoped
-        // and its `spec.parameters.namespace` is unconstrained, so a `--watch-namespace`
-        // scope would miss a params CR stored in another namespace. RBAC is a ClusterRole
-        // read; the proxy SA holds no write verb on this resource.
-        spawn_reflector(
-            &mut set,
-            class_params_writer,
-            Api::<CoxswainIngressClassParameters>::all(watch_client(&kube_config, &client)),
+        // Watched over `infra_scope` (tenant namespaces ∪ the controller's own
+        // namespace): an IngressClass is cluster-scoped but its params CR is a
+        // namespaced object, and scoping the watch to the widened infra set lets
+        // the lockdown grant a namespaced `Role` instead of cluster-wide read
+        // (#59). A params CR outside that set is not observed — the operator must
+        // place it in a watched namespace or the install namespace.
+        scoped.namespaced_in(
+            &infra_scope,
+            class_params_writers,
             control_watch_config(),
-            ReflectorEffects::new(
-                &rebuild_tx,
-                &controller_health,
-                "ingress_class_parameters",
-                metrics,
-            ),
+            "ingress_class_parameters",
             "CoxswainIngressClassParameters",
         );
         // Label-scoped to `ingress.coxswain-labs.dev/auth-tls=true` — only opt-in CA
         // Secrets for per-Ingress client-certificate mTLS are cached (#267).  Separate
         // watch from `secrets` (server-TLS) and `auth_secrets` (htpasswd) to bound
         // memory: only operator-tagged CA Secrets are loaded.
-        spawn_reflector(
-            &mut set,
-            auth_tls_secret_writer,
-            scoped_api::<Secret>(watch_client(&kube_config, &client), ns),
+        scoped.namespaced::<Secret>(
+            auth_tls_secret_writers,
             control_watch_config().labels("ingress.coxswain-labs.dev/auth-tls=true"),
-            ReflectorEffects::new(&rebuild_tx, &controller_health, "auth_tls_secret", metrics),
+            "auth_tls_secret",
             "AuthTlsSecret",
         );
     }
@@ -1990,37 +2183,26 @@ async fn spawn_tasks(
     // the reflectors once the CRDs appear (self-healing — no pod restart needed).
     if enable_gateway_api {
         let gw_writers = GatewayApiStoreWriters {
-            routes: route_writer,
-            grpc_routes: grpc_route_writer,
-            tls_routes: tls_route_writer,
-            tcp_routes: tcp_route_writer,
-            udp_routes: udp_route_writer,
-            gateways: gateway_writer,
+            routes: route_writers,
+            grpc_routes: grpc_route_writers,
+            tls_routes: tls_route_writers,
+            tcp_routes: tcp_route_writers,
+            udp_routes: udp_route_writers,
+            gateways: gateway_writers,
             gateway_classes: gateway_class_writer,
-            grants: grant_writer,
-            policies: policy_writer,
-            configmaps: configmap_writer,
-            path_rewrites: path_rewrite_writer,
-            basic_auths: basic_auth_writer,
-            request_size_limits: request_size_limit_writer,
-            listener_sets: listener_set_writer,
+            grants: grant_writers,
+            policies: policy_writers,
+            configmaps: configmap_writers,
+            path_rewrites: path_rewrite_writers,
+            basic_auths: basic_auth_writers,
+            request_size_limits: request_size_limit_writers,
+            listener_sets: listener_set_writers,
             namespaces: namespace_writer,
-            client_traffic_policies: ctp_writer,
-            coxswain_backend_policies: cbp_writer,
+            client_traffic_policies: ctp_writers,
+            coxswain_backend_policies: cbp_writers,
         };
         if crate::crds::gateway_api_crds_present(&client).await {
-            add_gateway_api_reflectors(
-                &mut set,
-                WatchClientSource {
-                    config: &kube_config,
-                    fallback: &client,
-                },
-                ns,
-                gw_writers,
-                &rebuild_tx,
-                &controller_health,
-                metrics,
-            );
+            add_gateway_api_reflectors(&mut scoped, gw_writers);
             controller_health.ready("gateway_api_crds");
         } else {
             tracing::warn!(
@@ -2037,9 +2219,9 @@ async fn spawn_tasks(
             let probe_kube_config = kube_config.clone();
             let probe_trigger = rebuild_tx.clone();
             let probe_health = controller_health.clone();
-            let probe_watch_namespace = watch_namespace.clone();
+            let probe_watch_scope = watch_scope.clone();
             let mut writers_slot = Some(gw_writers);
-            set.spawn(async move {
+            scoped.set.spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(30)).await;
                     if crate::crds::gateway_api_crds_present(&probe_client).await {
@@ -2050,19 +2232,18 @@ async fn spawn_tasks(
                             return;
                         };
                         let mut gw_set = JoinSet::new();
-                        let probe_ns = probe_watch_namespace.as_deref();
-                        add_gateway_api_reflectors(
-                            &mut gw_set,
-                            WatchClientSource {
+                        let mut probe_scoped = ScopedSpawn {
+                            set: &mut gw_set,
+                            clients: WatchClientSource {
                                 config: &probe_kube_config,
                                 fallback: &probe_client,
                             },
-                            probe_ns,
-                            writers,
-                            &probe_trigger,
-                            &probe_health,
+                            scope: &probe_watch_scope,
+                            trigger: &probe_trigger,
+                            health: &probe_health,
                             metrics,
-                        );
+                        };
+                        add_gateway_api_reflectors(&mut probe_scoped, writers);
                         probe_health.ready("gateway_api_crds");
                         bump_rebuild(&probe_trigger);
                         tracing::info!(
@@ -2100,26 +2281,46 @@ async fn spawn_tasks(
     // `watch_fleet`, the store population is not. The shared-proxy pod (which
     // lacks pod-read RBAC and has neither consumer) never reaches this branch.
     if watch_fleet || op_pods_w.is_some() {
-        let (pod_reader, pod_writer) = reader_writer::<Pod>(op_pods_w);
+        // Scoped to `infra_scope` (tenant namespaces ∪ the install namespace):
+        // coxswain's own pods live in the install namespace, and dedicated-proxy
+        // pods in the tenant namespaces, so the widened set covers both without a
+        // cluster-wide read (#59). The reader is a `MergedStore` folding every
+        // scope namespace; `pod_writers` aligns index-for-index with
+        // `infra_scope.api_scopes()`.
+        let (pod_reader, pod_writers) = scoped_reader_writers::<Pod>(op_pods_w, &infra_scope);
         // Own `watch` trigger for the fleet snapshot (same lossless rationale as
         // the rebuild trigger): a pod event during a `build_snapshot` must not be
         // dropped. Distinct channel because the fleet snapshot is a separate,
         // undebounced consumer of the pod watch, not part of the routing rebuild.
         let (fleet_trigger, fleet_rx) = watch::channel(0u64);
-        spawn_reflector(
-            &mut set,
-            pod_writer,
-            Api::<Pod>::all(watch_client(&kube_config, &client)),
-            control_watch_config().labels("app.kubernetes.io/name=coxswain"),
-            ReflectorEffects::new(&fleet_trigger, &controller_health, "pod", metrics),
-            "Pod",
-        );
+        // Direct spawn per scope namespace (not `ScopedSpawn::namespaced_in`, which
+        // is hard-wired to the rebuild trigger) because this watch drives the
+        // distinct `fleet_trigger`. One shared readiness barrier across the fan so
+        // the `pod` check flips Ready only once every namespace has synced.
+        let pod_readiness = Arc::new(AtomicUsize::new(pod_writers.len().max(1)));
+        for (writer, ns) in pod_writers.into_iter().zip(infra_scope.api_scopes()) {
+            spawn_reflector(
+                &mut *scoped.set,
+                writer,
+                scoped_api::<Pod>(clients.client(), ns),
+                control_watch_config().labels("app.kubernetes.io/name=coxswain"),
+                ReflectorEffects::new(
+                    &fleet_trigger,
+                    &controller_health,
+                    "pod",
+                    metrics,
+                    ns.unwrap_or("").to_string(),
+                    Arc::clone(&pod_readiness),
+                ),
+                "Pod",
+            );
+        }
         if watch_fleet {
             // Publishes a `SharedFleet` snapshot immediately on every pod watch
             // event — no debounce, because pod IP / annotation changes are
             // infrequent and low-latency matters for operator tooling.
             let mut fleet_rx = fleet_rx;
-            set.spawn(async move {
+            scoped.set.spawn(async move {
                 while fleet_rx.changed().await.is_ok() {
                     let pods = pod_reader.state();
                     fleet.store(Arc::new(fleet::build_snapshot(
@@ -2139,43 +2340,40 @@ async fn spawn_tasks(
     // Gateways require it) and by the presence of the pre-created operator writers
     // (controller role).
     if enable_gateway_api
-        && let (Some(params_writer), Some(relay_policies_writer), Some(nodes_writer)) =
+        && let (Some(params_writers), Some(relay_policies_writers), Some(nodes_writer)) =
             (op_params_w, op_relay_policies_w, op_nodes_w)
     {
-        spawn_reflector(
-            &mut set,
-            params_writer,
-            Api::<CoxswainGatewayParameters>::all(watch_client(&kube_config, &client)),
+        // CoxswainGatewayParameters is a namespaced CRD, watched over `infra_scope`
+        // (tenant namespaces ∪ the install namespace) so the lockdown grants a
+        // namespaced `Role` instead of cluster-wide read (#59). `params_writers`
+        // was pre-created in `new()` from the same `infra_scope`, so it aligns
+        // index-for-index with `api_scopes()` here. A dedicated Gateway's
+        // `parametersRef` must therefore resolve within the watch set or the
+        // install namespace; a params CR outside that set is not observed.
+        scoped.namespaced_in(
+            &infra_scope,
+            params_writers,
             control_watch_config(),
-            ReflectorEffects::new(
-                &rebuild_tx,
-                &controller_health,
-                "coxswain_gateway_parameters",
-                metrics,
-            ),
+            "coxswain_gateway_parameters",
             "CoxswainGatewayParameters",
         );
-        // CoxswainRelayPolicy is cluster-scoped; a policy change re-enqueues owned
-        // Gateways via `rebuild_tx` so per-namespace relay convergence recomputes.
-        spawn_reflector(
-            &mut set,
-            relay_policies_writer,
-            Api::<CoxswainRelayPolicy>::all(watch_client(&kube_config, &client)),
+        // CoxswainRelayPolicy is a namespaced CRD (#59): the policy in a namespace governs
+        // that namespace's relay, so it is watched over the tenant `watch_scope` (NOT
+        // widened by the install namespace — a relay policy governs a tenant namespace, not
+        // `coxswain-system`). A policy change re-enqueues owned Gateways via `rebuild_tx` so
+        // per-namespace relay convergence recomputes. `relay_policies_writers` was
+        // pre-created in `new()` from the same `watch_scope`, so it aligns index-for-index.
+        scoped.namespaced::<CoxswainRelayPolicy>(
+            relay_policies_writers,
             control_watch_config(),
-            ReflectorEffects::new(
-                &rebuild_tx,
-                &controller_health,
-                "coxswain_relay_policy",
-                metrics,
-            ),
+            "coxswain_relay_policy",
             "CoxswainRelayPolicy",
         );
-        spawn_reflector(
-            &mut set,
+        scoped.cluster::<Node>(
             nodes_writer,
-            Api::<Node>::all(watch_client(&kube_config, &client)),
+            Api::<Node>::all(clients.client()),
             bulk_watch_config(),
-            ReflectorEffects::new(&rebuild_tx, &controller_health, "node", metrics),
+            "node",
             "Node",
         );
     }
@@ -2401,7 +2599,7 @@ async fn spawn_tasks(
 /// re-enqueuing the full set after each rebuild converges cross-object status
 /// drift without a per-object diff.
 fn enqueue_status_keys(queue: &StatusWorkqueue, stores: &ReflectorStores<'_>) {
-    fn enq<K>(queue: &StatusWorkqueue, kind: StatusKind, store: &reflector::Store<K>)
+    fn enq<K>(queue: &StatusWorkqueue, kind: StatusKind, store: &MergedStore<K>)
     where
         K: kube::Resource + Clone + 'static,
         K::DynamicType: Eq + std::hash::Hash + Clone + Default,
@@ -2976,6 +3174,7 @@ fn record_rebuild_metrics(
 #[cfg(test)]
 mod tests {
     use super::gateway_is_cut_over;
+    use crate::MergedStore;
     use crate::gw_types::v::gateways::{Gateway, GatewayStatus};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
     use kube::api::ObjectMeta;
@@ -3158,28 +3357,28 @@ mod tests {
     use kube::runtime::{reflector, watcher};
     use std::collections::BTreeMap;
 
-    fn ic_store(classes: Vec<IngressClass>) -> reflector::Store<IngressClass> {
+    fn ic_store(classes: Vec<IngressClass>) -> MergedStore<IngressClass> {
         let mut w = reflector::store::Writer::<IngressClass>::default();
         for ic in classes {
             w.apply_watcher_event(&watcher::Event::Apply(ic));
         }
-        w.as_reader()
+        MergedStore::single(w.as_reader())
     }
 
-    fn gc_store(classes: Vec<GatewayClass>) -> reflector::Store<GatewayClass> {
+    fn gc_store(classes: Vec<GatewayClass>) -> MergedStore<GatewayClass> {
         let mut w = reflector::store::Writer::<GatewayClass>::default();
         for gc in classes {
             w.apply_watcher_event(&watcher::Event::Apply(gc));
         }
-        w.as_reader()
+        MergedStore::single(w.as_reader())
     }
 
-    fn gw_store_co(gateways: Vec<Gateway>) -> reflector::Store<Gateway> {
+    fn gw_store_co(gateways: Vec<Gateway>) -> MergedStore<Gateway> {
         let mut w = reflector::store::Writer::<Gateway>::default();
         for gw in gateways {
             w.apply_watcher_event(&watcher::Event::Apply(gw));
         }
-        w.as_reader()
+        MergedStore::single(w.as_reader())
     }
 
     fn make_ic(name: &str, controller: &str, default: bool) -> IngressClass {

@@ -1,16 +1,14 @@
 # CoxswainRelayPolicy (#589) whose autoscaling stanza is enabled but omits the
 # mandatory maxReplicas. The controller must refuse to autoscale (an uncapped relay
 # would regrow leader fan-out) and fall back to the static replicas (3 here). No HPA
-# is created. Selector pins it to the test namespace by its built-in name label.
+# is created. Namespaced: it lives in the test namespace and governs only its relay.
 ---
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
 kind: CoxswainRelayPolicy
 metadata:
-  name: e2e-relay-uncapped-${TESTNS}
+  name: e2e-relay-uncapped
+  namespace: ${TESTNS}
 spec:
-  namespaceSelector:
-    matchLabels:
-      kubernetes.io/metadata.name: ${TESTNS}
   enabled: true
   replicas: 3
   autoscaling:

@@ -1641,13 +1641,19 @@ async fn topology_shows_proxy_in_sync_after_ack() -> anyhow::Result<()> {
         );
     }
 
-    // /api/v1/fleet/summary.all_in_sync must also be true.
+    // /api/v1/fleet/summary must report THIS test's shared-proxy tier converged
+    // and healthy. We scope to `shared_proxies` rather than the global
+    // `all_in_sync` flag: `all_in_sync` spans the entire node registry, and in the
+    // parallel e2e pass concurrent tests' dedicated proxies are mid-provisioning
+    // (transiently not-in-sync / unreachable), which would flip it false through no
+    // fault of the shared proxy. The shared proxy's own sync is already proven
+    // authoritatively by the /topology `in_sync` check above.
     let summary_url = h.controller_admin_url("/api/v1/fleet/summary");
     let summary: serde_json::Value = client.get(&summary_url).send().await?.json().await?;
     assert_eq!(
-        summary["all_in_sync"],
-        serde_json::Value::Bool(true),
-        "fleet/summary.all_in_sync must be true when all nodes are converged; got {summary}"
+        summary["shared_proxies"]["worst"],
+        serde_json::Value::String("ok".to_owned()),
+        "fleet/summary shared-proxy tier must be healthy after ack; got {summary}"
     );
 
     Ok(())
@@ -1715,13 +1721,17 @@ async fn topology_reconverges_after_routing_change() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Confirm all_in_sync in the fleet summary.
+    // Confirm the shared-proxy tier is healthy in the fleet summary after
+    // re-convergence. Scoped to `shared_proxies` rather than the global
+    // `all_in_sync` flag, which the parallel e2e pass pollutes with concurrent
+    // tests' mid-provisioning dedicated proxies (this proxy's re-convergence is
+    // already proven by the /topology `in_sync` poll above).
     let summary_url = h.controller_admin_url("/api/v1/fleet/summary");
     let summary: serde_json::Value = client.get(&summary_url).send().await?.json().await?;
     assert_eq!(
-        summary["all_in_sync"],
-        serde_json::Value::Bool(true),
-        "fleet/summary.all_in_sync must be true after re-convergence; got {summary}"
+        summary["shared_proxies"]["worst"],
+        serde_json::Value::String("ok".to_owned()),
+        "fleet/summary shared-proxy tier must be healthy after re-convergence; got {summary}"
     );
 
     Ok(())

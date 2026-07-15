@@ -11,6 +11,7 @@ use super::reconcile_helpers::{
     resolve_ip_access_control_config, resolve_jwt_auth_config, resolve_mirror_filter,
     resolve_rate_limit_config, resolve_retry_config,
 };
+use crate::MergedStore;
 use crate::endpoints::pool::EndpointCache;
 use crate::k8s_utils::metadata_created_at;
 use coxswain_core::crd::{
@@ -23,7 +24,6 @@ use coxswain_core::routing::{
 };
 use k8s_openapi::api::core::v1::{Secret, Service};
 use k8s_openapi::api::networking::v1::Ingress;
-use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -68,20 +68,20 @@ impl<'a> IngressClassContext<'a> {
 /// see `IngressExtensionStores::backend_policy_index`.
 #[non_exhaustive]
 pub struct IngressCrRefStores<'a> {
-    pub(crate) compressions: &'a reflector::Store<Compression>,
-    pub(crate) retry_policies: &'a reflector::Store<RetryPolicy>,
-    pub(crate) rate_limits: &'a reflector::Store<RateLimit>,
-    pub(crate) ip_access_controls: &'a reflector::Store<IpAccessControl>,
+    pub(crate) compressions: &'a MergedStore<Compression>,
+    pub(crate) retry_policies: &'a MergedStore<RetryPolicy>,
+    pub(crate) rate_limits: &'a MergedStore<RateLimit>,
+    pub(crate) ip_access_controls: &'a MergedStore<IpAccessControl>,
 }
 
 impl<'a> IngressCrRefStores<'a> {
     /// Bundle the converged-CR-reference stores for a single reconcile pass.
     #[must_use]
     pub fn new(
-        compressions: &'a reflector::Store<Compression>,
-        retry_policies: &'a reflector::Store<RetryPolicy>,
-        rate_limits: &'a reflector::Store<RateLimit>,
-        ip_access_controls: &'a reflector::Store<IpAccessControl>,
+        compressions: &'a MergedStore<Compression>,
+        retry_policies: &'a MergedStore<RetryPolicy>,
+        rate_limits: &'a MergedStore<RateLimit>,
+        ip_access_controls: &'a MergedStore<IpAccessControl>,
     ) -> Self {
         Self {
             compressions,
@@ -105,15 +105,15 @@ impl<'a> IngressCrRefStores<'a> {
 /// every extension-CRD input an Ingress reconcile pass needs lands here.
 #[non_exhaustive]
 pub struct IngressExtensionStores<'a> {
-    pub(crate) auth_secrets: &'a reflector::Store<Secret>,
-    pub(crate) external_auths: &'a reflector::Store<CoxswainExternalAuth>,
-    pub(crate) jwt_auths: &'a reflector::Store<coxswain_core::crd::JwtAuth>,
+    pub(crate) auth_secrets: &'a MergedStore<Secret>,
+    pub(crate) external_auths: &'a MergedStore<CoxswainExternalAuth>,
+    pub(crate) jwt_auths: &'a MergedStore<coxswain_core::crd::JwtAuth>,
     pub(crate) jwks_cache: &'a crate::jwks::SharedJwksCache,
     pub(crate) backend_grants: &'a crate::reference_grants::GrantSet,
-    pub(crate) compressions: &'a reflector::Store<Compression>,
-    pub(crate) retry_policies: &'a reflector::Store<RetryPolicy>,
-    pub(crate) rate_limits: &'a reflector::Store<RateLimit>,
-    pub(crate) ip_access_controls: &'a reflector::Store<IpAccessControl>,
+    pub(crate) compressions: &'a MergedStore<Compression>,
+    pub(crate) retry_policies: &'a MergedStore<RetryPolicy>,
+    pub(crate) rate_limits: &'a MergedStore<RateLimit>,
+    pub(crate) ip_access_controls: &'a MergedStore<IpAccessControl>,
     /// Per-Service connection policy resolved from `CoxswainBackendPolicy`
     /// (#554). Looked up per backend Service — a single Ingress can route
     /// different paths to different Services, each with its own policy —
@@ -126,9 +126,9 @@ impl<'a> IngressExtensionStores<'a> {
     /// Bundle the extension-CRD stores for a single reconcile pass.
     #[must_use]
     pub fn new(
-        auth_secrets: &'a reflector::Store<Secret>,
-        external_auths: &'a reflector::Store<CoxswainExternalAuth>,
-        jwt_auths: &'a reflector::Store<coxswain_core::crd::JwtAuth>,
+        auth_secrets: &'a MergedStore<Secret>,
+        external_auths: &'a MergedStore<CoxswainExternalAuth>,
+        jwt_auths: &'a MergedStore<coxswain_core::crd::JwtAuth>,
         jwks_cache: &'a crate::jwks::SharedJwksCache,
         backend_grants: &'a crate::reference_grants::GrantSet,
         cr_refs: IngressCrRefStores<'a>,
@@ -169,7 +169,7 @@ impl IngressReconciler {
     pub fn reconcile(
         ingress: &Ingress,
         endpoint_cache: &EndpointCache,
-        services: &reflector::Store<Service>,
+        services: &MergedStore<Service>,
         classes: &IngressClassContext<'_>,
         ports: IngressPorts,
         builder: &mut IngressRoutingTableBuilder,

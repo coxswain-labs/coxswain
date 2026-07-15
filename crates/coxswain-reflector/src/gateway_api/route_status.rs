@@ -12,6 +12,7 @@
 //! listener-binding setup, parent-ref loop, `compute_accepted`, cross-namespace
 //! gate, and backend-ref validation) runs once here.
 
+use crate::MergedStore;
 use crate::gateway_api::hostnames::hostnames_intersect;
 use crate::gw_types::v::gateways::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
@@ -119,7 +120,7 @@ pub(super) fn compute_route_health<R: RouteLike>(
     owned_gateways: &HashSet<ObjectKey>,
     effective: &HashMap<ObjectKey, super::super::reconciler::listener_merge::EffectiveGateway>,
     backend_grants: &HashSet<ReferenceGrantKey>,
-    service_store: &reflector::Store<Service>,
+    service_store: &MergedStore<Service>,
     route_kind: &str,
 ) -> RouteStatusMap {
     let mut gw_listeners: HashMap<ObjectKey, Vec<ListenerEntry>> = gateways
@@ -394,7 +395,7 @@ fn check_backend_refs<R: RouteLike>(
     route: &R,
     route_ns: &str,
     backend_grants: &HashSet<ReferenceGrantKey>,
-    service_store: &reflector::Store<Service>,
+    service_store: &MergedStore<Service>,
 ) -> (bool, &'static str) {
     for b in route.health_backend_refs() {
         if b.kind != "Service" || (!b.group.is_empty() && b.group != "core") {

@@ -257,6 +257,10 @@ pub(crate) struct HelmOverrides {
     /// Passed as `relay.dedicated.minProxyReplicas` (#584): the break-even relay
     /// provisioning threshold. `None` leaves the chart default (8).
     pub relay_min_proxy_replicas: Option<u32>,
+    /// Passed as `watchNamespace` (#59): the controller's namespaced watch scope.
+    /// A comma-separated list (`ns1,ns2`) scopes the controller to those
+    /// namespaces. `None` leaves the chart default (cluster-wide).
+    pub watch_namespace: Option<String>,
 }
 
 /// Install or upgrade the coxswain Helm release with e2e-specific overrides.
@@ -382,6 +386,12 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         args.push("--set".into());
         args.push(format!("discovery.svidTtl={ttl}"));
     }
+    if let Some(ns) = &overrides.watch_namespace {
+        args.push("--set".into());
+        // Escape commas so Helm passes the whole namespace list as one string
+        // value instead of splitting it into a list (#59 multi-namespace watch).
+        args.push(format!("watchNamespace={}", ns.replace(',', "\\,")));
+    }
     if let Some(enabled) = overrides.gateway_api_enabled {
         args.push("--set".into());
         args.push(format!("controller.gatewayApi.enabled={enabled}"));
@@ -442,6 +452,7 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
         ingress_enabled: _,
         relay_dedicated_enabled: _,
         relay_min_proxy_replicas: _,
+        watch_namespace: _,
     } = HelmOverrides::default();
     let mut dirty = Vec::new();
     let mut check = |path: &[&str], is_dirty: bool| {
@@ -503,6 +514,7 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
         &["relay", "dedicated", "minProxyReplicas"],
         get(&["relay", "dedicated", "minProxyReplicas"]).is_some(),
     );
+    check(&["watchNamespace"], get(&["watchNamespace"]).is_some());
     dirty
 }
 

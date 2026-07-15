@@ -3,6 +3,7 @@
 //! Produces a per-Service lookup table (`BackendTlsIndex`) of resolved TLS
 //! configuration, and a per-policy health map for writing `status.ancestors[]`.
 
+use crate::MergedStore;
 use crate::gw_types::{
     BackendTlsPolicy, HttpRoute,
     v::backendtlspolicies::{
@@ -54,9 +55,9 @@ pub type BackendTlsIndex = HashMap<(ObjectKey, Option<u16>), ResolvedPolicy>;
 /// writes). Call `compute_policy_health` to fill in ancestor lists.
 #[must_use]
 pub fn build_backend_tls_index(
-    policies: &reflector::Store<BackendTlsPolicy>,
-    configmaps: &reflector::Store<ConfigMap>,
-    services: &reflector::Store<Service>,
+    policies: &MergedStore<BackendTlsPolicy>,
+    configmaps: &MergedStore<ConfigMap>,
+    services: &MergedStore<Service>,
 ) -> (BackendTlsIndex, BackendTlsPolicyStatusMap) {
     // Group policies by their (svc_key, optional section_name) scope. Per GEP-1897,
     // two policies on the same Service only conflict when they target the same
@@ -233,7 +234,7 @@ pub fn build_backend_tls_index(
 /// conformance `Conflicted` checks fail because the test queries by Gateway NN.
 pub fn compute_policy_health(
     index: &BackendTlsIndex,
-    policies: &reflector::Store<BackendTlsPolicy>,
+    policies: &MergedStore<BackendTlsPolicy>,
     routes: &[Arc<HttpRoute>],
     owned_gateways: &HashSet<ObjectKey>,
 ) -> BackendTlsPolicyStatusMap {
@@ -328,7 +329,7 @@ fn is_service_ref(target: &BackendTlsPolicyTargetRefs) -> bool {
 fn resolve_ca(
     policy_ns: &str,
     validation: &crate::gw_types::v::backendtlspolicies::BackendTlsPolicyValidation,
-    configmaps: &reflector::Store<ConfigMap>,
+    configmaps: &MergedStore<ConfigMap>,
 ) -> Result<UpstreamCa, &'static str> {
     if let Some(refs) = validation.ca_certificate_refs.as_deref()
         && !refs.is_empty()
@@ -360,7 +361,7 @@ fn resolve_ca(
 fn resolve_ca_from_ref(
     policy_ns: &str,
     ca_ref: &BackendTlsPolicyValidationCaCertificateRefs,
-    configmaps: &reflector::Store<ConfigMap>,
+    configmaps: &MergedStore<ConfigMap>,
 ) -> Result<UpstreamCa, &'static str> {
     // Only core/ConfigMap is supported (spec § Core support).
     let kind = ca_ref.kind.as_str();
@@ -509,26 +510,26 @@ mod tests {
 
     // ── Helpers ───────────────────────────────────────────────────────────────────
 
-    fn policy_store(policies: Vec<BackendTlsPolicy>) -> reflector::Store<BackendTlsPolicy> {
+    fn policy_store(policies: Vec<BackendTlsPolicy>) -> MergedStore<BackendTlsPolicy> {
         let mut writer = reflector::store::Writer::<BackendTlsPolicy>::default();
         for p in policies {
             writer.apply_watcher_event(&watcher::Event::Apply(p));
         }
-        writer.as_reader()
+        MergedStore::single(writer.as_reader())
     }
 
-    fn configmap_store(cms: Vec<ConfigMap>) -> reflector::Store<ConfigMap> {
+    fn configmap_store(cms: Vec<ConfigMap>) -> MergedStore<ConfigMap> {
         let mut writer = reflector::store::Writer::<ConfigMap>::default();
         for c in cms {
             writer.apply_watcher_event(&watcher::Event::Apply(c));
         }
-        writer.as_reader()
+        MergedStore::single(writer.as_reader())
     }
 
     /// Empty Service store — sectionName resolution lookups all miss in tests that
     /// don't exercise section names.
-    fn empty_service_store() -> reflector::Store<Service> {
-        reflector::store::Writer::<Service>::default().as_reader()
+    fn empty_service_store() -> MergedStore<Service> {
+        MergedStore::single(reflector::store::Writer::<Service>::default().as_reader())
     }
 
     fn make_policy(
@@ -767,12 +768,12 @@ mod tests {
         }
     }
 
-    fn service_store(svcs: Vec<Service>) -> reflector::Store<Service> {
+    fn service_store(svcs: Vec<Service>) -> MergedStore<Service> {
         let mut writer = reflector::store::Writer::<Service>::default();
         for s in svcs {
             writer.apply_watcher_event(&watcher::Event::Apply(s));
         }
-        writer.as_reader()
+        MergedStore::single(writer.as_reader())
     }
 
     #[test]

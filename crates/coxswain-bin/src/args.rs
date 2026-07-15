@@ -174,11 +174,13 @@ pub(crate) struct CommonArgs {
     #[arg(long, env = "COXSWAIN_HEALTH_PORT", default_value_t = 8081)]
     pub health_port: u16,
 
-    /// Kubernetes namespace to watch. Omit for cluster-wide scope.
+    /// Kubernetes namespace(s) to watch. Omit for cluster-wide scope.
     ///
-    /// Both the controller and proxy pods watch the same namespace scope so
-    /// they agree on which resources count. Mirror this value across both
-    /// pods when installing manually; Helm renders it identically by default.
+    /// Accepts a comma-separated list (`ns1,ns2,ns3`, #59): each entry spawns
+    /// one namespaced watch per resource type, letting the controller run with a
+    /// namespaced `Role` per namespace instead of cluster-wide read. A single
+    /// entry is the exact equivalent of the pre-list single-namespace scope; an
+    /// empty entry (e.g. a trailing comma) is rejected at startup.
     #[arg(long, env = "COXSWAIN_WATCH_NAMESPACE")]
     pub watch_namespace: Option<String>,
 
