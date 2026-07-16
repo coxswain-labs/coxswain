@@ -341,6 +341,12 @@ jobs:
 
       - name: Post conformance report as PR comment
         if: ${{ always() && steps.conformance.outputs.report-file != '' }}
+        # Reporting only — the conformance verdict is the `run-conformance` step
+        # above, and a comment that fails to post must never veto it. Every call
+        # below talks to the GitHub API, which fails often enough to matter: a
+        # REST incident returning HTML to `gh api` once failed this step (and so
+        # the whole required check) minutes after `go test` reported ok.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
