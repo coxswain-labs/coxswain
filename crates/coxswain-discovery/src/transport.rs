@@ -80,7 +80,6 @@ impl AsyncRead for PeerSvidStream {
     }
 }
 
-// Delegate AsyncWrite to the inner TlsStream.
 impl AsyncWrite for PeerSvidStream {
     fn poll_write(
         mut self: Pin<&mut Self>,

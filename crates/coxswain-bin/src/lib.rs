@@ -1002,7 +1002,6 @@ fn wire_proxy_services(
             None
         };
 
-    // Seed PROXY config onto each Ingress ListenerSpec.
     let ingress_specs_with_pp: HashSet<ListenerSpec> = ingress_specs
         .into_iter()
         .map(|mut s| {

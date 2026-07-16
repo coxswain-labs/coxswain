@@ -1547,7 +1547,6 @@ mod tests {
     /// flag nor the env var are set.
     #[test]
     fn management_bind_address_defaults_to_unspecified_v4() {
-        // Set env vars to empty to avoid bleed-through from the test runner.
         let cli =
             Cli::try_parse_from(["coxswain", "serve", "controller"]).expect("controller parses");
         let Commands::Serve(serve) = cli.command;

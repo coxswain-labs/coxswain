@@ -151,7 +151,6 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
             }
         };
 
-        // Read the admin port from the annotation.
         let admin_port: u16 = match pod
             .metadata
             .annotations
@@ -181,7 +180,6 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
             }
         };
 
-        // Determine component from the label.
         let component_str = pod
             .metadata
             .labels
