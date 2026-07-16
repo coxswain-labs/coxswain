@@ -87,7 +87,7 @@ spec:
                       Target number of downstream dedicated proxies each relay replica should front — the
                       **capacity ratio**, decoupled from the break-even gate (#602). The controller adds a
                       replica per this many proxies of live namespace fan-out. When omitted, falls back to
-                      `--relay-target-proxies-per-replica` (default 50): a relay is a fan-out cache (one
+                      `--relay-target-proxies-per-replica` (default 250, measured — #603): a relay is a fan-out cache (one
                       upstream stream in, broadcast to N subscribers), so real per-replica capacity is
                       O(100s), bounded by egress/serialization and failover blast radius — **not** the
                       break-even `--relay-min-proxy-replicas` number this once inherited. Keep `max_replicas`

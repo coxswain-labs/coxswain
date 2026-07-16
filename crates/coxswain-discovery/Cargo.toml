@@ -31,12 +31,18 @@ tracing       = { workspace = true }
 x509-parser   = { workspace = true }
 
 [dev-dependencies]
+clap          = { workspace = true }
 criterion     = { workspace = true }
 rcgen         = { workspace = true }
+sysinfo       = { workspace = true }
 tokio         = { workspace = true }
 
 [[bench]]
 name = "delta_apply"
+harness = false
+
+[[bench]]
+name = "relay_fanout"
 harness = false
 
 [build-dependencies]

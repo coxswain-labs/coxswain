@@ -117,6 +117,9 @@ serde_json         = { version = "1.0" }
 serde_yaml         = { version = "0.9" }
 smallvec           = { version = "1.13", features = ["union"] }
 static_assertions  = { version = "1.1" }
+# Cross-platform child-process CPU/mem sampling for the relay fan-out
+# load-test harness (#603) — macOS (libproc) + Linux (/proc), one API.
+sysinfo            = { version = "0.39", default-features = false, features = ["system"] }
 tempfile           = { version = "3" }
 thiserror          = { version = "2.0" }
 tls-parser         = { version = "0.12" }

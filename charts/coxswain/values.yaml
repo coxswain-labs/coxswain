@@ -286,8 +286,10 @@ relay:
   # Capacity ratio, DECOUPLED from the break-even threshold above
   # (-> --relay-target-proxies-per-replica). "How many subscribers can one relay
   # replica front?" A relay is a fan-out cache, so real per-replica capacity is
-  # O(100s). 50 is provisional (a benchmark, #603, will measure it).
-  targetProxiesPerReplica: 50
+  # O(100s). 250 is measured (#603, cargo bench -p coxswain-discovery --bench
+  # relay_fanout): under one CPU core and p99 fan-out latency under 20ms even at
+  # a sustained 10 changes/sec, with headroom below where cost climbs past a core.
+  targetProxiesPerReplica: 250
   # Deactivation cooldown (-> --relay-cooldown): once demand falls below
   # minProxyReplicas the relay is torn down only after it stays below for this long
   # (a genuinely-drained scope tears down at once). Replaces keep-until-fully-drained.

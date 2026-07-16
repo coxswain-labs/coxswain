@@ -917,12 +917,18 @@ pub(crate) struct ControllerArgs {
     /// by egress/serialization and failover blast radius — not the break-even
     /// number. An autoscaled relay (`CoxswainRelayPolicy` with a capped
     /// `RelayAutoscaling`) runs `clamp(ceil(live_subscribers / this), min, max)`.
-    /// Default 50 (provisional; #603 measures it). Per-namespace override:
-    /// `RelayAutoscaling.targetProxiesPerReplica`.
+    /// Default 250 — measured (#603: `cargo bench -p coxswain-discovery --bench
+    /// relay_fanout`), superseding #602's provisional 50. At 250 subscribers a
+    /// relay replica holds under one CPU core and p99 fan-out latency stays under
+    /// 20ms even at a sustained 10 changes/sec; both climb roughly linearly past
+    /// that point (500 crosses one core, 1000 needs ~two) rather than at a sharp
+    /// knee, so 250 is picked with headroom below the observed range rather than
+    /// at its edge — conservative relative to failover blast radius. Per-namespace
+    /// override: `RelayAutoscaling.targetProxiesPerReplica`.
     #[arg(
         long,
         env = "COXSWAIN_RELAY_TARGET_PROXIES_PER_REPLICA",
-        default_value_t = 50
+        default_value_t = 250
     )]
     pub relay_target_proxies_per_replica: u32,
 
