@@ -12,10 +12,23 @@ inputs:
 runs:
   using: composite
   steps:
+    # helm/kind-action downloads the kind + kubectl binaries via curl with no
+    # retry, so a transient "curl: (35) Recv failure: Connection reset by peer"
+    # fails the whole job before any test runs. Wrap it in Wandalen/wretry.action
+    # (purpose-built to retry a `uses:` step) so a flaky download is retried
+    # instead of aborting the run.
     - name: Create kind cluster
-      uses: helm/kind-action@v1
+      uses: Wandalen/wretry.action@v3.8.0
       with:
-        cluster_name: ${{ inputs.cluster-name }}
+        action: helm/kind-action@v1
+        with: |
+          cluster_name: ${{ inputs.cluster-name }}
+        attempt_limit: 3
+        attempt_delay: 15000
+        # Tear down any half-created cluster before retrying so the retry doesn't
+        # fail on "cluster already exists"; harmless (|| true) if the failure was
+        # the binary download, before any cluster existed.
+        pre_retry_command: kind delete cluster --name ${{ inputs.cluster-name }} || true
 
     - name: Route pod CIDR to kind node
       shell: bash
