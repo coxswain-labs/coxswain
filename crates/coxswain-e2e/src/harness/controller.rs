@@ -65,6 +65,19 @@ pub struct ControllerOptions {
     /// dedicated Gateway triggers a relay, or high to assert scale-to-zero.
     /// `None` leaves the chart default (8).
     pub relay_min_proxy_replicas: Option<u32>,
+    /// Sets `relay.dedicated.cooldown` (#602) — the deactivation cooldown. Tests
+    /// set this to a few seconds (e.g. `Some("5s")`) so the teardown-after-cooldown
+    /// behaviour is observable without waiting the 300s default. `None` leaves the
+    /// chart default.
+    pub relay_cooldown: Option<String>,
+    /// Sets `relay.dedicated.scaleDownStabilization` (#602) — the scale-down
+    /// stabilization window. Tests set a few seconds (or a large value to *assert*
+    /// anti-flap). `None` leaves the chart default (300s).
+    pub relay_scale_down_stabilization: Option<String>,
+    /// Sets `relay.dedicated.targetProxiesPerReplica` (#602) — the capacity ratio.
+    /// Tests set this low (e.g. `Some(2)`) so a small subscriber count drives a
+    /// multi-replica sizing decision. `None` leaves the chart default (50).
+    pub relay_target_proxies_per_replica: Option<u32>,
     /// Sets `watchNamespace` (#59) — the controller's namespaced watch scope.
     /// A comma-separated list (`ns1,ns2`) scopes the controller to those
     /// namespaces; resources elsewhere are ignored. `None` leaves the chart
@@ -142,6 +155,9 @@ impl ControllerProcess {
             shared_proxy_replicas: None,
             relay_dedicated_enabled: opts.relay_dedicated_enabled,
             relay_min_proxy_replicas: opts.relay_min_proxy_replicas,
+            relay_cooldown: opts.relay_cooldown,
+            relay_scale_down_stabilization: opts.relay_scale_down_stabilization,
+            relay_target_proxies_per_replica: opts.relay_target_proxies_per_replica,
             watch_namespace: opts.watch_namespace,
         };
         if overrides != HelmOverrides::default() {

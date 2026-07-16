@@ -30,6 +30,13 @@ pub const RELAY_POLICY_AUTOSCALING: &str = fixture!("relay_policy_autoscaling.ya
 pub const RELAY_POLICY_AUTOSCALING_UNCAPPED: &str =
     fixture!("relay_policy_autoscaling_uncapped.yaml");
 
+/// `CoxswainRelayPolicy` (#602) with capped autoscaling, `minReplicas: 1`, and
+/// `targetProxiesPerReplica: 1` so the relay's replica count tracks the live
+/// subscriber count exactly — used to observe the scale-down stabilization window
+/// (a subscriber dip must not immediately shed a replica).
+pub const RELAY_POLICY_AUTOSCALING_SCALEDOWN: &str =
+    fixture!("relay_policy_autoscaling_scaledown.yaml");
+
 /// Same dedicated-mode `Gateway` + an `HTTPRoute` attached to it backing a
 /// same-namespace Service. Used by the #209 e2e to verify per-namespace
 /// `RoleBinding` reconciliation.

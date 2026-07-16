@@ -33,6 +33,20 @@ spec:
                 description: Opt-in, capped, controller-driven autoscaling for the relay. See [`RelayAutoscaling`].
                 nullable: true
                 properties:
+                  cooldownSeconds:
+                    description: |-
+                      Deactivation cooldown, in seconds (#602). Once the live signal falls below the
+                      break-even activation threshold (`--relay-min-proxy-replicas`), the relay is torn down
+                      only after the signal has stayed below it continuously for this long — the KEDA-style
+                      hysteresis that replaces the old keep-until-fully-drained rule. A namespace that
+                      genuinely drains (no dedicated Gateways left) tears down at once; a transient `0` while
+                      Gateways remain (relay restart / control-stream reconnect) waits the cooldown, so a
+                      blip never deletes a live relay. When omitted, falls back to `--relay-cooldown`
+                      (default 300).
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
                   enabled:
                     default: false
                     description: |-
@@ -57,17 +71,43 @@ spec:
                     minimum: 1.0
                     nullable: true
                     type: integer
+                  scaleDownStabilizationSeconds:
+                    description: |-
+                      Scale-down stabilization window, in seconds (#602). When scaling **down**, the
+                      controller sizes on the **maximum** signal observed over this trailing window, so a
+                      brief dip does not immediately shed a replica (scale-up is not damped — a relay grows
+                      promptly under load). When omitted, falls back to `--relay-scale-down-stabilization`
+                      (default 300). `0` disables the window (size on the instantaneous signal).
+                    format: uint32
+                    minimum: 0.0
+                    nullable: true
+                    type: integer
                   targetProxiesPerReplica:
                     description: |-
-                      Target number of downstream dedicated proxies each relay replica should front. The
-                      controller adds a replica per this many proxies of namespace fan-out. When omitted,
-                      defaults to 8 (matching the `--relay-min-proxy-replicas` break-even default). Keep
-                      `max_replicas` well below the namespace's downstream fan-out divided by this, or the
-                      relay's own upstream streams approach the count it is meant to collapse. Must be ≥ 1.
+                      Target number of downstream dedicated proxies each relay replica should front — the
+                      **capacity ratio**, decoupled from the break-even gate (#602). The controller adds a
+                      replica per this many proxies of live namespace fan-out. When omitted, falls back to
+                      `--relay-target-proxies-per-replica` (default 50): a relay is a fan-out cache (one
+                      upstream stream in, broadcast to N subscribers), so real per-replica capacity is
+                      O(100s), bounded by egress/serialization and failover blast radius — **not** the
+                      break-even `--relay-min-proxy-replicas` number this once inherited. Keep `max_replicas`
+                      well below the namespace's downstream fan-out divided by this, or the relay's own
+                      upstream streams approach the count it is meant to collapse. Must be ≥ 1.
                     format: uint32
                     minimum: 1.0
                     nullable: true
                     type: integer
+                  tolerance:
+                    description: |-
+                      Relative sizing deadband (#602). The controller changes the replica count only when the
+                      newly-computed desired count differs from the current count by more than this fraction
+                      of the current — a `0.10` tolerance ignores deviations under 10%, so small signal
+                      jitter does not churn the Deployment. When omitted, falls back to `--relay-tolerance`
+                      (default 0.10). Must be ≥ 0.
+                    format: double
+                    minimum: 0.0
+                    nullable: true
+                    type: number
                 type: object
               enabled:
                 description: |-

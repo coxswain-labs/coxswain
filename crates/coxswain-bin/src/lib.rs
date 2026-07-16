@@ -194,16 +194,24 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         udp_routes: status_writer.outputs.udp_routes.clone(),
         publish: publish_index.clone(),
     };
-    // Provenance source for the relay tier (#584): the set of namespaces the
-    // operator has provisioned a relay into. The operator's relay convergence is
-    // its sole writer; the discovery server's `ProvisionedRelayAuthorizer` reads
-    // it lock-free to authorize a relay's `Scope::Namespace` subscribe. Empty
-    // when relay tiering is off, so the authorizer denies every Namespace
-    // subscribe — identical to the `DenyAllNamespaces` default.
+    // The relay tier keeps two derived sets, both written solely by the operator's
+    // relay control loop (#584/#602):
+    // - `provisioned_relays` (authz): every namespace with a relay in any state
+    //   (provisioning/active/draining). The discovery server's
+    //   `ProvisionedRelayAuthorizer` reads it lock-free to authorize a relay's own
+    //   `Scope::Namespace` upstream subscribe — a relay must be authorized *before*
+    //   it can become Ready.
+    // - `active_relays` (repoint): only namespaces whose relay is Ready and serving.
+    //   The `UpstreamResolverConfig` reads it so a leaf repoints onto a relay only
+    //   *after* it can serve — the make-before-break gate.
+    // Both empty when relay tiering is off (authorizer denies every Namespace
+    // subscribe, identical to the `DenyAllNamespaces` default; the resolver points
+    // every leaf at the controller).
     let provisioned_relays = Shared::<HashSet<String>>::new();
-    // Live upstream-repoint (#601): the resolver computes each dedicated leaf's
-    // current best upstream (its namespace's relay if provisioned, else the
-    // controller); the relay-change watch wakes live streams when provisioning
+    let active_relays = Shared::<HashSet<String>>::new();
+    // Live upstream-repoint (#601/#602): the resolver computes each dedicated leaf's
+    // current best upstream (its namespace's relay if that relay is Active, else the
+    // controller); the relay-change watch wakes live streams when the repoint set
     // moves. The bootstrap service reuses the same resolver so a leaf's initial
     // upstream and its live repoints are computed identically.
     let controller_stream_endpoint = format!(
@@ -217,7 +225,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         relay_service_name: RELAY_SERVICE_ACCOUNT.to_string(),
         relay_port: RELAY_DISCOVERY_PORT,
         relay_sa: RELAY_SERVICE_ACCOUNT.to_string(),
-        provisioned_relays: provisioned_relays.clone(),
+        active_relays: active_relays.clone(),
     });
     let (relay_changed_tx, relay_changed_rx) = watch::channel(0u64);
     let discovery_service = coxswain_discovery::DiscoveryService::new(
@@ -303,13 +311,18 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         relay_enabled: args.controller.relay_enabled,
         relay_replicas: args.controller.relay_replicas,
         relay_min_proxy_replicas: args.controller.relay_min_proxy_replicas,
+        relay_target_proxies_per_replica: args.controller.relay_target_proxies_per_replica,
+        relay_cooldown: args.controller.relay_cooldown,
+        relay_scale_down_stabilization: args.controller.relay_scale_down_stabilization,
+        relay_tolerance: args.controller.relay_tolerance,
         relay_cpu_request: args.controller.relay_cpu_request.clone(),
         relay_memory_request: args.controller.relay_memory_request.clone(),
         relay_memory_limit: args.controller.relay_memory_limit.clone(),
         provisioned_relays,
-        // Relay-provisioning change signal (#601): the operator bumps this on
-        // every relay provision/teardown so the discovery server repoints the
-        // affected leaves live.
+        active_relays,
+        // Repoint-set change signal (#601/#602): the relay control loop bumps this
+        // whenever a namespace enters or leaves `Active`, so the discovery server
+        // repoints the affected leaves live (make-before-break).
         relay_changed_tx: Some(relay_changed_tx),
     };
 

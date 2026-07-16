@@ -914,6 +914,68 @@ pub(crate) struct ControllerArgs {
     #[arg(long, env = "COXSWAIN_RELAY_MIN_PROXY_REPLICAS", default_value_t = 8)]
     pub relay_min_proxy_replicas: u32,
 
+    /// Capacity ratio: downstream dedicated proxies per relay replica the sizing
+    /// loop targets (#602).
+    ///
+    /// **Decoupled from** the break-even `--relay-min-proxy-replicas`: that gate
+    /// answers "is a relay worth existing?", this answers "how many subscribers can
+    /// one replica front?". A relay is a fan-out cache (one upstream stream in,
+    /// broadcast to N subscribers), so real per-replica capacity is O(100s), bounded
+    /// by egress/serialization and failover blast radius — not the break-even
+    /// number. An autoscaled relay (`CoxswainRelayPolicy` with a capped
+    /// `RelayAutoscaling`) runs `clamp(ceil(live_subscribers / this), min, max)`.
+    /// Default 50 (provisional; #603 measures it). Per-namespace override:
+    /// `RelayAutoscaling.targetProxiesPerReplica`.
+    #[arg(
+        long,
+        env = "COXSWAIN_RELAY_TARGET_PROXIES_PER_REPLICA",
+        default_value_t = 50
+    )]
+    pub relay_target_proxies_per_replica: u32,
+
+    /// Deactivation cooldown for a namespace relay (#602).
+    ///
+    /// Once the namespace's live dedicated-proxy subscriber count falls below the
+    /// break-even threshold (`--relay-min-proxy-replicas`), the relay is torn down
+    /// only after the signal has stayed below it continuously for this long — the
+    /// KEDA-style hysteresis that replaces the old keep-until-fully-drained rule. A
+    /// namespace that genuinely drains (no dedicated Gateways left) tears down at
+    /// once; a transient 0 while Gateways remain (relay restart / control-stream
+    /// reconnect) waits the cooldown, so a blip never deletes a live relay.
+    /// Per-namespace override: `RelayAutoscaling.cooldownSeconds`. Only meaningful
+    /// with `--relay-enabled`.
+    #[arg(
+        long,
+        env = "COXSWAIN_RELAY_COOLDOWN",
+        default_value = "300s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub relay_cooldown: Duration,
+
+    /// Scale-down stabilization window for an autoscaled namespace relay (#602).
+    ///
+    /// When scaling **down**, the loop sizes on the **maximum** subscriber count
+    /// observed over this trailing window, so a brief dip does not immediately shed a
+    /// replica (scale-**up** is not damped — a relay grows promptly under load).
+    /// Per-namespace override: `RelayAutoscaling.scaleDownStabilizationSeconds`.
+    #[arg(
+        long,
+        env = "COXSWAIN_RELAY_SCALE_DOWN_STABILIZATION",
+        default_value = "300s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub relay_scale_down_stabilization: Duration,
+
+    /// Relative sizing deadband for an autoscaled namespace relay (#602).
+    ///
+    /// The loop changes the replica count only when the usage ratio
+    /// (`live_subscribers / (current_replicas × target)`) deviates from 1.0 by more
+    /// than this fraction — a `0.10` tolerance ignores load within ±10% of target, so
+    /// small jitter does not churn the Deployment. Per-namespace override:
+    /// `RelayAutoscaling.tolerance`.
+    #[arg(long, env = "COXSWAIN_RELAY_TOLERANCE", default_value_t = 0.10)]
+    pub relay_tolerance: f64,
+
     /// CPU **request** for each provisioned namespace relay container (#584).
     ///
     /// A relay is otherwise BestEffort (no requests) — unschedulable-priority and

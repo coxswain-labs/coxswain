@@ -306,13 +306,33 @@ relay:
     enabled: false
     # HA replica count for each provisioned namespace relay (-> --relay-replicas).
     replicas: 2
-    # Break-even threshold: a namespace gets a relay only once its desired
-    # dedicated-proxy replicas reach this (-> --relay-min-proxy-replicas). Below
-    # it, that namespace's proxies stay direct-to-controller (relay scaled to 0).
+    # Break-even ACTIVATION threshold: a namespace gets a relay only once its live
+    # dedicated-proxy subscriber count reaches this (-> --relay-min-proxy-replicas).
+    # Below it, that namespace's proxies stay direct-to-controller (relay scaled to
+    # 0). "Is a relay worth existing?"
     minProxyReplicas: 8
+    # Capacity ratio, DECOUPLED from the break-even threshold above
+    # (-> --relay-target-proxies-per-replica). "How many subscribers can one relay
+    # replica front?" A relay is a fan-out cache, so real per-replica capacity is
+    # O(100s); an autoscaled relay runs ceil(liveSubscribers/this) within its cap.
+    # 50 is provisional (a benchmark, #603, will measure it).
+    targetProxiesPerReplica: 50
+    # Deactivation cooldown (-> --relay-cooldown): once the signal falls below
+    # minProxyReplicas the relay is torn down only after it stays below for this
+    # long (a signal of 0 tears down immediately). Replaces the old
+    # keep-until-fully-drained rule.
+    cooldown: 300s
+    # Scale-down stabilization window (-> --relay-scale-down-stabilization): an
+    # autoscaled relay scales DOWN on the max subscriber count over this window
+    # (scale-up is prompt), so a brief dip does not shed a replica.
+    scaleDownStabilization: 300s
+    # Relative sizing deadband (-> --relay-tolerance): the replica count changes
+    # only when load deviates from target by more than this fraction (0.10 = 10%),
+    # so small jitter does not churn the Deployment.
+    tolerance: 0.10
     # Resource requests/limits for each provisioned relay container. CPU carries a
     # request but no limit (a limit throttles fan-out); memory carries both.
-    # Per-namespace overrides arrive with the CoxswainRelayPolicy CRD (v0.6).
+    # Per-namespace overrides come from the CoxswainRelayPolicy CRD.
     resources:
       cpuRequest: 50m
       memoryRequest: 64Mi

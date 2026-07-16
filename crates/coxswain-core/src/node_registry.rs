@@ -286,6 +286,72 @@ impl NodeRegistry {
             .count()
     }
 
+    /// Live count of dedicated-proxy leaf nodes in `namespace` — the relay
+    /// control loop's demand **signal** (#602).
+    ///
+    /// Counts every [`NodeScope::Gateway`] node whose namespace matches, whether
+    /// it is streaming directly from the controller or folded behind the
+    /// namespace relay (`parent`-tagged). This is the *live* subscriber count the
+    /// HPA-style loop sizes and activates on — deliberately not the spec-derived
+    /// desired-replica sum, which never jitters and so cannot exercise the
+    /// tolerance deadband or the scale-down stabilization window. Relay entries
+    /// are never `Gateway`-scoped, so no `is_relay` filter is needed.
+    #[must_use]
+    pub fn namespace_leaf_count(&self, namespace: &str) -> usize {
+        self.nodes
+            .values()
+            .filter(
+                |e| matches!(&e.scope, NodeScope::Gateway { namespace: ns, .. } if ns == namespace),
+            )
+            .count()
+    }
+
+    /// Whether `namespace`'s relay has loaded its upstream cache and is ready to
+    /// serve leaves — the make-before-break **provision gate** (#602).
+    ///
+    /// True once at least one relay replica for the namespace (`is_relay &&
+    /// scope == Namespace{namespace}`) has Ack'd the controller's current
+    /// [`NodeScope::Namespace`] snapshot ([`NodeEntry::in_sync`]) — i.e. its
+    /// routing world is loaded. The control loop gates a leaf repoint on this,
+    /// never on mere provisioning intent, so no proxy is pointed at a
+    /// not-yet-serving relay.
+    #[must_use]
+    pub fn relay_ready(&self, namespace: &str) -> bool {
+        self.nodes.values().any(|e| {
+            e.is_relay
+                && matches!(&e.scope, NodeScope::Namespace { namespace: ns } if ns == namespace)
+                && e.in_sync()
+        })
+    }
+
+    /// Count of leaves still subscribed to `namespace`'s relay — the
+    /// make-before-break **teardown drain gate** (#602).
+    ///
+    /// Counts every node whose `parent` is one of the namespace's relay replicas
+    /// (`is_relay && scope == Namespace{namespace}`). Teardown deletes the relay
+    /// only once this reaches 0 — every leaf has cut its control stream back to
+    /// the controller — so deleting the relay never starves a still-connected
+    /// proxy of routing updates.
+    #[must_use]
+    pub fn relay_subscriber_count(&self, namespace: &str) -> usize {
+        let relay_ids: BTreeSet<&str> = self
+            .nodes
+            .values()
+            .filter(|e| {
+                e.is_relay
+                    && matches!(&e.scope, NodeScope::Namespace { namespace: ns } if ns == namespace)
+            })
+            .map(|e| e.node_id.as_str())
+            .collect();
+        if relay_ids.is_empty() {
+            return 0;
+        }
+        self.nodes
+            .values()
+            .filter(|e| e.parent.as_deref().is_some_and(|p| relay_ids.contains(p)))
+            .count()
+    }
+
     /// Shared quorum core for both gates: every node matching `scope_pred` has
     /// reported a bound set covering `required`, and at least one matches. The
     /// fail-closed semantics (unreported `None` ≠ bound, empty match set fails)
@@ -1231,6 +1297,82 @@ mod tests {
         assert!(
             snap.nodes.contains_key("leaf-b"),
             "relay-b subtree untouched"
+        );
+    }
+
+    // ── relay control-loop signal / ready / drain gates (#602) ───────────────────
+
+    fn ns_scope(namespace: &str) -> NodeScope {
+        NodeScope::Namespace {
+            namespace: namespace.to_owned(),
+        }
+    }
+
+    #[test]
+    fn namespace_leaf_count_counts_direct_and_folded_leaves() {
+        let reg = SharedNodeRegistry::new();
+        // One leaf dialing the controller directly, one folded behind the relay.
+        reg.connect("direct", gw("ns", "gw1"), now());
+        reg.connect("relay-a", ns_scope("ns"), now());
+        reg.apply_roster("relay-a", vec![leaf("folded", gw("ns", "gw2"), 5, &[443])]);
+        // A leaf in another namespace must not count.
+        reg.connect("other", gw("other-ns", "gw3"), now());
+        let snap = reg.load();
+        assert_eq!(
+            snap.namespace_leaf_count("ns"),
+            2,
+            "both the direct and the relay-folded leaf in ns count; the relay's own \
+             Namespace entry does not"
+        );
+        assert_eq!(snap.namespace_leaf_count("empty"), 0);
+    }
+
+    #[test]
+    fn relay_ready_true_only_when_relay_entry_in_sync() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect("relay-a", ns_scope("ns"), now());
+        reg.apply_roster("relay-a", vec![leaf("leaf-1", gw("ns", "gw"), 5, &[443])]);
+        let snap = reg.load();
+        assert!(
+            !snap.relay_ready("ns"),
+            "a provisioned-but-unacked relay is not yet ready to serve leaves"
+        );
+        // The relay Acks the controller's Namespace snapshot: cache loaded.
+        reg.record_target("relay-a", "v1".to_owned());
+        reg.record_ack("relay-a", "v1".to_owned(), 1, now());
+        assert!(
+            reg.load().relay_ready("ns"),
+            "an in_sync relay entry means the upstream cache is loaded → ready"
+        );
+    }
+
+    #[test]
+    fn relay_subscriber_count_counts_folded_children() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect("relay-a", ns_scope("ns"), now());
+        assert_eq!(
+            reg.load().relay_subscriber_count("ns"),
+            0,
+            "no relay yet folded any leaf"
+        );
+        reg.apply_roster(
+            "relay-a",
+            vec![
+                leaf("leaf-1", gw("ns", "gw1"), 5, &[443]),
+                leaf("leaf-2", gw("ns", "gw2"), 6, &[8443]),
+            ],
+        );
+        assert_eq!(
+            reg.load().relay_subscriber_count("ns"),
+            2,
+            "both folded leaves are still subscribed to the relay"
+        );
+        // Every leaf repointed back to the controller: the drain gate opens.
+        reg.apply_roster("relay-a", vec![]);
+        assert_eq!(
+            reg.load().relay_subscriber_count("ns"),
+            0,
+            "with no folded children the relay may be torn down"
         );
     }
 

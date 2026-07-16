@@ -266,6 +266,16 @@ pub(crate) struct HelmOverrides {
     /// Passed as `relay.dedicated.minProxyReplicas` (#584): the break-even relay
     /// provisioning threshold. `None` leaves the chart default (8).
     pub relay_min_proxy_replicas: Option<u32>,
+    /// Passed as `relay.dedicated.cooldown` (#602): the deactivation cooldown.
+    /// Tests set a short value (e.g. `"5s"`) to observe teardown. `None` leaves the
+    /// chart default (300s).
+    pub relay_cooldown: Option<String>,
+    /// Passed as `relay.dedicated.scaleDownStabilization` (#602): the scale-down
+    /// stabilization window. `None` leaves the chart default (300s).
+    pub relay_scale_down_stabilization: Option<String>,
+    /// Passed as `relay.dedicated.targetProxiesPerReplica` (#602): the capacity
+    /// ratio. `None` leaves the chart default (50).
+    pub relay_target_proxies_per_replica: Option<u32>,
     /// Passed as `watchNamespace` (#59): the controller's namespaced watch scope.
     /// A comma-separated list (`ns1,ns2`) scopes the controller to those
     /// namespaces. `None` leaves the chart default (cluster-wide).
@@ -424,6 +434,18 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
     if let Some(min) = overrides.relay_min_proxy_replicas {
         args.push("--set".into());
         args.push(format!("relay.dedicated.minProxyReplicas={min}"));
+    }
+    if let Some(cooldown) = &overrides.relay_cooldown {
+        args.push("--set".into());
+        args.push(format!("relay.dedicated.cooldown={cooldown}"));
+    }
+    if let Some(window) = &overrides.relay_scale_down_stabilization {
+        args.push("--set".into());
+        args.push(format!("relay.dedicated.scaleDownStabilization={window}"));
+    }
+    if let Some(target) = overrides.relay_target_proxies_per_replica {
+        args.push("--set".into());
+        args.push(format!("relay.dedicated.targetProxiesPerReplica={target}"));
     }
 
     // The shared proxy pool is now controller-provisioned (#604). Capture its
@@ -616,6 +638,9 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
         shared_proxy_replicas: _,
         relay_dedicated_enabled: _,
         relay_min_proxy_replicas: _,
+        relay_cooldown: _,
+        relay_scale_down_stabilization: _,
+        relay_target_proxies_per_replica: _,
         watch_namespace: _,
     } = HelmOverrides::default();
     let mut dirty = Vec::new();
@@ -685,6 +710,18 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
     check(
         &["relay", "dedicated", "minProxyReplicas"],
         get(&["relay", "dedicated", "minProxyReplicas"]).is_some(),
+    );
+    check(
+        &["relay", "dedicated", "cooldown"],
+        get(&["relay", "dedicated", "cooldown"]).is_some(),
+    );
+    check(
+        &["relay", "dedicated", "scaleDownStabilization"],
+        get(&["relay", "dedicated", "scaleDownStabilization"]).is_some(),
+    );
+    check(
+        &["relay", "dedicated", "targetProxiesPerReplica"],
+        get(&["relay", "dedicated", "targetProxiesPerReplica"]).is_some(),
     );
     check(&["watchNamespace"], get(&["watchNamespace"]).is_some());
     dirty

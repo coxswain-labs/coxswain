@@ -2259,3 +2259,121 @@ async fn dedicated_proxy_falls_back_to_controller_when_relay_deprovisioned() -> 
 
     Ok(())
 }
+
+/// Merge-patch the dedicated Gateway's `CoxswainGatewayParameters.spec.replicas`,
+/// changing how many dedicated-proxy subscribers the namespace has — the relay
+/// control loop's live signal (#602). `DynamicObject` because the CRD has no
+/// generated typed Rust struct in the e2e crate.
+async fn patch_dedicated_params_replicas(
+    client: &kube::Client,
+    namespace: &str,
+    replicas: i32,
+) -> anyhow::Result<()> {
+    use kube::api::{ApiResource, DynamicObject};
+    let ar = ApiResource {
+        group: "gateway.coxswain-labs.dev".into(),
+        version: "v1alpha1".into(),
+        api_version: "gateway.coxswain-labs.dev/v1alpha1".into(),
+        kind: "CoxswainGatewayParameters".into(),
+        plural: "coxswaingatewayparameters".into(),
+    };
+    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &ar);
+    api.patch(
+        "dedicated-params",
+        &PatchParams::default(),
+        &Patch::Merge(json!({ "spec": { "replicas": replicas } })),
+    )
+    .await
+    .context("patch dedicated-params replicas")?;
+    Ok(())
+}
+
+/// Happy path — the #602 make-before-break TEARDOWN traffic invariant: when a
+/// namespace drops **below** break-even at a **nonzero** subscriber count, the
+/// control loop tears the relay down after the cooldown, but sequences it safely —
+/// the still-connected proxy is repointed back to the controller (a live
+/// control-stream reconnect) *before* the relay is deleted, so live traffic is
+/// never dropped. This exercises the risky case the force-off veto does not: a
+/// proxy actively streaming through the relay at teardown time.
+///
+/// Serial: `relay.dedicated.*` mutator, always-serial binary.
+#[tokio::test]
+async fn relay_repoint_keeps_serving_during_teardown() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_dedicated_enabled: true,
+        // Break-even 2: two subscribers provision the relay; dropping to one (below
+        // break-even, but nonzero) drives the cooldown teardown.
+        relay_min_proxy_replicas: Some(2),
+        relay_cooldown: Some("5s".to_string()),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-teardown").await?;
+
+    // Converge the dedicated proxy (serves from the controller; 1 replica < 2 so no
+    // relay yet), then scale to 2 subscribers to cross break-even and provision the
+    // relay, folding both proxies under it.
+    let (http, host, _uid) = converge_dedicated_proxy(&h, &ns.name).await?;
+    patch_dedicated_params_replicas(&h.client, &ns.name, 2).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_relay_ready(&deployments).await?;
+    let topology_url = h.controller_admin_url("/api/v1/topology");
+    wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
+
+    // Drop to a single subscriber: below break-even (2) but NONZERO. After the
+    // cooldown the loop tears the relay down — repointing the surviving proxy back
+    // to the controller FIRST (make-before-break), so traffic never drops.
+    patch_dedicated_params_replicas(&h.client, &ns.name, 1).await?;
+
+    // The relay is deleted and the surviving proxy re-attaches directly to the
+    // controller (relay row gone, proxy has no relay parent).
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || {
+            let url = topology_url.clone();
+            async move {
+                format!("relay torn down after cooldown and proxy re-attached directly at '{url}'")
+            }
+        },
+        || {
+            let url = topology_url.clone();
+            let ns = ns.name.clone();
+            let deployments = deployments.clone();
+            async move {
+                if deployments.get(RELAY_NAME).await.is_ok() {
+                    return None;
+                }
+                let topology = fetch_topology(&url).await.ok()?;
+                if !relay_ids_in(&topology, &ns).is_empty() {
+                    return None;
+                }
+                let proxy = dedicated_proxy_node(&topology, &ns)?;
+                proxy
+                    .get("parent")
+                    .and_then(|v| v.as_str())
+                    .is_none_or(str::is_empty)
+                    .then_some(())
+            }
+        },
+    )
+    .await
+    .context(
+        "relay was not torn down / proxy did not re-attach after the below-break-even cooldown",
+    )?;
+
+    // The service Deployment is gone too, and the data plane never noticed: traffic
+    // still flows to the same backend through the (repointed) surviving proxy.
+    anyhow::ensure!(
+        services.get(RELAY_NAME).await.is_err(),
+        "relay Service must be GC'd alongside its Deployment at teardown"
+    );
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(30))
+        .await
+        .context("traffic dropped across the below-break-even relay teardown")?
+        .assert_backend("echo-a");
+
+    Ok(())
+}

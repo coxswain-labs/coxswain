@@ -52,7 +52,9 @@ pub(crate) mod apply;
 pub(crate) mod merge;
 pub(crate) mod params;
 pub(crate) mod reconciler;
+pub(crate) mod relay_autoscaler;
 pub(crate) mod relay_params;
+pub(crate) mod relay_reconcile;
 pub(crate) mod render;
 pub(crate) mod render_relay;
 pub(crate) mod render_shared;
@@ -69,5 +71,6 @@ pub use render_shared_proxy::SharedProxyConfig;
 // the unified worker's dedicated branch calls `reconcile_dedicated`, and the
 // controller spawns `run_vip_reconciler`.
 pub(crate) use reconciler::{ReconcileContext, reconcile_dedicated};
+pub(crate) use relay_reconcile::run_relay_reconciler;
 pub(crate) use shared_install::run_shared_install_reconciler;
 pub(crate) use vip::run_vip_reconciler;
