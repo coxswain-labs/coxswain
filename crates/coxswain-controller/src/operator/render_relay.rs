@@ -52,8 +52,68 @@ use super::render::{
 /// [`crate::RELAY_SERVICE_ACCOUNT`] so `coxswain-bin` shares the single source.
 pub(crate) use crate::RELAY_SERVICE_ACCOUNT as RELAY_NAME;
 
-/// `app.kubernetes.io/component` value stamped on every relay resource.
+/// Fixed name of the single controller-provisioned **shared-pool** relay's
+/// `ServiceAccount` / `Deployment` / `Service` (#605). Re-exported from the crate
+/// root as [`crate::SHARED_RELAY_SERVICE_ACCOUNT`] so render, the discovery
+/// upstream resolver, and the pool's `expected_server_sa` share one source.
+pub(crate) use crate::SHARED_RELAY_SERVICE_ACCOUNT as SHARED_RELAY_NAME;
+
+/// `app.kubernetes.io/component` value stamped on every per-namespace relay resource.
 const RELAY_COMPONENT: &str = "namespace-relay";
+
+/// `app.kubernetes.io/component` value stamped on every shared-pool relay resource
+/// (#605) — distinct from [`RELAY_COMPONENT`] so the two tiers' resources never
+/// collide on a selector.
+const SHARED_RELAY_COMPONENT: &str = "relay-shared";
+
+/// Which relay tier to render (#605): the per-namespace dedicated relay or the
+/// single shared-pool relay. Selects the name, component label, deploy namespace,
+/// and upstream-subscribe scope arg — everything else (identity/hardening/probes/
+/// resources) is identical across tiers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RelayVariant<'a> {
+    /// Per-namespace dedicated relay: `coxswain-relay` in the tenant namespace,
+    /// subscribing `--namespace=<ns>`.
+    Namespace { namespace: &'a str },
+    /// Shared-pool relay: `coxswain-relay-shared` in the install namespace,
+    /// subscribing `--shared`.
+    Shared { install_namespace: &'a str },
+}
+
+impl<'a> RelayVariant<'a> {
+    /// Fixed resource name (`coxswain-relay` / `coxswain-relay-shared`).
+    fn name(self) -> &'static str {
+        match self {
+            RelayVariant::Namespace { .. } => RELAY_NAME,
+            RelayVariant::Shared { .. } => SHARED_RELAY_NAME,
+        }
+    }
+
+    /// `app.kubernetes.io/component` value.
+    fn component(self) -> &'static str {
+        match self {
+            RelayVariant::Namespace { .. } => RELAY_COMPONENT,
+            RelayVariant::Shared { .. } => SHARED_RELAY_COMPONENT,
+        }
+    }
+
+    /// Namespace the relay's objects are deployed into.
+    fn deploy_namespace(self) -> &'a str {
+        match self {
+            RelayVariant::Namespace { namespace } => namespace,
+            RelayVariant::Shared { install_namespace } => install_namespace,
+        }
+    }
+
+    /// The upstream-subscribe scope arg: `--namespace=<ns>` (aggregate a tenant
+    /// namespace) or `--shared` (subscribe the shared pool's flat world).
+    fn scope_arg(self) -> String {
+        match self {
+            RelayVariant::Namespace { namespace } => format!("--namespace={namespace}"),
+            RelayVariant::Shared { .. } => "--shared".to_string(),
+        }
+    }
+}
 
 /// Downstream discovery port the relay serves leaves on (mirrors the controller
 /// discovery Stream port). Dedicated proxies in a relay-fronted namespace dial
@@ -70,8 +130,9 @@ const RELAY_HEALTH_PORT: i32 = 8081;
 /// the relay's upstream subscription needs, minus anything Gateway-specific.
 /// Borrowed straight from the reconcile context.
 pub(crate) struct RelayRenderInputs<'a> {
-    /// Tenant namespace the relay is provisioned into and aggregates.
-    pub namespace: &'a str,
+    /// Which tier to render (#605): per-namespace dedicated or shared-pool. Selects
+    /// the name, component, deploy namespace, and upstream-subscribe scope arg.
+    pub variant: RelayVariant<'a>,
     /// Replica count for the relay Deployment (`--relay-replicas`, min 1). A relay
     /// is a rollout-time SPOF for every leaf behind it at replica 1, so the
     /// operator default is 2 (HA); small clusters can pin it to 1.
@@ -123,25 +184,24 @@ pub(crate) struct RenderedRelay {
     pub pdb: Option<PodDisruptionBudget>,
 }
 
-/// Label selector matching every relay resource cluster-wide, joining
-/// `app.kubernetes.io/name` + `app.kubernetes.io/component` (the same keys the
-/// Deployment/Service select on). Single source for the startup rehydration
-/// `LIST` in [`super::reconciler`] so the query can never drift from the labels
-/// [`relay_labels`] stamps.
+/// Label selector matching every **dedicated** (per-namespace) relay resource
+/// cluster-wide, joining `app.kubernetes.io/name` + `app.kubernetes.io/component`
+/// (the same keys the Deployment/Service select on). Single source for the startup
+/// rehydration `LIST` in [`super::reconciler`] so the query can never drift from
+/// the labels [`relay_labels`] stamps.
 pub(super) fn relay_component_label_selector() -> String {
-    format!("app.kubernetes.io/name=coxswain,app.kubernetes.io/component={RELAY_COMPONENT}")
+    component_label_selector(RELAY_COMPONENT)
+}
+
+fn component_label_selector(component: &str) -> String {
+    format!("app.kubernetes.io/name=coxswain,app.kubernetes.io/component={component}")
 }
 
 /// The reserved label set every relay resource carries. The Service/Deployment
 /// selectors join on `app.kubernetes.io/name` + `app.kubernetes.io/component`,
-/// which uniquely identifies the (single) relay's pods within a namespace.
-fn relay_labels() -> BTreeMap<String, String> {
-    let mut labels = BTreeMap::new();
-    labels.insert("app.kubernetes.io/name".to_string(), "coxswain".to_string());
-    labels.insert(
-        "app.kubernetes.io/component".to_string(),
-        RELAY_COMPONENT.to_string(),
-    );
+/// which uniquely identifies the relay's pods within its namespace.
+fn relay_labels(component: &str) -> BTreeMap<String, String> {
+    let mut labels = relay_selector_labels(component);
     labels.insert(
         "app.kubernetes.io/managed-by".to_string(),
         "coxswain".to_string(),
@@ -151,22 +211,23 @@ fn relay_labels() -> BTreeMap<String, String> {
 
 /// The subset of [`relay_labels`] the Deployment/Service select on. Kept in sync
 /// with `relay_labels` by construction (a subset of the same keys).
-fn relay_selector_labels() -> BTreeMap<String, String> {
+fn relay_selector_labels(component: &str) -> BTreeMap<String, String> {
     let mut labels = BTreeMap::new();
     labels.insert("app.kubernetes.io/name".to_string(), "coxswain".to_string());
     labels.insert(
         "app.kubernetes.io/component".to_string(),
-        RELAY_COMPONENT.to_string(),
+        component.to_string(),
     );
     labels
 }
 
-fn relay_metadata(namespace: &str) -> ObjectMeta {
+fn relay_metadata(variant: RelayVariant<'_>) -> ObjectMeta {
     ObjectMeta {
-        name: Some(RELAY_NAME.to_string()),
-        namespace: Some(namespace.to_string()),
-        labels: Some(relay_labels()),
-        // No owner reference: a relay is per-namespace, not per-Gateway.
+        name: Some(variant.name().to_string()),
+        namespace: Some(variant.deploy_namespace().to_string()),
+        labels: Some(relay_labels(variant.component())),
+        // No owner reference: a relay outlives any single Gateway (dedicated) or is
+        // the install's shared infra (shared) — its lifecycle is explicit convergence.
         ..Default::default()
     }
 }
@@ -174,21 +235,21 @@ fn relay_metadata(namespace: &str) -> ObjectMeta {
 /// Render the bare, zero-verb relay `ServiceAccount`. Like the shared proxy, the
 /// relay disables the default token automount — it presents only the explicit,
 /// audience-scoped projected token from [`discovery_volumes`].
-fn render_relay_service_account(namespace: &str) -> ServiceAccount {
+fn render_relay_service_account(variant: RelayVariant<'_>) -> ServiceAccount {
     ServiceAccount {
-        metadata: relay_metadata(namespace),
+        metadata: relay_metadata(variant),
         automount_service_account_token: Some(false),
         ..Default::default()
     }
 }
 
-/// Render the downstream discovery `Service` (ClusterIP) that the namespace's
-/// dedicated proxies dial for routing snapshots.
-fn render_relay_service(namespace: &str) -> Service {
+/// Render the downstream discovery `Service` (ClusterIP) that the relay's leaves
+/// dial for routing snapshots.
+fn render_relay_service(variant: RelayVariant<'_>) -> Service {
     Service {
-        metadata: relay_metadata(namespace),
+        metadata: relay_metadata(variant),
         spec: Some(ServiceSpec {
-            selector: Some(relay_selector_labels()),
+            selector: Some(relay_selector_labels(variant.component())),
             ports: Some(vec![ServicePort {
                 name: Some("discovery".to_string()),
                 port: RELAY_DISCOVERY_PORT,
@@ -202,12 +263,16 @@ fn render_relay_service(namespace: &str) -> Service {
     }
 }
 
-/// Render the relay `Deployment` (`serve relay --namespace=<ns>`, ≥2 replicas).
+/// Render the relay `Deployment` (`serve relay {--namespace=<ns>|--shared}`, ≥2
+/// replicas).
 fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
+    let variant = inputs.variant;
+    let component = variant.component();
     let args = vec![
         "serve".to_string(),
         "relay".to_string(),
-        format!("--namespace={}", inputs.namespace),
+        // `--namespace=<ns>` (dedicated) or `--shared` (shared-pool) (#605).
+        variant.scope_arg(),
         // No `--discovery-endpoint` (#601): the relay learns its own routing
         // upstream (always the controller) from its bootstrap response.
         format!(
@@ -249,9 +314,10 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
         ]),
         // Readiness gates the Service endpoint on the relay actually caching a
         // routing world and serving downstream (`routing_table_loaded` +
-        // `downstream_serving` subsystems). A relay whose upstream `Namespace`
-        // subscribe is rejected never marks `routing_table_loaded` Ready, so it
-        // stays out of the Service — the sad-path signal.
+        // `downstream_serving` subsystems). A relay whose upstream subscribe is
+        // rejected (or whose shared world never caches) never marks
+        // `routing_table_loaded` Ready, so it stays out of the Service — the
+        // sad-path signal.
         readiness_probe: Some(http_get_probe("/readyz", RELAY_HEALTH_PORT)),
         liveness_probe: Some(http_get_probe("/healthz", RELAY_HEALTH_PORT)),
         // The relay binds only high ports (discovery 50051, health 8081), so no
@@ -264,11 +330,11 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
 
     let base_pod_template = PodTemplateSpec {
         metadata: Some(ObjectMeta {
-            labels: Some(relay_labels()),
+            labels: Some(relay_labels(component)),
             ..Default::default()
         }),
         spec: Some(PodSpec {
-            service_account_name: Some(RELAY_NAME.to_string()),
+            service_account_name: Some(variant.name().to_string()),
             security_context: Some(pod_hardening_security_context()),
             containers: vec![container],
             volumes: Some(discovery_volumes()),
@@ -279,18 +345,21 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
     // Apply the operator's `CoxswainRelayPolicy.spec.podTemplate` scheduling overlay
     // (#589) with the same strategic-merge semantics as the dedicated proxy — the base
     // coxswain container survives, scheduling fields (nodeSelector/tolerations/affinity/
-    // topologySpreadConstraints/priorityClassName) layer on.
+    // topologySpreadConstraints/priorityClassName) layer on. The shared relay carries
+    // no per-object podTemplate (no namespaced policy), so this is inert there.
     let pod_template = match inputs.pod_template {
-        Some(overlay) => merge_pod_template(&base_pod_template, overlay, inputs.namespace),
+        Some(overlay) => {
+            merge_pod_template(&base_pod_template, overlay, variant.deploy_namespace())
+        }
         None => base_pod_template,
     };
 
     Deployment {
-        metadata: relay_metadata(inputs.namespace),
+        metadata: relay_metadata(variant),
         spec: Some(DeploymentSpec {
             replicas: Some(inputs.replicas.max(1)),
             selector: LabelSelector {
-                match_labels: Some(relay_selector_labels()),
+                match_labels: Some(relay_selector_labels(component)),
                 ..Default::default()
             },
             template: pod_template,
@@ -342,11 +411,11 @@ fn render_relay_pdb(inputs: &RelayRenderInputs<'_>) -> Option<PodDisruptionBudge
         return None;
     }
     Some(PodDisruptionBudget {
-        metadata: relay_metadata(inputs.namespace),
+        metadata: relay_metadata(inputs.variant),
         spec: Some(PodDisruptionBudgetSpec {
             max_unavailable: Some(IntOrString::Int(1)),
             selector: Some(LabelSelector {
-                match_labels: Some(relay_selector_labels()),
+                match_labels: Some(relay_selector_labels(inputs.variant.component())),
                 ..Default::default()
             }),
             ..Default::default()
@@ -355,11 +424,11 @@ fn render_relay_pdb(inputs: &RelayRenderInputs<'_>) -> Option<PodDisruptionBudge
     })
 }
 
-/// Render all relay objects for `inputs.namespace`.
+/// Render all relay objects for `inputs.variant`.
 pub(crate) fn render_relay(inputs: &RelayRenderInputs<'_>) -> RenderedRelay {
     RenderedRelay {
-        service_account: render_relay_service_account(inputs.namespace),
-        service: render_relay_service(inputs.namespace),
+        service_account: render_relay_service_account(inputs.variant),
+        service: render_relay_service(inputs.variant),
         deployment: render_relay_deployment(inputs),
         pdb: render_relay_pdb(inputs),
     }
@@ -370,8 +439,20 @@ mod tests {
     use super::*;
 
     fn inputs() -> RelayRenderInputs<'static> {
-        RelayRenderInputs {
+        inputs_for(RelayVariant::Namespace {
             namespace: "team-a",
+        })
+    }
+
+    fn shared_inputs() -> RelayRenderInputs<'static> {
+        inputs_for(RelayVariant::Shared {
+            install_namespace: "coxswain-system",
+        })
+    }
+
+    fn inputs_for(variant: RelayVariant<'static>) -> RelayRenderInputs<'static> {
+        RelayRenderInputs {
+            variant,
             replicas: 2,
             controller_image: "ghcr.io/coxswain-labs/coxswain:test",
             discovery_bootstrap_endpoint: "https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052",
@@ -416,7 +497,9 @@ mod tests {
 
     #[test]
     fn service_account_is_zero_verb_and_disables_automount() {
-        let sa = render_relay_service_account("team-a");
+        let sa = render_relay_service_account(RelayVariant::Namespace {
+            namespace: "team-a",
+        });
         assert_eq!(sa.metadata.name.as_deref(), Some(RELAY_NAME));
         assert_eq!(sa.metadata.namespace.as_deref(), Some("team-a"));
         assert_eq!(
@@ -435,6 +518,66 @@ mod tests {
         );
         assert!(r.service.metadata.owner_references.is_none());
         assert!(r.deployment.metadata.owner_references.is_none());
+    }
+
+    #[test]
+    fn shared_variant_renders_serve_relay_shared_in_install_namespace() {
+        let r = render_relay(&shared_inputs());
+        assert_eq!(
+            r.service_account.metadata.name.as_deref(),
+            Some(SHARED_RELAY_NAME)
+        );
+        assert_eq!(
+            r.deployment.metadata.namespace.as_deref(),
+            Some("coxswain-system"),
+            "the shared relay lives in the install namespace"
+        );
+        // Component label distinguishes the tier so selectors never collide.
+        assert_eq!(
+            r.deployment
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("app.kubernetes.io/component"))
+                .map(String::as_str),
+            Some(SHARED_RELAY_COMPONENT)
+        );
+        let spec = r.deployment.spec.expect("deployment spec");
+        let pod = spec.template.spec.expect("pod spec");
+        assert_eq!(pod.service_account_name.as_deref(), Some(SHARED_RELAY_NAME));
+        let args = pod.containers[0].args.clone().expect("args");
+        assert_eq!(&args[0..2], ["serve", "relay"]);
+        assert!(
+            args.iter().any(|a| a == "--shared"),
+            "shared relay subscribes --shared: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("--namespace")),
+            "shared relay carries no --namespace: {args:?}"
+        );
+        assert!(
+            r.deployment.metadata.owner_references.is_none()
+                && r.service_account.metadata.owner_references.is_none(),
+            "the shared relay is install infra, not owner-ref'd"
+        );
+    }
+
+    #[test]
+    fn shared_and_namespace_variants_carry_distinct_selectors() {
+        let ns = render_relay(&inputs());
+        let shared = render_relay(&shared_inputs());
+        let component = |d: &Deployment| {
+            d.spec
+                .as_ref()
+                .and_then(|s| s.selector.match_labels.as_ref())
+                .and_then(|l| l.get("app.kubernetes.io/component"))
+                .cloned()
+        };
+        assert_ne!(
+            component(&ns.deployment),
+            component(&shared.deployment),
+            "the two tiers must select on distinct components so their pods never mix"
+        );
     }
 
     #[test]
@@ -580,7 +723,9 @@ mod tests {
 
     #[test]
     fn service_targets_the_downstream_discovery_port() {
-        let svc = render_relay_service("team-a");
+        let svc = render_relay_service(RelayVariant::Namespace {
+            namespace: "team-a",
+        });
         let spec = svc.spec.expect("service spec");
         let port = &spec.ports.expect("ports")[0];
         assert_eq!(port.port, RELAY_DISCOVERY_PORT);

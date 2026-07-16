@@ -61,10 +61,22 @@ pub struct UpstreamResolverConfig {
     pub controller_endpoint: String,
     /// The controller's ServiceAccount short-name (expected in its SVID).
     pub controller_sa: String,
-    /// The shared relay's routing endpoint, when a shared relay fronts the pool
-    /// (a static Helm toggle in v0.6). `None` = shared proxies stream from the
-    /// controller.
-    pub shared_relay_endpoint: Option<String>,
+    /// The shared relay's routing (Stream) endpoint, always
+    /// `https://{shared_relay_service}.{install-ns}.svc:{relay_port}` — a fixed DNS
+    /// name (the service exists only while [`Self::shared_relay_active`]). The pool
+    /// streams from it only when the shared relay is `Active`; see
+    /// [`Self::resolve_shared`].
+    pub shared_relay_endpoint: String,
+    /// The shared relay's ServiceAccount short-name (`coxswain-relay-shared`,
+    /// distinct from [`Self::relay_sa`]) — the `expected_server_sa` shared proxies
+    /// verify client-side, and the discriminator for the relays-never-tier rule
+    /// applied to the shared relay's own subscribe.
+    pub shared_relay_sa: String,
+    /// Whether the controller-provisioned shared relay is `Active` (Ready and
+    /// serving) — the shared-pool make-before-break repoint gate (#605), symmetric
+    /// with [`Self::active_relays`]. Written by the shared-relay control loop; read
+    /// lock-free here. `false` → shared proxies stream from the controller.
+    pub shared_relay_active: Shared<bool>,
     /// The dedicated relay's Service name (e.g. `coxswain-relay`); the per-namespace
     /// endpoint is `https://{relay_service_name}.{namespace}.svc:{relay_port}`.
     pub relay_service_name: String,
@@ -84,26 +96,61 @@ impl UpstreamResolverConfig {
     /// authenticated identity and subscription scope (#601).
     ///
     /// Rules, in order:
-    /// - A **relay** (its SA matches `relay_sa`) always streams from the
-    ///   controller — relays never tier.
-    /// - A **shared-pool** client streams from the shared relay if one is
-    ///   configured, else the controller.
+    /// - A **relay** (its SA matches `relay_sa` *or* `shared_relay_sa`) always
+    ///   streams from the controller — relays never tier (a shared relay pointed at
+    ///   itself would loop).
+    /// - A **shared-pool** client streams from the shared relay when it is `Active`,
+    ///   else the controller.
     /// - A **dedicated** (Gateway/Namespace) client streams from its namespace's
     ///   relay if that namespace is provisioned, else the controller.
     #[must_use]
     pub fn resolve(&self, spiffe: &SpiffeId, scope: &Scope) -> (String, String) {
-        if spiffe.service_account() == self.relay_sa {
+        if spiffe.service_account() == self.relay_sa
+            || spiffe.service_account() == self.shared_relay_sa
+        {
             return self.controller_target();
         }
         match scope {
-            Scope::SharedPool => match &self.shared_relay_endpoint {
-                Some(endpoint) => (endpoint.clone(), self.relay_sa.clone()),
-                None => self.controller_target(),
-            },
+            Scope::SharedPool => self.resolve_shared(),
             Scope::Gateway { namespace, .. } | Scope::Namespace { namespace } => {
                 self.resolve_namespace(namespace)
             }
         }
+    }
+
+    /// Resolve `(endpoint, expected_server_sa)` for a shared-pool client: the shared
+    /// relay when it is `Active` (Ready and serving), else the controller (#605).
+    ///
+    /// The identity-free counterpart of [`Self::resolve_namespace`] used by the
+    /// stream server to compute a shared-pool leaf's live best upstream. Reads the
+    /// `Active` gate ([`Self::shared_relay_active`]), so a leaf is never pointed at a
+    /// still-provisioning or draining shared relay — the make-before-break invariant.
+    #[must_use]
+    pub fn resolve_shared(&self) -> (String, String) {
+        if *self.shared_relay_active.load() {
+            (
+                self.shared_relay_endpoint.clone(),
+                self.shared_relay_sa.clone(),
+            )
+        } else {
+            self.controller_target()
+        }
+    }
+
+    /// Whether the peer on this stream is the shared relay itself (its SVID carries
+    /// `shared_relay_sa`) — the discriminator the shared-pool repoint push needs, as
+    /// the shared relay and the shared proxies both subscribe `Scope::SharedPool`
+    /// (unlike the dedicated tier, where relay=`Namespace` and proxy=`Gateway` are
+    /// distinct scopes). `None` peer (plaintext/test path) → treated as a proxy.
+    #[must_use]
+    pub fn is_shared_relay(&self, peer: Option<&crate::auth::PeerSvid>) -> bool {
+        peer.is_some_and(|p| {
+            p.uri_sans.iter().any(|uri| {
+                SpiffeId::parse(uri)
+                    .ok()
+                    .is_some_and(|id| id.service_account() == self.shared_relay_sa)
+            })
+        })
     }
 
     /// Resolve `(endpoint, expected_server_sa)` for a dedicated (namespace-scoped)
@@ -492,13 +539,16 @@ mod tests {
         })
     }
 
-    fn resolver(shared_relay: Option<&str>, active: &[&str]) -> Arc<UpstreamResolverConfig> {
+    fn resolver(shared_relay_active: bool, active: &[&str]) -> Arc<UpstreamResolverConfig> {
         let set: HashSet<String> = active.iter().map(|s| (*s).to_owned()).collect();
         Arc::new(UpstreamResolverConfig {
             controller_endpoint: "https://coxswain-controller-discovery.coxswain-system.svc:50051"
                 .to_owned(),
             controller_sa: "coxswain-controller".to_owned(),
-            shared_relay_endpoint: shared_relay.map(str::to_owned),
+            shared_relay_endpoint: "https://coxswain-relay-shared.coxswain-system.svc:50051"
+                .to_owned(),
+            shared_relay_sa: "coxswain-relay-shared".to_owned(),
+            shared_relay_active: Shared::from_value(shared_relay_active),
             relay_service_name: "coxswain-relay".to_owned(),
             relay_port: 50051,
             relay_sa: "coxswain-relay".to_owned(),
@@ -667,7 +717,7 @@ mod tests {
 
     #[test]
     fn dedicated_client_in_provisioned_namespace_points_at_relay() {
-        let cfg = resolver(None, &["team-a"]);
+        let cfg = resolver(false, &["team-a"]);
         let (endpoint, sa) = cfg.resolve(
             &dedicated_id("team-a"),
             &Scope::Gateway {
@@ -681,7 +731,7 @@ mod tests {
 
     #[test]
     fn dedicated_client_without_relay_points_at_controller() {
-        let cfg = resolver(None, &[]);
+        let cfg = resolver(false, &[]);
         let (endpoint, sa) = cfg.resolve(
             &dedicated_id("team-a"),
             &Scope::Gateway {
@@ -700,7 +750,7 @@ mod tests {
     fn relay_never_tiers_even_in_its_own_provisioned_namespace() {
         // A relay bootstraps in a namespace that is itself provisioned; it must
         // still be pointed at the controller, never at itself.
-        let cfg = resolver(None, &["team-a"]);
+        let cfg = resolver(false, &["team-a"]);
         let (endpoint, sa) = cfg.resolve(
             &relay_id("team-a"),
             &Scope::Namespace {
@@ -715,20 +765,32 @@ mod tests {
     }
 
     #[test]
-    fn shared_pool_client_uses_shared_relay_when_present_else_controller() {
-        let with_relay = resolver(
-            Some("https://coxswain-relay-shared.coxswain-system.svc:50051"),
-            &[],
-        );
-        let (endpoint, sa) = with_relay.resolve(&proxy_id(), &Scope::SharedPool);
+    fn shared_pool_client_uses_shared_relay_when_active_else_controller() {
+        let active = resolver(true, &[]);
+        let (endpoint, sa) = active.resolve(&proxy_id(), &Scope::SharedPool);
         assert_eq!(
             endpoint,
             "https://coxswain-relay-shared.coxswain-system.svc:50051"
         );
-        assert_eq!(sa, "coxswain-relay");
+        assert_eq!(sa, "coxswain-relay-shared");
 
-        let without = resolver(None, &[]);
-        let (endpoint, sa) = without.resolve(&proxy_id(), &Scope::SharedPool);
+        let inactive = resolver(false, &[]);
+        let (endpoint, sa) = inactive.resolve(&proxy_id(), &Scope::SharedPool);
+        assert_eq!(
+            endpoint,
+            "https://coxswain-controller-discovery.coxswain-system.svc:50051"
+        );
+        assert_eq!(sa, "coxswain-controller");
+    }
+
+    #[test]
+    fn shared_relay_never_tiers_onto_itself_even_when_active() {
+        // The shared relay's own SharedPool subscribe must resolve to the
+        // controller, never to itself, or it would stream from itself in a loop.
+        let cfg = resolver(true, &[]);
+        let shared_relay =
+            SpiffeId::from_parts("cluster.local", "coxswain-system", "coxswain-relay-shared");
+        let (endpoint, sa) = cfg.resolve(&shared_relay, &Scope::SharedPool);
         assert_eq!(
             endpoint,
             "https://coxswain-controller-discovery.coxswain-system.svc:50051"
@@ -746,7 +808,7 @@ mod tests {
             }),
             Arc::new(OkAuthenticator(dedicated_id("team-a"))),
         )
-        .with_upstream_resolver(resolver(None, &["team-a"]));
+        .with_upstream_resolver(resolver(false, &["team-a"]));
 
         let req = Request::new(BootstrapRequest {
             sa_token: "tok".to_owned(),

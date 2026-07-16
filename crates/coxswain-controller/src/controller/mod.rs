@@ -474,13 +474,21 @@ impl Controller {
         // set); the next restart/promotion retries. A clone survives the
         // `operator_ctx` move below so the promotion edge can rehydrate too.
         let op_ctx_promotion = operator_ctx.clone();
-        if let Some(op_ctx) = &operator_ctx
-            && let Err(e) = op_ctx.rehydrate_provisioned_relays().await
-        {
-            tracing::warn!(
-                error = %e,
-                "operator: relay-tracking rehydration failed; orphaned relays may not GC until the next restart"
-            );
+        if let Some(op_ctx) = &operator_ctx {
+            if let Err(e) = op_ctx.rehydrate_provisioned_relays().await {
+                tracing::warn!(
+                    error = %e,
+                    "operator: relay-tracking rehydration failed; orphaned relays may not GC until the next restart"
+                );
+            }
+            // Same for the single-cell shared-relay control loop (#605): seed it from
+            // a running shared relay so a restart re-adopts (or tears down) it.
+            if let Err(e) = op_ctx.rehydrate_shared_relay().await {
+                tracing::warn!(
+                    error = %e,
+                    "operator: shared-relay rehydration failed; an orphaned shared relay may not GC until the next restart"
+                );
+            }
         }
 
         tasks.spawn(run_status_worker(
@@ -601,6 +609,22 @@ impl Controller {
                                     ),
                                     Err(_) => tracing::warn!(
                                         "operator: relay-tracking rehydration on promotion timed out"
+                                    ),
+                                }
+                                // Same for the shared-relay cell (#605).
+                                match tokio::time::timeout(
+                                    REHYDRATE_BOUND,
+                                    op_ctx.rehydrate_shared_relay(),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => tracing::warn!(
+                                        error = %e,
+                                        "operator: shared-relay rehydration on promotion failed"
+                                    ),
+                                    Err(_) => tracing::warn!(
+                                        "operator: shared-relay rehydration on promotion timed out"
                                     ),
                                 }
                             }

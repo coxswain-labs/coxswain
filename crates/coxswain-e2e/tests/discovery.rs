@@ -1873,7 +1873,7 @@ const RELAY_POD_SELECTOR: &str = "app.kubernetes.io/component=namespace-relay";
 /// single servable dedicated Gateway (threshold 1).
 fn relay_tiering_threshold_1() -> ControllerOptions {
     ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         relay_min_proxy_replicas: Some(1),
         ..Default::default()
     }
@@ -2300,7 +2300,7 @@ async fn patch_dedicated_params_replicas(
 #[tokio::test]
 async fn relay_repoint_keeps_serving_during_teardown() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         // Break-even 2: two subscribers provision the relay; dropping to one (below
         // break-even, but nonzero) drives the cooldown teardown.
         relay_min_proxy_replicas: Some(2),

@@ -25,7 +25,7 @@ use anyhow::Context as _;
 use coxswain_e2e::{
     ControllerOptions, ControllerProcess, FixtureVars, Harness, NamespaceGuard, bootstrap,
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress as ing},
-    harness::{HttpClient, leader, wait},
+    harness::{HttpClient, leader, set_relay_enabled, wait},
 };
 use gateway_api_types::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
@@ -149,7 +149,7 @@ const RELAY_NAME: &str = "coxswain-relay";
 async fn namespace_relay_provisioned_and_gcd_over_dedicated_gateway_lifecycle() -> anyhow::Result<()>
 {
     let h = Harness::start_with_options(ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         relay_min_proxy_replicas: Some(1),
         ..Default::default()
     })
@@ -247,7 +247,7 @@ async fn namespace_relay_provisioned_and_gcd_over_dedicated_gateway_lifecycle() 
 #[tokio::test]
 async fn namespace_relay_not_provisioned_below_threshold() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         relay_min_proxy_replicas: Some(100),
         ..Default::default()
     })
@@ -264,6 +264,208 @@ async fn namespace_relay_not_provisioned_below_threshold() -> anyhow::Result<()>
         "a below-threshold namespace must stay direct-to-controller (scale-to-zero), \
          but relay '{RELAY_NAME}' was provisioned"
     );
+
+    Ok(())
+}
+
+// ── Shared-pool relay tier (#605) — controller-provisioned shared relay ───────
+//
+// Symmetric with the namespace relay above, but a SINGLE global relay in the
+// install namespace, sized off the shared pool's replica count (the signal). Also
+// `relay.*` Helm mutators, so serial (`e2e-serial`).
+
+/// Fixed name of the single controller-provisioned shared-pool relay
+/// (SA/Deployment/Service), from `SHARED_RELAY_SERVICE_ACCOUNT`.
+const SHARED_RELAY_NAME: &str = "coxswain-relay-shared";
+
+/// Assert the shared relay's readiness — its `SharedPool` upstream cached the
+/// shared world (readiness gates on `routing_table_loaded`), so the pool may
+/// repoint onto it.
+async fn wait_for_shared_relay_ready(deployments: &Api<Deployment>) -> anyhow::Result<()> {
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            format!("shared relay '{SHARED_RELAY_NAME}' pod Ready (cached the shared world)")
+        },
+        || async {
+            let ready = deployments
+                .get(SHARED_RELAY_NAME)
+                .await
+                .ok()
+                .and_then(|d| d.status)
+                .and_then(|s| s.ready_replicas)
+                .unwrap_or(0);
+            (ready >= 1).then_some(())
+        },
+    )
+    .await
+}
+
+/// Apply an echo backend + a shared Ingress in `ns` and wait until the shared pool
+/// serves it — the black-box "the pool is serving" probe used across these tests.
+async fn wait_shared_pool_serves(h: &Harness, ns: &str) -> anyhow::Result<String> {
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(ns)).await?;
+    wait::wait_for_backends(ns).await?;
+    fixtures::apply_fixture(ing::PATH_MATCHING, FixtureVars::new(ns)).await?;
+    let host = format!("ingress.{ns}.local");
+    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(90)).await?;
+    Ok(host)
+}
+
+/// Happy path: with relay tiering enabled and a break-even of 1, the shared proxy
+/// pool (≥1 replica) crosses the threshold, so the controller provisions the single
+/// shared-pool relay in the install namespace — zero-verb SA, no owner ref,
+/// relay-shared component, `serve relay --shared` — that becomes Ready. The pool
+/// keeps serving an Ingress route across the repoint onto the relay.
+#[tokio::test]
+async fn shared_relay_provisioned_when_pool_meets_break_even() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_enabled: true,
+        relay_min_proxy_replicas: Some(1),
+        ..Default::default()
+    })
+    .await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+
+    let deploy =
+        wait::wait_for_resource(&deployments, SHARED_RELAY_NAME, Duration::from_secs(60)).await?;
+    wait::wait_for_resource(&services, SHARED_RELAY_NAME, Duration::from_secs(15)).await?;
+    let sa = wait::wait_for_resource(&sas, SHARED_RELAY_NAME, Duration::from_secs(15)).await?;
+
+    assert_eq!(
+        sa.automount_service_account_token,
+        Some(false),
+        "shared relay SA must disable the default token automount (zero-verb identity)"
+    );
+    assert_eq!(
+        deploy
+            .metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get("app.kubernetes.io/component"))
+            .map(String::as_str),
+        Some("relay-shared"),
+        "shared relay carries the relay-shared component label"
+    );
+    assert!(
+        deploy
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_none_or(|r| r.is_empty()),
+        "the shared relay is install infra and must carry no owner reference"
+    );
+    let args = deploy
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .map(|p| &p.containers[0])
+        .and_then(|c| c.args.clone())
+        .unwrap_or_default();
+    assert!(
+        args.iter().any(|a| a == "--shared"),
+        "shared relay must subscribe --shared: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a.starts_with("--namespace")),
+        "shared relay is pool-scoped and must carry no --namespace: {args:?}"
+    );
+
+    wait_for_shared_relay_ready(&deployments).await?;
+
+    // The pool keeps serving across the repoint onto the shared relay.
+    let ns = NamespaceGuard::create(&h.client, "relay-shared-serve").await?;
+    wait_shared_pool_serves(&h, &ns.name)
+        .await
+        .context("shared pool stopped serving traffic across the shared-relay repoint")?;
+
+    Ok(())
+}
+
+/// Sad path — scale-to-zero: relay tiering enabled but with a break-even far above
+/// the shared pool's replica count, so the controller provisions NO shared relay
+/// and the pool streams direct from the controller. A short cooldown makes any
+/// relay left by a prior serial test GC deterministically.
+#[tokio::test]
+async fn shared_relay_below_break_even_stays_direct() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_enabled: true,
+        relay_min_proxy_replicas: Some(100),
+        relay_cooldown: Some("10s".to_string()),
+        ..Default::default()
+    })
+    .await?;
+
+    // The pool serves direct-to-controller.
+    let ns = NamespaceGuard::create(&h.client, "relay-shared-below").await?;
+    wait_shared_pool_serves(&h, &ns.name).await?;
+
+    // No shared relay: a below-break-even pool is a decided "not wanted". Poll so a
+    // relay left Active by a prior serial test tears down (short cooldown) rather
+    // than flaking on stale state.
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!(
+                "no shared relay '{SHARED_RELAY_NAME}' below break-even (pool stays direct-to-controller)"
+            )
+        },
+        || async { deployments.get(SHARED_RELAY_NAME).await.is_err().then_some(()) },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// Happy/transition: with the shared relay provisioned and serving, disabling the
+/// relay tier tears the shared relay down and repoints the pool back to the
+/// controller, which keeps serving — the make-before-break teardown in reverse.
+#[tokio::test]
+async fn shared_pool_repoints_direct_when_relay_disabled() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_enabled: true,
+        relay_min_proxy_replicas: Some(1),
+        ..Default::default()
+    })
+    .await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    wait::wait_for_resource(&deployments, SHARED_RELAY_NAME, Duration::from_secs(60)).await?;
+    wait_for_shared_relay_ready(&deployments).await?;
+
+    let ns = NamespaceGuard::create(&h.client, "relay-shared-revert").await?;
+    let host = wait_shared_pool_serves(&h, &ns.name).await?;
+
+    // Disable the tier → the shared relay tears down (force-off bypasses the cooldown).
+    set_relay_enabled(false).await?;
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            format!(
+                "shared relay '{SHARED_RELAY_NAME}' garbage-collected after the tier is disabled"
+            )
+        },
+        || async {
+            deployments
+                .get(SHARED_RELAY_NAME)
+                .await
+                .is_err()
+                .then_some(())
+        },
+    )
+    .await?;
+
+    // The pool repointed back to the controller and keeps serving the same route.
+    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60))
+        .await
+        .context("shared pool stopped serving after the relay was disabled and the pool reverted to the controller")?;
 
     Ok(())
 }
@@ -322,7 +524,7 @@ async fn assert_no_relay_hpa(h: &Harness, ns: &str) -> anyhow::Result<()> {
 #[tokio::test]
 async fn relay_policy_force_on_provisions_relay_with_overrides() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         relay_min_proxy_replicas: Some(100),
         ..Default::default()
     })
@@ -365,7 +567,7 @@ async fn relay_policy_force_on_provisions_relay_with_overrides() -> anyhow::Resu
 #[tokio::test]
 async fn relay_policy_force_off_gcs_provisioned_relay() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         relay_min_proxy_replicas: Some(1),
         ..Default::default()
     })
@@ -405,7 +607,7 @@ async fn relay_policy_force_off_gcs_provisioned_relay() -> anyhow::Result<()> {
 #[tokio::test]
 async fn relay_policy_autoscaling_sizes_relay_without_hpa() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         relay_min_proxy_replicas: Some(100),
         ..Default::default()
     })
@@ -428,7 +630,7 @@ async fn relay_policy_autoscaling_sizes_relay_without_hpa() -> anyhow::Result<()
 #[tokio::test]
 async fn relay_policy_uncapped_autoscaling_falls_back_to_static() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         relay_min_proxy_replicas: Some(100),
         ..Default::default()
     })
@@ -498,7 +700,7 @@ async fn assert_relay_not_scaled_below(
 #[tokio::test]
 async fn relay_deactivated_after_cooldown_below_break_even() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         // Break-even 2 so a single remaining subscriber (1) is below it but nonzero.
         relay_min_proxy_replicas: Some(2),
         relay_cooldown: Some("5s".to_string()),
@@ -553,7 +755,7 @@ async fn relay_deactivated_after_cooldown_below_break_even() -> anyhow::Result<(
 #[tokio::test]
 async fn relay_scale_down_debounced_by_stabilization_window() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         relay_min_proxy_replicas: Some(100),
         relay_scale_down_stabilization: Some("30s".to_string()),
         ..Default::default()
@@ -633,7 +835,7 @@ async fn namespace_relay_orphan_gcd_after_controller_restart_in_hysteresis_midra
     // Threshold 2: the fixture's `replicas: 2` gives 2 subscribers (≥ 2) → relay;
     // dropping params to `replicas: 1` puts the signal below break-even but nonzero.
     let opts = || ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         relay_min_proxy_replicas: Some(2),
         ..Default::default()
     };
@@ -696,7 +898,7 @@ async fn namespace_relay_orphan_gcd_after_controller_restart_in_hysteresis_midra
 #[tokio::test]
 async fn namespace_relay_not_provisioned_after_restart_below_threshold() -> anyhow::Result<()> {
     let opts = || ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         relay_min_proxy_replicas: Some(100),
         ..Default::default()
     };

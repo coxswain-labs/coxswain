@@ -56,7 +56,6 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_DISCOVERY_CA_MODE` | `--discovery-ca-mode` | `auto` | _(controller)_ `auto` self-generates the CA Secret if absent; `external` requires a pre-existing Secret (fail closed) |
 | `COXSWAIN_DISCOVERY_CA_SECRET` | `--discovery-ca-secret` | `coxswain-discovery-ca` | _(controller)_ Name of the CA Secret (`tls.crt`/`tls.key`) in the controller namespace |
 | `COXSWAIN_DISCOVERY_PORT` | `--discovery-port` | `50051` | _(controller)_ Port for the mTLS Stream gRPC listener (routing snapshots) |
-| `COXSWAIN_SHARED_RELAY_ENDPOINT` | `--shared-relay-endpoint` | _(none)_ | _(controller)_ `https://` Stream endpoint of the shared relay when one fronts the shared proxy pool (a static Helm toggle). Set, the controller hands shared-pool proxies this upstream at bootstrap instead of itself; unset, they stream from the controller |
 | `COXSWAIN_DISCOVERY_SA_TOKEN_PATH` | `--discovery-sa-token-path` | `/var/run/secrets/coxswain/discovery-token/token` | _(proxy)_ Path to the projected ServiceAccount token presented at bootstrap |
 | `COXSWAIN_DISCOVERY_SVID_TTL` | `--discovery-svid-ttl` | `24h` | _(controller)_ Lifetime of SVIDs issued to proxies; proxies refresh at ~50 % |
 | `COXSWAIN_DISCOVERY_TRUST_DOMAIN` | `--discovery-trust-domain` | `cluster.local` | SPIFFE trust domain; must match across the controller and all proxies |

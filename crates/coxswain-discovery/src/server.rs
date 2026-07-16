@@ -992,6 +992,7 @@ async fn run_stream(
     // Seeds the baseline on open (no send); the returned Ok is expected.
     let _ = seed_or_push_upstream(
         &sub.scope,
+        sub.peer_svid.as_ref(),
         upstream_resolver.as_ref(),
         &mut last_upstream,
         &tx,
@@ -1122,6 +1123,7 @@ async fn run_stream(
                 }
                 if seed_or_push_upstream(
                     &sub.scope,
+                    sub.peer_svid.as_ref(),
                     upstream_resolver.as_ref(),
                     &mut last_upstream,
                     &tx,
@@ -1202,15 +1204,21 @@ async fn recv_directive(
 /// The controller tags a directive it pushes on a relay's Namespace stream with
 /// the target `namespace` (and optionally a specific Gateway `name`); the relay
 /// forwards it to every leaf whose Gateway scope matches. An empty `target_name`
-/// matches every Gateway in the namespace. A `SharedPool` leaf is never a relay
-/// forward target (shared-pool live repoint is #605).
+/// matches every Gateway in the namespace.
+///
+/// A `SharedPool` leaf downstream of a **shared** relay always matches (#605): a
+/// shared relay serves only shared-pool leaves, so every directive the controller
+/// pushes on its upstream targets them — the `target_namespace`/`target_name`
+/// fields carry no namespace to match and are left empty. A `Namespace` leaf is
+/// never itself a forward target (a relay is never a leaf).
 fn directive_targets_leaf(directive: &p::PreferredUpstream, scope: &Scope) -> bool {
     match scope {
         Scope::Gateway { namespace, name } => {
             directive.target_namespace == *namespace
                 && (directive.target_name.is_empty() || directive.target_name == *name)
         }
-        Scope::Namespace { .. } | Scope::SharedPool => false,
+        Scope::SharedPool => true,
+        Scope::Namespace { .. } => false,
     }
 }
 
@@ -1228,17 +1236,27 @@ fn directive_targets_leaf(directive: &p::PreferredUpstream, scope: &Scope) -> bo
 /// — rather than the desired one — is what makes a fresh proxy that landed on the
 /// controller get repointed onto a relay provisioned in the same reconcile.
 ///
-/// A `SharedPool` stream is never repointed here (shared-pool live repoint is
-/// #605); a resolver-less service is a no-op.
+/// A resolver-less service is a no-op.
 ///
-/// For a `Gateway` scope (dedicated leaf streaming directly from the controller)
-/// the directive is untargeted — the leaf is the sole recipient. For a `Namespace`
-/// scope (a relay's aggregate stream) the directive carries `target_namespace` so
-/// the relay forwards it to its downstream leaves in that namespace.
+/// The seed baseline and the target are computed per scope as a `(seed, target,
+/// forward_target)` triple, then the shared push logic runs:
+/// - `Gateway` (dedicated leaf streaming directly from the controller): seed from
+///   the controller; target its namespace's best upstream; untargeted directive —
+///   the leaf is the sole recipient.
+/// - `Namespace` (a dedicated relay's aggregate stream): seed and target from the
+///   namespace's best upstream; the directive carries `target_namespace` so the
+///   relay forwards it to its downstream leaves in that namespace.
+/// - `SharedPool` (#605): the shared relay (peer SA == `shared_relay_sa`) seeds
+///   from the shared best upstream and forwards to its downstream shared-pool
+///   leaves on change; a direct shared proxy seeds from the controller and
+///   repoints itself. Both target the shared best upstream; the directive is
+///   untargeted (a shared relay serves only shared-pool leaves, so
+///   `directive_targets_leaf` matches them without a namespace).
 ///
 /// Returns `Err(())` if the outbound channel closed.
 async fn seed_or_push_upstream(
     scope: &Scope,
+    peer_svid: Option<&crate::auth::PeerSvid>,
     resolver: Option<&Arc<UpstreamResolverConfig>>,
     last: &mut Option<(String, String)>,
     tx: &mpsc::Sender<Result<p::ServerMessage, Status>>,
@@ -1246,21 +1264,34 @@ async fn seed_or_push_upstream(
     let Some(resolver) = resolver else {
         return Ok(());
     };
-    let (namespace, forward_target) = match scope {
-        Scope::Gateway { namespace, .. } => (namespace.clone(), String::new()),
-        Scope::Namespace { namespace } => (namespace.clone(), namespace.clone()),
-        Scope::SharedPool => return Ok(()),
+    // Seed from the CURRENTLY-CONNECTED upstream, not the desired one: a leaf
+    // streaming here is on the controller (Gateway / direct shared proxy), a relay's
+    // leaves are behind the relay (Namespace / shared relay). The `forward_target`
+    // is only meaningful for a relay's own stream (empty for SharedPool — a shared
+    // relay's leaves match regardless).
+    let (seed, target, forward_target) = match scope {
+        Scope::Gateway { namespace, .. } => (
+            resolver.controller_target(),
+            resolver.resolve_namespace(namespace),
+            String::new(),
+        ),
+        Scope::Namespace { namespace } => (
+            resolver.resolve_namespace(namespace),
+            resolver.resolve_namespace(namespace),
+            namespace.clone(),
+        ),
+        Scope::SharedPool => {
+            let seed = if resolver.is_shared_relay(peer_svid) {
+                resolver.resolve_shared()
+            } else {
+                resolver.controller_target()
+            };
+            (seed, resolver.resolve_shared(), String::new())
+        }
     };
-    // Seed from the CURRENTLY-CONNECTED upstream: a Gateway-scope client is
-    // connected to the controller (its stream is here), a Namespace-scope relay's
-    // leaves are behind the relay.
     if last.is_none() {
-        *last = Some(match scope {
-            Scope::Gateway { .. } => resolver.controller_target(),
-            _ => resolver.resolve_namespace(&namespace),
-        });
+        *last = Some(seed);
     }
-    let target = resolver.resolve_namespace(&namespace);
     if last.as_ref() == Some(&target) {
         return Ok(());
     }
@@ -3126,12 +3157,26 @@ mod tests {
             controller_endpoint: "https://coxswain-controller-discovery.coxswain-system.svc:50051"
                 .to_owned(),
             controller_sa: "coxswain-controller".to_owned(),
-            shared_relay_endpoint: None,
+            shared_relay_endpoint: "https://coxswain-relay-shared.coxswain-system.svc:50051"
+                .to_owned(),
+            shared_relay_sa: "coxswain-relay-shared".to_owned(),
+            shared_relay_active: Shared::from_value(false),
             relay_service_name: "coxswain-relay".to_owned(),
             relay_port: 50051,
             relay_sa: "coxswain-relay".to_owned(),
             active_relays: Shared::from_value(set),
         })
+    }
+
+    /// A `PeerSvid` bearing the shared relay's SVID — the discriminator
+    /// `seed_or_push_upstream` uses to treat a SharedPool stream as the relay's own
+    /// (forward path) rather than a direct proxy.
+    fn shared_relay_peer() -> crate::auth::PeerSvid {
+        crate::auth::PeerSvid {
+            uri_sans: vec![
+                "spiffe://cluster.local/ns/coxswain-system/sa/coxswain-relay-shared".to_owned(),
+            ],
+        }
     }
 
     /// Drain any directive currently queued on the receiver without blocking.
@@ -3157,7 +3202,7 @@ mod tests {
             name: "my-gw".to_owned(),
         };
         let mut last = None;
-        seed_or_push_upstream(&scope, Some(&resolver), &mut last, &tx)
+        seed_or_push_upstream(&scope, None, Some(&resolver), &mut last, &tx)
             .await
             .expect("seed must not fail");
         assert!(
@@ -3170,7 +3215,7 @@ mod tests {
         resolver
             .active_relays
             .store(Arc::new(HashSet::from(["team-a".to_owned()])));
-        seed_or_push_upstream(&scope, Some(&resolver), &mut last, &tx)
+        seed_or_push_upstream(&scope, None, Some(&resolver), &mut last, &tx)
             .await
             .expect("push must not fail");
         let directive = try_recv_directive(&mut rx).expect("a repoint directive must be pushed");
@@ -3200,7 +3245,7 @@ mod tests {
             name: "my-gw".to_owned(),
         };
         let mut last = None;
-        seed_or_push_upstream(&scope, Some(&resolver), &mut last, &tx)
+        seed_or_push_upstream(&scope, None, Some(&resolver), &mut last, &tx)
             .await
             .expect("push must not fail");
         let directive = try_recv_directive(&mut rx)
@@ -3221,7 +3266,7 @@ mod tests {
             namespace: "team-a".to_owned(),
         };
         let mut last = None;
-        seed_or_push_upstream(&scope, Some(&resolver), &mut last, &tx)
+        seed_or_push_upstream(&scope, None, Some(&resolver), &mut last, &tx)
             .await
             .expect("seed must not fail");
         assert!(try_recv_directive(&mut rx).is_none());
@@ -3229,7 +3274,7 @@ mod tests {
         // Deprovision → forward a controller-repoint directive tagged with the
         // namespace so the relay routes it to its downstream leaves.
         resolver.active_relays.store(Arc::new(HashSet::new()));
-        seed_or_push_upstream(&scope, Some(&resolver), &mut last, &tx)
+        seed_or_push_upstream(&scope, None, Some(&resolver), &mut last, &tx)
             .await
             .expect("push must not fail");
         let directive = try_recv_directive(&mut rx).expect("a forward directive must be pushed");
@@ -3245,22 +3290,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shared_pool_stream_is_never_repointed_here() {
+    async fn shared_pool_proxy_is_repointed_when_shared_relay_activates() {
+        // A direct shared proxy (no relay SVID) streaming from the controller: seed
+        // the controller baseline (no push), then when the shared relay becomes
+        // Active it is repointed onto the relay, untargeted (its own direct stream).
         let resolver = upstream_resolver(&[]);
         let (tx, mut rx) = mpsc::channel::<Result<ServerMessage, Status>>(4);
         let mut last = None;
-        seed_or_push_upstream(&Scope::SharedPool, Some(&resolver), &mut last, &tx)
+        seed_or_push_upstream(&Scope::SharedPool, None, Some(&resolver), &mut last, &tx)
             .await
-            .expect("no-op must not fail");
-        resolver
-            .active_relays
-            .store(Arc::new(HashSet::from(["team-a".to_owned()])));
-        seed_or_push_upstream(&Scope::SharedPool, Some(&resolver), &mut last, &tx)
-            .await
-            .expect("no-op must not fail");
+            .expect("seed must not fail");
         assert!(
             try_recv_directive(&mut rx).is_none(),
-            "shared-pool live repoint is #605, never pushed here"
+            "seeding a direct shared proxy must not push"
+        );
+
+        resolver.shared_relay_active.store(Arc::new(true));
+        seed_or_push_upstream(&Scope::SharedPool, None, Some(&resolver), &mut last, &tx)
+            .await
+            .expect("push must not fail");
+        let directive = try_recv_directive(&mut rx).expect("a repoint directive must be pushed");
+        assert_eq!(
+            directive.endpoint,
+            "https://coxswain-relay-shared.coxswain-system.svc:50051"
+        );
+        assert_eq!(directive.expected_server_sa, "coxswain-relay-shared");
+        assert_eq!(
+            directive.target_namespace, "",
+            "a direct shared-pool directive is untargeted"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_relay_stream_forwards_repoint_on_deactivate() {
+        // The shared relay's OWN SharedPool stream (its SVID carries the shared-relay
+        // SA), while Active: seed from the shared best upstream (the relay), no push.
+        let resolver = upstream_resolver(&[]);
+        resolver.shared_relay_active.store(Arc::new(true));
+        let peer = shared_relay_peer();
+        let (tx, mut rx) = mpsc::channel::<Result<ServerMessage, Status>>(4);
+        let mut last = None;
+        seed_or_push_upstream(
+            &Scope::SharedPool,
+            Some(&peer),
+            Some(&resolver),
+            &mut last,
+            &tx,
+        )
+        .await
+        .expect("seed must not fail");
+        assert!(try_recv_directive(&mut rx).is_none());
+
+        // Shared relay deactivates → forward a controller-repoint directive; the
+        // shared relay routes it to all its downstream shared-pool leaves
+        // (`directive_targets_leaf` matches them without a namespace).
+        resolver.shared_relay_active.store(Arc::new(false));
+        seed_or_push_upstream(
+            &Scope::SharedPool,
+            Some(&peer),
+            Some(&resolver),
+            &mut last,
+            &tx,
+        )
+        .await
+        .expect("push must not fail");
+        let directive = try_recv_directive(&mut rx).expect("a forward directive must be pushed");
+        assert_eq!(
+            directive.endpoint,
+            "https://coxswain-controller-discovery.coxswain-system.svc:50051"
+        );
+        assert_eq!(directive.expected_server_sa, "coxswain-controller");
+        assert_eq!(
+            directive.target_namespace, "",
+            "a shared-pool forward directive needs no namespace (a shared relay serves only shared-pool leaves)"
         );
     }
 
@@ -3295,15 +3397,17 @@ mod tests {
             &directive("team-b", ""),
             &gw("team-a", "gw-1")
         ));
-        // A relay/shared leaf is never a forward target.
+        // A dedicated relay's own Namespace stream is never a forward target.
         assert!(!directive_targets_leaf(
             &directive("team-a", ""),
             &Scope::Namespace {
                 namespace: "team-a".to_owned()
             }
         ));
-        assert!(!directive_targets_leaf(
-            &directive("team-a", ""),
+        // A shared-pool leaf downstream of a shared relay always matches (#605): the
+        // directive carries no namespace, since a shared relay serves only such leaves.
+        assert!(directive_targets_leaf(
+            &directive("", ""),
             &Scope::SharedPool
         ));
     }

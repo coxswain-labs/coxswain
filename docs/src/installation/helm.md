@@ -61,31 +61,27 @@ See the [Helm chart README](https://github.com/coxswain-labs/coxswain/blob/main/
 
 ## Discovery relay tier
 
-The optional [relay tier](../architecture/deployment-models.md#discovery-relay-tier) scales leader fan-out by inserting zero-RBAC cache pods between the controller and the proxies. It is **off by default** — a relay-free install is byte-identical to one without the feature — and is configured under `relay.*`, split into two independent families:
+The [relay tier](../architecture/deployment-models.md#discovery-relay-tier) scales leader fan-out by inserting zero-RBAC cache pods between the controller and the proxies. It is **on by default (opt-out)**, but the break-even gate keeps it inert until a scope's demand earns a relay — so a small install provisions no relays and is byte-identical to a relay-free one. The **controller** owns the whole tier (both the shared-pool relay and the per-namespace dedicated relays); these `relay.*` values map onto its `--relay-*` flags — there are no relay templates to render:
 
 | Value | Default | Description |
 |-------|---------|-------------|
-| `relay.shared.enabled` | `false` | Render the shared-pool relay **and** repoint the shared proxies at it |
-| `relay.shared.replicas` | `2` | Shared-relay replica count (ignored when autoscaling) |
-| `relay.shared.autoscaling.enabled` | `false` | Enable HPA for the shared relay (it fronts the whole pool, so it can scale) |
-| `relay.shared.resources` | `{}` | Shared-relay container resources |
-| `relay.dedicated.enabled` | `false` | Enable controller-provisioned per-namespace relays (→ `--relay-enabled`) |
-| `relay.dedicated.replicas` | `2` | HA replica count for each provisioned namespace relay |
-| `relay.dedicated.minProxyReplicas` | `8` | Break-even **activation** threshold: a namespace gets a relay only once its live dedicated-proxy subscriber count reaches this (below it, direct-to-controller) |
-| `relay.dedicated.targetProxiesPerReplica` | `50` | Capacity ratio — proxies per relay replica the sizing loop targets. Decoupled from the break-even threshold |
-| `relay.dedicated.cooldown` | `300s` | Deactivation cooldown: an active relay is torn down after the subscriber count holds below break-even for this long (0 → immediate) |
-| `relay.dedicated.scaleDownStabilization` | `300s` | Scale-down stabilization window for an autoscaled relay (scale up promptly, down only on the trailing-window peak) |
-| `relay.dedicated.tolerance` | `0.10` | Relative sizing deadband — the replica count changes only when load deviates from target by more than this fraction |
-| `relay.dedicated.resources.{cpuRequest,memoryRequest,memoryLimit}` | `50m` / `64Mi` / `256Mi` | Resources for each provisioned namespace relay (CPU request only — a limit would throttle fan-out) |
+| `relay.enabled` | `true` | Master switch (→ `--relay-enabled`). Set `false` to disable the whole tier |
+| `relay.replicas` | `2` | HA replica count / autoscaling floor for a provisioned relay |
+| `relay.maxReplicas` | `10` | Shared-relay autoscaling ceiling (→ `--relay-max-replicas`) — the mandatory cap on the upstream streams the shared relay opens against the leader. Dedicated relays cap via `CoxswainRelayPolicy` |
+| `relay.minProxyReplicas` | `8` | Break-even **activation** threshold: a scope gets a relay only once its demand (a namespace's live dedicated-proxy count, or the shared pool's replica count) reaches this (below it, direct-to-controller) |
+| `relay.targetProxiesPerReplica` | `50` | Capacity ratio — proxies per relay replica the sizing loop targets. Decoupled from the break-even threshold |
+| `relay.cooldown` | `300s` | Deactivation cooldown: an active relay is torn down after demand holds below break-even for this long (a genuinely-drained scope tears down at once) |
+| `relay.scaleDownStabilization` | `300s` | Scale-down stabilization window for an autoscaled relay (scale up promptly, down only on the trailing-window peak) |
+| `relay.tolerance` | `0.10` | Relative sizing deadband — the replica count changes only when load deviates from target by more than this fraction |
+| `relay.resources.{cpuRequest,memoryRequest,memoryLimit}` | `50m` / `64Mi` / `256Mi` | Resources for each provisioned relay (CPU request only — a limit would throttle fan-out) |
 
-`relay.shared.*` renders Deployment/Service/SA/PDB/HPA directly (static install infra). `relay.dedicated.*` is passed to the controller, which provisions the per-namespace relays dynamically — there are no dedicated-relay templates to render. Only the shared relay is a raw-manifest resource; enabling the tier on a non-Helm install is a Helm-only path today.
+Per-namespace overrides for the **dedicated** relays (force-on/off, replicas, resources, `podTemplate` scheduling, autoscaling) come from the namespaced [`CoxswainRelayPolicy`](../reference/relay-policy.md) CRD; the shared relay is global and reads the `relay.*` flag values directly.
 
 ```bash
-# Enable both relay families
+# Disable the relay tier entirely
 helm upgrade coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
   --namespace coxswain-system \
-  --set relay.shared.enabled=true \
-  --set relay.dedicated.enabled=true
+  --set relay.enabled=false
 ```
 
 ## Namespace-scoped install

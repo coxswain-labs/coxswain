@@ -260,21 +260,25 @@ pub(crate) struct HelmOverrides {
     /// direct `kubectl scale` (which the controller reverts). `Some(0)` drains the
     /// pool to zero (used by the #531 no-connected-proxies gate test).
     pub shared_proxy_replicas: Option<u32>,
-    /// Passed as `relay.dedicated.enabled` (#584): enables controller-provisioned
-    /// namespace relays. `false` leaves the chart default (off).
-    pub relay_dedicated_enabled: bool,
-    /// Passed as `relay.dedicated.minProxyReplicas` (#584): the break-even relay
-    /// provisioning threshold. `None` leaves the chart default (8).
+    /// Passed as `relay.enabled` (#584/#605): the unified relay-tier master switch
+    /// (shared + dedicated). Pinned explicitly (the chart default is on), so `false`
+    /// disables the whole tier for a test.
+    pub relay_enabled: bool,
+    /// Passed as `relay.minProxyReplicas` (#584): the break-even provisioning
+    /// threshold for both scopes. `None` leaves the chart default (8).
     pub relay_min_proxy_replicas: Option<u32>,
-    /// Passed as `relay.dedicated.cooldown` (#602): the deactivation cooldown.
-    /// Tests set a short value (e.g. `"5s"`) to observe teardown. `None` leaves the
-    /// chart default (300s).
+    /// Passed as `relay.maxReplicas` (#605): the shared relay's autoscaling ceiling.
+    /// `None` leaves the chart default (10).
+    pub relay_max_replicas: Option<u32>,
+    /// Passed as `relay.cooldown` (#602): the deactivation cooldown. Tests set a
+    /// short value (e.g. `"5s"`) to observe teardown. `None` leaves the chart
+    /// default (300s).
     pub relay_cooldown: Option<String>,
-    /// Passed as `relay.dedicated.scaleDownStabilization` (#602): the scale-down
-    /// stabilization window. `None` leaves the chart default (300s).
+    /// Passed as `relay.scaleDownStabilization` (#602): the scale-down stabilization
+    /// window. `None` leaves the chart default (300s).
     pub relay_scale_down_stabilization: Option<String>,
-    /// Passed as `relay.dedicated.targetProxiesPerReplica` (#602): the capacity
-    /// ratio. `None` leaves the chart default (50).
+    /// Passed as `relay.targetProxiesPerReplica` (#602): the capacity ratio. `None`
+    /// leaves the chart default (50).
     pub relay_target_proxies_per_replica: Option<u32>,
     /// Passed as `watchNamespace` (#59): the controller's namespaced watch scope.
     /// A comma-separated list (`ns1,ns2`) scopes the controller to those
@@ -427,25 +431,30 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         args.push("--set".into());
         args.push(format!("proxy.shared.replicas={replicas}"));
     }
-    if overrides.relay_dedicated_enabled {
-        args.push("--set".into());
-        args.push("relay.dedicated.enabled=true".into());
-    }
+    // Relay tier (#584/#605): unified `relay.*` knobs. `relay.enabled` is pinned
+    // explicitly (the chart/binary default is on) so a test that does not request
+    // the tier runs deterministically with it off, regardless of the opt-out default.
+    args.push("--set".into());
+    args.push(format!("relay.enabled={}", overrides.relay_enabled));
     if let Some(min) = overrides.relay_min_proxy_replicas {
         args.push("--set".into());
-        args.push(format!("relay.dedicated.minProxyReplicas={min}"));
+        args.push(format!("relay.minProxyReplicas={min}"));
+    }
+    if let Some(max) = overrides.relay_max_replicas {
+        args.push("--set".into());
+        args.push(format!("relay.maxReplicas={max}"));
     }
     if let Some(cooldown) = &overrides.relay_cooldown {
         args.push("--set".into());
-        args.push(format!("relay.dedicated.cooldown={cooldown}"));
+        args.push(format!("relay.cooldown={cooldown}"));
     }
     if let Some(window) = &overrides.relay_scale_down_stabilization {
         args.push("--set".into());
-        args.push(format!("relay.dedicated.scaleDownStabilization={window}"));
+        args.push(format!("relay.scaleDownStabilization={window}"));
     }
     if let Some(target) = overrides.relay_target_proxies_per_replica {
         args.push("--set".into());
-        args.push(format!("relay.dedicated.targetProxiesPerReplica={target}"));
+        args.push(format!("relay.targetProxiesPerReplica={target}"));
     }
 
     // The shared proxy pool is now controller-provisioned (#604). Capture its
@@ -508,6 +517,29 @@ pub async fn set_shared_proxy_replicas(replicas: u32) -> anyhow::Result<()> {
         &root,
         &HelmOverrides {
             shared_proxy_replicas: Some(replicas),
+            ..HelmOverrides::default()
+        },
+    )
+    .await
+}
+
+/// Toggle the relay tier on/off on the shared release mid-test (#605), via a Helm
+/// upgrade that resets every other override to its default. Serial-only (it
+/// reconfigures the shared release, enforced by the [`helm_install`] mutator guard).
+///
+/// Used to observe the shared pool repointing back to the controller — and the
+/// shared relay garbage-collecting — when the tier is disabled. Disabling forces
+/// immediate teardown (the KEDA force-off path bypasses the cooldown).
+///
+/// # Errors
+///
+/// Returns an error if the Helm upgrade or the convergence wait fails.
+pub async fn set_relay_enabled(enabled: bool) -> anyhow::Result<()> {
+    let root = workspace_root().context("workspace root")?;
+    helm_install(
+        &root,
+        &HelmOverrides {
+            relay_enabled: enabled,
             ..HelmOverrides::default()
         },
     )
@@ -636,8 +668,9 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
         ingress_enabled: _,
         shared_proxy_enabled: _,
         shared_proxy_replicas: _,
-        relay_dedicated_enabled: _,
+        relay_enabled: _,
         relay_min_proxy_replicas: _,
+        relay_max_replicas: _,
         relay_cooldown: _,
         relay_scale_down_stabilization: _,
         relay_target_proxies_per_replica: _,
@@ -703,25 +736,32 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
         &["proxy", "shared", "replicas"],
         get(&["proxy", "shared", "replicas"]).is_some(),
     );
+    // `relay.enabled` is pinned on every install (opt-out default), so it is only
+    // "dirty" — a leaked mutation — when a test turned the tier ON; the base's
+    // pinned `false` is the clean state.
     check(
-        &["relay", "dedicated", "enabled"],
-        get(&["relay", "dedicated", "enabled"]).and_then(serde_json::Value::as_bool) == Some(true),
+        &["relay", "enabled"],
+        get(&["relay", "enabled"]).and_then(serde_json::Value::as_bool) == Some(true),
     );
     check(
-        &["relay", "dedicated", "minProxyReplicas"],
-        get(&["relay", "dedicated", "minProxyReplicas"]).is_some(),
+        &["relay", "minProxyReplicas"],
+        get(&["relay", "minProxyReplicas"]).is_some(),
     );
     check(
-        &["relay", "dedicated", "cooldown"],
-        get(&["relay", "dedicated", "cooldown"]).is_some(),
+        &["relay", "maxReplicas"],
+        get(&["relay", "maxReplicas"]).is_some(),
     );
     check(
-        &["relay", "dedicated", "scaleDownStabilization"],
-        get(&["relay", "dedicated", "scaleDownStabilization"]).is_some(),
+        &["relay", "cooldown"],
+        get(&["relay", "cooldown"]).is_some(),
     );
     check(
-        &["relay", "dedicated", "targetProxiesPerReplica"],
-        get(&["relay", "dedicated", "targetProxiesPerReplica"]).is_some(),
+        &["relay", "scaleDownStabilization"],
+        get(&["relay", "scaleDownStabilization"]).is_some(),
+    );
+    check(
+        &["relay", "targetProxiesPerReplica"],
+        get(&["relay", "targetProxiesPerReplica"]).is_some(),
     );
     check(&["watchNamespace"], get(&["watchNamespace"]).is_some());
     dirty

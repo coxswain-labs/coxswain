@@ -252,6 +252,12 @@ pub struct OperatorConfig {
     /// break-even `H`. The flag default (50) a namespace without a
     /// `RelayAutoscaling.targetProxiesPerReplica` override falls back to.
     pub relay_target_proxies_per_replica: u32,
+    /// Autoscaling ceiling for the **shared-pool** relay (`--relay-max-replicas`,
+    /// #605). The shared relay has no `CoxswainRelayPolicy` (it is global, not
+    /// namespaced), so its control loop autoscales directly off the flags:
+    /// `clamp(ceil(pool-signal / target), relay_replicas, relay_max_replicas)`. The
+    /// dedicated tier ignores this (it caps via `RelayAutoscaling.maxReplicas`).
+    pub relay_max_replicas: u32,
     /// Deactivation cooldown (`--relay-cooldown`, #602): how long the signal must
     /// hold below `H` before an active relay tears down. Flag-default fallback.
     pub relay_cooldown: Duration,
@@ -281,11 +287,18 @@ pub struct OperatorConfig {
     /// serve them. Lags `provisioned_relays` on provision, leads it on teardown —
     /// the make-before-break invariant.
     pub active_relays: Shared<HashSet<String>>,
-    /// Bumped whenever the repoint set ([`Self::active_relays`]) changes (#601/#602),
-    /// waking the discovery server's live streams so a leaf is repointed the moment
-    /// its namespace's relay becomes Ready or starts draining. `None` disables live
-    /// repoint (the authorizer still works off `provisioned_relays`). The discovery
-    /// server holds the paired receiver (`DiscoveryService::with_upstream_directives`).
+    /// Whether the controller-provisioned **shared-pool** relay is `Active` (#605) —
+    /// the shared-tier repoint gate, symmetric with [`Self::active_relays`]. Written
+    /// by the shared-relay control loop; read lock-free by the discovery server's
+    /// `UpstreamResolverConfig` (`shared_relay_active`) so the pool repoints onto the
+    /// shared relay only once it can serve. Changes bump [`Self::relay_changed_tx`].
+    pub shared_relay_active: Shared<bool>,
+    /// Bumped whenever the repoint set ([`Self::active_relays`]) or the shared-relay
+    /// active gate ([`Self::shared_relay_active`]) changes (#601/#602/#605), waking
+    /// the discovery server's live streams so a leaf is repointed the moment its
+    /// relay becomes Ready or starts draining. `None` disables live repoint (the
+    /// authorizer still works off `provisioned_relays`). The discovery server holds
+    /// the paired receiver (`DiscoveryService::with_upstream_directives`).
     pub relay_changed_tx: Option<watch::Sender<u64>>,
 }
 
@@ -400,6 +413,9 @@ pub(crate) struct ReconcileContext {
     /// without a `CoxswainRelayPolicy` override falls back to. See the matching
     /// `--relay-*` flags on [`OperatorConfig`].
     pub(super) relay_target_proxies_per_replica: u32,
+    /// Shared-pool relay autoscaling ceiling (`--relay-max-replicas`, #605). See
+    /// [`OperatorConfig::relay_max_replicas`].
+    pub(super) relay_max_replicas: u32,
     pub(super) relay_cooldown: Duration,
     pub(super) relay_scale_down_stabilization: Duration,
     pub(super) relay_tolerance: f64,
@@ -424,7 +440,16 @@ pub(crate) struct ReconcileContext {
     /// [`super::run_relay_reconciler`] advances. Both derived sets above are
     /// recomputed from this. Guard is never held across an `.await`.
     pub(super) relay_states: Mutex<HashMap<String, relay_autoscaler::RelayNsRecord>>,
-    /// Bumped on every repoint-set change (#601/#602) to wake the discovery server's
+    /// Shared-pool repoint gate (#605): `Active` once the shared relay is Ready and
+    /// serving — read lock-free by the discovery server. Derived from
+    /// [`Self::shared_relay_state`] by [`Self::publish_shared_relay`].
+    pub(super) shared_relay_active: Shared<bool>,
+    /// Authoritative **single-cell** shared-pool relay control-loop state (#605): the
+    /// make-before-break lifecycle for the one shared relay, advanced by
+    /// [`super::converge_shared_pool`]. `None` = no shared relay provisioned. Guard is
+    /// never held across an `.await`.
+    pub(super) shared_relay_state: Mutex<Option<relay_autoscaler::RelayNsRecord>>,
+    /// Bumped on every repoint change (#601/#602/#605) to wake the discovery server's
     /// live streams for a repoint push. `None` disables live repoint.
     relay_changed_tx: Option<watch::Sender<u64>>,
     last_hashes: Mutex<HashMap<ObjectKey, u64>>,
@@ -484,6 +509,7 @@ impl ReconcileContext {
             relay_replicas: config.relay_replicas,
             relay_min_proxy_replicas: config.relay_min_proxy_replicas,
             relay_target_proxies_per_replica: config.relay_target_proxies_per_replica,
+            relay_max_replicas: config.relay_max_replicas,
             relay_cooldown: config.relay_cooldown,
             relay_scale_down_stabilization: config.relay_scale_down_stabilization,
             relay_tolerance: config.relay_tolerance,
@@ -492,6 +518,8 @@ impl ReconcileContext {
             relay_memory_limit: config.relay_memory_limit,
             provisioned_relays: config.provisioned_relays,
             active_relays: config.active_relays,
+            shared_relay_active: config.shared_relay_active,
+            shared_relay_state: Mutex::new(None),
             relay_changed_tx: config.relay_changed_tx,
             relay_states: Mutex::new(HashMap::new()),
             last_hashes: Mutex::new(HashMap::new()),
@@ -598,6 +626,80 @@ impl ReconcileContext {
         tracing::info!(
             provisioned_relays = count,
             "operator: rehydrated relay control-loop state from cluster"
+        );
+        Ok(())
+    }
+
+    /// Recompute and publish the shared-pool repoint gate from the single-cell
+    /// [`Self::shared_relay_state`] (#605), the shared-tier analogue of
+    /// [`Self::publish_relay_sets`].
+    ///
+    /// Sets [`Self::shared_relay_active`] to whether the cell is in
+    /// [`Active`](relay_autoscaler::RelayNsState::Active) — "the shared relay is
+    /// Ready, the pool should point here" — and bumps [`Self::relay_changed_tx`]
+    /// only on a change, so the discovery server repoints the pool exactly when the
+    /// shared relay enters or leaves `Active`. The guard is never held across an
+    /// `.await`.
+    pub(super) fn publish_shared_relay(&self) {
+        let active = self
+            .shared_relay_state
+            .lock()
+            .as_ref()
+            .is_some_and(|r| r.state == relay_autoscaler::RelayNsState::Active);
+        if *self.shared_relay_active.load() != active {
+            self.shared_relay_active.store(Arc::new(active));
+            if let Some(tx) = &self.relay_changed_tx {
+                tx.send_modify(|g| *g = g.wrapping_add(1));
+            }
+        }
+    }
+
+    /// Rebuild the shared-relay control-loop cell from the cluster (#605), the
+    /// shared-tier analogue of [`Self::rehydrate_provisioned_relays`].
+    ///
+    /// [`Self::shared_relay_state`] starts `None` on every process start; nothing
+    /// else rehydrates it, so a controller restart while the shared relay is running
+    /// would leave it untracked. GETs the shared-relay `Deployment` and, if present,
+    /// seeds an [`Active`](relay_autoscaler::RelayNsState::Active) cell sized to its
+    /// live `spec.replicas` (it was serving before the restart), then publishes the
+    /// gate.
+    ///
+    /// Runs **regardless of `relay_enabled`** — unlike the dedicated relay
+    /// reconciler, [`super::converge_shared_pool`] runs every pass whether or not
+    /// tiering is enabled, so a shared relay left over from before the tier was
+    /// disabled must still be adopted here; its force-off teardown then GCs it.
+    /// (Skipping rehydration when disabled would orphan that Deployment — the cell
+    /// stays `None` and the convergence loop only ever *provisions* from `None`.)
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying [`kube::Error`] if the GET fails for a reason other
+    /// than `NotFound`; the caller logs and proceeds (the next restart/promotion
+    /// retries).
+    pub(crate) async fn rehydrate_shared_relay(&self) -> Result<(), kube::Error> {
+        let deployments: Api<Deployment> =
+            Api::namespaced(self.client.clone(), &self.controller_namespace);
+        let record = deployments
+            .get_opt(render_relay::SHARED_RELAY_NAME)
+            .await?
+            .map(|d| {
+                let replicas = d
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.replicas)
+                    .and_then(|r| u32::try_from(r).ok())
+                    .unwrap_or(1);
+                relay_autoscaler::RelayNsRecord::existing(
+                    relay_autoscaler::RelayNsState::Active,
+                    replicas,
+                )
+            });
+        let present = record.is_some();
+        *self.shared_relay_state.lock() = record;
+        self.publish_shared_relay();
+        tracing::info!(
+            shared_relay = present,
+            "operator: rehydrated shared-relay control-loop state from cluster"
         );
         Ok(())
     }
