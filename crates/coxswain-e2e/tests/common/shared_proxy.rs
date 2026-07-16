@@ -1,66 +1,36 @@
 #![allow(missing_docs)]
-//! Shared-proxy Deployment lifecycle helpers (#531).
+//! Shared-proxy pool lifecycle helpers (#531).
 //!
 //! Scaling or restarting `coxswain-shared-proxy` breaks every tenant's data
 //! plane, so tests using these helpers are only legal in whole-binary-serial
 //! suites (`status_conditions`, `discovery`, `resilience` — see
-//! `.config/nextest.toml`). [`SharedProxyScaleGuard`] restores `replicas=1`
-//! on drop (panic-safe) via a synchronous `kubectl` invocation — no runtime
-//! is needed in `Drop`, sidestepping the current-thread-runtime teardown trap
-//! that async cleanup would hit.
+//! `.config/nextest.toml`).
+//!
+//! Since #604 the pool is controller-owned: its replica count is config-driven
+//! and re-asserted via server-side apply, so a direct `kubectl scale` is reverted
+//! within a reconcile. [`scale_shared_proxy`] therefore drives the count through
+//! a Helm upgrade of `proxy.shared.replicas`. Panic-safety no longer needs an
+//! explicit restore guard — a leaked non-default override is detected and
+//! restored by the harness's `ensure_default_release` on the next default-options
+//! test. A `rollout restart` (churn without a replica change) still goes through
+//! `kubectl`, since the controller does not fight it.
 
-use std::time::Duration;
-
-use coxswain_e2e::harness::wait;
 use tokio::process::Command;
 
 const DEPLOYMENT: &str = "coxswain-shared-proxy";
 const NAMESPACE: &str = "coxswain-system";
 
-/// Scale the shared-proxy Deployment and wait for the real post-condition:
-/// zero pods remaining (scale to 0) or all replicas Ready (scale up).
+/// Scale the controller-owned shared proxy pool to `replicas` and block until it
+/// converges (including 0). Drives the count through `proxy.shared.replicas` — a
+/// direct `kubectl scale` would be reverted by the install reconciler.
 pub async fn scale_shared_proxy(replicas: u32) -> anyhow::Result<()> {
-    let status = Command::new("kubectl")
-        .args([
-            "scale",
-            &format!("deployment/{DEPLOYMENT}"),
-            "-n",
-            NAMESPACE,
-            &format!("--replicas={replicas}"),
-        ])
-        .status()
-        .await?;
-    anyhow::ensure!(
-        status.success(),
-        "kubectl scale shared proxy to {replicas} failed"
-    );
-    wait_for_shared_proxy_replicas(replicas).await
-}
-
-/// Wait until the Deployment reports exactly `replicas` ready replicas and no
-/// surplus pods (`kubectl scale` returns at spec-update time, not settle time).
-pub async fn wait_for_shared_proxy_replicas(replicas: u32) -> anyhow::Result<()> {
-    wait::poll_until(
-        Duration::from_secs(120),
-        wait::POLL,
-        || async move {
-            format!(
-                "shared proxy Deployment to settle at {replicas} ready replica(s); \
-                 current: {:?}",
-                deployment_counts().await
-            )
-        },
-        || async move {
-            let (total, ready) = deployment_counts().await?;
-            (total == replicas && ready == replicas).then_some(())
-        },
-    )
-    .await
+    coxswain_e2e::harness::set_shared_proxy_replicas(replicas).await
 }
 
 /// `kubectl rollout restart` the shared proxy — the churn source for the #531
 /// anti-flap test: the replacement pod connects with an empty bound set while
-/// the old one drains.
+/// the old one drains. The replica count is unchanged, so the controller does
+/// not fight it.
 pub async fn rollout_restart_shared_proxy() -> anyhow::Result<()> {
     let status = Command::new("kubectl")
         .args([
@@ -129,26 +99,4 @@ pub async fn shared_proxy_settled(replicas: u32) -> anyhow::Result<bool> {
     Ok(deployment_counts()
         .await
         .is_some_and(|(total, ready)| total == replicas && ready == replicas))
-}
-
-/// Panic-safe restoration of the single-replica shared proxy.
-///
-/// Construct before scaling down; drop runs a *synchronous* `kubectl scale
-/// --replicas=1` so the fixture is restored even when the test body panics
-/// mid-assertion. Tests should still scale back up explicitly and assert the
-/// recovery — the guard is the backstop, not the assertion.
-pub struct SharedProxyScaleGuard;
-
-impl Drop for SharedProxyScaleGuard {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("kubectl")
-            .args([
-                "scale",
-                &format!("deployment/{DEPLOYMENT}"),
-                "-n",
-                NAMESPACE,
-                "--replicas=1",
-            ])
-            .status();
-    }
 }

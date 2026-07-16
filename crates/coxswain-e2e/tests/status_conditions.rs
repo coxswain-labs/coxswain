@@ -2922,7 +2922,7 @@ async fn shared_gateway_generation_trails_programmed_until_pool_binds() -> anyho
 #[tokio::test]
 async fn shared_gateway_with_no_connected_proxies_holds_programmed_pending_until_pool_returns()
 -> anyhow::Result<()> {
-    use common::shared_proxy::{SharedProxyScaleGuard, scale_shared_proxy};
+    use common::shared_proxy::scale_shared_proxy;
 
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "sc-gw-pool-empty-holds").await?;
@@ -2930,8 +2930,10 @@ async fn shared_gateway_with_no_connected_proxies_holds_programmed_pending_until
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
-    // Panic-safe restore; the explicit scale-up below is the real assertion.
-    let _restore = SharedProxyScaleGuard;
+    // Drain the controller-owned pool to zero via config (a direct kubectl scale
+    // is reverted). The explicit scale-up below is the real assertion; a panic in
+    // between leaves proxy.shared.replicas=0, which the next default-options test's
+    // ensure_default_release restores.
     scale_shared_proxy(0).await?;
 
     fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;

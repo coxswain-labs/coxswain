@@ -137,6 +137,9 @@ impl ControllerProcess {
             gateway_api_enabled: opts.gateway_api_enabled,
             ingress_enabled: opts.ingress_enabled,
             shared_proxy_enabled: opts.shared_proxy_enabled,
+            // Pool replica count is driven through `set_shared_proxy_replicas`, not
+            // ControllerOptions (it needs no port-forwards, so it handles 0).
+            shared_proxy_replicas: None,
             relay_dedicated_enabled: opts.relay_dedicated_enabled,
             relay_min_proxy_replicas: opts.relay_min_proxy_replicas,
             watch_namespace: opts.watch_namespace,
