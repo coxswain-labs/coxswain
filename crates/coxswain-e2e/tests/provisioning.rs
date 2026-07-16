@@ -21,8 +21,9 @@
 //! read-only-proxy ServiceAccount audit live in `discovery.rs`. Shared dedicated
 //! helpers live in `common::dedicated`.
 
+use anyhow::Context as _;
 use coxswain_e2e::{
-    ControllerOptions, FixtureVars, Harness, NamespaceGuard,
+    ControllerOptions, ControllerProcess, FixtureVars, Harness, NamespaceGuard, bootstrap,
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress as ing},
     harness::{HttpClient, leader, wait},
 };
@@ -1737,6 +1738,180 @@ async fn params_autoscaling_disabled_provisions_no_hpa() -> anyhow::Result<()> {
         pdb_result.is_err(),
         "PDB must not exist when replica floor < 2; got: {pdb_result:?}"
     );
+
+    Ok(())
+}
+
+// ── Controller-owned shared proxy pool (#604) ──────────────────────────────
+
+/// Fixed name of the controller-owned shared proxy pool objects in the e2e
+/// install (release `coxswain` → `coxswain.sharedProxy.fullname`).
+const SHARED_PROXY_NAME: &str = "coxswain-shared-proxy";
+
+/// #604 happy/bootstrap: the shared proxy pool is provisioned BY THE CONTROLLER
+/// at install with zero Gateways. Assert it is controller-owned (SSA field
+/// manager, not Helm), carries the selector bridge and the `serve proxy --shared`
+/// invocation with no static discovery endpoint (bootstrap-delivered upstream,
+/// #601), and serves Ingress traffic end-to-end through the retained LB Service.
+#[tokio::test]
+async fn shared_proxy_pool_provisioned_at_install_without_gateways() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+
+    // The pool exists at base install — this test creates no Gateway.
+    let deploys: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    let deploy = deploys.get(SHARED_PROXY_NAME).await.context(
+        "the controller-owned shared proxy Deployment must exist at install with zero Gateways",
+    )?;
+
+    // Controller-owned, not Helm-owned — the crux of the ownership move.
+    let managers: Vec<String> = deploy
+        .metadata
+        .managed_fields
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|f| f.manager.clone())
+        .collect();
+    assert!(
+        managers.iter().any(|m| m == "coxswain-controller"),
+        "shared proxy Deployment must carry the coxswain-controller field manager; managers={managers:?}"
+    );
+    assert!(
+        !managers.iter().any(|m| m == "Helm"),
+        "ownership moved off Helm (#604): no Helm field manager expected; managers={managers:?}"
+    );
+
+    let spec = deploy.spec.as_ref().context("deployment spec")?;
+
+    // Selector bridge: the Deployment selects the shared-proxy component label the
+    // retained LB Service (and per-Gateway VIP Services) also select on.
+    let selector = spec
+        .selector
+        .match_labels
+        .as_ref()
+        .context("selector match_labels")?;
+    assert_eq!(
+        selector
+            .get("app.kubernetes.io/component")
+            .map(String::as_str),
+        Some("shared-proxy"),
+        "selector must bridge to the shared-proxy component; selector={selector:?}"
+    );
+
+    let pod_spec = spec.template.spec.as_ref().context("pod spec")?;
+    let args = pod_spec.containers[0]
+        .args
+        .clone()
+        .context("container args")?;
+    assert!(
+        args.iter().any(|a| a == "--shared") && args.iter().any(|a| a == "proxy"),
+        "the pool runs `serve proxy --shared`: {args:?}"
+    );
+    assert!(
+        args.iter()
+            .any(|a| a.starts_with("--discovery-bootstrap-endpoint=")),
+        "the pool bootstraps its SVID + upstream: {args:?}"
+    );
+    assert!(
+        !args.iter().any(|a| a.starts_with("--discovery-endpoint")),
+        "no static --discovery-endpoint — the routing upstream is bootstrap-delivered (#601): {args:?}"
+    );
+    assert_eq!(
+        pod_spec.automount_service_account_token,
+        Some(false),
+        "the pool pod must disable the default token automount (zero-verb identity)"
+    );
+
+    // Routing smoke: drive Ingress traffic through the controller-owned pool.
+    let ns = NamespaceGuard::create(&h.client, "sp-pool-smoke").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ing::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    let host = format!("ingress.{}.local", ns.name);
+    wait::wait_for_backend(&h.http, &host, "/a", "echo-a", Duration::from_secs(60)).await?;
+    let resp = h.http.get(&host, "/a").await?;
+    resp.assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// #604 idempotency (serial mutator): a second `helm upgrade` must not fight the
+/// controller for ownership of the pool. Because the pool objects left the chart,
+/// Helm never manages them — assert no `Helm` field manager appears and the pool
+/// spec does not churn (generation stable) across an upgrade.
+#[tokio::test]
+async fn shared_proxy_pool_survives_helm_upgrade_without_field_manager_fight() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let deploys: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    let generation_before = deploys.get(SHARED_PROXY_NAME).await?.metadata.generation;
+    drop(h);
+
+    // Force a `helm upgrade` with a benign, default-valued override so the pool
+    // spec is unchanged — any generation bump or Helm manager would signal a fight.
+    let h = Harness::start_with_options(ControllerOptions {
+        access_log: Some(true),
+        ..Default::default()
+    })
+    .await?;
+    let deploys: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    let after = deploys.get(SHARED_PROXY_NAME).await?;
+
+    let managers: Vec<String> = after
+        .metadata
+        .managed_fields
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|f| f.manager.clone())
+        .collect();
+    assert!(
+        managers.iter().any(|m| m == "coxswain-controller"),
+        "pool must remain controller-owned after a helm upgrade; managers={managers:?}"
+    );
+    assert!(
+        !managers.iter().any(|m| m == "Helm"),
+        "helm upgrade must not reclaim the controller-owned pool (no field-manager fight); managers={managers:?}"
+    );
+    assert_eq!(
+        after.metadata.generation, generation_before,
+        "an idempotent helm upgrade must not churn the pool spec (generation stable)"
+    );
+
+    Ok(())
+}
+
+/// #604 sad path (serial mutator): with `proxy.shared.enabled=false` the
+/// controller reclaims a previously-provisioned pool rather than orphaning it —
+/// the Deployment and the chart's Ingress LB Service both vanish.
+#[tokio::test]
+async fn shared_proxy_pool_absent_when_disabled() -> anyhow::Result<()> {
+    bootstrap().await?;
+    let client = kube::Client::try_default().await?;
+
+    // Disabling rolls the controller; its install reconcile then deletes the pool.
+    let _controller = ControllerProcess::start_with_options(ControllerOptions {
+        shared_proxy_enabled: Some(false),
+        ..Default::default()
+    })
+    .await?;
+
+    let deploys: Api<Deployment> = Api::namespaced(client.clone(), leader::SYSTEM_NAMESPACE);
+    let svcs: Api<Service> = Api::namespaced(client.clone(), leader::SYSTEM_NAMESPACE);
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            "the disabled shared proxy pool Deployment and its LB Service to be reclaimed"
+                .to_string()
+        },
+        || async {
+            let deploy_gone = deploys.get(SHARED_PROXY_NAME).await.is_err();
+            let lb_gone = svcs.get(SHARED_PROXY_NAME).await.is_err();
+            (deploy_gone && lb_gone).then_some(())
+        },
+    )
+    .await?;
 
     Ok(())
 }

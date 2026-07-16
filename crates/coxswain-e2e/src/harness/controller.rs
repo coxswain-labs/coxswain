@@ -53,6 +53,10 @@ pub struct ControllerOptions {
     /// Sets `controller.ingress.enabled`. `None` leaves the chart default
     /// (`true`). Use `Some(false)` to test Gateway-API-only installs.
     pub ingress_enabled: Option<bool>,
+    /// Sets `proxy.shared.enabled` (#604). `None` leaves the chart default
+    /// (`true`). Use `Some(false)` to assert the controller provisions no shared
+    /// proxy pool when disabled.
+    pub shared_proxy_enabled: Option<bool>,
     /// Sets `relay.dedicated.enabled` (#584) — enables controller-provisioned
     /// namespace relays. `false` leaves the chart default (off).
     pub relay_dedicated_enabled: bool,
@@ -96,8 +100,10 @@ pub struct ControllerProcess {
     /// routing table — served from the controller's own local snapshot, not
     /// a fan-out to the pod.
     pub controller_admin_addr: SocketAddr,
-    health_pf: Child,
-    admin_pf: Child,
+    // `None` when the shared proxy pool is disabled (`proxy.shared.enabled=false`,
+    // #604): its internal Service does not exist, so there is nothing to forward.
+    health_pf: Option<Child>,
+    admin_pf: Option<Child>,
     controller_admin_pf: Child,
 }
 
@@ -130,6 +136,7 @@ impl ControllerProcess {
             discovery_svid_ttl: opts.discovery_svid_ttl,
             gateway_api_enabled: opts.gateway_api_enabled,
             ingress_enabled: opts.ingress_enabled,
+            shared_proxy_enabled: opts.shared_proxy_enabled,
             relay_dedicated_enabled: opts.relay_dedicated_enabled,
             relay_min_proxy_replicas: opts.relay_min_proxy_replicas,
             watch_namespace: opts.watch_namespace,
@@ -155,7 +162,11 @@ impl ControllerProcess {
         // internal ClusterIP service used for health/admin port-forwards is always
         // present. Use the unspecified address as a sentinel; tests that disable ingress
         // must not send traffic through proxy_addr / tls_addr.
-        let lb_ip = if overrides.ingress_enabled == Some(false) {
+        // The external LB Service (and the internal one) only exist when the
+        // shared pool is enabled AND ingress is enabled; skip the LB-IP wait and
+        // the shared-proxy port-forwards otherwise (they would hang / fail).
+        let shared_proxy_absent = overrides.shared_proxy_enabled == Some(false);
+        let lb_ip = if overrides.ingress_enabled == Some(false) || shared_proxy_absent {
             IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
         } else {
             wait_for_lb_ip(SHARED_PROXY_SVC, COXSWAIN_NAMESPACE)
@@ -168,20 +179,25 @@ impl ControllerProcess {
 
         let controller_admin_port = free_port()?;
 
-        let health_pf = start_port_forward(
-            &format!("svc/{SHARED_PROXY_INTERNAL_SVC}"),
-            health_port,
-            8081,
-            COXSWAIN_NAMESPACE,
-        )
-        .await?;
-        let admin_pf = start_port_forward(
-            &format!("svc/{SHARED_PROXY_INTERNAL_SVC}"),
-            admin_port,
-            8082,
-            COXSWAIN_NAMESPACE,
-        )
-        .await?;
+        let (health_pf, admin_pf) = if shared_proxy_absent {
+            (None, None)
+        } else {
+            let health_pf = start_port_forward(
+                &format!("svc/{SHARED_PROXY_INTERNAL_SVC}"),
+                health_port,
+                8081,
+                COXSWAIN_NAMESPACE,
+            )
+            .await?;
+            let admin_pf = start_port_forward(
+                &format!("svc/{SHARED_PROXY_INTERNAL_SVC}"),
+                admin_port,
+                8082,
+                COXSWAIN_NAMESPACE,
+            )
+            .await?;
+            (Some(health_pf), Some(admin_pf))
+        };
         let controller_admin_pf = start_port_forward(
             &format!("svc/{CONTROLLER_SVC}"),
             controller_admin_port,
@@ -269,8 +285,12 @@ impl ControllerProcess {
 
 impl Drop for ControllerProcess {
     fn drop(&mut self) {
-        let _ = self.health_pf.start_kill();
-        let _ = self.admin_pf.start_kill();
+        if let Some(pf) = &mut self.health_pf {
+            let _ = pf.start_kill();
+        }
+        if let Some(pf) = &mut self.admin_pf {
+            let _ = pf.start_kill();
+        }
         let _ = self.controller_admin_pf.start_kill();
     }
 }

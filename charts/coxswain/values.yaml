@@ -324,9 +324,26 @@ relay:
 proxy:
   # Shared-pool proxy (serves Ingress + non-dedicated Gateway traffic).
   shared:
-    # Render the shared-proxy Deployment + Services + PDB. Set to false
-    # for a strict-multi-tenant install where every Gateway runs a dedicated
-    # proxy provisioned by the controller.
+    # The shared proxy pool is provisioned by the controller, not by Helm (#604):
+    # these `proxy.shared.*` values are remapped to COXSWAIN_SHARED_PROXY_* env on
+    # the controller Deployment, and the controller renders the pool's
+    # Deployment/ServiceAccount/HPA/PDB/internal-Service. The chart keeps only the
+    # Ingress LoadBalancer Service (shared-proxy-service.yaml), which selects the
+    # pods the controller stamps.
+    #
+    # Scheduling + pod-metadata knobs (podLabels, podAnnotations, nodeSelector,
+    # tolerations, affinity, topologySpreadConstraints, priorityClassName) and
+    # image.pullSecrets are strategic-merged onto the controller-owned pool via a
+    # podTemplate overlay the chart builds and hands the controller. The pool is
+    # hardened by the controller with a fixed securityContext (runAsNonRoot +
+    # RuntimeDefault seccomp, read-only rootfs, drop ALL caps, NET_BIND_SERVICE only
+    # when binding a privileged Ingress port), so the top-level
+    # podSecurityContext/containerSecurityContext values do not apply. The
+    # serviceAccount and bindAddress knobs are also inert (the pool's SA is
+    # controller-managed; bindAddress stays the 0.0.0.0 default).
+
+    # Provision the controller-owned shared proxy pool. Set to false for a
+    # strict-multi-tenant install where every Gateway runs a dedicated proxy.
     enabled: true
 
     # Service type for the per-Gateway VIP Services the controller provisions

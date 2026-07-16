@@ -158,16 +158,93 @@ spec:
             - name: COXSWAIN_IMAGE
               value: {{ .Values.controller.coxswainImage | quote }}
             {{- end }}
+            # Shared proxy pool (#604): the controller — not Helm — owns the pool
+            # Deployment/SA/HPA/PDB/internal-Service. `proxy.shared.*` values are
+            # remapped to COXSWAIN_SHARED_PROXY_* env here; the controller renders
+            # them onto the pod. The retained Ingress LB Service and the per-Gateway
+            # VIP Services (#472) select the labels the controller stamps.
+            # ENABLED + NAME are set even when the pool is disabled so the
+            # controller can reclaim a previously-provisioned pool by name.
+            - name: COXSWAIN_SHARED_PROXY_ENABLED
+              value: {{ .Values.proxy.shared.enabled | quote }}
+            - name: COXSWAIN_SHARED_PROXY_NAME
+              value: {{ include "coxswain.sharedProxy.fullname" . | quote }}
             {{- if .Values.proxy.shared.enabled }}
-            # Shared-mode per-Gateway addressing (#472): the controller provisions
-            # one VIP Service per owned shared Gateway, selecting the shared proxy
-            # pod. The selector must match the shared-proxy Deployment's labels;
-            # the chart supplies it here because the controller cannot derive the
-            # release name (app.kubernetes.io/instance) itself.
             - name: COXSWAIN_SHARED_PROXY_SELECTOR
               value: {{ printf "app.kubernetes.io/name=%s,app.kubernetes.io/instance=%s,app.kubernetes.io/component=shared-proxy" (include "coxswain.name" .) .Release.Name | quote }}
             - name: COXSWAIN_SHARED_VIP_SERVICE_TYPE
               value: {{ .Values.proxy.shared.vipServiceType | quote }}
+            - name: COXSWAIN_SHARED_PROXY_REPLICAS
+              value: {{ .Values.proxy.shared.replicas | quote }}
+            - name: COXSWAIN_SHARED_PROXY_CPU_REQUEST
+              value: {{ .Values.proxy.shared.resources.requests.cpu | quote }}
+            - name: COXSWAIN_SHARED_PROXY_MEMORY_REQUEST
+              value: {{ .Values.proxy.shared.resources.requests.memory | quote }}
+            - name: COXSWAIN_SHARED_PROXY_CPU_LIMIT
+              value: {{ .Values.proxy.shared.resources.limits.cpu | quote }}
+            - name: COXSWAIN_SHARED_PROXY_MEMORY_LIMIT
+              value: {{ .Values.proxy.shared.resources.limits.memory | quote }}
+            - name: COXSWAIN_SHARED_PROXY_AUTOSCALING_ENABLED
+              value: {{ .Values.proxy.shared.autoscaling.enabled | quote }}
+            - name: COXSWAIN_SHARED_PROXY_AUTOSCALING_MIN_REPLICAS
+              value: {{ .Values.proxy.shared.autoscaling.minReplicas | quote }}
+            - name: COXSWAIN_SHARED_PROXY_AUTOSCALING_MAX_REPLICAS
+              value: {{ .Values.proxy.shared.autoscaling.maxReplicas | quote }}
+            - name: COXSWAIN_SHARED_PROXY_AUTOSCALING_TARGET_CPU
+              value: {{ .Values.proxy.shared.autoscaling.targetCPUUtilizationPercentage | quote }}
+            - name: COXSWAIN_SHARED_PROXY_THREADS
+              value: {{ .Values.proxy.shared.threads | quote }}
+            - name: COXSWAIN_SHARED_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE
+              value: {{ .Values.proxy.shared.upstreamKeepalivePoolSize | quote }}
+            - name: COXSWAIN_SHARED_PROXY_SHUTDOWN_GRACE_PERIOD
+              value: {{ .Values.proxy.shared.shutdownGracePeriod | quote }}
+            - name: COXSWAIN_SHARED_PROXY_SHUTDOWN_TIMEOUT
+              value: {{ .Values.proxy.shared.shutdownTimeout | quote }}
+            - name: COXSWAIN_SHARED_PROXY_LISTENER_DRAIN_TIMEOUT
+              value: {{ .Values.proxy.shared.listenerDrainTimeout | quote }}
+            - name: COXSWAIN_SHARED_PROXY_ACCEPT_PROXY_PROTOCOL
+              value: {{ .Values.proxy.shared.acceptProxyProtocol | quote }}
+            {{- with .Values.proxy.shared.trustedSources }}
+            - name: COXSWAIN_SHARED_PROXY_TRUSTED_SOURCES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- with .Values.proxy.shared.defaultRequestTimeout }}
+            - name: COXSWAIN_SHARED_PROXY_DEFAULT_REQUEST_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.proxy.shared.defaultBackendRequestTimeout }}
+            - name: COXSWAIN_SHARED_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.proxy.shared.ingressDefaultBackend }}
+            - name: COXSWAIN_SHARED_PROXY_INGRESS_DEFAULT_BACKEND
+              value: {{ . | quote }}
+            {{- end }}
+            - name: COXSWAIN_SHARED_PROXY_ACCESS_LOG
+              value: {{ .Values.proxy.shared.accessLog | quote }}
+            - name: COXSWAIN_SHARED_PROXY_ACCESS_LOG_PATH_MODE
+              value: {{ .Values.proxy.shared.accessLogPathMode | quote }}
+            {{- /* Pod-template overlay (#604): scheduling + pod metadata + pull
+                   secrets the controller strategic-merges onto the pool pod.
+                   Built from proxy.shared.* + image.pullSecrets; emitted only when
+                   at least one is set. */}}
+            {{- $spec := dict }}
+            {{- with .Values.proxy.shared.nodeSelector }}{{- $_ := set $spec "nodeSelector" . }}{{- end }}
+            {{- with .Values.proxy.shared.tolerations }}{{- $_ := set $spec "tolerations" . }}{{- end }}
+            {{- with .Values.proxy.shared.affinity }}{{- $_ := set $spec "affinity" . }}{{- end }}
+            {{- with .Values.proxy.shared.topologySpreadConstraints }}{{- $_ := set $spec "topologySpreadConstraints" . }}{{- end }}
+            {{- with .Values.proxy.shared.priorityClassName }}{{- $_ := set $spec "priorityClassName" . }}{{- end }}
+            {{- with .Values.image.pullSecrets }}{{- $_ := set $spec "imagePullSecrets" . }}{{- end }}
+            {{- $meta := dict }}
+            {{- with .Values.proxy.shared.podLabels }}{{- $_ := set $meta "labels" . }}{{- end }}
+            {{- with .Values.proxy.shared.podAnnotations }}{{- $_ := set $meta "annotations" . }}{{- end }}
+            {{- $tmpl := dict }}
+            {{- if $spec }}{{- $_ := set $tmpl "spec" $spec }}{{- end }}
+            {{- if $meta }}{{- $_ := set $tmpl "metadata" $meta }}{{- end }}
+            {{- if $tmpl }}
+            - name: COXSWAIN_SHARED_PROXY_POD_TEMPLATE
+              value: {{ $tmpl | toJson | quote }}
+            {{- end }}
             {{- end }}
             # Discovery control-plane / CA (#423). COXSWAIN_DISCOVERY_PORT is set
             # above with the other bound ports.

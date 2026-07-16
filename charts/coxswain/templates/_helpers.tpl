@@ -126,17 +126,6 @@ Controller ServiceAccount name.
 {{- end }}
 
 {{/*
-Shared-proxy ServiceAccount name.
-*/}}
-{{- define "coxswain.sharedProxy.serviceAccountName" -}}
-{{- if .Values.proxy.shared.serviceAccount.create }}
-{{- default (include "coxswain.sharedProxy.fullname" .) .Values.proxy.shared.serviceAccount.name }}
-{{- else }}
-{{- default "default" .Values.proxy.shared.serviceAccount.name }}
-{{- end }}
-{{- end }}
-
-{{/*
 Shared-pool relay pod fullname: "<release>-coxswain-relay-shared" (#584).
 Release-prefixed (unlike the controller discovery Service) because only the
 chart-rendered shared proxy dials it, and both are templated from these helpers

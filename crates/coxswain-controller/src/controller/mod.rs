@@ -17,7 +17,7 @@
 
 use crate::operator::{
     OperatorConfig, ReconcileContext as OperatorReconcileContext, reconcile_dedicated,
-    run_vip_reconciler,
+    run_shared_install_reconciler, run_vip_reconciler,
 };
 use async_trait::async_trait;
 use coxswain_core::Shared;
@@ -448,6 +448,10 @@ impl Controller {
         });
         if let Some(op_ctx) = &operator_ctx {
             tasks.spawn(run_vip_reconciler(Arc::clone(op_ctx), shutdown.clone()));
+            tasks.spawn(run_shared_install_reconciler(
+                Arc::clone(op_ctx),
+                shutdown.clone(),
+            ));
         }
 
         // Relay-tracking rehydration (#593): rebuild the operator's provisioned-relay

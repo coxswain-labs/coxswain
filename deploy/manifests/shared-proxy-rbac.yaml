@@ -1,9 +1,0 @@
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: coxswain-shared-proxy
-  namespace: coxswain-system
-  labels:
-    app.kubernetes.io/name: coxswain
-    app.kubernetes.io/component: shared-proxy
-automountServiceAccountToken: false

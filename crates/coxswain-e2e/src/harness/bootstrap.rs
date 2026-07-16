@@ -251,6 +251,10 @@ pub(crate) struct HelmOverrides {
     /// Passed as `controller.ingress.enabled`. `None` leaves the chart
     /// default (`true`). Use `Some(false)` to test Gateway-API-only installs.
     pub ingress_enabled: Option<bool>,
+    /// Passed as `proxy.shared.enabled` (#604). `None` leaves the chart default
+    /// (`true`). Use `Some(false)` to test that the controller provisions no
+    /// shared proxy pool when disabled.
+    pub shared_proxy_enabled: Option<bool>,
     /// Passed as `relay.dedicated.enabled` (#584): enables controller-provisioned
     /// namespace relays. `false` leaves the chart default (off).
     pub relay_dedicated_enabled: bool,
@@ -400,6 +404,10 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         args.push("--set".into());
         args.push(format!("controller.ingress.enabled={enabled}"));
     }
+    if let Some(enabled) = overrides.shared_proxy_enabled {
+        args.push("--set".into());
+        args.push(format!("proxy.shared.enabled={enabled}"));
+    }
     if overrides.relay_dedicated_enabled {
         args.push("--set".into());
         args.push("relay.dedicated.enabled=true".into());
@@ -408,6 +416,14 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         args.push("--set".into());
         args.push(format!("relay.dedicated.minProxyReplicas={min}"));
     }
+
+    // The shared proxy pool is now controller-provisioned (#604). Capture its
+    // Deployment generation BEFORE the upgrade: a config-changing helm upgrade
+    // makes the controller re-render + roll the pool, which advances the
+    // generation. `wait_for_shared_proxy_ready` blocks until that new revision has
+    // fully rolled out — restoring the convergence guarantee `helm --wait` gave
+    // when the pool was chart-owned.
+    let pool_generation_before = read_shared_proxy_generation().await;
 
     let status = Command::new("helm")
         .args(&args)
@@ -427,7 +443,115 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
     wait_for_leader_ready()
         .await
         .context("controller leader handover")?;
+
+    // The shared proxy pool is controller-provisioned (#604), not Helm-installed,
+    // so `helm --wait` no longer covers it: the controller renders and applies it
+    // only after winning leadership. Block until it is Ready so callers (and the
+    // health/admin port-forwards) can assume the data plane exists. Skipped when
+    // the pool is disabled — there is nothing to wait for.
+    if overrides.shared_proxy_enabled != Some(false) {
+        wait_for_shared_proxy_ready(pool_generation_before)
+            .await
+            .context("controller-provisioned shared proxy pool")?;
+    }
     Ok(())
+}
+
+/// Read the shared proxy pool Deployment's `metadata.generation`, or `0` when the
+/// pool does not exist yet (fresh install). The generation advances whenever the
+/// controller re-renders the pool with a changed spec, so a caller can tell a
+/// pool-config-changing upgrade (generation advances) from an unrelated one.
+async fn read_shared_proxy_generation() -> i64 {
+    let out = Command::new("kubectl")
+        .args([
+            "get",
+            "deploy",
+            "-n",
+            COXSWAIN_NAMESPACE,
+            "-l",
+            "app.kubernetes.io/component=shared-proxy",
+            "-o",
+            "jsonpath={.items[0].metadata.generation}",
+        ])
+        .output()
+        .await;
+    out.ok()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .trim()
+                .parse()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+/// Block until the controller-provisioned shared proxy pool has converged after a
+/// `helm upgrade` (#604). Because the pool is controller-owned — not chart-owned —
+/// `helm --wait` no longer tracks its rollout, so this restores that guarantee.
+///
+/// A config-changing upgrade advances the Deployment's generation (the controller
+/// re-renders it); this returns once that new revision is **fully rolled out**
+/// (`observedGeneration == generation`, no surplus old pods, every replica updated
+/// and ready). An upgrade that does not touch the pool leaves the generation
+/// unchanged and no rollout happens — so once the pool is settled and a short
+/// grace window has elapsed (long enough for the controller's post-leadership
+/// re-apply to fire), the unchanged-but-ready pool is accepted.
+///
+/// # Errors
+///
+/// Returns an error if the pool has not converged within 120 s.
+async fn wait_for_shared_proxy_ready(generation_before: i64) -> anyhow::Result<()> {
+    let start = tokio::time::Instant::now();
+    // Longer than the controller's post-leadership re-apply latency (its ≤15 s
+    // install-reconcile tick + rollout), so a real config change advances the
+    // generation and takes the `gen > before` path *before* this fires; the grace
+    // path only catches an upgrade that left the pool spec unchanged.
+    let grace = std::time::Duration::from_secs(30);
+    let deadline = start + std::time::Duration::from_secs(150);
+    loop {
+        let out = Command::new("kubectl")
+            .args([
+                "get",
+                "deploy",
+                "-n",
+                COXSWAIN_NAMESPACE,
+                "-l",
+                "app.kubernetes.io/component=shared-proxy",
+                "-o",
+                "jsonpath={.items[0].metadata.generation}/{.items[0].status.observedGeneration}/{.items[0].spec.replicas}/{.items[0].status.replicas}/{.items[0].status.updatedReplicas}/{.items[0].status.readyReplicas}",
+            ])
+            .output()
+            .await
+            .context("kubectl get shared-proxy deploy")?;
+        let status = String::from_utf8_lossy(&out.stdout);
+        let f: Vec<i64> = status
+            .split('/')
+            .map(|s| s.trim().parse().unwrap_or(0))
+            .collect();
+        // Absent pool renders an empty jsonpath → fewer than 6 fields; default to 0
+        // so `desired == 0` keeps the loop waiting rather than panicking on index.
+        let g = |i: usize| f.get(i).copied().unwrap_or(0);
+        let (generation, obs, desired, total, updated, ready) =
+            (g(0), g(1), g(2), g(3), g(4), g(5));
+        // Fully rolled out: current spec observed, no surplus old pods, all
+        // replicas updated to the new revision and Ready.
+        let settled = desired > 0
+            && obs == generation
+            && total == desired
+            && updated == desired
+            && ready == desired;
+        // The controller re-applied a changed pool spec (generation advanced) and it
+        // rolled out — or the upgrade didn't touch the pool and the grace elapsed.
+        if settled && (generation > generation_before || start.elapsed() >= grace) {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "shared proxy pool did not converge: gen={generation} (before={generation_before}) obs={obs} desired={desired} total={total} updated={updated} ready={ready} (the controller provisions it after winning leadership — check the controller log for apply errors)"
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 /// Helm-values paths only a non-default [`HelmOverrides`] can set. Returns the
@@ -450,6 +574,7 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
         discovery_svid_ttl: _,
         gateway_api_enabled: _,
         ingress_enabled: _,
+        shared_proxy_enabled: _,
         relay_dedicated_enabled: _,
         relay_min_proxy_replicas: _,
         watch_namespace: _,
@@ -505,6 +630,10 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
     check(
         &["controller", "ingress", "enabled"],
         get(&["controller", "ingress", "enabled"]).is_some(),
+    );
+    check(
+        &["proxy", "shared", "enabled"],
+        get(&["proxy", "shared", "enabled"]).is_some(),
     );
     check(
         &["relay", "dedicated", "enabled"],

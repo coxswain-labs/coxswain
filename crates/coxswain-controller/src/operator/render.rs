@@ -71,8 +71,9 @@ use k8s_openapi::api::autoscaling::v2::{
     MetricTarget, ResourceMetricSource,
 };
 use k8s_openapi::api::core::v1::{
-    ConfigMapVolumeSource, Container, ContainerPort, EnvVar, EnvVarSource, ObjectFieldSelector,
-    PodSpec, PodTemplateSpec, ProjectedVolumeSource, Service, ServiceAccount,
+    Capabilities, ConfigMapVolumeSource, Container, ContainerPort, EnvVar, EnvVarSource,
+    HTTPGetAction, ObjectFieldSelector, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
+    ProjectedVolumeSource, SeccompProfile, SecurityContext, Service, ServiceAccount,
     ServiceAccountTokenProjection, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeProjection,
 };
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
@@ -618,6 +619,9 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         ports: Some(container_ports(inputs.gateway, inputs.effective_ports)),
         env: Some(pod_identity_env()),
         resources: inputs.params.resources.clone(),
+        security_context: Some(container_hardening_security_context(
+            effective_ports_need_net_bind(inputs.effective_ports),
+        )),
         volume_mounts: Some(discovery_volume_mounts()),
         ..Default::default()
     };
@@ -634,6 +638,7 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         }),
         spec: Some(PodSpec {
             service_account_name: Some(common.name.to_string()),
+            security_context: Some(pod_hardening_security_context()),
             containers: vec![coxswain_container],
             volumes: Some(discovery_volumes()),
             ..Default::default()
@@ -789,6 +794,59 @@ fn container_ports(
         }
     }
     out
+}
+
+/// Pod-level hardening shared by every controller-provisioned pod (dedicated
+/// proxy, shared pool, namespace relay): run as non-root under the default
+/// seccomp profile. Keeps the pod admissible on a namespace enforcing the
+/// `restricted` Pod Security Standard. The `distroless/cc:nonroot` runtime image
+/// already runs as a non-root UID, so `runAsNonRoot` needs no explicit `runAsUser`.
+pub(super) fn pod_hardening_security_context() -> PodSecurityContext {
+    PodSecurityContext {
+        run_as_non_root: Some(true),
+        seccomp_profile: Some(SeccompProfile {
+            type_: "RuntimeDefault".to_string(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Container-level hardening shared by every controller-provisioned pod: forbid
+/// privilege escalation, drop every capability, and run on a read-only root
+/// filesystem (all three roles bootstrap from projected volumes and write nothing
+/// to `/`). `NET_BIND_SERVICE` is added back only when `needs_net_bind` — i.e. the
+/// pod binds a privileged (`<1024`) listener port as non-root.
+pub(super) fn container_hardening_security_context(needs_net_bind: bool) -> SecurityContext {
+    SecurityContext {
+        allow_privilege_escalation: Some(false),
+        read_only_root_filesystem: Some(true),
+        capabilities: Some(Capabilities {
+            drop: Some(vec!["ALL".to_string()]),
+            add: needs_net_bind.then(|| vec!["NET_BIND_SERVICE".to_string()]),
+        }),
+        ..Default::default()
+    }
+}
+
+/// An HTTP-GET readiness/liveness probe against `path` on the management `port`.
+/// Shared by the shared pool and namespace relay, both of which gate their
+/// Service endpoints on the data/discovery plane actually serving.
+pub(super) fn http_get_probe(path: &str, port: i32) -> Probe {
+    Probe {
+        http_get: Some(HTTPGetAction {
+            path: Some(path.to_string()),
+            port: IntOrString::Int(port),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Whether any effective Gateway listener port is privileged (`<1024`) and so
+/// requires `NET_BIND_SERVICE` for a non-root proxy to bind it.
+pub(super) fn effective_ports_need_net_bind(effective_ports: &[EffectiveListenerPort]) -> bool {
+    effective_ports.iter().any(|p| p.port < 1024)
 }
 
 /// Apply a partial `PodTemplateSpec` overlay to a base via the strategic
@@ -1207,6 +1265,73 @@ mod tests {
             .collect();
         assert!(mount_names.contains(&"discovery-token"));
         assert!(mount_names.contains(&"trust-bundle"));
+    }
+
+    #[test]
+    fn dedicated_pod_is_hardened_with_net_bind_only_for_privileged_ports() {
+        let gw = make_gateway("tenant-a", "gw", vec![("https", 443, "HTTPS")]);
+        let params = EffectiveParams::default();
+        let mk = |ports: &[EffectiveListenerPort]| {
+            render(&RenderInputs {
+                gateway: &gw,
+                params: &params,
+                controller_image: "coxswain:v0.2",
+                gateway_class_name: "coxswain",
+                discovery_bootstrap_endpoint: "http://x:50052",
+                discovery_sa_token_path: "/t",
+                discovery_ca_bundle_path: "/c",
+                discovery_trust_domain: "cluster.local",
+                admin_port: 8082,
+                effective_ports: ports,
+            })
+            .deployment
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+        };
+
+        // Privileged listener (443) → non-root pod needs NET_BIND_SERVICE.
+        let priv_pod = mk(&[EffectiveListenerPort {
+            name: "https".to_string(),
+            port: 443,
+            protocol: "HTTPS".to_string(),
+        }]);
+        assert_eq!(
+            priv_pod.security_context.and_then(|s| s.run_as_non_root),
+            Some(true),
+            "dedicated pod must run as non-root (restricted-PSA admissible)"
+        );
+        let sc = priv_pod.containers[0]
+            .security_context
+            .as_ref()
+            .expect("container security context");
+        assert_eq!(sc.read_only_root_filesystem, Some(true));
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().add.as_deref(),
+            Some(&["NET_BIND_SERVICE".to_string()][..]),
+            "a non-root proxy needs NET_BIND_SERVICE to bind :443"
+        );
+
+        // Unprivileged listener (8080) → no NET_BIND_SERVICE.
+        let hi_pod = mk(&[EffectiveListenerPort {
+            name: "http".to_string(),
+            port: 8080,
+            protocol: "HTTP".to_string(),
+        }]);
+        assert!(
+            hi_pod.containers[0]
+                .security_context
+                .as_ref()
+                .unwrap()
+                .capabilities
+                .as_ref()
+                .unwrap()
+                .add
+                .is_none(),
+            "no NET_BIND_SERVICE when all listeners bind unprivileged ports"
+        );
     }
 
     /// One Service port per listener.

@@ -95,6 +95,7 @@ helm install coxswain charts/coxswain \
   --set image.repository=coxswain \
   --set image.tag=e2e \
   --set image.pullPolicy=IfNotPresent \
+  --set controller.coxswainImage=coxswain:e2e \
   --set "proxy.shared.vipServiceType=$VIP_SERVICE_TYPE" \
   --set controller.ingress.enabled=false
 

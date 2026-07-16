@@ -13,7 +13,9 @@ A `Subscribe` message with no scope field is treated as `SharedPool`. A scope me
 
 ## Shared
 
-One cluster-wide proxy pool serves every `Ingress` and every `Gateway` that has not opted into dedicated mode. This is the Helm chart default: one controller `Deployment` and one shared proxy `Deployment` in `coxswain-system`.
+One cluster-wide proxy pool serves every `Ingress` and every `Gateway` that has not opted into dedicated mode. This is the Helm chart default: one controller `Deployment` in `coxswain-system`, which in turn provisions the shared proxy pool.
+
+**The controller owns the shared proxy pool.** The pool's `Deployment`, `ServiceAccount`, internal `Service`, and (optional) `HorizontalPodAutoscaler`/`PodDisruptionBudget` are **controller-provisioned and controller-owned** (SSA field manager `coxswain-controller`), not rendered by Helm — the same ownership model as dedicated proxies and namespace relays. The chart supplies the pool's configuration to the controller as `COXSWAIN_SHARED_PROXY_*` env (remapped from `proxy.shared.*` values) and keeps only the pool's external Ingress `LoadBalancer` `Service`, which selects the pods the controller stamps. Controller ownership is what lets the controller repoint the pool's discovery upstream without fighting Helm's field manager on every `helm upgrade`. Because the pool is provisioned off config rather than off any Gateway, it exists from install with **zero Gateways** — the base data plane. Disabling it (`proxy.shared.enabled=false`) makes the controller reclaim the pool rather than orphan it.
 
 **Shared compute, per-Gateway addressing.** "Shared" describes the proxy *pod* (one set of compute serving everything) — it does not mean Gateways share an address. Each owned `Gateway` still gets its own `Service`/VIP:
 
@@ -29,7 +31,7 @@ One cluster-wide proxy pool serves every `Ingress` and every `Gateway` that has 
 - It's owner-referenced to the Gateway, so deleting the Gateway garbage-collects it automatically; moving a Gateway into dedicated mode prunes it explicitly instead.
 - Infrastructure annotations from this object also propagate onto the Gateway's VIP `Service` — this is how, for example, a cloud load-balancer annotation set on the Gateway reaches the actual `LoadBalancer` Service.
 
-The fixed shared `80`/`443` listeners on the proxy pod are **Ingress-only**: Ingresses legitimately share one address because they merge by host/path and have no per-Ingress isolation. The cost of per-Gateway addressing is **one load-balancer IP per Gateway** in cloud environments — the "one IP for everything" property is intentionally given up; only the proxy compute stays shared. The shared-proxy selector the controller stamps on each VIP `Service` is supplied by the Helm chart via `--shared-proxy-selector` (the chart knows the release name; the controller cannot derive `app.kubernetes.io/instance` itself).
+The fixed shared `80`/`443` listeners on the proxy pod are **Ingress-only**: Ingresses legitimately share one address because they merge by host/path and have no per-Ingress isolation. The cost of per-Gateway addressing is **one load-balancer IP per Gateway** in cloud environments — the "one IP for everything" property is intentionally given up; only the proxy compute stays shared. The shared-proxy selector is supplied by the Helm chart via `--shared-proxy-selector` (the chart knows the release name; the controller cannot derive `app.kubernetes.io/instance` itself); the controller stamps that same label set on the pool's pods and reuses it as the selector of each VIP `Service` and the retained Ingress `LoadBalancer` `Service`, so all three agree.
 
 The VIP `Service` type is set by `proxy.shared.vipServiceType` (default `LoadBalancer`), independent of the shared-proxy `Service` itself. `LoadBalancer` gives each Gateway an external address and works on cloud LBs and MetalLB, which assign a distinct IP per `Service` and route `IP:port` independently. It does **not** work on host-port-binding LBs such as k3s/OrbStack `klipper-lb`, where multiple `LoadBalancer` Services advertising the same port (e.g. `:443`) collide on the host and stay `<pending>` — set `vipServiceType: ClusterIP` there to give each Gateway a stable in-cluster VIP (typically fronted by an external ingress/LB). `NodePort` is rejected: it cannot preserve the advertised listener port.
 
@@ -124,7 +126,7 @@ flowchart LR
     GP --> A1
 ```
 
-When every Gateway opts into dedicated mode and the shared proxy `Deployment` is scaled to `replicas: 0`, each team's Gateway gets a fully isolated data plane. Classic `Ingress` is unavailable in this arrangement.
+When every Gateway opts into dedicated mode and the shared proxy pool is scaled to zero (`proxy.shared.replicas: 0`) or disabled (`proxy.shared.enabled: false`), each team's Gateway gets a fully isolated data plane. Classic `Ingress` is unavailable in this arrangement.
 
 ```mermaid
 flowchart LR
@@ -164,7 +166,7 @@ The relay tier is **not** a third deployment model — it is optional *discovery
 
 Two families, split along the same static-vs-dynamic line as the proxies themselves:
 
-- **Shared-pool relay** — a single, install-level relay in front of the shared proxy pool. It subscribes `SharedPool` and re-serves it verbatim (a flat passthrough cache). Because the shared pool is static Helm-managed infrastructure, so is its relay: you enable it in Helm (`relay.shared.enabled`), which both renders the relay and repoints the shared proxies at it. It can autoscale (`relay.shared.autoscaling`) because it fronts the whole, cluster-wide pool.
+- **Shared-pool relay** — a single, install-level relay in front of the shared proxy pool. It subscribes `SharedPool` and re-serves it verbatim (a flat passthrough cache). It is a Helm-level toggle (`relay.shared.enabled`), which renders the relay and, via the controller, delivers it as the shared pool's routing upstream at bootstrap. It can autoscale (`relay.shared.autoscaling`) because it fronts the whole, cluster-wide pool.
 - **Namespace relay** — a per-namespace relay in front of a namespace's *dedicated* proxies. It subscribes the aggregate `Namespace` scope (every dedicated Gateway's world in that namespace, key-qualified per Gateway), demuxes it back into per-Gateway worlds, and serves each dedicated proxy exactly as the controller would. Because dedicated proxies are dynamic and controller-provisioned, so are their relays: the **controller** provisions a namespace relay (and repoints that namespace's dedicated proxies) — nothing to hand-manage. Enable with `relay.dedicated.enabled`.
 
 **When a namespace relay appears (break-even + scale-to-zero).** A relay costs the leader `relay.dedicated.replicas` streams (each replica opens its own upstream stream) and saves it the namespace's downstream streams. So it only *reduces* leader load once a namespace's desired dedicated-proxy replicas exceed the relay's own cost. The controller provisions a namespace relay only when that count reaches `relay.dedicated.minProxyReplicas` (default 8); below it the namespace stays direct-to-controller — a small namespace is never handed a relay it doesn't need. Once provisioned, a relay is kept until its namespace drains to **zero** dedicated Gateways (hysteresis), so a transient dip never strands the sibling proxies still pointed at it.
