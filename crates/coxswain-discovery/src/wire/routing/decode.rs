@@ -485,9 +485,6 @@ pub(crate) fn upstream_tls_from_wire(dto: &p::UpstreamTls) -> Result<UpstreamTls
         // Drop unknown SAN kinds gracefully — consistent with to_wire's _ => None.
         // This prevents a future proto Kind from being coerced to the default (Hostname=0)
         // and producing a spurious SAN mismatch / silent auth downgrade on rolling upgrades.
-        // Drop unknown SAN kinds gracefully — consistent with to_wire's _ => None.
-        // This prevents a future proto Kind from being coerced to the default (Hostname=0)
-        // and producing a spurious SAN mismatch on rolling upgrades.
         let sans: Arc<[SubjectAltName]> = dto
             .subject_alt_names
             .iter()

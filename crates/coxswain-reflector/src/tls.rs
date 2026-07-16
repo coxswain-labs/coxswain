@@ -98,7 +98,6 @@ fn parse_leaf_cert_metadata(
     let (_, cert) =
         parse_x509_certificate(&pem.contents).map_err(|e| format!("X509 parse: {e}"))?;
 
-    // notAfter
     let not_after_unix = cert.validity().not_after.timestamp();
     let not_after = if not_after_unix < 0 {
         None
