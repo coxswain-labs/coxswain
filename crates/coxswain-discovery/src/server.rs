@@ -3120,8 +3120,8 @@ mod tests {
 
     // ── live upstream-repoint push (#601) ──────────────────────────────────────
 
-    fn upstream_resolver(provisioned: &[&str]) -> Arc<UpstreamResolverConfig> {
-        let set: HashSet<String> = provisioned.iter().map(|s| (*s).to_owned()).collect();
+    fn upstream_resolver(active: &[&str]) -> Arc<UpstreamResolverConfig> {
+        let set: HashSet<String> = active.iter().map(|s| (*s).to_owned()).collect();
         Arc::new(UpstreamResolverConfig {
             controller_endpoint: "https://coxswain-controller-discovery.coxswain-system.svc:50051"
                 .to_owned(),
@@ -3130,7 +3130,7 @@ mod tests {
             relay_service_name: "coxswain-relay".to_owned(),
             relay_port: 50051,
             relay_sa: "coxswain-relay".to_owned(),
-            provisioned_relays: Shared::from_value(set),
+            active_relays: Shared::from_value(set),
         })
     }
 
@@ -3168,7 +3168,7 @@ mod tests {
         // Namespace becomes provisioned → the leaf is repointed to the relay,
         // untargeted (it is the sole recipient of its own direct stream).
         resolver
-            .provisioned_relays
+            .active_relays
             .store(Arc::new(HashSet::from(["team-a".to_owned()])));
         seed_or_push_upstream(&scope, Some(&resolver), &mut last, &tx)
             .await
@@ -3228,7 +3228,7 @@ mod tests {
 
         // Deprovision → forward a controller-repoint directive tagged with the
         // namespace so the relay routes it to its downstream leaves.
-        resolver.provisioned_relays.store(Arc::new(HashSet::new()));
+        resolver.active_relays.store(Arc::new(HashSet::new()));
         seed_or_push_upstream(&scope, Some(&resolver), &mut last, &tx)
             .await
             .expect("push must not fail");
@@ -3253,7 +3253,7 @@ mod tests {
             .await
             .expect("no-op must not fail");
         resolver
-            .provisioned_relays
+            .active_relays
             .store(Arc::new(HashSet::from(["team-a".to_owned()])));
         seed_or_push_upstream(&Scope::SharedPool, Some(&resolver), &mut last, &tx)
             .await

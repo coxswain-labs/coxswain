@@ -133,6 +133,14 @@ spec:
               value: {{ .Values.relay.dedicated.replicas | quote }}
             - name: COXSWAIN_RELAY_MIN_PROXY_REPLICAS
               value: {{ .Values.relay.dedicated.minProxyReplicas | quote }}
+            - name: COXSWAIN_RELAY_TARGET_PROXIES_PER_REPLICA
+              value: {{ .Values.relay.dedicated.targetProxiesPerReplica | quote }}
+            - name: COXSWAIN_RELAY_COOLDOWN
+              value: {{ .Values.relay.dedicated.cooldown | quote }}
+            - name: COXSWAIN_RELAY_SCALE_DOWN_STABILIZATION
+              value: {{ .Values.relay.dedicated.scaleDownStabilization | quote }}
+            - name: COXSWAIN_RELAY_TOLERANCE
+              value: {{ .Values.relay.dedicated.tolerance | quote }}
             - name: COXSWAIN_RELAY_CPU_REQUEST
               value: {{ .Values.relay.dedicated.resources.cpuRequest | quote }}
             - name: COXSWAIN_RELAY_MEMORY_REQUEST

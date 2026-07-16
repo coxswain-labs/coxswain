@@ -142,8 +142,9 @@ const RELAY_NAME: &str = "coxswain-relay";
 /// single dedicated Gateway provisions a namespace relay (zero-verb SA, no owner
 /// ref, namespace-relay component) that becomes Ready — proving its `Namespace`
 /// subscribe was authorized by provenance end-to-end. Deleting the last dedicated
-/// Gateway drains the namespace to zero and garbage-collects the relay
-/// (hysteresis GC-at-zero).
+/// Gateway leaves the namespace with no dedicated Gateways, which deactivates the
+/// relay immediately (a genuinely drained namespace bypasses the cooldown) and
+/// garbage-collects it.
 #[tokio::test]
 async fn namespace_relay_provisioned_and_gcd_over_dedicated_gateway_lifecycle() -> anyhow::Result<()>
 {
@@ -239,11 +240,10 @@ async fn namespace_relay_provisioned_and_gcd_over_dedicated_gateway_lifecycle() 
 }
 
 /// Sad/negative path — scale-to-zero: relay tiering enabled but with a high
-/// threshold, a single-replica dedicated Gateway stays below it, so the namespace
-/// must stay direct-to-controller with NO relay. Once the dedicated proxy is
-/// provisioned the operator has reconciled the Gateway (and run relay
-/// convergence, which is a no-op below threshold), so the relay's absence is a
-/// decided "not wanted", not "not yet looked at".
+/// activation threshold, a dedicated Gateway's subscriber count stays below it, so
+/// the namespace must stay direct-to-controller with NO relay. Below the threshold
+/// the control loop's activation check never provisions anything, so the relay's
+/// absence is a decided "not wanted".
 #[tokio::test]
 async fn namespace_relay_not_provisioned_below_threshold() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
@@ -254,9 +254,8 @@ async fn namespace_relay_not_provisioned_below_threshold() -> anyhow::Result<()>
     .await?;
     let ns = NamespaceGuard::create(&h.client, "relay-ded-below").await?;
 
-    // Waiting for the dedicated proxy resources proves the reconcile ran; relay
-    // convergence runs in the same `reconcile_dedicated` and, being below
-    // threshold, never creates anything — so the relay is never provisioned.
+    // The live subscriber count stays far below the activation threshold (100), so
+    // the control loop never provisions a relay for this namespace.
     apply_and_wait(&h, &ns).await?;
 
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
@@ -362,7 +361,7 @@ async fn relay_policy_force_on_provisions_relay_with_overrides() -> anyhow::Resu
 
 /// Sad/veto path — a relay auto-provisions (threshold met), then an `enabled: false`
 /// policy vetoes it and the controller garbage-collects the relay, overriding the
-/// GC-at-zero hysteresis with an explicit operator intent.
+/// control loop's automatic decision with an explicit operator intent.
 #[tokio::test]
 async fn relay_policy_force_off_gcs_provisioned_relay() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
@@ -380,8 +379,8 @@ async fn relay_policy_force_off_gcs_provisioned_relay() -> anyhow::Result<()> {
     // Auto-provisioned first: threshold of 1 is met and no policy exists yet.
     wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
 
-    // Force-off vetoes it — the policy change re-drives the Gateway reconcile, whose
-    // relay convergence now sees `enabled: false` and GCs the relay.
+    // Force-off vetoes it — the relay control loop resolves the policy on its next
+    // pass, sees `enabled: false`, and tears the relay down (drain then GC).
     apply_relay_policy(dedicated::RELAY_POLICY_FORCE_OFF, &ns.name).await?;
     wait::poll_until(
         Duration::from_secs(60),
@@ -445,6 +444,144 @@ async fn relay_policy_uncapped_autoscaling_falls_back_to_static() -> anyhow::Res
     Ok(())
 }
 
+// ── Relay control loop (#602) — activation/cooldown/stabilization ────────────
+//
+// The dedicated relay is provisioned by an HPA+KEDA-style control loop driven by
+// the namespace's LIVE dedicated-proxy subscriber count. These are global-config
+// mutators (relay.dedicated.*), so they run in the serial pass. They shorten the
+// 300s cooldown/stabilization defaults to a few seconds so the behaviour is
+// observable within a test.
+//
+// Note: the tolerance deadband is a continuous-math property that is not cleanly
+// observable with coarse integer proxy counts (the live signal jitters during
+// repoint/pod convergence, and immediate scale-up reacts to it), so it is covered
+// by unit tests rather than e2e.
+
+/// Poll for the relay Deployment to drop **below** `floor` `spec.replicas`,
+/// treating "never dropped within `window`" as SUCCESS — i.e. assert the relay did
+/// NOT scale down. A transient upward spike (repoint/pod churn) does not violate the
+/// anti-flap property, so this checks `>= floor`, not equality. No bare sleep: the
+/// poll IS the window, it just inverts success/failure.
+async fn assert_relay_not_scaled_below(
+    deployments: &Api<Deployment>,
+    floor: i32,
+    window: Duration,
+) -> anyhow::Result<()> {
+    let dropped = wait::poll_until(
+        window,
+        wait::POLL,
+        || async { format!("relay '{RELAY_NAME}' spec.replicas to drop below {floor}") },
+        || async {
+            let got = deployments
+                .get(RELAY_NAME)
+                .await
+                .ok()
+                .and_then(|d| d.spec)
+                .and_then(|s| s.replicas);
+            got.is_some_and(|r| r < floor).then_some(())
+        },
+    )
+    .await;
+    anyhow::ensure!(
+        dropped.is_err(),
+        "relay '{RELAY_NAME}' scaled below {floor} inside the stabilization window \
+         (scale-down was not debounced)"
+    );
+    Ok(())
+}
+
+/// Happy path — the #602 behaviour change: a relay whose namespace drops **below**
+/// break-even but stays at a **nonzero** subscriber count is torn down after the
+/// cooldown. The old keep-until-fully-drained rule would keep it forever; this
+/// proves the KEDA-style cooldown deactivation, and that teardown happens while a
+/// proxy is still connected (make-before-break repoints it back to the controller).
+#[tokio::test]
+async fn relay_deactivated_after_cooldown_below_break_even() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_dedicated_enabled: true,
+        // Break-even 2 so a single remaining subscriber (1) is below it but nonzero.
+        relay_min_proxy_replicas: Some(2),
+        relay_cooldown: Some("5s".to_string()),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-cooldown").await?;
+
+    // The dedicated Gateway's params default to 2 replicas → 2 subscribers ≥ 2.
+    apply_and_wait(&h, &ns).await?;
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
+
+    // Drop to a single subscriber: below break-even (2) but NONZERO.
+    patch_params_replicas(&h.client, &ns.name, "dedicated-params", 1).await?;
+
+    // After the cooldown the relay tears down — even though a proxy is still
+    // connected (the behaviour change: no keep-until-fully-drained).
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            format!(
+                "relay '{RELAY_NAME}' torn down after the cooldown at a NONZERO (below-break-even) \
+                 subscriber count"
+            )
+        },
+        || async { deployments.get(RELAY_NAME).await.is_err().then_some(()) },
+    )
+    .await?;
+
+    // The dedicated proxy is still running (1 replica) — teardown fired at a
+    // nonzero subscriber count, not because the namespace drained to zero.
+    let dedicated_ready = deployments
+        .get(RESOURCE_NAME)
+        .await?
+        .status
+        .and_then(|s| s.ready_replicas)
+        .unwrap_or(0);
+    assert!(
+        dedicated_ready >= 1,
+        "the dedicated proxy must still be running when the relay is torn down \
+         (proves teardown at a nonzero subscriber count, not GC-at-zero)"
+    );
+    Ok(())
+}
+
+/// Sad/anti-flap path — a transient subscriber dip must NOT immediately scale the
+/// relay down: the scale-down stabilization window sizes on the trailing-window
+/// maximum. The relay holds its higher count for the window, then settles to the
+/// dip level once the window's peak ages out.
+#[tokio::test]
+async fn relay_scale_down_debounced_by_stabilization_window() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_dedicated_enabled: true,
+        relay_min_proxy_replicas: Some(100),
+        relay_scale_down_stabilization: Some("30s".to_string()),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-debounce").await?;
+    // minReplicas 1, target 1 → replica count tracks the live subscriber count.
+    apply_relay_policy(dedicated::RELAY_POLICY_AUTOSCALING_SCALEDOWN, &ns.name).await?;
+    apply_and_wait(&h, &ns).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    // 3 subscribers → 3 relay replicas (proves 3 proxies connected).
+    patch_params_replicas(&h.client, &ns.name, "dedicated-params", 3).await?;
+    wait_for_relay_replicas(&deployments, 3).await?;
+
+    // Drop to 1 subscriber — a scale-DOWN candidate the stabilization window damps.
+    patch_params_replicas(&h.client, &ns.name, "dedicated-params", 1).await?;
+
+    // Within the 30s window the relay must not scale DOWN below 3 (the trailing-
+    // window peak), rather than dropping straight to 1 — the anti-flap guarantee.
+    // (`>= 3`, not `== 3`: a transient upward spike from convergence churn is fine.)
+    assert_relay_not_scaled_below(&deployments, 3, Duration::from_secs(12)).await?;
+
+    // Once the peak ages out of the window, it settles to the dip level (1).
+    wait_for_relay_replicas(&deployments, 1).await?;
+    Ok(())
+}
+
 // ── Relay-tracking rehydration across a controller restart (#593) ────────────
 //
 // Also global-config mutators (relay.dedicated.*) → serial pass. Restart mirrors
@@ -452,10 +589,10 @@ async fn relay_policy_uncapped_autoscaling_falls_back_to_static() -> anyhow::Res
 // wait_for_controller_reconciled) on a PERSISTENT namespace so the second
 // bootstrap purge doesn't delete it mid-test.
 
-/// Merge-patch a `CoxswainGatewayParameters` object's `spec.replicas` (#593 test
-/// support). Dropping the replica count lowers the namespace's desired
-/// dedicated-proxy fan-out below the relay break-even threshold while keeping ≥1
-/// Gateway — the hysteresis mid-range. `DynamicObject` because the CRD has no
+/// Merge-patch a `CoxswainGatewayParameters` object's `spec.replicas` (#593/#602
+/// test support). Dropping the replica count scales the dedicated proxy Deployment,
+/// lowering the namespace's live subscriber count below the relay break-even
+/// threshold while keeping ≥1 Gateway. `DynamicObject` because the CRD has no
 /// generated typed Rust struct in the e2e crate.
 async fn patch_params_replicas(
     client: &kube::Client,
@@ -481,19 +618,20 @@ async fn patch_params_replicas(
     Ok(())
 }
 
-/// Happy/regression path — a relay kept alive by hysteresis in the mid-range
-/// (provisioned, then desired fan-out dropped below `--relay-min-proxy-replicas`)
-/// survives a controller restart AND is still garbage-collected once its namespace
-/// drains to zero. Pre-#593 the restart cleared the in-memory relay-tracking set
-/// with nothing to rehydrate it, so `converge_namespace_relay` saw
-/// `currently=false, desired=false` and its `!desired && !currently` short-circuit
-/// skipped the delete forever — orphaning the relay. Startup rehydration re-adopts
-/// the orphan (`currently=true`), so GC-at-zero fires. This poll times out on `main`.
+/// Happy/regression path — a relay whose namespace sits just below break-even (a
+/// live subscriber count under `--relay-min-proxy-replicas`, held within the
+/// deactivation cooldown so the relay is still running) survives a controller
+/// restart AND is still garbage-collected once its namespace drains to zero. Under
+/// #602 rehydration is still load-bearing: without it the restart leaves the running
+/// relay untracked (no state-machine record), so the control loop — whose
+/// provision-from-absent branch can only *provision*, never delete — would never
+/// tear it down even at zero subscribers. Startup rehydration re-adopts the relay as
+/// `Active`, so the below-break-even/zero-subscriber teardown fires.
 #[tokio::test]
 async fn namespace_relay_orphan_gcd_after_controller_restart_in_hysteresis_midrange()
 -> anyhow::Result<()> {
-    // Threshold 2: one dedicated Gateway with the fixture's `replicas: 2` provisions
-    // the relay (sum 2 ≥ 2); dropping params to `replicas: 1` puts it mid-range.
+    // Threshold 2: the fixture's `replicas: 2` gives 2 subscribers (≥ 2) → relay;
+    // dropping params to `replicas: 1` puts the signal below break-even but nonzero.
     let opts = || ControllerOptions {
         relay_dedicated_enabled: true,
         relay_min_proxy_replicas: Some(2),
@@ -506,8 +644,9 @@ async fn namespace_relay_orphan_gcd_after_controller_restart_in_hysteresis_midra
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
     wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
 
-    // Drop desired fan-out to 1 (< threshold 2): hysteresis KEEPS the relay
-    // (currently=true), entering the mid-range that pre-#593 orphaned on restart.
+    // Drop to 1 subscriber (< threshold 2, nonzero): the default 300s cooldown keeps
+    // the relay running well within the test's runtime — the state the restart must
+    // re-adopt rather than orphan.
     patch_params_replicas(&h.client, &ns.name, "dedicated-params", 1).await?;
 
     // Restart the controller (fresh process = empty tracking set pre-fix).
@@ -534,8 +673,8 @@ async fn namespace_relay_orphan_gcd_after_controller_restart_in_hysteresis_midra
         wait::POLL,
         || async {
             format!(
-                "relay '{RELAY_NAME}' GC'd after a controller restart in the hysteresis mid-range, \
-                 once the namespace drained to zero (proves startup rehydration re-adopted the orphan)"
+                "relay '{RELAY_NAME}' GC'd after a controller restart below break-even, once the \
+                 namespace drained to zero (proves startup rehydration re-adopted the running relay)"
             )
         },
         || async {
@@ -564,8 +703,7 @@ async fn namespace_relay_not_provisioned_after_restart_below_threshold() -> anyh
     let h = Harness::start_with_options(opts()).await?;
     let ns = NamespaceGuard::create_persistent(&h.client, "relay-restart-below").await?;
 
-    // Desired fan-out 2 < threshold 100 → no relay. Waiting on the dedicated proxy
-    // proves the reconcile (and its below-threshold no-op convergence) ran.
+    // Subscriber count (2) < activation threshold 100 → no relay is ever provisioned.
     apply_and_wait(&h, &ns).await?;
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
     assert!(

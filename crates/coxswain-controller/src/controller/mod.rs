@@ -17,7 +17,7 @@
 
 use crate::operator::{
     OperatorConfig, ReconcileContext as OperatorReconcileContext, reconcile_dedicated,
-    run_shared_install_reconciler, run_vip_reconciler,
+    run_relay_reconciler, run_shared_install_reconciler, run_vip_reconciler,
 };
 use async_trait::async_trait;
 use coxswain_core::Shared;
@@ -452,6 +452,14 @@ impl Controller {
             // the instant this pod wins the lease, rather than up to one resync
             // tick later — the base data plane must come up promptly on promotion.
             tasks.spawn(run_shared_install_reconciler(
+                Arc::clone(op_ctx),
+                shutdown.clone(),
+                self.leadership_watch.as_ref().map(|tx| tx.subscribe()),
+            ));
+            // The relay control loop (#602): the promotion edge provisions/adopts
+            // relays promptly, and its own registry-watch + resync tick drive the
+            // subscriber-count control loop and the make-before-break sequencing.
+            tasks.spawn(run_relay_reconciler(
                 Arc::clone(op_ctx),
                 shutdown.clone(),
                 self.leadership_watch.as_ref().map(|tx| tx.subscribe()),

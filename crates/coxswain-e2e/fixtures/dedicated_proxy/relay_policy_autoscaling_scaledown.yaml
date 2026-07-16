@@ -1,0 +1,18 @@
+# CoxswainRelayPolicy (#602) force-enabling a relay with capped autoscaling and a
+# minReplicas of 1, so the relay can scale ALL the way down. targetProxiesPerReplica
+# of 1 makes the replica count track the live subscriber count exactly (N subscribers
+# -> N replicas), so the scale-down stabilization window is observable at small
+# proxy counts. Namespaced: governs only the test namespace's relay.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainRelayPolicy
+metadata:
+  name: e2e-relay-scaledown
+  namespace: ${TESTNS}
+spec:
+  enabled: true
+  autoscaling:
+    enabled: true
+    minReplicas: 1
+    maxReplicas: 5
+    targetProxiesPerReplica: 1

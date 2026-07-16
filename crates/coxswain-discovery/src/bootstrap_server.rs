@@ -50,9 +50,11 @@ use crate::wire::scope_from_wire;
 /// Kept as plain data (no controller dependency): `coxswain-controller` depends
 /// on this crate, not the reverse, so the endpoint templates and relay/controller
 /// ServiceAccount names are passed in from `coxswain-bin`, which knows both sides.
-/// The `provisioned_relays` set is the same lock-free cell the discovery server's
-/// `ScopeAuthorizer` reads — the single source of truth for "which namespaces are
-/// relay-fronted right now".
+/// The `active_relays` set is the controller's **repoint** set — namespaces whose
+/// relay is Ready and serving (`RelayNsState::Active`), the make-before-break gate
+/// that a leaf may repoint onto the relay. It is distinct from the authz set the
+/// `ScopeAuthorizer` reads (which also covers provisioning/draining relays): a leaf
+/// must never point at a not-yet-Ready or already-draining relay (#602).
 // intentionally open: field-literal constructed in coxswain-bin
 pub struct UpstreamResolverConfig {
     /// The controller's own routing (Stream) endpoint — the always-up fallback.
@@ -71,8 +73,10 @@ pub struct UpstreamResolverConfig {
     /// The relay ServiceAccount short-name (expected in a relay's SVID, and the
     /// discriminator for the relays-never-tier rule).
     pub relay_sa: String,
-    /// Namespaces that currently have a provisioned dedicated relay.
-    pub provisioned_relays: Shared<HashSet<String>>,
+    /// Namespaces whose dedicated relay is Ready and serving (the controller's
+    /// repoint set): a dedicated leaf in one of these streams from the relay, else
+    /// from the controller (#601/#602).
+    pub active_relays: Shared<HashSet<String>>,
 }
 
 impl UpstreamResolverConfig {
@@ -103,16 +107,19 @@ impl UpstreamResolverConfig {
     }
 
     /// Resolve `(endpoint, expected_server_sa)` for a dedicated (namespace-scoped)
-    /// client: its namespace's relay if provisioned, else the controller (#601).
+    /// client: its namespace's relay if that relay is **Active** (Ready and
+    /// serving), else the controller (#601/#602).
     ///
     /// Used by the controller's stream server to compute a leaf's current best
-    /// upstream when deciding whether to push a live repoint directive. Unlike
-    /// [`Self::resolve`] it takes no identity — the stream push only ever targets
-    /// dedicated leaves, never a relay (the relays-never-tier rule is enforced at
-    /// bootstrap, where the SA is authenticated).
+    /// upstream when deciding whether to push a live repoint directive. Reads the
+    /// repoint set ([`Self::active_relays`]), not the authz set, so a leaf is never
+    /// pointed at a still-provisioning or draining relay. Unlike [`Self::resolve`]
+    /// it takes no identity — the stream push only ever targets dedicated leaves,
+    /// never a relay (the relays-never-tier rule is enforced at bootstrap, where the
+    /// SA is authenticated).
     #[must_use]
     pub fn resolve_namespace(&self, namespace: &str) -> (String, String) {
-        if self.provisioned_relays.load().contains(namespace) {
+        if self.active_relays.load().contains(namespace) {
             let endpoint = format!(
                 "https://{}.{}.svc:{}",
                 self.relay_service_name, namespace, self.relay_port
@@ -485,8 +492,8 @@ mod tests {
         })
     }
 
-    fn resolver(shared_relay: Option<&str>, provisioned: &[&str]) -> Arc<UpstreamResolverConfig> {
-        let set: HashSet<String> = provisioned.iter().map(|s| (*s).to_owned()).collect();
+    fn resolver(shared_relay: Option<&str>, active: &[&str]) -> Arc<UpstreamResolverConfig> {
+        let set: HashSet<String> = active.iter().map(|s| (*s).to_owned()).collect();
         Arc::new(UpstreamResolverConfig {
             controller_endpoint: "https://coxswain-controller-discovery.coxswain-system.svc:50051"
                 .to_owned(),
@@ -495,7 +502,7 @@ mod tests {
             relay_service_name: "coxswain-relay".to_owned(),
             relay_port: 50051,
             relay_sa: "coxswain-relay".to_owned(),
-            provisioned_relays: Shared::from_value(set),
+            active_relays: Shared::from_value(set),
         })
     }
 

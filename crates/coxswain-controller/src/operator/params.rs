@@ -65,23 +65,6 @@ pub(super) struct EffectiveParams {
     pub(super) autoscaling: Option<AutoscalingParams>,
 }
 
-impl EffectiveParams {
-    /// Desired proxy replica count the renderer will run this Gateway at: the
-    /// autoscaling floor (`minReplicas`, default 1) when autoscaling is enabled,
-    /// otherwise the static `replicas` (default 1) — the same defaults
-    /// [`super::render`] applies.
-    ///
-    /// Used by the relay tier's downstream-demand threshold (#584): summing this
-    /// across a namespace's dedicated Gateways yields the fan-out a relay there
-    /// would absorb, decidable before any proxy pod is Ready.
-    pub(super) fn desired_replicas(&self) -> u32 {
-        match self.autoscaling.as_ref() {
-            Some(a) if a.enabled => a.min_replicas.unwrap_or(1),
-            _ => self.replicas.unwrap_or(1),
-        }
-    }
-}
-
 /// Extract the [`ParamsRef`] the given GatewayClass's `parametersRef` points
 /// at — or `None` if no such reference is set or the reference targets a
 /// different CRD kind.
@@ -524,47 +507,6 @@ mod tests {
             autoscaling.max_replicas,
             Some(10),
             "Gateway maxReplicas wins"
-        );
-    }
-
-    /// `desired_replicas` (the relay-tier downstream-demand input, #584) reads the
-    /// static `replicas` when autoscaling is off and the autoscaling floor when on.
-    #[test]
-    fn desired_replicas_static_and_autoscaling_floor() {
-        assert_eq!(
-            EffectiveParams {
-                replicas: Some(5),
-                ..Default::default()
-            }
-            .desired_replicas(),
-            5,
-            "static replicas govern when autoscaling is off"
-        );
-        assert_eq!(
-            EffectiveParams::default().desired_replicas(),
-            1,
-            "unset replicas default to 1 (matching the renderer)"
-        );
-
-        // Autoscaling enabled: the minReplicas floor is the desired count.
-        let class = gateway_class("coxswain", None, None);
-        let gw = gateway("default", "my-gw", Some("gw-params"));
-        let gw_spec = spec_from_json(serde_json::json!({
-            "replicas": 1,
-            "autoscaling": {"enabled": true, "minReplicas": 4, "maxReplicas": 10}
-        }));
-        let lookup = lookup_from_pairs(vec![(
-            ParamsRef {
-                namespace: "default".into(),
-                name: "gw-params".into(),
-            },
-            gw_spec,
-        )]);
-        let eff = resolve(&gw, &class, lookup).expect("ok").expect("some");
-        assert_eq!(
-            eff.desired_replicas(),
-            4,
-            "the autoscaling floor is the desired downstream replica count"
         );
     }
 

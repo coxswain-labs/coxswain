@@ -71,7 +71,11 @@ The optional [relay tier](../architecture/deployment-models.md#discovery-relay-t
 | `relay.shared.resources` | `{}` | Shared-relay container resources |
 | `relay.dedicated.enabled` | `false` | Enable controller-provisioned per-namespace relays (→ `--relay-enabled`) |
 | `relay.dedicated.replicas` | `2` | HA replica count for each provisioned namespace relay |
-| `relay.dedicated.minProxyReplicas` | `8` | Break-even threshold: a namespace gets a relay only once its desired dedicated-proxy replicas reach this (below it, direct-to-controller) |
+| `relay.dedicated.minProxyReplicas` | `8` | Break-even **activation** threshold: a namespace gets a relay only once its live dedicated-proxy subscriber count reaches this (below it, direct-to-controller) |
+| `relay.dedicated.targetProxiesPerReplica` | `50` | Capacity ratio — proxies per relay replica the sizing loop targets. Decoupled from the break-even threshold |
+| `relay.dedicated.cooldown` | `300s` | Deactivation cooldown: an active relay is torn down after the subscriber count holds below break-even for this long (0 → immediate) |
+| `relay.dedicated.scaleDownStabilization` | `300s` | Scale-down stabilization window for an autoscaled relay (scale up promptly, down only on the trailing-window peak) |
+| `relay.dedicated.tolerance` | `0.10` | Relative sizing deadband — the replica count changes only when load deviates from target by more than this fraction |
 | `relay.dedicated.resources.{cpuRequest,memoryRequest,memoryLimit}` | `50m` / `64Mi` / `256Mi` | Resources for each provisioned namespace relay (CPU request only — a limit would throttle fan-out) |
 
 `relay.shared.*` renders Deployment/Service/SA/PDB/HPA directly (static install infra). `relay.dedicated.*` is passed to the controller, which provisions the per-namespace relays dynamically — there are no dedicated-relay templates to render. Only the shared relay is a raw-manifest resource; enabling the tier on a non-Helm install is a Helm-only path today.
