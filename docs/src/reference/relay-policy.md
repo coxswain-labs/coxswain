@@ -8,8 +8,8 @@ enablement, HA, resources, scheduling, and autoscaling — on top of the install
 
 !!! note "Scope: namespace relays only"
     This CRD applies **only** to the dynamic, per-namespace relays the controller provisions
-    for **dedicated** proxies. The **shared-pool relay** is static Helm-managed infrastructure
-    — tune it through `relay.shared.*` Helm values, never this CRD.
+    for **dedicated** proxies. The **shared-pool relay** is global (one per install) and reads
+    the install-wide `--relay-*` flag values directly — it has no per-namespace policy.
 
 ## Model: override, not activation
 

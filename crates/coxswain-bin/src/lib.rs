@@ -9,8 +9,8 @@ use coxswain_admin::{AdminServer, EventSources, OperatorAggregator};
 use coxswain_controller::{
     BootstrapRejectHook, CaMode, ControllerConfig, IngressPorts, KubeTokenAuthenticator,
     LeaseSettings, OperatorConfig, RELAY_DISCOVERY_PORT, RELAY_SERVICE_ACCOUNT,
-    SharedGatewayListenerStatus, StatusWriterConfig, load_or_generate, spawn_status_writer,
-    spawn_trust_publisher,
+    SHARED_RELAY_SERVICE_ACCOUNT, SharedGatewayListenerStatus, StatusWriterConfig,
+    load_or_generate, spawn_status_writer, spawn_trust_publisher,
 };
 use coxswain_core::health::{HealthRegistry, SubsystemHandle};
 use coxswain_core::identity::{SpiffeId, SvidIssuer};
@@ -209,9 +209,21 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     // every leaf at the controller).
     let provisioned_relays = Shared::<HashSet<String>>::new();
     let active_relays = Shared::<HashSet<String>>::new();
-    // Live upstream-repoint (#601/#602): the resolver computes each dedicated leaf's
-    // current best upstream (its namespace's relay if that relay is Active, else the
-    // controller); the relay-change watch wakes live streams when the repoint set
+    // Shared-pool repoint gate (#605): the shared-relay control loop flips this
+    // `Active` once its relay is Ready, and the resolver points the pool at the
+    // shared relay while it is set (else the controller). Written by the operator,
+    // read here — the same make-before-break gate as `active_relays`, single-cell.
+    let shared_relay_active = Shared::from_value(false);
+    // The shared relay's fixed Service DNS — provisioned in the install namespace
+    // under the same constant the operator renders it with, so the endpoint the pool
+    // is repointed to stays in lockstep with the rendered Service by construction.
+    let shared_relay_endpoint = format!(
+        "https://{}.{}.svc:{}",
+        SHARED_RELAY_SERVICE_ACCOUNT, args.common.pod_namespace, RELAY_DISCOVERY_PORT
+    );
+    // Live upstream-repoint (#601/#602/#605): the resolver computes each leaf's
+    // current best upstream (its namespace's relay / the shared relay if Active, else
+    // the controller); the relay-change watch wakes live streams when a repoint set
     // moves. The bootstrap service reuses the same resolver so a leaf's initial
     // upstream and its live repoints are computed identically.
     let controller_stream_endpoint = format!(
@@ -221,7 +233,9 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     let upstream_resolver = Arc::new(UpstreamResolverConfig {
         controller_endpoint: controller_stream_endpoint,
         controller_sa: CONTROLLER_SPIFFE_SA.to_string(),
-        shared_relay_endpoint: args.controller.shared_relay_endpoint.clone(),
+        shared_relay_endpoint,
+        shared_relay_sa: SHARED_RELAY_SERVICE_ACCOUNT.to_string(),
+        shared_relay_active: shared_relay_active.clone(),
         relay_service_name: RELAY_SERVICE_ACCOUNT.to_string(),
         relay_port: RELAY_DISCOVERY_PORT,
         relay_sa: RELAY_SERVICE_ACCOUNT.to_string(),
@@ -312,6 +326,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         relay_replicas: args.controller.relay_replicas,
         relay_min_proxy_replicas: args.controller.relay_min_proxy_replicas,
         relay_target_proxies_per_replica: args.controller.relay_target_proxies_per_replica,
+        relay_max_replicas: args.controller.relay_max_replicas,
         relay_cooldown: args.controller.relay_cooldown,
         relay_scale_down_stabilization: args.controller.relay_scale_down_stabilization,
         relay_tolerance: args.controller.relay_tolerance,
@@ -320,9 +335,12 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         relay_memory_limit: args.controller.relay_memory_limit.clone(),
         provisioned_relays,
         active_relays,
-        // Repoint-set change signal (#601/#602): the relay control loop bumps this
-        // whenever a namespace enters or leaves `Active`, so the discovery server
-        // repoints the affected leaves live (make-before-break).
+        // Shared-pool repoint gate (#605): the shared-relay control loop flips this,
+        // the resolver reads it (same cell as above).
+        shared_relay_active,
+        // Repoint-set change signal (#601/#602/#605): the relay control loops bump
+        // this whenever a namespace (or the shared pool) enters or leaves `Active`,
+        // so the discovery server repoints the affected leaves live (make-before-break).
         relay_changed_tx: Some(relay_changed_tx),
     };
 

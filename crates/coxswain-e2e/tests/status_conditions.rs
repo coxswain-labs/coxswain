@@ -3487,7 +3487,7 @@ async fn dedicated_gateway_with_malformed_tls_secret_settles_programmed_false_in
 #[tokio::test]
 async fn dedicated_gateway_behind_namespace_relay_becomes_programmed() -> anyhow::Result<()> {
     let h = Harness::start_with_options(ControllerOptions {
-        relay_dedicated_enabled: true,
+        relay_enabled: true,
         relay_min_proxy_replicas: Some(1),
         ..Default::default()
     })

@@ -256,87 +256,57 @@ discovery:
     secretName: coxswain-discovery-ca
 
 # =============================================================================
-# Discovery relay tier (#584) — leader fan-out scaling. Two independent families:
-#   relay.shared    — a chart-rendered relay in front of the shared proxy pool
-#                     (static install infra; these values render Deployment/
-#                     Service/SA/PDB/HPA directly, like the shared proxy).
-#   relay.dedicated — controller-provisioned per-namespace relays in front of
-#                     dedicated proxies (dynamic; these values are passed to the
-#                     controller as `--relay-*` flags, NOT rendered here).
-# Both default off — a relay-free install is byte-identical to before.
+# Discovery relay tier (#584/#605) — leader fan-out scaling. ONE controller-owned,
+# demand-driven tier with two scopes, both provisioned by the controller off these
+# flags (there is no chart-rendered relay any more):
+#   * a single SHARED-POOL relay in front of the shared proxy pool
+#   * a PER-NAMESPACE relay in front of each namespace's dedicated proxies
+# Each scope is provisioned only once its demand crosses `minProxyReplicas`
+# (break-even), so an on-by-default install below threshold provisions nothing and
+# is byte-identical to a relay-free one. These map onto the controller's `--relay-*`
+# flags; per-namespace overrides (dedicated only) come from the CoxswainRelayPolicy
+# CRD. The shared relay uses these flag values directly.
 # =============================================================================
 relay:
-  shared:
-    # Render the shared-pool relay AND repoint the shared proxies at it. A single
-    # switch: a relay nobody points at is useless and proxies pointed at a relay
-    # that doesn't exist break, so the two are never independent.
-    enabled: false
-    # Replica count when autoscaling is disabled. >=2 for HA (a leaf reconnecting
-    # during a rollout must always find a serving replica).
-    replicas: 2
-    autoscaling:
-      # The shared relay fronts the whole (cluster-wide, itself autoscaled) pool,
-      # so unlike the namespace relay it earns CPU autoscaling. Off by default.
-      enabled: false
-      minReplicas: 2
-      maxReplicas: 10
-      targetCPUUtilizationPercentage: 80
-      # -- Resource requests/limits for the relay container.
-    resources: {}
-    podDisruptionBudget:
-      enabled: true
-      maxUnavailable: 1
-    serviceAccount:
-      create: true
-      name: ""
-      annotations: {}
-    service:
-      annotations: {}
-    podLabels: {}
-    podAnnotations: {}
-    nodeSelector: {}
-    tolerations: []
-    affinity: {}
-    topologySpreadConstraints: []
-    priorityClassName: ""
-  dedicated:
-    # Enable controller-provisioned namespace relays (-> --relay-enabled). When
-    # on, a namespace that holds enough dedicated-proxy replicas gets its own
-    # relay and its dedicated proxies are repointed at it.
-    enabled: false
-    # HA replica count for each provisioned namespace relay (-> --relay-replicas).
-    replicas: 2
-    # Break-even ACTIVATION threshold: a namespace gets a relay only once its live
-    # dedicated-proxy subscriber count reaches this (-> --relay-min-proxy-replicas).
-    # Below it, that namespace's proxies stay direct-to-controller (relay scaled to
-    # 0). "Is a relay worth existing?"
-    minProxyReplicas: 8
-    # Capacity ratio, DECOUPLED from the break-even threshold above
-    # (-> --relay-target-proxies-per-replica). "How many subscribers can one relay
-    # replica front?" A relay is a fan-out cache, so real per-replica capacity is
-    # O(100s); an autoscaled relay runs ceil(liveSubscribers/this) within its cap.
-    # 50 is provisional (a benchmark, #603, will measure it).
-    targetProxiesPerReplica: 50
-    # Deactivation cooldown (-> --relay-cooldown): once the signal falls below
-    # minProxyReplicas the relay is torn down only after it stays below for this
-    # long (a signal of 0 tears down immediately). Replaces the old
-    # keep-until-fully-drained rule.
-    cooldown: 300s
-    # Scale-down stabilization window (-> --relay-scale-down-stabilization): an
-    # autoscaled relay scales DOWN on the max subscriber count over this window
-    # (scale-up is prompt), so a brief dip does not shed a replica.
-    scaleDownStabilization: 300s
-    # Relative sizing deadband (-> --relay-tolerance): the replica count changes
-    # only when load deviates from target by more than this fraction (0.10 = 10%),
-    # so small jitter does not churn the Deployment.
-    tolerance: 0.10
-    # Resource requests/limits for each provisioned relay container. CPU carries a
-    # request but no limit (a limit throttles fan-out); memory carries both.
-    # Per-namespace overrides come from the CoxswainRelayPolicy CRD.
-    resources:
-      cpuRequest: 50m
-      memoryRequest: 64Mi
-      memoryLimit: 256Mi
+  # Master switch (-> --relay-enabled). ON by default (opt-out): set false to
+  # disable the whole tier. Break-even gates each scope, so on-by-default is inert
+  # below threshold and scale-to-zero-safe.
+  enabled: true
+  # HA replica count / autoscaling floor for a provisioned relay (-> --relay-replicas).
+  replicas: 2
+  # Shared-relay autoscaling CEILING (-> --relay-max-replicas): the shared relay
+  # fronts the whole (traffic-HPA'd) pool and autoscales between `replicas` and this
+  # off ceil(poolReplicas/targetProxiesPerReplica). The mandatory cap on the upstream
+  # streams it opens against the leader. (Dedicated relays cap via CoxswainRelayPolicy.)
+  maxReplicas: 10
+  # Break-even ACTIVATION threshold: a scope gets a relay only once its demand
+  # reaches this (-> --relay-min-proxy-replicas). Below it, its proxies stay
+  # direct-to-controller (relay scaled to 0). "Is a relay worth existing?"
+  minProxyReplicas: 8
+  # Capacity ratio, DECOUPLED from the break-even threshold above
+  # (-> --relay-target-proxies-per-replica). "How many subscribers can one relay
+  # replica front?" A relay is a fan-out cache, so real per-replica capacity is
+  # O(100s). 50 is provisional (a benchmark, #603, will measure it).
+  targetProxiesPerReplica: 50
+  # Deactivation cooldown (-> --relay-cooldown): once demand falls below
+  # minProxyReplicas the relay is torn down only after it stays below for this long
+  # (a genuinely-drained scope tears down at once). Replaces keep-until-fully-drained.
+  cooldown: 300s
+  # Scale-down stabilization window (-> --relay-scale-down-stabilization): an
+  # autoscaled relay scales DOWN on the max signal over this window (scale-up is
+  # prompt), so a brief dip does not shed a replica.
+  scaleDownStabilization: 300s
+  # Relative sizing deadband (-> --relay-tolerance): the replica count changes only
+  # when load deviates from target by more than this fraction (0.10 = 10%), so small
+  # jitter does not churn the Deployment.
+  tolerance: 0.10
+  # Resource requests/limits for each provisioned relay container. CPU carries a
+  # request but no limit (a limit throttles fan-out); memory carries both.
+  # Per-namespace overrides (dedicated only) come from the CoxswainRelayPolicy CRD.
+  resources:
+    cpuRequest: 50m
+    memoryRequest: 64Mi
+    memoryLimit: 256Mi
 
 # =============================================================================
 # Proxy pod — read-only data plane.

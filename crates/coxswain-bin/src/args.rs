@@ -864,30 +864,23 @@ pub(crate) struct ControllerArgs {
     )]
     pub discovery_trust_domain: String,
 
-    /// Enable the discovery relay tier (#584).
+    /// Enable the discovery relay tier (#584, #605).
     ///
-    /// When set, every namespace that holds ≥1 dedicated Gateway is provisioned a
-    /// controller-managed namespace relay (SA + Deployment + Service), and that
-    /// namespace's dedicated proxies subscribe for routing snapshots through the
-    /// relay instead of directly to the controller — so the leader fans out one
-    /// stream per relay rather than one per proxy replica. Off by default: no
-    /// relays are provisioned and the install is byte-identical to a non-relay
-    /// one. The controller authorizes a relay's `Namespace` subscribe only for the
-    /// SA it provisioned in that namespace (provenance, deny-by-default).
-    #[arg(long, env = "COXSWAIN_RELAY_ENABLED", default_value_t = false)]
+    /// **On by default (opt-out).** When enabled, the controller demand-drives the
+    /// whole relay tier: a single shared-pool relay in front of the shared proxy
+    /// pool, and a per-namespace relay in front of each namespace's dedicated
+    /// proxies — each provisioned only once its scope crosses the break-even
+    /// threshold (`--relay-min-proxy-replicas`), so an on-by-default install below
+    /// threshold provisions nothing and is byte-identical to a relay-free one.
+    /// Downstream proxies then subscribe for routing snapshots through the relay
+    /// instead of directly to the controller, so the leader fans out one stream per
+    /// relay rather than one per proxy replica. Set `--relay-enabled=false` to opt
+    /// out entirely. The controller authorizes a dedicated relay's `Namespace`
+    /// subscribe only for the SA it provisioned (provenance, deny-by-default); a
+    /// shared relay's `SharedPool` subscribe carries the shared world, which is not
+    /// tenant-scoped.
+    #[arg(long, env = "COXSWAIN_RELAY_ENABLED", default_value_t = true)]
     pub relay_enabled: bool,
-
-    /// Routing (Stream) endpoint of the **shared** relay, when one fronts the
-    /// shared proxy pool (#601).
-    ///
-    /// A static Helm toggle in v0.6 (the shared relay is not controller-managed
-    /// like namespace relays). When set, the controller hands shared-pool proxies
-    /// this endpoint as their best upstream at bootstrap instead of the controller's
-    /// own Stream endpoint. Unset (default) → shared proxies stream from the
-    /// controller. Example:
-    /// `https://coxswain-relay-shared.coxswain-system.svc:50051`.
-    #[arg(long, env = "COXSWAIN_SHARED_RELAY_ENDPOINT")]
-    pub shared_relay_endpoint: Option<String>,
 
     /// Replica count for each provisioned namespace relay (#584).
     ///
@@ -932,6 +925,21 @@ pub(crate) struct ControllerArgs {
         default_value_t = 50
     )]
     pub relay_target_proxies_per_replica: u32,
+
+    /// Autoscaling ceiling for the **shared-pool** relay (#605).
+    ///
+    /// The shared relay fronts the whole (traffic-HPA'd) shared proxy pool and,
+    /// unlike a namespace relay, has no `CoxswainRelayPolicy`, so it autoscales
+    /// directly off the flags:
+    /// `clamp(ceil(pool-replicas / --relay-target-proxies-per-replica),
+    /// --relay-replicas, this)`. This is the mandatory cap on the upstream streams
+    /// the shared relay opens against the leader — keep it well below the pool's
+    /// replica count divided by the capacity ratio, or the relay's own streams
+    /// approach the count it is meant to collapse. Does not affect the dedicated
+    /// tier (which caps via `RelayAutoscaling.maxReplicas`). Only meaningful with
+    /// `--relay-enabled`.
+    #[arg(long, env = "COXSWAIN_RELAY_MAX_REPLICAS", default_value_t = 10)]
+    pub relay_max_replicas: u32,
 
     /// Deactivation cooldown for a namespace relay (#602).
     ///

@@ -121,43 +121,35 @@ spec:
               value: {{ .Values.controller.reconcileDebounceMin | quote }}
             - name: COXSWAIN_RECONCILE_DEBOUNCE_MAX
               value: {{ .Values.controller.reconcileDebounceMax | quote }}
-            {{- if .Values.relay.dedicated.enabled }}
-            # Namespace relay tiering (#584): the controller provisions a per-
-            # namespace relay (SA + Deployment + Service) once a namespace's
-            # desired dedicated-proxy replicas cross `minProxyReplicas`, and
-            # repoints that namespace's dedicated proxies at it. These map the
-            # `relay.dedicated.*` values onto the controller's `--relay-*` flags.
+            # Relay tier (#584/#605): the controller demand-drives one tier with two
+            # scopes — a shared-pool relay in front of the shared proxy pool, and a
+            # per-namespace relay in front of each namespace's dedicated proxies —
+            # each provisioned/sized/GC'd once its demand crosses `minProxyReplicas`.
+            # These map the unified `relay.*` values onto the controller's `--relay-*`
+            # flags. ENABLED by default (opt-out): the binary default is also true,
+            # so `relay.enabled: false` is what turns the whole tier off.
             - name: COXSWAIN_RELAY_ENABLED
-              value: "true"
+              value: {{ .Values.relay.enabled | quote }}
             - name: COXSWAIN_RELAY_REPLICAS
-              value: {{ .Values.relay.dedicated.replicas | quote }}
+              value: {{ .Values.relay.replicas | quote }}
+            - name: COXSWAIN_RELAY_MAX_REPLICAS
+              value: {{ .Values.relay.maxReplicas | quote }}
             - name: COXSWAIN_RELAY_MIN_PROXY_REPLICAS
-              value: {{ .Values.relay.dedicated.minProxyReplicas | quote }}
+              value: {{ .Values.relay.minProxyReplicas | quote }}
             - name: COXSWAIN_RELAY_TARGET_PROXIES_PER_REPLICA
-              value: {{ .Values.relay.dedicated.targetProxiesPerReplica | quote }}
+              value: {{ .Values.relay.targetProxiesPerReplica | quote }}
             - name: COXSWAIN_RELAY_COOLDOWN
-              value: {{ .Values.relay.dedicated.cooldown | quote }}
+              value: {{ .Values.relay.cooldown | quote }}
             - name: COXSWAIN_RELAY_SCALE_DOWN_STABILIZATION
-              value: {{ .Values.relay.dedicated.scaleDownStabilization | quote }}
+              value: {{ .Values.relay.scaleDownStabilization | quote }}
             - name: COXSWAIN_RELAY_TOLERANCE
-              value: {{ .Values.relay.dedicated.tolerance | quote }}
+              value: {{ .Values.relay.tolerance | quote }}
             - name: COXSWAIN_RELAY_CPU_REQUEST
-              value: {{ .Values.relay.dedicated.resources.cpuRequest | quote }}
+              value: {{ .Values.relay.resources.cpuRequest | quote }}
             - name: COXSWAIN_RELAY_MEMORY_REQUEST
-              value: {{ .Values.relay.dedicated.resources.memoryRequest | quote }}
+              value: {{ .Values.relay.resources.memoryRequest | quote }}
             - name: COXSWAIN_RELAY_MEMORY_LIMIT
-              value: {{ .Values.relay.dedicated.resources.memoryLimit | quote }}
-            {{- end }}
-            {{- if .Values.relay.shared.enabled }}
-            # Shared relay (#601): the shared relay is a static Helm toggle, not
-            # controller-managed like namespace relays, so the controller cannot
-            # discover it. This tells the controller the shared relay's Stream
-            # endpoint so it hands shared-pool proxies this upstream at bootstrap
-            # instead of its own — keeping shared-relay fronting working now that
-            # the proxy has no COXSWAIN_DISCOVERY_ENDPOINT of its own.
-            - name: COXSWAIN_SHARED_RELAY_ENDPOINT
-              value: {{ include "coxswain.relayShared.discoveryEndpoint" . | quote }}
-            {{- end }}
+              value: {{ .Values.relay.resources.memoryLimit | quote }}
             {{- if .Values.controller.statusAddress }}
             - name: COXSWAIN_STATUS_ADDRESS
               value: {{ .Values.controller.statusAddress | quote }}

@@ -126,47 +126,6 @@ Controller ServiceAccount name.
 {{- end }}
 
 {{/*
-Shared-pool relay pod fullname: "<release>-coxswain-relay-shared" (#584).
-Release-prefixed (unlike the controller discovery Service) because only the
-chart-rendered shared proxy dials it, and both are templated from these helpers
-so they always agree — nothing in the binary hardcodes this name.
-*/}}
-{{- define "coxswain.relayShared.fullname" -}}
-{{- printf "%s-relay-shared" (include "coxswain.fullname" .) | trunc 63 | trimSuffix "-" }}
-{{- end }}
-
-{{/*
-Shared-pool relay selector labels — selectorLabels + component=relay-shared.
-*/}}
-{{- define "coxswain.relayShared.selectorLabels" -}}
-{{ include "coxswain.selectorLabels" . }}
-app.kubernetes.io/component: relay-shared
-{{- end }}
-
-{{/*
-Shared-pool relay ServiceAccount name. This is the SA half of the relay's SVID
-(`spiffe://<trust-domain>/ns/<ns>/sa/<this>`); the controller hands it to
-shared-pool proxies alongside the shared relay endpoint at bootstrap (#601) so
-they verify the relay's identity instead of the controller's.
-*/}}
-{{- define "coxswain.relayShared.serviceAccountName" -}}
-{{- if .Values.relay.shared.serviceAccount.create }}
-{{- default (include "coxswain.relayShared.fullname" .) .Values.relay.shared.serviceAccount.name }}
-{{- else }}
-{{- default "default" .Values.relay.shared.serviceAccount.name }}
-{{- end }}
-{{- end }}
-
-{{/*
-Downstream discovery endpoint the shared proxies dial when they are repointed at
-the shared relay (#584): `https://<relay-service>.<ns>.svc:<discovery-port>`.
-The relay serves the unchanged `SharedPool` protocol on this endpoint.
-*/}}
-{{- define "coxswain.relayShared.discoveryEndpoint" -}}
-{{- printf "https://%s.%s.svc:%d" (include "coxswain.relayShared.fullname" .) (include "coxswain.namespace" .) (.Values.discovery.port | int) }}
-{{- end }}
-
-{{/*
 Discovery gRPC stream endpoint the shared and dedicated proxies connect to over
 mTLS. Must match the value the controller binary hardcodes for dedicated proxies
 (coxswain-bin/src/lib.rs):

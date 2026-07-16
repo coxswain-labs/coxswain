@@ -115,6 +115,15 @@ spec:
               value: "1"
             - name: COXSWAIN_SHARED_PROXY_THREADS
               value: "2"
+            # Relay tier (#605): the controller demand-drives one relay tier with two
+            # scopes (a shared-pool relay + per-namespace dedicated relays), each
+            # provisioned only above the `--relay-min-proxy-replicas` break-even. ON
+            # by default (matches the binary); set "false" to disable the whole tier.
+            # Inert on this quickstart (1 shared-proxy replica is well below break-even),
+            # so no relay is provisioned here. The remaining `--relay-*` tuning knobs
+            # inherit their binary defaults; see values.yaml for the full set.
+            - name: COXSWAIN_RELAY_ENABLED
+              value: "true"
           livenessProbe:
             httpGet:
               path: /healthz

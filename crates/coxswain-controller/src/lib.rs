@@ -32,6 +32,17 @@ pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writ
 /// the authorized identity stay in lockstep by construction.
 pub const RELAY_SERVICE_ACCOUNT: &str = "coxswain-relay";
 
+/// Fixed `ServiceAccount` (and `Deployment`/`Service`) name of the single
+/// controller-provisioned **shared-pool** relay (#605).
+///
+/// Distinct from [`RELAY_SERVICE_ACCOUNT`] (the per-namespace dedicated relay): the
+/// shared relay fronts the install's shared proxy pool, lives in the install
+/// namespace, and subscribes `Scope::SharedPool`. Public so `coxswain-bin` builds
+/// the discovery upstream resolver (#601/#605) with the *same* name + SA the
+/// operator renders the shared relay with — the endpoint the pool is repointed to
+/// and the `expected_server_sa` the pool verifies stay in lockstep by construction.
+pub const SHARED_RELAY_SERVICE_ACCOUNT: &str = "coxswain-relay-shared";
+
 /// The dedicated relay's downstream routing (Stream) port.
 ///
 /// Public so `coxswain-bin` builds the discovery best-upstream resolver (#601)

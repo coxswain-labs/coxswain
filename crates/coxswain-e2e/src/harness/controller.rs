@@ -57,26 +57,30 @@ pub struct ControllerOptions {
     /// (`true`). Use `Some(false)` to assert the controller provisions no shared
     /// proxy pool when disabled.
     pub shared_proxy_enabled: Option<bool>,
-    /// Sets `relay.dedicated.enabled` (#584) — enables controller-provisioned
-    /// namespace relays. `false` leaves the chart default (off).
-    pub relay_dedicated_enabled: bool,
-    /// Sets `relay.dedicated.minProxyReplicas` (#584) — the break-even
-    /// provisioning threshold. A test sets this low (e.g. `Some(1)`) so a single
-    /// dedicated Gateway triggers a relay, or high to assert scale-to-zero.
-    /// `None` leaves the chart default (8).
+    /// Sets `relay.enabled` (#584/#605) — the unified relay-tier master switch
+    /// (shared-pool relay + per-namespace dedicated relays). Pinned explicitly by
+    /// the harness (the chart/binary default is on), so `false` disables the whole
+    /// tier deterministically for a test.
+    pub relay_enabled: bool,
+    /// Sets `relay.minProxyReplicas` (#584) — the break-even provisioning
+    /// threshold applied to both scopes. A test sets this low (e.g. `Some(1)`) so a
+    /// single dedicated Gateway (or a one-replica shared pool) triggers a relay, or
+    /// high to assert scale-to-zero. `None` leaves the chart default (8).
     pub relay_min_proxy_replicas: Option<u32>,
-    /// Sets `relay.dedicated.cooldown` (#602) — the deactivation cooldown. Tests
-    /// set this to a few seconds (e.g. `Some("5s")`) so the teardown-after-cooldown
-    /// behaviour is observable without waiting the 300s default. `None` leaves the
-    /// chart default.
+    /// Sets `relay.maxReplicas` (#605) — the shared relay's autoscaling ceiling.
+    /// `None` leaves the chart default (10).
+    pub relay_max_replicas: Option<u32>,
+    /// Sets `relay.cooldown` (#602) — the deactivation cooldown. Tests set this to
+    /// a few seconds (e.g. `Some("5s")`) so the teardown-after-cooldown behaviour is
+    /// observable without waiting the 300s default. `None` leaves the chart default.
     pub relay_cooldown: Option<String>,
-    /// Sets `relay.dedicated.scaleDownStabilization` (#602) — the scale-down
-    /// stabilization window. Tests set a few seconds (or a large value to *assert*
-    /// anti-flap). `None` leaves the chart default (300s).
+    /// Sets `relay.scaleDownStabilization` (#602) — the scale-down stabilization
+    /// window. Tests set a few seconds (or a large value to *assert* anti-flap).
+    /// `None` leaves the chart default (300s).
     pub relay_scale_down_stabilization: Option<String>,
-    /// Sets `relay.dedicated.targetProxiesPerReplica` (#602) — the capacity ratio.
-    /// Tests set this low (e.g. `Some(2)`) so a small subscriber count drives a
-    /// multi-replica sizing decision. `None` leaves the chart default (50).
+    /// Sets `relay.targetProxiesPerReplica` (#602) — the capacity ratio. Tests set
+    /// this low (e.g. `Some(2)`) so a small signal drives a multi-replica sizing
+    /// decision. `None` leaves the chart default (50).
     pub relay_target_proxies_per_replica: Option<u32>,
     /// Sets `watchNamespace` (#59) — the controller's namespaced watch scope.
     /// A comma-separated list (`ns1,ns2`) scopes the controller to those
@@ -153,8 +157,9 @@ impl ControllerProcess {
             // Pool replica count is driven through `set_shared_proxy_replicas`, not
             // ControllerOptions (it needs no port-forwards, so it handles 0).
             shared_proxy_replicas: None,
-            relay_dedicated_enabled: opts.relay_dedicated_enabled,
+            relay_enabled: opts.relay_enabled,
             relay_min_proxy_replicas: opts.relay_min_proxy_replicas,
+            relay_max_replicas: opts.relay_max_replicas,
             relay_cooldown: opts.relay_cooldown,
             relay_scale_down_stabilization: opts.relay_scale_down_stabilization,
             relay_target_proxies_per_replica: opts.relay_target_proxies_per_replica,

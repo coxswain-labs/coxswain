@@ -41,7 +41,7 @@ use super::relay_autoscaler::{
     should_provision,
 };
 use super::relay_params::EffectiveRelayPolicy;
-use super::render_relay::{self, RelayRenderInputs};
+use super::render_relay::{self, RelayRenderInputs, RelayVariant};
 use super::{apply, params};
 
 /// Resync backstop cadence. The registry watch is the prompt driver (a leaf
@@ -257,7 +257,10 @@ async fn process_namespace(
                     commit(ctx, namespace, record, decision.next_state, None);
                 }
                 RelayAction::Delete => {
-                    if let Err(e) = delete_relay_resources(&ctx.client, namespace).await {
+                    if let Err(e) =
+                        delete_relay_resources(&ctx.client, namespace, render_relay::RELAY_NAME)
+                            .await
+                    {
                         tracing::warn!(
                             namespace = %namespace,
                             error = %e,
@@ -321,7 +324,7 @@ async fn apply_relay_at(
         )
     });
     let rendered = render_relay::render_relay(&RelayRenderInputs {
-        namespace,
+        variant: RelayVariant::Namespace { namespace },
         replicas: clamp_u32_to_i32(replicas),
         controller_image: &ctx.controller_image,
         discovery_bootstrap_endpoint: &ctx.discovery_bootstrap_endpoint,
@@ -335,16 +338,22 @@ async fn apply_relay_at(
     apply::apply_relay(&ctx.client, namespace, &rendered).await
 }
 
-/// Idempotently delete a namespace relay's `Deployment` / `Service` /
-/// `ServiceAccount` / `PodDisruptionBudget` (all share
-/// [`render_relay::RELAY_NAME`]). The relay has no owner reference, so GC is this
-/// explicit delete; a `NotFound` is success.
+/// Idempotently delete a relay's `Deployment` / `Service` / `ServiceAccount` /
+/// `PodDisruptionBudget` (all share `name` — [`render_relay::RELAY_NAME`] for the
+/// dedicated tier, [`render_relay::SHARED_RELAY_NAME`] for the shared pool). A relay
+/// has no owner reference, so GC is this explicit delete; a `NotFound` is success.
+/// `pub(super)` so the shared-relay convergence in [`super::shared_install`] reuses
+/// the same teardown.
 ///
 /// # Errors
 ///
 /// Returns the underlying [`kube::Error`] for any delete that fails for a reason
 /// other than `NotFound`.
-async fn delete_relay_resources(client: &Client, namespace: &str) -> Result<(), kube::Error> {
+pub(super) async fn delete_relay_resources(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+) -> Result<(), kube::Error> {
     let dp = DeleteParams::default();
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
     let services: Api<Service> = Api::namespaced(client.clone(), namespace);
@@ -352,21 +361,23 @@ async fn delete_relay_resources(client: &Client, namespace: &str) -> Result<(), 
     // The PDB is optional (rendered only at ceiling ≥2); delete it unconditionally so GC is
     // complete whether or not one was ever provisioned (NotFound is success).
     let pdbs: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
-    ignore_not_found(deployments.delete(render_relay::RELAY_NAME, &dp).await)?;
-    ignore_not_found(services.delete(render_relay::RELAY_NAME, &dp).await)?;
-    ignore_not_found(service_accounts.delete(render_relay::RELAY_NAME, &dp).await)?;
-    ignore_not_found(pdbs.delete(render_relay::RELAY_NAME, &dp).await)?;
+    ignore_not_found(deployments.delete(name, &dp).await)?;
+    ignore_not_found(services.delete(name, &dp).await)?;
+    ignore_not_found(service_accounts.delete(name, &dp).await)?;
+    ignore_not_found(pdbs.delete(name, &dp).await)?;
     Ok(())
 }
 
 /// Saturating `usize → u32` for a registry count (a count above `u32::MAX` is
-/// nonsensical but must never wrap or panic).
-fn clamp_usize(v: usize) -> u32 {
+/// nonsensical but must never wrap or panic). `pub(super)` so the shared-relay
+/// convergence reuses the same saturation.
+pub(super) fn clamp_usize(v: usize) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
 }
 
 /// Saturating `u32 → i32` for a replica count (a count above `i32::MAX` is
-/// nonsensical but must never wrap or panic).
-fn clamp_u32_to_i32(v: u32) -> i32 {
+/// nonsensical but must never wrap or panic). `pub(super)` for the shared-relay
+/// convergence.
+pub(super) fn clamp_u32_to_i32(v: u32) -> i32 {
     i32::try_from(v).unwrap_or(i32::MAX)
 }

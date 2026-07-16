@@ -14,11 +14,21 @@
 //! signal retries from cluster state).
 
 use super::reconciler::ReconcileContext;
+use super::relay_autoscaler::{
+    RelayAction, RelayInputs, RelayNsRecord, RelayNsState, RelayTuning, initial_size,
+    should_provision,
+};
+use super::relay_params::EffectiveRelayPolicy;
+use super::relay_reconcile::{clamp_u32_to_i32, clamp_usize, delete_relay_resources};
+use super::render_relay::{self, RelayRenderInputs, RelayVariant};
 use super::render_shared_proxy::{SharedProxyRenderInputs, render_shared_proxy};
+use coxswain_core::crd::RelayAutoscaling;
+use k8s_openapi::api::apps::v1::Deployment;
+use kube::Api;
 use pingora_core::server::ShutdownWatch;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 /// Resync backstop cadence. The leadership edge + the trigger are the real
@@ -46,6 +56,10 @@ pub(crate) async fn run_shared_install_reconciler(
     if ctx.shared_proxy.name.is_empty() {
         return;
     }
+    // The node registry is the prompt driver for the shared-relay control loop
+    // (#605): a shared proxy connect/disconnect shifts the ready/subscriber gates.
+    // `None` in unit contexts, so the arm parks forever there.
+    let mut registry = ctx.node_registry.as_ref().map(|r| r.subscribe());
     let mut interval = tokio::time::interval(SHARED_INSTALL_RESYNC_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -60,6 +74,7 @@ pub(crate) async fn run_shared_install_reconciler(
                 became_leader = leadership.as_ref().is_some_and(|rx| *rx.borrow());
             }
             _ = ctx.shared_install_trigger.notified() => {}
+            _ = registry_changed(&mut registry) => {}
             _ = interval.tick() => {}
         }
         // Only the leader writes; followers idle until promotion. Both apply and
@@ -67,7 +82,21 @@ pub(crate) async fn run_shared_install_reconciler(
         // (or a leadership flap) needs no seeding — the next pass re-converges.
         if became_leader || ctx.leader.load(Ordering::Acquire) {
             reconcile_shared_pool(&ctx).await;
+            // Advance the demand-driven shared-relay control loop after the pool
+            // pass, so its provision/GC decision sees the pool's current state.
+            converge_shared_pool(&ctx, Instant::now()).await;
         }
+    }
+}
+
+/// Await the next node-registry membership change, or park forever when the
+/// registry is unwired (tests) so the `select!` arm never fires.
+async fn registry_changed(registry: &mut Option<watch::Receiver<u64>>) {
+    match registry {
+        Some(rx) => {
+            let _ = rx.changed().await;
+        }
+        None => std::future::pending().await,
     }
 }
 
@@ -128,4 +157,216 @@ async fn reconcile_shared_pool(ctx: &ReconcileContext) {
             "shared-install: failed to apply the shared proxy pool; retrying on the next resync tick"
         );
     }
+}
+
+/// Advance the single-cell **shared-pool relay** control loop one pass (#605), the
+/// shared-tier analogue of [`super::relay_reconcile`]'s per-namespace pass.
+///
+/// The demand **signal** is the shared pool's replica count
+/// ([`shared_pool_replica_signal`]) — stable across proxies repointing behind the
+/// relay, unlike a live subscriber count. The break-even + cooldown + autoscaling
+/// decision reuses the #602 [`super::relay_autoscaler`] verbatim; the shared relay
+/// has no `CoxswainRelayPolicy`, so its tuning is synthesized from the `--relay-*`
+/// flags (autoscaled between `--relay-replicas` and `--relay-max-replicas`). Make-
+/// before-break is enforced by [`RelayInputs::ready`] (the shared relay caches
+/// before the pool repoints) and [`RelayInputs::subscribers`] (the pool drains
+/// before delete), both read off the node registry. Best-effort — a failed
+/// apply/delete logs and the next pass retries.
+async fn converge_shared_pool(ctx: &ReconcileContext, now: Instant) {
+    // The shared relay exists only when tiering is on AND the pool exists. When the
+    // pool is gone the relay tears down at once (bypassing the cooldown), exactly as
+    // a genuinely-drained namespace does via `has_dedicated_gateways`.
+    let pool_present = ctx.shared_proxy.enabled && !ctx.shared_proxy_selector.is_empty();
+    let tuning = shared_relay_tuning(ctx);
+
+    let signal = shared_pool_replica_signal(ctx).await;
+    let (ready, subscribers) = match &ctx.node_registry {
+        Some(reg) => {
+            let snap = reg.load();
+            (
+                snap.shared_pool_relay_ready(),
+                clamp_usize(snap.shared_pool_relay_subscriber_count()),
+            )
+        }
+        None => (false, 0),
+    };
+    let inputs = RelayInputs {
+        signal,
+        ready,
+        subscribers,
+        has_dedicated_gateways: pool_present,
+    };
+
+    let existing = ctx.shared_relay_state.lock().clone();
+    match existing {
+        None => {
+            if should_provision(signal, &tuning) {
+                let (replicas, pdb_ceiling) = initial_size(signal, &tuning);
+                if let Err(e) = apply_shared_relay_at(ctx, replicas, pdb_ceiling).await {
+                    tracing::warn!(
+                        error = %e,
+                        "shared relay: provision apply failed; retrying next pass"
+                    );
+                    return;
+                }
+                let mut record = RelayNsRecord::existing(RelayNsState::Provisioning, replicas);
+                record.observe(now, signal, &tuning);
+                *ctx.shared_relay_state.lock() = Some(record);
+                tracing::info!(replicas, "shared relay: provisioned (awaiting Ready)");
+            }
+        }
+        Some(mut record) => {
+            record.observe(now, signal, &tuning);
+            let decision = record.decide(now, inputs, &tuning);
+            match decision.action {
+                RelayAction::None => commit_shared(ctx, record, decision.next_state, None),
+                RelayAction::Activate => {
+                    tracing::info!("shared relay: Ready — repointing the pool onto it");
+                    commit_shared(ctx, record, decision.next_state, None);
+                }
+                RelayAction::Resize {
+                    replicas,
+                    pdb_ceiling,
+                } => {
+                    if let Err(e) = apply_shared_relay_at(ctx, replicas, pdb_ceiling).await {
+                        tracing::warn!(
+                            error = %e,
+                            "shared relay: resize apply failed; retrying next pass"
+                        );
+                        return;
+                    }
+                    tracing::info!(replicas, "shared relay: resized to live pool demand");
+                    commit_shared(ctx, record, decision.next_state, Some(replicas));
+                }
+                RelayAction::StartDrain => {
+                    tracing::info!(
+                        "shared relay: below break-even past cooldown — repointing the pool back to the controller, then draining"
+                    );
+                    commit_shared(ctx, record, decision.next_state, None);
+                }
+                RelayAction::Delete => {
+                    if let Err(e) = delete_relay_resources(
+                        &ctx.client,
+                        &ctx.controller_namespace,
+                        render_relay::SHARED_RELAY_NAME,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "shared relay: teardown delete failed; retrying next pass"
+                        );
+                        return;
+                    }
+                    *ctx.shared_relay_state.lock() = None;
+                    tracing::info!("shared relay: drained (0 subscribers) — deleted");
+                }
+            }
+        }
+    }
+    // Publish the repoint gate once per pass (bumps the discovery watch only on a
+    // real Active transition, so the pool is repointed exactly then).
+    ctx.publish_shared_relay();
+}
+
+/// Synthesize the shared relay's [`RelayTuning`] from the `--relay-*` flags (#605).
+///
+/// The shared relay has no namespaced `CoxswainRelayPolicy`, so it autoscales
+/// directly off the flags: floor `--relay-replicas`, cap `--relay-max-replicas`,
+/// capacity `--relay-target-proxies-per-replica`; cooldown / stabilization /
+/// tolerance fall back to their flag defaults. `enabled: Some(false)` when tiering
+/// is off force-tears-down any running shared relay (the KEDA force-off path).
+fn shared_relay_tuning(ctx: &ReconcileContext) -> RelayTuning {
+    let floor = ctx.relay_replicas.max(1);
+    let policy = EffectiveRelayPolicy {
+        enabled: (!ctx.relay_enabled).then_some(false),
+        replicas: None,
+        resources: None,
+        pod_template: None,
+        autoscaling: Some(RelayAutoscaling::capped(
+            floor,
+            ctx.relay_max_replicas.max(floor),
+            ctx.relay_target_proxies_per_replica.max(1),
+        )),
+    };
+    RelayTuning::resolve(&policy, ctx.relay_tuning_defaults())
+}
+
+/// The shared-relay demand signal (#605): the shared pool's replica count.
+///
+/// An HPA-autoscaled pool has the HPA own `spec.replicas`, so the live count is
+/// read from the Deployment; a statically-sized pool uses its config replica count
+/// (no I/O). A disabled/unaddressable pool signals 0 (no relay). The pool's *size*
+/// — not a live subscriber count — is the signal: it stays stable when proxies
+/// repoint behind the relay, so the break-even/cooldown decision does not thrash on
+/// its own make-before-break cutover.
+async fn shared_pool_replica_signal(ctx: &ReconcileContext) -> u32 {
+    if !ctx.shared_proxy.enabled || ctx.shared_proxy_selector.is_empty() {
+        return 0;
+    }
+    if !ctx.shared_proxy.autoscaling_enabled {
+        return ctx.shared_proxy.replicas;
+    }
+    let deployments: Api<Deployment> =
+        Api::namespaced(ctx.client.clone(), &ctx.controller_namespace);
+    match deployments.get_opt(&ctx.shared_proxy.name).await {
+        Ok(dep) => dep
+            .and_then(|d| d.spec)
+            .and_then(|s| s.replicas)
+            .and_then(|r| u32::try_from(r).ok())
+            .unwrap_or(ctx.shared_proxy.autoscaling_min_replicas),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "shared relay: failed to read pool replicas; using the autoscaling floor as the signal"
+            );
+            ctx.shared_proxy.autoscaling_min_replicas
+        }
+    }
+}
+
+/// Render and server-side-apply the shared-pool relay at `replicas`/`pdb_ceiling`
+/// into the install namespace (#605). Resources come straight from the `--relay-*`
+/// flags (no namespaced policy overlay).
+async fn apply_shared_relay_at(
+    ctx: &ReconcileContext,
+    replicas: u32,
+    pdb_ceiling: u32,
+) -> Result<(), super::apply::ApplyError> {
+    let resources = render_relay::relay_resources(
+        &ctx.relay_cpu_request,
+        &ctx.relay_memory_request,
+        &ctx.relay_memory_limit,
+    );
+    let rendered = render_relay::render_relay(&RelayRenderInputs {
+        variant: RelayVariant::Shared {
+            install_namespace: &ctx.controller_namespace,
+        },
+        replicas: clamp_u32_to_i32(replicas),
+        controller_image: &ctx.controller_image,
+        discovery_bootstrap_endpoint: &ctx.discovery_bootstrap_endpoint,
+        discovery_sa_token_path: &ctx.discovery_sa_token_path,
+        discovery_ca_bundle_path: &ctx.discovery_ca_bundle_path,
+        discovery_trust_domain: &ctx.discovery_trust_domain,
+        resources,
+        pod_template: None,
+        pdb_replica_ceiling: clamp_u32_to_i32(pdb_ceiling),
+    });
+    super::apply::apply_relay(&ctx.client, &ctx.controller_namespace, &rendered).await
+}
+
+/// Commit a transitioned single-cell record: set its state and, when the action
+/// resized the Deployment, its sizing baseline (#605). Mirrors the per-namespace
+/// `commit` in [`super::relay_reconcile`].
+fn commit_shared(
+    ctx: &ReconcileContext,
+    mut record: RelayNsRecord,
+    next_state: RelayNsState,
+    replicas: Option<u32>,
+) {
+    record.state = next_state;
+    if let Some(r) = replicas {
+        record.current_replicas = r;
+    }
+    *ctx.shared_relay_state.lock() = Some(record);
 }

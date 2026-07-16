@@ -352,6 +352,46 @@ impl NodeRegistry {
             .count()
     }
 
+    /// Whether the shared-pool relay has loaded its upstream cache and is ready to
+    /// serve the pool — the shared-tier make-before-break **provision gate** (#605).
+    ///
+    /// The `Scope::SharedPool` analogue of [`Self::relay_ready`]: true once at least
+    /// one shared-relay replica (`is_relay && scope == SharedPool`) has Ack'd the
+    /// controller's current shared snapshot ([`NodeEntry::in_sync`]). The shared
+    /// relay control loop gates the pool's repoint on this, so no shared proxy is
+    /// pointed at a not-yet-serving shared relay.
+    #[must_use]
+    pub fn shared_pool_relay_ready(&self) -> bool {
+        self.nodes
+            .values()
+            .any(|e| e.is_relay && e.scope == NodeScope::SharedPool && e.in_sync())
+    }
+
+    /// Count of shared proxies still subscribed to the shared-pool relay — the
+    /// shared-tier make-before-break **teardown drain gate** (#605).
+    ///
+    /// The `Scope::SharedPool` analogue of [`Self::relay_subscriber_count`]: counts
+    /// every node whose `parent` is one of the shared-relay replicas (`is_relay &&
+    /// scope == SharedPool`). Teardown deletes the shared relay only once this
+    /// reaches 0 — every shared proxy has cut its control stream back to the
+    /// controller — so deleting it never starves a still-connected proxy.
+    #[must_use]
+    pub fn shared_pool_relay_subscriber_count(&self) -> usize {
+        let relay_ids: BTreeSet<&str> = self
+            .nodes
+            .values()
+            .filter(|e| e.is_relay && e.scope == NodeScope::SharedPool)
+            .map(|e| e.node_id.as_str())
+            .collect();
+        if relay_ids.is_empty() {
+            return 0;
+        }
+        self.nodes
+            .values()
+            .filter(|e| e.parent.as_deref().is_some_and(|p| relay_ids.contains(p)))
+            .count()
+    }
+
     /// Shared quorum core for both gates: every node matching `scope_pred` has
     /// reported a bound set covering `required`, and at least one matches. The
     /// fail-closed semantics (unreported `None` ≠ bound, empty match set fails)
@@ -1373,6 +1413,52 @@ mod tests {
             reg.load().relay_subscriber_count("ns"),
             0,
             "with no folded children the relay may be torn down"
+        );
+    }
+
+    #[test]
+    fn shared_pool_relay_ready_true_only_when_shared_relay_in_sync() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect("shared-relay", shared(), now());
+        reg.apply_roster("shared-relay", vec![leaf("leaf-1", shared(), 5, &[443])]);
+        assert!(
+            !reg.load().shared_pool_relay_ready(),
+            "a provisioned-but-unacked shared relay is not yet ready to serve the pool"
+        );
+        reg.record_target("shared-relay", "v1".to_owned());
+        reg.record_ack("shared-relay", "v1".to_owned(), 1, now());
+        assert!(
+            reg.load().shared_pool_relay_ready(),
+            "an in_sync shared-relay entry means the shared world is cached → ready"
+        );
+    }
+
+    #[test]
+    fn shared_pool_relay_subscriber_count_counts_folded_children() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect("shared-relay", shared(), now());
+        assert_eq!(
+            reg.load().shared_pool_relay_subscriber_count(),
+            0,
+            "no shared relay yet folded any proxy"
+        );
+        reg.apply_roster(
+            "shared-relay",
+            vec![
+                leaf("leaf-1", shared(), 5, &[443]),
+                leaf("leaf-2", shared(), 6, &[8443]),
+            ],
+        );
+        assert_eq!(
+            reg.load().shared_pool_relay_subscriber_count(),
+            2,
+            "both folded shared proxies are still subscribed to the shared relay"
+        );
+        reg.apply_roster("shared-relay", vec![]);
+        assert_eq!(
+            reg.load().shared_pool_relay_subscriber_count(),
+            0,
+            "with no folded children the shared relay may be torn down"
         );
     }
 

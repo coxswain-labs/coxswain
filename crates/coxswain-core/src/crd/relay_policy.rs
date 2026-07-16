@@ -181,6 +181,27 @@ pub struct RelayAutoscaling {
     pub tolerance: Option<f64>,
 }
 
+impl RelayAutoscaling {
+    /// An enabled, capped autoscaling config (#605).
+    ///
+    /// The shared-pool relay has no `CoxswainRelayPolicy` (it is global, not
+    /// namespaced), so its control loop synthesizes this from the controller flags
+    /// (`--relay-replicas` floor, `--relay-max-replicas` cap,
+    /// `--relay-target-proxies-per-replica`). The cooldown / stabilization /
+    /// tolerance stay `None` so they fall back to the flag defaults, exactly as an
+    /// unspecified policy field would.
+    #[must_use]
+    pub fn capped(min_replicas: u32, max_replicas: u32, target_proxies_per_replica: u32) -> Self {
+        Self {
+            enabled: true,
+            min_replicas: Some(min_replicas),
+            max_replicas: Some(max_replicas),
+            target_proxies_per_replica: Some(target_proxies_per_replica),
+            ..Default::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(missing_docs)]
