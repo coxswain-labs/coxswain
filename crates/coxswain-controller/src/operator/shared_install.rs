@@ -5,11 +5,13 @@
 //! Gateway or a namespace's dedicated demand — the shared pool is the install's
 //! base data plane and must exist from install with **zero Gateways**. So a
 //! single serialized task, modelled on [`super::run_vip_reconciler`], provisions
-//! the pool off config alone: the immediate first interval tick brings it up at
-//! boot, a 15s resync backstops watch lag, and per-Gateway reconciles nudge the
-//! [`super::ReconcileContext::shared_install_trigger`] for prompt convergence.
-//! Leader-gated (only the lease holder applies); best-effort per pass (a failed
-//! apply logs and the next tick retries from cluster state).
+//! the pool off config alone. It is **event-driven with a resync backstop**: the
+//! leadership edge provisions the pool the moment the controller wins the lease
+//! (no waiting for a poll tick — the base data plane must come up promptly), the
+//! [`super::ReconcileContext::shared_install_trigger`] nudges it on Gateway
+//! changes, and a 15s resync backstops any missed signal. Leader-gated (only the
+//! lease holder applies); best-effort per pass (a failed apply logs and the next
+//! signal retries from cluster state).
 
 use super::reconciler::ReconcileContext;
 use super::render_shared_proxy::{SharedProxyRenderInputs, render_shared_proxy};
@@ -17,8 +19,9 @@ use pingora_core::server::ShutdownWatch;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
+use tokio::sync::watch;
 
-/// Resync backstop cadence. The trigger + the immediate first tick are the real
+/// Resync backstop cadence. The leadership edge + the trigger are the real
 /// drivers; this bounds staleness if a signal is ever missed.
 const SHARED_INSTALL_RESYNC_INTERVAL: Duration = Duration::from_secs(15);
 
@@ -29,11 +32,16 @@ const SHARED_INSTALL_RESYNC_INTERVAL: Duration = Duration::from_secs(15);
 /// test context). Otherwise it loops, and each leader-gated pass **apply-or-
 /// deletes**: it provisions the pool when enabled with a selector, and reclaims it
 /// (idempotent, 404-tolerant delete) when disabled or unaddressable — so toggling
-/// `proxy.shared.enabled=false` removes the pool instead of orphaning it. Shutdown
-/// wins (biased); a trigger or the resync tick drives each pass.
+/// `proxy.shared.enabled=false` removes the pool instead of orphaning it.
+///
+/// `leadership` is the controller's leadership watch (`None` in tests): the
+/// false→true edge provisions the pool immediately on promotion, so a fresh
+/// leader (e.g. after a `helm upgrade` rolls the controller) brings the data
+/// plane up without waiting for the resync tick. Shutdown wins (biased).
 pub(crate) async fn run_shared_install_reconciler(
     ctx: Arc<ReconcileContext>,
     mut shutdown: ShutdownWatch,
+    mut leadership: Option<watch::Receiver<bool>>,
 ) {
     if ctx.shared_proxy.name.is_empty() {
         return;
@@ -41,18 +49,38 @@ pub(crate) async fn run_shared_install_reconciler(
     let mut interval = tokio::time::interval(SHARED_INSTALL_RESYNC_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        // `became_leader` is read straight off the watch value (not the leader
+        // AtomicBool) so the promotion edge acts without racing whichever writer
+        // updates first.
+        let mut became_leader = false;
         tokio::select! {
             biased;
             _ = shutdown.changed() => break,
+            _ = leadership_changed(&mut leadership) => {
+                became_leader = leadership.as_ref().is_some_and(|rx| *rx.borrow());
+            }
             _ = ctx.shared_install_trigger.notified() => {}
             _ = interval.tick() => {}
         }
         // Only the leader writes; followers idle until promotion. Both apply and
         // delete are idempotent against current cluster state, so a fresh leader
         // (or a leadership flap) needs no seeding — the next pass re-converges.
-        if ctx.leader.load(Ordering::Acquire) {
+        if became_leader || ctx.leader.load(Ordering::Acquire) {
             reconcile_shared_pool(&ctx).await;
         }
+    }
+}
+
+/// Await the next leadership change, or park forever when leadership is unwired
+/// (tests) so the `select!` arm never fires.
+async fn leadership_changed(leadership: &mut Option<watch::Receiver<bool>>) {
+    match leadership {
+        Some(rx) => {
+            // A closed sender (controller shutting down) ends the wait; the
+            // shutdown arm handles teardown, so treat it as a benign no-op.
+            let _ = rx.changed().await;
+        }
+        None => std::future::pending().await,
     }
 }
 

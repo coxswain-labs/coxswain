@@ -502,12 +502,13 @@ async fn read_shared_proxy_generation() -> i64 {
 /// Returns an error if the pool has not converged within 120 s.
 async fn wait_for_shared_proxy_ready(generation_before: i64) -> anyhow::Result<()> {
     let start = tokio::time::Instant::now();
-    // Longer than the controller's post-leadership re-apply latency (its ≤15 s
-    // install-reconcile tick + rollout), so a real config change advances the
-    // generation and takes the `gen > before` path *before* this fires; the grace
-    // path only catches an upgrade that left the pool spec unchanged.
-    let grace = std::time::Duration::from_secs(30);
-    let deadline = start + std::time::Duration::from_secs(150);
+    // Longer than the controller's post-leadership re-apply + rollout (it now
+    // provisions the pool on the leadership edge, not a poll tick), so a real
+    // config change advances the generation and takes the `gen > before` path
+    // *before* this fires; the grace path only catches an upgrade that left the
+    // pool spec unchanged.
+    let grace = std::time::Duration::from_secs(12);
+    let deadline = start + std::time::Duration::from_secs(120);
     loop {
         let out = Command::new("kubectl")
             .args([
