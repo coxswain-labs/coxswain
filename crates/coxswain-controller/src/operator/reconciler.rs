@@ -40,6 +40,7 @@
 //! path within watch latency without a dedicated retrigger channel.
 
 use super::relay_params::{self, EffectiveRelayPolicy};
+use super::render_shared_proxy::SharedProxyConfig;
 use super::{apply, params, render, render_relay, render_shared, status, vip};
 use crate::controller::StatusOutcome;
 use coxswain_core::Shared;
@@ -198,6 +199,21 @@ pub struct OperatorConfig {
     /// Service type for the per-Gateway shared-mode VIP Services (#472).
     /// `LoadBalancer` by default so each Gateway gets its own external address.
     pub shared_vip_service_type: ServiceType,
+    /// Controller-owned shared proxy pool configuration (#604). The install
+    /// reconcile (`run_shared_install_reconciler`) renders the pool from this +
+    /// the install-wide fields below. `enabled=false` (or an empty selector)
+    /// leaves the pool unprovisioned.
+    pub shared_proxy: SharedProxyConfig,
+    /// Health server port for the rendered shared proxy pool (`--health-port`,
+    /// mirrors the controller's own). Also the internal Service's health target.
+    pub health_port: u16,
+    /// Whether the Ingress surface is enabled install-wide (mirrors the
+    /// controller's `--disable-ingress`). Rendered onto the shared pool so it
+    /// binds exactly the listeners the install expects.
+    pub enable_ingress: bool,
+    /// Whether the Gateway API surface is enabled install-wide (mirrors the
+    /// controller's `--disable-gateway-api`).
+    pub enable_gateway_api: bool,
     /// Shared handle for publishing definitively-failed static-address VIP
     /// provisioning to the status writer (#531/#533). Constructed in
     /// `coxswain-bin` and cloned into the `Controller` too, so the single
@@ -260,7 +276,7 @@ pub struct OperatorConfig {
 #[non_exhaustive]
 pub(crate) struct ReconcileContext {
     pub(super) controller_name: String,
-    controller_image: String,
+    pub(super) controller_image: String,
     pub(super) leader: Arc<AtomicBool>,
     pub(super) client: Client,
     pub(super) class_store: MergedStore<GatewayClass>,
@@ -286,17 +302,19 @@ pub(crate) struct ReconcileContext {
     listener_status: SharedGatewayListenerStatus,
     /// Ports reserved for the Ingress data plane via the controller's CLI.
     /// Forwarded to [`super::status::build_dedicated_gateway_status_patch`]
-    /// for the listener `PortUnavailable` precedence check.
-    ingress_ports: IngressPorts,
+    /// for the listener `PortUnavailable` precedence check, and rendered onto
+    /// the shared proxy pool's container ports + listener flags (#604).
+    pub(super) ingress_ports: IngressPorts,
     /// Admin server port injected as `gateway.coxswain-labs.dev/admin-port` on
-    /// every rendered dedicated-proxy pod.
-    admin_port: u16,
+    /// every rendered dedicated-proxy pod, and the shared pool's `--admin-port`.
+    pub(super) admin_port: u16,
     /// Bootstrap endpoint + token/bundle paths + trust domain rendered into the
-    /// dedicated-proxy Deployment so it can obtain an SVID (#423).
-    discovery_bootstrap_endpoint: String,
-    discovery_sa_token_path: String,
-    discovery_ca_bundle_path: String,
-    discovery_trust_domain: String,
+    /// dedicated-proxy Deployment so it can obtain an SVID (#423). Reused
+    /// verbatim by the shared proxy pool (#604).
+    pub(super) discovery_bootstrap_endpoint: String,
+    pub(super) discovery_sa_token_path: String,
+    pub(super) discovery_ca_bundle_path: String,
+    pub(super) discovery_trust_domain: String,
     /// Controller namespace; source of the trust-bundle ConfigMap copied into
     /// out-of-namespace dedicated proxies.
     pub(super) controller_namespace: String,
@@ -319,10 +337,23 @@ pub(crate) struct ReconcileContext {
     /// provisioning (#472). See [`OperatorConfig::shared_proxy_selector`].
     pub(super) shared_proxy_selector: BTreeMap<String, String>,
     pub(super) shared_vip_service_type: ServiceType,
+    /// Controller-owned shared proxy pool config (#604). Read by the serialized
+    /// [`super::run_shared_install_reconciler`] to render + apply the pool.
+    pub(super) shared_proxy: SharedProxyConfig,
+    /// Health port + install-wide surface enablement rendered onto the shared
+    /// pool (#604), mirroring the controller's own CLI.
+    pub(super) health_port: u16,
+    pub(super) enable_ingress: bool,
+    pub(super) enable_gateway_api: bool,
     /// Signals the serialized [`run_vip_reconciler`] task to run a whole-VIP
     /// pass (#472). Per-Gateway reconciles only *signal* here — they never
     /// provision VIP Services themselves, so the allocation stays single-writer.
     pub(super) vip_trigger: Arc<tokio::sync::Notify>,
+    /// Signals the serialized [`super::run_shared_install_reconciler`] to run an
+    /// install pass (#604). Fired once at spawn (via the immediate first interval
+    /// tick) and by per-Gateway reconciles for prompt convergence; the pool is
+    /// config-keyed, so the resync tick is the real driver.
+    pub(super) shared_install_trigger: Arc<tokio::sync::Notify>,
     /// Shared-mode Gateways whose static-address VIP provisioning has
     /// definitively failed (all requested clusterIPs rejected). Written by
     /// [`run_vip_reconciler`] each pass, read by the shared-pool status writer so
@@ -402,7 +433,12 @@ impl ReconcileContext {
             namespaces_store: stores.namespaces,
             shared_proxy_selector: config.shared_proxy_selector,
             shared_vip_service_type: config.shared_vip_service_type,
+            shared_proxy: config.shared_proxy,
+            health_port: config.health_port,
+            enable_ingress: config.enable_ingress,
+            enable_gateway_api: config.enable_gateway_api,
             vip_trigger: Arc::new(tokio::sync::Notify::new()),
+            shared_install_trigger: Arc::new(tokio::sync::Notify::new()),
             vip_failures: config.vip_failures,
             node_registry: config.node_registry,
             publish_index: config.publish_index,
@@ -882,6 +918,12 @@ async fn reconcile_inner(
     // Skipped when the feature is off (no VIP task is consuming the signal).
     if !ctx.shared_proxy_selector.is_empty() {
         ctx.vip_trigger.notify_one();
+    }
+
+    // The shared pool is Gateway-independent (its own tick + resync drive it),
+    // but a Gateway edit is a free coalesced nudge to re-assert ownership sooner.
+    if ctx.shared_proxy.enabled && !ctx.shared_proxy_selector.is_empty() {
+        ctx.shared_install_trigger.notify_one();
     }
 
     let key = gateway_key(&gw);

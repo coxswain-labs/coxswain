@@ -80,6 +80,14 @@ command = ["bash", "-c", 'echo "COXSWAIN_E2E_SERIAL=1" >> "$NEXTEST_ENV"']
 # serial pass so the number reflects true uncontended convergence and the bound
 # stays a meaningful regression guard rather than a coin flip.
 #
+# Same category: `isolated_route_change_debounces_well_under_fixed_floor`
+# (observability) reads the `coxswain_controller_reconcile_debounce_seconds`
+# histogram after one isolated Ingress apply and asserts a sub-0.3 s mean wait.
+# In the parallel pass, concurrent tests churn the shared control plane so the
+# histogram folds in unrelated reconcile cycles (some at the 500 ms debounce
+# ceiling), inflating the mean past the bound — measurement contention, not a
+# regression. It runs in the serial pass so the isolated change is the only load.
+#
 # The two profiles below split on exactly this set via `default-filter`, so the
 # run command stays uniform (`-E 'binary(<suite>)'`) for both passes.
 
@@ -101,6 +109,7 @@ default-filter = '''
     | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
     | test(=timeouts_request_returns_504) | test(=timeouts_backend_request_returns_504)
     | test(=route_propagation_time_gateway_api_apply_to_first_success) | test(=route_propagation_time_ingress_apply_to_first_success)
+    | test(=isolated_route_change_debounces_well_under_fixed_floor)
     | test(=proxy_generated_forwarded_reaches_backend_and_overrides_spoof)
     | test(=cert_manager_http01_challenge_issues_and_serves_certificate)
     | test(=gateway_api_disabled_skips_gateway_reconcile) | test(=ingress_disabled_skips_ingress_reconcile)
@@ -109,6 +118,7 @@ default-filter = '''
     | test(=relay_policy_autoscaling_sizes_relay_without_hpa) | test(=relay_policy_uncapped_autoscaling_falls_back_to_static)
     | test(=namespace_relay_orphan_gcd_after_controller_restart_in_hysteresis_midrange) | test(=namespace_relay_not_provisioned_after_restart_below_threshold)
     | test(=watch_namespace_list_serves_listed_and_ignores_unlisted)
+    | test(=shared_proxy_pool_survives_helm_upgrade_without_field_manager_fight) | test(=shared_proxy_pool_absent_when_disabled)
   )
   and not binary(resilience)
   and not binary(status_conditions)
@@ -146,6 +156,7 @@ default-filter = '''
   | test(=access_log_path_mode_pattern_uses_rule_pattern) | test(=access_log_path_mode_none_omits_path) | test(=access_log_disabled_emits_nothing)
   | test(=timeouts_request_returns_504) | test(=timeouts_backend_request_returns_504)
   | test(=route_propagation_time_gateway_api_apply_to_first_success) | test(=route_propagation_time_ingress_apply_to_first_success)
+  | test(=isolated_route_change_debounces_well_under_fixed_floor)
   | test(=proxy_generated_forwarded_reaches_backend_and_overrides_spoof)
   | test(=cert_manager_http01_challenge_issues_and_serves_certificate)
   | test(=gateway_api_disabled_skips_gateway_reconcile) | test(=ingress_disabled_skips_ingress_reconcile)
@@ -154,6 +165,7 @@ default-filter = '''
   | test(=relay_policy_autoscaling_sizes_relay_without_hpa) | test(=relay_policy_uncapped_autoscaling_falls_back_to_static)
   | test(=namespace_relay_orphan_gcd_after_controller_restart_in_hysteresis_midrange) | test(=namespace_relay_not_provisioned_after_restart_below_threshold)
   | test(=watch_namespace_list_serves_listed_and_ignores_unlisted)
+  | test(=shared_proxy_pool_survives_helm_upgrade_without_field_manager_fight) | test(=shared_proxy_pool_absent_when_disabled)
   | binary(resilience)
   | binary(status_conditions)
   | binary(discovery)

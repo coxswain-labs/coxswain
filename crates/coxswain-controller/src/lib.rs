@@ -20,7 +20,7 @@ pub use controller::{
     Controller, ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress,
     StatusChannels,
 };
-pub use operator::OperatorConfig;
+pub use operator::{OperatorConfig, SharedProxyConfig};
 pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writer};
 
 /// Fixed `ServiceAccount` (and `Deployment`/`Service`) name of every

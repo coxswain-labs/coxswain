@@ -56,14 +56,18 @@ pub(crate) mod relay_params;
 pub(crate) mod render;
 pub(crate) mod render_relay;
 pub(crate) mod render_shared;
+pub(crate) mod render_shared_proxy;
 pub(crate) mod shared_alloc;
+pub(crate) mod shared_install;
 pub(crate) mod status;
 pub(crate) mod vip;
 
 pub use reconciler::OperatorConfig;
+pub use render_shared_proxy::SharedProxyConfig;
 // #574 fold: the operator no longer runs as its own `BackgroundService`. The
 // controller builds the reconcile context off the reflector's `OperatorStores`,
 // the unified worker's dedicated branch calls `reconcile_dedicated`, and the
 // controller spawns `run_vip_reconciler`.
 pub(crate) use reconciler::{ReconcileContext, reconcile_dedicated};
+pub(crate) use shared_install::run_shared_install_reconciler;
 pub(crate) use vip::run_vip_reconciler;

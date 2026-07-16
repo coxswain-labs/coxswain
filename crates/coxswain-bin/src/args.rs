@@ -26,7 +26,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
-use coxswain_controller::IngressDefaultBackend;
+use coxswain_controller::{IngressDefaultBackend, SharedProxyConfig};
 use ipnet::IpNet;
 
 /// Log output format selector.
@@ -50,6 +50,18 @@ pub(crate) enum AccessLogPathMode {
     Pattern,
     /// Omit the `path` field from the access log entirely.
     None,
+}
+
+impl AccessLogPathMode {
+    /// The `--access-log-path-mode` value string, for re-rendering onto a
+    /// provisioned pod's flags (#604).
+    pub(crate) fn as_flag_value(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Pattern => "pattern",
+            Self::None => "none",
+        }
+    }
 }
 
 /// Coxswain: a Kubernetes Ingress & Gateway API Controller built on Pingora.
@@ -479,6 +491,17 @@ fn parse_label_selector(s: &str) -> Result<BTreeMap<String, String>, String> {
     Ok(map)
 }
 
+/// Parse a `--shared-proxy-pod-template` JSON object into a [`serde_json::Value`]
+/// (#604). The chart builds this from the `proxy.shared.*` scheduling / pod-metadata
+/// values; the controller strategic-merges it onto the rendered pool pod.
+///
+/// # Errors
+///
+/// Returns the `serde_json` parse error message for malformed JSON.
+fn parse_json(s: &str) -> Result<serde_json::Value, String> {
+    serde_json::from_str(s).map_err(|e| format!("invalid pod-template JSON: {e}"))
+}
+
 /// Parse the `--shared-vip-service-type` value into a [`ServiceType`] (#472).
 ///
 /// `NodePort` is intentionally rejected: a shared-VIP NodePort maps the
@@ -571,6 +594,206 @@ pub(crate) struct ControllerArgs {
         value_parser = parse_service_type,
     )]
     pub shared_vip_service_type: ServiceType,
+
+    // ── Controller-owned shared proxy pool (#604) ──────────────────────────
+    // The shared proxy pool is provisioned by the controller (not Helm). These
+    // flags are the full-parity remap of the former `proxy.shared.*` chart
+    // values; the controller renders them onto the pool's pod. Ports, ingress /
+    // gateway-api enablement, and the discovery bootstrap material come from the
+    // controller's own `CommonArgs` (shared install-wide), not from here.
+    /// Provision the controller-owned shared proxy pool (#604).
+    ///
+    /// `true` (default) provisions the base data plane at install. `false` leaves
+    /// it unprovisioned (as does an empty `--shared-proxy-selector`, an
+    /// Ingress-only / test install).
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub shared_proxy_enabled: bool,
+
+    /// Name of the shared proxy Deployment / ServiceAccount / HPA / PDB (and the
+    /// stem of the internal Service, `<name>-internal`). Chart-supplied, release
+    /// prefixed.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_NAME",
+        default_value = "coxswain-shared-proxy"
+    )]
+    pub shared_proxy_name: String,
+
+    /// Static replica count for the shared proxy pool. Ignored under autoscaling.
+    #[arg(long, env = "COXSWAIN_SHARED_PROXY_REPLICAS", default_value_t = 1)]
+    pub shared_proxy_replicas: u32,
+
+    /// Container CPU request for the shared proxy pool. Empty omits it.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_CPU_REQUEST",
+        default_value = "100m"
+    )]
+    pub shared_proxy_cpu_request: String,
+
+    /// Container memory request for the shared proxy pool. Empty omits it.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_MEMORY_REQUEST",
+        default_value = "128Mi"
+    )]
+    pub shared_proxy_memory_request: String,
+
+    /// Container CPU limit for the shared proxy pool. Empty omits it.
+    #[arg(long, env = "COXSWAIN_SHARED_PROXY_CPU_LIMIT", default_value = "500m")]
+    pub shared_proxy_cpu_limit: String,
+
+    /// Container memory limit for the shared proxy pool. Empty omits it.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_MEMORY_LIMIT",
+        default_value = "256Mi"
+    )]
+    pub shared_proxy_memory_limit: String,
+
+    /// Provision a traffic-scaling `HorizontalPodAutoscaler` over the pool.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_AUTOSCALING_ENABLED",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub shared_proxy_autoscaling_enabled: bool,
+
+    /// HPA `minReplicas` for the shared proxy pool.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_AUTOSCALING_MIN_REPLICAS",
+        default_value_t = 2
+    )]
+    pub shared_proxy_autoscaling_min_replicas: u32,
+
+    /// HPA `maxReplicas` for the shared proxy pool.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_AUTOSCALING_MAX_REPLICAS",
+        default_value_t = 10
+    )]
+    pub shared_proxy_autoscaling_max_replicas: u32,
+
+    /// HPA target average CPU utilization percentage for the shared proxy pool.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_AUTOSCALING_TARGET_CPU",
+        default_value_t = 80
+    )]
+    pub shared_proxy_autoscaling_target_cpu: u32,
+
+    /// Worker threads per proxy service for the pool (`0` = auto).
+    #[arg(long, env = "COXSWAIN_SHARED_PROXY_THREADS", default_value_t = 0)]
+    pub shared_proxy_threads: usize,
+
+    /// Upstream keepalive pool size for the shared proxy pool.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE",
+        default_value_t = 128
+    )]
+    pub shared_proxy_upstream_keepalive_pool_size: usize,
+
+    /// Shutdown grace period for the shared proxy pool.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_SHUTDOWN_GRACE_PERIOD",
+        default_value = "30s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub shared_proxy_shutdown_grace_period: Duration,
+
+    /// Shutdown timeout for the shared proxy pool.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_SHUTDOWN_TIMEOUT",
+        default_value = "5s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub shared_proxy_shutdown_timeout: Duration,
+
+    /// Listener drain timeout for the shared proxy pool.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_LISTENER_DRAIN_TIMEOUT",
+        default_value = "30s",
+        value_parser = humantime::parse_duration,
+    )]
+    pub shared_proxy_listener_drain_timeout: Duration,
+
+    /// Global default total request timeout for the pool. Omit to disable.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_DEFAULT_REQUEST_TIMEOUT",
+        value_parser = humantime::parse_duration,
+    )]
+    pub shared_proxy_default_request_timeout: Option<Duration>,
+
+    /// Global default backend (upstream-only) request timeout. Omit to disable.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT",
+        value_parser = humantime::parse_duration,
+    )]
+    pub shared_proxy_default_backend_request_timeout: Option<Duration>,
+
+    /// Enable HAProxy PROXY protocol on the pool's Ingress listeners.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_ACCEPT_PROXY_PROTOCOL",
+        default_value_t = false,
+        action = clap::ArgAction::Set,
+    )]
+    pub shared_proxy_accept_proxy_protocol: bool,
+
+    /// CIDR ranges permitted to send PROXY headers to the pool.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_TRUSTED_SOURCES",
+        value_delimiter = ','
+    )]
+    pub shared_proxy_trusted_sources: Vec<IpNet>,
+
+    /// Controller-wide default backend for the pool (`<namespace>/<service>:<port>`).
+    #[arg(long, env = "COXSWAIN_SHARED_PROXY_INGRESS_DEFAULT_BACKEND")]
+    pub shared_proxy_ingress_default_backend: Option<IngressDefaultBackend>,
+
+    /// Enable per-request access logging on the pool.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_ACCESS_LOG",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub shared_proxy_access_log: bool,
+
+    /// What the pool's access log records in the `path` field
+    /// (`full`|`pattern`|`none`).
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_ACCESS_LOG_PATH_MODE",
+        default_value = "full"
+    )]
+    pub shared_proxy_access_log_path_mode: AccessLogPathMode,
+
+    /// Partial `PodTemplateSpec` (JSON) strategic-merged onto the shared pool pod:
+    /// scheduling (nodeSelector/tolerations/affinity/topologySpreadConstraints/
+    /// priorityClassName), pod labels/annotations, and image pull secrets. The
+    /// chart builds it from `proxy.shared.*`. Controller-managed fields (SA,
+    /// security context, discovery volumes, coxswain container) survive the merge.
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_POD_TEMPLATE",
+        value_parser = parse_json,
+    )]
+    pub shared_proxy_pod_template: Option<serde_json::Value>,
 
     /// Port the discovery gRPC server binds to.
     ///
@@ -740,6 +963,65 @@ pub(crate) struct ControllerArgs {
         value_parser = humantime::parse_duration,
     )]
     pub reconcile_debounce_max: Duration,
+}
+
+impl ControllerArgs {
+    /// Build the render-ready [`SharedProxyConfig`] the operator carries (#604)
+    /// from the `--shared-proxy-*` flags. Durations/CIDRs/enums are pre-formatted
+    /// to strings here so `coxswain-controller` stays free of `humantime`/`ipnet`
+    /// and its renderer is pure string interpolation. The selector is not on this
+    /// struct — `--shared-proxy-selector` reaches the renderer via
+    /// `OperatorConfig::shared_proxy_selector`, the single source the VIP Services
+    /// also select on.
+    pub(crate) fn shared_proxy_config(&self) -> SharedProxyConfig {
+        SharedProxyConfig {
+            enabled: self.shared_proxy_enabled,
+            name: self.shared_proxy_name.clone(),
+            replicas: self.shared_proxy_replicas,
+            cpu_request: self.shared_proxy_cpu_request.clone(),
+            memory_request: self.shared_proxy_memory_request.clone(),
+            cpu_limit: self.shared_proxy_cpu_limit.clone(),
+            memory_limit: self.shared_proxy_memory_limit.clone(),
+            autoscaling_enabled: self.shared_proxy_autoscaling_enabled,
+            autoscaling_min_replicas: self.shared_proxy_autoscaling_min_replicas,
+            autoscaling_max_replicas: self.shared_proxy_autoscaling_max_replicas,
+            autoscaling_target_cpu: self.shared_proxy_autoscaling_target_cpu,
+            threads: self.shared_proxy_threads,
+            upstream_keepalive_pool_size: self.shared_proxy_upstream_keepalive_pool_size,
+            shutdown_grace_period: humantime::format_duration(
+                self.shared_proxy_shutdown_grace_period,
+            )
+            .to_string(),
+            shutdown_timeout: humantime::format_duration(self.shared_proxy_shutdown_timeout)
+                .to_string(),
+            listener_drain_timeout: humantime::format_duration(
+                self.shared_proxy_listener_drain_timeout,
+            )
+            .to_string(),
+            default_request_timeout: self
+                .shared_proxy_default_request_timeout
+                .map(|d| humantime::format_duration(d).to_string()),
+            default_backend_request_timeout: self
+                .shared_proxy_default_backend_request_timeout
+                .map(|d| humantime::format_duration(d).to_string()),
+            accept_proxy_protocol: self.shared_proxy_accept_proxy_protocol,
+            trusted_sources: self
+                .shared_proxy_trusted_sources
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            ingress_default_backend: self
+                .shared_proxy_ingress_default_backend
+                .as_ref()
+                .map(|b| format!("{}/{}:{}", b.namespace, b.name, b.port)),
+            access_log: self.shared_proxy_access_log,
+            access_log_path_mode: self
+                .shared_proxy_access_log_path_mode
+                .as_flag_value()
+                .to_string(),
+            pod_template: self.shared_proxy_pod_template.clone(),
+        }
+    }
 }
 
 /// CA provisioning mode selector.

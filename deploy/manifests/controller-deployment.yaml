@@ -102,6 +102,19 @@ spec:
               value: "24h"
             - name: COXSWAIN_DISCOVERY_TRUST_DOMAIN
               value: "cluster.local"
+            # Shared proxy pool (#604): the controller — not this base — owns the
+            # pool Deployment/SA/HPA/PDB/internal-Service. The retained
+            # shared-proxy-service.yaml LoadBalancer selects the labels below.
+            - name: COXSWAIN_SHARED_PROXY_ENABLED
+              value: "true"
+            - name: COXSWAIN_SHARED_PROXY_SELECTOR
+              value: "app.kubernetes.io/name=coxswain,app.kubernetes.io/component=shared-proxy"
+            - name: COXSWAIN_SHARED_PROXY_NAME
+              value: "coxswain-shared-proxy"
+            - name: COXSWAIN_SHARED_PROXY_REPLICAS
+              value: "1"
+            - name: COXSWAIN_SHARED_PROXY_THREADS
+              value: "2"
           livenessProbe:
             httpGet:
               path: /healthz

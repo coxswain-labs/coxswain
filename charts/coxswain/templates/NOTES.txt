@@ -37,7 +37,7 @@ gateway Service maps 80/443 → 8080/8443. CAP_NET_BIND_SERVICE is not required.
 The shared-proxy ServiceAccount holds no Kubernetes API access — it exists
 only as a pod identity for mTLS bootstrap. Verify no coxswain RBAC is bound:
 
-  kubectl auth can-i --list --as=system:serviceaccount:{{ include "coxswain.namespace" . }}:{{ include "coxswain.sharedProxy.serviceAccountName" . }}
+  kubectl auth can-i --list --as=system:serviceaccount:{{ include "coxswain.namespace" . }}:{{ include "coxswain.sharedProxy.fullname" . }}
 
 The output should show only Kubernetes baseline grants (selfsubject* resources
 and non-resource URLs). If you see any resource rows beyond those, file a bug.

@@ -30,8 +30,8 @@
 
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, HTTPGetAction, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
-    Service, ServiceAccount, ServicePort, ServiceSpec,
+    Container, ContainerPort, PodSpec, PodTemplateSpec, ResourceRequirements, Service,
+    ServiceAccount, ServicePort, ServiceSpec,
 };
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -40,7 +40,10 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::BTreeMap;
 
-use super::render::{discovery_volume_mounts, discovery_volumes, merge_pod_template};
+use super::render::{
+    container_hardening_security_context, discovery_volume_mounts, discovery_volumes,
+    http_get_probe, merge_pod_template, pod_hardening_security_context,
+};
 
 /// Fixed name of every per-namespace relay `ServiceAccount` / `Deployment` /
 /// `Service`. One relay per namespace, so a constant name is unambiguous (no
@@ -249,8 +252,11 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
         // `downstream_serving` subsystems). A relay whose upstream `Namespace`
         // subscribe is rejected never marks `routing_table_loaded` Ready, so it
         // stays out of the Service — the sad-path signal.
-        readiness_probe: Some(relay_probe("/readyz")),
-        liveness_probe: Some(relay_probe("/healthz")),
+        readiness_probe: Some(http_get_probe("/readyz", RELAY_HEALTH_PORT)),
+        liveness_probe: Some(http_get_probe("/healthz", RELAY_HEALTH_PORT)),
+        // The relay binds only high ports (discovery 50051, health 8081), so no
+        // NET_BIND_SERVICE is needed for the non-root runtime.
+        security_context: Some(container_hardening_security_context(false)),
         resources: inputs.resources.clone(),
         volume_mounts: Some(discovery_volume_mounts()),
         ..Default::default()
@@ -263,6 +269,7 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
         }),
         spec: Some(PodSpec {
             service_account_name: Some(RELAY_NAME.to_string()),
+            security_context: Some(pod_hardening_security_context()),
             containers: vec![container],
             volumes: Some(discovery_volumes()),
             ..Default::default()
@@ -290,18 +297,6 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
             ..Default::default()
         }),
         status: None,
-    }
-}
-
-/// An HTTP GET probe against `path` on the health port.
-fn relay_probe(path: &str) -> Probe {
-    Probe {
-        http_get: Some(HTTPGetAction {
-            path: Some(path.to_string()),
-            port: IntOrString::Int(RELAY_HEALTH_PORT),
-            ..Default::default()
-        }),
-        ..Default::default()
     }
 }
 
@@ -481,6 +476,30 @@ mod tests {
             d.spec.unwrap().replicas,
             Some(1),
             "a relay must never render 0 replicas (0 = leave --relay-enabled off)"
+        );
+    }
+
+    #[test]
+    fn relay_pod_is_hardened_without_net_bind_service() {
+        let d = render_relay_deployment(&inputs());
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        assert_eq!(
+            pod.security_context.and_then(|s| s.run_as_non_root),
+            Some(true),
+            "relay pod must run as non-root"
+        );
+        let sc = pod.containers[0]
+            .security_context
+            .as_ref()
+            .expect("container security context");
+        assert_eq!(sc.read_only_root_filesystem, Some(true));
+        assert_eq!(
+            sc.capabilities.as_ref().unwrap().drop.as_deref(),
+            Some(&["ALL".to_string()][..])
+        );
+        assert!(
+            sc.capabilities.as_ref().unwrap().add.is_none(),
+            "the relay binds only high ports; no NET_BIND_SERVICE"
         );
     }
 

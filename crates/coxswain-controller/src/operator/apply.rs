@@ -29,6 +29,7 @@
 
 use super::render::RenderedSpecs;
 use super::render_relay::RenderedRelay;
+use super::render_shared_proxy::RenderedSharedProxy;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
@@ -282,6 +283,150 @@ pub(super) async fn apply_relay(
                 .map_err(ApplyError::Pdb)?;
         }
     }
+
+    Ok(())
+}
+
+/// Server-side-apply the controller-owned shared proxy pool's rendered objects
+/// (#604).
+///
+/// Sequenced ServiceAccount → internal Service → Deployment under the same
+/// `force=true` field-manager contract as [`apply_rendered`], then HPA and PDB
+/// apply-or-delete via [`ignore_not_found`] so autoscaling/PDB on↔off transitions
+/// reconcile with no extra bookkeeping. Idempotent on an unchanged pool: a second
+/// `helm upgrade` never touches these objects (they left the chart), so the
+/// controller re-asserts ownership without a field-manager fight. The external
+/// Ingress LoadBalancer Service is **not** applied here — it stays Helm-owned.
+///
+/// # Errors
+///
+/// Returns the matching [`ApplyError`] variant if the apiserver rejects the SA,
+/// internal Service, Deployment, HPA, or PDB call. On the first error the
+/// remaining applies are skipped and the next install-reconcile pass retries.
+///
+/// # Panics
+///
+/// Panics if a rendered shared-proxy resource has no `metadata.name` — a
+/// rendering invariant whose absence indicates a controller bug.
+pub(super) async fn apply_shared_proxy(
+    client: &Client,
+    namespace: &str,
+    rendered: &RenderedSharedProxy,
+) -> Result<(), ApplyError> {
+    let params = PatchParams::apply(FIELD_MANAGER).force();
+
+    let sa_name = rendered
+        .service_account
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or_else(|| panic!("invariant: rendered shared-proxy ServiceAccount has no name"));
+    let sa_api: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    sa_api
+        .patch(sa_name, &params, &Patch::Apply(&rendered.service_account))
+        .await
+        .map_err(ApplyError::ServiceAccount)?;
+
+    let svc_name = rendered
+        .internal_service
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or_else(|| panic!("invariant: rendered shared-proxy internal Service has no name"));
+    let svc_api: Api<Service> = Api::namespaced(client.clone(), namespace);
+    svc_api
+        .patch(svc_name, &params, &Patch::Apply(&rendered.internal_service))
+        .await
+        .map_err(ApplyError::Service)?;
+
+    let deploy_name = rendered
+        .deployment
+        .metadata
+        .name
+        .as_deref()
+        .unwrap_or_else(|| panic!("invariant: rendered shared-proxy Deployment has no name"));
+    let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    deploy_api
+        .patch(deploy_name, &params, &Patch::Apply(&rendered.deployment))
+        .await
+        .map_err(ApplyError::Deployment)?;
+
+    // HPA: apply-or-delete on the shared Deployment name, so an autoscaling
+    // on↔off flip reclaims the stale HPA without extra bookkeeping.
+    let hpa_api: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
+    match rendered.hpa.as_ref() {
+        Some(hpa) => {
+            let hpa_name = hpa
+                .metadata
+                .name
+                .as_deref()
+                .unwrap_or_else(|| panic!("invariant: rendered shared-proxy HPA has no name"));
+            hpa_api
+                .patch(hpa_name, &params, &Patch::Apply(hpa))
+                .await
+                .map_err(ApplyError::Hpa)?;
+        }
+        None => {
+            ignore_not_found(hpa_api.delete(deploy_name, &DeleteParams::default()).await)
+                .map_err(ApplyError::Hpa)?;
+        }
+    }
+
+    // PDB: same apply-or-delete pattern.
+    let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
+    match rendered.pdb.as_ref() {
+        Some(pdb) => {
+            let pdb_name = pdb
+                .metadata
+                .name
+                .as_deref()
+                .unwrap_or_else(|| panic!("invariant: rendered shared-proxy PDB has no name"));
+            pdb_api
+                .patch(pdb_name, &params, &Patch::Apply(pdb))
+                .await
+                .map_err(ApplyError::Pdb)?;
+        }
+        None => {
+            ignore_not_found(pdb_api.delete(deploy_name, &DeleteParams::default()).await)
+                .map_err(ApplyError::Pdb)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Delete every controller-owned shared proxy pool object by name (#604), so
+/// disabling the pool (`proxy.shared.enabled=false`) or clearing its selector
+/// reclaims it instead of orphaning it. Idempotent: each delete is 404-tolerant,
+/// so a never-provisioned install (or a repeated pass) is a harmless no-op. The
+/// retained Ingress LoadBalancer Service is Helm-owned and left untouched.
+///
+/// # Errors
+///
+/// Returns the matching [`ApplyError`] variant if a delete fails for a reason
+/// other than 404 Not Found.
+pub(super) async fn delete_shared_proxy(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+) -> Result<(), ApplyError> {
+    let dp = DeleteParams::default();
+    let internal = format!("{name}-internal");
+
+    let hpa_api: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
+    ignore_not_found(hpa_api.delete(name, &dp).await).map_err(ApplyError::Hpa)?;
+
+    let pdb_api: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
+    ignore_not_found(pdb_api.delete(name, &dp).await).map_err(ApplyError::Pdb)?;
+
+    let deploy_api: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+    ignore_not_found(deploy_api.delete(name, &dp).await).map_err(ApplyError::Deployment)?;
+
+    let svc_api: Api<Service> = Api::namespaced(client.clone(), namespace);
+    ignore_not_found(svc_api.delete(&internal, &dp).await).map_err(ApplyError::Service)?;
+
+    let sa_api: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    ignore_not_found(sa_api.delete(name, &dp).await).map_err(ApplyError::ServiceAccount)?;
 
     Ok(())
 }

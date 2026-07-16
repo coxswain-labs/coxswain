@@ -794,6 +794,7 @@ dependencies = [
  "pingora-proxy",
  "reqwest",
  "rustls",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
