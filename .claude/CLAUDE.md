@@ -19,33 +19,31 @@ Roadmap: [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projec
 
 **Coxswain** is a pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora). It watches `Ingress` and `Gateway API` resources and dynamically routes traffic without a full reload.
 
-Coxswain ships as two cooperating pod roles:
+Coxswain ships as three cooperating pod roles:
 - `serve controller` — leader-elected status writer; cluster-wide reads + `*/status` writes.
-- `serve proxy --shared` — read-only data plane; the ServiceAccount holds zero write verbs.
+- `serve proxy --shared` / `--dedicated` — read-only HTTP/TCP/UDP data plane; the ServiceAccount holds zero write verbs.
+- `serve relay --shared` / `--namespace=NS` — Kube-free discovery fan-out node; relays delta snapshots from the controller to proxy replicas without watching the cluster itself.
 
-Production deployments always pick a role explicitly; bare `coxswain serve` errors with clap help. The Dockerfile has no `CMD`. For local development run both roles in separate terminals — `serve controller` and `serve proxy --shared`.
+Production deployments always pick a role explicitly; bare `coxswain serve` errors with clap help. The Dockerfile has no `CMD`. For local development run each role you need in a separate terminal — most commonly `serve controller` and `serve proxy --shared`.
 
 ## Architecture
 
-Eight crates with a strict dependency order:
+Ten crates. Dependency edges (measured from each crate's `[dependencies]`):
 
 ```
-coxswain-bin
-  ├── coxswain-controller
-  │     ├── coxswain-core
-  │     └── coxswain-reflector
-  ├── coxswain-proxy
-  │     ├── coxswain-core
-  │     └── coxswain-reflector
-  ├── coxswain-reflector
-  │     └── coxswain-core
-  ├── coxswain-health
-  ├── coxswain-admin
-  │     └── coxswain-core
-  └── (coxswain-e2e — black-box tests, not a runtime dep)
+coxswain-bin        → core, reflector, admin, controller, discovery, health, proxy
+coxswain-controller → core, discovery, reflector
+coxswain-proxy      → core
+coxswain-reflector  → core, gateway-api-types
+coxswain-admin      → core, gateway-api-types
+coxswain-health     → core
+coxswain-discovery  → core
+coxswain-core       → (none)
+gateway-api-types   → (none)
+(coxswain-e2e       — black-box tests, not a runtime dep)
 ```
 
-`coxswain-proxy` and `coxswain-controller` never depend on each other. The read-only-proxy invariant is enforced at RBAC (proxy SA holds zero write verbs) AND at the crate graph (the proxy never imports the controller). Per-crate responsibilities live in each crate's `src/lib.rs` `//!` header.
+`coxswain-proxy` and `coxswain-controller` never depend on each other, and `proxy` depends on `core` only — not `reflector`, not `discovery`. The read-only-proxy invariant is enforced at RBAC (proxy SA holds zero write verbs) AND at the crate graph (the proxy never imports the controller or the reflector). Per-crate responsibilities live in each crate's `src/lib.rs` `//!` header.
 
 ## Operator UI
 
@@ -106,9 +104,20 @@ coxswain-bin
 
 ### Hot path
 
-Proxy request path (`Proxy::request_filter`, `upstream_peer`, `filter::FilterSet::apply_request_filters`, `filter::FilterSet::apply_response_filters`) is performance-critical:
+Coxswain has four per-event data planes; each is performance-critical at its own event rate, and every rule below (no per-event allocation beyond a capture set, no lock/`.await` held across the event, degrade-don't-panic) applies to all four — an unnamed plane is an unaudited plane:
 
-- Capture immutable request data at `request_filter` entry: `host` and `path` as `Arc<str>`, `query` as `Option<String>` — 3 allocations per request, max.
+| Plane | Rate | Code |
+|---|---|---|
+| HTTP request | per **request** | `crates/coxswain-proxy/src/hooks.rs`, `filters/`, `routing/` |
+| UDP datagram | per **datagram** — highest event rate in the product | `crates/coxswain-proxy/src/edge/udp.rs` |
+| TCP / TLS passthrough / terminate | per **connection** | `crates/coxswain-proxy/src/edge/{tcp,passthrough,terminate}.rs` |
+| Relay / discovery fan-out | per **message × per subscriber** | `crates/coxswain-discovery/src/server.rs` |
+
+The relay is a data plane, not a control-plane convenience — the codebase already calls it "the delta-fan-out path" (`operator/render_shared_proxy.rs`, `render_relay.rs`) and `crates/coxswain-discovery/benches/relay_fanout.rs` (#603) load-tests it.
+
+HTTP request path (`Proxy::request_filter`, `upstream_peer`, `filter::FilterSet::apply_request_filters`, `filter::FilterSet::apply_response_filters`):
+
+- Capture immutable request data at `request_filter` entry: `host` and `path` as `Arc<str>`, `query` as `Option<String>`. Do not assert a per-request allocation count in prose — the counting-allocator budget gate (#620) pins the measured baseline instead.
 - Routing lookup, upstream selection, metric emission, and access-log path allocate nothing beyond the capture set. Render `u16` labels (port, status) via `itoa::Buffer` — never `.to_string()`.
 - TLS connections allocate one SNI hostname `String` per outbound connection (Pingora's `HttpPeer` requires owned). Per connection, not per request; cleartext upstreams skip it.
 - Access-log `SocketAddr::to_string()` allocates exactly once per request, only when `--access-log=on`. Operators silencing the log skip it.
