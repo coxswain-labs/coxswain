@@ -326,6 +326,32 @@ Post the script's output as a comment on the relevant GitHub issue (e.g. #513, o
 
 ---
 
+## Relay fan-out load test
+
+A relay replica is a fan-out cache — one upstream stream in, broadcast to N downstream subscribers — so its real capacity is bounded by egress/serialization cost and failover blast radius, not compute. `--relay-target-proxies-per-replica` (the relay autoscaler's capacity ratio) is set from a measured knee in that cost, not a guess (#603). **The measured number is not committed to this repo** — it's environment-dependent (machine cores, OrbStack vs CI, background load) — so re-run the harness and post the output as a #603 comment rather than trusting a stale snapshot.
+
+Not a `criterion` micro-bench: a relay's cost is I/O on change, not a hot function, so the harness drives real gRPC connections against a real child OS process instead.
+
+```bash
+# Release build for accurate CPU/mem numbers — debug-mode overhead skews both.
+cargo build --release -p coxswain-discovery --bench relay_fanout
+
+# Full default sweep (N = 10,50,100,250,500,1000 x churn = 0,1,10 changes/sec,
+# 10s per cell) — takes several minutes.
+./target/release/deps/relay_fanout-* --world-size 500
+
+# Narrower sweep for a quick check.
+./target/release/deps/relay_fanout-* --subscribers 100,500 --churn-rates 0,10 --duration-secs 5
+```
+
+Each row is one (subscriber count, churn rate) cell: p50/p99 change-to-delivery latency, the relay child process's average CPU/mem (sampled via `sysinfo`, isolated from the driver's own usage), and aggregate egress bytes/sec (`Σ Message::encoded_len()` over every delivered snapshot — no server-side instrumentation needed). Idle-mode latency prints `-`: there's no churn event to time, only connection-hold steady-state cost.
+
+Pick the default from where cost stays comfortably safe under the worst-case (highest churn) row — not at the edge of the observed range, since a relay's capacity ratio is deliberately conservative relative to failover blast radius (a dead replica's subscribers all reconnect to a survivor at once). Wire the result into `crates/coxswain-bin/src/args.rs`'s `relay_target_proxies_per_replica` default (+ doc comment), `charts/coxswain/values.yaml`'s `relay.targetProxiesPerReplica`, and the CRD doc string in `crates/coxswain-core/src/crd/relay_policy.rs` (regenerate both CRD YAMLs per that file's `committed_manifest_crd_matches_generator` test failure message — never hand-edit them).
+
+Re-tune once v0.6 delta/EDS snapshot updates land — the harness only exercises full-snapshot push today, and the knee moves a lot under deltas.
+
+---
+
 ## Troubleshooting
 
 ### macOS: BoringSSL build setup
