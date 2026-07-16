@@ -922,7 +922,7 @@ async fn reconcile_inner(
 
     // The shared pool is Gateway-independent (its own tick + resync drive it),
     // but a Gateway edit is a free coalesced nudge to re-assert ownership sooner.
-    if ctx.shared_proxy.enabled && !ctx.shared_proxy.selector.is_empty() {
+    if ctx.shared_proxy.enabled && !ctx.shared_proxy_selector.is_empty() {
         ctx.shared_install_trigger.notify_one();
     }
 

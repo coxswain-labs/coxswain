@@ -60,7 +60,7 @@ pub(crate) async fn run_shared_install_reconciler(
 /// selector (the chart couples the two); otherwise reclaims any previously
 /// provisioned pool. Best-effort — a failure logs and the next tick retries.
 async fn reconcile_shared_pool(ctx: &ReconcileContext) {
-    if !ctx.shared_proxy.enabled || ctx.shared_proxy.selector.is_empty() {
+    if !ctx.shared_proxy.enabled || ctx.shared_proxy_selector.is_empty() {
         if let Err(e) = super::apply::delete_shared_proxy(
             &ctx.client,
             &ctx.controller_namespace,
@@ -77,6 +77,7 @@ async fn reconcile_shared_pool(ctx: &ReconcileContext) {
     }
     let inputs = SharedProxyRenderInputs {
         config: &ctx.shared_proxy,
+        selector: &ctx.shared_proxy_selector,
         namespace: &ctx.controller_namespace,
         controller_image: &ctx.controller_image,
         discovery_bootstrap_endpoint: &ctx.discovery_bootstrap_endpoint,

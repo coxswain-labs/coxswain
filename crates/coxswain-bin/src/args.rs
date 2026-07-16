@@ -969,13 +969,14 @@ impl ControllerArgs {
     /// Build the render-ready [`SharedProxyConfig`] the operator carries (#604)
     /// from the `--shared-proxy-*` flags. Durations/CIDRs/enums are pre-formatted
     /// to strings here so `coxswain-controller` stays free of `humantime`/`ipnet`
-    /// and its renderer is pure string interpolation. The `selector` mirrors
-    /// `--shared-proxy-selector` — the same label set the VIP Services select on.
+    /// and its renderer is pure string interpolation. The selector is not on this
+    /// struct — `--shared-proxy-selector` reaches the renderer via
+    /// `OperatorConfig::shared_proxy_selector`, the single source the VIP Services
+    /// also select on.
     pub(crate) fn shared_proxy_config(&self) -> SharedProxyConfig {
         SharedProxyConfig {
             enabled: self.shared_proxy_enabled,
             name: self.shared_proxy_name.clone(),
-            selector: self.shared_proxy_selector.clone(),
             replicas: self.shared_proxy_replicas,
             cpu_request: self.shared_proxy_cpu_request.clone(),
             memory_request: self.shared_proxy_memory_request.clone(),

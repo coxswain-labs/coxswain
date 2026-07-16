@@ -18,8 +18,8 @@
 //! ## Selector bridge
 //!
 //! The pods carry exactly the label set the install passes as
-//! [`SharedProxyConfig::selector`] (`--shared-proxy-selector`). The Deployment's
-//! own `spec.selector`, the retained Helm-owned Ingress LoadBalancer Service, and
+//! `--shared-proxy-selector` (threaded in via [`SharedProxyRenderInputs::selector`]).
+//! The Deployment's own `spec.selector`, the retained Helm-owned Ingress LoadBalancer Service, and
 //! every per-Gateway shared-mode VIP Service ([`super::render_shared`]) all select
 //! on that same set — so moving ownership never changes which pods answer traffic.
 //!
@@ -77,11 +77,6 @@ pub struct SharedProxyConfig {
     /// of the internal Service (`<name>-internal`). Chart-supplied, release-name
     /// prefixed (e.g. `coxswain-shared-proxy`).
     pub name: String,
-    /// Pod label set — the selector bridge. Stamped on the pod template and used
-    /// verbatim as the Deployment's `spec.selector`, the retained Ingress LB
-    /// Service selector, and every per-Gateway VIP Service selector. Empty
-    /// disables the pool (there is nothing to select).
-    pub selector: BTreeMap<String, String>,
     /// Static replica count. Ignored (the field is omitted so the HPA owns it)
     /// when [`Self::autoscaling_enabled`].
     pub replicas: u32,
@@ -145,6 +140,12 @@ pub struct SharedProxyConfig {
 pub(crate) struct SharedProxyRenderInputs<'a> {
     /// The proxy-specific knob bundle.
     pub config: &'a SharedProxyConfig,
+    /// The selector bridge (`--shared-proxy-selector`): the label set stamped on
+    /// the pool's pods and used as the Deployment/internal-Service/PDB
+    /// `spec.selector`. The same map backs the per-Gateway VIP Services and the
+    /// retained Ingress LB Service, so all agree. Sourced from the reconcile
+    /// context's `shared_proxy_selector` — one source, not duplicated on the config.
+    pub selector: &'a BTreeMap<String, String>,
     /// Install namespace the pool is provisioned into (the controller's own).
     pub namespace: &'a str,
     /// Container image (the controller's own image, version-pinned).
@@ -195,8 +196,8 @@ pub(crate) struct RenderedSharedProxy {
 /// controller `managed-by` marker. The selector set is a subset, so it can back
 /// the Deployment/Service `spec.selector` while `managed-by` rides along on
 /// metadata only.
-fn shared_proxy_labels(config: &SharedProxyConfig) -> BTreeMap<String, String> {
-    let mut labels = config.selector.clone();
+fn shared_proxy_labels(selector: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut labels = selector.clone();
     labels.insert(
         "app.kubernetes.io/managed-by".to_string(),
         "coxswain".to_string(),
@@ -204,11 +205,15 @@ fn shared_proxy_labels(config: &SharedProxyConfig) -> BTreeMap<String, String> {
     labels
 }
 
-fn shared_proxy_metadata(name: &str, namespace: &str, config: &SharedProxyConfig) -> ObjectMeta {
+fn shared_proxy_metadata(
+    name: &str,
+    namespace: &str,
+    selector: &BTreeMap<String, String>,
+) -> ObjectMeta {
     ObjectMeta {
         name: Some(name.to_string()),
         namespace: Some(namespace.to_string()),
-        labels: Some(shared_proxy_labels(config)),
+        labels: Some(shared_proxy_labels(selector)),
         // No owner reference: the shared pool is the base data plane, not owned by
         // any Gateway. Its lifecycle is the config-keyed install reconcile.
         ..Default::default()
@@ -223,7 +228,7 @@ fn internal_service_name(config: &SharedProxyConfig) -> String {
 /// Render the zero-verb shared-proxy `ServiceAccount` with token automount off.
 fn render_shared_proxy_service_account(inputs: &SharedProxyRenderInputs<'_>) -> ServiceAccount {
     ServiceAccount {
-        metadata: shared_proxy_metadata(&inputs.config.name, inputs.namespace, inputs.config),
+        metadata: shared_proxy_metadata(&inputs.config.name, inputs.namespace, inputs.selector),
         automount_service_account_token: Some(false),
         ..Default::default()
     }
@@ -415,7 +420,7 @@ fn render_shared_proxy_deployment(inputs: &SharedProxyRenderInputs<'_>) -> Deplo
 
     let base_pod_template = PodTemplateSpec {
         metadata: Some(ObjectMeta {
-            labels: Some(shared_proxy_labels(config)),
+            labels: Some(shared_proxy_labels(inputs.selector)),
             annotations: Some(annotations),
             ..Default::default()
         }),
@@ -449,11 +454,11 @@ fn render_shared_proxy_deployment(inputs: &SharedProxyRenderInputs<'_>) -> Deplo
     };
 
     Deployment {
-        metadata: shared_proxy_metadata(&config.name, inputs.namespace, config),
+        metadata: shared_proxy_metadata(&config.name, inputs.namespace, inputs.selector),
         spec: Some(DeploymentSpec {
             replicas,
             selector: LabelSelector {
-                match_labels: Some(config.selector.clone()),
+                match_labels: Some(inputs.selector.clone()),
                 ..Default::default()
             },
             template: pod_template,
@@ -479,11 +484,11 @@ fn render_shared_proxy_internal_service(inputs: &SharedProxyRenderInputs<'_>) ->
         metadata: shared_proxy_metadata(
             &internal_service_name(inputs.config),
             inputs.namespace,
-            inputs.config,
+            inputs.selector,
         ),
         spec: Some(ServiceSpec {
             type_: Some("ClusterIP".to_string()),
-            selector: Some(inputs.config.selector.clone()),
+            selector: Some(inputs.selector.clone()),
             ports: Some(vec![
                 ServicePort {
                     name: Some("health".to_string()),
@@ -532,7 +537,7 @@ fn render_shared_proxy_hpa(
         ..Default::default()
     }];
     Some(HorizontalPodAutoscaler {
-        metadata: shared_proxy_metadata(&config.name, inputs.namespace, config),
+        metadata: shared_proxy_metadata(&config.name, inputs.namespace, inputs.selector),
         spec: HorizontalPodAutoscalerSpec {
             scale_target_ref: CrossVersionObjectReference {
                 api_version: Some("apps/v1".to_string()),
@@ -564,11 +569,11 @@ fn render_shared_proxy_pdb(inputs: &SharedProxyRenderInputs<'_>) -> Option<PodDi
         return None;
     }
     Some(PodDisruptionBudget {
-        metadata: shared_proxy_metadata(&config.name, inputs.namespace, config),
+        metadata: shared_proxy_metadata(&config.name, inputs.namespace, inputs.selector),
         spec: Some(PodDisruptionBudgetSpec {
             max_unavailable: Some(IntOrString::Int(1)),
             selector: Some(LabelSelector {
-                match_labels: Some(config.selector.clone()),
+                match_labels: Some(inputs.selector.clone()),
                 ..Default::default()
             }),
             ..Default::default()
@@ -614,7 +619,6 @@ mod tests {
         SharedProxyConfig {
             enabled: true,
             name: "coxswain-shared-proxy".to_string(),
-            selector: selector(),
             replicas: 1,
             cpu_request: "100m".to_string(),
             memory_request: "128Mi".to_string(),
@@ -641,8 +645,12 @@ mod tests {
     }
 
     fn inputs(config: &SharedProxyConfig) -> SharedProxyRenderInputs<'_> {
+        // Leak a selector so the returned inputs can borrow it for the test's
+        // lifetime without threading a separate binding through every call site.
+        let selector: &'static BTreeMap<String, String> = Box::leak(Box::new(selector()));
         SharedProxyRenderInputs {
             config,
+            selector,
             namespace: "coxswain-system",
             controller_image: "ghcr.io/coxswain-labs/coxswain:test",
             discovery_bootstrap_endpoint: "https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052",
@@ -760,12 +768,12 @@ mod tests {
         let spec = d.spec.expect("spec");
         assert_eq!(
             spec.selector.match_labels.as_ref(),
-            Some(&c.selector),
+            Some(&selector()),
             "the selector bridge: Deployment must select exactly the labels the LB/VIP Services select on"
         );
         // Pod labels must be a superset of the selector so pods actually match.
         let pod_labels = spec.template.metadata.unwrap().labels.unwrap();
-        for (k, v) in &c.selector {
+        for (k, v) in &selector() {
             assert_eq!(pod_labels.get(k), Some(v), "pod missing selector label {k}");
         }
     }
@@ -1003,7 +1011,7 @@ mod tests {
         );
         let spec = svc.spec.expect("spec");
         assert_eq!(spec.type_.as_deref(), Some("ClusterIP"));
-        assert_eq!(spec.selector.as_ref(), Some(&c.selector));
+        assert_eq!(spec.selector.as_ref(), Some(&selector()));
         let names: Vec<_> = spec
             .ports
             .expect("ports")
