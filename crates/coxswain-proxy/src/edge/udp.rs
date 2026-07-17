@@ -82,11 +82,11 @@
 //! i.e. re-establishment churn.
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
 use tokio::net::UdpSocket;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -140,13 +140,30 @@ const SESSION_REPLY_BUF: usize = MAX_DATAGRAM;
 /// `coxswain_proxy_udp_datagrams_dropped_total` is the signal for that.
 const MAX_CONCURRENT_SESSIONS: usize = 2048;
 
+/// Monotonic base for the coarse-millis `last_seen` stamp.
+///
+/// Initialised on first UDP activity. `UdpSession::last_seen` stores
+/// milliseconds elapsed since this instant as a plain `AtomicU64`, so the
+/// per-datagram activity bump is a single relaxed store rather than a
+/// `parking_lot::Mutex` lock/unlock on the product's highest-rate plane (#620).
+static UDP_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Milliseconds since [`UDP_EPOCH`]. Coarse-millis resolution is ample for an
+/// idle-timeout comparison and `u64` millis never overflows in any real uptime.
+fn epoch_millis() -> u64 {
+    // `as` saturates conceptually here: elapsed millis fit in u64 for ~584M years.
+    UDP_EPOCH.elapsed().as_millis() as u64
+}
+
 /// One tracked client flow: the backend-bound socket and last-activity stamp.
 ///
 /// `last_seen` is read by the reply-pump task on every idle-timeout tick to
-/// distinguish "genuinely idle" from "a fresh datagram raced the timeout".
+/// distinguish "genuinely idle" from "a fresh datagram raced the timeout". It is
+/// a lock-free [`AtomicU64`] of [`epoch_millis`] — no invariant couples it to
+/// `upstream`, so relaxed load/store is correct.
 struct UdpSession {
     upstream: UdpSocket,
-    last_seen: Mutex<Instant>,
+    last_seen: AtomicU64,
 }
 
 type SessionMap = DashMap<SocketAddr, Arc<UdpSession>>;
@@ -390,7 +407,7 @@ fn handle_datagram(state: ListenerState<'_>, client: SocketAddr, payload: &[u8])
     if let Some(entry) = sessions.get(&client) {
         let session = Arc::clone(&entry);
         drop(entry);
-        *session.last_seen.lock() = Instant::now();
+        session.last_seen.store(epoch_millis(), Ordering::Relaxed);
         if let Err(e) = session.upstream.try_send(payload) {
             debug!(
                 peer = %client,
@@ -515,7 +532,7 @@ async fn establish_and_run_session(pending: PendingSession) {
 
     let session = Arc::new(UdpSession {
         upstream,
-        last_seen: Mutex::new(Instant::now()),
+        last_seen: AtomicU64::new(epoch_millis()),
     });
     if let Err(e) = session.upstream.send(&payload).await {
         debug!(
@@ -594,7 +611,9 @@ async fn run_reply_pump(
                 // Idle-timeout tick: a fresh client datagram may have bumped
                 // `last_seen` after this recv() was already parked, so check
                 // real elapsed idle time before tearing down.
-                if session.last_seen.lock().elapsed() >= idle_timeout {
+                let idle_ms = idle_timeout.as_millis() as u64;
+                let last = session.last_seen.load(Ordering::Relaxed);
+                if epoch_millis().saturating_sub(last) >= idle_ms {
                     break;
                 }
             }
@@ -623,7 +642,7 @@ mod tests {
             .expect("loopback bind succeeds in tests");
         Arc::new(UdpSession {
             upstream,
-            last_seen: Mutex::new(Instant::now()),
+            last_seen: AtomicU64::new(epoch_millis()),
         })
     }
 

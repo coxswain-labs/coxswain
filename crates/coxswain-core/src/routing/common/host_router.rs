@@ -41,9 +41,9 @@ pub struct RouteMatch {
     /// Per-route request body size limit in bytes (`None` = unlimited).
     pub max_body_size: Option<u64>,
     /// Per-route source-IP allow-list (`None` = admit all source IPs).
-    pub allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    pub allow_source_range: Option<Arc<[ipnet::IpNet]>>,
     /// Per-route source-IP block list (`None` = block nothing; deny checked before allow).
-    pub deny_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    pub deny_source_range: Option<Arc<[ipnet::IpNet]>>,
     /// Per-class access-log enabled override (`None` = inherit proxy-wide flag).
     ///
     /// Populated from `RouteEntry::access_log_enabled`. `Some(false)` suppresses

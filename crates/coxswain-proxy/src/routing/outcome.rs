@@ -47,14 +47,23 @@ pub(crate) async fn resolve_outcome(
                 .unwrap_or_else(|e| tracing::error!("failed to write error response: {e}"));
             Ok(None)
         }
-        RouteOutcome::NoHost => Err(pingora_core::Error::explain(
-            HTTPStatus(404),
-            format!("no route for host {host}"),
-        )),
-        RouteOutcome::NoPath => Err(pingora_core::Error::explain(
-            HTTPStatus(404),
-            format!("no route for path {path} on host {host}"),
-        )),
+        // Miss variants carry a `&'static str` context — the attacker-controlled
+        // host/path go into lazy `tracing` fields (formatted only when the debug
+        // subscriber is on), never a per-miss `format!` heap `String`.
+        RouteOutcome::NoHost => {
+            tracing::debug!(%host, "404 miss: no route for host");
+            Err(pingora_core::Error::explain(
+                HTTPStatus(404),
+                "no route for host",
+            ))
+        }
+        RouteOutcome::NoPath => {
+            tracing::debug!(%host, %path, "404 miss: no route for path on host");
+            Err(pingora_core::Error::explain(
+                HTTPStatus(404),
+                "no route for path on host",
+            ))
+        }
         // `RouteOutcome` is cross-crate `#[non_exhaustive]`: a variant added in
         // coxswain-core compiles clean here and would reach this arm at runtime on the
         // data plane. Degrade to a 500 rather than panicking (zero-crash-site bar).

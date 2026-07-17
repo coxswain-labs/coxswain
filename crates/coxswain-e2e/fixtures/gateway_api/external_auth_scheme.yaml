@@ -1,0 +1,103 @@
+# CoxswainExternalAuth gRPC scheme check (#620). Apply backends::ECHO and
+# backends::SCHEME_AUTHZ first.
+#
+# One Gateway with two listeners on the same class:
+#   * https (Terminate) on GATEWAY_HTTPS_PORT, host HTTPS_HOSTNAME
+#   * http on GATEWAY_HTTP_PORT, host HTTP_HOSTNAME
+# Both routes carry the same CoxswainExternalAuth(GRPC → scheme-authz:9000)
+# ExtensionRef filter. scheme-authz ALLOWS iff the CheckRequest scheme is
+# "https", so:
+#   * an HTTPS request → proxy reports scheme=https → allowed → echo-a (200),
+#   * an HTTP request  → proxy reports scheme=http  → denied  → 403.
+# This proves the proxy sends the real downstream scheme, not a hard-coded one.
+#
+# Placeholders: TESTNS, HTTPS_HOSTNAME, HTTP_HOSTNAME, SECRET_NAME,
+# TLS_CRT_B64, TLS_KEY_B64.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${SECRET_NAME}
+type: kubernetes.io/tls
+data:
+  tls.crt: ${TLS_CRT_B64}
+  tls.key: ${TLS_KEY_B64}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-extauth-scheme
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: https
+      port: ${GATEWAY_HTTPS_PORT}
+      protocol: HTTPS
+      hostname: "${HTTPS_HOSTNAME}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            name: ${SECRET_NAME}
+      allowedRoutes:
+        namespaces:
+          from: Same
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      hostname: "${HTTP_HOSTNAME}"
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
+metadata:
+  name: extauth-scheme
+spec:
+  protocol: GRPC
+  backendRef:
+    name: scheme-authz
+    port: 9000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: extauth-scheme-https
+spec:
+  parentRefs:
+    - name: coxswain-extauth-scheme
+      sectionName: https
+  hostnames:
+    - "${HTTPS_HOSTNAME}"
+  rules:
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: ExternalAuth
+            name: extauth-scheme
+      backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: extauth-scheme-http
+spec:
+  parentRefs:
+    - name: coxswain-extauth-scheme
+      sectionName: http
+  hostnames:
+    - "${HTTP_HOSTNAME}"
+  rules:
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: ExternalAuth
+            name: extauth-scheme
+      backendRefs:
+        - name: echo-a
+          port: 3000

@@ -1,11 +1,13 @@
 //! Cache for pre-parsed upstream TLS objects used by `BackendTLSPolicy` and GEP-3155.
 //!
 //! `X509::stack_from_pem` and `CertKey::new` are called at most once per distinct
-//! `group_key`. The Mutex is never held across an `.await` point — `upstream_peer`
-//! calls `get_or_parse` synchronously.
+//! `group_key`. Each cache is a [`GroupKeyCache`] over a `DashMap`, so the
+//! per-request read on the upstream-TLS path takes only a sharded read-lock —
+//! never one process-wide `Mutex` — and never crosses an `.await` point
+//! (`upstream_peer` calls the getters synchronously).
 
 use coxswain_core::routing::{SubjectAltName, UpstreamCa, UpstreamTls, san_set_matches};
-use parking_lot::Mutex;
+use dashmap::DashMap;
 use pingora_core::protocols::tls::CaType;
 use pingora_core::protocols::tls::HandshakeCompleteHook;
 use pingora_core::tls::{pkey::PKey, x509::X509};
@@ -13,8 +15,48 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::utils::tls::CertKey;
 use pingora_core::{HTTPStatus, Result};
 use std::any::Any;
-use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Lock-free-read cache keyed by `group_key`, shared by the three upstream-TLS
+/// caches below.
+///
+/// Backed by a `DashMap`, so concurrent per-request reads hit sharded locks
+/// instead of one global `Mutex`. Values are `Arc`-like clone handles; the
+/// expensive build (PEM parse, closure allocation) is always done by the caller
+/// *outside* any lock, then handed to [`GroupKeyCache::get_or_insert`], which
+/// holds a shard write-lock only for the map insert.
+struct GroupKeyCache<T>(DashMap<u64, T>);
+
+// Manual `Default` (not derived): the derive would add a spurious `T: Default`
+// bound, but the values (`Arc<dyn Fn…>`, `Arc<CertKey>`) are not `Default` and
+// never need to be — an empty `DashMap` requires nothing of `T`.
+impl<T> Default for GroupKeyCache<T> {
+    fn default() -> Self {
+        Self(DashMap::new())
+    }
+}
+
+impl<T: Clone> GroupKeyCache<T> {
+    /// Cached value for `group_key`, or `None` if not yet built.
+    fn get(&self, group_key: u64) -> Option<T> {
+        self.0.get(&group_key).map(|e| e.value().clone())
+    }
+
+    /// Store `value` for `group_key` and return it, unless another thread raced
+    /// an insert between the caller's miss and this call — then return theirs.
+    ///
+    /// Not atomic (a plain `get` then `insert`, avoiding the write-locking
+    /// `DashMap::entry`), which is fine here: every thread parses an *equivalent*
+    /// value for a given `group_key`, so a benign race just does redundant parse
+    /// work and the last writer wins with an identical object.
+    fn get_or_insert(&self, group_key: u64, value: T) -> T {
+        if let Some(existing) = self.get(group_key) {
+            return existing;
+        }
+        self.0.insert(group_key, value.clone());
+        value
+    }
+}
 
 /// Zero-size type placed in a connection's `SslDigest.extension` when the
 /// post-handshake SAN check fails.
@@ -31,11 +73,11 @@ pub(crate) struct UpstreamSanMismatch;
 /// `upstream_peer` / `apply_upstream_tls` run once **per request/retry**, so
 /// allocating a fresh `Arc<closure>` each time would hit the hot path.  This
 /// cache ensures the `Arc` is built at most once per distinct SAN policy
-/// (`group_key`).  The Mutex is never held across an `.await` point.
+/// (`group_key`).  Reads take only a `DashMap` shard lock, never across `.await`.
 #[non_exhaustive]
 #[derive(Default)]
 pub struct SanCheckHookCache {
-    inner: Mutex<HashMap<u64, HandshakeCompleteHook>>,
+    inner: GroupKeyCache<HandshakeCompleteHook>,
 }
 
 impl SanCheckHookCache {
@@ -50,11 +92,8 @@ impl SanCheckHookCache {
         group_key: u64,
         sans: Arc<[SubjectAltName]>,
     ) -> HandshakeCompleteHook {
-        {
-            let guard = self.inner.lock();
-            if let Some(hook) = guard.get(&group_key) {
-                return Arc::clone(hook);
-            }
+        if let Some(hook) = self.inner.get(group_key) {
+            return hook;
         }
         let hook: HandshakeCompleteHook = Arc::new(move |ssl| {
             // Pull the peer leaf cert from the completed handshake.
@@ -105,8 +144,7 @@ impl SanCheckHookCache {
                 Some(Arc::new(UpstreamSanMismatch) as Arc<dyn Any + Send + Sync>)
             }
         });
-        let mut guard = self.inner.lock();
-        Arc::clone(guard.entry(group_key).or_insert(hook))
+        self.inner.get_or_insert(group_key, hook)
     }
 }
 
@@ -117,7 +155,7 @@ impl SanCheckHookCache {
 #[non_exhaustive]
 #[derive(Default)]
 pub struct UpstreamCaCache {
-    inner: Mutex<HashMap<u64, Arc<CaType>>>,
+    inner: GroupKeyCache<Arc<CaType>>,
 }
 
 impl UpstreamCaCache {
@@ -130,19 +168,15 @@ impl UpstreamCaCache {
     ///
     /// Returns `None` when the PEM is malformed — callers should respond with 502.
     pub fn get_or_parse(&self, group_key: u64, pem: &[u8]) -> Option<Arc<CaType>> {
-        {
-            let guard = self.inner.lock();
-            if let Some(cached) = guard.get(&group_key) {
-                return Some(Arc::clone(cached));
-            }
+        if let Some(cached) = self.inner.get(group_key) {
+            return Some(cached);
         }
         // Parse outside the lock so we don't hold it during the crypto call.
         let stack = X509::stack_from_pem(pem)
             .map_err(|e| tracing::warn!(error = %e, "UpstreamCaCache: PEM parse failed"))
             .ok()?;
         let bundle: Arc<CaType> = Arc::new(stack.into_boxed_slice());
-        let mut guard = self.inner.lock();
-        Some(Arc::clone(guard.entry(group_key).or_insert(bundle)))
+        Some(self.inner.get_or_insert(group_key, bundle))
     }
 }
 
@@ -153,11 +187,11 @@ impl UpstreamCaCache {
 /// [`UpstreamTls::with_client_cert`]). Entries accumulate until process restart;
 /// the number of distinct gateway client certs is bounded in practice.
 ///
-/// The Mutex is never held across an `.await` point — `upstream_peer` is synchronous.
+/// Reads take only a `DashMap` shard lock, never across `.await` — `upstream_peer` is synchronous.
 #[non_exhaustive]
 #[derive(Default)]
 pub struct BackendClientCertCache {
-    inner: Mutex<HashMap<u64, Arc<CertKey>>>,
+    inner: GroupKeyCache<Arc<CertKey>>,
 }
 
 impl BackendClientCertCache {
@@ -176,11 +210,8 @@ impl BackendClientCertCache {
         cert_pem: &[u8],
         key_pem: &[u8],
     ) -> Option<Arc<CertKey>> {
-        {
-            let guard = self.inner.lock();
-            if let Some(cached) = guard.get(&group_key) {
-                return Some(Arc::clone(cached));
-            }
+        if let Some(cached) = self.inner.get(group_key) {
+            return Some(cached);
         }
         // Parse outside the lock so we don't hold it during the crypto calls.
         let certs = X509::stack_from_pem(cert_pem)
@@ -196,8 +227,7 @@ impl BackendClientCertCache {
             .map_err(|e| tracing::warn!(error = %e, "BackendClientCertCache: key PEM parse failed"))
             .ok()?;
         let cert_key = Arc::new(CertKey::new(certs, pkey));
-        let mut guard = self.inner.lock();
-        Some(Arc::clone(guard.entry(group_key).or_insert(cert_key)))
+        Some(self.inner.get_or_insert(group_key, cert_key))
     }
 }
 

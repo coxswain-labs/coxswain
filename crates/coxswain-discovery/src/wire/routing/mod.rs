@@ -917,8 +917,8 @@ mod tests {
         let bg = simple_bg("ns/svc", &[addr("10.0.0.1:80")]);
         let entry = Arc::new(
             simple_entry(bg)
-                .with_allow_source_range(Some(Arc::new(vec!["10.0.0.0/8".parse().unwrap()])))
-                .with_deny_source_range(Some(Arc::new(vec!["10.1.0.0/16".parse().unwrap()]))),
+                .with_allow_source_range(Some(Arc::from(vec!["10.0.0.0/8".parse().unwrap()])))
+                .with_deny_source_range(Some(Arc::from(vec!["10.1.0.0/16".parse().unwrap()]))),
         );
 
         let mut b = IngressRoutingTableBuilder::new();

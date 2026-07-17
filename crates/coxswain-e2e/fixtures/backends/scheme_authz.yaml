@@ -1,0 +1,46 @@
+# Scheme-checking gRPC ext_authz backend for #620 e2e
+# (coxswain-e2e/fixtures/scheme-authz).
+#
+# Implements envoy.service.auth.v3.Authorization/Check and ALLOWS a request iff
+# the CheckRequest reports `attributes.request.http.scheme == "https"`, else
+# denies (403). Used to prove coxswain-proxy reports the real downstream scheme
+# to the authz service instead of a hard-coded "http".
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: scheme-authz
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: scheme-authz
+  template:
+    metadata:
+      labels:
+        app: scheme-authz
+    spec:
+      containers:
+        - name: scheme-authz
+          image: ${SCHEME_AUTHZ_IMAGE}
+          imagePullPolicy: Never
+          ports:
+            - name: grpc
+              containerPort: 9000
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 1
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: scheme-authz
+spec:
+  selector:
+    app: scheme-authz
+  ports:
+    - name: grpc
+      port: 9000
+      targetPort: 9000

@@ -37,7 +37,7 @@ impl<Kind> RoutingEngine<Kind> {
         path: &str,
         ctx: &RequestContext<'_>,
     ) -> Option<Arc<BackendGroup>> {
-        self.table.load().route(port, host, path, ctx)
+        self.table.guard().route(port, host, path, ctx)
     }
 
     /// Resolves a request to a route outcome.
@@ -52,7 +52,7 @@ impl<Kind> RoutingEngine<Kind> {
         path: &str,
         ctx: &RequestContext<'_>,
     ) -> RouteOutcome {
-        self.table.load().find(port, host, path, ctx)
+        self.table.guard().find(port, host, path, ctx)
     }
 }
 

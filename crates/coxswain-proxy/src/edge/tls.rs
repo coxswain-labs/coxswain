@@ -2,6 +2,7 @@
 
 use async_trait::async_trait;
 use coxswain_core::tls::{ClientCertConfigState, SharedClientCertStore, SharedPortTlsStore};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use pingora_core::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
 use pingora_core::tls::{
@@ -29,8 +30,13 @@ use std::sync::Arc;
 /// Information about the verified client certificate, stored as a nested field
 /// inside [`ConnTlsInfo`] after a successful mTLS handshake.
 pub(crate) struct ClientCertInfo {
-    /// PEM-encoded client certificate as presented by the peer.
-    pub(crate) cert_pem: String,
+    /// Pre-rendered `X-SSL-Client-Cert` header value: the peer's PEM,
+    /// percent-encoded (`NON_ALPHANUMERIC`, nginx-ingress convention), built
+    /// **once per connection** here instead of on every request. The per-request
+    /// path (`upstream_request_filter`) only clones this `HeaderValue` — a cheap
+    /// `Bytes` refcount bump — rather than re-cloning a multi-KB PEM `String` and
+    /// re-encoding it (a ~2-3x blowup) per request on mTLS routes (#620).
+    pub(crate) forward_header: http::HeaderValue,
 }
 
 /// TLS connection metadata stored in `SslDigest.extension` after every
@@ -283,9 +289,22 @@ impl TlsAccept for SniCertSelector {
         let sni = normalized_sni(ssl).map(Box::<str>::from);
 
         let client_cert = ssl.peer_certificate().and_then(|peer| match peer.to_pem() {
-            Ok(pem) => Some(ClientCertInfo {
-                cert_pem: String::from_utf8_lossy(&pem).into_owned(),
-            }),
+            Ok(pem) => {
+                // Percent-encode once, here, per connection — not per request.
+                let encoded =
+                    utf8_percent_encode(&String::from_utf8_lossy(&pem), NON_ALPHANUMERIC)
+                        .to_string();
+                // Encoded output is `%XX`/alphanumeric only, so it is always a
+                // valid header value; degrade to not forwarding if that ever
+                // changes rather than panicking on the data plane.
+                match http::HeaderValue::from_str(&encoded) {
+                    Ok(forward_header) => Some(ClientCertInfo { forward_header }),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "client-cert header encode failed — not forwarding");
+                        None
+                    }
+                }
+            }
             Err(e) => {
                 tracing::warn!(error = %e, "peer_certificate().to_pem() failed — not forwarding");
                 None

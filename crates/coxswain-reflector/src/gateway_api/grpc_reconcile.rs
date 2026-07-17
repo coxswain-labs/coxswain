@@ -382,10 +382,10 @@ struct GrpcRuleContext<'a> {
     rate_limit: Option<Arc<coxswain_core::routing::RateLimitConfig>>,
     /// Source-IP allow-list resolved from the rule's `IpAccessControl` `ExtensionRef`
     /// (#479). Shared across every entry the rule installs.
-    allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    allow_source_range: Option<Arc<[ipnet::IpNet]>>,
     /// Source-IP deny-list resolved from the same `IpAccessControl`. Enforced before
     /// `allow_source_range` in the proxy.
-    deny_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    deny_source_range: Option<Arc<[ipnet::IpNet]>>,
     /// Auth chain resolved from the rule's `JwtAuth` `ExtensionRef` (#441).
     /// `GRPCRoute` carries no Gateway-attached auth mandate today (unlike
     /// HTTPRoute's `CoxswainExternalAuth` `targetRefs`), so this is just the

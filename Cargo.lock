@@ -940,7 +940,6 @@ dependencies = [
  "ipnet",
  "itoa",
  "jsonwebtoken",
- "parking_lot",
  "percent-encoding",
  "pingora-core",
  "pingora-http",

@@ -119,12 +119,12 @@ The relay is a data plane, not a control-plane convenience — the codebase alre
 
 HTTP request path (`Proxy::request_filter`, `upstream_peer`, `filter::FilterSet::apply_request_filters`, `filter::FilterSet::apply_response_filters`):
 
-- Capture immutable request data at `request_filter` entry: `host` and `path` as `Arc<str>`, `query` as `Option<String>`. Do not assert a per-request allocation count in prose — the counting-allocator budget gate (#620) pins the measured baseline instead.
+- Capture immutable request data at `request_filter` entry: `host` and `path` as `Arc<str>`, `query` as `Option<String>`. Do not assert a per-request allocation count in prose — the counting-allocator budget gate `crates/coxswain-proxy/tests/alloc_budget.rs` (#620) pins the measured counts for `RoutingEngine::find` + the pure filter predicates instead.
 - Routing lookup, upstream selection, metric emission, and access-log path allocate nothing beyond the capture set. Render `u16` labels (port, status) via `itoa::Buffer` — never `.to_string()`.
 - TLS connections allocate one SNI hostname `String` per outbound connection (Pingora's `HttpPeer` requires owned). Per connection, not per request; cleartext upstreams skip it.
 - Access-log `SocketAddr::to_string()` allocates exactly once per request, only when `--access-log=on`. Operators silencing the log skip it.
 - Two opt-in request filters each carry exactly one intentional allocation beyond the capture set, both owned-string sinks that can't be elided: the `Forwarded` header value when `--proxy-accept-proxy-protocol` injects the real client addr, and the rewritten `path_and_query` an `HTTPRoute` `URLRewrite` path modifier feeds to `http::Uri::builder`. Both are single-allocation by construction (no intermediate `format!`); routes without these filters allocate nothing here. The one exception is the Ingress `use-regex` capture-group rewrite (`PathModifier::RegexReplace`), which runs one `Regex::captures` + one `expand` into a fresh `String` — bounded extra work that fires only on routes configured with both `use-regex` and a `rewrite-target`; the `Regex` itself is compiled once at reconcile and `Arc`-shared, never per request.
-- Use `Shared<T>` (the `ArcSwap`-backed wrapper in `coxswain-core`) for lock-free routing/TLS snapshot reads.
+- Use `Shared<T>` (the `ArcSwap`-backed wrapper in `coxswain-core`) for lock-free routing/TLS snapshot reads; on the hot path read via `Shared::guard()` (no atomic RMW), reserving `load()` for when an owned `Arc<T>` must outlive the borrow.
 - Never hold a `Mutex` or `RwLock` guard across `.await`.
 
 ### Proxy module structure

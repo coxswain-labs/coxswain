@@ -175,7 +175,7 @@ pub struct RouteEntry {
     /// least one CIDR; clients outside every range are rejected with 403 Forbidden.
     /// `None` (the default) admits all source IPs. Shared as an `Arc` so cloning
     /// into the lookup result is a refcount bump, not a heap copy, on the hot path.
-    pub allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    pub allow_source_range: Option<Arc<[ipnet::IpNet]>>,
     /// Source-IP block list, from the same `ip-access-control` annotation or
     /// `IpAccessControl` CRD `ExtensionRef` filter as
     /// [`Self::allow_source_range`] (#553).
@@ -186,7 +186,7 @@ pub struct RouteEntry {
     /// Shared as an `Arc` for the same zero-copy-on-hot-path reason as
     /// `allow_source_range`. A `None` client IP is *not* denied — a block list
     /// only acts on IPs it can positively attribute to a listed range.
-    pub deny_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+    pub deny_source_range: Option<Arc<[ipnet::IpNet]>>,
     /// Per-class access-log override from `CoxswainIngressClassParameters.spec.accessLog`.
     ///
     /// `None` (the default, and the value for all Gateway-API routes) means the
@@ -484,7 +484,7 @@ impl RouteEntry {
     #[must_use]
     pub fn with_allow_source_range(
         mut self,
-        allow_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+        allow_source_range: Option<Arc<[ipnet::IpNet]>>,
     ) -> Self {
         self.allow_source_range = allow_source_range;
         self
@@ -502,7 +502,7 @@ impl RouteEntry {
     #[must_use]
     pub fn with_deny_source_range(
         mut self,
-        deny_source_range: Option<Arc<Vec<ipnet::IpNet>>>,
+        deny_source_range: Option<Arc<[ipnet::IpNet]>>,
     ) -> Self {
         self.deny_source_range = deny_source_range;
         self
@@ -639,7 +639,11 @@ impl RouteEntry {
 // satisfy: Satisfy (#273) added without a bump — 1-byte enum occupies existing struct padding.
 // Bumped 320→328 by adding circuit_breaker: Option<Arc<CircuitBreakerConfig>> (8 bytes, niche pointer) for the ingress.coxswain-labs.dev/circuit-breaker-* per-endpoint circuit breaker (#282).
 // Bumped 328→336 by widening auth: Option<Arc<IngressAuthConfig>> (8 bytes) → Arc<[Arc<IngressAuthConfig>]> (16-byte fat pointer) for the additive ext_authz chain (#23).
-static_assertions::assert_eq_size!(RouteEntry, [u8; 336]);
+// Bumped 336→352 by widening allow_source_range + deny_source_range each from
+// Option<Arc<Vec<IpNet>>> (8-byte thin pointer) to Option<Arc<[IpNet]>> (16-byte
+// fat pointer) — one fewer heap allocation and indirection, matching the
+// Arc<[T]> siblings; +8 bytes each (#620).
+static_assertions::assert_eq_size!(RouteEntry, [u8; 352]);
 
 #[cfg(test)]
 mod tests {
@@ -662,7 +666,8 @@ mod tests {
         // satisfy: Satisfy (#273) added without a bump — 1-byte enum occupies existing struct padding.
         // Bumped 320→328: circuit_breaker: Option<Arc<CircuitBreakerConfig>> added for circuit-breaker-* annotations (#282).
         // Bumped 328→336: auth widened Option<Arc<_>> → Arc<[Arc<_>]> (additive ext_authz chain, #23).
-        static_assertions::assert_eq_size!(RouteEntry, [u8; 336]);
+        // Bumped 336→352: allow_source_range + deny_source_range widened Arc<Vec<IpNet>> → Arc<[IpNet]> (16-byte fat ptr each, #620).
+        static_assertions::assert_eq_size!(RouteEntry, [u8; 352]);
     }
 
     #[test]

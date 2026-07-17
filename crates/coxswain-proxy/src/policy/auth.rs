@@ -200,12 +200,13 @@ async fn enforce_ext_authz_http(
         builder = builder.header(reqwest::header::HOST, &host_hdr);
     }
     for (name, value) in &req_hdr.headers {
-        let name_lower = name.as_str().to_ascii_lowercase();
-        if name_lower == "host" || HOP_BY_HOP.contains(&name_lower.as_str()) {
+        // `HeaderName::as_str()` is already lowercase — compare in place.
+        let name_str = name.as_str();
+        if name_str == "host" || HOP_BY_HOP.contains(&name_str) {
             continue;
         }
         if let Ok(v) = value.to_str() {
-            builder = builder.header(name.as_str(), v);
+            builder = builder.header(name_str, v);
         }
     }
 
@@ -274,8 +275,10 @@ async fn enforce_ext_authz_http(
         .headers()
         .iter()
         .filter_map(|(name, value)| {
-            let name_s = name.as_str().to_ascii_lowercase();
-            if HOP_BY_HOP.contains(&name_s.as_str()) {
+            // `HeaderName::as_str()` is already lowercase — no owned copy needed
+            // for the comparisons; only the forwarded key below is owned.
+            let name_s = name.as_str();
+            if HOP_BY_HOP.contains(&name_s) {
                 return None;
             }
             if name_s == "set-cookie" && !http_cfg.always_set_cookie {
@@ -291,7 +294,7 @@ async fn enforce_ext_authz_http(
             value
                 .to_str()
                 .ok()
-                .map(|v| (name.as_str().to_owned(), v.to_owned()))
+                .map(|v| (name_s.to_owned(), v.to_owned()))
         })
         .collect();
 
@@ -1299,21 +1302,26 @@ mod grpc {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_owned();
-        let mut headers: HashMap<String, String> = HashMap::new();
+        let mut headers: HashMap<String, String> = HashMap::with_capacity(req.headers.len());
         for (name, value) in &req.headers {
-            let name_lower = name.as_str().to_ascii_lowercase();
-            if HOP_BY_HOP.contains(&name_lower.as_str()) {
+            // `HeaderName::as_str()` is already lowercase — used directly for the
+            // hop-by-hop check and as the (owned) map key.
+            let name_str = name.as_str();
+            if HOP_BY_HOP.contains(&name_str) {
                 continue;
             }
             if let Ok(v) = value.to_str() {
-                headers.insert(name_lower, v.to_owned());
+                headers.insert(name_str.to_owned(), v.to_owned());
             }
         }
         let http_req = auth_pb::attribute_context::HttpRequest {
             method,
             path,
             host,
-            scheme: "http".to_owned(),
+            // Derived from the downstream TLS state — hard-coding `"http"` here
+            // reported the wrong scheme to the authz service on HTTPS listeners,
+            // bypassing any policy keyed on `scheme == "https"`.
+            scheme: crate::hooks::downstream_tls_scheme(session).to_owned(),
             headers,
             ..Default::default()
         };

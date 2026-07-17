@@ -80,6 +80,15 @@ pub const MALFORMED_AUTHZ: &str = concat!(
     "/fixtures/backends/malformed_authz.yaml"
 );
 
+/// gRPC ext_authz backend that allows iff the CheckRequest scheme is `"https"`
+/// (#620, `coxswain-e2e/fixtures/scheme-authz`). Purpose-built to assert the
+/// proxy reports the real downstream scheme instead of a hard-coded `"http"` —
+/// no header-based sample server inspects the scheme.
+pub const SCHEME_AUTHZ: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/scheme_authz.yaml"
+);
+
 /// Mixed-latency backend pair for load-balance algorithm tests (#275).
 ///
 /// Creates:

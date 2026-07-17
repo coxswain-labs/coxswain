@@ -35,9 +35,26 @@ impl<T> Shared<T> {
     }
 
     /// Atomically load the current snapshot (refcount bump, no lock).
+    ///
+    /// Calls arc-swap's `load_full`, an atomic read-modify-write that clones the
+    /// `Arc`. Use only when an owned `Arc<T>` must outlive the read; on the hot
+    /// path prefer [`Shared::guard`], which reads without the RMW.
     #[must_use]
     pub fn load(&self) -> Arc<T> {
         self.0.load_full()
+    }
+
+    /// Borrow the current snapshot without a refcount bump.
+    ///
+    /// Returns an [`arc_swap::Guard`] that derefs through `Arc<T>` to `&T`. This
+    /// is the hot-path read: arc-swap serves it from a debt slot with no atomic
+    /// read-modify-write, unlike [`Shared::load`] (`load_full`). Hold the guard
+    /// only for the duration of the read — a long-lived guard can stall the next
+    /// writer's `store`. Reach for [`Shared::load`] when the value must escape
+    /// the borrow as an owned `Arc<T>`.
+    #[must_use]
+    pub fn guard(&self) -> arc_swap::Guard<Arc<T>> {
+        self.0.load()
     }
 
     /// Atomically replace the current snapshot with `value`.

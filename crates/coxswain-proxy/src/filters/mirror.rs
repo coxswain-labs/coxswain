@@ -89,14 +89,16 @@ pub(crate) fn setup(
             .headers
             .iter()
             .filter_map(|(name, value)| {
-                let lower = name.as_str().to_ascii_lowercase();
-                if lower == "host"
+                // `HeaderName::as_str()` is contractually lowercase, so compare
+                // it directly — no per-header owned lowercase copy.
+                let name_str = name.as_str();
+                if name_str == "host"
                     // content-length is stripped because the streaming mirror body uses
                     // Transfer-Encoding: chunked; forwarding the original CL alongside
                     // chunked TE violates RFC 9112 §6.1 and confuses strict backends.
-                    || lower == "content-length"
-                    || crate::policy::auth::HOP_BY_HOP.contains(&lower.as_str())
-                    || MIRROR_CREDENTIAL_HEADERS.contains(&lower.as_str())
+                    || name_str == "content-length"
+                    || crate::policy::auth::HOP_BY_HOP.contains(&name_str)
+                    || MIRROR_CREDENTIAL_HEADERS.contains(&name_str)
                 {
                     return None;
                 }

@@ -305,6 +305,14 @@ pub const EXTERNAL_AUTH_GRPC: &str = fixture!("external_auth_grpc.yaml");
 /// `failClosed`-default CR denies (503), the `failClosed: false` CR allows
 /// (200). Apply `backends::ECHO` and `backends::MALFORMED_AUTHZ` first.
 pub const EXTERNAL_AUTH_GRPC_MALFORMED: &str = fixture!("external_auth_grpc_malformed.yaml");
+/// Gateway with an HTTPS (Terminate) listener and an HTTP listener, both routed
+/// through a `CoxswainExternalAuth` (protocol: GRPC, `scheme-authz:9000`)
+/// `ExtensionRef` filter (#620). `scheme-authz` allows iff the CheckRequest
+/// scheme is `"https"`, so an HTTPS request reaches `echo-a` (200) and an HTTP
+/// request is denied (403) — proving the proxy reports the real downstream
+/// scheme. Apply `backends::ECHO` and `backends::SCHEME_AUTHZ` first. Vars:
+/// `HTTPS_HOSTNAME`, `HTTP_HOSTNAME`, `SECRET_NAME`, `TLS_CRT_B64`, `TLS_KEY_B64`.
+pub const EXTERNAL_AUTH_SCHEME: &str = fixture!("external_auth_scheme.yaml");
 /// Gateway + `BasicAuth` CR referencing an UNLABELED htpasswd Secret +
 /// HTTPRoute with `ExtensionRef` (#442 sad path). The reflector never loads
 /// the Secret, so the proxy fails closed with 503 even for valid credentials.

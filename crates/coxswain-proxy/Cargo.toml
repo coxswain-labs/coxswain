@@ -29,7 +29,6 @@ itoa = { workspace = true }
 # never fetched here) and verifies bearer-token signatures. The sole
 # JWT/crypto-parsing boundary in the crate.
 jsonwebtoken = { workspace = true }
-parking_lot = { workspace = true }
 percent-encoding = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
