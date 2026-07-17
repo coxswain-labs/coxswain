@@ -58,6 +58,7 @@ use ppp::PartialResult as _;
 use crate::SniCertSelector;
 use crate::ctx::{CONN_INFO, ConnectionInfo};
 use crate::edge::passthrough::{handle_passthrough, peek_sni};
+use crate::edge::peek::PeekBackoff;
 use crate::edge::tcp::handle_tcp_proxy;
 use crate::edge::terminate::handle_terminate;
 use crate::edge::udp::run_udp_listener;
@@ -1629,6 +1630,9 @@ pub(crate) fn build_tls_context(
 /// Returns the real source [`SocketAddr`] carried by the header, or `fallback`
 /// for `LOCAL` commands and `UNKNOWN` / unspecified address families.
 ///
+/// Retries wait on `PeekBackoff` — see `crate::edge::peek` for why a peek loop
+/// must poll rather than await readiness.
+///
 /// # Errors
 ///
 /// - [`ProxyHeaderError::Timeout`] — no complete header within 5 s.
@@ -1645,14 +1649,9 @@ async fn peek_and_drain_proxy_header(
 
     tokio::time::timeout(TIMEOUT, async move {
         let mut buf = vec![0u8; 32]; // start small, double when buffer fills
+        let mut backoff = PeekBackoff::new();
 
         // Grow-and-peek loop: expand `buf` until ppp can parse a complete header.
-        //
-        // When `ppp` says incomplete we must wait for new data before re-peeking.
-        // Without `tcp.readable().await`, re-peeking immediately returns the same
-        // partial bytes already in the kernel buffer — the buffer would grow to
-        // `MAX_PROXY_PEEK` in microseconds and spuriously report `TooLarge` on a
-        // legitimately fragmented PROXY header.
         let (real_addr, header_len) = loop {
             let n = tcp.peek(&mut buf).await.map_err(ProxyHeaderError::Io)?;
             if n == 0 {
@@ -1672,11 +1671,12 @@ async fn peek_and_drain_proxy_header(
                         return Err(ProxyHeaderError::TooLarge(MAX_PROXY_PEEK));
                     }
                     buf.resize((buf.len() * 2).min(MAX_PROXY_PEEK), 0);
+                    // A larger buffer may expose bytes already queued: re-peek before
+                    // sleeping, so a header longer than the initial 32 bytes (every v1
+                    // header carrying real addresses) pays no delay per grow.
+                    continue;
                 }
-                // Wait for the kernel to deliver more bytes before re-peeking.
-                // After `tcp.peek` consumes the readiness event, `readable()` blocks
-                // until a new EPOLLIN fires (i.e., fresh bytes have arrived).
-                tcp.readable().await.map_err(ProxyHeaderError::Io)?;
+                backoff.wait(n).await;
                 continue;
             }
 
@@ -1743,6 +1743,9 @@ async fn peek_and_drain_proxy_header(
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
     use super::*;
 
     fn active_state(
@@ -1772,6 +1775,119 @@ mod tests {
                 (addr, dummy_handle())
             })
             .collect()
+    }
+
+    // ── peek_and_drain_proxy_header (#628) ───────────────────────────────────────
+
+    /// A v1 header carrying real addresses (47 bytes) exceeds the 32-byte initial
+    /// buffer, so this drives the grow path across a genuine segment boundary:
+    /// fragmentation must still parse, and the drain must consume exactly the
+    /// header — hence asserting the trailing payload survives.
+    ///
+    /// This pins correctness, not the #628 spin: the grow has always been gated on
+    /// `n == buf.len()`, so a short first peek never ran the buffer to the cap, and
+    /// the header parses even with the old `readable()` wait — it just burned a
+    /// core for the 150ms gap first. `stalled_one_byte_peer_is_timed_out_without_spinning`
+    /// is what fails when the wait regresses.
+    #[tokio::test]
+    async fn fragmented_proxy_header_parses_across_segments() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let header = b"PROXY TCP4 192.168.0.1 192.168.0.11 56324 443\r\n";
+        // Split mid-header: 20 bytes is inside the source address, so the first
+        // parse must report incomplete while n (20) < buf.len() (32) — the exact
+        // state that used to spin.
+        let (head, tail) = header.split_at(20);
+        let (head, tail) = (head.to_vec(), tail.to_vec());
+
+        let writer = tokio::spawn(async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(&head).await.unwrap();
+            client.flush().await.unwrap();
+            // Force a real segment boundary: the peek loop must wait here.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            client.write_all(&tail).await.unwrap();
+            client.write_all(b"payload").await.unwrap();
+            client.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let (mut server, _) = listener.accept().await.unwrap();
+        let fallback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+
+        let real_addr = peek_and_drain_proxy_header(&mut server, fallback)
+            .await
+            .expect("fragmented PROXY header must parse");
+        assert_eq!(
+            real_addr,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)), 56324),
+            "must report the source address carried by the header, not the fallback"
+        );
+
+        let mut payload = [0u8; 7];
+        server
+            .read_exact(&mut payload)
+            .await
+            .expect("payload must survive the drain");
+        assert_eq!(
+            &payload, b"payload",
+            "drain must consume exactly the header and leave the payload queued"
+        );
+        writer.abort();
+    }
+
+    /// #628: a peer that sends one byte and stalls must cost a bounded number of
+    /// wakeups, not a spinning core.
+    ///
+    /// One byte is enough to reach the loop's incomplete branch — `ppp` reads `P`
+    /// as a valid v1 prefix, so it never short-circuits to `BadPreamble`.
+    ///
+    /// The paused clock is the oracle. Tokio auto-advances virtual time only when
+    /// the runtime is *idle*, so a loop that sleeps reaches the 5s timeout in
+    /// microseconds of real time, while a loop that spins on readiness never lets
+    /// the runtime idle and never returns at all. Real elapsed is therefore a
+    /// proxy for wakeup count. Since the regression's failure mode is a hang, the
+    /// runtime gets its own thread and a *real*-time `recv_timeout` bounds it —
+    /// a CI job timeout diagnoses nothing.
+    #[test]
+    fn stalled_one_byte_peer_is_timed_out_without_spinning() {
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+
+                tokio::spawn(async move {
+                    let mut client = TcpStream::connect(addr).await.unwrap();
+                    client.write_all(b"P").await.unwrap();
+                    client.flush().await.unwrap();
+                    // Hold the connection open, sending nothing further.
+                    std::future::pending::<()>().await;
+                });
+
+                let (mut server, _) = listener.accept().await.unwrap();
+                let fallback = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+                let result = peek_and_drain_proxy_header(&mut server, fallback).await;
+                let _ = tx.send(matches!(result, Err(ProxyHeaderError::Timeout)));
+            });
+        });
+
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(true) => {}
+            Ok(false) => panic!("stalled 1-byte peer must be closed by ProxyHeaderError::Timeout"),
+            Err(_) => panic!(
+                "peek_and_drain_proxy_header did not reach its 5s virtual timeout within 10s of \
+                 real time: the retry loop is spinning on readiness instead of sleeping, so the \
+                 runtime never idles and the paused clock never advances (#628)"
+            ),
+        }
     }
 
     // ── publish_bound_ports (#531) ───────────────────────────────────────────────

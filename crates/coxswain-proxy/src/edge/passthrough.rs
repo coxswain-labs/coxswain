@@ -23,6 +23,8 @@ use tracing::debug;
 
 use coxswain_core::routing::{Selected, SharedTlsPassthroughTable};
 
+use crate::edge::peek::PeekBackoff;
+
 /// Buffer size for each direction of the TCP splice (~16 KiB).
 const SPLICE_BUF: usize = 16 * 1024;
 
@@ -34,18 +36,6 @@ const MAX_PEEK: usize = 16 * 1024;
 
 /// Timeout on the initial ClientHello peek.
 const PEEK_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// First delay between ClientHello peek retries, doubling to [`PEEK_POLL_MAX`].
-///
-/// A fragmented ClientHello's segments are sent back-to-back by the client, so
-/// they arrive microseconds apart — 1ms catches real fragmentation on the first
-/// retry while costing a stalled peer only a handful of wakeups. See [`peek_sni`]
-/// for why this is a poll rather than a readiness await.
-const PEEK_POLL_MIN: Duration = Duration::from_millis(1);
-
-/// Ceiling on the [`PEEK_POLL_MIN`] backoff, bounding a stalled peer to roughly
-/// `PEEK_TIMEOUT / PEEK_POLL_MAX` wakeups before the timeout closes it.
-const PEEK_POLL_MAX: Duration = Duration::from_millis(32);
 
 // ── SNI extraction ────────────────────────────────────────────────────────────
 
@@ -257,7 +247,9 @@ pub(crate) async fn handle_passthrough(
 /// queue) and return the SNI server_name if present.
 ///
 /// Grows the peek buffer until [`client_hello_sni`] reports a complete parse,
-/// or until [`MAX_PEEK`] bytes have been read, or until a timeout fires.
+/// or until [`MAX_PEEK`] bytes have been read, or until `PEEK_TIMEOUT` fires.
+/// Retries wait on `PeekBackoff` — see `crate::edge::peek` for why a peek loop
+/// must poll rather than await readiness.
 ///
 /// # Errors
 ///
@@ -266,8 +258,7 @@ pub(crate) async fn handle_passthrough(
 pub(crate) async fn peek_sni(tcp: &TcpStream) -> io::Result<Option<String>> {
     let mut buf = vec![0u8; 512];
     let deadline = timeout(PEEK_TIMEOUT, async {
-        let mut last_n = 0usize;
-        let mut backoff = PEEK_POLL_MIN;
+        let mut backoff = PeekBackoff::new();
         loop {
             let n = tcp.peek(&mut buf).await?;
             if n == 0 {
@@ -293,18 +284,7 @@ pub(crate) async fn peek_sni(tcp: &TcpStream) -> io::Result<Option<String>> {
                         // A larger buffer may expose bytes already queued.
                         continue;
                     }
-                    // Poll, don't await readiness. `MSG_PEEK` leaves the bytes in the
-                    // kernel queue, so it never reports `EWOULDBLOCK` while any byte is
-                    // queued — and tokio clears read-readiness *only* on `EWOULDBLOCK`.
-                    // `readable()` would therefore return instantly forever and spin a
-                    // core until PEEK_TIMEOUT. No "readable beyond n bytes" edge exists,
-                    // so a bounded backoff is the only correct wait here.
-                    if n != last_n {
-                        last_n = n;
-                        backoff = PEEK_POLL_MIN;
-                    }
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(PEEK_POLL_MAX);
+                    backoff.wait(n).await;
                 }
                 Ok(SniPeek::Found(host)) => return Ok(Some(host)),
                 Ok(SniPeek::NoSni) => return Ok(None),
