@@ -48,7 +48,20 @@ pub struct PortRoutingTable {
 }
 
 impl PortRoutingTable {
+    /// Resolve `host` + `path` to a route.
+    ///
+    /// `host` must be ASCII-lowercase: matching here is case-sensitive by
+    /// design, because the hostnames this table is keyed by are already
+    /// lowercase (RFC 1123 is enforced by the `Hostname` CRD schema), so
+    /// normalizing per request would be redundant work on the hot path. Callers
+    /// normalize once at ingestion instead — see the host capture in
+    /// `coxswain_proxy::hooks::request_filter`.
     pub(super) fn find(&self, host: &str, path: &str, ctx: &RequestContext<'_>) -> RouteOutcome {
+        debug_assert!(
+            !host.bytes().any(|b| b.is_ascii_uppercase()),
+            "host must be normalized to ASCII-lowercase before routing; \
+             an un-normalized ingestion point silently 404s mixed-case hosts"
+        );
         let router = if let Some(r) = self.exact_hosts.get(host) {
             r
         } else if let Some((_, _, r)) = self

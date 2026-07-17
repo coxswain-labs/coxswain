@@ -38,8 +38,32 @@ Route id formats:
 | `coxswain_proxy_connections_active` | Gauge | `listener` |
 | `coxswain_proxy_connections_total` | Counter | `listener` |
 | `coxswain_proxy_connection_duration_seconds` | Histogram | `listener` |
+| `coxswain_proxy_udp_sessions_active` | Gauge | `listener` — open `UDPRoute` sessions |
+| `coxswain_proxy_udp_sessions_total` | Counter | `listener` — cumulative `UDPRoute` sessions created |
+| `coxswain_proxy_udp_datagrams_dropped_total` | Counter | `listener`, `reason` (see below) |
+
+#### UDP datagram drops
+
+UDP carries no status code and no connection reset, so a lost datagram is invisible to the client. `coxswain_proxy_udp_datagrams_dropped_total` is the only signal that distinguishes "no traffic" from "every datagram discarded". Its `reason` label:
+
+| `reason` | Meaning |
+|----------|---------|
+| `recv_error` | The listener socket's own `recv_from` failed — realistically `ENOBUFS`/`ENOMEM`, i.e. the kernel dropped an inbound datagram. |
+| `no_route` | No `UDPRoute` is bound to this port. Fires legitimately in the window between a listener binding and its route snapshot arriving, so alert on a *sustained* rate rather than any non-zero value. |
+| `no_backend` | A route matched but its backend group is empty. |
+| `session_limit` | The listener is at its concurrent-session cap. The only drop logged at `warn`: it means saturation, not ordinary UDP loss. |
+| `upstream_bind`, `upstream_connect` | A new session's ephemeral upstream socket could not be prepared. |
+| `upstream_send` | A new session's **first** datagram was rejected by the backend socket, so the session never established — typically the backend is down at session start. |
+| `session_send` | A **subsequent** datagram on an established session could not be handed to the backend socket. Do **not** read this as "the backend died": the dominant cause is a full kernel send buffer under a burst, i.e. local backpressure. |
+| `client_send` | A backend **reply** could not be delivered back to the client. |
+
+A backend that goes away *mid-session* is not counted here — it surfaces as a session teardown rather than a datagram drop. Watch `coxswain_proxy_udp_sessions_active` falling while `coxswain_proxy_udp_sessions_total` keeps climbing (re-establishment churn) for that.
+
+`coxswain_proxy_udp_sessions_active` counts only *established* sessions, while the session cap is applied at *admission* — before a session finishes binding and connecting. The gauge therefore reads at or below the cap by design and cannot be used to detect saturation; `session_limit` above is the signal for that.
 
 The following listener-lifecycle metrics are also exposed: `coxswain_proxy_listeners_active`, `coxswain_proxy_listener_lifecycle_total`, `coxswain_proxy_listener_drain_duration_seconds`, `coxswain_proxy_requests_force_closed_total`.
+
+`coxswain_proxy_listeners_active` carries a `state` label ∈ `{serving, draining}`. A listener occupies exactly one state at a time and releases it when its task exits, so both series return to zero once every listener is gone. `coxswain_proxy_listener_drain_duration_seconds` is observed for TCP/HTTP listeners only — a UDP drain has no graceful window to measure (a dropped datagram is normal for the protocol, and clients already retry), so UDP listeners stop immediately and report only `drain_completed`.
 
 `coxswain_proxy_listener_lifecycle_total` carries an `event` label ∈ `{added, removed, drain_completed, drain_exceeded, bind_failed}`. **`bind_failed`** counts a listener whose socket `bind()` failed — that local port serves no traffic until a later reconcile retries the bind. A sustained non-zero rate is a data-plane outage signal worth alerting on (a port conflict, or a stale process still holding the port); it should otherwise stay flat at zero.
 

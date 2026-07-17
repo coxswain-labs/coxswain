@@ -1556,3 +1556,169 @@ async fn unmappable_change_falls_back_to_full_rebuild() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ── UDP listener drain (#618) ─────────────────────────────────────────────────
+
+/// Sum every sample of `metric` in a Prometheus exposition, ignoring labels.
+///
+/// The `listener` label on a shared-mode Gateway is the controller-allocated
+/// internal accept port, not the advertised one, so a test cannot predict it.
+/// Summing sidesteps that; this suite is serial, so the total is attributable.
+fn metric_sum(exposition: &str, metric: &str) -> f64 {
+    exposition
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter(|l| {
+            l.split(&[' ', '{'][..])
+                .next()
+                .is_some_and(|name| name == metric)
+        })
+        .filter_map(|l| {
+            let after = match l.rsplit_once('}') {
+                Some((_, rest)) => rest,
+                None => l.split_once(' ').map(|(_, rest)| rest)?,
+            };
+            after.split_whitespace().next()?.parse::<f64>().ok()
+        })
+        .sum()
+}
+
+async fn proxy_metric_sum(h: &Harness, metric: &str) -> anyhow::Result<f64> {
+    let body = reqwest::get(h.admin_url("/metrics"))
+        .await
+        .context("scrape proxy /metrics")?
+        .text()
+        .await?;
+    Ok(metric_sum(&body, metric))
+}
+
+/// Removing a UDP listener must return its session and listener gauges to
+/// baseline (#618).
+///
+/// UDP drain calls `JoinSet::abort_all`, which cancels each reply pump exactly
+/// where it is parked — inside `recv()`. Cleanup written as straight-line code
+/// after the pump loop therefore never runs, so `udp_sessions_active` kept every
+/// session it ever opened. The gauge is keyed by listener port, so a listener
+/// re-added on that port inherits the drift: it compounds per reconcile and
+/// never self-heals. `listeners_active{draining}` had the same shape — the
+/// reconcile increments it for both protocols, but only the TCP path ever
+/// decremented it, so every UDP add/remove cycle inflated it permanently and an
+/// operator alerting on stuck drains got a false positive forever.
+///
+/// Both assertions are baseline-relative: this suite is serial, but the proxy is
+/// shared, so absolute values are not the test's to own.
+#[tokio::test]
+async fn udp_listener_removal_does_not_leak_session_gauge() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "res-udp-drain").await?;
+
+    let sessions_baseline = proxy_metric_sum(&h, "coxswain_proxy_udp_sessions_active").await?;
+    let draining_baseline = proxy_metric_sum(&h, "coxswain_proxy_listeners_active").await?;
+
+    fixtures::apply_fixture(backends::UDP_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["udp-echo-a"]).await?;
+    fixtures::apply_fixture(
+        gwa::UDP_ROUTE,
+        FixtureVars::new(&ns.name).with(
+            "GATEWAY_UDP_PROXY_PORT",
+            coxswain_e2e::harness::GATEWAY_UDP_PROXY_PORT.to_string(),
+        ),
+    )
+    .await?;
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-udp-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Each probe binds a fresh client socket, so each opens a distinct session.
+    // Hold them open: the sessions must still be live when the listener is
+    // removed, or the drain has nothing to leak.
+    let udp_addr = h.gateway_udp_addr(&ns.name).await?;
+    let mut clients = Vec::new();
+    for _ in 0..3u8 {
+        let sock = tokio::net::UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("bind UDP client")?;
+        sock.connect(&udp_addr)
+            .await
+            .context("connect UDP client")?;
+        clients.push(sock);
+    }
+
+    // Poll rather than assume the route is live: the first datagram of a session
+    // is what establishes it.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { "UDP sessions to establish on the proxy".to_string() },
+        || async {
+            for sock in &clients {
+                sock.send(b"hello-udp").await.ok()?;
+            }
+            let live = proxy_metric_sum(&h, "coxswain_proxy_udp_sessions_active")
+                .await
+                .ok()?;
+            (live > sessions_baseline).then_some(live)
+        },
+    )
+    .await?;
+
+    // Remove the listener: this is the drain that used to leak.
+    Api::<Gateway>::namespaced(h.client.clone(), &ns.name)
+        .delete("coxswain-udp-gw", &DeleteParams::default())
+        .await
+        .context("delete the UDP Gateway")?;
+
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            let live = proxy_metric_sum(&h, "coxswain_proxy_udp_sessions_active")
+                .await
+                .unwrap_or(-1.0);
+            format!(
+                "udp_sessions_active to fall back to its {sessions_baseline} baseline \
+                 after the UDP listener drained (currently {live}); a stuck value is \
+                 the abort_all() leak — every session the listener ever opened, \
+                 counted forever"
+            )
+        },
+        || async {
+            let live = proxy_metric_sum(&h, "coxswain_proxy_udp_sessions_active")
+                .await
+                .ok()?;
+            (live <= sessions_baseline).then_some(())
+        },
+    )
+    .await?;
+
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            let live = proxy_metric_sum(&h, "coxswain_proxy_listeners_active")
+                .await
+                .unwrap_or(-1.0);
+            format!(
+                "listeners_active to fall back to its {draining_baseline} baseline \
+                 after the UDP listener drained (currently {live}); a stuck value \
+                 means the drained listener never released its slot, so every UDP \
+                 add/remove cycle inflates the gauge permanently"
+            )
+        },
+        || async {
+            let live = proxy_metric_sum(&h, "coxswain_proxy_listeners_active")
+                .await
+                .ok()?;
+            (live <= draining_baseline).then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}

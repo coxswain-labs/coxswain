@@ -127,12 +127,26 @@ impl SniCertSelector {
     }
 }
 
+/// This connection's SNI, lowercased, or `None` when the client sent none.
+///
+/// openssl parses the ClientHello itself on the terminate path, so this never
+/// passes through [`crate::edge::passthrough::peek_sni`] and has to normalize
+/// independently. It must: the cert store, the mTLS client-cert config store and
+/// the GEP-3567 misdirected-request check are all keyed by the lowercase
+/// hostnames the reconciler wrote, while RFC 6066 defers to DNS — a peer may
+/// legitimately send `App.Example.Com` and expect `app.example.com`'s
+/// certificate. Costs nothing over the owned copy each caller already needed.
+fn normalized_sni(ssl: &TlsRef) -> Option<String> {
+    ssl.servername(NameType::HOST_NAME)
+        .map(str::to_ascii_lowercase)
+}
+
 #[async_trait]
 impl TlsAccept for SniCertSelector {
     async fn certificate_callback(&self, ssl: &mut TlsRef) {
         // Clone immediately to drop the immutable borrow before the mutable
         // ssl_use_certificate / ssl_use_private_key calls below.
-        let Some(sni) = ssl.servername(NameType::HOST_NAME).map(str::to_owned) else {
+        let Some(sni) = normalized_sni(ssl) else {
             tracing::debug!("TLS handshake with no SNI — no cert installed");
             return;
         };
@@ -268,7 +282,7 @@ impl TlsAccept for SniCertSelector {
         // This callback fires for every TLS connection, so we return `Some`
         // unconditionally: even connections without mTLS need the SNI
         // propagated for the misdirected-request check (GEP-3567, #96).
-        let sni = ssl.servername(NameType::HOST_NAME).map(Box::<str>::from);
+        let sni = normalized_sni(ssl).map(Box::<str>::from);
 
         let client_cert = ssl.peer_certificate().and_then(|peer| match peer.to_pem() {
             Ok(pem) => Some(ClientCertInfo {

@@ -115,7 +115,18 @@ pub(crate) async fn request_filter<K>(
     ctx.start.get_or_insert_with(Instant::now);
 
     let req = session.req_header();
-    let host: Arc<str> = Arc::from(extract_host(req));
+    // Lowercased at capture so every consumer — the host router, and the
+    // GEP-3567 misdirected-request check — compares against the lowercase
+    // hostnames the reconciler wrote. RFC 9110 §4.2.3 makes the authority
+    // case-insensitive, and unlike a browser a raw client may send any casing.
+    // The common (already-lowercase) case costs one linear scan and no
+    // allocation beyond the `Arc<str>` this always built.
+    let raw_host = extract_host(req);
+    let host: Arc<str> = if raw_host.bytes().any(|b| b.is_ascii_uppercase()) {
+        Arc::from(raw_host.to_ascii_lowercase())
+    } else {
+        Arc::from(raw_host)
+    };
     let path: Arc<str> = Arc::from(req.uri.path());
     let query = req.uri.query().map(str::to_string);
     // Capture the downstream protocol once: the mid-stream `max_body_size` cap in

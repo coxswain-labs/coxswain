@@ -21,7 +21,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::debug;
 
-use coxswain_core::routing::{Selected, SharedTlsPassthroughTable};
+use coxswain_core::routing::{BackendGroup, Selected};
 
 use crate::edge::peek::PeekBackoff;
 
@@ -120,9 +120,15 @@ pub(crate) fn client_hello_sni(buf: &[u8]) -> Result<SniPeek, SniParseError> {
             Ok((rest, TlsExtension::SNI(names))) => {
                 // Only the `host_name` (type 0) name type is defined by RFC 6066.
                 if let Some((_, name)) = names.into_iter().next() {
+                    // Lowercased here, at the one point that turns ClientHello
+                    // bytes into an SNI, so every consumer downstream compares
+                    // against the lowercase hostnames the routing and TLS tables
+                    // are keyed by. RFC 6066 defers to DNS, which is
+                    // case-insensitive; a peer is free to send `App.Example.Com`.
+                    // Costs nothing over the `to_owned` it replaces.
                     let host = std::str::from_utf8(name)
                         .map_err(|_| SniParseError::InvalidUtf8)?
-                        .to_owned();
+                        .to_ascii_lowercase();
                     return Ok(SniPeek::Found(host));
                 }
                 remaining = rest;
@@ -139,58 +145,25 @@ pub(crate) fn client_hello_sni(buf: &[u8]) -> Result<SniPeek, SniParseError> {
 
 // ── Connection handler ────────────────────────────────────────────────────────
 
-/// Handle one accepted TCP connection on a TLS-passthrough listener.
+/// Splice one accepted TCP connection to `backend`, encrypted end-to-end.
 ///
-/// Peeks the ClientHello via [`TcpStream::peek`] (MSG_PEEK — bytes stay in the
-/// kernel queue), extracts the SNI, matches against the passthrough routing
-/// table, dials the backend, and splices bytes bidirectionally.
+/// `backend` is resolved by the caller ([`crate::edge::accept`]'s TLS-L4
+/// dispatch), which has already peeked the ClientHello and matched `sni`
+/// against the passthrough table. Taking the resolved group rather than the
+/// table is what makes the routing decision and the connection it applies to
+/// the same event: re-loading the snapshot here would both repeat the peek and
+/// SNI match, and let a reconcile landing in between drop a connection that had
+/// just tested as routable. `sni` is carried only for diagnostics.
 ///
 /// All failure paths log at `debug` level and return — the connection is closed
 /// when the `TcpStream` is dropped.
 pub(crate) async fn handle_passthrough(
     tcp: TcpStream,
     peer_addr: SocketAddr,
-    table: &SharedTlsPassthroughTable,
-    listener_port: u16,
+    backend: &BackendGroup,
+    sni: Option<&str>,
     dial_timeout: Duration,
 ) {
-    let sni = match peek_sni(&tcp).await {
-        Ok(s) => s,
-        Err(e) => {
-            debug!(
-                peer = %peer_addr,
-                error = %e,
-                "TLS passthrough: failed to read ClientHello SNI"
-            );
-            return;
-        }
-    };
-
-    let snapshot = table.load();
-    let router = match snapshot.port(listener_port) {
-        Some(r) => r,
-        None => {
-            debug!(
-                peer = %peer_addr,
-                port = listener_port,
-                "TLS passthrough: no routes for listener port"
-            );
-            return;
-        }
-    };
-
-    let backend = match router.match_sni(sni.as_deref()) {
-        Some(bg) => bg,
-        None => {
-            debug!(
-                peer = %peer_addr,
-                sni = ?sni,
-                "TLS passthrough: no backend matched SNI"
-            );
-            return;
-        }
-    };
-
     let Selected {
         addr: backend_addr, ..
     } = match backend.select_upstream(None) {
@@ -421,6 +394,23 @@ mod tests {
         let record = sample_client_hello(b"sni.example.com");
         match client_hello_sni(&record) {
             Ok(SniPeek::Found(host)) => assert_eq!(host, "sni.example.com"),
+            other => panic!("expected Found, got: {other:?}"),
+        }
+    }
+
+    /// RFC 6066 defers to DNS, which is case-insensitive, so a peer may send any
+    /// casing. Every table the SNI is matched against is keyed by the lowercase
+    /// hostnames the reconciler wrote, so normalizing at this single extraction
+    /// point is what keeps mixed-case connections routable.
+    #[test]
+    fn mixed_case_sni_is_normalized_at_extraction() {
+        let record = sample_client_hello(b"SNI.Example.COM");
+        match client_hello_sni(&record) {
+            Ok(SniPeek::Found(host)) => assert_eq!(
+                host, "sni.example.com",
+                "a mixed-case SNI must be lowercased here; leaving it raw makes \
+                 every downstream lookup (route, cert, mTLS config) miss"
+            ),
             other => panic!("expected Found, got: {other:?}"),
         }
     }

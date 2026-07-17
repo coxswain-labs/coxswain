@@ -678,6 +678,83 @@ async fn gateway_tls_termination_with_sni() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A terminating HTTPS listener resolves its certificate from the SNI **openssl**
+/// parses during the handshake — a different ingestion point from the
+/// `peek_sni` used for L4 routing. Both must normalize, and this pins the one
+/// that a passthrough-only fix would miss: were only `peek_sni` lowercased, a
+/// hybrid port's `has_cert_for(lowercase)` would say "a listener claims this
+/// SNI", fall through to termination, and then `find_certs(MixedCase)` would find
+/// nothing — turning a routable connection into a handshake failure (#618).
+///
+/// Uses `https_get_with_sni` rather than `https_get`: the latter builds a URL, and
+/// the `url` crate lowercases hosts for http/https per WHATWG, which would make a
+/// mixed-case assertion pass vacuously. rustls sends the SNI verbatim.
+#[tokio::test]
+async fn tls_terminate_serves_cert_for_mixed_case_sni() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-gw-sni-case").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    let host_a = format!("tls-a.{}.local", ns.name);
+    let host_b = format!("tls-b.{}.local", ns.name);
+    let cert_a = GeneratedCert::for_host(&host_a);
+    let cert_b = GeneratedCert::for_host(&host_b);
+
+    fixtures::apply_fixture(
+        gwa::TLS_TERMINATION,
+        FixtureVars::new(&ns.name)
+            .with("LISTENER_A_HOSTNAME", &host_a)
+            .with("LISTENER_B_HOSTNAME", &host_b)
+            .with("SECRET_A_NAME", "cert-a")
+            .with("SECRET_B_NAME", "cert-b")
+            .with("TLS_CRT_A_B64", cert_a.cert_b64())
+            .with("TLS_KEY_A_B64", cert_a.key_b64())
+            .with("TLS_CRT_B_B64", cert_b.cert_b64())
+            .with("TLS_KEY_B_B64", cert_b.key_b64()),
+    )
+    .await?;
+
+    let gw_addr = wait::wait_for_gateway_address(
+        &h.client,
+        "coxswain-tls-test",
+        &ns.name,
+        GATEWAY_HTTPS_PORT,
+        Duration::from_secs(120),
+    )
+    .await?;
+
+    // Settle on the canonical lowercase form first, so a mixed-case failure below
+    // is unambiguously a casing bug and not an unconverged listener.
+    wait::wait_for_https_route(gw_addr, &host_a, "/", Duration::from_secs(60))
+        .await?
+        .assert_backend("echo-a");
+
+    // Mixed case in BOTH the SNI (cert selection, via openssl's servername) and
+    // the Host header (route lookup + the GEP-3567 misdirected-request check).
+    // Each is a distinct ingestion point; a miss in any one shows up here as a
+    // handshake failure, a 404, or a spurious 421 respectively.
+    let mixed = format!("TLS-A.{}.LOCAL", ns.name);
+    let status = https_get_with_sni(&mixed, &mixed, "/", gw_addr)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "mixed-case SNI {mixed} must select the same cert as its lowercase \
+                 form; the handshake failed instead: {e}"
+            )
+        })?;
+
+    assert_eq!(
+        status, 200,
+        "a mixed-case SNI + Host must terminate, route, and pass the GEP-3567 \
+         check exactly as the lowercase form does; got {status} (404 = host \
+         router missed, 421 = misdirected-request check missed)"
+    );
+
+    Ok(())
+}
+
 /// Cross-Gateway TLS-termination isolation (#472): two shared-mode Gateways in
 /// one namespace BOTH terminate the SAME hostname with DIFFERENT certs, each on
 /// its OWN per-Gateway VIP. Because the proxy keys its terminate cert store by
@@ -3385,6 +3462,175 @@ async fn tls_passthrough_unknown_sni_is_rejected() -> anyhow::Result<()> {
     assert!(
         result.is_err(),
         "expected connection error for unknown SNI, got success",
+    );
+
+    Ok(())
+}
+
+/// RFC 6066 defers to DNS, which is case-insensitive, so a peer may send its SNI
+/// in any casing. The passthrough table is keyed by the lowercase hostnames the
+/// CRD schema enforces, so an SNI that is not normalized when the ClientHello is
+/// parsed matches nothing and the connection is silently dropped (#618).
+///
+/// rustls sends the SNI byte-for-byte as given (`DnsName` preserves case and
+/// `validate()` accepts `A-Z`), so the mixed-case host below really does reach
+/// the proxy mixed-case — this would fail against an un-normalized proxy rather
+/// than pass vacuously.
+#[tokio::test]
+async fn tls_passthrough_routes_mixed_case_sni() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-passthrough-sni-case").await?;
+
+    let hostname = format!("passthrough.{}.local", ns.name);
+    let backend_cert = GeneratedCert::for_host(&hostname);
+
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", backend_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", backend_cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    fixtures::apply_fixture(
+        gwa::TLS_PASSTHROUGH,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("PASSTHROUGH_HOSTNAME", &hostname),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-passthrough-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // Settle on the canonical lowercase SNI first, so a mixed-case failure below
+    // is unambiguously a casing bug and not an unconverged route.
+    let passthrough_addr = h.gateway_passthrough_addr(&ns.name).await?;
+    let trusted_ca_der = backend_cert.cert_der();
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("TLS passthrough route for {hostname} to become live (pre-condition)") },
+        || async {
+            try_tls_passthrough(
+                &passthrough_addr,
+                &hostname,
+                &trusted_ca_der,
+                "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .ok()
+        },
+    )
+    .await?;
+
+    let mixed = format!("PassThrough.{}.LOCAL", ns.name);
+    let body = try_tls_passthrough(
+        &passthrough_addr,
+        &mixed,
+        &trusted_ca_der,
+        "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .map_err(|e| {
+        anyhow::anyhow!(
+            "mixed-case SNI {mixed} must route to the same backend as its \
+             lowercase form; the proxy dropped the connection instead: {e}"
+        )
+    })?;
+
+    assert!(
+        body.contains("namespace"),
+        "expected the echo-tls JSON body for a mixed-case SNI, got: {body}",
+    );
+
+    Ok(())
+}
+
+/// The sad-path companion to `tls_passthrough_routes_mixed_case_sni`: proves the
+/// fix normalizes casing rather than loosening matching. An SNI with no TLSRoute
+/// must still be dropped however it is cased.
+#[tokio::test]
+async fn tls_passthrough_unmatched_mixed_case_sni_is_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-passthrough-sni-case-deny").await?;
+
+    let hostname = format!("passthrough.{}.local", ns.name);
+    let backend_cert = GeneratedCert::for_host(&hostname);
+
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&ns.name)
+            .with("TLS_SERVER_CERT_B64", backend_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", backend_cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-tls"]).await?;
+
+    fixtures::apply_fixture(
+        gwa::TLS_PASSTHROUGH,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("PASSTHROUGH_HOSTNAME", &hostname),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-passthrough-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let passthrough_addr = h.gateway_passthrough_addr(&ns.name).await?;
+    let trusted_ca_der = backend_cert.cert_der();
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("TLS passthrough route for {hostname} to become live (pre-condition)") },
+        || async {
+            try_tls_passthrough(
+                &passthrough_addr,
+                &hostname,
+                &trusted_ca_der,
+                "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .ok()
+        },
+    )
+    .await?;
+
+    let unknown_mixed = format!("UnKnown.{}.Local", ns.name);
+    let result = try_tls_passthrough(
+        &passthrough_addr,
+        &unknown_mixed,
+        &trusted_ca_der,
+        "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+    )
+    .await;
+
+    assert!(
+        result.is_err(),
+        "SNI {unknown_mixed} matches no TLSRoute and must be dropped; \
+         lowercasing the peer's SNI must not turn matching into a catch-all",
     );
 
     Ok(())
