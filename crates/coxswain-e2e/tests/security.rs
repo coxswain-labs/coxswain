@@ -1973,6 +1973,83 @@ async fn gateway_external_auth_grpc_denies_without_header() -> anyhow::Result<()
     Ok(())
 }
 
+/// gRPC ext_authz malformed response (#615 sad path): `malformed-authz`
+/// answers every check with a zero-length body, decoding as a status-less
+/// `CheckResponse`. On the CR that omits `failClosed` (default: fail-closed),
+/// the proxy must treat this as a check failure and deny with 503 — before the
+/// fix it silently allowed (the bug this issue closes).
+#[tokio::test]
+async fn grpc_absent_status_denies_when_fail_closed() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-grpc-malf-closed").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::MALFORMED_AUTHZ, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        gwa::EXTERNAL_AUTH_GRPC_MALFORMED,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-a", "malformed-authz"]).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwextauthgrpcmalformedclosed.{}.local", ns.name);
+
+    // 404 while not yet programmed; 503 while the malformed-authz endpoint is not
+    // yet resolved into the proxy's routing snapshot is ALSO 503 — indistinguishable
+    // from the deny we're asserting on a single hit. A regression that silently
+    // allows (the bug this issue closes) only shows up once resolution has
+    // definitely settled, so require 5 *consecutive*, real-time-spaced (500 ms
+    // apart, via the canonical poller) 503s rather than a single occurrence: any
+    // resolution-driven flip to 200 breaks the streak and this fails.
+    let streak = std::cell::Cell::new(0u32);
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async {
+            format!(
+                "5 consecutive sustained 503s at {host} (streak={})",
+                streak.get()
+            )
+        },
+        || async {
+            match gw.get_status(&host, "/").await {
+                Ok(503) => {
+                    streak.set(streak.get() + 1);
+                    (streak.get() >= 5).then_some(())
+                }
+                _ => {
+                    streak.set(0);
+                    None
+                }
+            }
+        },
+    )
+    .await?;
+    Ok(())
+}
+
+/// gRPC ext_authz malformed response (#615 happy path): same `malformed-authz`
+/// backend, but the CR sets `failClosed: false` — the malformed response still
+/// fails the check, but the fail-open posture lets the request proceed to the
+/// backend.
+#[tokio::test]
+async fn grpc_absent_status_allows_when_fail_open() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-grpc-malf-open").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::MALFORMED_AUTHZ, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        gwa::EXTERNAL_AUTH_GRPC_MALFORMED,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwextauthgrpcmalformedopen.{}.local", ns.name);
+
+    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(120)).await?;
+    resp.assert_backend("echo-a");
+    Ok(())
+}
+
 /// gRPC ext_authz channel pooling (#544 happy path): once the pooled channel to
 /// `ext-authz-grpc` is warm, many sequential checks all succeed. Before pooling,
 /// each check dialled a fresh TCP+HTTP/2 connection per request; a regression

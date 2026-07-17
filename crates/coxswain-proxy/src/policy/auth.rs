@@ -1269,7 +1269,14 @@ mod grpc {
             Err(_) => return fail(session, cfg.fail_closed, "check timed out").await,
         };
 
-        map_check_response(resp, grpc_cfg, session, auth_response_headers_out).await
+        map_check_response(
+            resp,
+            grpc_cfg,
+            cfg.fail_closed,
+            session,
+            auth_response_headers_out,
+        )
+        .await
     }
 
     /// Fail an unreachable/errored/timed-out check: 503 when fail-closed, else allow.
@@ -1329,18 +1336,32 @@ mod grpc {
         }
     }
 
+    /// The `google.rpc.Status.code` of a check response, or `None` when the
+    /// service omitted `status` entirely — a malformed response, not an
+    /// implicit OK (prost gives message fields as `Option`; an absent field is
+    /// indistinguishable on the wire from an explicit `code: 0` unless handled
+    /// separately).
+    fn response_status_code(resp: &auth_pb::CheckResponse) -> Option<i32> {
+        resp.status.as_ref().map(|s| s.code)
+    }
+
     /// Map a `CheckResponse` onto the allow/deny contract.
     ///
     /// `status.code == OK` → allow (copy the OK response's `allowed_upstream_headers`
     /// allow-list onto the upstream request). Any other code → deny (return the
     /// denied response's HTTP status + controlled headers + body to the client).
+    /// An absent `status` is malformed and honours `fail_closed` exactly like a
+    /// transport error, rather than being silently treated as OK.
     async fn map_check_response(
         resp: auth_pb::CheckResponse,
         grpc_cfg: &coxswain_core::routing::GrpcExtAuthConfig,
+        fail_closed: bool,
         session: &mut Session,
         auth_response_headers_out: &mut Option<Vec<(Box<str>, Box<str>)>>,
     ) -> Result<bool> {
-        let code = resp.status.as_ref().map_or(RPC_OK, |s| s.code);
+        let Some(code) = response_status_code(&resp) else {
+            return fail(session, fail_closed, "malformed check response").await;
+        };
 
         if code == RPC_OK {
             if let Some(HttpResponse::OkResponse(ok)) = resp.http_response
@@ -1386,7 +1407,8 @@ mod grpc {
                         .collect();
                     (status, hdrs, d.body.into_bytes())
                 }
-                // OK/Error/absent with a non-OK code → a bare deny with no body.
+                // OK response shape with a non-OK code, or Error → a bare deny with
+                // no body (absent `status` is handled earlier, above).
                 _ => (DEFAULT_DENY_STATUS, Vec::new(), Vec::new()),
             };
 
@@ -1489,15 +1511,37 @@ mod grpc {
             assert_eq!(denied(0), DEFAULT_DENY_STATUS);
         }
 
-        /// A missing `status` (None) is treated as OK per Envoy semantics (allow).
+        /// A missing `status` is malformed, not an implicit OK (#615) — the caller
+        /// must fail the request rather than defaulting to allow.
         #[test]
-        fn absent_status_is_ok() {
+        fn response_status_code_absent_status_is_none() {
             let resp = auth_pb::CheckResponse {
                 status: None,
                 http_response: None,
                 ..Default::default()
             };
-            assert_eq!(resp.status.as_ref().map_or(RPC_OK, |s| s.code), RPC_OK);
+            assert_eq!(response_status_code(&resp), None);
+        }
+
+        #[test]
+        fn response_status_code_present_status_is_some() {
+            let ok = auth_pb::CheckResponse {
+                status: Some(envoy_types::pb::google::rpc::Status {
+                    code: RPC_OK,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(response_status_code(&ok), Some(RPC_OK));
+
+            let denied = auth_pb::CheckResponse {
+                status: Some(envoy_types::pb::google::rpc::Status {
+                    code: 7, // PERMISSION_DENIED
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            assert_eq!(response_status_code(&denied), Some(7));
         }
     }
 }

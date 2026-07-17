@@ -299,6 +299,12 @@ pub const EXTERNAL_AUTH_GATEWAY_ADDITIVE: &str = fixture!("external_auth_gateway
 /// HTTPRoute `ExtensionRef` (#23 gRPC transport). Allowed with `x-ext-authz:
 /// allow`, denied (403) otherwise. Apply `backends::EXT_AUTHZ_GRPC` first.
 pub const EXTERNAL_AUTH_GRPC: &str = fixture!("external_auth_grpc.yaml");
+/// Gateway + two `CoxswainExternalAuth` CRs (protocol: GRPC,
+/// `malformed-authz:9000`) + two HTTPRoutes on distinct hosts (#615). The
+/// backend answers every check with a status-less `CheckResponse`: the
+/// `failClosed`-default CR denies (503), the `failClosed: false` CR allows
+/// (200). Apply `backends::ECHO` and `backends::MALFORMED_AUTHZ` first.
+pub const EXTERNAL_AUTH_GRPC_MALFORMED: &str = fixture!("external_auth_grpc_malformed.yaml");
 /// Gateway + `BasicAuth` CR referencing an UNLABELED htpasswd Secret +
 /// HTTPRoute with `ExtensionRef` (#442 sad path). The reflector never loads
 /// the Secret, so the proxy fails closed with 503 even for valid credentials.

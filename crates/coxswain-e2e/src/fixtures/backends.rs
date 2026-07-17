@@ -67,6 +67,19 @@ pub const EXT_AUTHZ_GRPC: &str = concat!(
     "/fixtures/backends/ext_authz_grpc.yaml"
 );
 
+/// Malformed gRPC ext_authz backend for #615 e2e.
+///
+/// Creates one `malformed-authz` Service exposing a gRPC check server on
+/// `:9000` (`coxswain-e2e/fixtures/malformed-authz`, a purpose-built local
+/// fixture image — no public ext_authz image can be coerced into this shape).
+/// Every check reply is a zero-length message, which decodes as a
+/// status-less `CheckResponse` — the malformed response coxswain-proxy must
+/// honour `fail_closed` for, rather than treating as an implicit allow.
+pub const MALFORMED_AUTHZ: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/malformed_authz.yaml"
+);
+
 /// Mixed-latency backend pair for load-balance algorithm tests (#275).
 ///
 /// Creates:
