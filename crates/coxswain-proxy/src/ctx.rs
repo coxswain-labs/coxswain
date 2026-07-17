@@ -228,15 +228,16 @@ pub struct ProxyCtx {
     /// state and exactly one allocation is made when an encoder is created.
     /// The encoder is consumed by `response_body_filter`, chunk by chunk.
     pub compression_encoder: Option<Box<dyn Encode + Send + Sync>>,
-    /// PEM-encoded verified client certificate to forward upstream (#267).
+    /// Pre-rendered `X-SSL-Client-Cert` header value to forward upstream (#267).
     ///
     /// Set in `request_filter` when the matched Ingress has
     /// `auth-tls-pass-certificate-to-upstream: "true"` AND the connection's
-    /// `SslDigest` carries a verified `edge::tls::ClientCertInfo`.
-    /// Consumed (`.take()`d) in `upstream_request_filter` to inject the
-    /// `X-SSL-Client-Cert` header (URL-encoded PEM).  `None` (the common case)
-    /// incurs no cost.
-    pub client_cert_pem: Option<String>,
+    /// `SslDigest` carries a verified `edge::tls::ClientCertInfo`. Holding the
+    /// already-percent-encoded `HeaderValue` (built once per connection) makes
+    /// this a cheap `Bytes` clone rather than a per-request PEM copy + re-encode
+    /// (#620). Consumed (`.take()`d) in `upstream_request_filter`. `None` (the
+    /// common case) incurs no cost.
+    pub client_cert_header: Option<http::HeaderValue>,
     /// Effective client IP resolved in `request_filter` (#271).
     ///
     /// When the matched route carries a `ForwardedForConfig`, this is the first
@@ -323,4 +324,7 @@ const _: () = assert!(std::mem::size_of::<ResolvedRoute>() == 192);
 // ProxyCtx: +0 for is_h2: bool absorbed into existing alignment padding (#509).
 // ProxyCtx: +24 for strip_upstream_headers: Option<Vec<Box<str>>> (niche-opt on
 // Vec's ptr; 24 bytes) (#441) (536→560).
-const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 560);
+// ProxyCtx: +16 for client_cert_pem: Option<String> (24B) → client_cert_header:
+// Option<HeaderValue> (40B) — PEM pre-encoded once per connection instead of
+// per request (#620) (560→576).
+const _: () = assert!(std::mem::size_of::<ProxyCtx>() == 576);

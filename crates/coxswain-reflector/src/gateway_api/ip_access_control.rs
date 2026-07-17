@@ -17,7 +17,7 @@ use std::sync::Arc;
 /// lint; `pub(crate)` so [`super::filters`] (the `ExtensionRef` scanner) and
 /// [`crate::ingress::reconcile_helpers`] (the Ingress annotation resolver)
 /// share one definition rather than each declaring their own alias.
-pub(crate) type CidrSet = Option<Arc<Vec<ipnet::IpNet>>>;
+pub(crate) type CidrSet = Option<Arc<[ipnet::IpNet]>>;
 
 /// Resolve an `IpAccessControl` spec into the `(allow, deny)` CIDR sets the
 /// proxy enforces — deny evaluated first, then allow (the same
@@ -83,7 +83,7 @@ pub(super) fn parse_cidr_set(
     if nets.is_empty() {
         None
     } else {
-        Some(Arc::new(nets))
+        Some(Arc::from(nets))
     }
 }
 

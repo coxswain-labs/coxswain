@@ -272,7 +272,7 @@ fn build_route_entry(dto: &p::RouteEntry, pool: &EndpointPool) -> Result<RouteEn
             .iter()
             .map(|s| s.parse::<ipnet::IpNet>().map_err(WireError::InvalidCidr))
             .collect::<Result<_, _>>()?;
-        entry = entry.with_allow_source_range(Some(Arc::new(nets)));
+        entry = entry.with_allow_source_range(Some(Arc::from(nets)));
     }
 
     if !dto.deny_source_range.is_empty() {
@@ -281,7 +281,7 @@ fn build_route_entry(dto: &p::RouteEntry, pool: &EndpointPool) -> Result<RouteEn
             .iter()
             .map(|s| s.parse::<ipnet::IpNet>().map_err(WireError::InvalidCidr))
             .collect::<Result<_, _>>()?;
-        entry = entry.with_deny_source_range(Some(Arc::new(nets)));
+        entry = entry.with_deny_source_range(Some(Arc::from(nets)));
     }
 
     if let Some(enabled) = dto.access_log_enabled {

@@ -19,6 +19,7 @@ use coxswain_e2e::{
     NamespaceGuard, bootstrap,
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::{
+        GATEWAY_HTTPS_PORT,
         http::{EchoResponse, https_get, https_get_with_client_cert},
         wait,
     },
@@ -1970,6 +1971,85 @@ async fn gateway_external_auth_grpc_denies_without_header() -> anyhow::Result<()
     // No `x-ext-authz` header → the gRPC auth service denies → 403 (404 while the
     // route is not yet programmed; 503 while the auth Pod is not ready — keep polling).
     wait::wait_for_route_status(&gw, &host, "/", 403, Duration::from_secs(120)).await?;
+    Ok(())
+}
+
+/// gRPC ext_authz scheme (#620 happy path): the proxy reports the *real*
+/// downstream scheme in the `CheckRequest`, not a hard-coded `"http"`.
+/// `scheme-authz` allows iff the scheme is `"https"`, so a request over the
+/// HTTPS (Terminate) listener is allowed and reaches echo-a. A regression to the
+/// old hard-coded `"http"` would flip this to a 403.
+#[tokio::test]
+async fn gateway_external_auth_grpc_sees_https_scheme_on_tls_listener() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-scheme-https").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::SCHEME_AUTHZ, FixtureVars::new(&ns.name)).await?;
+
+    let https_host = format!("schemehttps.{}.local", ns.name);
+    let http_host = format!("schemehttp.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&https_host);
+    fixtures::apply_fixture(
+        gwa::EXTERNAL_AUTH_SCHEME,
+        FixtureVars::new(&ns.name)
+            .with("HTTPS_HOSTNAME", &https_host)
+            .with("HTTP_HOSTNAME", &http_host)
+            .with("SECRET_NAME", "scheme-cert")
+            .with("TLS_CRT_B64", cert.cert_b64())
+            .with("TLS_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-a", "scheme-authz"]).await?;
+
+    let gw_addr = wait::wait_for_gateway_address(
+        &h.client,
+        "coxswain-extauth-scheme",
+        &ns.name,
+        GATEWAY_HTTPS_PORT,
+        Duration::from_secs(120),
+    )
+    .await?;
+
+    // HTTPS request → proxy reports scheme=https → scheme-authz allows → echo-a.
+    // `wait_for_https_route` polls through the route-not-yet-programmed / authz-Pod-
+    // not-ready transients until a settled 2xx.
+    wait::wait_for_https_route(gw_addr, &https_host, "/", Duration::from_secs(120))
+        .await?
+        .assert_backend("echo-a");
+    Ok(())
+}
+
+/// gRPC ext_authz scheme (#620 sad path): over the plain-HTTP listener the proxy
+/// reports scheme=`"http"`, so `scheme-authz` denies → 403 and echo-a is never
+/// reached. Companion to the https test above; together they prove the scheme
+/// reflects the actual downstream connection rather than a constant.
+#[tokio::test]
+async fn gateway_external_auth_grpc_sees_http_scheme_on_cleartext_listener() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-scheme-http").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::SCHEME_AUTHZ, FixtureVars::new(&ns.name)).await?;
+
+    let https_host = format!("schemehttps.{}.local", ns.name);
+    let http_host = format!("schemehttp.{}.local", ns.name);
+    let cert = GeneratedCert::for_host(&https_host);
+    fixtures::apply_fixture(
+        gwa::EXTERNAL_AUTH_SCHEME,
+        FixtureVars::new(&ns.name)
+            .with("HTTPS_HOSTNAME", &https_host)
+            .with("HTTP_HOSTNAME", &http_host)
+            .with("SECRET_NAME", "scheme-cert")
+            .with("TLS_CRT_B64", cert.cert_b64())
+            .with("TLS_KEY_B64", cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&ns.name, &["echo-a", "scheme-authz"]).await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    // HTTP request → proxy reports scheme=http → scheme-authz denies → 403 (404
+    // while the route is not yet programmed, 503 while the authz Pod is not ready
+    // — `wait_for_route_status` keeps polling until a settled 403).
+    wait::wait_for_route_status(&gw, &http_host, "/", 403, Duration::from_secs(120)).await?;
     Ok(())
 }
 

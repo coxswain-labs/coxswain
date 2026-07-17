@@ -212,12 +212,17 @@ pub enum CorsOrigin {
 
 impl CorsOrigin {
     /// Returns `true` if `request_origin` matches this entry (case-insensitive).
+    ///
+    /// The `Exact` arm compares in place via `eq_ignore_ascii_case` and allocates
+    /// nothing — this is the per-request hot path (one call per allow-list entry).
+    /// Only the rarer `Wildcard` arm lowercases into an owned `String`, because
+    /// `starts_with`/`ends_with` have no case-insensitive stdlib equivalent.
     #[must_use]
     pub fn matches(&self, request_origin: &str) -> bool {
-        let lower = request_origin.to_ascii_lowercase();
         match self {
-            CorsOrigin::Exact(s) => lower == s.as_str(),
+            CorsOrigin::Exact(s) => request_origin.eq_ignore_ascii_case(s),
             CorsOrigin::Wildcard { prefix, suffix } => {
+                let lower = request_origin.to_ascii_lowercase();
                 lower.starts_with(prefix.as_ref()) && lower.ends_with(suffix.as_ref())
             }
         }
@@ -226,8 +231,12 @@ impl CorsOrigin {
 
 /// Pre-rendered CORS policy for one `HTTPRoute` rule (GEP-1767).
 ///
-/// All `HeaderValue`s are built once at reconcile time so the response path
-/// allocates nothing beyond a cheap `Bytes`-backed clone per injection.
+/// The fixed `HeaderValue`s (methods, headers, expose-headers, max-age) are all
+/// built once at reconcile time, so injecting them is a cheap `Bytes`-backed
+/// clone. The one value constructed per matched request is the echoed
+/// `Access-Control-Allow-Origin` — see [`CorsConfig::resolve_origin`], which
+/// must mirror the caller's own `Origin` and so builds a fresh `HeaderValue`
+/// from it (only on a match; non-matches allocate nothing).
 ///
 /// Origin matching always echoes the concrete request `Origin` back rather than
 /// `*`, which is spec-correct in all cases and is required when

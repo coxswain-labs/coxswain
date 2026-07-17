@@ -1305,7 +1305,8 @@ mod tests {
         let bare = RouteEntry::path_only(Arc::clone(&group), "ns/r".to_string(), None);
         assert!(bare.allow_source_range.is_none());
 
-        let nets = Arc::new(vec!["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]);
+        let nets: Arc<[ipnet::IpNet]> =
+            Arc::from(vec!["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]);
         let entry = RouteEntry::path_only(group, "ns/r".to_string(), None)
             .with_allow_source_range(Some(Arc::clone(&nets)));
         assert_eq!(entry.allow_source_range.as_deref(), Some(&*nets));
@@ -1317,7 +1318,8 @@ mod tests {
         let bare = RouteEntry::path_only(Arc::clone(&group), "ns/r".to_string(), None);
         assert!(bare.deny_source_range.is_none());
 
-        let nets = Arc::new(vec!["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]);
+        let nets: Arc<[ipnet::IpNet]> =
+            Arc::from(vec!["10.0.0.0/8".parse::<ipnet::IpNet>().unwrap()]);
         let entry = RouteEntry::path_only(group, "ns/r".to_string(), None)
             .with_deny_source_range(Some(Arc::clone(&nets)));
         assert_eq!(entry.deny_source_range.as_deref(), Some(&*nets));

@@ -262,7 +262,12 @@ pub(crate) async fn peek_sni(tcp: &TcpStream) -> io::Result<Option<String>> {
                 Ok(SniPeek::Found(host)) => return Ok(Some(host)),
                 Ok(SniPeek::NoSni) => return Ok(None),
                 Err(e) => {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, e.to_string()));
+                    // Attacker-triggerable per-connection reject (any non-TLS first
+                    // byte). Avoid the `e.to_string()` heap alloc — the reason goes
+                    // to a lazy `debug!` field, the error itself to a payload-free
+                    // `ErrorKind` (#620).
+                    debug!(error = %e, "SNI peek: rejecting non-TLS or invalid ClientHello");
+                    return Err(io::Error::from(io::ErrorKind::InvalidData));
                 }
             }
         }

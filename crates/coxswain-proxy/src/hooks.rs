@@ -50,13 +50,26 @@ use coxswain_core::routing::{
 };
 use coxswain_core::tls::ClientCertConfigState;
 use http::header;
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, HTTPStatus, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
 use pingora_proxy::Session;
 use std::sync::Arc;
 use std::time::Instant;
+
+/// Downstream request scheme: `"https"` when the connection terminated TLS at
+/// this proxy, else `"http"`. Derived from the session's TLS digest, never
+/// hard-coded — callers that report the scheme to an external policy (ext_authz)
+/// or a header must reflect the real downstream protocol.
+#[must_use]
+pub(crate) fn downstream_tls_scheme(session: &Session) -> &'static str {
+    let is_tls = session
+        .as_downstream()
+        .digest()
+        .and_then(|d| d.ssl_digest.as_ref())
+        .is_some();
+    if is_tls { "https" } else { "http" }
+}
 
 /// Construct a fresh per-request context, seeding from the connection-local
 /// `CONN_INFO` task-local when present (PROXY-protocol path).
@@ -85,7 +98,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             strip_upstream_headers: None,
             mirror_txs: Vec::new(),
             compression_encoder: None,
-            client_cert_pem: None,
+            client_cert_header: None,
             client_ip: None,
             lb_track: None,
             hash_key: None,
@@ -142,14 +155,9 @@ pub(crate) async fn request_filter<K>(
         .map(Box::from);
     // PROXY-protocol path sets real_client_proto directly; standard Pingora TLS path
     // does not set CONN_INFO, so fall back to inspecting the session's TLS digest.
-    let proto = ctx.real_client_proto.unwrap_or_else(|| {
-        let is_tls = session
-            .as_downstream()
-            .digest()
-            .and_then(|d| d.ssl_digest.as_ref())
-            .is_some();
-        if is_tls { "https" } else { "http" }
-    });
+    let proto = ctx
+        .real_client_proto
+        .unwrap_or_else(|| downstream_tls_scheme(session));
 
     let port = ctx
         .local_port
@@ -262,7 +270,7 @@ pub(crate) async fn request_filter<K>(
                     && cc_cfg.pass_to_upstream
                     && let Some(ci) = cert_info
                 {
-                    ctx.client_cert_pem = Some(ci.cert_pem.clone());
+                    ctx.client_cert_header = Some(ci.forward_header.clone());
                 }
             }
         }
@@ -875,14 +883,13 @@ pub(crate) async fn upstream_request_filter(
     // Verified client-certificate forwarding (#267): when the Ingress annotation
     // `auth-tls-pass-certificate-to-upstream: "true"` is set and a client cert was
     // verified at the TLS handshake, forward its PEM as `X-SSL-Client-Cert`
-    // (URL-encoded, per nginx-ingress convention). Applied after auth-response headers
-    // so auth-service overrides cannot clobber it. `.take()` clears the field so the
-    // header is never duplicated on retries.
-    if let Some(pem) = ctx.client_cert_pem.take() {
-        let encoded = utf8_percent_encode(&pem, NON_ALPHANUMERIC).to_string();
-        if let Ok(hv) = http::HeaderValue::from_str(&encoded) {
-            let _ = upstream_request.insert_header("x-ssl-client-cert", hv);
-        }
+    // (URL-encoded, per nginx-ingress convention). The value is percent-encoded
+    // once per connection (see `edge::tls::ClientCertInfo`), so this is a cheap
+    // `HeaderValue` clone. Applied after auth-response headers so auth-service
+    // overrides cannot clobber it. `.take()` clears the field so the header is
+    // never duplicated on retries.
+    if let Some(hv) = ctx.client_cert_header.take() {
+        let _ = upstream_request.insert_header("x-ssl-client-cert", hv);
     }
 
     Ok(())

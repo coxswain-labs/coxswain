@@ -1119,26 +1119,43 @@ async fn kind_load_image(cluster_name: &str) -> anyhow::Result<()> {
 /// ext_authz image can produce that malformed shape on demand.
 pub const MALFORMED_AUTHZ_IMAGE: &str = "coxswain-malformed-authz:e2e";
 
-/// Build the small local-only fixture images the e2e suites need (currently
-/// just [`MALFORMED_AUTHZ_IMAGE`]). Unlike [`build_image`], this always runs —
-/// it is not gated by `COXSWAIN_E2E_SKIP_BUILD`, which exists to skip the
-/// expensive multi-stage coxswain/BoringSSL build. These images are tiny
-/// (`golang:alpine` → `scratch`) and build in a few seconds on any host with
-/// Docker, so there is no CI workflow change needed to preload them.
+/// Local Docker image tag for the `scheme-authz` gRPC fixture (#620): a
+/// purpose-built ext_authz server that ALLOWS iff the CheckRequest's
+/// `attributes.request.http.scheme` is `"https"`, so an e2e can assert the
+/// proxy reports the real downstream scheme (was hard-coded `"http"`). No
+/// public/header-based sample server inspects the scheme.
+pub const SCHEME_AUTHZ_IMAGE: &str = "coxswain-scheme-authz:e2e";
+
+/// Every local-only fixture image as `(tag, fixture subdirectory)`. Both build
+/// (`golang:alpine` → `scratch`) in a few seconds; add a row here to introduce
+/// another.
+const FIXTURE_IMAGES: &[(&str, &str)] = &[
+    (MALFORMED_AUTHZ_IMAGE, "malformed-authz"),
+    (SCHEME_AUTHZ_IMAGE, "scheme-authz"),
+];
+
+/// Build the small local-only fixture images the e2e suites need
+/// ([`FIXTURE_IMAGES`]). Unlike [`build_image`], this always runs — it is not
+/// gated by `COXSWAIN_E2E_SKIP_BUILD`, which exists to skip the expensive
+/// multi-stage coxswain/BoringSSL build. These images are tiny and build in a
+/// few seconds on any host with Docker, so there is no CI workflow change
+/// needed to preload them.
 ///
 /// # Errors
 ///
-/// Returns an error if `docker build` exits non-zero.
+/// Returns an error if any `docker build` exits non-zero.
 async fn build_fixture_images(root: &Path) -> anyhow::Result<()> {
-    let dir = root.join("crates/coxswain-e2e/fixtures/malformed-authz");
-    tracing::info!("building Docker image {MALFORMED_AUTHZ_IMAGE}");
-    let status = Command::new("docker")
-        .args(["build", "-t", MALFORMED_AUTHZ_IMAGE, "."])
-        .current_dir(&dir)
-        .status()
-        .await
-        .context("docker build malformed-authz")?;
-    anyhow::ensure!(status.success(), "docker build malformed-authz failed");
+    for (image, subdir) in FIXTURE_IMAGES {
+        let dir = root.join("crates/coxswain-e2e/fixtures").join(subdir);
+        tracing::info!("building Docker image {image}");
+        let status = Command::new("docker")
+            .args(["build", "-t", image, "."])
+            .current_dir(&dir)
+            .status()
+            .await
+            .with_context(|| format!("docker build {image}"))?;
+        anyhow::ensure!(status.success(), "docker build {image} failed");
+    }
     Ok(())
 }
 
@@ -1146,24 +1163,17 @@ async fn build_fixture_images(root: &Path) -> anyhow::Result<()> {
 ///
 /// # Errors
 ///
-/// Returns an error if `kind load docker-image` exits non-zero.
+/// Returns an error if any `kind load docker-image` exits non-zero.
 async fn kind_load_fixture_images(cluster_name: &str) -> anyhow::Result<()> {
-    tracing::info!(cluster = %cluster_name, "loading fixture images into kind cluster");
-    let status = Command::new("kind")
-        .args([
-            "load",
-            "docker-image",
-            MALFORMED_AUTHZ_IMAGE,
-            "--name",
-            cluster_name,
-        ])
-        .status()
-        .await
-        .context("kind load docker-image malformed-authz")?;
-    anyhow::ensure!(
-        status.success(),
-        "kind load docker-image malformed-authz failed"
-    );
+    for (image, _) in FIXTURE_IMAGES {
+        tracing::info!(cluster = %cluster_name, image = %image, "loading fixture image into kind cluster");
+        let status = Command::new("kind")
+            .args(["load", "docker-image", image, "--name", cluster_name])
+            .status()
+            .await
+            .with_context(|| format!("kind load docker-image {image}"))?;
+        anyhow::ensure!(status.success(), "kind load docker-image {image} failed");
+    }
     Ok(())
 }
 

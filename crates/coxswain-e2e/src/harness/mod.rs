@@ -12,8 +12,8 @@ pub mod wait;
 use anyhow::Context as _;
 pub use bootstrap::{
     GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, GATEWAY_TCP_PROXY_PORT, GATEWAY_TLS_PASSTHROUGH_PORT,
-    GATEWAY_UDP_PROXY_PORT, MALFORMED_AUTHZ_IMAGE, bootstrap, bootstrap_cluster, set_relay_enabled,
-    set_shared_proxy_replicas,
+    GATEWAY_UDP_PROXY_PORT, MALFORMED_AUTHZ_IMAGE, SCHEME_AUTHZ_IMAGE, bootstrap,
+    bootstrap_cluster, set_relay_enabled, set_shared_proxy_replicas,
 };
 pub use controller::{ControllerOptions, ControllerProcess, INGRESS_HTTP_PORT, INGRESS_HTTPS_PORT};
 pub use http::HttpClient;

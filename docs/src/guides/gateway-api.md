@@ -633,7 +633,7 @@ Precedence is **additive** (GEP-713 override posture): when both a Gateway-attac
 Two transports, selected by `spec.protocol`:
 
 - **`HTTP`** — forward-auth: the original method, Host, path, and client headers are replayed to the service (no body); **2xx** allows, any other status is returned to the client.
-- **`GRPC`** — the Envoy `envoy.service.auth.v3.Authorization/Check` proto: the request context is sent as a `CheckRequest`; an `OK` status allows (copying `allowedResponseHeaders` from the OK response onto the upstream request), any other status denies with the denied response's HTTP status (default `403`), headers, and body.
+- **`GRPC`** — the Envoy `envoy.service.auth.v3.Authorization/Check` proto: the request context is sent as a `CheckRequest`; an `OK` status allows (copying `allowedResponseHeaders` from the OK response onto the upstream request), any other status denies with the denied response's HTTP status (default `403`), headers, and body. The `CheckRequest`'s `attributes.request.http.scheme` reflects the real downstream connection — `https` on a TLS listener, `http` on a cleartext one — so an authz policy may key on it.
 
 `CoxswainExternalAuth` is **HTTPRoute-only** (a Gateway-attached policy covers the HTTPRoutes on the Gateway); `GRPCRoute` is not yet supported.
 
