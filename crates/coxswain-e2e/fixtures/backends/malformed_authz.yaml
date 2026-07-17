@@ -1,0 +1,45 @@
+# Malformed gRPC ext_authz backend for #615 e2e (coxswain-e2e/fixtures/malformed-authz).
+#
+# Answers every gRPC call with a zero-length response body — a client decoding
+# it as envoy.service.auth.v3.CheckResponse sees `status: None`, the malformed
+# shape coxswain-proxy must treat as a check failure (honouring fail_closed)
+# rather than an implicit allow.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: malformed-authz
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: malformed-authz
+  template:
+    metadata:
+      labels:
+        app: malformed-authz
+    spec:
+      containers:
+        - name: malformed-authz
+          image: ${MALFORMED_AUTHZ_IMAGE}
+          imagePullPolicy: Never
+          ports:
+            - name: grpc
+              containerPort: 9000
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 1
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: malformed-authz
+spec:
+  selector:
+    app: malformed-authz
+  ports:
+    - name: grpc
+      port: 9000
+      targetPort: 9000

@@ -162,10 +162,16 @@ pub async fn bootstrap_cluster() -> anyhow::Result<()> {
             let cluster = ClusterKind::detect().await.context("detect cluster kind")?;
 
             build_image(&root).await.context("docker build")?;
+            build_fixture_images(&root)
+                .await
+                .context("docker build fixture images")?;
 
             match &cluster {
                 ClusterKind::Kind { name } => {
                     kind_load_image(name).await.context("kind load")?;
+                    kind_load_fixture_images(name)
+                        .await
+                        .context("kind load fixture images")?;
                     install_cloud_provider_kind_if_missing()
                         .await
                         .context("cloud-provider-kind")?;
@@ -1104,6 +1110,60 @@ async fn kind_load_image(cluster_name: &str) -> anyhow::Result<()> {
         .await
         .context("kind load docker-image")?;
     anyhow::ensure!(status.success(), "kind load docker-image failed");
+    Ok(())
+}
+
+/// Local Docker image tag for the `malformed-authz` gRPC fixture (#615): a
+/// purpose-built test double answering every check with a zero-length
+/// response body, so it decodes as a status-less `CheckResponse` — no public
+/// ext_authz image can produce that malformed shape on demand.
+pub const MALFORMED_AUTHZ_IMAGE: &str = "coxswain-malformed-authz:e2e";
+
+/// Build the small local-only fixture images the e2e suites need (currently
+/// just [`MALFORMED_AUTHZ_IMAGE`]). Unlike [`build_image`], this always runs —
+/// it is not gated by `COXSWAIN_E2E_SKIP_BUILD`, which exists to skip the
+/// expensive multi-stage coxswain/BoringSSL build. These images are tiny
+/// (`golang:alpine` → `scratch`) and build in a few seconds on any host with
+/// Docker, so there is no CI workflow change needed to preload them.
+///
+/// # Errors
+///
+/// Returns an error if `docker build` exits non-zero.
+async fn build_fixture_images(root: &Path) -> anyhow::Result<()> {
+    let dir = root.join("crates/coxswain-e2e/fixtures/malformed-authz");
+    tracing::info!("building Docker image {MALFORMED_AUTHZ_IMAGE}");
+    let status = Command::new("docker")
+        .args(["build", "-t", MALFORMED_AUTHZ_IMAGE, "."])
+        .current_dir(&dir)
+        .status()
+        .await
+        .context("docker build malformed-authz")?;
+    anyhow::ensure!(status.success(), "docker build malformed-authz failed");
+    Ok(())
+}
+
+/// Load the local-only fixture images into the named kind cluster.
+///
+/// # Errors
+///
+/// Returns an error if `kind load docker-image` exits non-zero.
+async fn kind_load_fixture_images(cluster_name: &str) -> anyhow::Result<()> {
+    tracing::info!(cluster = %cluster_name, "loading fixture images into kind cluster");
+    let status = Command::new("kind")
+        .args([
+            "load",
+            "docker-image",
+            MALFORMED_AUTHZ_IMAGE,
+            "--name",
+            cluster_name,
+        ])
+        .status()
+        .await
+        .context("kind load docker-image malformed-authz")?;
+    anyhow::ensure!(
+        status.success(),
+        "kind load docker-image malformed-authz failed"
+    );
     Ok(())
 }
 

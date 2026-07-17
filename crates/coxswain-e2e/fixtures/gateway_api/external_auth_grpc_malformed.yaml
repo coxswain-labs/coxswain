@@ -1,0 +1,95 @@
+# CoxswainExternalAuth gRPC transport, malformed response (#615). Apply
+# backends::ECHO and backends::MALFORMED_AUTHZ first.
+#
+# malformed-authz answers every check with a zero-length body, decoding as a
+# status-less CheckResponse — a malformed response, not an implicit OK. Two
+# CoxswainExternalAuth CRs point at it on distinct hosts:
+#   * extauth-grpc-malformed-closed omits failClosed (defaults true)  → deny (503).
+#   * extauth-grpc-malformed-open   sets failClosed: false            → allow (200).
+#
+# Gateway: coxswain-extauth-grpc-malformed on GATEWAY_HTTP_PORT.
+# Route hosts: gwextauthgrpcmalformedclosed.TESTNS.local,
+#              gwextauthgrpcmalformedopen.TESTNS.local, both path / -> echo-a:3000.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-extauth-grpc-malformed
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
+metadata:
+  name: extauth-grpc-malformed-closed
+spec:
+  protocol: GRPC
+  backendRef:
+    name: malformed-authz
+    port: 9000
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
+metadata:
+  name: extauth-grpc-malformed-open
+spec:
+  protocol: GRPC
+  failClosed: false
+  backendRef:
+    name: malformed-authz
+    port: 9000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: extauth-grpc-malformed-closed-route
+spec:
+  parentRefs:
+    - name: coxswain-extauth-grpc-malformed
+  hostnames:
+    - "gwextauthgrpcmalformedclosed.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: ExternalAuth
+            name: extauth-grpc-malformed-closed
+      backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: extauth-grpc-malformed-open-route
+spec:
+  parentRefs:
+    - name: coxswain-extauth-grpc-malformed
+  hostnames:
+    - "gwextauthgrpcmalformedopen.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: ExternalAuth
+            name: extauth-grpc-malformed-open
+      backendRefs:
+        - name: echo-a
+          port: 3000

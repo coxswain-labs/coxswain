@@ -8,6 +8,7 @@ pub mod ingress;
 
 use crate::harness::{
     GATEWAY_HTTP_PORT, GATEWAY_HTTPS_PORT, INGRESS_HTTP_PORT, INGRESS_HTTPS_PORT,
+    MALFORMED_AUTHZ_IMAGE,
 };
 use anyhow::Context as _;
 use std::path::Path;
@@ -157,6 +158,7 @@ fn prepare_fixture_content(path: &Path, vars: FixtureVars) -> anyhow::Result<(St
     content = substitute(&content, "GO_HTTPBIN_IMAGE", images::GO_HTTPBIN);
     content = substitute(&content, "PEBBLE_IMAGE", images::PEBBLE);
     content = substitute(&content, "EXT_AUTHZ_IMAGE", images::EXT_AUTHZ);
+    content = substitute(&content, "MALFORMED_AUTHZ_IMAGE", MALFORMED_AUTHZ_IMAGE);
 
     // Extra vars (caller-supplied, e.g. `${TLS_HOSTNAME}`, `${CA_PEM}`).
     for (key, val) in &vars.extra {
