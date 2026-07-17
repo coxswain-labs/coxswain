@@ -604,8 +604,12 @@ impl ReconcileContext {
     /// the task is live, but the caller triggers a pass immediately after, which
     /// re-derives every namespace's desired state from the registry within one pass.
     ///
-    /// No-op when relay tiering is disabled — the state is never populated then, so
-    /// the `LIST` would be wasted work.
+    /// Runs **regardless of `relay_enabled`** (#616) — the master switch gates
+    /// provisioning, never convergence. A namespace relay left over from before the
+    /// tier was disabled must still be adopted here; [`super::run_relay_reconciler`]'s
+    /// force-off teardown then GCs it. Skipping rehydration when disabled would strand
+    /// that Deployment forever — the state stays empty and the control loop only ever
+    /// *provisions* from an empty record, never tears down what it never tracked.
     ///
     /// # Errors
     ///
@@ -613,9 +617,6 @@ impl ReconcileContext {
     /// fails; the caller logs and proceeds (the empty state is no worse than the
     /// pre-#593 one, and the next restart/promotion retries).
     pub(crate) async fn rehydrate_provisioned_relays(&self) -> Result<(), kube::Error> {
-        if !self.relay_enabled {
-            return Ok(());
-        }
         let deployments: Api<Deployment> = Api::all(self.client.clone());
         let lp = ListParams::default().labels(&render_relay::relay_component_label_selector());
         let list = deployments.list(&lp).await?;
@@ -664,12 +665,13 @@ impl ReconcileContext {
     /// live `spec.replicas` (it was serving before the restart), then publishes the
     /// gate.
     ///
-    /// Runs **regardless of `relay_enabled`** — unlike the dedicated relay
-    /// reconciler, [`super::converge_shared_pool`] runs every pass whether or not
-    /// tiering is enabled, so a shared relay left over from before the tier was
-    /// disabled must still be adopted here; its force-off teardown then GCs it.
-    /// (Skipping rehydration when disabled would orphan that Deployment — the cell
-    /// stays `None` and the convergence loop only ever *provisions* from `None`.)
+    /// Runs **regardless of `relay_enabled`**, same as
+    /// [`Self::rehydrate_provisioned_relays`] (#616) — [`super::converge_shared_pool`]
+    /// runs every pass whether or not tiering is enabled, so a shared relay left over
+    /// from before the tier was disabled must still be adopted here; its force-off
+    /// teardown then GCs it. (Skipping rehydration when disabled would orphan that
+    /// Deployment — the cell stays `None` and the convergence loop only ever
+    /// *provisions* from `None`.)
     ///
     /// # Errors
     ///
