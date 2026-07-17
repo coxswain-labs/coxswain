@@ -5,7 +5,12 @@ use regex::Regex;
 use smallvec::SmallVec;
 
 /// How a value is compared in a predicate — used by header and query matchers.
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone)]
 pub enum ValueMatch {
     /// Case-sensitive equality comparison.

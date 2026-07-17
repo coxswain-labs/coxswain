@@ -16,7 +16,8 @@
 //! Services whose owning Gateway is gone or has left shared mode.
 
 use super::reconciler::{
-    ReconcileContext, gateway_id, gateway_key, ignore_not_found, is_owned_shared_mode,
+    GatewayIdentity, ReconcileContext, gateway_id, gateway_key, ignore_not_found,
+    is_owned_shared_mode,
 };
 use super::{apply, render_shared};
 use coxswain_core::crd::ServiceType;
@@ -191,7 +192,14 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
     let mut static_vip_failures: std::collections::HashSet<ObjectKey> =
         std::collections::HashSet::new();
     for gw in gateways.iter().filter(|g| is_shared(g)) {
-        let key = gateway_key(gw);
+        let Some(identity) = GatewayIdentity::from_gateway(gw) else {
+            tracing::warn!(
+                gateway = ?gw.metadata.name,
+                "operator: shared Gateway missing namespace/name/uid; skipping VIP provisioning"
+            );
+            continue;
+        };
+        let key = identity.key.clone();
         if allocation.is_gateway_exhausted(&key) {
             emit_port_exhaustion_event(&ctx.client, gw, &ctx.controller_name).await;
         }
@@ -208,10 +216,8 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
         // ladder reads `status.addresses` from the multi-address window.
         let candidates = render_shared::requested_static_cluster_ips(gw);
         if !candidates.is_empty() {
-            let svc_name = render_shared::shared_gateway_service_name(
-                gw.metadata.namespace.as_deref().unwrap_or_default(),
-                gw.metadata.name.as_deref().unwrap_or_default(),
-            );
+            let svc_name =
+                render_shared::shared_gateway_service_name(&identity.key.ns, &identity.key.name);
             // The keep-or-repin decision MUST read the LIVE Service, never the
             // watch store: the store lags this reconciler's own writes, so a
             // triggered pass arriving within the lag window would see the
@@ -241,6 +247,7 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
             let failed = bind_static_vip_service(StaticVipBinding {
                 ctx,
                 gw,
+                identity: &identity,
                 ctrl_ns,
                 candidates: &candidates,
                 effective_ports: gw_effective_ports,
@@ -258,6 +265,7 @@ async fn reconcile_all_vips(ctx: &ReconcileContext) {
         let service =
             render_shared::render_shared_gateway_service(&render_shared::SharedServiceInputs {
                 gateway: gw,
+                identity: &identity,
                 controller_namespace: ctrl_ns,
                 shared_proxy_selector: &ctx.shared_proxy_selector,
                 effective_ports: gw_effective_ports,
@@ -370,6 +378,9 @@ struct StaticVipBinding<'a> {
     ctx: &'a ReconcileContext,
     /// The shared-mode Gateway whose VIP is being bound.
     gw: &'a Gateway,
+    /// The Gateway's identity, parsed once at the loop boundary — supplies
+    /// name/namespace to the rendered VIP Service without re-derivation.
+    identity: &'a GatewayIdentity,
     /// Controller namespace — where the VIP Service lives (#472).
     ctrl_ns: &'a str,
     /// Requested static `IPAddress` candidates, in `spec.addresses` order.
@@ -512,6 +523,7 @@ async fn apply_static_vip_candidate(
     let service =
         render_shared::render_shared_gateway_service(&render_shared::SharedServiceInputs {
             gateway: b.gw,
+            identity: b.identity,
             controller_namespace: b.ctrl_ns,
             shared_proxy_selector: &b.ctx.shared_proxy_selector,
             effective_ports: b.effective_ports,

@@ -10,6 +10,7 @@
 //! is deliberately distinct from the GEP-1762 dedicated resource name so a
 //! shared↔dedicated migration never entangles the two lifecycles.
 
+use super::reconciler::GatewayIdentity;
 use super::render::{
     SHARED_GATEWAY_VIP_COMPONENT, final_labels, gateway_owner_reference, k8s_service_protocol,
     overlay_infra_annotations, service_type_to_k8s_string,
@@ -45,20 +46,13 @@ pub(super) const SHARED_GATEWAY_SA_COMPONENT: &str = "shared-gateway-sa";
 /// Owner-reffed to the Gateway (same namespace → legal), so a plain Gateway
 /// delete reclaims it via GC; a shared→dedicated migration prunes it explicitly
 /// (the owning Gateway survives the migration, so GC never fires).
-///
-/// # Panics
-///
-/// Panics if the Gateway has no `metadata.name` or `metadata.namespace` —
-/// apiserver invariants whose absence indicates a controller bug.
 #[must_use]
-pub(super) fn render_shared_gateway_service_account(gateway: &Gateway) -> ServiceAccount {
-    let gw_name =
-        gateway.metadata.name.as_deref().unwrap_or_else(|| {
-            panic!("invariant: Gateway has no name; the API server requires it")
-        });
-    let gw_ns = gateway.metadata.namespace.as_deref().unwrap_or_else(|| {
-        panic!("invariant: Gateway has no namespace; the API server requires it")
-    });
+pub(super) fn render_shared_gateway_service_account(
+    gateway: &Gateway,
+    identity: &GatewayIdentity,
+) -> ServiceAccount {
+    let gw_ns = identity.key.ns.as_str();
+    let gw_name = identity.key.name.as_str();
     let labels = final_labels(gateway, SHARED_GATEWAY_SA_COMPONENT);
     let annotations = overlay_infra_annotations(BTreeMap::new(), gateway);
     ServiceAccount {
@@ -67,7 +61,7 @@ pub(super) fn render_shared_gateway_service_account(gateway: &Gateway) -> Servic
             namespace: Some(gw_ns.to_string()),
             labels: Some(labels),
             annotations: (!annotations.is_empty()).then_some(annotations),
-            owner_references: Some(vec![gateway_owner_reference(gateway)]),
+            owner_references: Some(vec![gateway_owner_reference(identity)]),
             ..Default::default()
         },
         ..Default::default()
@@ -167,6 +161,11 @@ pub(super) fn requested_static_cluster_ip(gw: &Gateway) -> Option<std::net::IpAd
 pub(super) struct SharedServiceInputs<'a> {
     /// The shared-mode Gateway getting its own VIP.
     pub(super) gateway: &'a Gateway,
+    /// The Gateway's identity, parsed once at the reconcile boundary. Supplies
+    /// name/namespace so this render never re-derives (nor panics on) them. The
+    /// VIP Service carries no owner reference (cross-namespace refs are illegal),
+    /// so `identity.uid` is unused here.
+    pub(super) identity: &'a GatewayIdentity,
     /// Namespace the shared proxy pod lives in — the VIP Service is created here
     /// (#472) so its selector resolves to the proxy pod (a selector only matches
     /// same-namespace pods, and selectorless `LoadBalancer` Services are
@@ -209,13 +208,8 @@ pub(super) struct SharedServiceInputs<'a> {
 #[must_use]
 pub(super) fn render_shared_gateway_service(inputs: &SharedServiceInputs<'_>) -> Service {
     let gw = inputs.gateway;
-    let gw_name =
-        gw.metadata.name.as_deref().unwrap_or_else(|| {
-            panic!("invariant: Gateway has no name; the API server requires it")
-        });
-    let gw_ns = gw.metadata.namespace.as_deref().unwrap_or_else(|| {
-        panic!("invariant: Gateway has no namespace; the API server requires it")
-    });
+    let gw_ns = inputs.identity.key.ns.as_str();
+    let gw_name = inputs.identity.key.name.as_str();
 
     // GEP-1867 (#482): overlay `spec.infrastructure.{labels,annotations}` so an
     // operator can stamp cloud-LB annotations (and labels) onto each Gateway's

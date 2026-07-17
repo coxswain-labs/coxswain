@@ -492,8 +492,6 @@ fn extract_hash_key(
         HashSource::Cookie(name) => affinity::cookie_value(req, name)
             .filter(|v| !v.is_empty())
             .map(|v| affinity_hash(v.as_bytes())),
-        // `HashSource` is `#[non_exhaustive]`; a future variant degrades to round-robin.
-        _ => None,
     }
 }
 

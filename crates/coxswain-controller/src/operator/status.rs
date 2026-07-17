@@ -46,6 +46,7 @@
 //! owned condition — not just `observed_generation` — to detect a status-only
 //! transition that nonetheless requires repatching.
 
+use super::reconciler::GatewayIdentity;
 use crate::status_common::addresses::{
     StaticAddressOutcome, SupportedAddressType, TypedAddress, evaluate_static_addresses,
 };
@@ -131,6 +132,10 @@ impl AddressType {
 pub(crate) struct DedicatedGatewayStatusInputs<'a> {
     /// The Gateway under reconcile.
     pub(crate) gw: &'a Gateway,
+    /// The Gateway's identity, parsed once at the reconcile boundary. Supplies
+    /// name/namespace for the status patch target so it never re-derives (nor
+    /// panics on) them.
+    pub(crate) identity: &'a GatewayIdentity,
     /// The provisioned dedicated-proxy Service, if it has been observed via
     /// the operator's Service reflector. `None` on the `InvalidParameters`
     /// path (we never SSA'd anything to look up) — `compute_addresses`
@@ -452,11 +457,6 @@ pub(crate) fn dedicated_gateway_needs_status_patch(
 /// Returns the underlying [`kube::Error`] if the apiserver rejects the patch
 /// (RBAC, resource-version conflict, network).
 ///
-/// # Panics
-///
-/// Panics if the Gateway has no `metadata.name` or no `metadata.namespace`
-/// — both are apiserver invariants on any object reachable through a watch,
-/// so a violation indicates a controller bug rather than user input.
 pub(crate) async fn patch_dedicated_gateway_status(
     client: &Client,
     inputs: &DedicatedGatewayStatusInputs<'_>,
@@ -464,13 +464,8 @@ pub(crate) async fn patch_dedicated_gateway_status(
     if !dedicated_gateway_needs_status_patch(inputs) {
         return Ok(());
     }
-    let name =
-        inputs.gw.metadata.name.as_deref().unwrap_or_else(|| {
-            panic!("invariant: Gateway has no name; the API server requires it")
-        });
-    let ns = inputs.gw.metadata.namespace.as_deref().unwrap_or_else(|| {
-        panic!("invariant: Gateway has no namespace; the API server requires it")
-    });
+    let name = inputs.identity.key.name.as_str();
+    let ns = inputs.identity.key.ns.as_str();
     let generation = inputs.gw.metadata.generation.unwrap_or(0);
     let now = Time(k8s_openapi::jiff::Timestamp::now());
     let patch = build_dedicated_gateway_status_patch(inputs, generation, &now);
@@ -498,13 +493,10 @@ pub(crate) async fn patch_dedicated_gateway_status(
 /// # Errors
 ///
 /// Returns the underlying [`kube::Error`] if the apiserver rejects the patch.
-///
-/// # Panics
-///
-/// Panics if the Gateway has no `metadata.name` or no `metadata.namespace`.
 pub(crate) async fn clear_dedicated_gateway_status(
     client: &Client,
     gw: &Gateway,
+    identity: &GatewayIdentity,
 ) -> Result<(), kube::Error> {
     let current_conditions = gw
         .status
@@ -531,13 +523,8 @@ pub(crate) async fn clear_dedicated_gateway_status(
         // already been cleared.
         return Ok(());
     }
-    let name =
-        gw.metadata.name.as_deref().unwrap_or_else(|| {
-            panic!("invariant: Gateway has no name; the API server requires it")
-        });
-    let ns = gw.metadata.namespace.as_deref().unwrap_or_else(|| {
-        panic!("invariant: Gateway has no namespace; the API server requires it")
-    });
+    let name = identity.key.name.as_str();
+    let ns = identity.key.ns.as_str();
     let patch = serde_json::json!({
         "status": {
             "conditions": preserved,
@@ -892,6 +879,7 @@ pub(crate) fn resource_name(gw_name: &str, gateway_class_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::reconciler::GatewayIdentity;
     use super::{
         AcceptedOutcome, DEDICATED_PROXY_READY_CONDITION_TYPE, DedicatedGatewayStatusInputs,
         build_dedicated_gateway_status_patch, dedicated_gateway_needs_status_patch,
@@ -923,6 +911,7 @@ mod tests {
             metadata: ObjectMeta {
                 name: Some("my-gw".to_string()),
                 namespace: Some("default".to_string()),
+                uid: Some("uid-my-gw".to_string()),
                 generation: Some(generation),
                 ..Default::default()
             },
@@ -1017,8 +1006,15 @@ mod tests {
         accepted: AcceptedOutcome,
         ready_pods: usize,
     ) -> DedicatedGatewayStatusInputs<'a> {
+        // Leak the parsed identity so it satisfies the `&'a` field without
+        // threading an extra binding through all 28 test call sites. Bounded,
+        // test-only, freed at process exit.
+        let identity: &'a GatewayIdentity = Box::leak(Box::new(
+            GatewayIdentity::from_gateway(gw).expect("test gateway has identity"),
+        ));
         DedicatedGatewayStatusInputs {
             gw,
+            identity,
             service,
             nodes,
             listener_status: health,

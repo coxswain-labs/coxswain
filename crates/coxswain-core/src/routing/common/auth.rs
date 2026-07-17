@@ -19,7 +19,12 @@ use zeroize::ZeroizeOnDrop;
 /// Carried as `Option<Arc<IngressAuthConfig>>` on [`RouteEntry`][super::entry::RouteEntry]
 /// so the common case (no auth annotation) has zero size impact on the hot
 /// `RouteEntry` beyond an 8-byte niche pointer.
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Debug)]
 pub enum IngressAuthConfig {
     /// Forward a sub-request to an external authorization service.
@@ -294,12 +299,15 @@ impl std::fmt::Debug for BasicCredential {
 
 /// Supported htpasswd hash algorithms.
 ///
-/// `#[non_exhaustive]` so future formats (MD5 `$apr1$`, etc.) can be added
-/// without breaking callers.  Unknown formats are WARN+skipped at parse time.
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so a new format (MD5 `$apr1$`, etc.) is a
+/// compiler-enforced change rather than a silent runtime drop. `#[non_exhaustive]`
+/// would force a wildcard arm there and defeat that. Unknown formats are
+/// WARN+skipped at parse time.
 ///
 /// Hash bytes are zeroed on drop via [`ZeroizeOnDrop`].
 /// `Debug` is hand-implemented to redact the hash value.
-#[non_exhaustive]
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(ZeroizeOnDrop)]
 pub enum PasswordHash {
     /// bcrypt hash (`$2a$`, `$2b$`, or `$2y$` prefix).

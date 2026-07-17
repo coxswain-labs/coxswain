@@ -266,8 +266,6 @@ impl TlsAccept for SniCertSelector {
                     "mTLS: CA Unavailable — fail-closing all client handshakes"
                 );
             }
-            // Forward-compatible: future variants are treated as no mTLS for this SNI.
-            _ => {}
         }
     }
 

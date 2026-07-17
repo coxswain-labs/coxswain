@@ -355,9 +355,6 @@ pub(crate) fn upstream_tls_to_wire(tls: &UpstreamTls) -> p::UpstreamTls {
     let ca = match &tls.ca {
         UpstreamCa::System => p::upstream_tls::Ca::System(true),
         UpstreamCa::Bundle(pem) => p::upstream_tls::Ca::Bundle(pem.to_vec()),
-        _ => unreachable!(
-            "invariant: all UpstreamCa variants handled; update wire.rs when adding new variants"
-        ),
     };
     let (client_cert_pem, client_cert_key, client_cert_source) = match tls.client_cert() {
         Some(cc) => (
@@ -370,20 +367,15 @@ pub(crate) fn upstream_tls_to_wire(tls: &UpstreamTls) -> p::UpstreamTls {
     let subject_alt_names = tls
         .subject_alt_names()
         .iter()
-        .filter_map(|san| match san {
-            SubjectAltName::Hostname(h) => Some(p::SubjectAltName {
+        .map(|san| match san {
+            SubjectAltName::Hostname(h) => p::SubjectAltName {
                 kind: p::subject_alt_name::Kind::Hostname.into(),
                 value: h.to_string(),
-            }),
-            SubjectAltName::Uri(u) => Some(p::SubjectAltName {
+            },
+            SubjectAltName::Uri(u) => p::SubjectAltName {
                 kind: p::subject_alt_name::Kind::Uri.into(),
                 value: u.to_string(),
-            }),
-            // Forward-compatible: unknown variants added in future releases are dropped
-            // (they were added after this binary was compiled; a rolling upgrade is safe
-            // because the SAN set must contain at least one recognisable entry to enforce
-            // — an empty residual is caught by from_wire's fail-closed path).
-            _ => None,
+            },
         })
         .collect();
     p::UpstreamTls {
@@ -416,9 +408,6 @@ fn load_balance_to_wire(lb: &LoadBalance) -> p::LoadBalance {
         LoadBalance::LeastConn => p::load_balance::Algorithm::LeastConn(true),
         LoadBalance::Ewma => p::load_balance::Algorithm::Ewma(true),
         LoadBalance::Hash(src) => p::load_balance::Algorithm::Hash(hash_source_to_wire(src)),
-        _ => unreachable!(
-            "invariant: all LoadBalance variants handled; update wire.rs when adding new variants"
-        ),
     };
     p::LoadBalance {
         algorithm: Some(algorithm),
@@ -431,9 +420,6 @@ fn hash_source_to_wire(src: &HashSource) -> p::HashSource {
         HashSource::SourceIp => p::hash_source::Source::SourceIp(true),
         HashSource::Header(name) => p::hash_source::Source::Header(name.as_str().to_string()),
         HashSource::Cookie(name) => p::hash_source::Source::Cookie(name.to_string()),
-        _ => unreachable!(
-            "invariant: all HashSource variants handled; update wire.rs when adding new variants"
-        ),
     };
     p::HashSource {
         source: Some(source),
@@ -448,9 +434,6 @@ fn session_affinity_to_wire(sa: &SessionAffinity) -> p::SessionAffinity {
         SessionAffinity::Header { header } => {
             p::session_affinity::Mode::Header(header.as_str().to_string())
         }
-        _ => unreachable!(
-            "invariant: all SessionAffinity variants handled; update wire.rs when adding new variants"
-        ),
     };
     p::SessionAffinity { mode: Some(mode) }
 }
@@ -510,9 +493,6 @@ fn filter_to_wire(
             })
         }
         FilterAction::Cors(cfg) => p::filter_action::Action::Cors(cors_config_to_wire(cfg)),
-        _ => unreachable!(
-            "invariant: all FilterAction variants handled; update wire.rs when adding new variants"
-        ),
     };
     p::FilterAction {
         action: Some(action),
@@ -557,9 +537,6 @@ fn path_modifier_to_wire(pm: &PathModifier) -> p::PathModifier {
                 replacement: replacement.to_string(),
             })
         }
-        _ => unreachable!(
-            "invariant: all PathModifier variants handled; update wire.rs when adding new variants"
-        ),
     };
     p::PathModifier {
         modifier: Some(modifier),
@@ -596,9 +573,6 @@ fn value_match_to_wire(vm: &ValueMatch) -> p::ValueMatch {
     let m = match vm {
         ValueMatch::Exact(s) => p::value_match::Value::Exact(s.clone()),
         ValueMatch::Regex(re) => p::value_match::Value::Regex(re.as_str().to_string()),
-        _ => unreachable!(
-            "invariant: all ValueMatch variants handled; update wire.rs when adding new variants"
-        ),
     };
     p::ValueMatch { value: Some(m) }
 }
@@ -636,9 +610,6 @@ fn rate_limit_to_wire(rl: &RateLimitConfig) -> p::RateLimitConfig {
         RateLimitKey::Header(name) => p::RateLimitKey {
             dimension: Some(p::rate_limit_key::Dimension::Header(name.to_string())),
         },
-        _ => unreachable!(
-            "invariant: all RateLimitKey variants handled; update wire.rs when adding new variants"
-        ),
     };
     p::RateLimitConfig {
         requests_per_second: rl.requests_per_second.get(),
@@ -686,29 +657,22 @@ fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfig {
                 grpc,
             })
         }
-        IngressAuthConfig::Basic(creds) => {
-            p::ingress_auth_config::Auth::Basic(p::BasicCredList {
-                credentials: creds
-                    .iter()
-                    .map(|c| {
-                        let (hash_kind, hash) = match &c.hash {
-                            PasswordHash::Bcrypt(h) => {
-                                (p::PasswordHash::Bcrypt as i32, h.to_string())
-                            }
-                            PasswordHash::Sha1(h) => {
-                                (p::PasswordHash::Sha1 as i32, h.to_string())
-                            }
-                            _ => unreachable!("invariant: all PasswordHash variants handled; update wire.rs when adding new variants"),
-                        };
-                        p::BasicCred {
-                            username: c.username.to_string(),
-                            hash_kind,
-                            hash,
-                        }
-                    })
-                    .collect(),
-            })
-        }
+        IngressAuthConfig::Basic(creds) => p::ingress_auth_config::Auth::Basic(p::BasicCredList {
+            credentials: creds
+                .iter()
+                .map(|c| {
+                    let (hash_kind, hash) = match &c.hash {
+                        PasswordHash::Bcrypt(h) => (p::PasswordHash::Bcrypt as i32, h.to_string()),
+                        PasswordHash::Sha1(h) => (p::PasswordHash::Sha1 as i32, h.to_string()),
+                    };
+                    p::BasicCred {
+                        username: c.username.to_string(),
+                        hash_kind,
+                        hash,
+                    }
+                })
+                .collect(),
+        }),
         IngressAuthConfig::Jwt(jwt) => p::ingress_auth_config::Auth::Jwt(p::JwtAuthConfig {
             issuer: jwt.issuer.to_string(),
             audiences: jwt.audiences.iter().map(|s| s.to_string()).collect(),
@@ -732,10 +696,7 @@ fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfig {
                 .collect(),
             forward_token: jwt.forward_token,
         }),
-        IngressAuthConfig::Unavailable => {
-            p::ingress_auth_config::Auth::Unavailable(true)
-        }
-        _ => unreachable!("invariant: all IngressAuthConfig variants handled; update wire.rs when adding new variants"),
+        IngressAuthConfig::Unavailable => p::ingress_auth_config::Auth::Unavailable(true),
     };
     p::IngressAuthConfig { auth: Some(a) }
 }
@@ -780,9 +741,6 @@ fn route_kind_to_wire(k: RouteKind) -> p::RouteKind {
         RouteKind::Exact => p::RouteKind::Exact,
         RouteKind::Prefix => p::RouteKind::Prefix,
         RouteKind::Regex => p::RouteKind::Regex,
-        _ => unreachable!(
-            "invariant: all RouteKind variants handled; update wire.rs when adding new variants"
-        ),
     }
 }
 
@@ -790,9 +748,6 @@ fn wildcard_kind_to_wire(k: WildcardKind) -> p::WildcardKind {
     match k {
         WildcardKind::SingleLabel => p::WildcardKind::SingleLabel,
         WildcardKind::MultiLabel => p::WildcardKind::MultiLabel,
-        _ => unreachable!(
-            "invariant: all WildcardKind variants handled; update wire.rs when adding new variants"
-        ),
     }
 }
 
@@ -801,9 +756,6 @@ fn normalize_level_to_wire(n: NormalizeLevel) -> p::NormalizeLevel {
         NormalizeLevel::Base => p::NormalizeLevel::Base,
         NormalizeLevel::MergeSlashes => p::NormalizeLevel::MergeSlashes,
         NormalizeLevel::DecodeAndMergeSlashes => p::NormalizeLevel::DecodeAndMergeSlashes,
-        _ => unreachable!(
-            "invariant: all NormalizeLevel variants handled; update wire.rs when adding new variants"
-        ),
     }
 }
 
@@ -812,9 +764,6 @@ fn protocol_to_wire(proto: BackendProtocol) -> p::BackendProtocol {
         BackendProtocol::Http1 => p::BackendProtocol::Http1,
         BackendProtocol::H2c => p::BackendProtocol::H2c,
         BackendProtocol::WebSocket => p::BackendProtocol::WebSocket,
-        _ => unreachable!(
-            "invariant: all BackendProtocol variants handled; update wire.rs when adding new variants"
-        ),
     }
 }
 
@@ -826,9 +775,6 @@ fn cors_config_to_wire(cfg: &CorsConfig) -> p::CorsFilter {
         .map(|o| match o {
             CorsOrigin::Exact(s) => s.clone(),
             CorsOrigin::Wildcard { prefix, suffix } => format!("{}*{}", prefix, suffix),
-            _ => unreachable!(
-                "invariant: all CorsOrigin variants handled; update wire.rs when adding new variants"
-            ),
         })
         .collect();
     // Pre-joined header values are sent as-is (the proxy re-parses into HeaderValue).

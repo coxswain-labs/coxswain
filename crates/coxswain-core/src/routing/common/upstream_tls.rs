@@ -16,7 +16,12 @@ use std::sync::Arc;
 /// `UpstreamTls::sni` (the `hostname` field) is then used **solely** for SNI
 /// and cert selection and **MUST NOT** be used for authentication — Pingora's
 /// built-in hostname check is disabled in favour of this SAN check.
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SubjectAltName {
     /// DNS-type SAN (`type: Hostname` in the policy).
@@ -80,7 +85,12 @@ fn dns_san_matches(expected: &str, cert_san: &str) -> bool {
 }
 
 /// CA certificate source for a [`BackendTLSPolicy`](https://gateway-api.sigs.k8s.io/references/spec/#gateway.networking.k8s.io/v1alpha3.BackendTLSPolicy) attachment.
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug)]
 pub enum UpstreamCa {
     /// `wellKnownCACertificates: System` — use the OS trust store.
@@ -234,7 +244,12 @@ impl UpstreamTls {
 /// [`UpstreamTls`] on the [`BackendGroup`](super::backend::BackendGroup); see that
 /// type. `appProtocol` values that imply TLS (`https`, `kubernetes.io/wss`) have no
 /// Gateway API basis and map to [`Http1`](Self::Http1) (cleartext).
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BackendProtocol {
     /// Plain HTTP/1.1 — the default when `appProtocol` is absent or unrecognised.

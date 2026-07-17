@@ -61,12 +61,6 @@ pub(crate) fn resolve(req: &RequestHeader, group: &BackendGroup) -> AffinityDeci
                 set_cookie: false,
             }
         }
-        // `SessionAffinity` is non-exhaustive; a future mode the proxy doesn't yet
-        // understand degrades safely to round-robin.
-        Some(_) => AffinityDecision {
-            pin: None,
-            set_cookie: false,
-        },
     }
 }
 

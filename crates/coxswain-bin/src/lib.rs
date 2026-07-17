@@ -84,7 +84,9 @@ pub fn run() -> Result<()> {
         Role::Controller(controller_args) => run_controller(controller_args),
         Role::Proxy(proxy_args) => match proxy_args.scope() {
             ProxyScope::Shared => run_proxy_shared(proxy_args),
-            ProxyScope::Gateway { .. } => run_proxy_gateway(proxy_args),
+            ProxyScope::Gateway { name, namespace } => {
+                run_proxy_gateway(proxy_args, name, namespace)
+            }
         },
         Role::Relay(relay_args) => run_relay(relay_args),
     }
@@ -360,7 +362,15 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     // cells directly (#537) rather than fanning out to the proxy over HTTP —
     // it's the controller's own intent, the exact thing it pushes to proxies
     // over the discovery stream.
+    // Fan-out HTTP client for the operator aggregator, built once here so a
+    // rustls-init failure surfaces as a typed startup error rather than a panic
+    // deep in the aggregator constructor.
+    let aggregator_http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .context("building the operator-aggregator fan-out HTTP client")?;
     let aggregator = OperatorAggregator::new(
+        aggregator_http,
         fleet,
         status_writer.outputs.cluster_summary,
         Some(node_registry_for_agg),
@@ -486,15 +496,17 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
 
 /// Wire and run the `proxy --dedicated` pod role: read-only data plane scoped
 /// to one named Gateway.
-fn run_proxy_gateway(args: ProxyRoleArgs) -> Result<()> {
+///
+/// `gateway_name`/`gateway_namespace` are the `ProxyScope::Gateway` payload the
+/// caller already matched in [`run`] — passed in rather than re-derived via a
+/// second `args.scope()` call, which would re-clone both strings and force a
+/// dead `ProxyScope::Shared` arm that could only be reached by a caller bug.
+fn run_proxy_gateway(
+    args: ProxyRoleArgs,
+    gateway_name: String,
+    gateway_namespace: String,
+) -> Result<()> {
     init_logger(args.common.log_format, &args.common.log_filter)?;
-
-    let (gateway_name, gateway_namespace) = match args.scope() {
-        ProxyScope::Gateway { name, namespace } => (name, namespace),
-        ProxyScope::Shared => {
-            panic!("invariant: run_proxy_gateway must be invoked with ProxyScope::Gateway");
-        }
-    };
 
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -812,7 +824,7 @@ fn wire_gateway_only_proxy_services(
     let auth_client = reqwest::Client::builder()
         .use_rustls_tls()
         .build()
-        .unwrap_or_else(|e| panic!("invariant: reqwest::Client construction must succeed: {e}"));
+        .context("building the ext_authz sub-request HTTP client")?;
     let cfg = SharedProxyConfig::new(
         default_timeouts,
         ca_cache,
@@ -939,7 +951,7 @@ fn wire_proxy_services(
     let auth_client = reqwest::Client::builder()
         .use_rustls_tls()
         .build()
-        .unwrap_or_else(|e| panic!("invariant: reqwest::Client construction must succeed: {e}"));
+        .context("building the ext_authz sub-request HTTP client")?;
     // Shared startup-time config for both proxy types.  Clone is cheap:
     // Arc pointer bumps + Copy/Clone values.
     let mut shared_cfg = SharedProxyConfig::new(

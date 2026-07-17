@@ -61,6 +61,7 @@
 
 use super::merge::strategic_merge_pod_template;
 use super::params::EffectiveParams;
+use super::reconciler::GatewayIdentity;
 use coxswain_core::crd::ServiceType;
 use coxswain_core::naming::gep1762_resource_name;
 use coxswain_reflector::EffectiveListenerPort;
@@ -118,6 +119,10 @@ const RESERVED_LABEL_KEYS: &[&str] = &[
 pub(super) struct RenderInputs<'a> {
     /// The Gateway whose dedicated proxy is being rendered.
     pub(super) gateway: &'a Gateway,
+    /// The Gateway's identity, parsed once at the reconcile boundary. Supplies
+    /// name/namespace/uid so the render path never re-derives (and never panics
+    /// on) those apiserver-populated fields.
+    pub(super) identity: &'a GatewayIdentity,
     /// The merged parameters from [`super::params::resolve`].
     pub(super) params: &'a EffectiveParams,
     /// Image to use for the proxy container when `params.image` is `None`.
@@ -210,26 +215,13 @@ struct Common<'a> {
 }
 
 /// Render all three resources for a Gateway.
-///
-/// # Panics
-///
-/// Panics if the Gateway has no `metadata.namespace`. This is an apiserver
-/// invariant on any object delivered through a watch; its absence indicates
-/// a controller bug.
 #[must_use]
 pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
-    let name = resource_name(inputs.gateway, inputs.gateway_class_name);
-    let namespace = inputs
-        .gateway
-        .metadata
-        .namespace
-        .clone()
-        .unwrap_or_else(|| {
-            panic!("invariant: Gateway has no namespace; the API server requires it")
-        });
+    let name = resource_name(&inputs.identity.key.name, inputs.gateway_class_name);
+    let namespace = inputs.identity.key.ns.clone();
     let labels = final_labels(inputs.gateway, "dedicated-proxy");
     let annotations = final_annotations(inputs.gateway, inputs.admin_port);
-    let owner_ref = gateway_owner_reference(inputs.gateway);
+    let owner_ref = gateway_owner_reference(inputs.identity);
     let common = Common {
         name: &name,
         namespace: &namespace,
@@ -258,11 +250,7 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
 /// is derived from the same single source of truth that provisioning rendered.
 /// Delegates to [`coxswain_core::naming::gep1762_resource_name`] — the same
 /// formula used by the discovery scope-binding check.
-pub(super) fn resource_name(gateway: &Gateway, class_name: &str) -> String {
-    let gw_name =
-        gateway.metadata.name.as_deref().unwrap_or_else(|| {
-            panic!("invariant: Gateway has no name; the API server requires it")
-        });
+pub(super) fn resource_name(gw_name: &str, class_name: &str) -> String {
     gep1762_resource_name(gw_name, class_name)
 }
 
@@ -368,27 +356,16 @@ fn final_annotations(gateway: &Gateway, admin_port: u16) -> BTreeMap<String, Str
 /// to the parent Gateway. Both fields are required for K8s garbage collection
 /// to cascade Gateway deletion to the provisioned resources without leaving
 /// orphans.
-pub(super) fn gateway_owner_reference(gateway: &Gateway) -> OwnerReference {
+pub(super) fn gateway_owner_reference(identity: &GatewayIdentity) -> OwnerReference {
     let group = <Gateway as kube::Resource>::group(&()).into_owned();
     let version = <Gateway as kube::Resource>::version(&()).into_owned();
     let api_version = format!("{group}/{version}");
     let kind = <Gateway as kube::Resource>::kind(&()).into_owned();
-    let name = gateway
-        .metadata
-        .name
-        .clone()
-        .unwrap_or_else(|| panic!("invariant: Gateway has no name"));
-    let uid = gateway.metadata.uid.clone().unwrap_or_else(|| {
-        panic!(
-            "invariant: Gateway has no UID; owner references require one and \
-             the API server populates it on creation"
-        )
-    });
     OwnerReference {
         api_version,
         kind,
-        name,
-        uid,
+        name: identity.key.name.clone(),
+        uid: identity.uid.clone(),
         controller: Some(true),
         block_owner_deletion: Some(true),
     }
@@ -1111,6 +1088,7 @@ mod tests {
         ]);
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &EffectiveParams::default(),
             controller_image: "ghcr.io/coxswain-labs/coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1134,6 +1112,7 @@ mod tests {
         let params = EffectiveParams::default();
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &params,
             controller_image: "ghcr.io/coxswain-labs/coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1187,6 +1166,7 @@ mod tests {
         };
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &params,
             controller_image: "irrelevant",
             gateway_class_name: "coxswain",
@@ -1212,6 +1192,7 @@ mod tests {
         let params = EffectiveParams::default();
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1274,6 +1255,7 @@ mod tests {
         let mk = |ports: &[EffectiveListenerPort]| {
             render(&RenderInputs {
                 gateway: &gw,
+                identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
                 params: &params,
                 controller_image: "coxswain:v0.2",
                 gateway_class_name: "coxswain",
@@ -1345,6 +1327,7 @@ mod tests {
         let params = EffectiveParams::default();
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1379,6 +1362,7 @@ mod tests {
         let params = EffectiveParams::default();
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1411,6 +1395,7 @@ mod tests {
         };
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1503,6 +1488,7 @@ mod tests {
         let params = EffectiveParams::default();
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1545,6 +1531,7 @@ mod tests {
         let params = EffectiveParams::default();
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1575,6 +1562,7 @@ mod tests {
         let params = EffectiveParams::default();
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1620,6 +1608,7 @@ mod tests {
         });
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &EffectiveParams::default(),
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1664,6 +1653,7 @@ mod tests {
         });
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &EffectiveParams::default(),
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1704,6 +1694,7 @@ mod tests {
         });
         let result = render(&RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &EffectiveParams::default(),
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1747,6 +1738,7 @@ mod tests {
         );
         let svc = render_shared_gateway_service(&SharedServiceInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             controller_namespace: "coxswain-system",
             shared_proxy_selector: &selector,
             effective_ports: &effective_ports,
@@ -1824,6 +1816,7 @@ mod tests {
         let selector = BTreeMap::new();
         let svc = render_shared_gateway_service(&SharedServiceInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             controller_namespace: "coxswain-system",
             shared_proxy_selector: &selector,
             effective_ports: &effective_ports,
@@ -1886,7 +1879,10 @@ mod tests {
             annotations: Some(user_anno),
             ..Default::default()
         });
-        let sa = render_shared_gateway_service_account(&gw);
+        let sa = render_shared_gateway_service_account(
+            &gw,
+            &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
+        );
         assert_eq!(
             sa.metadata.namespace.as_deref(),
             Some("team-a"),
@@ -1954,7 +1950,10 @@ mod tests {
         // No infra annotations → annotations field omitted (legal subset of {} for
         // the conformance check), and no stray admin-port annotation.
         let gw = make_gateway("team-a", "gw", vec![("http", 80, "HTTP")]);
-        let sa = render_shared_gateway_service_account(&gw);
+        let sa = render_shared_gateway_service_account(
+            &gw,
+            &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
+        );
         assert!(sa.metadata.annotations.is_none());
     }
 

@@ -107,6 +107,13 @@ pub enum WireError {
     #[error("invalid header value: {0}")]
     InvalidHeaderValue(#[from] http::header::InvalidHeaderValue),
 
+    /// A header modifier could not be decoded for a reason other than an invalid
+    /// name or value — carries the source error's message. The fail-closed sink
+    /// for a future `HeaderModError` variant added in `coxswain-core`, so decode
+    /// Nacks (keeping the last-good world) instead of panicking on the wire path.
+    #[error("invalid header modifier: {0}")]
+    InvalidHeaderMod(String),
+
     /// An HTTP method string is not a valid token.
     #[error("invalid HTTP method: {0}")]
     InvalidMethod(#[from] http::method::InvalidMethod),

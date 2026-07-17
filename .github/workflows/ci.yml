@@ -66,6 +66,7 @@ jobs:
               - 'scripts/check-must-use-results.sh'
               - 'scripts/check-bounded-regex.sh'
               - 'scripts/check-no-peek-readable.sh'
+              - 'scripts/check-no-wildcard-panic.sh'
               - 'scripts/check-no-e2e-sleeps.sh'
               - 'scripts/check-e2e-single-poller.sh'
               - 'scripts/check-annotation-coverage.sh'
@@ -234,6 +235,8 @@ jobs:
         run: bash scripts/check-bounded-regex.sh
       - name: MSG_PEEK retry loops wait via PeekBackoff, never readable()
         run: bash scripts/check-no-peek-readable.sh
+      - name: No panicking wildcard arms in the data plane
+        run: bash scripts/check-no-wildcard-panic.sh
       - name: No unused dependencies (cargo-machete)
         uses: taiki-e/install-action@v2
         with:
