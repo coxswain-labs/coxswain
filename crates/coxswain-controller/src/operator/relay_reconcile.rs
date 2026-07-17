@@ -54,20 +54,23 @@ const RELAY_RESYNC_INTERVAL: Duration = Duration::from_secs(10);
 
 /// The single serialized task that owns the dedicated relay tier (#602).
 ///
-/// Returns immediately when relay tiering is disabled (nothing to manage).
-/// Otherwise it loops; each leader-gated pass advances every candidate namespace's
-/// control-loop state machine off the live registry signal. `registry` (from
-/// `node_registry.subscribe()`) is the prompt driver; `leadership` provisions
-/// promptly on the promotion edge; the resync interval fires the time-based
-/// transitions. Shutdown wins (biased).
+/// Runs regardless of `--relay-enabled` (#616) — like
+/// [`super::run_shared_install_reconciler`], the master switch gates
+/// **provisioning**, never **convergence**: a namespace relay left over from before
+/// the tier was disabled must still be advanced by this loop, whose force-off
+/// teardown (see [`process_namespace`]) then GCs it. Skipping the loop when
+/// disabled would strand that Deployment forever (it would never even be tracked —
+/// see [`super::reconciler::ReconcileContext::rehydrate_provisioned_relays`]).
+///
+/// Each leader-gated pass advances every candidate namespace's control-loop state
+/// machine off the live registry signal. `registry` (from `node_registry.subscribe()`)
+/// is the prompt driver; `leadership` provisions promptly on the promotion edge; the
+/// resync interval fires the time-based transitions. Shutdown wins (biased).
 pub(crate) async fn run_relay_reconciler(
     ctx: Arc<ReconcileContext>,
     mut shutdown: ShutdownWatch,
     mut leadership: Option<watch::Receiver<bool>>,
 ) {
-    if !ctx.relay_enabled {
-        return;
-    }
     let mut registry = ctx.node_registry.as_ref().map(|r| r.subscribe());
     let mut interval = tokio::time::interval(RELAY_RESYNC_INTERVAL);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -193,7 +196,15 @@ async fn process_namespace(
     if namespace_is_terminating(&ctx.namespaces_store, namespace) {
         return;
     }
-    let policy = ctx.resolve_relay_policy(namespace);
+    let mut policy = ctx.resolve_relay_policy(namespace);
+    // The master switch overrides even a per-namespace `enabled: true` policy — a
+    // disabled tier force-tears-down everything via the same KEDA force-off path a
+    // namespace's own `enabled: false` uses (mirrors `shared_relay_tuning` in
+    // `shared_install.rs`). Without this, `enabled_override` stays `None` here
+    // (no per-namespace policy) and `should_deactivate` never force-triggers (#616).
+    if !ctx.relay_enabled {
+        policy.enabled = Some(false);
+    }
     let tuning = RelayTuning::resolve(&policy, ctx.relay_tuning_defaults());
     let (signal, ready, subscribers) = registry_signal(ctx, namespace);
     let inputs = RelayInputs {

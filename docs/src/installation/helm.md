@@ -65,7 +65,7 @@ The [relay tier](../architecture/deployment-models.md#discovery-relay-tier) scal
 
 | Value | Default | Description |
 |-------|---------|-------------|
-| `relay.enabled` | `true` | Master switch (→ `--relay-enabled`). Set `false` to disable the whole tier |
+| `relay.enabled` | `true` | Master switch (→ `--relay-enabled`). Set `false` to disable the whole tier — any already-provisioned relay (shared or per-namespace) is torn down, not orphaned |
 | `relay.replicas` | `2` | HA replica count / autoscaling floor for a provisioned relay |
 | `relay.maxReplicas` | `10` | Shared-relay autoscaling ceiling (→ `--relay-max-replicas`) — the mandatory cap on the upstream streams the shared relay opens against the leader. Dedicated relays cap via `CoxswainRelayPolicy` |
 | `relay.minProxyReplicas` | `8` | Break-even **activation** threshold: a scope gets a relay only once its demand (a namespace's live dedicated-proxy count, or the shared pool's replica count) reaches this (below it, direct-to-controller) |

@@ -268,6 +268,120 @@ async fn namespace_relay_not_provisioned_below_threshold() -> anyhow::Result<()>
     Ok(())
 }
 
+/// Happy/transition path (#616) — with a namespace relay `Active` and serving
+/// (leaves repointed onto it, make-before-break), disabling the relay tier tears
+/// the relay down and the dedicated proxy repoints its discovery subscribe back to
+/// the controller, which keeps serving — the make-before-break teardown in
+/// reverse, the dedicated-tier analogue of
+/// `shared_pool_repoints_direct_when_relay_disabled`. Before the fix this relay
+/// would be orphaned forever: `rehydrate_provisioned_relays` skipped the LIST while
+/// disabled, so the restarted (Helm-upgraded) controller never re-adopted it.
+#[tokio::test]
+async fn namespace_relay_gcd_and_traffic_continues_when_relay_disabled() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_enabled: true,
+        relay_min_proxy_replicas: Some(1),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-ded-disable").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(dedicated::TRAFFIC, FixtureVars::new(&ns.name)).await?;
+
+    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+    let dedicated_addr =
+        wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
+            .await?;
+    let http = HttpClient::new(dedicated_addr)?;
+    let host = format!("dedicated.{}.local", ns.name);
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(60))
+        .await?
+        .assert_backend("echo-a");
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
+
+    // Reach Active (Ready) before disabling — leaves are repointed onto it, so the
+    // teardown below exercises the make-before-break StartDrain path.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("namespace relay '{RELAY_NAME}' pod Ready before disabling the tier") },
+        || async {
+            let ready = deployments
+                .get(RELAY_NAME)
+                .await
+                .ok()
+                .and_then(|d| d.status)
+                .and_then(|s| s.ready_replicas)
+                .unwrap_or(0);
+            (ready >= 1).then_some(())
+        },
+    )
+    .await?;
+
+    // Disable the tier → the relay tears down (force-off bypasses the cooldown).
+    set_relay_enabled(false).await?;
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            format!("namespace relay '{RELAY_NAME}' garbage-collected after the tier is disabled")
+        },
+        || async {
+            let gone = deployments.get(RELAY_NAME).await.is_err()
+                && services.get(RELAY_NAME).await.is_err()
+                && sas.get(RELAY_NAME).await.is_err();
+            gone.then_some(())
+        },
+    )
+    .await?;
+
+    // The dedicated proxy repointed its discovery subscribe back to the controller
+    // and keeps serving the same route — no orphan is left degraded.
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(60))
+        .await
+        .context("dedicated proxy stopped serving after its relay was disabled and torn down")?
+        .assert_backend("echo-a");
+
+    Ok(())
+}
+
+/// Sad/negative path (#616) — the master switch still gates provisioning now that
+/// the control loop and rehydration run unconditionally: a namespace whose demand
+/// meets the activation threshold gets NO relay while the tier is disabled.
+/// Companion to `namespace_relay_not_provisioned_below_threshold` — proves "always
+/// run the loop" did not regress into "always provision" once the guards were
+/// removed to fix the orphan-on-disable bug.
+#[tokio::test]
+async fn namespace_relay_not_provisioned_when_relay_disabled_despite_demand() -> anyhow::Result<()>
+{
+    let h = Harness::start_with_options(ControllerOptions {
+        relay_enabled: false,
+        relay_min_proxy_replicas: Some(1),
+        ..Default::default()
+    })
+    .await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-ded-off").await?;
+
+    // The fixture's 1 desired replica meets the threshold (1) — would provision if
+    // the tier were enabled.
+    apply_and_wait(&h, &ns).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    assert!(
+        deployments.get(RELAY_NAME).await.is_err(),
+        "a disabled relay tier must never provision '{RELAY_NAME}', even with demand \
+         at the activation threshold"
+    );
+
+    Ok(())
+}
+
 // ── Shared-pool relay tier (#605) — controller-provisioned shared relay ───────
 //
 // Symmetric with the namespace relay above, but a SINGLE global relay in the
