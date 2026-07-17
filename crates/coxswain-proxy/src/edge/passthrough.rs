@@ -35,6 +35,18 @@ const MAX_PEEK: usize = 16 * 1024;
 /// Timeout on the initial ClientHello peek.
 const PEEK_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// First delay between ClientHello peek retries, doubling to [`PEEK_POLL_MAX`].
+///
+/// A fragmented ClientHello's segments are sent back-to-back by the client, so
+/// they arrive microseconds apart — 1ms catches real fragmentation on the first
+/// retry while costing a stalled peer only a handful of wakeups. See [`peek_sni`]
+/// for why this is a poll rather than a readiness await.
+const PEEK_POLL_MIN: Duration = Duration::from_millis(1);
+
+/// Ceiling on the [`PEEK_POLL_MIN`] backoff, bounding a stalled peer to roughly
+/// `PEEK_TIMEOUT / PEEK_POLL_MAX` wakeups before the timeout closes it.
+const PEEK_POLL_MAX: Duration = Duration::from_millis(32);
+
 // ── SNI extraction ────────────────────────────────────────────────────────────
 
 /// Result of parsing bytes peeked from a TLS ClientHello.
@@ -254,6 +266,8 @@ pub(crate) async fn handle_passthrough(
 pub(crate) async fn peek_sni(tcp: &TcpStream) -> io::Result<Option<String>> {
     let mut buf = vec![0u8; 512];
     let deadline = timeout(PEEK_TIMEOUT, async {
+        let mut last_n = 0usize;
+        let mut backoff = PEEK_POLL_MIN;
         loop {
             let n = tcp.peek(&mut buf).await?;
             if n == 0 {
@@ -264,14 +278,33 @@ pub(crate) async fn peek_sni(tcp: &TcpStream) -> io::Result<Option<String>> {
             }
             match client_hello_sni(&buf[..n]) {
                 Ok(SniPeek::Incomplete) => {
-                    if buf.len() >= MAX_PEEK {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "ClientHello exceeds peek cap",
-                        ));
+                    // Grow only when the buffer was full: a short read means the
+                    // capacity is already sufficient and bytes are simply missing.
+                    // Growing unconditionally is what made a fragmented ClientHello
+                    // hit the cap and get rejected (#614).
+                    if n == buf.len() {
+                        if buf.len() >= MAX_PEEK {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "ClientHello exceeds peek cap",
+                            ));
+                        }
+                        buf.resize((buf.len() * 2).min(MAX_PEEK), 0);
+                        // A larger buffer may expose bytes already queued.
+                        continue;
                     }
-                    // Double the buffer and retry; peek will block until more data arrives.
-                    buf.resize(buf.len() * 2, 0);
+                    // Poll, don't await readiness. `MSG_PEEK` leaves the bytes in the
+                    // kernel queue, so it never reports `EWOULDBLOCK` while any byte is
+                    // queued — and tokio clears read-readiness *only* on `EWOULDBLOCK`.
+                    // `readable()` would therefore return instantly forever and spin a
+                    // core until PEEK_TIMEOUT. No "readable beyond n bytes" edge exists,
+                    // so a bounded backoff is the only correct wait here.
+                    if n != last_n {
+                        last_n = n;
+                        backoff = PEEK_POLL_MIN;
+                    }
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(PEEK_POLL_MAX);
                 }
                 Ok(SniPeek::Found(host)) => return Ok(Some(host)),
                 Ok(SniPeek::NoSni) => return Ok(None),
@@ -291,6 +324,8 @@ pub(crate) async fn peek_sni(tcp: &TcpStream) -> io::Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
 
     #[test]
     fn parse_sni_from_client_hello() {
@@ -338,15 +373,14 @@ mod tests {
         }
     }
 
-    #[test]
-    fn full_client_hello_with_sni_extracted() {
-        // Build a minimal but complete TLS ClientHello with SNI.
-        // Record: ContentType=22 (handshake), version=0x0301, then body.
-        // Handshake: type=1 (ClientHello), length (3 bytes), then:
-        //   version (2), random (32), session_id_len (1), cipher_suites_len (2),
-        //   cipher_suites (2), compression_len (1), compression (1),
-        //   extensions_len (2), extensions...
-        let sni_host = b"sni.example.com";
+    /// Build a minimal but complete TLS ClientHello record carrying `sni_host`.
+    ///
+    /// Record: ContentType=22 (handshake), version=0x0301, then body.
+    /// Handshake: type=1 (ClientHello), length (3 bytes), then:
+    ///   version (2), random (32), session_id_len (1), cipher_suites_len (2),
+    ///   cipher_suites (2), compression_len (1), compression (1),
+    ///   extensions_len (2), extensions...
+    pub(super) fn sample_client_hello(sni_host: &[u8]) -> Vec<u8> {
         let sni_host_len = sni_host.len() as u16;
         // SNI extension wire format
         let sni_ext_body: Vec<u8> = {
@@ -399,10 +433,80 @@ mod tests {
         record.extend_from_slice(&[0x03, 0x01]); // version
         record.extend_from_slice(&hs_len.to_be_bytes());
         record.extend_from_slice(&hs);
+        record
+    }
 
+    #[test]
+    fn full_client_hello_with_sni_extracted() {
+        let record = sample_client_hello(b"sni.example.com");
         match client_hello_sni(&record) {
             Ok(SniPeek::Found(host)) => assert_eq!(host, "sni.example.com"),
             other => panic!("expected Found, got: {other:?}"),
         }
+    }
+
+    /// #614: a ClientHello split across TCP segments must still be peeked.
+    ///
+    /// Before the fix the grow loop doubled the buffer on every `Incomplete`
+    /// regardless of how many bytes had actually arrived, so a short first read
+    /// ran 512→`MAX_PEEK` in microseconds and returned "ClientHello exceeds peek
+    /// cap" long before the second segment landed. A single-segment test passes
+    /// even with that bug — the split and the delay between writes are what make
+    /// this a regression test.
+    #[tokio::test]
+    async fn fragmented_client_hello_is_peeked_across_segments() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let hello = sample_client_hello(b"frag.example.com");
+        // Split mid-record: 20 bytes is past the 5-byte record header but far
+        // short of the SNI extension, so the first parse must report Incomplete.
+        let (head, tail) = hello.split_at(20);
+        let (head, tail) = (head.to_vec(), tail.to_vec());
+
+        let writer = tokio::spawn(async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(&head).await.unwrap();
+            client.flush().await.unwrap();
+            // Force a genuine segment boundary: the peek loop must park here.
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            client.write_all(&tail).await.unwrap();
+            client.flush().await.unwrap();
+            // Hold the connection open until the peek completes.
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let (server, _) = listener.accept().await.unwrap();
+        let sni = peek_sni(&server)
+            .await
+            .expect("fragmented hello must parse");
+        assert_eq!(sni.as_deref(), Some("frag.example.com"));
+        writer.abort();
+    }
+
+    /// The cap still rejects a hello that genuinely never completes — the #614
+    /// fix must not turn "too large" into "hang until the timeout".
+    #[tokio::test]
+    async fn oversized_client_hello_still_rejected() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // A record claiming the u16 maximum, followed by more filler than
+        // MAX_PEEK, so the grow loop fills its cap and never completes a parse.
+        let mut blob: Vec<u8> = vec![0x16, 0x03, 0x01, 0xff, 0xff];
+        blob.resize(MAX_PEEK + 1024, 0);
+
+        let writer = tokio::spawn(async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let _ = client.write_all(&blob).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let (server, _) = listener.accept().await.unwrap();
+        let err = peek_sni(&server)
+            .await
+            .expect_err("must reject over-cap hello");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        writer.abort();
     }
 }

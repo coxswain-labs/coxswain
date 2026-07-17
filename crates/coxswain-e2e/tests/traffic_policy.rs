@@ -1314,8 +1314,9 @@ async fn session_persistence_pins_httproute_backend() -> anyhow::Result<()> {
     let host = format!("session-cookie.{}.local", ns.name);
     let gw = h.gateway_http(&ns.name).await?;
     wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
-    // All 3 endpoints must be propagated before establishing the cookie pin —
-    // mirrors the Ingress cookie test's readiness gate for the same reason.
+    // All 3 endpoints must be live before the cookie is issued, or the pin proves
+    // nothing: with a single Ready replica every request "pins" trivially. Mirrors
+    // the Ingress cookie test's gate.
     wait::wait_for_distinct_backends(&gw, &host, "/", 3, Duration::from_secs(60)).await?;
 
     let (status, hdrs, body) = gw.get_full(&host, "/").await?;
@@ -1361,10 +1362,20 @@ async fn session_persistence_header_mode_requires_name_httproute() -> anyhow::Re
     let host = format!("session-header-missing.{}.local", ns.name);
     let gw = h.gateway_http(&ns.name).await?;
     wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60)).await?;
+    // `wait_for_route` only proves *one* endpoint answers, but this test asserts the
+    // calls spread — over a single Ready replica it would see one pod and fail. Probe
+    // with no session header (which never pins) so the gate measures endpoint
+    // readiness, not the persistence behaviour under test below.
+    wait::wait_for_distinct_backends(&gw, &host, "/", 3, Duration::from_secs(60)).await?;
 
+    // Every request carries the session header the policy failed to name: the point is
+    // that a *header-bearing* request still spreads, because an incomplete policy
+    // disables persistence rather than defaulting the name the way cookie mode does.
     let mut pods = std::collections::HashSet::new();
     for i in 0..30 {
-        let (status, hdrs, body) = gw.get_full(&host, "/").await?;
+        let (status, hdrs, body) = gw
+            .get_full_with_headers(&host, "/", &[("X-Session-Id", "user-42")])
+            .await?;
         assert_eq!(status, 200, "request {i} must succeed");
         assert!(
             hdrs.get(reqwest::header::SET_COOKIE).is_none(),
@@ -1435,6 +1446,68 @@ async fn grpc_echo_call_with_metadata(
     }
 }
 
+/// Poll until `expected` distinct pods have answered on `host`, returning the set
+/// observed — the gRPC counterpart of [`wait::wait_for_distinct_backends`], which
+/// only speaks HTTP.
+///
+/// A session-persistence test must not sample the endpoint set until it has
+/// settled. Header mode rendezvous-hashes over the *live* set, so a replica
+/// joining mid-test re-maps ~1/N of session keys and breaks a pin established
+/// against the smaller set; a round-robin assertion made too early sees a single
+/// pod. Calls are issued without the session header, which round-robins under both
+/// a valid Header-mode policy (no header to hash) and an incomplete one
+/// (persistence disabled), so this reaches every live endpoint either way.
+async fn wait_for_distinct_grpc_backends(
+    gw_addr: SocketAddr,
+    host: &str,
+    expected: usize,
+    timeout: Duration,
+) -> anyhow::Result<std::collections::HashSet<String>> {
+    wait::poll_until(
+        timeout,
+        wait::POLL,
+        || async {
+            // Re-probe rather than echo the expectation: "saw 2 of 3 pods" and "every
+            // call failed: connect refused" are opposite diagnoses, and this gate is
+            // the likeliest step in these tests to time out.
+            let mut seen = std::collections::HashSet::new();
+            let mut last_err = None;
+            for _ in 0..(expected * 5) {
+                match grpc_echo_call_with_metadata(gw_addr, host, None).await {
+                    Ok(resp) => {
+                        if let Some(p) = resp.assertions.and_then(|a| a.context).map(|c| c.pod) {
+                            seen.insert(p);
+                        }
+                    }
+                    Err(s) => last_err = Some(s),
+                }
+            }
+            match last_err {
+                Some(s) if seen.is_empty() => format!(
+                    "at least {expected} distinct backend pods to answer gRPC Echo on {host}; \
+                     every call failed, last: {s}"
+                ),
+                _ => format!(
+                    "at least {expected} distinct backend pods to answer gRPC Echo on {host}; \
+                     saw {seen:?}"
+                ),
+            }
+        },
+        || async {
+            let mut pods = std::collections::HashSet::new();
+            for _ in 0..(expected * 5) {
+                if let Ok(resp) = grpc_echo_call_with_metadata(gw_addr, host, None).await
+                    && let Some(p) = resp.assertions.and_then(|a| a.context).map(|c| c.pod)
+                {
+                    pods.insert(p);
+                }
+            }
+            (pods.len() >= expected).then_some(pods)
+        },
+    )
+    .await
+}
+
 /// Happy path (#554): a `CoxswainBackendPolicy` with `sessionPersistence: {type:
 /// Header, sessionName: x-session-id}` attached to a GRPCRoute's backend Service
 /// pins every call carrying the same `x-session-id` metadata value to the same
@@ -1459,8 +1532,14 @@ async fn session_persistence_pins_grpcroute_backend() -> anyhow::Result<()> {
     let host = format!("grpc-session-header.{}.local", ns.name);
     let gw_addr = h.gateway_http_addr(&ns.name).await?;
 
-    // Readiness + baseline pin: poll until the call succeeds, then capture the
-    // serving pod for a fixed metadata value.
+    // All 3 endpoints must be in the group before the pin is established: header
+    // mode hashes over the live set, so a replica joining later re-maps the key
+    // and moves the pin mid-loop. Mirrors the HTTPRoute test's readiness gate.
+    // Wait on the pods first so the gate's own budget covers only propagation.
+    wait::wait_for_deployments(&ns.name, &["grpc-echo-aff"]).await?;
+    wait_for_distinct_grpc_backends(gw_addr, &host, 3, Duration::from_secs(60)).await?;
+
+    // Baseline pin: the pod serving a fixed metadata value, over the settled set.
     let pinned_pod = wait::poll_until(
         Duration::from_secs(60),
         wait::POLL,
@@ -1510,18 +1589,11 @@ async fn session_persistence_header_mode_requires_name_grpcroute() -> anyhow::Re
     let host = format!("grpc-session-header-missing.{}.local", ns.name);
     let gw_addr = h.gateway_http_addr(&ns.name).await?;
 
-    // Readiness: poll until the call succeeds at all.
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || async { format!("gRPC Echo via {host} to succeed") },
-        || async {
-            grpc_echo_call_with_metadata(gw_addr, &host, None)
-                .await
-                .ok()
-        },
-    )
-    .await?;
+    // Readiness: all 3 endpoints must answer before asserting they round-robin —
+    // a single Ready replica would serve every call and read as a pin.
+    // Wait on the pods first so the gate's own budget covers only propagation.
+    wait::wait_for_deployments(&ns.name, &["grpc-echo-aff"]).await?;
+    wait_for_distinct_grpc_backends(gw_addr, &host, 3, Duration::from_secs(60)).await?;
 
     let mut pods = std::collections::HashSet::new();
     for i in 0..30u32 {
@@ -1579,9 +1651,11 @@ async fn session_affinity_cookie_pins_client_to_same_backend_when_cookie_replaye
     wait::wait_for_deployments(&ns.name, &["echo-aff"]).await?;
     let host = format!("affinity.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60)).await?;
-    // All 3 endpoints must be propagated before establishing the cookie pin:
-    // the cookie encodes the chosen endpoint, and a set that grows afterwards
-    // shifts that mapping. Un-keyed requests round-robin to confirm the full set.
+    // All 3 endpoints must be live before the cookie is issued, or the pin proves
+    // nothing: with a single Ready replica every request "pins" trivially. Growth
+    // itself cannot move a cookie pin — the cookie carries the endpoint's token and
+    // resolves by exact match, so only losing the pinned pod breaks it.
+    // Un-keyed requests round-robin to confirm the full set.
     wait::wait_for_distinct_backends(&h.http, &host, "/", 3, Duration::from_secs(60)).await?;
 
     // First request carries no cookie → the proxy round-robins to a pod and pins it
