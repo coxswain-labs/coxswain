@@ -548,7 +548,12 @@ pub type SharedPortTlsStore = Shared<PortTlsStore>;
 /// Keyed by SNI host pattern in [`ClientCertStore`] and read by the proxy during
 /// every TLS handshake. The enum is crypto-free; PEM parsing happens at reconcile
 /// time (reflector) and at handshake time (proxy).
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Debug, PartialEq)]
 pub enum ClientCertConfigState {
     /// mTLS configured and the CA bundle was resolved successfully.

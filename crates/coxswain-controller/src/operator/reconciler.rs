@@ -762,6 +762,34 @@ pub(super) fn gateway_key(gw: &Gateway) -> ObjectKey {
     )
 }
 
+/// A Gateway's identity, parsed once at the reconcile boundary.
+///
+/// Carries `uid` — which [`ObjectKey`] does not — because owner references
+/// require it. Parsing here rather than re-deriving `metadata.namespace`/`.name`/
+/// `.uid` at each provisioning helper means an object the apiserver somehow
+/// delivered without one of these fields is skipped once, at the boundary, with a
+/// single log line — instead of aborting the controller process deep inside a
+/// render or patch helper. Every dedicated-provisioning path takes a
+/// `&GatewayIdentity`, so those helpers can no longer be reached with a nameless
+/// or uid-less object.
+pub(crate) struct GatewayIdentity {
+    /// Namespace + name of the Gateway.
+    pub(crate) key: ObjectKey,
+    /// `metadata.uid` — required to build owner references on provisioned resources.
+    pub(crate) uid: String,
+}
+
+impl GatewayIdentity {
+    /// Parse a [`GatewayIdentity`], returning `None` if the apiserver did not
+    /// populate `metadata.namespace`, `metadata.name`, or `metadata.uid`.
+    pub(crate) fn from_gateway(gw: &Gateway) -> Option<Self> {
+        Some(Self {
+            key: ObjectKey::from_meta(&gw.metadata)?,
+            uid: gw.metadata.uid.clone()?,
+        })
+    }
+}
+
 /// Reconcile one dedicated-mode Gateway's provisioning (#574 operator fold): the
 /// entry the unified status worker's dedicated branch calls. Infallible from the
 /// worker's view — a reconcile error is folded into a per-object exponential
@@ -817,9 +845,22 @@ async fn reconcile_inner(
         ctx.shared_install_trigger.notify_one();
     }
 
-    let key = gateway_key(&gw);
-    let gw_namespace = gw.metadata.namespace.as_deref().unwrap_or("");
-    let gw_name = gw.metadata.name.as_deref().unwrap_or("");
+    // Parse the Gateway's identity once, here, at the reconcile boundary. Every
+    // dedicated-provisioning helper below takes the parsed `identity`, so none can
+    // be reached with a nameless or uid-less object — the metadata absence that
+    // used to abort the process deep in a render/patch helper is a single
+    // skip-and-wait here instead. The apiserver always populates these fields; a
+    // `None` means a malformed object we cannot act on, so we wait for a valid one.
+    let Some(identity) = GatewayIdentity::from_gateway(&gw) else {
+        tracing::warn!(
+            gateway = ?gw.metadata.name,
+            "operator: Gateway missing namespace/name/uid; skipping until a valid object arrives"
+        );
+        return Ok(StatusOutcome::await_change());
+    };
+    let key = identity.key.clone();
+    let gw_namespace = identity.key.ns.as_str();
+    let gw_name = identity.key.name.as_str();
 
     // ----- Finalizer / deletion path ------------------------------------
     //
@@ -834,7 +875,7 @@ async fn reconcile_inner(
                 gateway = %gateway_id(&gw),
                 "operator: finalizing terminating dedicated-mode Gateway"
             );
-            remove_finalizer(&ctx.client, &gw).await?;
+            remove_finalizer(&ctx.client, &gw, &identity).await?;
             // GC of in-namespace resources (Deployment/Service/SA) is
             // owner-ref driven; nothing else to do here.
             ctx.last_hashes.lock().remove(&key);
@@ -902,7 +943,7 @@ async fn reconcile_inner(
             // object. SSA force-apply makes add/update/remove of those fields
             // reconcile for free. Runs for every owned shared Gateway, including
             // one mid dedicated→shared migration (the dedicated teardown below).
-            let sa = render_shared::render_shared_gateway_service_account(&gw);
+            let sa = render_shared::render_shared_gateway_service_account(&gw, &identity);
             apply::apply_shared_gateway_service_account(&ctx.client, gw_namespace, &sa).await?;
 
             // The Gateway is no longer in dedicated mode. If we never placed our
@@ -933,7 +974,7 @@ async fn reconcile_inner(
                         gateway = %gateway_id(&gw),
                         "operator: Gateway left dedicated mode; clearing status and handing back to shared pool"
                     );
-                    status::clear_dedicated_gateway_status(&ctx.client, &gw).await?;
+                    status::clear_dedicated_gateway_status(&ctx.client, &gw, &identity).await?;
                     return Ok(StatusOutcome::requeue(MIGRATION_HANDOFF_REQUEUE));
                 }
 
@@ -955,14 +996,14 @@ async fn reconcile_inner(
                 // between the two leaves the finalizer in place, so the next
                 // leader re-runs the idempotent delete and only then drops it —
                 // never re-leaking the proxy.
-                let resource_name = render::resource_name(&gw, class_name);
+                let resource_name = render::resource_name(gw_name, class_name);
                 tracing::info!(
                     gateway = %gateway_id(&gw),
                     resource = %resource_name,
                     "operator: shared pool serving migrated Gateway; deleting dedicated proxy resources"
                 );
                 delete_dedicated_resources(&ctx.client, gw_namespace, &resource_name).await?;
-                remove_finalizer(&ctx.client, &gw).await?;
+                remove_finalizer(&ctx.client, &gw, &identity).await?;
                 ctx.last_hashes.lock().remove(&key);
                 ctx.error_attempts.lock().remove(&key);
                 clear_dataplane_gauge(&gw); // #585: no longer a dedicated Gateway
@@ -984,6 +1025,7 @@ async fn reconcile_inner(
             // directly here, no shared cross-task signal involved.
             let inputs = status::DedicatedGatewayStatusInputs {
                 gw: &gw,
+                identity: &identity,
                 service: None,
                 nodes: &[],
                 listener_status: &GatewayListenerStatus::default(),
@@ -1002,7 +1044,7 @@ async fn reconcile_inner(
     // any provisioning — if anything goes wrong before the finalizer is
     // patched, a delete can race past us. Add → requeue → continue.
     if !has_our_finalizer(&gw) {
-        add_finalizer(&ctx.client, &gw).await?;
+        add_finalizer(&ctx.client, &gw, &identity).await?;
         return Ok(StatusOutcome::requeue(POST_FINALIZER_REQUEUE));
     }
 
@@ -1025,7 +1067,7 @@ async fn reconcile_inner(
     );
     let empty_effective_ports = Vec::new();
     let dedicated_ports = dedicated_effective
-        .get(&gateway_key(&gw))
+        .get(&identity.key)
         .unwrap_or(&empty_effective_ports);
 
     // Relay tiering (#601): the dedicated proxy no longer takes a rendered
@@ -1037,6 +1079,7 @@ async fn reconcile_inner(
     // relay-agnostic.
     let rendered = render::render(&render::RenderInputs {
         gateway: &gw,
+        identity: &identity,
         params: &effective,
         controller_image: &ctx.controller_image,
         gateway_class_name: class_name,
@@ -1059,7 +1102,7 @@ async fn reconcile_inner(
     // only sees the bundle after kubelet's next ConfigMap sync (up to ~1 min) —
     // long enough to blow a 60 s route-liveness budget. Creating the ConfigMap
     // first means the pod mounts it populated from the start.
-    copy_trust_bundle(&ctx.client, &gw, &ctx.controller_namespace).await?;
+    copy_trust_bundle(&ctx.client, &identity, &ctx.controller_namespace).await?;
 
     // GatewayStaticAddresses (#260): when the rendered Service pins a requested
     // clusterIP that diverges from a live one, delete first — clusterIP is
@@ -1071,7 +1114,7 @@ async fn reconcile_inner(
     // Service → Deployment. The dedicated proxy is a pure discovery client
     // (post-#424) with zero Kubernetes API access, so the rendered SA carries
     // no RoleBindings — it exists only as the pod identity.
-    apply::apply_rendered(&ctx.client, &gw, &rendered).await?;
+    apply::apply_rendered(&ctx.client, gw_namespace, &rendered).await?;
 
     // A Gateway that migrated shared→dedicated still carries the shared-mode
     // identity ServiceAccount (#482) in its namespace; owner-ref GC cannot
@@ -1185,6 +1228,7 @@ async fn reconcile_inner(
     }
     let inputs = status::DedicatedGatewayStatusInputs {
         gw: &gw,
+        identity: &identity,
         service: service.as_ref(),
         nodes: &nodes,
         listener_status: &gateway_health,
@@ -1258,12 +1302,10 @@ fn has_our_finalizer(gw: &Gateway) -> bool {
 /// a later reconcile lands the copy.
 async fn copy_trust_bundle(
     client: &Client,
-    gw: &Gateway,
+    identity: &GatewayIdentity,
     controller_namespace: &str,
 ) -> Result<(), kube::Error> {
-    let gw_namespace = gw.metadata.namespace.as_deref().unwrap_or_else(|| {
-        panic!("invariant: Gateway has no namespace; the API server requires it")
-    });
+    let gw_namespace = identity.key.ns.as_str();
     if gw_namespace == controller_namespace {
         return Ok(());
     }
@@ -1280,7 +1322,7 @@ async fn copy_trust_bundle(
         metadata: ObjectMeta {
             name: Some(cm_name.to_string()),
             namespace: Some(gw_namespace.to_string()),
-            owner_references: Some(vec![render::gateway_owner_reference(gw)]),
+            owner_references: Some(vec![render::gateway_owner_reference(identity)]),
             ..Default::default()
         },
         data: source.data.clone(),
@@ -1293,14 +1335,13 @@ async fn copy_trust_bundle(
     Ok(())
 }
 
-async fn add_finalizer(client: &Client, gw: &Gateway) -> Result<(), kube::Error> {
-    let namespace = gw.metadata.namespace.as_deref().unwrap_or_else(|| {
-        panic!("invariant: Gateway has no namespace; the API server requires it")
-    });
-    let name =
-        gw.metadata.name.as_deref().unwrap_or_else(|| {
-            panic!("invariant: Gateway has no name; the API server requires it")
-        });
+async fn add_finalizer(
+    client: &Client,
+    gw: &Gateway,
+    identity: &GatewayIdentity,
+) -> Result<(), kube::Error> {
+    let namespace = identity.key.ns.as_str();
+    let name = identity.key.name.as_str();
     // Construct the desired finalizer set: existing + ours. SSA's strategic
     // merge handles deduplication when we list our finalizer alongside
     // pre-existing ones.
@@ -1322,14 +1363,13 @@ async fn add_finalizer(client: &Client, gw: &Gateway) -> Result<(), kube::Error>
 /// Patch the Gateway to remove our finalizer. Idempotent — if the finalizer
 /// isn't present, we still write the resulting list back; the apiserver
 /// accepts the no-op.
-async fn remove_finalizer(client: &Client, gw: &Gateway) -> Result<(), kube::Error> {
-    let namespace = gw.metadata.namespace.as_deref().unwrap_or_else(|| {
-        panic!("invariant: Gateway has no namespace; the API server requires it")
-    });
-    let name =
-        gw.metadata.name.as_deref().unwrap_or_else(|| {
-            panic!("invariant: Gateway has no name; the API server requires it")
-        });
+async fn remove_finalizer(
+    client: &Client,
+    gw: &Gateway,
+    identity: &GatewayIdentity,
+) -> Result<(), kube::Error> {
+    let namespace = identity.key.ns.as_str();
+    let name = identity.key.name.as_str();
     let finalizers: Vec<String> = gw
         .metadata
         .finalizers
@@ -1914,6 +1954,7 @@ mod tests {
         };
         let r_a = render::render(&render::RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &params_a,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1926,6 +1967,7 @@ mod tests {
         });
         let r_b = render::render(&render::RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &params_b,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",
@@ -1966,6 +2008,7 @@ mod tests {
         let params = EffectiveParams::default();
         let inputs = render::RenderInputs {
             gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
             params: &params,
             controller_image: "coxswain:v0.2",
             gateway_class_name: "coxswain",

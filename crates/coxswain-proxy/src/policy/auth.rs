@@ -124,12 +124,6 @@ pub(crate) async fn enforce(
             write_simple(session, 503).await?;
             Ok(true)
         }
-        // #[non_exhaustive]: future variants (e.g. gRPC ext_authz from #23).
-        _ => {
-            tracing::warn!("unknown auth variant — refusing request (503)");
-            write_simple(session, 503).await?;
-            Ok(true)
-        }
     }
 }
 
@@ -418,8 +412,6 @@ async fn enforce_basic(
                 let computed = sha1::Sha1::digest(pass_bytes);
                 constant_time_eq::constant_time_eq(computed.as_slice(), &expected)
             }
-            // #[non_exhaustive]: future hash formats land here.
-            _ => false,
         };
         if verified {
             return Ok(false);

@@ -8,7 +8,12 @@ use http::{HeaderName, HeaderValue};
 use std::sync::Arc;
 
 /// How a path is modified by `URLRewrite` or `RequestRedirect`.
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug)]
 pub enum PathModifier {
     /// Discard the entire original path and use this fixed value instead.
@@ -182,7 +187,12 @@ impl HeaderMod {
 ///
 /// A bare `*` entry (match-all) is expressed via
 /// [`CorsConfig::allow_all_origins`] rather than this enum.
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug)]
 pub enum CorsOrigin {
     /// Exact origin string (lowercased at construction time).
@@ -344,7 +354,12 @@ impl MirrorFraction {
 }
 
 /// A filter action evaluated per-request on the proxy hot path.
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug)]
 pub enum FilterAction {
     /// Modify request headers before forwarding upstream.

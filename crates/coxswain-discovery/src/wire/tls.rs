@@ -254,10 +254,6 @@ fn client_cert_state_to_wire(s: &ClientCertConfigState) -> p::ClientCertConfigSt
             })
         }
         ClientCertConfigState::Unavailable => p::client_cert_config_state::Kind::Unavailable(true),
-        &_ => unreachable!(
-            "invariant: all ClientCertConfigState variants handled; \
-             add a new arm when the core type gains a variant"
-        ),
     };
     p::ClientCertConfigState { kind: Some(kind) }
 }

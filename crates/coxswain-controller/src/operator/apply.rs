@@ -30,7 +30,6 @@
 use super::render::RenderedSpecs;
 use super::render_relay::RenderedRelay;
 use super::render_shared_proxy::RenderedSharedProxy;
-use coxswain_reflector::gw_types::v::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
@@ -103,19 +102,14 @@ impl ApplyError {
 ///
 /// # Panics
 ///
-/// Panics if the Gateway has no `metadata.namespace`, or if the rendered
-/// ServiceAccount, Service, or Deployment have no `metadata.name`. All are
-/// apiserver invariants or rendering invariants; their absence indicates a
-/// controller bug.
+/// Panics if the rendered ServiceAccount, Service, or Deployment have no
+/// `metadata.name` — a rendering invariant set by this crate's own render path,
+/// so its absence indicates a controller bug.
 pub(super) async fn apply_rendered(
     client: &Client,
-    gateway: &Gateway,
+    namespace: &str,
     rendered: &RenderedSpecs,
 ) -> Result<(), ApplyError> {
-    let namespace = gateway.metadata.namespace.as_deref().unwrap_or_else(|| {
-        panic!("invariant: Gateway has no namespace; the API server requires it")
-    });
-
     let params = PatchParams::apply(FIELD_MANAGER).force();
 
     let sa_name = rendered

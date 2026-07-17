@@ -25,7 +25,12 @@ use std::time::Duration;
 /// replicas — which is exactly the contract. Populated today only from the Ingress
 /// `ingress.coxswain-labs.dev/session-*` annotations; a backend with no affinity
 /// binding keeps plain weighted round-robin.
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug)]
 pub enum SessionAffinity {
     /// Cookie mode: the proxy injects a cookie whose value is the endpoint token
@@ -51,7 +56,12 @@ pub enum SessionAffinity {
 /// upstream via rendezvous (HRW) hashing — only the keys whose owner is removed remap
 /// on endpoint changes. All variants fall back to round-robin when the attribute is
 /// absent or empty.
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HashSource {
     /// Path + query of the request URI (`/path?query`).
@@ -113,7 +123,12 @@ pub struct BackendGroupSpec {
 /// `ingress.coxswain-labs.dev/load-balance` annotation.
 ///
 /// Gateway API routes always carry `RoundRobin` (the annotation is Ingress-only).
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum LoadBalance {
     /// Standard weighted round-robin (the default; current behaviour).

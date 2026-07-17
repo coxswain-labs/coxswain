@@ -485,7 +485,6 @@ fn compute_group_key(sni: &str, ca: &UpstreamCa) -> u64 {
     match ca {
         UpstreamCa::System => 0u64.hash(&mut h),
         UpstreamCa::Bundle(pem) => pem.hash(&mut h),
-        _ => {}
     }
     h.finish()
 }

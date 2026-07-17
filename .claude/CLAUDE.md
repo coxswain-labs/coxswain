@@ -82,6 +82,7 @@ gateway-api-types   → (none)
 | Every reflector `ReflectorEffects::new(…, "check", …)` name is registered on the controller health subsystem | `scripts/check-reflector-health-checks.sh` |
 | Tenant-supplied regexes compile via `compile_bounded` (size-limited), never bare `Regex::new` in core/reflector | `scripts/check-bounded-regex.sh` |
 | An `MSG_PEEK` retry loop waits via `edge::peek::PeekBackoff`, never `readable()` | `scripts/check-no-peek-readable.sh` |
+| No `panic!`/`unreachable!`/`todo!` in a `_ =>`/bound catch-all arm in the data-plane crates (`coxswain-proxy`, `coxswain-discovery`); degrade instead | `scripts/check-no-wildcard-panic.sh` |
 | Shipped CRD manifests (coxswain's own + the pinned upstream Gateway API CRDs) pass `kubeconform -strict` | `scripts/check-crd-kubeconform.sh` |
 | `cargo doc` is warning-free (no broken or private intra-doc links) | `.github/workflows/ci.yml` `doc` job (`RUSTDOCFLAGS=-D warnings`) |
 

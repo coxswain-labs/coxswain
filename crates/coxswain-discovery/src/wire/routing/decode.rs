@@ -207,10 +207,6 @@ fn route_entry_from_wire(
         RouteKind::Regex => {
             host_builder.add_regex_route(&dto.path, entry);
         }
-        _ => unreachable!(
-            "invariant: all RouteKind variants handled; \
-             add a new arm when the core type gains a variant"
-        ),
     }
     Ok(())
 }
@@ -482,9 +478,10 @@ pub(crate) fn upstream_tls_from_wire(dto: &p::UpstreamTls) -> Result<UpstreamTls
     // so the wire group_key is preserved verbatim (the builder re-folds the hash and
     // diverges from the sender's pool key, breaking connection-pool isolation).
     if !dto.subject_alt_names.is_empty() {
-        // Drop unknown SAN kinds gracefully — consistent with to_wire's _ => None.
-        // This prevents a future proto Kind from being coerced to the default (Hostname=0)
-        // and producing a spurious SAN mismatch / silent auth downgrade on rolling upgrades.
+        // Drop unknown SAN kinds gracefully: `san.kind` is the wire (proto) enum,
+        // which stays forward-compatible across versions. This prevents a future
+        // proto Kind from being coerced to the default (Hostname=0) and producing a
+        // spurious SAN mismatch / silent auth downgrade on rolling upgrades.
         let sans: Arc<[SubjectAltName]> = dto
             .subject_alt_names
             .iter()
@@ -644,10 +641,7 @@ fn header_mod_from_wire(dto: &p::HeaderMod) -> Result<HeaderMod, WireError> {
         coxswain_core::routing::HeaderModError::InvalidValue { source, .. } => {
             WireError::InvalidHeaderValue(source)
         }
-        _ => unreachable!(
-            "invariant: all HeaderModError variants handled; \
-                 add a new arm when the core type gains a variant"
-        ),
+        other => WireError::InvalidHeaderMod(other.to_string()),
     })
 }
 

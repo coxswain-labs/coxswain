@@ -644,7 +644,12 @@ impl HostRouterBuilder {
 ///
 /// Routes registered from Ingress resources use `SingleLabel`; routes from
 /// Gateway API resources use `MultiLabel`.
-#[non_exhaustive]
+///
+/// Deliberately closed: matched exhaustively across the crate boundary on the
+/// discovery wire-encode path, so adding a variant is a compiler-enforced change
+/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
+/// arm there and defeat that.
+// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WildcardKind {
     /// Ingress spec: the wildcard matches exactly one subdomain label.

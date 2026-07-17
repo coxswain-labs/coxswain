@@ -2391,16 +2391,24 @@ async fn spawn_tasks(
         // Single connection-pooling client for JWKS fetches — mirrors the
         // ext_authz sub-request client (bin/lib.rs); rustls backend, no
         // native-tls dep. `run()` installs the crypto provider before any
-        // reconciler role starts, so this construction cannot fail at runtime.
-        let jwks_client = reqwest::Client::builder()
-            .use_rustls_tls()
-            .build()
-            .unwrap_or_else(|e| {
-                panic!("invariant: reqwest::Client construction must succeed: {e}")
-            });
-        set.spawn(async move {
-            crate::jwks::run(cache, jwt_auths_for_fetch, jwks_client).await;
-        });
+        // reconciler role starts, so this construction succeeds in practice; a
+        // rustls-init failure is environmental, not a logic bug, so degrade
+        // (skip the fetcher — JWT validation fails closed on absent keys) rather
+        // than crashing the controller.
+        match reqwest::Client::builder().use_rustls_tls().build() {
+            Ok(jwks_client) => {
+                set.spawn(async move {
+                    crate::jwks::run(cache, jwt_auths_for_fetch, jwks_client).await;
+                });
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "JWKS fetch client could not be built; remote JWKS refresh disabled \
+                     (JWT validation fails closed until the controller restarts)"
+                );
+            }
+        }
         // Forward cache-change notifications into the shared rebuild trigger so a
         // JWKS resolving, rotating, or starting to fail re-drives the debounced
         // rebuild below — the same mechanism every watched CR uses. Bumping the

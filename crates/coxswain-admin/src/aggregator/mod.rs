@@ -20,7 +20,6 @@ use http::{HeaderValue, Response, StatusCode, header};
 use kube::Client;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{OnceCell, Semaphore};
 
 use coxswain_core::cluster::SharedClusterSummary;
@@ -94,11 +93,13 @@ impl OperatorAggregator {
     /// `dedicated_registry` are the same cells the controller feeds to the
     /// discovery server (#537) — this aggregator never fans out to a proxy
     /// pod to answer "what does it serve", it reads its own copy of what it
-    /// pushed. Installs the `ring` rustls crypto provider (idempotent) so the
-    /// reqwest client can be built; the remaining fan-out targets (pod
-    /// health/logs) are plain HTTP and TLS is never exercised at request time.
+    /// pushed. The fan-out `http` client is built once by the caller at startup
+    /// (where a rustls-init failure surfaces as a typed startup error) and
+    /// plumbed in; the fan-out targets (pod health/logs) are plain HTTP and TLS
+    /// is never exercised at request time.
     #[must_use]
     pub fn new(
+        http: reqwest::Client,
         fleet: SharedFleet,
         cluster: SharedClusterSummary,
         node_registry: Option<SharedNodeRegistry>,
@@ -106,17 +107,6 @@ impl OperatorAggregator {
         gateway_routes: SharedGatewayRoutingTable,
         dedicated_registry: DedicatedRoutingRegistry,
     ) -> Self {
-        // reqwest 0.13 uses rustls-no-provider; install ring as the
-        // process-default provider. The call is idempotent — the `Err`
-        // returned when a provider is already registered is intentionally
-        // discarded.
-        let _ = rustls::crypto::ring::default_provider().install_default();
-
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap_or_else(|e| panic!("invariant: reqwest client must build: {e}"));
-
         Self {
             http,
             fleet,
