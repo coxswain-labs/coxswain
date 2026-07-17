@@ -82,9 +82,22 @@ impl SniRouter {
 
     /// Select a backend for `sni`.
     ///
+    /// `sni` must be ASCII-lowercase: matching is case-sensitive by design,
+    /// because the patterns this router is keyed by are already lowercase (the
+    /// `Hostname` CRD schema enforces RFC 1123), so normalizing per connection
+    /// would be redundant. Callers normalize once at ingestion — see
+    /// `coxswain_proxy::edge::passthrough::peek_sni`, which lowercases while
+    /// parsing the ClientHello. RFC 6066 defers to case-insensitive DNS, so a
+    /// peer may legitimately send any casing and expect a match.
+    ///
     /// Returns `None` when no pattern matches — the caller should close the connection.
     #[must_use]
     pub fn match_sni(&self, sni: Option<&str>) -> Option<&Arc<BackendGroup>> {
+        debug_assert!(
+            !sni.is_some_and(|s| s.bytes().any(|b| b.is_ascii_uppercase())),
+            "sni must be normalized to ASCII-lowercase before matching; \
+             an un-normalized ingestion point silently drops mixed-case connections"
+        );
         if let Some(sni) = sni {
             if let Some(bg) = self.exact.get(sni) {
                 return Some(bg);
@@ -284,5 +297,31 @@ mod tests {
     fn unknown_port_returns_none() {
         let t = table_one_port(443, "app.example.com");
         assert!(t.port(8444).is_none());
+    }
+
+    /// The router matches case-sensitively on purpose (patterns are already
+    /// lowercase, so per-connection normalization would be wasted work); callers
+    /// normalize at ingestion instead. This pins the *contract* — that a
+    /// normalized mixed-case SNI matches — so that a future change making the
+    /// patterns case-sensitive in a different way, or dropping the ingestion-side
+    /// lowercasing, is caught here rather than in production.
+    #[test]
+    fn normalized_mixed_case_sni_matches_exact_and_wildcard() {
+        let t = TlsPassthroughTableBuilder::new()
+            .add_route(443, "app.example.com", backend())
+            .add_route(443, "*.wild.example.com", backend())
+            .build();
+        let r = t.port(443).expect("port 443 was registered");
+
+        assert!(
+            r.match_sni(Some(&"App.Example.COM".to_ascii_lowercase()))
+                .is_some(),
+            "a mixed-case SNI normalized at ingestion must hit the exact route"
+        );
+        assert!(
+            r.match_sni(Some(&"Deep.Sub.Wild.Example.Com".to_ascii_lowercase()))
+                .is_some(),
+            "a mixed-case SNI normalized at ingestion must hit the wildcard route"
+        );
     }
 }

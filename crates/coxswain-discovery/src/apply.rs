@@ -1508,13 +1508,29 @@ fn passthrough_refs(pt: &p::TlsPassthroughPort) -> HashSet<EndpointKey> {
 /// collecting (the compile phase rejects it with `MirrorTooDeep` before commit,
 /// so incomplete refs never reach the cache). Bounding here keeps a malformed,
 /// deeply-nested proto from overflowing the stack on the data plane.
+///
+/// A ref whose port is outside the `u16` range is **skipped**, not narrowed: the
+/// pool is keyed by `u16`-narrowed keys, so such a ref can never legitimately
+/// resolve, and truncating it (65616 → 80) would stage a phantom referrer on an
+/// unrelated port's key — enough to make `validate_removed_endpoints_unreferenced`
+/// reject a *legitimate* removal of that other port with the wrong error. Skipping
+/// keeps `staged.refs` and `staged.endpoints` consistently keyed and leaves
+/// `bg_from_wire` as the single authority, which still rejects the ref with the
+/// accurate `UnknownEndpointRef` at compile.
 fn collect_bg_refs(bg: &p::BackendGroup, out: &mut HashSet<EndpointKey>, depth: usize) {
     if depth > crate::wire::MAX_MIRROR_DEPTH {
         return;
     }
     for wb in &bg.weighted {
         if let Some(r) = &wb.endpoint_ref {
-            out.insert(endpoint_key_from_wire(&r.namespace, &r.service, r.port));
+            let Ok(port) = u16::try_from(r.port) else {
+                continue;
+            };
+            out.insert(endpoint_key_from_wire(
+                &r.namespace,
+                &r.service,
+                u32::from(port),
+            ));
         }
     }
     for pbf in &bg.per_backend_filters {
@@ -2964,5 +2980,59 @@ mod tests {
         assert_delta_rejected_untouched(&mut cache, &cells, &d, |e| {
             matches!(e, WireError::UnknownResourceKey { .. })
         });
+    }
+
+    /// Build a one-backend group whose `endpoint_ref` carries `port` verbatim.
+    fn bg_with_ref_port(port: u32) -> p::BackendGroup {
+        p::BackendGroup {
+            name: "default/svc".to_owned(),
+            weighted: vec![p::WeightedBackend {
+                addrs: Vec::new(),
+                weight: 1,
+                endpoint_ref: Some(p::EndpointRef {
+                    namespace: "default".to_owned(),
+                    service: "svc".to_owned(),
+                    port,
+                }),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn collect_bg_refs_keys_an_in_range_ref() {
+        let mut out = HashSet::new();
+        collect_bg_refs(&bg_with_ref_port(80), &mut out, 0);
+        assert!(
+            out.contains(&EndpointKey::new("default", "svc", 80)),
+            "an in-range ref must still be staged"
+        );
+    }
+
+    /// #618: a ref port outside `u16` must be skipped, not narrowed.
+    ///
+    /// `endpoint_key_from_wire` narrows with a bare `as u16`, so 65616 truncates
+    /// to 80 — staging a phantom referrer against an *unrelated* port's key. That
+    /// is enough to make `validate_removed_endpoints_unreferenced` reject a
+    /// legitimate removal of `(default, svc, 80)` with
+    /// `RemovedEndpointStillReferenced`, blaming a referrer that does not exist.
+    /// The delta is Nacked either way (`bg_from_wire` rejects the ref at compile),
+    /// so only the *error* differs — but the staged world must stay coherently
+    /// keyed regardless.
+    #[test]
+    fn collect_bg_refs_skips_an_out_of_range_ref_rather_than_truncating() {
+        let mut out = HashSet::new();
+        collect_bg_refs(&bg_with_ref_port(65616), &mut out, 0);
+
+        assert!(
+            !out.contains(&EndpointKey::new("default", "svc", 80)),
+            "65616 must not truncate to 80 and stage a phantom referrer on an \
+             unrelated port's key"
+        );
+        assert!(
+            out.is_empty(),
+            "an unresolvable ref must stage no key at all; bg_from_wire remains \
+             the authority and reports it as UnknownEndpointRef"
+        );
     }
 }

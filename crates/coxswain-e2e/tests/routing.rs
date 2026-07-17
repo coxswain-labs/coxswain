@@ -735,6 +735,80 @@ async fn gateway_wildcard_host_matches_multi_label_subdomains() -> anyhow::Resul
     Ok(())
 }
 
+/// RFC 9110 §4.2.3 makes the `Host` authority case-insensitive, and unlike a
+/// browser a raw client sends whatever casing it was given. The routing table is
+/// keyed by the lowercase hostnames the CRD schema enforces, so a `Host` that is
+/// not normalized at capture misses every route and 404s (#618).
+///
+/// Covers both matcher branches — the exact-host map and the wildcard suffix
+/// scan — because normalizing for one and not the other is its own bug.
+#[tokio::test]
+async fn gateway_route_matches_mixed_case_host() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-host-case").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::TWO_HOSTS, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::WILDCARD_HOST, FixtureVars::new(&ns.name)).await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+
+    // Settle on the canonical lowercase host first, so a later mixed-case miss is
+    // unambiguously a casing bug rather than a route that had not converged.
+    let host = format!("host-a.{}.local", ns.name);
+    wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60))
+        .await?
+        .assert_backend("echo-a");
+
+    let mixed = format!("Host-A.{}.LOCAL", ns.name);
+    gw.get(&mixed, "/").await?.assert_backend("echo-a");
+
+    // The wildcard suffix scan is a separate matcher and must agree.
+    let wildcard_host = format!("foo.wildcard.{}.local", ns.name);
+    wait::wait_for_route(&gw, &wildcard_host, "/", Duration::from_secs(60))
+        .await?
+        .assert_backend("echo-c");
+
+    let mixed_wildcard = format!("FOO.Wildcard.{}.Local", ns.name);
+    gw.get(&mixed_wildcard, "/").await?.assert_backend("echo-c");
+
+    Ok(())
+}
+
+/// The sad-path companion to `gateway_route_matches_mixed_case_host`: proves the
+/// fix normalizes casing rather than loosening matching. A host that matches no
+/// route must still 404 however it is cased.
+#[tokio::test]
+async fn gateway_route_rejects_unmatched_host_regardless_of_case() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-gw-host-case-deny").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::TWO_HOSTS, FixtureVars::new(&ns.name)).await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("host-a.{}.local", ns.name);
+    wait::wait_for_route(&gw, &host, "/", Duration::from_secs(60))
+        .await?
+        .assert_backend("echo-a");
+
+    for unmatched in [
+        format!("nope.{}.local", ns.name),
+        format!("NOPE.{}.LOCAL", ns.name),
+    ] {
+        let status = gw.get_status(&unmatched, "/").await?;
+        assert_eq!(
+            status, 404,
+            "host {unmatched} matches no route and must 404; lowercasing the \
+             request host must not turn host matching into a catch-all"
+        );
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn cross_namespace_grant_allows_backend_routing() -> anyhow::Result<()> {
     let h = Harness::start().await?;

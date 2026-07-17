@@ -28,13 +28,16 @@ use crate::wire::routing::protocol_from_wire;
 ///
 /// The `u32` port narrows to `u16`: the sole producer writes `u32::from(u16)`, so
 /// the value is in range by construction. Out-of-range ports are **not** the
-/// concern of this helper — they are rejected upstream before a key is built: the
-/// apply path narrows endpoint-resource ports with a typed error at stage, and
-/// `bg_from_wire` narrows a `WeightedBackend.endpoint_ref` port with
-/// [`WireError::UnknownEndpointRef`] before calling here. Both guarantee `port`
-/// already fits `u16`, so a caller passing an out-of-range value is a bug, not
-/// untrusted input (a bare narrow here would truncate `65616 → 80` and bind an
-/// unrelated port's endpoints).
+/// concern of this helper — every caller resolves them before building a key, so
+/// a caller passing an out-of-range value is a bug, not untrusted input (a bare
+/// narrow here would truncate `65616 → 80` and bind an unrelated port's
+/// endpoints). The callers and how each discharges that obligation:
+///
+/// - the apply path narrows endpoint-resource ports with a typed error at stage;
+/// - `bg_from_wire` narrows a `WeightedBackend.endpoint_ref` port with
+///   [`WireError::UnknownEndpointRef`];
+/// - `collect_bg_refs` skips an out-of-range ref rather than staging a phantom
+///   referrer, leaving `bg_from_wire` to report it.
 #[must_use]
 pub(crate) fn endpoint_key_from_wire(namespace: &str, service: &str, port: u32) -> EndpointKey {
     EndpointKey::new(namespace, service, port as u16)

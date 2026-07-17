@@ -351,6 +351,64 @@ pub(crate) fn udp_sessions_total() -> &'static IntCounterVec {
     })
 }
 
+/// Counter: UDP datagrams lost on a listener's forwarding path, by listener port
+/// and cause.
+///
+/// UDP carries no status code and no connection reset, so a lost datagram is
+/// invisible to the client — and, before this counter, to the operator too:
+/// every drop path in [`crate::edge::udp`] logged at `debug` and stopped there,
+/// leaving "no traffic" and "every datagram discarded" indistinguishable on a
+/// dashboard.
+///
+/// Labels: `listener` (bind port); `reason`, one of:
+///
+/// | `reason` | Meaning |
+/// |---|---|
+/// | `recv_error` | the listener socket's own `recv_from` failed — realistically `ENOBUFS`/`ENOMEM`, i.e. the kernel dropped an inbound datagram |
+/// | `no_route` | no UDPRoute is bound to this port |
+/// | `no_backend` | a route matched but its backend group is empty |
+/// | `session_limit` | the listener is at `MAX_CONCURRENT_SESSIONS` |
+/// | `upstream_bind` / `upstream_connect` | a new session's ephemeral socket could not be prepared |
+/// | `upstream_send` | a new session's **first** datagram was rejected by the backend socket, so the session never established |
+/// | `session_send` | a **subsequent** datagram on an established session could not be handed to the backend socket |
+/// | `client_send` | a backend **reply** could not be delivered to the client |
+///
+/// Two of these are not literally client→backend datagram drops — `recv_error`
+/// names one the kernel lost before the proxy saw it, and `client_send` names a
+/// reply travelling the other way — but both are datagrams the listener failed
+/// to move, which is what an operator is asking about. There is deliberately no
+/// `direction` label: the `reason` values already determine direction, so one
+/// would be redundant cardinality.
+///
+/// Do not read `session_send` as "the backend died": the dominant cause is a
+/// full kernel send buffer (`WouldBlock`) under a burst, which is local
+/// backpressure. A backend that goes away mid-session usually surfaces instead
+/// as `ECONNREFUSED` on the session's parked `recv()`, which is a session
+/// teardown rather than a datagram drop and so is not counted here — watch
+/// [`udp_sessions_active`] falling against a climbing [`udp_sessions_total`]
+/// (re-establishment churn) for that.
+///
+/// `no_route` fires legitimately in the window between a listener binding and
+/// its route snapshot arriving, so alert on a sustained rate rather than any
+/// nonzero value.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`listeners_active`].
+pub(crate) fn udp_datagrams_dropped_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_proxy_udp_datagrams_dropped_total",
+                "UDP datagrams lost on a listener's forwarding path, by listener port and cause",
+            ),
+            &["listener", "reason"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
 /// Counter: upstream connections established by the proxy, classified by whether
 /// the connection was freshly opened or reused from the keepalive pool.
 ///

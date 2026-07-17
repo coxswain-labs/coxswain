@@ -967,7 +967,7 @@ async fn run_listener<P>(
             let elapsed = drain_start.elapsed().as_secs_f64();
             metrics::drain_duration().with_label_values::<&str>(&[]).observe(elapsed);
             metrics::lifecycle().with_label_values(&["drain_completed"]).inc();
-            metrics::listeners_active().with_label_values(&["draining"]).dec();
+            release_listener_slot(&drain_token);
             tracing::info!(addr = %addr, elapsed_s = elapsed, "Listener drain completed");
             0u64
         }
@@ -977,7 +977,7 @@ async fn run_listener<P>(
             let elapsed = drain_start.elapsed().as_secs_f64();
             metrics::drain_duration().with_label_values::<&str>(&[]).observe(elapsed);
             metrics::lifecycle().with_label_values(&["drain_exceeded"]).inc();
-            metrics::listeners_active().with_label_values(&["draining"]).dec();
+            release_listener_slot(&drain_token);
             if n > 0 {
                 metrics::requests_force_closed()
                     .with_label_values(&["drain_exceeded"])
@@ -1067,18 +1067,26 @@ where
         }
     };
 
-    // Check passthrough table.
+    // Check passthrough table. Resolve the backend group here and hand it to the
+    // handler: testing for a match and then having the handler repeat the lookup
+    // would peek the ClientHello and match the SNI twice per connection, and a
+    // reconcile landing between the two would silently drop a connection that had
+    // just tested as routable. Cloning the `Arc` (and dropping the snapshot)
+    // rather than borrowing through it also keeps a long-lived splice from
+    // pinning the routing snapshot it was dialled from.
     {
         let snapshot = handler.passthrough_table.load();
-        let has_match = snapshot
+        let matched = snapshot
             .port(port)
-            .is_some_and(|r| r.match_sni(sni.as_deref()).is_some());
-        if has_match {
+            .and_then(|r| r.match_sni(sni.as_deref()))
+            .map(Arc::clone);
+        drop(snapshot);
+        if let Some(backend) = matched {
             handle_passthrough(
                 tcp,
                 peer_addr,
-                &handler.passthrough_table,
-                port,
+                &backend,
+                sni.as_deref(),
                 handler.l4_dial_timeout,
             )
             .await;
@@ -1086,17 +1094,21 @@ where
         }
     }
 
-    // Check terminate table (#481).
+    // Check terminate table (#481). Same resolve-once contract as passthrough
+    // above.
     {
         let snapshot = handler.terminate_table.load();
-        let has_match = snapshot
+        let matched = snapshot
             .port(port)
-            .is_some_and(|r| r.match_sni(sni.as_deref()).is_some());
-        if has_match {
+            .and_then(|r| r.match_sni(sni.as_deref()))
+            .map(Arc::clone);
+        drop(snapshot);
+        if let Some(backend) = matched {
             handle_terminate(
                 tcp,
                 peer_addr,
-                &handler.terminate_table,
+                &backend,
+                sni.as_deref(),
                 &handler.tls_selector,
                 port,
                 handler.l4_dial_timeout,
@@ -1251,6 +1263,26 @@ async fn handle_connection<P>(
         )
         .await;
     }
+}
+
+/// Release this listener's `coxswain_proxy_listeners_active` slot, decrementing
+/// whichever state it actually holds.
+///
+/// A reconcile-driven removal moves the listener to `draining` before cancelling
+/// its token (see `reconcile_listeners`); a global shutdown never does — the
+/// listener is still counted as `serving` when its task exits. Decrementing
+/// `draining` unconditionally therefore makes a gracefully-shutting-down proxy
+/// report a negative `draining` and a `serving` that never returns to zero, for
+/// as long as its admin port keeps answering scrapes.
+pub(crate) fn release_listener_slot(drain_token: &CancellationToken) {
+    let state = if drain_token.is_cancelled() {
+        "draining"
+    } else {
+        "serving"
+    };
+    metrics::listeners_active()
+        .with_label_values(&[state])
+        .dec();
 }
 
 /// RAII guard: increments `coxswain_proxy_connections_active{listener}` on

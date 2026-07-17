@@ -17,20 +17,26 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tracing::debug;
 
-use coxswain_core::routing::{Selected, SharedTlsPassthroughTable};
+use coxswain_core::routing::{BackendGroup, Selected};
 
 use crate::SniCertSelector;
 use crate::edge::accept::{AcceptorBuildError, build_tls_context, observe_tls_handshake};
-use crate::edge::passthrough::peek_sni;
 
 /// Buffer size for each direction of the TCP splice (~16 KiB).
 const SPLICE_BUF: usize = 16 * 1024;
 
-/// Handle one accepted TCP connection on a TLS-terminate listener.
+/// Terminate TLS on one accepted connection and splice the decrypted stream to
+/// `backend`.
 ///
-/// Peeks the ClientHello via [`peek_sni`] (MSG_PEEK — bytes stay in the kernel
-/// queue), selects the listener certificate via SNI, terminates TLS, then
-/// splices the decrypted stream bidirectionally to the matched plaintext backend.
+/// `backend` is resolved by the caller ([`crate::edge::accept`]'s TLS-L4
+/// dispatch), which has already peeked the ClientHello and matched `sni`
+/// against the terminate table. Taking the resolved group rather than the table
+/// is what makes the routing decision and the connection it applies to the same
+/// event: re-loading the snapshot here would both repeat the peek and SNI
+/// match, and let a reconcile landing in between drop a connection that had
+/// just tested as routable. `sni` is carried only for diagnostics — the
+/// certificate is selected independently, from the SNI openssl itself parses
+/// during the handshake below.
 ///
 /// All failure paths log at `debug` level and return — the connection is closed
 /// when the streams are dropped.
@@ -42,48 +48,12 @@ const SPLICE_BUF: usize = 16 * 1024;
 pub(crate) async fn handle_terminate(
     tcp: TcpStream,
     peer_addr: SocketAddr,
-    table: &SharedTlsPassthroughTable,
+    backend: &BackendGroup,
+    sni: Option<&str>,
     selector: &SniCertSelector,
     listener_port: u16,
     dial_timeout: Duration,
 ) {
-    let sni = match peek_sni(&tcp).await {
-        Ok(s) => s,
-        Err(e) => {
-            debug!(
-                peer = %peer_addr,
-                error = %e,
-                "TLS terminate: failed to read ClientHello SNI"
-            );
-            return;
-        }
-    };
-
-    let snapshot = table.load();
-    let router = match snapshot.port(listener_port) {
-        Some(r) => r,
-        None => {
-            debug!(
-                peer = %peer_addr,
-                port = listener_port,
-                "TLS terminate: no routes for listener port"
-            );
-            return;
-        }
-    };
-
-    let backend = match router.match_sni(sni.as_deref()) {
-        Some(bg) => bg,
-        None => {
-            debug!(
-                peer = %peer_addr,
-                sni = ?sni,
-                "TLS terminate: no backend matched SNI"
-            );
-            return;
-        }
-    };
-
     let Selected {
         addr: backend_addr, ..
     } = match backend.select_upstream(None) {

@@ -122,7 +122,13 @@ impl TlsStore {
     ///
     /// Lookup precedence: exact host wins over wildcard suffix, wildcard over
     /// default. Returns an empty slice when no cert matches.
+    ///
+    /// `sni` must be ASCII-lowercase — see [`Self::has_specific_cert`] for why.
     pub fn find_certs(&self, sni: &str) -> &[Arc<TlsCert>] {
+        debug_assert!(
+            !sni.bytes().any(|b| b.is_ascii_uppercase()),
+            "sni must be normalized to ASCII-lowercase before cert lookup"
+        );
         if let Some(certs) = self.exact.get(sni) {
             return certs.as_slice();
         }
@@ -154,8 +160,21 @@ impl TlsStore {
     /// terminate when a specific listener claims it, otherwise reject — a
     /// catch-all default listener must not silently terminate an SNI destined
     /// for the port's passthrough routes (GEP-2643 / #70).
+    ///
+    /// `sni` must be ASCII-lowercase: matching is case-sensitive by design,
+    /// because this store is keyed by the lowercase hostnames the reconciler
+    /// wrote. Both of this store's SNI sources normalize at ingestion —
+    /// `peek_sni` (which feeds the hybrid-port decision this method serves) and
+    /// openssl's `servername` (which feeds [`Self::find_certs`] during the
+    /// handshake). They must agree: were only one normalized, a mixed-case SNI
+    /// could pass the check here and then find no cert there, turning a routable
+    /// connection into a handshake failure.
     #[must_use]
     pub fn has_specific_cert(&self, sni: &str) -> bool {
+        debug_assert!(
+            !sni.bytes().any(|b| b.is_ascii_uppercase()),
+            "sni must be normalized to ASCII-lowercase before cert lookup"
+        );
         self.exact.get(sni).is_some_and(|c| !c.is_empty())
             || self
                 .wildcard
@@ -657,7 +676,14 @@ impl HostClientCertConfigs {
     ///
     /// Exact match wins over wildcard, wildcard over default, matching the
     /// precedence of [`TlsStore::find_cert`].
+    ///
+    /// `sni` must be ASCII-lowercase — see [`TlsStore::has_specific_cert`]. A
+    /// mixed-case SNI reaching here would find no config and fail mTLS closed.
     pub fn find_config(&self, sni: &str) -> Option<Arc<ClientCertConfigState>> {
+        debug_assert!(
+            !sni.bytes().any(|b| b.is_ascii_uppercase()),
+            "sni must be normalized to ASCII-lowercase before mTLS config lookup"
+        );
         if let Some(cfg) = self.exact.get(sni) {
             return Some(Arc::clone(cfg));
         }
@@ -814,7 +840,17 @@ pub type SharedClientCertStore = Shared<ClientCertStore>;
 ///
 /// - `*.suffix` → single-label wildcard via [`wildcard_matches`].
 /// - Any other pattern → exact string equality.
+///
+/// `host` must be ASCII-lowercase; it is compared case-sensitively against the
+/// lowercase patterns the reconciler wrote. Both callers feed this from a
+/// normalized source — the request's captured `Host` and the connection's SNI —
+/// because a mixed-case value reaching here fails the match and answers a
+/// perfectly well-directed request with a spurious 421.
 fn listener_pattern_matches(host: &str, pattern: &str) -> bool {
+    debug_assert!(
+        !host.bytes().any(|b| b.is_ascii_uppercase()),
+        "host/sni must be normalized to ASCII-lowercase before the GEP-3567 check"
+    );
     if let Some(suffix) = pattern.strip_prefix("*.") {
         wildcard_matches(host, suffix)
     } else {

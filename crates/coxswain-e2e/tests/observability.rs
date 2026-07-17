@@ -1819,3 +1819,80 @@ async fn dedicated_dataplane_gauge_tracks_leaf_presence() -> anyhow::Result<()> 
 
     Ok(())
 }
+
+// ── UDP datagram drops (#618) ────────────────────────────────────────────────
+
+/// A UDP datagram the proxy discards must be counted, not just `debug!`-logged.
+///
+/// UDP carries no status code and no reset, so a dropped datagram is invisible to
+/// the client by construction. Before `coxswain_proxy_udp_datagrams_dropped_total`
+/// every drop path logged at `debug` and stopped there, leaving "no traffic" and
+/// "every datagram discarded" indistinguishable on a dashboard.
+///
+/// Drives `reason="no_route"`, the one drop an e2e can provoke deterministically:
+/// a `protocol: UDP` listener with no UDPRoute attached binds the port and
+/// discards everything that arrives.
+#[tokio::test]
+async fn udp_datagram_to_unrouted_port_increments_drop_counter() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "obs-udp-drop").await?;
+
+    fixtures::apply_fixture(
+        gwa::UDP_ROUTE_GW_ONLY,
+        FixtureVars::new(&ns.name).with(
+            "GATEWAY_UDP_PROXY_PORT",
+            coxswain_e2e::harness::GATEWAY_UDP_PROXY_PORT.to_string(),
+        ),
+    )
+    .await?;
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-udp-gw-only",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let udp_addr = h.gateway_udp_addr(&ns.name).await?;
+    let sock = tokio::net::UdpSocket::bind("0.0.0.0:0")
+        .await
+        .context("bind UDP client")?;
+    sock.connect(&udp_addr)
+        .await
+        .context("connect UDP client")?;
+
+    // The listener binds before its (empty) route snapshot lands, so `no_route`
+    // is the steady state here rather than a race — but poll anyway: the counter
+    // only moves once a datagram has actually reached the bound port.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            "coxswain_proxy_udp_datagrams_dropped_total{reason=\"no_route\"} to be \
+             incremented by a datagram sent to a routeless UDP listener; without \
+             it, UDP loss is invisible to the operator"
+                .to_string()
+        },
+        || async {
+            sock.send(b"into-the-void").await.ok()?;
+            let body = reqwest::get(h.admin_url("/metrics"))
+                .await
+                .ok()?
+                .text()
+                .await
+                .ok()?;
+            body.lines()
+                .filter(|l| !l.starts_with('#'))
+                .any(|l| {
+                    l.starts_with("coxswain_proxy_udp_datagrams_dropped_total{")
+                        && l.contains(r#"reason="no_route""#)
+                })
+                .then_some(())
+        },
+    )
+    .await?;
+
+    Ok(())
+}
