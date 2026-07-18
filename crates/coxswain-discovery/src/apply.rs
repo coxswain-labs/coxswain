@@ -254,6 +254,40 @@ impl RoutingApplier {
         self.publish = Some(publish);
         self
     }
+
+    /// Apply a **locally-built, trusted** message, skipping the F6 version
+    /// self-check (#621).
+    ///
+    /// Used by the namespace relay's per-Gateway reconstruction
+    /// ([`crate::relay::dedicated_snapshot_from_resources`]): it stamps
+    /// `msg.version` from the same per-resource digest set `apply_message` would
+    /// re-hash for the check, so the recompute is provably redundant. Inherent
+    /// rather than on [`SnapshotApplier`] — the wire path (the trait `apply`) must
+    /// keep the check mandatory against an untrusted peer.
+    ///
+    /// # Errors
+    ///
+    /// Every [`WireError`] `apply_message` can return except
+    /// [`WireError::VersionMismatch`] (the skipped check).
+    pub(crate) fn apply_trusted(
+        &mut self,
+        msg: &p::Snapshot,
+        expect_full: bool,
+    ) -> Result<ApplyStats, WireError> {
+        let cells = SnapshotCells {
+            ingress: &self.ingress,
+            gateway: &self.gateway,
+            tls: &self.tls,
+            client_certs: &self.client_certs,
+            status: &self.listener_status,
+            listener_hostnames: &self.listener_hostnames,
+            passthrough: &self.passthrough,
+            terminate: &self.terminate,
+            tcp: &self.tcp,
+            udp: &self.udp,
+        };
+        apply_message(&mut self.cache, msg, cells, expect_full, false)
+    }
 }
 
 impl SnapshotApplier for RoutingApplier {
@@ -270,7 +304,7 @@ impl SnapshotApplier for RoutingApplier {
             tcp: &self.tcp,
             udp: &self.udp,
         };
-        let stats = apply_message(&mut self.cache, msg, cells, expect_full)?;
+        let stats = apply_message(&mut self.cache, msg, cells, expect_full, true)?;
         // Publication fence: advance the downstream publish counter only after
         // the cells are committed (apply_message returned Ok), so a downstream
         // build that captures `current_seq()` never reads stale cells under a
@@ -347,9 +381,12 @@ pub(crate) struct ResourceCache {
     /// to dirty only the partitions an endpoint change touches.
     ep_index: HashMap<EndpointKey, HashSet<ResourceId>>,
     /// Per-resource content digests (`canonical_key → resource_hash`); the
-    /// change oracle for the whole-snapshot skip and (commit 6) the version
-    /// self-check.
-    digests: HashMap<String, String>,
+    /// change oracle for the whole-snapshot skip and the version self-check.
+    ///
+    /// Both key and value are `Arc<str>` so cloning the map into a delta's staged
+    /// successor ([`staged_from_cache`]) bumps refcounts instead of deep-copying
+    /// every canonical key and 64-byte hex digest.
+    digests: HashMap<Arc<str>, Arc<str>>,
     /// Whether at least one full snapshot has been applied on this cache.
     has_full: bool,
 }
@@ -390,7 +427,40 @@ struct Staged {
     udp: HashMap<u16, Arc<p::UdpRoutePort>>,
     endpoints: HashMap<EndpointKey, Arc<p::EndpointResource>>,
     refs: HashMap<ResourceId, Arc<HashSet<EndpointKey>>>,
-    digests: HashMap<String, String>,
+    digests: HashMap<Arc<str>, Arc<str>>,
+}
+
+/// Which coarse per-port cells a staging pass actually touched (#621).
+///
+/// A delta clones the committed cache, so a cell it never upserts or tombstones
+/// is byte-identical to the committed one — its whole-map equality compare is a
+/// foregone conclusion and can be skipped. A **full** builds fresh and replaces
+/// the world (a cell absent from it is a change: clear it), so every cell is
+/// treated dirty via [`StagedDirty::all`].
+#[derive(Default)]
+struct StagedDirty {
+    tls: bool,
+    client_certs: bool,
+    listener_status: bool,
+    passthrough: bool,
+    terminate: bool,
+    tcp: bool,
+    udp: bool,
+}
+
+impl StagedDirty {
+    /// Every cell dirty — the full-snapshot case (absence is a change).
+    fn all() -> Self {
+        Self {
+            tls: true,
+            client_certs: true,
+            listener_status: true,
+            passthrough: true,
+            terminate: true,
+            tcp: true,
+            udp: true,
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -447,12 +517,20 @@ pub(crate) struct ApplyStats {
 ///   ref, malformed address, …).
 ///
 /// On any error the cache **and** every cell are left untouched.
+///
+/// `verify_version` gates the F6 self-check. It is `true` on the real wire path
+/// (the peer's stamp is untrusted — a mismatch means the two sides disagree). A
+/// trusted local caller that just built `msg` from a set it *also* hashed to stamp
+/// `msg.version` (the namespace relay's per-Gateway reconstruction, #621) passes
+/// `false` to skip re-hashing the identical set — the recompute could only ever
+/// equal the stamp it just produced.
 #[must_use = "the apply outcome decides Ack vs Nack; dropping it silently accepts a failed apply"]
 pub(crate) fn apply_message(
     cache: &mut ResourceCache,
     msg: &p::Snapshot,
     cells: SnapshotCells<'_>,
     expect_full: bool,
+    verify_version: bool,
 ) -> Result<ApplyStats, WireError> {
     // Invariant 1: the first message of a session is a full snapshot. `expect_full`
     // is the caller's per-session flag — true on every (re)connect, cleared after
@@ -472,8 +550,11 @@ pub(crate) fn apply_message(
     // scratch (replace-all); a delta folds upserts (whole-resource replace) and
     // tombstones onto a clone of the committed cache (invariant 2: the upsert and
     // tombstone key sets are disjoint, a tombstone of an unheld key is a no-op).
-    let staged = if msg.full {
-        stage_full(msg)?
+    // `dirty` marks which coarse per-port cells this apply touched. A full is
+    // all-dirty (it replaces the world); a delta reports exactly the cells its
+    // upserts/tombstones hit, so an untouched cell skips its whole-map compare.
+    let (staged, dirty) = if msg.full {
+        (stage_full(msg)?, StagedDirty::all())
     } else {
         stage_delta(cache, msg)?
     };
@@ -490,16 +571,19 @@ pub(crate) fn apply_message(
     // Version self-check (F6): recompute the global version from the post-apply
     // per-resource digests and compare to the server's stamp. A mismatch means the
     // two sides disagree on the applied world — Nack for a self-healing resync
-    // (invariant 6) before touching anything live.
-    let computed =
-        crate::version::ContentHash::from_per_resource(staged.digests.values().cloned().collect())
-            .as_str()
-            .to_owned();
-    if computed != msg.version {
-        return Err(WireError::VersionMismatch {
-            expected: msg.version.clone(),
-            computed,
-        });
+    // (invariant 6) before touching anything live. Skipped on the trusted local
+    // path (#621), where the caller stamped `msg.version` from this same set.
+    if verify_version {
+        let computed =
+            crate::version::ContentHash::from_per_resource(staged.digests.values().map(|h| &**h))
+                .as_str()
+                .to_owned();
+        if computed != msg.version {
+            return Err(WireError::VersionMismatch {
+                expected: msg.version.clone(),
+                computed,
+            });
+        }
     }
 
     // Phase B — change detection. With the version confirmed, a staged world
@@ -554,32 +638,37 @@ pub(crate) fn apply_message(
     // changed (their DTOs carry only a ref, so an endpoint address change leaves
     // the DTO — but not the compiled backend group — identical). TLS, client-cert
     // and listener-status resources never reference endpoints, so DTO inequality
-    // alone decides them.
-    let tls_new = (staged.tls != cache.tls)
+    // alone decides them. A cell the delta never touched (`!dirty.X`) is
+    // byte-identical to the committed one, so its whole-map compare is skipped
+    // (#621); a full is all-dirty, so every compare runs.
+    let tls_new = (dirty.tls && staged.tls != cache.tls)
         .then(|| decode_tls_cell(&staged.tls))
         .transpose()?;
-    let client_certs_new = (staged.client_certs != cache.client_certs)
+    let client_certs_new = (dirty.client_certs && staged.client_certs != cache.client_certs)
         .then(|| decode_client_certs_cell(&staged.client_certs))
         .transpose()?;
     // Listener status drives the derived per-port HTTPS hostname snapshot; both
     // are rebuilt together, only when the listener-status resources changed.
-    let listener_status_new = if staged.listener_status != cache.listener_status {
-        let map = decode_listener_status_cell(&staged.listener_status)?;
-        let hostnames = derive_listener_hostnames(&map);
-        Some((map, hostnames))
-    } else {
-        None
-    };
-    let passthrough_new = (ep_dirty.passthrough || staged.passthrough != cache.passthrough)
+    let listener_status_new =
+        if dirty.listener_status && staged.listener_status != cache.listener_status {
+            let map = decode_listener_status_cell(&staged.listener_status)?;
+            let hostnames = derive_listener_hostnames(&map);
+            Some((map, hostnames))
+        } else {
+            None
+        };
+    let passthrough_new = (ep_dirty.passthrough
+        || (dirty.passthrough && staged.passthrough != cache.passthrough))
         .then(|| decode_passthrough_cell(&staged.passthrough, &pool))
         .transpose()?;
-    let terminate_new = (ep_dirty.terminate || staged.terminate != cache.terminate)
+    let terminate_new = (ep_dirty.terminate
+        || (dirty.terminate && staged.terminate != cache.terminate))
         .then(|| decode_passthrough_cell(&staged.terminate, &pool))
         .transpose()?;
-    let tcp_new = (ep_dirty.tcp || staged.tcp != cache.tcp)
+    let tcp_new = (ep_dirty.tcp || (dirty.tcp && staged.tcp != cache.tcp))
         .then(|| decode_tcp_cell(&staged.tcp, &pool))
         .transpose()?;
-    let udp_new = (ep_dirty.udp || staged.udp != cache.udp)
+    let udp_new = (ep_dirty.udp || (dirty.udp && staged.udp != cache.udp))
         .then(|| decode_udp_cell(&staged.udp, &pool))
         .transpose()?;
 
@@ -654,9 +743,12 @@ pub(crate) fn apply_message(
 /// recording per-resource digests. Fails closed on any unkeyable resource.
 fn stage_full(msg: &p::Snapshot) -> Result<Staged, WireError> {
     let mut staged = Staged::default();
+    // A full is all-dirty (see `StagedDirty`), so its per-cell touch tracking is
+    // discarded — the caller uses `StagedDirty::all()`.
+    let mut dirty = StagedDirty::default();
     let mut seen = HashSet::new();
     for resource in &msg.resources {
-        stage_resource(&mut staged, &mut seen, resource)?;
+        stage_resource(&mut staged, &mut dirty, &mut seen, resource)?;
     }
     Ok(staged)
 }
@@ -666,14 +758,18 @@ fn stage_full(msg: &p::Snapshot) -> Result<Staged, WireError> {
 ///
 /// The two key sets are disjoint (invariant 2): a key in both is an inconsistent
 /// delta, rejected. A tombstone of an unheld key is an idempotent no-op.
-fn stage_delta(cache: &ResourceCache, msg: &p::Snapshot) -> Result<Staged, WireError> {
+fn stage_delta(
+    cache: &ResourceCache,
+    msg: &p::Snapshot,
+) -> Result<(Staged, StagedDirty), WireError> {
     let mut staged = staged_from_cache(cache);
+    let mut dirty = StagedDirty::default();
     // Upserts. `seen` tracks the message's own keys so a duplicate *within* the
     // message is rejected even though the digest map is pre-populated from the
     // committed world (where an "already present" key is a replace, not a dup).
     let mut seen = HashSet::new();
     for resource in &msg.resources {
-        stage_resource(&mut staged, &mut seen, resource)?;
+        stage_resource(&mut staged, &mut dirty, &mut seen, resource)?;
     }
     // Tombstones.
     for removed in &msg.removed_resources {
@@ -683,9 +779,9 @@ fn stage_delta(cache: &ResourceCache, msg: &p::Snapshot) -> Result<Staged, WireE
             });
         }
         let parsed = parse_canonical_key(removed).map_err(wire_from_key_err)?;
-        remove_from_staged(&mut staged, removed, parsed)?;
+        remove_from_staged(&mut staged, &mut dirty, removed, parsed)?;
     }
-    Ok(staged)
+    Ok((staged, dirty))
 }
 
 /// Clone the committed cache into a mutable staged successor. Every map is
@@ -720,6 +816,7 @@ fn staged_from_cache(cache: &ResourceCache) -> Staged {
 /// review).
 fn stage_resource(
     staged: &mut Staged,
+    dirty: &mut StagedDirty,
     seen: &mut HashSet<String>,
     resource: &p::Resource,
 ) -> Result<(), WireError> {
@@ -729,7 +826,9 @@ fn stage_resource(
             reason: "message contains a duplicate canonical resource key",
         });
     }
-    staged.digests.insert(key, resource_hash(resource));
+    staged
+        .digests
+        .insert(Arc::from(key), Arc::from(resource_hash(resource)));
 
     let payload = resource
         .payload
@@ -748,14 +847,17 @@ fn stage_resource(
             staged.routes.insert(pk, Arc::new(rh.clone()));
         }
         p::resource::Payload::TlsPort(e) => {
+            dirty.tls = true;
             staged.tls.insert(port_u16(e.port)?, Arc::new(e.clone()));
         }
         p::resource::Payload::ClientCertPort(r) => {
+            dirty.client_certs = true;
             staged
                 .client_certs
                 .insert(port_u16(r.port)?, Arc::new(r.clone()));
         }
         p::resource::Payload::ListenerStatus(e) => {
+            dirty.listener_status = true;
             let ok =
                 e.object_key
                     .parse::<ObjectKey>()
@@ -765,6 +867,7 @@ fn stage_resource(
             staged.listener_status.insert(ok, Arc::new(e.clone()));
         }
         p::resource::Payload::TlsPassthroughPort(pt) => {
+            dirty.passthrough = true;
             let port = port_u16(pt.port)?;
             staged.refs.insert(
                 ResourceId::Passthrough(port),
@@ -773,6 +876,7 @@ fn stage_resource(
             staged.passthrough.insert(port, Arc::new(pt.clone()));
         }
         p::resource::Payload::TlsTerminatePort(pt) => {
+            dirty.terminate = true;
             let port = port_u16(pt.port)?;
             staged
                 .refs
@@ -780,6 +884,7 @@ fn stage_resource(
             staged.terminate.insert(port, Arc::new(pt.clone()));
         }
         p::resource::Payload::TcpPort(pt) => {
+            dirty.tcp = true;
             let port = port_u16(pt.port)?;
             let mut refs = HashSet::new();
             if let Some(bg) = &pt.backend_group {
@@ -789,6 +894,7 @@ fn stage_resource(
             staged.tcp.insert(port, Arc::new(pt.clone()));
         }
         p::resource::Payload::UdpPort(pt) => {
+            dirty.udp = true;
             let port = port_u16(pt.port)?;
             let mut refs = HashSet::new();
             if let Some(bg) = &pt.backend_group {
@@ -833,6 +939,7 @@ fn stage_resource(
 /// closed).
 fn remove_from_staged(
     staged: &mut Staged,
+    dirty: &mut StagedDirty,
     key_str: &str,
     parsed: ParsedKey,
 ) -> Result<(), WireError> {
@@ -868,12 +975,15 @@ fn remove_from_staged(
             staged.refs.remove(&ResourceId::Route(pk));
         }
         ParsedKey::Tls(port) => {
+            dirty.tls = true;
             staged.tls.remove(&port);
         }
         ParsedKey::ClientCert(port) => {
+            dirty.client_certs = true;
             staged.client_certs.remove(&port);
         }
         ParsedKey::Listener(ok_str) => {
+            dirty.listener_status = true;
             let ok = ok_str
                 .parse::<ObjectKey>()
                 .map_err(|()| WireError::UnknownResourceKey {
@@ -882,18 +992,22 @@ fn remove_from_staged(
             staged.listener_status.remove(&ok);
         }
         ParsedKey::TlsPassthrough(port) => {
+            dirty.passthrough = true;
             staged.passthrough.remove(&port);
             staged.refs.remove(&ResourceId::Passthrough(port));
         }
         ParsedKey::TlsTerminate(port) => {
+            dirty.terminate = true;
             staged.terminate.remove(&port);
             staged.refs.remove(&ResourceId::Terminate(port));
         }
         ParsedKey::Tcp(port) => {
+            dirty.tcp = true;
             staged.tcp.remove(&port);
             staged.refs.remove(&ResourceId::Tcp(port));
         }
         ParsedKey::Udp(port) => {
+            dirty.udp = true;
             staged.udp.remove(&port);
             staged.refs.remove(&ResourceId::Udp(port));
         }
@@ -1038,7 +1152,11 @@ fn changed_or_removed_endpoints(
     let mut out = HashSet::new();
     for (key, staged_dto) in staged {
         match committed.get(key) {
-            Some(prev) if **prev == **staged_dto => {}
+            // A delta clones the committed cache, so an untouched endpoint is the
+            // SAME `Arc` — a pointer check clears it without the deep DTO compare
+            // (#621). A full builds fresh, so this misses and falls through to the
+            // value compare, no regression.
+            Some(prev) if Arc::ptr_eq(prev, staged_dto) || **prev == **staged_dto => {}
             _ => {
                 out.insert(key.clone());
             }
@@ -1154,16 +1272,20 @@ where
 {
     // Split the staged keys for THIS table into dirty (recompile) and clean
     // (splice). `dirty` holds owned keys so it outlives the `staged_keys` borrows.
+    // Each staged key carries its `host_selector` result so the assembly loop
+    // below reuses it instead of recomputing (`format!("*.{suffix}")` / clone)
+    // per partition per table (#621).
     let mut dirty: HashSet<RoutePartitionKey> = HashSet::new();
-    let mut staged_keys: Vec<&RoutePartitionKey> = Vec::new();
+    let mut staged_keys: Vec<(&RoutePartitionKey, Option<String>, WildcardKind)> = Vec::new();
     for (pk, dto) in staged_routes {
         if pk.table != which {
             continue;
         }
-        staged_keys.push(pk);
         let (hostname_opt, kind) = host_selector(&pk.host);
         let changed = match committed_routes.get(pk) {
-            Some(prev) => **prev != **dto,
+            // Delta-clone reuse: an untouched partition is the same `Arc` as the
+            // committed one, so a pointer check skips the deep DTO compare (#621).
+            Some(prev) => !Arc::ptr_eq(prev, dto) && **prev != **dto,
             None => true,
         };
         let missing_live = live
@@ -1172,6 +1294,7 @@ where
         if changed || ep_dirty.contains(pk) || missing_live {
             dirty.insert(pk.clone());
         }
+        staged_keys.push((pk, hostname_opt, kind));
     }
 
     // A partition cached under this table but absent from the staged world was
@@ -1209,8 +1332,7 @@ where
     let mut builder = RoutingTableBuilder::<Kind>::new();
     let mut recompiled = 0u64;
     let mut reused = 0u64;
-    for pk in staged_keys {
-        let (hostname_opt, kind) = host_selector(&pk.host);
+    for (pk, hostname_opt, kind) in staged_keys {
         let host_repr = conflict_host_repr(hostname_opt.as_deref());
 
         let router = if dirty.contains(pk) {
@@ -1830,7 +1952,7 @@ mod tests {
             vec![ingress_route_resource(literal_bg("ns/svc", "10.0.0.1:80"))],
         );
 
-        apply_message(&mut cache, &msg, cells.bundle(), true).expect("apply");
+        apply_message(&mut cache, &msg, cells.bundle(), true, true).expect("apply");
 
         assert!(cache.has_full, "cache records the applied full");
         assert_eq!(cache.routes.len(), 1, "the one route partition is cached");
@@ -1885,7 +2007,7 @@ mod tests {
             "v1",
             vec![ingress_route_resource(literal_bg("ns/svc", "10.0.0.1:80"))],
         );
-        apply_message(&mut cache, &msg, cells.bundle(), true).expect("first apply");
+        apply_message(&mut cache, &msg, cells.bundle(), true, true).expect("first apply");
 
         let ingress_before = cells.ingress.load();
         let tls_before = cells.tls.load();
@@ -1896,7 +2018,7 @@ mod tests {
             "v2",
             vec![ingress_route_resource(literal_bg("ns/svc", "10.0.0.1:80"))],
         );
-        apply_message(&mut cache, &again, cells.bundle(), true).expect("second apply");
+        apply_message(&mut cache, &again, cells.bundle(), true, true).expect("second apply");
 
         assert!(
             Arc::ptr_eq(&ingress_before, &cells.ingress.load()),
@@ -1931,7 +2053,7 @@ mod tests {
                 },
             ],
         );
-        apply_message(&mut cache, &two, cells.bundle(), true).expect("apply two");
+        apply_message(&mut cache, &two, cells.bundle(), true, true).expect("apply two");
         assert_eq!(cache.routes.len(), 2, "both partitions cached");
 
         // Re-send with only the first route.
@@ -1939,7 +2061,7 @@ mod tests {
             "v2",
             vec![ingress_route_resource(literal_bg("ns/a", "10.0.0.1:80"))],
         );
-        apply_message(&mut cache, &one, cells.bundle(), true).expect("apply one");
+        apply_message(&mut cache, &one, cells.bundle(), true, true).expect("apply one");
         assert_eq!(cache.routes.len(), 1, "removed partition pruned from cache");
         assert!(
             !cache
@@ -1960,7 +2082,7 @@ mod tests {
             "v1",
             vec![ingress_route_resource(literal_bg("ns/svc", "10.0.0.1:80"))],
         );
-        apply_message(&mut cache, &good, cells.bundle(), true).expect("baseline");
+        apply_message(&mut cache, &good, cells.bundle(), true, true).expect("baseline");
 
         let ingress_before = cells.ingress.load();
         let gateway_before = cells.gateway.load();
@@ -1969,7 +2091,7 @@ mod tests {
 
         // Apply a snapshot whose route carries an invalid regex.
         let bad = full("v2", vec![bad_regex_resource()]);
-        let err = apply_message(&mut cache, &bad, cells.bundle(), true).unwrap_err();
+        let err = apply_message(&mut cache, &bad, cells.bundle(), true, true).unwrap_err();
         assert!(matches!(err, WireError::InvalidRegex(_)), "got: {err:?}");
 
         assert!(
@@ -1988,6 +2110,111 @@ mod tests {
         );
     }
 
+    /// #621: `verify_version = false` (the trusted local path used by the relay's
+    /// per-Gateway reconstruction) applies a message whose `version` stamp the
+    /// checked path would Nack, and commits the identical world a correctly-stamped
+    /// checked apply produces.
+    #[test]
+    fn apply_message_trusted_skips_version_self_check() {
+        let resource = ingress_route_resource(literal_bg("ns/svc", "10.0.0.1:80"));
+
+        // A message with a deliberately-corrupt version stamp.
+        let mut bogus = full("v1", vec![resource.clone()]);
+        bogus.version = "not-the-real-hash".to_owned();
+
+        // Checked path Nacks it.
+        let mut checked = ResourceCache::new();
+        let checked_cells = Cells::new();
+        let err =
+            apply_message(&mut checked, &bogus, checked_cells.bundle(), true, true).unwrap_err();
+        assert!(
+            matches!(err, WireError::VersionMismatch { .. }),
+            "checked path must Nack a wrong version: {err:?}"
+        );
+
+        // Trusted path applies it.
+        let mut trusted = ResourceCache::new();
+        let trusted_cells = Cells::new();
+        apply_message(&mut trusted, &bogus, trusted_cells.bundle(), true, false)
+            .expect("trusted apply ignores the version stamp");
+
+        // And commits the same world as a correctly-stamped checked apply.
+        let mut reference = ResourceCache::new();
+        let ref_cells = Cells::new();
+        apply_message(
+            &mut reference,
+            &full("v1", vec![resource]),
+            ref_cells.bundle(),
+            true,
+            true,
+        )
+        .expect("checked apply");
+        assert_eq!(
+            trusted.digests, reference.digests,
+            "trusted apply commits the same digests as a checked apply of the same world"
+        );
+    }
+
+    /// #621 dirty-flag: a delta that upserts only a route leaves an untouched L4
+    /// cell byte-identical — its whole-map compare is skipped and the live cell
+    /// keeps its exact `Arc`; a full that omits the cell still clears it (a full is
+    /// all-dirty, so an absent cell is a change).
+    #[test]
+    fn dirty_flag_skips_untouched_l4_on_delta_but_full_clears_it() {
+        let mut cache = ResourceCache::new();
+        let cells = Cells::new();
+
+        // Baseline full: one ingress route + one TCP port (both literal-backed, so
+        // neither references an endpoint that could force an L4 rebuild).
+        let route_a = ingress_exact_resource("a.example.com", literal_bg("ns/a", "10.0.0.1:80"));
+        let tcp = tcp_resource(9000, literal_bg("t", "10.0.0.7:80"));
+        apply_message(
+            &mut cache,
+            &full("v1", vec![route_a.clone(), tcp.clone()]),
+            cells.bundle(),
+            true,
+            true,
+        )
+        .expect("baseline full");
+        let tcp_cell_before = cells.tcp.load();
+        assert!(cache.tcp.contains_key(&9000), "baseline holds the TCP port");
+
+        // Delta: add a second route only — the TCP cell is never touched.
+        let route_b = ingress_exact_resource("b.example.com", literal_bg("ns/b", "10.0.0.2:80"));
+        let d = delta(
+            vec![route_b.clone()],
+            &[],
+            &[route_a.clone(), route_b, tcp.clone()],
+        );
+        apply_message(&mut cache, &d, cells.bundle(), false, true).expect("route-only delta");
+        assert!(
+            Arc::ptr_eq(&tcp_cell_before, &cells.tcp.load()),
+            "a route-only delta must not rebuild the untouched TCP cell"
+        );
+        assert!(
+            cache.tcp.contains_key(&9000),
+            "the TCP port survives the delta"
+        );
+
+        // A full that omits the TCP port clears it (full is all-dirty).
+        apply_message(
+            &mut cache,
+            &full("v2", vec![route_a]),
+            cells.bundle(),
+            false,
+            true,
+        )
+        .expect("full without the TCP port");
+        assert!(
+            !cache.tcp.contains_key(&9000),
+            "a full without the TCP port must clear it from the cache"
+        );
+        assert!(
+            !Arc::ptr_eq(&tcp_cell_before, &cells.tcp.load()),
+            "clearing the TCP port must republish the (now-empty) cell"
+        );
+    }
+
     /// A delta (`full = false`) is rejected until commit 6 lifts the guard.
     #[test]
     fn delta_before_full_is_rejected() {
@@ -1995,7 +2222,7 @@ mod tests {
         let cells = Cells::new();
         let mut delta = full("v1", Vec::new());
         delta.full = false;
-        let err = apply_message(&mut cache, &delta, cells.bundle(), true).unwrap_err();
+        let err = apply_message(&mut cache, &delta, cells.bundle(), true, true).unwrap_err();
         assert!(
             matches!(err, WireError::DeltaBeforeFullSnapshot),
             "got: {err:?}"
@@ -2015,7 +2242,7 @@ mod tests {
                 ingress_route_resource(keyed_bg("ns/svc", "ns", "svc", 80)),
             ],
         );
-        apply_message(&mut cache, &msg, cells.bundle(), true).expect("apply");
+        apply_message(&mut cache, &msg, cells.bundle(), true, true).expect("apply");
 
         assert!(
             ep_index_is_consistent(&cache.refs, &cache.ep_index),
@@ -2083,7 +2310,7 @@ mod tests {
                 ingress_exact_resource("c.com", literal_bg("c", "10.0.0.3:80")),
             ],
         );
-        apply_message(&mut cache, &v1, cells.bundle(), true).expect("v1");
+        apply_message(&mut cache, &v1, cells.bundle(), true, true).expect("v1");
         let ra = ingress_router(&cells, "a.com");
         let rb = ingress_router(&cells, "b.com");
         let rc = ingress_router(&cells, "c.com");
@@ -2097,7 +2324,7 @@ mod tests {
                 ingress_exact_resource("c.com", literal_bg("c", "10.0.0.3:80")),
             ],
         );
-        let stats = apply_message(&mut cache, &v2, cells.bundle(), true).expect("v2");
+        let stats = apply_message(&mut cache, &v2, cells.bundle(), true, true).expect("v2");
 
         assert!(
             Arc::ptr_eq(&ra, &ingress_router(&cells, "a.com")),
@@ -2138,7 +2365,7 @@ mod tests {
                 udp_resource(9002, literal_bg("ludp", "10.0.0.9:80")),
             ],
         );
-        apply_message(&mut cache, &v1, cells.bundle(), true).expect("v1");
+        apply_message(&mut cache, &v1, cells.bundle(), true, true).expect("v1");
         let r_ref = ingress_router(&cells, "ref.com");
         let r_noref = ingress_router(&cells, "noref.com");
         let tcp_before = cells.tcp.load();
@@ -2155,7 +2382,7 @@ mod tests {
                 udp_resource(9002, literal_bg("ludp", "10.0.0.9:80")),
             ],
         );
-        let stats = apply_message(&mut cache, &v2, cells.bundle(), true).expect("v2");
+        let stats = apply_message(&mut cache, &v2, cells.bundle(), true, true).expect("v2");
 
         assert!(
             !Arc::ptr_eq(&r_ref, &ingress_router(&cells, "ref.com")),
@@ -2192,7 +2419,7 @@ mod tests {
                 ingress_exact_resource("other.com", literal_bg("o", "10.0.0.5:80")),
             ],
         );
-        apply_message(&mut cache, &v1, cells.bundle(), true).expect("v1");
+        apply_message(&mut cache, &v1, cells.bundle(), true, true).expect("v1");
         let r_ref = ingress_router(&cells, "ref.com");
 
         // Endpoint identical; only the unrelated `other.com` route changes.
@@ -2204,7 +2431,7 @@ mod tests {
                 ingress_exact_resource("other.com", literal_bg("o", "10.9.9.9:80")),
             ],
         );
-        let stats = apply_message(&mut cache, &v2, cells.bundle(), true).expect("v2");
+        let stats = apply_message(&mut cache, &v2, cells.bundle(), true, true).expect("v2");
 
         assert!(
             Arc::ptr_eq(&r_ref, &ingress_router(&cells, "ref.com")),
@@ -2233,7 +2460,7 @@ mod tests {
                 ingress_exact_resource("c.com", literal_bg("c", "10.0.0.3:80")),
             ],
         );
-        apply_message(&mut cache, &v1, cells.bundle(), true).expect("v1");
+        apply_message(&mut cache, &v1, cells.bundle(), true, true).expect("v1");
         let ra = ingress_router(&cells, "a.com");
 
         let v2 = full(
@@ -2243,7 +2470,7 @@ mod tests {
                 literal_bg("a", "10.0.0.1:80"),
             )],
         );
-        let stats = apply_message(&mut cache, &v2, cells.bundle(), true).expect("v2");
+        let stats = apply_message(&mut cache, &v2, cells.bundle(), true, true).expect("v2");
 
         assert!(
             Arc::ptr_eq(&ra, &ingress_router(&cells, "a.com")),
@@ -2279,7 +2506,7 @@ mod tests {
                 tcp_resource(9000, literal_bg("t", "10.0.0.7:80")),
             ],
         );
-        apply_message(&mut cache, &v1, cells.bundle(), true).expect("v1");
+        apply_message(&mut cache, &v1, cells.bundle(), true, true).expect("v1");
         let ra = ingress_router(&cells, "a.com");
         let tcp_before = cells.tcp.load();
 
@@ -2291,7 +2518,7 @@ mod tests {
                 tcp_resource(9000, literal_bg("t", "10.0.0.7:80")),
             ],
         );
-        apply_message(&mut cache, &v2, cells.bundle(), true).expect("v2");
+        apply_message(&mut cache, &v2, cells.bundle(), true, true).expect("v2");
 
         assert!(
             Arc::ptr_eq(&tcp_before, &cells.tcp.load()),
@@ -2317,7 +2544,7 @@ mod tests {
                 ingress_exact_resource("other.com", literal_bg("o", "10.0.0.5:80")),
             ],
         );
-        apply_message(&mut cache, &v1, cells.bundle(), true).expect("v1");
+        apply_message(&mut cache, &v1, cells.bundle(), true, true).expect("v1");
         let r_conf = ingress_router(&cells, "conf.com");
         assert!(
             cells
@@ -2337,7 +2564,7 @@ mod tests {
                 ingress_exact_resource("other.com", literal_bg("o", "10.9.9.9:80")),
             ],
         );
-        let stats = apply_message(&mut cache, &v2, cells.bundle(), true).expect("v2");
+        let stats = apply_message(&mut cache, &v2, cells.bundle(), true, true).expect("v2");
 
         assert!(
             Arc::ptr_eq(&r_conf, &ingress_router(&cells, "conf.com")),
@@ -2370,7 +2597,7 @@ mod tests {
                 udp_resource(9002, literal_bg("u", "10.0.0.8:80")),
             ],
         );
-        apply_message(&mut cache, &good, cells.bundle(), true).expect("baseline");
+        apply_message(&mut cache, &good, cells.bundle(), true, true).expect("baseline");
 
         let ingress_before = cells.ingress.load();
         let gateway_before = cells.gateway.load();
@@ -2379,7 +2606,7 @@ mod tests {
 
         // A bad regex fails the route compile; nothing must be published.
         let bad = full("v2", vec![bad_regex_resource()]);
-        let err = apply_message(&mut cache, &bad, cells.bundle(), true).unwrap_err();
+        let err = apply_message(&mut cache, &bad, cells.bundle(), true, true).unwrap_err();
         assert!(matches!(err, WireError::InvalidRegex(_)), "got: {err:?}");
 
         assert!(Arc::ptr_eq(&ingress_before, &cells.ingress.load()));
@@ -2405,7 +2632,7 @@ mod tests {
                 literal_bg("a", "10.0.0.1:80"),
             )],
         );
-        apply_message(&mut cache, &good, cells.bundle(), true).expect("baseline");
+        apply_message(&mut cache, &good, cells.bundle(), true, true).expect("baseline");
 
         let ingress_before = cells.ingress.load();
         let digests_before = cache.digests.clone();
@@ -2419,7 +2646,7 @@ mod tests {
                 ingress_exact_resource("dup.com", literal_bg("d", "10.0.0.2:80")),
             ],
         );
-        let err = apply_message(&mut cache, &dup, cells.bundle(), true).unwrap_err();
+        let err = apply_message(&mut cache, &dup, cells.bundle(), true, true).unwrap_err();
         assert!(
             matches!(err, WireError::UnknownResourceKey { .. }),
             "got: {err:?}"
@@ -2481,7 +2708,7 @@ mod tests {
                 ingress_exact_resource("c.com", literal_bg("c", "10.0.0.3:80")),
             ],
         );
-        apply_message(&mut cache, &v1, cells.bundle(), true).expect("v1 full");
+        apply_message(&mut cache, &v1, cells.bundle(), true, true).expect("v1 full");
         let ra = ingress_router(&cells, "a.com");
         let rc = ingress_router(&cells, "c.com");
         let rb = ingress_router(&cells, "b.com");
@@ -2495,7 +2722,7 @@ mod tests {
             ingress_exact_resource("c.com", literal_bg("c", "10.0.0.3:80")),
         ];
         let d = delta(vec![b_new], &[], &post);
-        let stats = apply_message(&mut cache, &d, cells.bundle(), false).expect("delta acks");
+        let stats = apply_message(&mut cache, &d, cells.bundle(), false, true).expect("delta acks");
 
         assert!(
             Arc::ptr_eq(&ra, &ingress_router(&cells, "a.com")),
@@ -2535,7 +2762,7 @@ mod tests {
                 udp_resource(9002, literal_bg("ludp", "10.0.0.9:80")),
             ],
         );
-        apply_message(&mut cache, &v1, cells.bundle(), true).expect("v1 full");
+        apply_message(&mut cache, &v1, cells.bundle(), true, true).expect("v1 full");
         let r_ref = ingress_router(&cells, "ref.com");
         let r_noref = ingress_router(&cells, "noref.com");
         let tcp_before = cells.tcp.load();
@@ -2551,7 +2778,7 @@ mod tests {
             udp_resource(9002, literal_bg("ludp", "10.0.0.9:80")),
         ];
         let d = delta(vec![ep_new], &[], &post);
-        let stats = apply_message(&mut cache, &d, cells.bundle(), false).expect("delta acks");
+        let stats = apply_message(&mut cache, &d, cells.bundle(), false, true).expect("delta acks");
 
         assert!(
             !Arc::ptr_eq(&r_ref, &ingress_router(&cells, "ref.com")),
@@ -2586,7 +2813,7 @@ mod tests {
                 ingress_exact_resource("b.com", literal_bg("b", "10.0.0.2:80")),
             ],
         );
-        apply_message(&mut cache, &v1, cells.bundle(), true).expect("v1 full");
+        apply_message(&mut cache, &v1, cells.bundle(), true, true).expect("v1 full");
         let ra = ingress_router(&cells, "a.com");
 
         // Delta tombstoning b.com; post-apply world is a.com only.
@@ -2595,7 +2822,7 @@ mod tests {
             literal_bg("a", "10.0.0.1:80"),
         )];
         let d = delta(Vec::new(), &["route|ingress|80|exact|b.com"], &post);
-        apply_message(&mut cache, &d, cells.bundle(), false).expect("delta acks");
+        apply_message(&mut cache, &d, cells.bundle(), false, true).expect("delta acks");
 
         assert!(
             Arc::ptr_eq(&ra, &ingress_router(&cells, "a.com")),
@@ -2630,7 +2857,7 @@ mod tests {
                 literal_bg("a", "10.0.0.1:80"),
             )],
         );
-        apply_message(&mut cache, &v1, cells.bundle(), true).expect("v1 full");
+        apply_message(&mut cache, &v1, cells.bundle(), true, true).expect("v1 full");
         let ra = ingress_router(&cells, "a.com");
 
         // Tombstone a host we never held; post-apply world equals the committed one.
@@ -2639,7 +2866,7 @@ mod tests {
             literal_bg("a", "10.0.0.1:80"),
         )];
         let d = delta(Vec::new(), &["route|ingress|80|exact|ghost.com"], &post);
-        let stats = apply_message(&mut cache, &d, cells.bundle(), false).expect("delta acks");
+        let stats = apply_message(&mut cache, &d, cells.bundle(), false, true).expect("delta acks");
 
         assert!(
             Arc::ptr_eq(&ra, &ingress_router(&cells, "a.com")),
@@ -2668,7 +2895,7 @@ mod tests {
                 ingress_exact_resource("other.com", literal_bg("o", "10.0.0.5:80")),
             ],
         );
-        apply_message(&mut cache, &v1, cells.bundle(), true).expect("v1 full");
+        apply_message(&mut cache, &v1, cells.bundle(), true, true).expect("v1 full");
         let r_other = ingress_router(&cells, "other.com");
 
         // Drop ref.com and its endpoint together; post-apply world is other.com only.
@@ -2681,7 +2908,7 @@ mod tests {
             &["route|ingress|80|exact|ref.com", "endpoints|ns/svc/80"],
             &post,
         );
-        apply_message(&mut cache, &d, cells.bundle(), false).expect("GC delta acks");
+        apply_message(&mut cache, &d, cells.bundle(), false, true).expect("GC delta acks");
 
         assert!(
             Arc::ptr_eq(&r_other, &ingress_router(&cells, "other.com")),
@@ -2733,7 +2960,7 @@ mod tests {
                 ),
             ],
         );
-        apply_message(&mut cache, &v1, cells.bundle(), true).expect("v1 full");
+        apply_message(&mut cache, &v1, cells.bundle(), true, true).expect("v1 full");
         let pass_before = cells.passthrough.load();
         let term_before = cells.terminate.load();
 
@@ -2755,7 +2982,7 @@ mod tests {
             ),
         ];
         let d = delta(vec![ep_new], &[], &post);
-        apply_message(&mut cache, &d, cells.bundle(), false).expect("delta acks");
+        apply_message(&mut cache, &d, cells.bundle(), false, true).expect("delta acks");
 
         assert!(
             !Arc::ptr_eq(&pass_before, &cells.passthrough.load()),
@@ -2781,7 +3008,7 @@ mod tests {
         let tcp_before = cells.tcp.load();
         let digests_before = cache.digests.clone();
 
-        let err = apply_message(cache, d, cells.bundle(), false).unwrap_err();
+        let err = apply_message(cache, d, cells.bundle(), false, true).unwrap_err();
         assert!(want(&err), "unexpected error: {err:?}");
 
         assert!(
@@ -2804,7 +3031,7 @@ mod tests {
                 ingress_exact_resource("ref.com", keyed_bg("kref", "ns", "svc", 80)),
             ],
         );
-        apply_message(cache, &v1, cells.bundle(), true).expect("baseline full");
+        apply_message(cache, &v1, cells.bundle(), true, true).expect("baseline full");
     }
 
     /// A delta as the first message of a session (`expect_full = true`) is rejected
@@ -2820,7 +3047,7 @@ mod tests {
         let d = delta(Vec::new(), &[], &[]);
         let ingress_before = cells.ingress.load();
         // expect_full = true simulates the first message of a new session.
-        let err = apply_message(&mut cache, &d, cells.bundle(), true).unwrap_err();
+        let err = apply_message(&mut cache, &d, cells.bundle(), true, true).unwrap_err();
         assert!(
             matches!(err, WireError::DeltaBeforeFullSnapshot),
             "got: {err:?}"

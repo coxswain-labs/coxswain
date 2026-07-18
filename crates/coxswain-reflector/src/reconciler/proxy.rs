@@ -59,7 +59,9 @@ use coxswain_core::crd::{
     CoxswainIngressClassParameters, CoxswainRelayPolicy, IpAccessControl, JwtAuth,
     PathRewriteRegex, RateLimit, RequestSizeLimit, RetryPolicy,
 };
-use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
+use coxswain_core::dedicated_registry::{
+    DedicatedRegistryData, DedicatedRoutingRegistry, DedicatedRoutingSnapshot,
+};
 use coxswain_core::fleet::{self, SharedFleet};
 use coxswain_core::health::LivenessGate;
 use coxswain_core::health::SubsystemHandle;
@@ -3056,7 +3058,9 @@ fn rebuild(
     outputs
         .listener_status
         .update_scoped(dedicated_health, |k| dedicated_keys.contains(k));
-    outputs.dedicated_registry.store(Arc::new(registry_map));
+    outputs
+        .dedicated_registry
+        .store(Arc::new(DedicatedRegistryData::from_map(registry_map)));
 
     // Build the SNI-keyed TLS passthrough table from TLSRoutes bound to
     // TLS/Passthrough listeners on owned Gateways and their attached ListenerSets

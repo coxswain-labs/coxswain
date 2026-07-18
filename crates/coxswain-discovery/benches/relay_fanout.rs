@@ -32,11 +32,17 @@
 //!   in world size and doesn't contaminate the CPU measurement.
 //! - **Driver** (default role): for each (subscriber count, churn rate) cell,
 //!   spawns a fresh server child, opens `N` independent gRPC channels (one
-//!   real subscriber each, `Scope::SharedPool`, raw generated client — no
-//!   apply pipeline needed, delivery is what's measured, apply cost is
-//!   already covered by `benches/delta_apply.rs`), samples the child's
-//!   CPU/mem via `sysinfo`, and on every delivered `Snapshot` decodes the
-//!   probe marker for latency and sums `Message::encoded_len()` for egress.
+//!   real subscriber each, on the `--scope` subscription — `Scope::SharedPool`
+//!   or `Scope::Gateway`, raw generated client — no apply pipeline needed,
+//!   delivery is what's measured, apply cost is already covered by
+//!   `benches/delta_apply.rs`), samples the child's CPU/mem via `sysinfo`, and
+//!   on every delivered `Snapshot` decodes the probe marker for latency and
+//!   sums `Message::encoded_len()` for egress.
+//!
+//! `--scope gateway` fans out `N` subscribers over ONE dedicated Gateway, so the
+//! server materializes that Gateway's world once per generation and shares it
+//! across every subscriber (#621, #1) — the CPU/latency gap versus the
+//! per-subscriber rebuild it replaced is this mode's evidence.
 //!
 //! Run: `cargo bench -p coxswain-discovery --bench relay_fanout -- --help`.
 //! See `DEVELOPMENT.md` "Relay fan-out load test" for the full recipe and the
@@ -59,16 +65,22 @@ use tokio::sync::watch;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
 use tonic::transport::{Endpoint, Server};
 
-use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
+use coxswain_core::dedicated_registry::{
+    DedicatedRegistryData, DedicatedRoutingRegistry, DedicatedRoutingSnapshot,
+};
 use coxswain_core::listener_status::SharedGatewayListenerStatus;
 use coxswain_core::node_registry::SharedNodeRegistry;
+use coxswain_core::ownership::ObjectKey;
 use coxswain_core::publish_index::SharedGatewayPublishIndex;
 use coxswain_core::routing::{
-    BackendGroup, IngressRoutingTable, IngressRoutingTableBuilder, PortTableBuilder, RouteEntry,
-    SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
-    SharedTlsPassthroughTable, SharedUdpRouteTable, WildcardKind,
+    BackendGroup, GatewayRoutingTable, GatewayRoutingTableBuilder, IngressRoutingTable,
+    IngressRoutingTableBuilder, PortTableBuilder, RouteEntry, SharedGatewayRoutingTable,
+    SharedIngressRoutingTable, SharedTcpRouteTable, SharedTlsPassthroughTable, SharedUdpRouteTable,
+    WildcardKind,
 };
-use coxswain_core::tls::{SharedClientCertStore, SharedPortTlsStore};
+use coxswain_core::tls::{
+    ClientCertStore, PortTlsStore, SharedClientCertStore, SharedPortTlsStore,
+};
 use coxswain_discovery::proto::v1::{
     self as p, client_message::Kind as CKind, discovery_client::DiscoveryClient as TonicClient,
     discovery_server::DiscoveryServer, server_message::Kind as SKind,
@@ -79,6 +91,48 @@ use coxswain_discovery::{DiscoveryService, Scope, SnapshotSource, WIRE_VERSION, 
 /// synthetic world is a static, never-changing filler route.
 const PROBE_HOST: &str = "probe.relay-fanout.example.com";
 const LISTEN_PORT: u16 = 80;
+/// The single dedicated Gateway every `--scope gateway` subscriber streams — so
+/// N subscribers share ONE cached materialize per generation (#621, #1). Its
+/// listener port is 443, distinct from the SharedPool ingress `LISTEN_PORT`.
+const GW_NAMESPACE: &str = "prod";
+const GW_NAME: &str = "gw-a";
+const GW_PORT: u16 = 443;
+
+/// Which subscription scope the fan-out cell exercises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BenchScope {
+    /// The shared routing world (`ingress` cell), served to every leaf identically.
+    SharedPool,
+    /// One dedicated Gateway's world — the #621 view-cache path: N leaves on the
+    /// same Gateway share one build per generation instead of one build each.
+    Gateway,
+}
+
+impl BenchScope {
+    fn parse(s: &str) -> Self {
+        match s {
+            "gateway" => Self::Gateway,
+            _ => Self::SharedPool,
+        }
+    }
+
+    fn as_arg(self) -> &'static str {
+        match self {
+            Self::SharedPool => "shared",
+            Self::Gateway => "gateway",
+        }
+    }
+
+    fn wire(self) -> Scope {
+        match self {
+            Self::SharedPool => Scope::SharedPool,
+            Self::Gateway => Scope::Gateway {
+                name: GW_NAME.to_owned(),
+                namespace: GW_NAMESPACE.to_owned(),
+            },
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -96,6 +150,12 @@ struct Cli {
     /// Synthetic ingress world size (route count) the relay serves.
     #[arg(long, default_value_t = 500)]
     world_size: usize,
+
+    /// Subscription scope the cell exercises: `shared` (the shared-pool world) or
+    /// `gateway` (one dedicated Gateway — the #621 view-cache fan-out path). Both
+    /// roles honour it; the driver forwards it to each spawned server child.
+    #[arg(long, default_value = "shared")]
+    scope: String,
 
     /// Server role only: full-snapshot churn rate in changes/sec (0 = idle).
     #[arg(long, default_value_t = 0.0)]
@@ -119,7 +179,12 @@ struct Cli {
 async fn main() {
     let cli = Cli::parse();
     if cli.server {
-        run_server(cli.world_size, cli.churn_rate).await;
+        run_server(
+            cli.world_size,
+            cli.churn_rate,
+            BenchScope::parse(&cli.scope),
+        )
+        .await;
         return;
     }
     run_driver(&cli).await;
@@ -130,14 +195,16 @@ async fn main() {
 async fn run_driver(cli: &Cli) {
     let exe = env::current_exe().unwrap_or_else(|e| panic!("current_exe: {e}"));
     let duration = Duration::from_secs(cli.duration_secs);
+    let scope = BenchScope::parse(&cli.scope);
 
+    println!("scope: {}", scope.as_arg());
     println!(
         "{:>6}  {:>8}  {:>9}  {:>9}  {:>8}  {:>10}  {:>13}  {:>10}",
         "N", "churn/s", "p50(ms)", "p99(ms)", "cpu(%)", "mem(MB)", "egress(KB/s)", "snapshots"
     );
     for &rate in &cli.churn_rates {
         for &n in &cli.subscribers {
-            let cell = run_cell(&exe, cli.world_size, rate, n, duration).await;
+            let cell = run_cell(&exe, cli.world_size, rate, n, duration, scope).await;
             print_cell(n, rate, &cell);
         }
     }
@@ -152,8 +219,9 @@ async fn run_cell(
     churn_rate: f64,
     n_subscribers: usize,
     duration: Duration,
+    scope: BenchScope,
 ) -> CellResult {
-    let mut child = spawn_server(server_bin, world_size, churn_rate).await;
+    let mut child = spawn_server(server_bin, world_size, churn_rate, scope).await;
     let (port, pid) = read_port_pid(&mut child).await;
     let addr: SocketAddr = format!("127.0.0.1:{port}")
         .parse()
@@ -163,7 +231,12 @@ async fn run_cell(
     let mut handles = Vec::with_capacity(n_subscribers);
     for i in 0..n_subscribers {
         let node_id = format!("loadtest-{i}");
-        handles.push(tokio::spawn(run_subscriber(addr, node_id, stop_rx.clone())));
+        handles.push(tokio::spawn(run_subscriber(
+            addr,
+            node_id,
+            scope,
+            stop_rx.clone(),
+        )));
     }
 
     // Let every subscriber finish its initial connect + full-snapshot Ack
@@ -199,13 +272,20 @@ async fn run_cell(
     aggregate(&stats, &cpu_samples, &mem_samples, duration)
 }
 
-async fn spawn_server(bin: &std::path::Path, world_size: usize, churn_rate: f64) -> Child {
+async fn spawn_server(
+    bin: &std::path::Path,
+    world_size: usize,
+    churn_rate: f64,
+    scope: BenchScope,
+) -> Child {
     Command::new(bin)
         .arg("--server")
         .arg("--world-size")
         .arg(world_size.to_string())
         .arg("--churn-rate")
         .arg(churn_rate.to_string())
+        .arg("--scope")
+        .arg(scope.as_arg())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
@@ -252,6 +332,7 @@ struct SubscriberStats {
 async fn run_subscriber(
     addr: SocketAddr,
     node_id: String,
+    scope: BenchScope,
     mut stop_rx: watch::Receiver<bool>,
 ) -> SubscriberStats {
     let mut stats = SubscriberStats::default();
@@ -266,7 +347,7 @@ async fn run_subscriber(
         kind: Some(CKind::Subscribe(p::Subscribe {
             node_id,
             wire_version: WIRE_VERSION,
-            scope: Some(scope_to_wire(&Scope::SharedPool)),
+            scope: Some(scope_to_wire(&scope.wire())),
         })),
     })
     .await
@@ -416,9 +497,10 @@ fn print_cell(n: usize, rate: f64, r: &CellResult) {
 /// piped, fully-buffered stdout), then serves until killed. If
 /// `churn_rate > 0`, rewrites [`PROBE_HOST`]'s route every `1/churn_rate`
 /// seconds.
-async fn run_server(world_size: usize, churn_rate: f64) {
+async fn run_server(world_size: usize, churn_rate: f64, scope: BenchScope) {
     let source = empty_source();
     let ingress = source.ingress.clone();
+    let dedicated = source.dedicated.clone();
     let publish = source.publish.clone();
     let (rebuild_tx, rebuild_rx) = watch::channel(0u64);
     let registry = SharedNodeRegistry::new();
@@ -426,10 +508,24 @@ async fn run_server(world_size: usize, churn_rate: f64) {
     // No probe host at startup: idle-mode subscribers must never see a probe
     // marker (there's no churn event to time), and a churning world adds the
     // probe host as a fresh resource on its first real tick instead of an
-    // update to a meaningless sentinel.
-    let initial = rebuild(&IngressRoutingTable::default(), world_size, None);
-    let mut prev = Arc::new(initial);
-    ingress.store(Arc::clone(&prev));
+    // update to a meaningless sentinel. The world lives in the ingress cell
+    // (SharedPool) or the dedicated Gateway's snapshot (Gateway).
+    let mut world = match scope {
+        BenchScope::SharedPool => {
+            let prev = Arc::new(rebuild(&IngressRoutingTable::default(), world_size, None));
+            ingress.store(Arc::clone(&prev));
+            World::Shared(prev)
+        }
+        BenchScope::Gateway => {
+            let prev = Arc::new(gateway_rebuild(
+                &GatewayRoutingTable::default(),
+                world_size,
+                None,
+            ));
+            store_gateway_world(&dedicated, Arc::clone(&prev));
+            World::Gateway(prev)
+        }
+    };
 
     let svc = DiscoveryService::new(source, registry, rebuild_rx);
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -465,10 +561,18 @@ async fn run_server(world_size: usize, churn_rate: f64) {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let table = rebuild(&prev, world_size, Some(now_nanos));
-        let next = Arc::new(table);
-        ingress.store(Arc::clone(&next));
-        prev = next;
+        match &mut world {
+            World::Shared(prev) => {
+                let next = Arc::new(rebuild(prev, world_size, Some(now_nanos)));
+                ingress.store(Arc::clone(&next));
+                *prev = next;
+            }
+            World::Gateway(prev) => {
+                let next = Arc::new(gateway_rebuild(prev, world_size, Some(now_nanos)));
+                store_gateway_world(&dedicated, Arc::clone(&next));
+                *prev = next;
+            }
+        }
 
         publish.stamp_rebuild(std::iter::empty());
         let next_gen = rebuild_tx.borrow().wrapping_add(1);
@@ -476,6 +580,34 @@ async fn run_server(world_size: usize, churn_rate: f64) {
             .send(next_gen)
             .unwrap_or_else(|e| panic!("rebuild watch send: {e}"));
     }
+}
+
+/// The churn-carried previous world, per scope, so a rebuild splices unchanged
+/// hosts from it (O(1)-in-world-size churn, #511 reuse path) rather than
+/// recompiling every host each tick.
+enum World {
+    Shared(Arc<IngressRoutingTable>),
+    Gateway(Arc<GatewayRoutingTable>),
+}
+
+/// Publish one dedicated Gateway's routing table into the registry the discovery
+/// server reads for `Scope::Gateway`. Plaintext subscribers present no SVID, so
+/// `expected_proxy_sa` is never matched against one — its value only needs to be
+/// non-empty to model a real cut-over Gateway.
+fn store_gateway_world(dedicated: &DedicatedRoutingRegistry, gateway: Arc<GatewayRoutingTable>) {
+    let snap = Arc::new(DedicatedRoutingSnapshot {
+        gateway,
+        tls: Arc::new(PortTlsStore::default()),
+        client_certs: Arc::new(ClientCertStore::default()),
+        listener_status: std::collections::HashMap::new(),
+        expected_proxy_sa: format!("{GW_NAME}-coxswain"),
+    });
+    let mut map = std::collections::HashMap::new();
+    map.insert(
+        ObjectKey::new(GW_NAMESPACE.to_owned(), GW_NAME.to_owned()),
+        snap,
+    );
+    dedicated.store(Arc::new(DedicatedRegistryData::from_map(map)));
 }
 
 /// A `SnapshotSource` over freshly empty cells — every non-ingress cell stays
@@ -522,6 +654,33 @@ fn rebuild(
         add_probe_host(port_builder, now_nanos);
     }
     builder.build().unwrap_or_else(|e| panic!("rebuild: {e}"))
+}
+
+/// The `Scope::Gateway` twin of [`rebuild`]: the same `world_size`-host world,
+/// but compiled into a [`GatewayRoutingTable`] on [`GW_PORT`] and splice-reused
+/// from `prev` the same way (#511), so a `--scope gateway` churn tick costs the
+/// same O(1)-in-world-size the SharedPool path does — the fan-out CPU difference
+/// then isolates the per-subscriber materialize the #621 view cache removes.
+fn gateway_rebuild(
+    prev: &GatewayRoutingTable,
+    world_size: usize,
+    marker: Option<u128>,
+) -> GatewayRoutingTable {
+    let mut builder = GatewayRoutingTableBuilder::new();
+    let port_builder = builder.for_port(GW_PORT);
+    for i in 0..world_size {
+        let host = format!("h{i}.relay-fanout.example.com");
+        match prev.get_compiled(GW_PORT, Some(&host), WildcardKind::MultiLabel) {
+            Some(router) => port_builder.insert_compiled_exact_host(host, router),
+            None => add_static_host(port_builder, &host, i),
+        }
+    }
+    if let Some(now_nanos) = marker {
+        add_probe_host(port_builder, now_nanos);
+    }
+    builder
+        .build()
+        .unwrap_or_else(|e| panic!("gateway rebuild: {e}"))
 }
 
 fn add_static_host(port_builder: &mut PortTableBuilder, host: &str, idx: usize) {

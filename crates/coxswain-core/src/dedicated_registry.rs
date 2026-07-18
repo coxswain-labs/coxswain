@@ -74,8 +74,37 @@ pub struct DedicatedRoutingSnapshot {
     pub expected_proxy_sa: String,
 }
 
+/// The stored value behind a [`DedicatedRoutingRegistry`]: the per-Gateway
+/// snapshot map plus a namespace → keys index.
+///
+/// The `by_ns` index is built once per `store()` (at the two writers) so the
+/// namespace-view fan-out (#582, the relay tier's upstream) reads
+/// `by_ns[namespace]` instead of scanning every Gateway in the cluster on every
+/// per-namespace materialization (#621). Single-key readers index into `map`.
+#[non_exhaustive]
+#[derive(Default)]
+pub struct DedicatedRegistryData {
+    /// Cut-over Gateway [`ObjectKey`] → its [`DedicatedRoutingSnapshot`].
+    pub map: HashMap<ObjectKey, Arc<DedicatedRoutingSnapshot>>,
+    /// Namespace → the keys of every Gateway in it — the namespace-view fan-out
+    /// index, derived from `map` at construction.
+    pub by_ns: HashMap<String, Vec<ObjectKey>>,
+}
+
+impl DedicatedRegistryData {
+    /// Build the registry data from a per-Gateway map, deriving the `by_ns` index.
+    #[must_use]
+    pub fn from_map(map: HashMap<ObjectKey, Arc<DedicatedRoutingSnapshot>>) -> Self {
+        let mut by_ns: HashMap<String, Vec<ObjectKey>> = HashMap::new();
+        for key in map.keys() {
+            by_ns.entry(key.ns.clone()).or_default().push(key.clone());
+        }
+        Self { map, by_ns }
+    }
+}
+
 /// Lock-free registry mapping each cut-over Gateway [`ObjectKey`] to its
-/// [`DedicatedRoutingSnapshot`].
+/// [`DedicatedRoutingSnapshot`], plus a namespace → keys index ([`DedicatedRegistryData`]).
 ///
 /// Constructed once in `coxswain-bin`'s `run_controller` and cloned into both
 /// the shared reconciler (writer) and the `coxswain_discovery::SnapshotSource`
@@ -86,7 +115,7 @@ pub struct DedicatedRoutingSnapshot {
 /// delivery) yields an empty snapshot — the dedicated proxy receives no routes
 /// until its Gateway appears in the registry, which is the fail-closed
 /// behaviour intended by #426.
-pub type DedicatedRoutingRegistry = Shared<HashMap<ObjectKey, Arc<DedicatedRoutingSnapshot>>>;
+pub type DedicatedRoutingRegistry = Shared<DedicatedRegistryData>;
 
 #[cfg(test)]
 mod tests {
@@ -110,7 +139,7 @@ mod tests {
     fn registry_starts_empty() {
         let reg: DedicatedRoutingRegistry = Shared::new();
         assert!(
-            reg.load().is_empty(),
+            reg.load().map.is_empty(),
             "fresh registry must contain no entries"
         );
     }
@@ -123,10 +152,15 @@ mod tests {
 
         let mut map = HashMap::new();
         map.insert(k.clone(), snap);
-        reg.store(Arc::new(map));
+        reg.store(Arc::new(DedicatedRegistryData::from_map(map)));
 
         let loaded = reg.load();
-        assert!(loaded.contains_key(&k), "stored key must be present");
+        assert!(loaded.map.contains_key(&k), "stored key must be present");
+        assert_eq!(
+            loaded.by_ns.get("prod").map(Vec::as_slice),
+            Some(&[k][..]),
+            "the namespace index lists the stored key"
+        );
     }
 
     #[test]
@@ -139,23 +173,33 @@ mod tests {
         let mut map1 = HashMap::new();
         map1.insert(k_a.clone(), make_snapshot());
         map1.insert(k_b.clone(), make_snapshot());
-        reg.store(Arc::new(map1));
+        reg.store(Arc::new(DedicatedRegistryData::from_map(map1)));
         assert_eq!(
-            reg.load().len(),
+            reg.load().map.len(),
             2,
             "both entries present after first store"
+        );
+        assert_eq!(
+            reg.load().by_ns.get("prod").map(Vec::len),
+            Some(2),
+            "the namespace index lists both keys"
         );
 
         // Second store: only gw-a (gw-b migrated back to shared pool).
         let mut map2 = HashMap::new();
         map2.insert(k_a.clone(), make_snapshot());
-        reg.store(Arc::new(map2));
+        reg.store(Arc::new(DedicatedRegistryData::from_map(map2)));
 
         let loaded = reg.load();
-        assert!(loaded.contains_key(&k_a), "gw-a still present");
+        assert!(loaded.map.contains_key(&k_a), "gw-a still present");
         assert!(
-            !loaded.contains_key(&k_b),
+            !loaded.map.contains_key(&k_b),
             "gw-b removed by whole-map replace"
+        );
+        assert_eq!(
+            loaded.by_ns.get("prod").map(Vec::as_slice),
+            Some(&[k_a][..]),
+            "the namespace index dropped the stale key"
         );
     }
 
@@ -164,7 +208,7 @@ mod tests {
         let reg: DedicatedRoutingRegistry = Shared::new();
         let loaded = reg.load();
         assert!(
-            loaded.get(&key("ns", "missing")).is_none(),
+            !loaded.map.contains_key(&key("ns", "missing")),
             "absent key must return None"
         );
     }

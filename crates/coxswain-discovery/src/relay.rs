@@ -24,7 +24,9 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
+use coxswain_core::dedicated_registry::{
+    DedicatedRegistryData, DedicatedRoutingRegistry, DedicatedRoutingSnapshot,
+};
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::publish_index::SharedGatewayPublishIndex;
@@ -184,7 +186,16 @@ pub(crate) struct NamespaceDemux {
     /// The de-duplicated wire world last applied, keyed by canonical key. A full
     /// replaces it; a delta upserts/tombstones onto a clone (committed only
     /// after the rebuild below succeeds — atomic like the proxy apply path).
-    resources: HashMap<String, Arc<p::Resource>>,
+    ///
+    /// Keys are `Arc<str>` shared with [`Self::resource_hashes`], so a delta's
+    /// clone-then-mutate of both maps bumps refcounts instead of deep-copying
+    /// every canonical key (#621).
+    resources: HashMap<Arc<str>, Arc<p::Resource>>,
+    /// Per-key content digests of the committed world (`canonical_key →
+    /// resource_hash`), retained so a delta re-hashes only its own upserts rather
+    /// than the whole staged world on every message (#621). The version self-check
+    /// folds this map order-independently.
+    resource_hashes: HashMap<Arc<str>, Arc<str>>,
     /// Whether a full has been applied on this session-spanning cache.
     has_full: bool,
     /// Downstream-serving registry (shared with the relay's `SnapshotSource`).
@@ -200,40 +211,56 @@ impl NamespaceDemux {
     pub(crate) fn new() -> Self {
         Self {
             resources: HashMap::new(),
+            resource_hashes: HashMap::new(),
             has_full: false,
             dedicated: DedicatedRoutingRegistry::new(),
             publish: SharedGatewayPublishIndex::new(),
         }
     }
 
-    /// Fold `msg` into a fresh de-duplicated resource map (full = replace-all;
-    /// delta = upsert/tombstone onto a clone of the committed world). Mirrors the
-    /// proxy apply path's invariants: a delta before a full is rejected, a key in
-    /// both a delta's upsert and tombstone sets is rejected, an unheld tombstone
-    /// is an idempotent no-op.
-    fn stage(&self, msg: &p::Snapshot) -> Result<HashMap<String, Arc<p::Resource>>, WireError> {
+    /// Fold `msg` into a fresh de-duplicated resource map **and** its per-key
+    /// digest map (full = replace-all; delta = upsert/tombstone onto a clone of
+    /// the committed world). Mirrors the proxy apply path's invariants: a delta
+    /// before a full is rejected, a key in both a delta's upsert and tombstone
+    /// sets is rejected, an unheld tombstone is an idempotent no-op.
+    ///
+    /// A delta re-hashes only its own upserts; every unchanged key's digest is
+    /// carried over from [`Self::resource_hashes`] by refcount bump, so a
+    /// one-resource delta never re-hashes the whole namespace world (#621).
+    fn stage(&self, msg: &p::Snapshot) -> Result<StagedWorld, WireError> {
         if msg.full {
-            let mut staged = HashMap::with_capacity(msg.resources.len());
+            let mut resources = HashMap::with_capacity(msg.resources.len());
+            let mut hashes = HashMap::with_capacity(msg.resources.len());
             for resource in &msg.resources {
-                let key = canonical_key(resource).map_err(wire_from_key_err)?;
-                if staged.insert(key, Arc::new(resource.clone())).is_some() {
+                let key: Arc<str> = Arc::from(canonical_key(resource).map_err(wire_from_key_err)?);
+                let hash: Arc<str> = Arc::from(resource_hash(resource));
+                if resources
+                    .insert(Arc::clone(&key), Arc::new(resource.clone()))
+                    .is_some()
+                {
                     return Err(WireError::UnknownResourceKey {
                         reason: "namespace full contains a duplicate canonical resource key",
                     });
                 }
+                hashes.insert(key, hash);
             }
-            Ok(staged)
+            Ok(StagedWorld { resources, hashes })
         } else {
-            let mut staged = self.resources.clone();
+            // Refcount-only clones (both maps key on the same shared `Arc<str>`).
+            let mut resources = self.resources.clone();
+            let mut hashes = self.resource_hashes.clone();
             let mut seen = HashSet::new();
             for resource in &msg.resources {
-                let key = canonical_key(resource).map_err(wire_from_key_err)?;
-                if !seen.insert(key.clone()) {
+                let key: Arc<str> = Arc::from(canonical_key(resource).map_err(wire_from_key_err)?);
+                if !seen.insert(Arc::clone(&key)) {
                     return Err(WireError::UnknownResourceKey {
                         reason: "namespace delta contains a duplicate canonical resource key",
                     });
                 }
-                staged.insert(key, Arc::new(resource.clone()));
+                // Hash ONLY this upsert; retained keys keep their carried digest.
+                let hash: Arc<str> = Arc::from(resource_hash(resource));
+                resources.insert(Arc::clone(&key), Arc::new(resource.clone()));
+                hashes.insert(key, hash);
             }
             for removed in &msg.removed_resources {
                 if seen.contains(removed.as_str()) {
@@ -241,11 +268,19 @@ impl NamespaceDemux {
                         reason: "namespace delta key appears in both upsert and tombstone sets",
                     });
                 }
-                staged.remove(removed);
+                resources.remove(removed.as_str());
+                hashes.remove(removed.as_str());
             }
-            Ok(staged)
+            Ok(StagedWorld { resources, hashes })
         }
     }
+}
+
+/// The staged successor of a [`NamespaceDemux`] world: the de-duplicated resource
+/// map plus its per-key digest map, committed together on a successful apply.
+struct StagedWorld {
+    resources: HashMap<Arc<str>, Arc<p::Resource>>,
+    hashes: HashMap<Arc<str>, Arc<str>>,
 }
 
 impl SnapshotApplier for NamespaceDemux {
@@ -262,10 +297,11 @@ impl SnapshotApplier for NamespaceDemux {
         // independent over the per-resource digests of the *qualified* resources,
         // exactly as the controller computed it. A mismatch means the two sides
         // disagree — Nack for a self-healing resync before touching anything.
-        let computed =
-            ContentHash::from_per_resource(staged.values().map(|r| resource_hash(r)).collect())
-                .as_str()
-                .to_owned();
+        // Folded from the retained + delta digests, never re-hashing unchanged
+        // resources (#621).
+        let computed = ContentHash::from_per_resource(staged.hashes.values().map(|h| &**h))
+            .as_str()
+            .to_owned();
         if computed != msg.version {
             return Err(WireError::VersionMismatch {
                 expected: msg.version.clone(),
@@ -275,7 +311,7 @@ impl SnapshotApplier for NamespaceDemux {
 
         // Rebuild the registry (fallible) before committing any shared state, so
         // a malformed world leaves the last-good registry serving untouched.
-        let rebuilt = rebuild_registry(&staged)?;
+        let rebuilt = rebuild_registry(&staged.resources)?;
 
         // Commit (infallible from here). Store the registry FIRST so a downstream
         // rebuild triggered by the supervisor's post-apply signal reads the new
@@ -286,9 +322,11 @@ impl SnapshotApplier for NamespaceDemux {
         // could Ack a fresh seq over a stale world. The counter tracks the max
         // per-Gateway `GatewayMeta.publish_seq`, so a leaf for Gateway G Acks
         // `current_seq() >= stamp_G.seq`, exactly what `gateway_node_acked` checks.
-        self.dedicated.store(Arc::new(rebuilt.registry));
+        self.dedicated
+            .store(Arc::new(DedicatedRegistryData::from_map(rebuilt.registry)));
         self.publish.advance_to(rebuilt.max_publish_seq);
-        self.resources = staged;
+        self.resources = staged.resources;
+        self.resource_hashes = staged.hashes;
         self.has_full = true;
         Ok(ApplyStats::default())
     }
@@ -309,7 +347,7 @@ struct RebuiltRegistry {
 /// seen; a Gateway carries its bound proxy SA in its [`p::GatewayMeta`], defaulted
 /// to empty (fail-closed — an empty SA matches no SVID) if absent.
 fn rebuild_registry(
-    resources: &HashMap<String, Arc<p::Resource>>,
+    resources: &HashMap<Arc<str>, Arc<p::Resource>>,
 ) -> Result<RebuiltRegistry, WireError> {
     // Per-Gateway de-qualified routing resources; per-Gateway meta; shared eps.
     let mut per_gateway: HashMap<ObjectKey, Vec<p::Resource>> = HashMap::new();
@@ -409,13 +447,12 @@ fn dedicated_snapshot_from_resources(
     all.extend(gateway_resources.iter().cloned());
     all.extend(endpoint_resources.iter().cloned());
 
-    // The synthetic full must carry the version `apply_message` will recompute
-    // from the same per-resource digests, or its self-check would reject it.
-    let version = ContentHash::from_per_resource(all.iter().map(resource_hash).collect())
-        .as_str()
-        .to_owned();
+    // No version stamp: this synthetic full is applied via `apply_trusted`, which
+    // skips the F6 self-check (#621). The relay just built this set locally, so
+    // re-hashing it to satisfy a check against itself is pure waste — dropping the
+    // stamp eliminates that hash and the check's recompute together.
     let synthetic = p::Snapshot {
-        version,
+        version: String::new(),
         nonce: Vec::new(),
         full: true,
         resources: all,
@@ -429,7 +466,7 @@ fn dedicated_snapshot_from_resources(
     let (mut applier, cells) = RoutingApplier::new();
     // Fresh applier ⇒ `expect_full = true`; a first full publishes its cells even
     // when empty, so a routes-less Gateway yields an empty gateway table.
-    applier.apply(&synthetic, true)?;
+    applier.apply_trusted(&synthetic, true)?;
 
     Ok(DedicatedRoutingSnapshot {
         gateway: cells.gateway.load(),
@@ -497,7 +534,7 @@ mod tests {
                 Arc::new(dedicated_snapshot(name, host)),
             );
         }
-        dedicated.store(Arc::new(map));
+        dedicated.store(Arc::new(DedicatedRegistryData::from_map(map)));
         SnapshotSource {
             ingress: SharedIngressRoutingTable::new(),
             gateway: SharedGatewayRoutingTable::new(),
@@ -577,13 +614,12 @@ mod tests {
             &Scope::Namespace {
                 namespace: "prod".to_owned(),
             },
-            None,
         );
         let relay = relay_source_after(&[full_snapshot(&ns_view)]);
 
         for name in ["gw-a", "gw-b"] {
-            let direct = materialize(&origin, &gw_scope(name), None);
-            let via_relay = materialize(&relay, &gw_scope(name), None);
+            let direct = materialize(&origin, &gw_scope(name));
+            let via_relay = materialize(&relay, &gw_scope(name));
             assert_eq!(
                 direct.version, via_relay.version,
                 "{name}: relay-served version must equal the controller's"
@@ -595,40 +631,47 @@ mod tests {
         }
     }
 
-    /// The relay reconstructs each Gateway's bound proxy SA from `GatewayMeta`,
-    /// so its downstream `Scope::Gateway` materialize enforces the same SVID
-    /// binding the controller does: a non-matching identity gets an empty,
-    /// seq-0 world (AC #4, at the materialize layer).
+    /// The relay reconstructs each Gateway's bound proxy SA from `GatewayMeta`, so
+    /// its downstream `Scope::Gateway` serving enforces the same SVID binding the
+    /// controller does. Enforcement is the server's post-cache
+    /// [`crate::server::gateway_svid_denied`] gate (#427, moved out of the cached
+    /// build); this asserts the relay feeds it the correct `expected_proxy_sa` —
+    /// a matching identity is allowed, a non-matching one denied — over the relay's
+    /// reconstructed registry (AC #4).
     #[test]
-    fn relay_enforces_gateway_svid_binding_from_reconstructed_sa() {
+    fn relay_reconstructs_sa_so_gateway_svid_gate_binds() {
         let origin = source_with_dedicated(&[("prod", "gw-a", "a.example.com")]);
         let ns_view = materialize(
             &origin,
             &Scope::Namespace {
                 namespace: "prod".to_owned(),
             },
-            None,
         );
         let relay = relay_source_after(&[full_snapshot(&ns_view)]);
 
-        // Matching SVID (`gw-a-coxswain` in ns `prod`) → the real world.
+        // The reconstructed Gateway world is non-empty, so a denial below is a real
+        // withholding, not a vacuously-empty world.
+        assert!(
+            !materialize(&relay, &gw_scope("gw-a")).resources.is_empty(),
+            "relay reconstructs a non-empty gw-a world"
+        );
+
+        // Matching SVID (`gw-a-coxswain` in ns `prod`) → allowed.
         let matching = PeerSvid {
             uri_sans: vec!["spiffe://cluster.local/ns/prod/sa/gw-a-coxswain".to_owned()],
         };
-        let served = materialize(&relay, &gw_scope("gw-a"), Some(&matching));
         assert!(
-            !served.resources.is_empty(),
-            "matching SVID must be served the Gateway world"
+            !crate::server::gateway_svid_denied(&relay, "prod", "gw-a", Some(&matching)),
+            "matching SVID must be allowed the reconstructed Gateway world"
         );
 
-        // Wrong SA → fail closed to an empty, seq-0 world.
+        // Wrong SA → denied (served an empty seq-0 world by `view_for`).
         let wrong = PeerSvid {
             uri_sans: vec!["spiffe://cluster.local/ns/prod/sa/someone-else".to_owned()],
         };
-        let denied = materialize(&relay, &gw_scope("gw-a"), Some(&wrong));
         assert!(
-            denied.resources.is_empty() && denied.seq == 0,
-            "non-matching SVID must get an empty seq-0 world"
+            crate::server::gateway_svid_denied(&relay, "prod", "gw-a", Some(&wrong)),
+            "non-matching SVID must be denied"
         );
     }
 
@@ -659,7 +702,6 @@ mod tests {
             &Scope::Namespace {
                 namespace: "prod".to_owned(),
             },
-            None,
         );
         let relay = relay_source_after(&[full_snapshot(&ns_view)]);
 
@@ -671,7 +713,7 @@ mod tests {
         // A leaf for gw-a (controller stamp 1) captures the downstream seq 2 on
         // its build → Acks 2 >= 1, satisfying the dedicated ack gate.
         assert_eq!(
-            materialize(&relay, &gw_scope("gw-a"), None).seq,
+            materialize(&relay, &gw_scope("gw-a")).seq,
             2,
             "a gw-a leaf Acks a seq >= gw-a's controller stamp"
         );
@@ -690,7 +732,6 @@ mod tests {
             &Scope::Namespace {
                 namespace: "prod".to_owned(),
             },
-            None,
         ));
 
         // Target world: gw-a removed, gw-c added; gw-b unchanged.
@@ -703,7 +744,6 @@ mod tests {
             &Scope::Namespace {
                 namespace: "prod".to_owned(),
             },
-            None,
         );
 
         // Build the delta from full → target by canonical-key diff.
@@ -712,14 +752,11 @@ mod tests {
             &Scope::Namespace {
                 namespace: "prod".to_owned(),
             },
-            None,
         );
         let upserts: Vec<p::Resource> = target_view
             .resources
             .iter()
-            .filter(|(k, e)| {
-                full_view.resource_hashes.get(*k).map(String::as_str) != Some(e.hash.as_str())
-            })
+            .filter(|(k, e)| full_view.resource_hashes.get(*k) != Some(&e.hash))
             .map(|(_, e)| (*e.resource).clone())
             .collect();
         let removed: Vec<String> = full_view
@@ -740,21 +777,90 @@ mod tests {
         let relay = relay_source_after(&[full, delta]);
         let registry = relay.dedicated.load();
         assert!(
-            registry
-                .get(&ObjectKey::new("prod".to_owned(), "gw-a".to_owned()))
-                .is_none(),
+            !registry
+                .map
+                .contains_key(&ObjectKey::new("prod".to_owned(), "gw-a".to_owned())),
             "gw-a must be gone after the delta"
         );
         assert!(
             registry
-                .get(&ObjectKey::new("prod".to_owned(), "gw-c".to_owned()))
-                .is_some(),
+                .map
+                .contains_key(&ObjectKey::new("prod".to_owned(), "gw-c".to_owned())),
             "gw-c must be present after the delta"
         );
         // gw-b's relay world still matches the controller's direct world.
-        let direct_b = materialize(&origin_bc, &gw_scope("gw-b"), None);
-        let via_relay_b = materialize(&relay, &gw_scope("gw-b"), None);
+        let direct_b = materialize(&origin_bc, &gw_scope("gw-b"));
+        let via_relay_b = materialize(&relay, &gw_scope("gw-b"));
         assert_eq!(direct_b.version, via_relay_b.version, "gw-b unchanged");
+    }
+
+    /// #621: a namespace delta carries over every unchanged key's digest by
+    /// refcount (pointer-identical `Arc<str>`), re-hashing only its own upserts —
+    /// a one-Gateway addition never re-hashes the rest of the namespace world.
+    #[test]
+    fn namespace_delta_retains_unchanged_digests_by_refcount() {
+        let ns_scope = Scope::Namespace {
+            namespace: "prod".to_owned(),
+        };
+        let origin_ab = source_with_dedicated(&[
+            ("prod", "gw-a", "a.example.com"),
+            ("prod", "gw-b", "b.example.com"),
+        ]);
+
+        let mut demux = NamespaceDemux::new();
+        demux
+            .apply(&full_snapshot(&materialize(&origin_ab, &ns_scope)), true)
+            .expect("full");
+
+        // Pre-delta digest allocations, keyed by canonical key.
+        let before: StdHashMap<Arc<str>, *const u8> = demux
+            .resource_hashes
+            .iter()
+            .map(|(k, v)| (Arc::clone(k), Arc::as_ptr(v) as *const u8))
+            .collect();
+        assert!(!before.is_empty(), "the full must have populated digests");
+
+        // Delta: add gw-c only — gw-a and gw-b are untouched (no upserts, no
+        // tombstones for their keys).
+        let full_view = materialize(&origin_ab, &ns_scope);
+        let origin_abc = source_with_dedicated(&[
+            ("prod", "gw-a", "a.example.com"),
+            ("prod", "gw-b", "b.example.com"),
+            ("prod", "gw-c", "c.example.com"),
+        ]);
+        let target = materialize(&origin_abc, &ns_scope);
+        let upserts: Vec<p::Resource> = target
+            .resources
+            .iter()
+            .filter(|(k, e)| full_view.resource_hashes.get(*k) != Some(&e.hash))
+            .map(|(_, e)| (*e.resource).clone())
+            .collect();
+        assert!(
+            !upserts.is_empty(),
+            "adding gw-c must produce at least one upsert"
+        );
+        let delta = p::Snapshot {
+            version: target.version.clone(),
+            nonce: Vec::new(),
+            full: false,
+            resources: upserts,
+            removed_resources: Vec::new(),
+            publish_seq: target.seq,
+        };
+        demux.apply(&delta, false).expect("delta");
+
+        // Every pre-delta key still present keeps its exact digest allocation.
+        for (key, ptr) in &before {
+            let now = demux
+                .resource_hashes
+                .get(key)
+                .expect("an unchanged key must survive the delta");
+            assert_eq!(
+                Arc::as_ptr(now) as *const u8,
+                *ptr,
+                "unchanged key {key} must carry its digest by refcount, not re-hash it"
+            );
+        }
     }
 
     /// A delta arriving as the first message of a session is rejected (invariant
@@ -788,13 +894,15 @@ mod tests {
             &Scope::Namespace {
                 namespace: "prod".to_owned(),
             },
-            None,
         ));
         full.version = "deadbeef".to_owned();
         let mut demux = NamespaceDemux::new();
         let err = demux.apply(&full, true).expect_err("bad version must fail");
         assert!(matches!(err, WireError::VersionMismatch { .. }));
         // Nothing was committed.
-        assert!(demux.dedicated.load().is_empty(), "registry stays empty");
+        assert!(
+            demux.dedicated.load().map.is_empty(),
+            "registry stays empty"
+        );
     }
 }

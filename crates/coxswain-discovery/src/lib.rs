@@ -159,7 +159,7 @@ pub mod bench_internals {
                 tcp: &self.tcp,
                 udp: &self.udp,
             };
-            let stats = apply_message(&mut self.cache, msg, cells, expect_full)?;
+            let stats = apply_message(&mut self.cache, msg, cells, expect_full, true)?;
             Ok((stats.partitions_recompiled, stats.partitions_reused))
         }
     }
@@ -178,12 +178,54 @@ pub mod bench_internals {
     /// this whole-resource convenience.
     #[must_use]
     pub fn snapshot_version(resources: &[p::Resource]) -> String {
-        let hashes = resources
+        let hashes: Vec<String> = resources
             .iter()
             .map(crate::wire::resource::resource_hash)
             .collect();
-        crate::version::ContentHash::from_per_resource(hashes)
+        crate::version::ContentHash::from_per_resource(hashes.iter().map(String::as_str))
             .as_str()
             .to_owned()
+    }
+
+    /// Bench-only relay demux surface (#621) — drives the real `NamespaceDemux`
+    /// apply path (per-key digest retention + the trusted per-Gateway
+    /// reconstruction that skips the redundant self-check) so
+    /// `benches/relay_apply.rs` can time it without reaching the `pub(crate)`
+    /// type. Same `#[doc(hidden)]`, non-API status as [`Harness`].
+    #[non_exhaustive]
+    pub struct RelayHarness {
+        demux: crate::relay::NamespaceDemux,
+        expect_full: bool,
+    }
+
+    impl Default for RelayHarness {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl RelayHarness {
+        /// A fresh demux with no namespace world applied yet.
+        #[must_use]
+        pub fn new() -> Self {
+            Self {
+                demux: crate::relay::NamespaceDemux::new(),
+                expect_full: true,
+            }
+        }
+
+        /// Apply one `Scope::Namespace` wire message. The first call must be a
+        /// full; each later call is a delta folded onto the retained world.
+        ///
+        /// # Errors
+        ///
+        /// Propagates any [`WireError`] from the demux apply path (version
+        /// mismatch, unkeyable resource, compile failure, …).
+        pub fn apply(&mut self, msg: &p::Snapshot) -> Result<(), WireError> {
+            use crate::apply::SnapshotApplier as _;
+            let out = self.demux.apply(msg, self.expect_full).map(|_| ());
+            self.expect_full = false;
+            out
+        }
     }
 }

@@ -161,7 +161,7 @@ impl OperatorAggregator {
             Component::DedicatedProxy => {
                 let dedicated = entry.gateway_ref.as_deref().and_then(|name| {
                     let key = ObjectKey::new(entry.pod_namespace.clone(), name.to_owned());
-                    self.dedicated_registry.load().get(&key).cloned()
+                    self.dedicated_registry.load().map.get(&key).cloned()
                 });
                 match dedicated {
                     Some(snap) => (

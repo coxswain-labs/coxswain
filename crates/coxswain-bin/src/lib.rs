@@ -663,39 +663,27 @@ fn run_relay(args: RelayRoleArgs) -> Result<()> {
         .with_directive_forwarding(directive_tx);
 
     // Debounced roster reporter: watch the downstream registry and republish it
-    // to the upstream client whenever it changes (#585). A periodic backstop
-    // tick catches ack-only changes — `record_ack` deliberately does NOT fire
-    // the registry's change watch (per #531, to avoid re-driving gate consumers
-    // on every push), yet acks carry the `acked_seq` the controller's gate needs.
-    // The content dedup suppresses redundant sends so an idle relay stays quiet.
+    // to the upstream client whenever it changes (#585, #621). The roster-change
+    // watch fires on EVERY mutation — including the ack/target stamps the #531
+    // `notify` channel deliberately skips — so it is the authoritative change
+    // oracle; no periodic backstop tick or content dedup is needed. On an idle
+    // relay the counter is stable, `changed()` parks, and the reporter performs
+    // no `load()` and no clone.
     {
         let registry = node_registry.clone();
         server.add_service(background_service(
             "relay-roster-reporter",
             FutureService::new(async move {
-                let mut change = registry.subscribe();
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                let mut last_sent: Option<coxswain_core::node_registry::NodeRegistry> = None;
+                let mut change = registry.subscribe_roster();
                 loop {
-                    tokio::select! {
-                        res = change.changed() => {
-                            if res.is_err() {
-                                break; // registry dropped (process shutdown)
-                            }
-                        }
-                        _ = tick.tick() => {}
+                    if change.changed().await.is_err() {
+                        break; // registry dropped (process shutdown)
                     }
                     // Coalesce a burst of changes into one send.
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    let snapshot = registry.load();
-                    if last_sent.as_ref() == Some(&snapshot) {
-                        continue;
-                    }
-                    if roster_tx.send(snapshot.clone()).is_err() {
+                    if roster_tx.send(registry.load()).is_err() {
                         break; // upstream client gone
                     }
-                    last_sent = Some(snapshot);
                 }
             }),
         ));

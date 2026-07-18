@@ -1208,7 +1208,7 @@ async fn reconcile_inner(
                         None => true,
                     };
                     snapshot_acked
-                        && registry.load().gateway_node_bound(
+                        && registry.gateway_node_bound(
                             gw_namespace,
                             gw_name,
                             &awaited_dedicated_ports,
@@ -1221,7 +1221,7 @@ async fn reconcile_inner(
     // (folded-behind-relay or direct) serving this Gateway. Non-latched, unlike
     // `Programmed` — operators alert on `== 0` for a total-loss blind spot.
     if let Some(registry) = &ctx.node_registry {
-        let count = registry.load().gateway_node_count(gw_namespace, gw_name);
+        let count = registry.gateway_node_count(gw_namespace, gw_name);
         crate::metrics::dataplane_proxies()
             .with_label_values(&[gw_namespace, gw_name])
             .set(i64::try_from(count).unwrap_or(i64::MAX));
