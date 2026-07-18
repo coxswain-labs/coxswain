@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use coxswain_controller::{
-    IngressDefaultBackend, RELAY_DISCOVERY_PORT, RelayConfig, SharedProxyConfig,
+    IngressDefaultBackend, ProxyPoolConfig, RELAY_DISCOVERY_PORT, RelayConfig,
 };
 use ipnet::IpNet;
 
@@ -1044,15 +1044,15 @@ pub(crate) struct ControllerArgs {
 }
 
 impl ControllerArgs {
-    /// Build the render-ready [`SharedProxyConfig`] the operator carries (#604)
+    /// Build the render-ready [`ProxyPoolConfig`] the operator carries (#604)
     /// from the `--shared-proxy-*` flags. Durations/CIDRs/enums are pre-formatted
     /// to strings here so `coxswain-controller` stays free of `humantime`/`ipnet`
     /// and its renderer is pure string interpolation. The selector is not on this
     /// struct — `--shared-proxy-selector` reaches the renderer via
     /// `OperatorConfig::shared_proxy_selector`, the single source the VIP Services
     /// also select on.
-    pub(crate) fn shared_proxy_config(&self) -> SharedProxyConfig {
-        SharedProxyConfig {
+    pub(crate) fn shared_proxy_config(&self) -> ProxyPoolConfig {
+        ProxyPoolConfig {
             enabled: self.shared_proxy_enabled,
             name: self.shared_proxy_name.clone(),
             replicas: self.shared_proxy_replicas,
@@ -1104,7 +1104,7 @@ impl ControllerArgs {
     /// Build the [`RelayConfig`] the operator carries (#584/#602/#605) from the
     /// `--relay-*` flags. Plain scalars (no pre-formatting needed — the relay
     /// renderer/control-loop consume `Duration`/`u32`/`String` directly), grouped
-    /// so the flag set threads through as one value like [`SharedProxyConfig`].
+    /// so the flag set threads through as one value like [`ProxyPoolConfig`].
     pub(crate) fn relay_config(&self) -> RelayConfig {
         RelayConfig {
             enabled: self.relay_enabled,
@@ -1264,12 +1264,19 @@ pub(crate) struct DiscoveryClientArgs {
 }
 
 /// Resolved scope for a `proxy` role invocation.
+///
+/// Shares the `Shared`/`Dedicated` axis with [`RelayScope`], but the dedicated
+/// *unit* differs: a proxy is dedicated to one **Gateway**, so its payload is a
+/// Gateway `(name, namespace)` pair sourced from `--gateway-name` /
+/// `--gateway-namespace`. A relay is dedicated to one **namespace** and carries
+/// only a namespace. The identity flags therefore differ by design even though
+/// the axis is the same.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ProxyScope {
     /// Serve the shared pool.
     Shared,
     /// Serve a single dedicated Gateway.
-    Gateway {
+    Dedicated {
         /// Gateway name.
         name: String,
         /// Gateway namespace.
@@ -1295,7 +1302,7 @@ impl ProxyRoleArgs {
             // `shared`/`dedicated` is set, and `required_if_eq` guarantees the
             // identifiers are present whenever `dedicated` is.
             match (&self.gateway_name, &self.gateway_namespace) {
-                (Some(name), Some(namespace)) => ProxyScope::Gateway {
+                (Some(name), Some(namespace)) => ProxyScope::Dedicated {
                     name: name.clone(),
                     namespace: namespace.clone(),
                 },
@@ -1344,12 +1351,18 @@ pub(crate) struct RelayRoleArgs {
 }
 
 /// Resolved upstream subscription scope for a `relay` role invocation.
+///
+/// Shares the `Shared`/`Dedicated` axis with [`ProxyScope`], but the dedicated
+/// *unit* differs: a relay is dedicated to one **namespace** (fronting that
+/// namespace's dedicated Gateways), so its payload is a single namespace sourced
+/// from `--namespace=NS` — not a Gateway `(name, namespace)` pair. The identity
+/// flags therefore differ by design even though the axis is the same.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RelayScope {
     /// Front the shared pool (`SharedPool` upstream).
     Shared,
     /// Front one namespace's dedicated Gateways (`Namespace{ns}` upstream).
-    Namespace {
+    Dedicated {
         /// The namespace whose dedicated Gateways this relay aggregates.
         namespace: String,
     },
@@ -1369,7 +1382,7 @@ impl RelayRoleArgs {
             RelayScope::Shared
         } else {
             match &self.namespace {
-                Some(namespace) => RelayScope::Namespace {
+                Some(namespace) => RelayScope::Dedicated {
                     namespace: namespace.clone(),
                 },
                 None => panic!(
@@ -1431,7 +1444,7 @@ mod tests {
     }
 
     /// `coxswain serve proxy --dedicated --gateway-name=NAME
-    /// --gateway-namespace=NS` resolves to `ProxyScope::Gateway`.
+    /// --gateway-namespace=NS` resolves to `ProxyScope::Dedicated`.
     #[test]
     fn serve_proxy_gateway_parses() {
         let cli = Cli::try_parse_from([
@@ -1450,7 +1463,7 @@ mod tests {
         };
         assert_eq!(
             args.scope(),
-            ProxyScope::Gateway {
+            ProxyScope::Dedicated {
                 name: "my-gw".to_string(),
                 namespace: "tenant-a".to_string(),
             }

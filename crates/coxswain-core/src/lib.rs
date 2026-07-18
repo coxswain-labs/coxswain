@@ -3,7 +3,7 @@
 //! Provides the routing table, atomic [`Shared<T>`] snapshot wrapper, TLS cert
 //! store, Kubernetes ownership helpers, `ReferenceGrant` evaluation logic, the
 //! fleet discovery snapshot, the [`RoutingSource`] trait, the
-//! [`SharedGatewayListenerStatus`] shared cell, the
+//! [`GatewayListenerStatusHandle`] shared cell, the
 //! [`DedicatedRoutingRegistry`] per-Gateway snapshot registry, and the
 //! canonical [`endpoints`] endpoint-resource model — all used by both the
 //! controller and proxy crates.
@@ -37,9 +37,9 @@ pub use identity::{
     AuthnError, CsrPem, IssuedSvid, IssuerError, SpiffeId, SpiffeIdError, SvidIssuer,
     TokenAuthenticator,
 };
-pub use listener_status::SharedGatewayListenerStatus;
-pub use node_registry::{NodeEntry, NodeRegistry, NodeScope, RosterChild, SharedNodeRegistry};
-pub use publish_index::{PublishStamp, SharedGatewayPublishIndex};
+pub use listener_status::GatewayListenerStatusHandle;
+pub use node_registry::{NodeEntry, NodeRegistry, NodeRegistryHandle, NodeScope, RosterChild};
+pub use publish_index::{GatewayPublishIndexHandle, PublishStamp};
 pub use shared::Shared;
 pub use source::RoutingSource;
 pub use workqueue::{RateLimitConfig, RateLimitingWorkqueue};

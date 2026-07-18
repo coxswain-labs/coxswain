@@ -102,7 +102,7 @@ pub use cluster::{ClusterSummaryInputs, build_cluster_summary};
 pub use coxswain_core::fleet::SharedFleet;
 pub use crds::gateway_api_crds_present;
 pub use ingress::IngressPorts;
-pub use jwks::SharedJwksCache;
+pub use jwks::JwksCacheHandle;
 pub use k8s_utils::{WatchScope, WatchScopeError};
 pub use merged_store::MergedStore;
 pub use metrics::{MetricsPrefix, ReflectorMetrics};
@@ -113,12 +113,11 @@ pub use reconciler::{
     ReconcilerOptions, ReconcilerOutputs, SharedProxyReconciler, StatusStores,
 };
 pub use status::{
-    BackendTlsPolicyStatus, BackendTlsPolicyStatusMap, ClientTrafficPolicyStatus,
-    ClientTrafficPolicyStatusMap, CoxswainBackendPolicyStatus, CoxswainBackendPolicyStatusMap,
-    CoxswainExternalAuthStatus, CoxswainExternalAuthStatusMap, GatewayListenerStatus, ListenerInfo,
-    ListenerReadiness, ListenerSource, ListenerStatusKey, RouteParentStatus, RouteStatusMap,
-    SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus,
-    SharedCoxswainBackendPolicyStatus, SharedCoxswainExternalAuthStatus,
-    SharedGatewayListenerStatus, SharedRouteStatus,
+    BackendTlsPolicyStatus, BackendTlsPolicyStatusHandle, BackendTlsPolicyStatusMap,
+    ClientTrafficPolicyStatus, ClientTrafficPolicyStatusHandle, ClientTrafficPolicyStatusMap,
+    CoxswainBackendPolicyStatus, CoxswainBackendPolicyStatusHandle, CoxswainBackendPolicyStatusMap,
+    CoxswainExternalAuthStatus, CoxswainExternalAuthStatusHandle, CoxswainExternalAuthStatusMap,
+    GatewayListenerStatus, GatewayListenerStatusHandle, ListenerInfo, ListenerReadiness,
+    ListenerSource, ListenerStatusKey, RouteParentStatus, RouteStatusHandle, RouteStatusMap,
 };
 pub use status_queue::{StatusKey, StatusKind, StatusWorkqueue};

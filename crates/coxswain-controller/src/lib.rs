@@ -20,7 +20,7 @@ pub use controller::{
     Controller, ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress,
     StatusChannels,
 };
-pub use operator::{OperatorConfig, RelayConfig, SharedProxyConfig};
+pub use operator::{OperatorConfig, ProxyPoolConfig, RelayConfig};
 pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writer};
 
 /// Fixed `ServiceAccount` (and `Deployment`/`Service`) name of every
@@ -56,9 +56,8 @@ pub const RELAY_DISCOVERY_PORT: u16 = 50051;
 // without forcing every site to learn the new crate name.
 pub use coxswain_core::cluster::SharedClusterSummary;
 pub use coxswain_reflector::{
-    GatewayListenerStatus, IngressPorts, ListenerInfo, ListenerReadiness,
-    SharedBackendTlsPolicyStatus, SharedGatewayListenerStatus, SharedRouteStatus,
-    gateway_api_crds_present,
+    BackendTlsPolicyStatusHandle, GatewayListenerStatus, GatewayListenerStatusHandle, IngressPorts,
+    ListenerInfo, ListenerReadiness, RouteStatusHandle, gateway_api_crds_present,
 };
 
 // The status writer no longer instantiates a reconciler directly — bin owns

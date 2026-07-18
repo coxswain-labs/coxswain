@@ -24,7 +24,7 @@ use tokio::sync::{OnceCell, Semaphore};
 
 use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
-use coxswain_core::node_registry::SharedNodeRegistry;
+use coxswain_core::node_registry::NodeRegistryHandle;
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
 
 mod controllers;
@@ -53,7 +53,7 @@ pub struct OperatorAggregator {
     cluster: SharedClusterSummary,
     /// Connected proxy node registry, populated by the discovery server.
     /// `None` in dev and proxy roles (discovery not active).
-    node_registry: Option<SharedNodeRegistry>,
+    node_registry: Option<NodeRegistryHandle>,
     /// The controller's own shared-pool Ingress routing table — the same
     /// [`Shared`](coxswain_core::Shared) cell fed to the discovery server and
     /// pushed to every `SharedPool`-scoped proxy. Backs the local re-source of
@@ -102,7 +102,7 @@ impl OperatorAggregator {
         http: reqwest::Client,
         fleet: SharedFleet,
         cluster: SharedClusterSummary,
-        node_registry: Option<SharedNodeRegistry>,
+        node_registry: Option<NodeRegistryHandle>,
         ingress_routes: SharedIngressRoutingTable,
         gateway_routes: SharedGatewayRoutingTable,
         dedicated_registry: DedicatedRoutingRegistry,
@@ -405,12 +405,12 @@ pub(super) mod tests {
         make_agg_full(fleet, cluster, None)
     }
 
-    /// Build an [`OperatorAggregator`] with a populated [`SharedNodeRegistry`]
+    /// Build an [`OperatorAggregator`] with a populated [`NodeRegistryHandle`]
     /// for topology unit tests.
     pub(crate) fn make_agg_with_registry(
         fleet: SharedFleet,
         cluster: SharedClusterSummary,
-        node_registry: SharedNodeRegistry,
+        node_registry: NodeRegistryHandle,
     ) -> OperatorAggregator {
         make_agg_full(fleet, cluster, Some(node_registry))
     }
@@ -418,7 +418,7 @@ pub(super) mod tests {
     fn make_agg_full(
         fleet: SharedFleet,
         cluster: SharedClusterSummary,
-        node_registry: Option<SharedNodeRegistry>,
+        node_registry: Option<NodeRegistryHandle>,
     ) -> OperatorAggregator {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::builder()

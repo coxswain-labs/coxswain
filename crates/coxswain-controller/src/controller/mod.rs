@@ -33,9 +33,9 @@ use coxswain_reflector::gw_types::{
     BackendTlsPolicy, GrpcRoute, HttpRoute, TcpRoute, TlsRoute, UdpRoute,
 };
 use coxswain_reflector::status::{
-    GatewayListenerStatus, SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus,
-    SharedCoxswainBackendPolicyStatus, SharedCoxswainExternalAuthStatus,
-    SharedGatewayListenerStatus, SharedRouteStatus,
+    BackendTlsPolicyStatusHandle, ClientTrafficPolicyStatusHandle,
+    CoxswainBackendPolicyStatusHandle, CoxswainExternalAuthStatusHandle, GatewayListenerStatus,
+    GatewayListenerStatusHandle, RouteStatusHandle,
 };
 use coxswain_reflector::{
     IngressEvent, MergedStore, OperatorStores, StatusKey, StatusKind, StatusStores, StatusWorkqueue,
@@ -132,34 +132,34 @@ const SETTLED_NEGATIVE_REQUEUE: Duration = Duration::from_secs(15);
 // intentionally open: field-literal constructed in crate::spawn_status_writer.
 pub struct StatusChannels {
     /// Per-listener Gateway TLS health.
-    pub tls: SharedGatewayListenerStatus,
+    pub tls: GatewayListenerStatusHandle,
     /// Per-HTTPRoute Accepted/ResolvedRefs health.
-    pub route: SharedRouteStatus,
+    pub route: RouteStatusHandle,
     /// Per-GRPCRoute Accepted/ResolvedRefs health.
     ///
     /// Separate from `route` — `RouteParentKey` is kind-neutral and an HTTPRoute + GRPCRoute
     /// with the same name/ns/gateway would collide in one map.
-    pub grpc_route: SharedRouteStatus,
+    pub grpc_route: RouteStatusHandle,
     /// Per-TLSRoute Accepted/ResolvedRefs health.
     ///
     /// Separate from `route` and `grpc_route` for the same kind-neutrality reason.
-    pub tls_route: SharedRouteStatus,
+    pub tls_route: RouteStatusHandle,
     /// Per-TCPRoute Accepted/ResolvedRefs health.
     ///
     /// Separate from the other route-kind channels for the same kind-neutrality reason.
-    pub tcp_route: SharedRouteStatus,
+    pub tcp_route: RouteStatusHandle,
     /// Per-UDPRoute Accepted/ResolvedRefs health.
     ///
     /// Separate from the other route-kind channels for the same kind-neutrality reason.
-    pub udp_route: SharedRouteStatus,
+    pub udp_route: RouteStatusHandle,
     /// Per-`BackendTLSPolicy` ancestor health.
-    pub policy: SharedBackendTlsPolicyStatus,
+    pub policy: BackendTlsPolicyStatusHandle,
     /// Per-`ClientTrafficPolicy` ancestor health (#327).
-    pub ctp: SharedClientTrafficPolicyStatus,
+    pub ctp: ClientTrafficPolicyStatusHandle,
     /// Per-`CoxswainBackendPolicy` ancestor health (#354).
-    pub cbp: SharedCoxswainBackendPolicyStatus,
+    pub cbp: CoxswainBackendPolicyStatusHandle,
     /// Per-`CoxswainExternalAuth` ancestor health (#23).
-    pub external_auth: SharedCoxswainExternalAuthStatus,
+    pub external_auth: CoxswainExternalAuthStatusHandle,
 }
 
 /// Leader-elected status writer. Registered as a Pingora `BackgroundService`
@@ -195,13 +195,13 @@ pub struct Controller {
     /// Connected-proxy registry (bound-port reports) read by the shared-mode
     /// `Programmed` readiness gate (#531). `None` (tests/dev) disables the
     /// gate — today's address-only convergence behaviour.
-    node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
+    node_registry: Option<coxswain_core::node_registry::NodeRegistryHandle>,
     /// Per-Gateway publish-sequence index (#531). Paired with `node_registry`:
     /// the ack half of the `Programmed` gate — every connected shared-pool
     /// node must have Ack'd a snapshot containing the Gateway's current
     /// generation, not merely have its ports bound (pre-bound ports satisfy
     /// the bind gate instantly while the config is still propagating).
-    publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
+    publish_index: Option<coxswain_core::publish_index::GatewayPublishIndexHandle>,
     /// Dedicated-provisioning operator inputs (#574 fold): its config + the
     /// reflector's `OperatorStores`. `run_controllers` builds the operator
     /// reconcile context from these, spawns its VIP reconciler, and the unified
@@ -287,7 +287,7 @@ impl Controller {
     #[must_use]
     pub fn with_node_registry(
         mut self,
-        registry: coxswain_core::node_registry::SharedNodeRegistry,
+        registry: coxswain_core::node_registry::NodeRegistryHandle,
     ) -> Self {
         self.node_registry = Some(registry);
         self
@@ -299,7 +299,7 @@ impl Controller {
     #[must_use]
     pub fn with_publish_index(
         mut self,
-        index: coxswain_core::publish_index::SharedGatewayPublishIndex,
+        index: coxswain_core::publish_index::GatewayPublishIndexHandle,
     ) -> Self {
         self.publish_index = Some(index);
         self
@@ -1000,16 +1000,16 @@ struct ReconcileContext {
     controller_namespace: String,
     ingress_ports: coxswain_reflector::ingress::IngressPorts,
     owned_gateways: OwnedGateways,
-    listener_status: SharedGatewayListenerStatus,
-    route_status: SharedRouteStatus,
-    grpc_route_status: SharedRouteStatus,
-    tls_route_status: SharedRouteStatus,
-    tcp_route_status: SharedRouteStatus,
-    udp_route_status: SharedRouteStatus,
-    policy_status: SharedBackendTlsPolicyStatus,
-    ctp_status: SharedClientTrafficPolicyStatus,
-    cbp_status: SharedCoxswainBackendPolicyStatus,
-    external_auth_status: SharedCoxswainExternalAuthStatus,
+    listener_status: GatewayListenerStatusHandle,
+    route_status: RouteStatusHandle,
+    grpc_route_status: RouteStatusHandle,
+    tls_route_status: RouteStatusHandle,
+    tcp_route_status: RouteStatusHandle,
+    udp_route_status: RouteStatusHandle,
+    policy_status: BackendTlsPolicyStatusHandle,
+    ctp_status: ClientTrafficPolicyStatusHandle,
+    cbp_status: CoxswainBackendPolicyStatusHandle,
+    external_auth_status: CoxswainExternalAuthStatusHandle,
     /// Synced GatewayClass store, read for Gateway ownership at reconcile time.
     gateway_classes: MergedStore<GatewayClass>,
     /// Synced IngressClass store, read for Ingress ownership at reconcile time.
@@ -1041,10 +1041,10 @@ struct ReconcileContext {
     /// by the shared-Gateway reconcile to gate `Programmed=True` on every
     /// connected shared-pool node having bound the Gateway's VIP internal
     /// ports. `None` disables the gate (tests / dev).
-    node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
+    node_registry: Option<coxswain_core::node_registry::NodeRegistryHandle>,
     /// Per-Gateway publish-sequence index (#531): the ack half of the
     /// `Programmed` gate. `None` disables it (tests / dev).
-    publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
+    publish_index: Option<coxswain_core::publish_index::GatewayPublishIndexHandle>,
     /// Gateways currently exiting the reconcile through a deferred-`Programmed`
     /// requeue — the backing set for the `gateways_held_pending` gauge (#570).
     /// Inserted on the not-converged path, removed on any settled exit, and
@@ -2364,7 +2364,7 @@ mod tests {
 
     #[test]
     fn proxy_bind_pending_detail_names_empty_pool() {
-        let reg = coxswain_core::node_registry::SharedNodeRegistry::new();
+        let reg = coxswain_core::node_registry::NodeRegistryHandle::new();
         let detail = proxy_bind_pending_detail(&reg.load(), &[30001u16].into_iter().collect());
         assert!(
             detail.contains("no shared proxy nodes connected"),
@@ -2374,8 +2374,8 @@ mod tests {
 
     #[test]
     fn proxy_bind_pending_detail_counts_unbound_nodes_and_ports() {
-        use coxswain_core::node_registry::{NodeScope, SharedNodeRegistry};
-        let reg = SharedNodeRegistry::new();
+        use coxswain_core::node_registry::{NodeRegistryHandle, NodeScope};
+        let reg = NodeRegistryHandle::new();
         let now = std::time::SystemTime::UNIX_EPOCH;
         reg.connect("node-a", NodeScope::SharedPool, now);
         reg.record_bound_ports("node-a", [30001u16, 30002].into_iter().collect());

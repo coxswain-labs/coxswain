@@ -9,7 +9,7 @@
 //! the engine, which prevents a routing snapshot for one spec from being
 //! handed to the proxy that serves the other.
 
-use crate::config::SharedProxyConfig;
+use crate::config::ProxyServices;
 use crate::ctx::ProxyCtx;
 use crate::hooks;
 use crate::retry;
@@ -35,13 +35,13 @@ pub struct IngressProxy {
     ///
     /// The engine is kept separate because it is typed differently for each
     /// proxy; all other startup-time config lives here.
-    pub cfg: SharedProxyConfig,
+    pub cfg: ProxyServices,
 }
 
 impl IngressProxy {
     /// Construct an `IngressProxy` from its engine and shared runtime config.
     #[must_use]
-    pub fn new(engine: Arc<IngressEngine>, cfg: SharedProxyConfig) -> Self {
+    pub fn new(engine: Arc<IngressEngine>, cfg: ProxyServices) -> Self {
         Self { engine, cfg }
     }
 }

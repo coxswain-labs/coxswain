@@ -146,7 +146,7 @@ pub(crate) struct DedicatedGatewayStatusInputs<'a> {
     /// the Service is `NodePort`-typed; pass `&[]` on other paths.
     pub(crate) nodes: &'a [Arc<Node>],
     /// Listener-health snapshot for this Gateway — read from
-    /// `SharedGatewayListenerStatus.load().get(&object_key)`. Pass
+    /// `GatewayListenerStatusHandle.load().get(&object_key)`. Pass
     /// `&GatewayListenerStatus::default()` when the reflector hasn't yet
     /// computed an entry; per-listener helpers degrade to healthy defaults.
     pub(crate) listener_status: &'a GatewayListenerStatus,
@@ -722,12 +722,12 @@ fn cut_over_outcome(accepted: AcceptedOutcome, ready_pod_count: usize) -> Condit
     }
 }
 
-impl AddressType {
+impl From<AddressType> for SupportedAddressType {
     /// Map to the shared static-address validator's type enum (#260).
-    fn to_supported(self) -> SupportedAddressType {
-        match self {
-            Self::IpAddress => SupportedAddressType::IpAddress,
-            Self::Hostname => SupportedAddressType::Hostname,
+    fn from(value: AddressType) -> Self {
+        match value {
+            AddressType::IpAddress => Self::IpAddress,
+            AddressType::Hostname => Self::Hostname,
         }
     }
 }
@@ -737,7 +737,7 @@ impl AddressType {
 fn evaluate_dedicated_static(gw: &Gateway, bound: &[StatusAddress]) -> StaticAddressOutcome {
     let resolved: Vec<TypedAddress> = bound
         .iter()
-        .map(|a| TypedAddress::new(a.type_.to_supported(), a.value.clone()))
+        .map(|a| TypedAddress::new(a.type_.into(), a.value.clone()))
         .collect();
     evaluate_static_addresses(gw.spec.addresses.as_deref().unwrap_or_default(), &resolved)
 }

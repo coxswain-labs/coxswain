@@ -29,7 +29,7 @@ use coxswain_core::dedicated_registry::{
 };
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::publish_index::SharedGatewayPublishIndex;
+use coxswain_core::publish_index::GatewayPublishIndexHandle;
 use tokio::sync::{broadcast, watch};
 
 use crate::apply::{ApplyStats, RoutingApplier, SnapshotApplier, wire_from_key_err};
@@ -60,6 +60,11 @@ pub struct RelayUpstream {
     pub directive_tx: broadcast::Sender<p::PreferredUpstream>,
 }
 
+/// Broadcast buffer for forwarded repoint directives (#601). Repoints are
+/// level-triggered — a lagged leaf that drops a directive re-derives its target
+/// on the next relay-provisioning tick — so a small buffer is ample.
+const DIRECTIVE_FANOUT_CAPACITY: usize = 16;
+
 /// Assemble a **shared-pool** relay's upstream (subscribes `Scope::SharedPool`).
 ///
 /// The flat routing cells the `RoutingApplier` reconstructs are the shared
@@ -88,7 +93,7 @@ pub fn shared_relay(
     // controller's envelope seq on each apply) and the downstream `SnapshotSource`
     // (reader: stamps that seq onto leaf Acks), so shared leaves Ack in the
     // controller's seq space and the #531 gate can evaluate them (#585).
-    let publish = SharedGatewayPublishIndex::new();
+    let publish = GatewayPublishIndexHandle::new();
     let (applier, cells) = RoutingApplier::new();
     let applier = applier.with_publish_index(publish.clone());
     let (supervisor, rebuild_rx) =
@@ -114,11 +119,6 @@ pub fn shared_relay(
         directive_tx,
     })
 }
-
-/// Broadcast buffer for forwarded repoint directives (#601). Repoints are
-/// level-triggered — a lagged leaf that drops a directive re-derives its target
-/// on the next relay-provisioning tick — so a small buffer is ample.
-const DIRECTIVE_FANOUT_CAPACITY: usize = 16;
 
 /// Assemble a **namespace** relay's upstream (subscribes `Scope::Namespace`).
 ///
@@ -156,7 +156,7 @@ pub fn namespace_relay(
         gateway: coxswain_core::routing::SharedGatewayRoutingTable::new(),
         tls: coxswain_core::tls::SharedPortTlsStore::new(),
         client_certs: coxswain_core::tls::SharedClientCertStore::new(),
-        listener_status: coxswain_core::listener_status::SharedGatewayListenerStatus::new(),
+        listener_status: coxswain_core::listener_status::GatewayListenerStatusHandle::new(),
         dedicated,
         passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
@@ -201,7 +201,7 @@ pub(crate) struct NamespaceDemux {
     /// Downstream-serving publish index (shared with the `SnapshotSource`). The
     /// relay's own monotone rebuild counter drives the downstream `Gateway`-view
     /// seq; per-Gateway upstream seq propagation across tiers lands with #585.
-    publish: SharedGatewayPublishIndex,
+    publish: GatewayPublishIndexHandle,
 }
 
 impl NamespaceDemux {
@@ -211,7 +211,7 @@ impl NamespaceDemux {
             resources: HashMap::new(),
             resource_hashes: HashMap::new(),
             dedicated: DedicatedRoutingRegistry::new(),
-            publish: SharedGatewayPublishIndex::new(),
+            publish: GatewayPublishIndexHandle::new(),
         }
     }
 
@@ -468,7 +468,7 @@ fn dedicated_snapshot_from_resources(
         gateway: cells.gateway.load(),
         tls: cells.tls.load(),
         client_certs: cells.client_certs.load(),
-        // `SharedGatewayListenerStatus::load` yields a `Guard<Arc<HashMap>>`;
+        // `GatewayListenerStatusHandle::load` yields a `Guard<Arc<HashMap>>`;
         // the snapshot holds the owned map, so double-deref then clone.
         listener_status: (**cells.listener_status.load()).clone(),
         expected_proxy_sa,
@@ -481,8 +481,8 @@ mod tests {
     use crate::auth::PeerSvid;
     use crate::materialize::materialize;
     use crate::subscription::Scope;
-    use coxswain_core::listener_status::SharedGatewayListenerStatus;
-    use coxswain_core::publish_index::SharedGatewayPublishIndex;
+    use coxswain_core::listener_status::GatewayListenerStatusHandle;
+    use coxswain_core::publish_index::GatewayPublishIndexHandle;
     use coxswain_core::routing::{
         BackendGroup, GatewayRoutingTableBuilder, RouteEntry, SharedGatewayRoutingTable,
         SharedIngressRoutingTable, SharedTcpRouteTable, SharedTlsPassthroughTable,
@@ -528,13 +528,13 @@ mod tests {
             gateway: SharedGatewayRoutingTable::new(),
             tls: SharedPortTlsStore::new(),
             client_certs: SharedClientCertStore::new(),
-            listener_status: SharedGatewayListenerStatus::new(),
+            listener_status: GatewayListenerStatusHandle::new(),
             dedicated,
             passthrough_routes: SharedTlsPassthroughTable::new(),
             terminate_routes: SharedTlsPassthroughTable::new(),
             tcp_routes: SharedTcpRouteTable::new(),
             udp_routes: SharedUdpRouteTable::new(),
-            publish: SharedGatewayPublishIndex::new(),
+            publish: GatewayPublishIndexHandle::new(),
         }
     }
 
@@ -571,7 +571,7 @@ mod tests {
             gateway: SharedGatewayRoutingTable::new(),
             tls: SharedPortTlsStore::new(),
             client_certs: SharedClientCertStore::new(),
-            listener_status: SharedGatewayListenerStatus::new(),
+            listener_status: GatewayListenerStatusHandle::new(),
             dedicated,
             passthrough_routes: SharedTlsPassthroughTable::new(),
             terminate_routes: SharedTlsPassthroughTable::new(),

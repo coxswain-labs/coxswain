@@ -8,7 +8,7 @@
 //! prevents a routing snapshot for one spec from being handed to the proxy
 //! that serves the other.
 
-use crate::config::SharedProxyConfig;
+use crate::config::ProxyServices;
 use crate::ctx::ProxyCtx;
 use crate::hooks;
 use crate::retry;
@@ -34,13 +34,13 @@ pub struct GatewayProxy {
     ///
     /// The engine is kept separate because it is typed differently for each
     /// proxy; all other startup-time config lives here.
-    pub cfg: SharedProxyConfig,
+    pub cfg: ProxyServices,
 }
 
 impl GatewayProxy {
     /// Construct a `GatewayProxy` from its engine and shared runtime config.
     #[must_use]
-    pub fn new(engine: Arc<GatewayEngine>, cfg: SharedProxyConfig) -> Self {
+    pub fn new(engine: Arc<GatewayEngine>, cfg: ProxyServices) -> Self {
         Self { engine, cfg }
     }
 }

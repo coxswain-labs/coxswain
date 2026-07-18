@@ -2,13 +2,13 @@
 //! reported bound listener ports.
 //!
 //! [`NodeRegistry`] is a plain snapshot value (like [`crate::fleet::FleetSnapshot`]).
-//! [`SharedNodeRegistry`] is the multi-writer handle: each discovery stream task holds
+//! [`NodeRegistryHandle`] is the multi-writer handle: each discovery stream task holds
 //! a clone and upserts its own row concurrently. Interior [`Mutex`] makes writes
 //! in-place and correct; the lock is never held across an `.await`.
 //!
 //! The registry is populated by the discovery server (T5, #376) and read by the admin
 //! UI convergence panel (T8) and by the controller's shared-Gateway `Programmed`
-//! readiness gate (#531), which subscribes to [`SharedNodeRegistry::subscribe`] for
+//! readiness gate (#531), which subscribes to [`NodeRegistryHandle::subscribe`] for
 //! re-drives on membership/bound-port changes.
 
 use std::collections::{BTreeSet, HashMap};
@@ -93,8 +93,8 @@ pub struct NodeEntry {
     pub last_acked_seq: Option<u64>,
     /// `node_id` of the relay whose `RosterReport` folded this entry into the
     /// controller's registry (#585), or `None` for a directly-connected node
-    /// (including a relay's own stream). Set by [`SharedNodeRegistry::apply_roster`];
-    /// the whole subtree is evicted via [`SharedNodeRegistry::evict_children`]
+    /// (including a relay's own stream). Set by [`NodeRegistryHandle::apply_roster`];
+    /// the whole subtree is evicted via [`NodeRegistryHandle::evict_children`]
     /// when the relay's stream drops. Missing in JSON from pre-#585 peers →
     /// `None` via `serde(default)`.
     #[serde(default)]
@@ -111,7 +111,7 @@ pub struct NodeEntry {
 }
 
 /// A leaf entry from a relay's `RosterReport` (#585), folded into the registry
-/// by [`SharedNodeRegistry::apply_roster`].
+/// by [`NodeRegistryHandle::apply_roster`].
 ///
 /// Mirrors the subset of [`NodeEntry`] a relay knows about a downstream leaf;
 /// `parent`/`is_relay` are stamped by the registry on fold, so they are not
@@ -158,7 +158,7 @@ impl NodeEntry {
 /// Snapshot of all currently-connected proxy nodes.
 ///
 /// This is a plain value type — create a point-in-time copy via
-/// [`SharedNodeRegistry::load`] and hold it briefly; do not cache it across
+/// [`NodeRegistryHandle::load`] and hold it briefly; do not cache it across
 /// reconcile cycles.
 #[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -174,7 +174,7 @@ impl NodeRegistry {
     /// SharedPool node is present.
     ///
     /// Free-standing on the plain snapshot type (not just
-    /// [`SharedNodeRegistry`]) so a registry merged from multiple controller
+    /// [`NodeRegistryHandle`]) so a registry merged from multiple controller
     /// replicas — e.g. a topology fan-out union — can compute the same value
     /// a single replica's live registry would.
     #[must_use]
@@ -430,19 +430,19 @@ impl NodeRegistry {
     }
 }
 
-// ── SharedNodeRegistry ────────────────────────────────────────────────────────
+// ── NodeRegistryHandle ────────────────────────────────────────────────────────
 
 /// Multi-writer shared handle to the live [`NodeRegistry`].
 ///
-/// Unlike [`crate::shared::Shared`] (a single-writer primitive), `SharedNodeRegistry`
+/// Unlike [`crate::shared::Shared`] (a single-writer primitive), `NodeRegistryHandle`
 /// allows N concurrent stream tasks to upsert their own rows. The interior
 /// [`Mutex`] is held only for the duration of the map operation, never across
 /// an `.await`. Freely `Clone`d into each stream task.
 #[non_exhaustive]
 #[derive(Clone)]
-pub struct SharedNodeRegistry(Arc<RegistryInner>);
+pub struct NodeRegistryHandle(Arc<RegistryInner>);
 
-/// Shared state behind [`SharedNodeRegistry`].
+/// Shared state behind [`NodeRegistryHandle`].
 struct RegistryInner {
     /// The live registry map.
     map: Mutex<NodeRegistry>,
@@ -460,7 +460,7 @@ struct RegistryInner {
     roster: watch::Sender<u64>,
 }
 
-impl Default for SharedNodeRegistry {
+impl Default for NodeRegistryHandle {
     fn default() -> Self {
         Self(Arc::new(RegistryInner {
             map: Mutex::new(NodeRegistry::default()),
@@ -470,7 +470,7 @@ impl Default for SharedNodeRegistry {
     }
 }
 
-impl SharedNodeRegistry {
+impl NodeRegistryHandle {
     /// Construct a new, empty registry.
     #[must_use]
     pub fn new() -> Self {
@@ -831,7 +831,7 @@ mod tests {
 
     #[test]
     fn connect_inserts_entry() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         let snap = reg.load();
         assert!(
@@ -844,7 +844,7 @@ mod tests {
 
     #[test]
     fn connect_records_scope() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.connect("node-b", gw("default", "my-gw"), now());
         let snap = reg.load();
@@ -858,7 +858,7 @@ mod tests {
 
     #[test]
     fn record_ack_updates_version_and_time() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         let ack_time = SystemTime::UNIX_EPOCH;
         reg.record_ack("node-a", "abc123".to_owned(), 1, ack_time);
@@ -872,7 +872,7 @@ mod tests {
 
     #[test]
     fn record_ack_on_unknown_node_is_noop() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         // Must not panic
         reg.record_ack("phantom", "hash".to_owned(), 1, now());
         assert!(reg.load().nodes.is_empty());
@@ -880,7 +880,7 @@ mod tests {
 
     #[test]
     fn record_target_then_ack_is_in_sync() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.record_target("node-a", "v1".to_owned());
         assert!(!reg.load().nodes["node-a"].in_sync(), "not yet acked");
@@ -890,7 +890,7 @@ mod tests {
 
     #[test]
     fn ack_of_stale_version_is_out_of_sync() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.record_target("node-a", "v2".to_owned());
         reg.record_ack("node-a", "v1".to_owned(), 1, now());
@@ -902,20 +902,20 @@ mod tests {
 
     #[test]
     fn record_target_on_unknown_node_is_noop() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.record_target("phantom", "v1".to_owned());
         assert!(reg.load().nodes.is_empty());
     }
 
     #[test]
     fn all_in_sync_true_when_empty() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         assert!(reg.all_in_sync(), "vacuously true with no nodes");
     }
 
     #[test]
     fn all_in_sync_false_with_one_laggard() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.record_target("node-a", "v2".to_owned());
         reg.record_ack("node-a", "v1".to_owned(), 1, now());
@@ -930,7 +930,7 @@ mod tests {
 
     #[test]
     fn controller_version_from_shared_pool_node() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.record_target("node-a", "v42".to_owned());
         assert_eq!(reg.controller_version().as_deref(), Some("v42"));
@@ -938,7 +938,7 @@ mod tests {
 
     #[test]
     fn controller_version_none_when_no_shared_pool() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", gw("ns", "gw"), now());
         reg.record_target("node-a", "v1".to_owned());
         assert_eq!(
@@ -950,7 +950,7 @@ mod tests {
 
     #[test]
     fn disconnect_removes_entry() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.disconnect("node-a");
         assert!(
@@ -961,14 +961,14 @@ mod tests {
 
     #[test]
     fn disconnect_unknown_node_is_noop() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         // Must not panic
         reg.disconnect("phantom");
     }
 
     #[test]
     fn load_returns_independent_clone() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         let snap1 = reg.load();
         reg.disconnect("node-a");
@@ -979,7 +979,7 @@ mod tests {
 
     #[test]
     fn clone_shares_state() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         let reg2 = reg.clone();
         reg.connect("node-a", shared(), now());
         // reg2 sees the same underlying map
@@ -990,9 +990,9 @@ mod tests {
 
     #[test]
     fn merge_unions_disjoint_node_ids() {
-        let a = SharedNodeRegistry::new();
+        let a = NodeRegistryHandle::new();
         a.connect("node-a", shared(), now());
-        let b = SharedNodeRegistry::new();
+        let b = NodeRegistryHandle::new();
         b.connect("node-b", shared(), now());
         let mut merged = a.load();
         merged.merge(b.load());
@@ -1003,10 +1003,10 @@ mod tests {
 
     #[test]
     fn merge_overwrites_on_shared_node_id() {
-        let a = SharedNodeRegistry::new();
+        let a = NodeRegistryHandle::new();
         a.connect("node-a", shared(), now());
         a.record_target("node-a", "v1".to_owned());
-        let b = SharedNodeRegistry::new();
+        let b = NodeRegistryHandle::new();
         b.connect("node-a", shared(), now());
         b.record_target("node-a", "v2".to_owned());
         let mut merged = a.load();
@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn controller_version_on_plain_registry_matches_shared_handle() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.record_target("node-a", "v42".to_owned());
         let snap = reg.load();
@@ -1037,14 +1037,14 @@ mod tests {
 
     #[test]
     fn record_bound_ports_on_unknown_node_is_noop() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.record_bound_ports("phantom", ports(&[8080]));
         assert!(reg.load().nodes.is_empty());
     }
 
     #[test]
     fn all_shared_nodes_bound_true_when_all_connected_nodes_cover_ports() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.connect("node-b", shared(), now());
         reg.record_bound_ports("node-a", ports(&[30001, 30002, 8443]));
@@ -1057,7 +1057,7 @@ mod tests {
 
     #[test]
     fn all_shared_nodes_bound_false_when_one_node_misses_a_port() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.connect("node-b", shared(), now());
         reg.record_bound_ports("node-a", ports(&[30001, 30002]));
@@ -1070,7 +1070,7 @@ mod tests {
 
     #[test]
     fn all_shared_nodes_bound_fails_closed_on_empty_registry() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         assert!(
             !reg.load().all_shared_nodes_bound(&ports(&[30001])),
             "zero connected proxies means no data plane — must not pass vacuously"
@@ -1079,7 +1079,7 @@ mod tests {
 
     #[test]
     fn all_shared_nodes_bound_false_when_node_has_not_reported() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         assert!(
             !reg.load().all_shared_nodes_bound(&ports(&[30001])),
@@ -1095,7 +1095,7 @@ mod tests {
 
     #[test]
     fn all_shared_nodes_bound_empty_required_passes_once_connected_and_reported() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         assert!(
             !reg.load().all_shared_nodes_bound(&ports(&[])),
             "empty pool fails closed even with nothing required"
@@ -1114,7 +1114,7 @@ mod tests {
 
     #[test]
     fn dedicated_scope_nodes_excluded_from_shared_bound_query() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.record_bound_ports("node-a", ports(&[30001]));
         reg.connect("node-d", gw("ns", "gw"), now());
@@ -1127,7 +1127,7 @@ mod tests {
 
     #[test]
     fn disconnect_of_only_bound_node_fails_the_query_closed() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.record_bound_ports("node-a", ports(&[30001]));
         assert!(reg.load().all_shared_nodes_bound(&ports(&[30001])));
@@ -1140,7 +1140,7 @@ mod tests {
 
     #[test]
     fn re_report_wholesale_replaces_previous_bound_set() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.record_bound_ports("node-a", ports(&[30001, 30002]));
         reg.record_bound_ports("node-a", ports(&[30002]));
@@ -1153,7 +1153,7 @@ mod tests {
 
     #[test]
     fn gateway_node_bound_matches_only_its_gateway() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-d", gw("ns", "gw"), now());
         reg.record_bound_ports("node-d", ports(&[443]));
         let snap = reg.load();
@@ -1170,7 +1170,7 @@ mod tests {
 
     #[test]
     fn gateway_node_bound_requires_all_overlapping_rollout_pods_bound() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("pod-old", gw("ns", "gw"), now());
         reg.record_bound_ports("pod-old", ports(&[443]));
         reg.connect("pod-new", gw("ns", "gw"), now());
@@ -1183,7 +1183,7 @@ mod tests {
 
     #[test]
     fn gateway_node_bound_fails_closed_with_no_connected_node() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         assert!(!reg.load().gateway_node_bound("ns", "gw", &ports(&[443])));
     }
 
@@ -1191,7 +1191,7 @@ mod tests {
 
     #[test]
     fn all_shared_nodes_acked_true_when_every_node_reached_the_seq() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.connect("node-b", shared(), now());
         reg.record_ack("node-a", "v1".to_owned(), 7, now());
@@ -1202,7 +1202,7 @@ mod tests {
 
     #[test]
     fn all_shared_nodes_acked_fails_closed_on_empty_pool_and_unacked_node() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         assert!(!reg.all_shared_nodes_acked(0), "empty pool fails closed");
         reg.connect("node-a", shared(), now());
         assert!(
@@ -1213,7 +1213,7 @@ mod tests {
 
     #[test]
     fn acked_seq_never_moves_backwards() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.record_ack("node-a", "v2".to_owned(), 5, now());
         reg.record_ack("node-a", "v1".to_owned(), 3, now());
@@ -1225,7 +1225,7 @@ mod tests {
 
     #[test]
     fn advance_acked_seq_moves_forward_without_an_ack() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         reg.record_ack("node-a", "v1".to_owned(), 2, now());
         reg.advance_acked_seq("node-a", 6);
@@ -1241,7 +1241,7 @@ mod tests {
 
     #[test]
     fn gateway_node_acked_scopes_to_its_gateway() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("ded-a", gw("ns", "gw"), now());
         reg.connect("other", gw("ns", "other-gw"), now());
         reg.record_ack("ded-a", "v1".to_owned(), 4, now());
@@ -1259,7 +1259,7 @@ mod tests {
 
     #[test]
     fn watch_fires_on_membership_and_bound_changes_but_not_acks() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         let mut rx = reg.subscribe();
         assert!(!rx.has_changed().unwrap_or(true), "no change at subscribe");
 
@@ -1312,7 +1312,7 @@ mod tests {
 
     #[test]
     fn apply_roster_folds_children_tagged_with_parent() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect(
             "relay-a",
             NodeScope::Namespace {
@@ -1338,7 +1338,7 @@ mod tests {
 
     #[test]
     fn apply_roster_wholesale_replaces_prior_children() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect(
             "relay-a",
             NodeScope::Namespace {
@@ -1359,7 +1359,7 @@ mod tests {
 
     #[test]
     fn apply_roster_does_not_touch_other_relays_children() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.apply_roster("relay-a", vec![leaf("leaf-a", gw("ns", "gw1"), 5, &[443])]);
         reg.apply_roster("relay-b", vec![leaf("leaf-b", gw("ns", "gw2"), 6, &[8443])]);
         // Re-report relay-a with a new child; relay-b's subtree is untouched.
@@ -1375,7 +1375,7 @@ mod tests {
 
     #[test]
     fn apply_roster_never_displaces_a_directly_connected_row() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         // A directly-connected node dials the controller itself.
         reg.connect("dup", shared(), now());
         reg.record_bound_ports("dup", ports(&[30001]));
@@ -1395,7 +1395,7 @@ mod tests {
 
     #[test]
     fn evict_children_removes_only_the_named_relays_subtree() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.apply_roster("relay-a", vec![leaf("leaf-a", gw("ns", "gw1"), 5, &[443])]);
         reg.apply_roster("relay-b", vec![leaf("leaf-b", gw("ns", "gw2"), 6, &[8443])]);
         reg.evict_children("relay-a");
@@ -1420,7 +1420,7 @@ mod tests {
 
     #[test]
     fn namespace_leaf_count_counts_direct_and_folded_leaves() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         // One leaf dialing the controller directly, one folded behind the relay.
         reg.connect("direct", gw("ns", "gw1"), now());
         reg.connect("relay-a", ns_scope("ns"), now());
@@ -1439,7 +1439,7 @@ mod tests {
 
     #[test]
     fn relay_ready_true_only_when_relay_entry_in_sync() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("relay-a", ns_scope("ns"), now());
         reg.apply_roster("relay-a", vec![leaf("leaf-1", gw("ns", "gw"), 5, &[443])]);
         let snap = reg.load();
@@ -1458,7 +1458,7 @@ mod tests {
 
     #[test]
     fn relay_subscriber_count_counts_folded_children() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("relay-a", ns_scope("ns"), now());
         assert_eq!(
             reg.load().relay_subscriber_count("ns"),
@@ -1488,7 +1488,7 @@ mod tests {
 
     #[test]
     fn shared_pool_relay_ready_true_only_when_shared_relay_in_sync() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("shared-relay", shared(), now());
         reg.apply_roster("shared-relay", vec![leaf("leaf-1", shared(), 5, &[443])]);
         assert!(
@@ -1505,7 +1505,7 @@ mod tests {
 
     #[test]
     fn shared_pool_relay_subscriber_count_counts_folded_children() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("shared-relay", shared(), now());
         assert_eq!(
             reg.load().shared_pool_relay_subscriber_count(),
@@ -1534,7 +1534,7 @@ mod tests {
 
     #[test]
     fn folded_gateway_leaf_satisfies_the_dedicated_gate() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect(
             "relay-a",
             NodeScope::Namespace {
@@ -1556,7 +1556,7 @@ mod tests {
 
     #[test]
     fn relay_outage_eviction_fails_the_dedicated_gate_closed() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.apply_roster("relay-a", vec![leaf("leaf-1", gw("ns", "gw"), 9, &[443])]);
         assert!(reg.load().gateway_node_bound("ns", "gw", &ports(&[443])));
         reg.evict_children("relay-a");
@@ -1568,7 +1568,7 @@ mod tests {
 
     #[test]
     fn shared_relay_own_entry_excluded_from_shared_quorum() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         // A shared-pool relay connects (SharedPool scope) and reports two leaves.
         reg.connect("relay-shared", shared(), now());
         reg.apply_roster(
@@ -1611,7 +1611,7 @@ mod tests {
 
     #[test]
     fn node_entry_and_registry_round_trip_json() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", gw("default", "my-gw"), now());
         reg.record_target("node-a", "v1".to_owned());
         reg.record_ack("node-a", "v1".to_owned(), 1, now());
@@ -1633,7 +1633,7 @@ mod tests {
     /// absent node bumps neither — an idle relay's reporter stays parked.
     #[test]
     fn roster_channel_fires_on_ack_while_gate_channel_stays_quiet() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", shared(), now());
         // Subscribe AFTER connect so both channels start caught-up.
         let notify = reg.subscribe();

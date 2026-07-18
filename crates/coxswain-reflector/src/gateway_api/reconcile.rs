@@ -97,7 +97,7 @@ pub struct RouteResolution<'a> {
     /// Controller-fetched remote-JWKS cache, read synchronously when resolving a
     /// `JwtAuth` CR that names a `jwks.remote` (#441). Never populated by the
     /// proxy — see [`crate::jwks`].
-    pub jwks_cache: &'a crate::jwks::SharedJwksCache,
+    pub jwks_cache: &'a crate::jwks::JwksCacheHandle,
     /// Label-scoped htpasswd Secrets (`ingress.coxswain-labs.dev/auth-basic=true`)
     /// consumed by a resolved `BasicAuth` CR's `secretRef` (#442). The same store
     /// the Ingress `auth-basic-secret` annotation reads — no duplicate watcher.

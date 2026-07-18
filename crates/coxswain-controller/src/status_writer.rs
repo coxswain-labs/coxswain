@@ -21,10 +21,10 @@ use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames};
 use coxswain_core::workqueue::RateLimitConfig;
 use coxswain_reflector::StatusWorkqueue;
 use coxswain_reflector::{
-    ControllerReconciler, IngressEvent, ReconcilerHealth, ReconcilerOptions, ReconcilerOutputs,
-    SharedBackendTlsPolicyStatus, SharedClientTrafficPolicyStatus,
-    SharedCoxswainBackendPolicyStatus, SharedCoxswainExternalAuthStatus,
-    SharedGatewayListenerStatus, SharedRouteStatus,
+    BackendTlsPolicyStatusHandle, ClientTrafficPolicyStatusHandle, ControllerReconciler,
+    CoxswainBackendPolicyStatusHandle, CoxswainExternalAuthStatusHandle,
+    GatewayListenerStatusHandle, IngressEvent, ReconcilerHealth, ReconcilerOptions,
+    ReconcilerOutputs, RouteStatusHandle,
 };
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -135,7 +135,7 @@ pub fn spawn_status_writer(
     let tls_store = coxswain_core::tls::SharedPortTlsStore::new();
     let client_cert_store = SharedClientCertStore::new();
     let listener_hostnames = SharedListenerHostnames::new();
-    let gateway_listener_status = SharedGatewayListenerStatus::new();
+    let gateway_listener_status = GatewayListenerStatusHandle::new();
     let cluster_summary = SharedClusterSummary::new();
     let leader = Arc::new(AtomicBool::new(false));
     let owned_gateways = OwnedGateways::new();
@@ -297,15 +297,15 @@ pub fn spawn_status_writer(
         },
     );
 
-    let route_status: SharedRouteStatus = reconciler.route_status();
-    let grpc_route_status: SharedRouteStatus = reconciler.grpc_route_status();
-    let tls_route_status: SharedRouteStatus = reconciler.tls_route_status();
-    let tcp_route_status: SharedRouteStatus = reconciler.tcp_route_status();
-    let udp_route_status: SharedRouteStatus = reconciler.udp_route_status();
-    let policy_status: SharedBackendTlsPolicyStatus = reconciler.policy_status();
-    let ctp_status: SharedClientTrafficPolicyStatus = reconciler.ctp_status();
-    let cbp_status: SharedCoxswainBackendPolicyStatus = reconciler.cbp_status();
-    let external_auth_status: SharedCoxswainExternalAuthStatus = reconciler.external_auth_status();
+    let route_status: RouteStatusHandle = reconciler.route_status();
+    let grpc_route_status: RouteStatusHandle = reconciler.grpc_route_status();
+    let tls_route_status: RouteStatusHandle = reconciler.tls_route_status();
+    let tcp_route_status: RouteStatusHandle = reconciler.tcp_route_status();
+    let udp_route_status: RouteStatusHandle = reconciler.udp_route_status();
+    let policy_status: BackendTlsPolicyStatusHandle = reconciler.policy_status();
+    let ctp_status: ClientTrafficPolicyStatusHandle = reconciler.ctp_status();
+    let cbp_status: CoxswainBackendPolicyStatusHandle = reconciler.cbp_status();
+    let external_auth_status: CoxswainExternalAuthStatusHandle = reconciler.external_auth_status();
 
     // Take the status-store read handles the reconciler created (it must hand
     // them over since we set `status_stores = true` above).

@@ -48,7 +48,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use coxswain_core::endpoints::{EndpointKey, EndpointPool};
-use coxswain_core::listener_status::{GatewayListenerStatus, SharedGatewayListenerStatus};
+use coxswain_core::listener_status::{GatewayListenerStatus, GatewayListenerStatusHandle};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{
     Gateway, Ingress, RouteConflict, RouterError, RoutingTable, RoutingTableBuilder,
@@ -156,7 +156,7 @@ pub(crate) struct SnapshotCells<'a> {
     /// Per-port client-certificate (mTLS) config store.
     pub(crate) client_certs: &'a SharedClientCertStore,
     /// Per-Gateway listener status map (drives dynamic bind/unbind).
-    pub(crate) status: &'a SharedGatewayListenerStatus,
+    pub(crate) status: &'a GatewayListenerStatusHandle,
     /// Per-port HTTPS listener-hostname snapshot (GEP-3567, #96).
     pub(crate) listener_hostnames: &'a SharedListenerHostnames,
     /// SNI→backend TLS passthrough table (#70).
@@ -204,7 +204,7 @@ pub(crate) struct RoutingApplier {
     gateway: SharedGatewayRoutingTable,
     tls: SharedPortTlsStore,
     client_certs: SharedClientCertStore,
-    listener_status: SharedGatewayListenerStatus,
+    listener_status: GatewayListenerStatusHandle,
     listener_hostnames: SharedListenerHostnames,
     passthrough: SharedTlsPassthroughTable,
     terminate: SharedTlsPassthroughTable,
@@ -214,7 +214,7 @@ pub(crate) struct RoutingApplier {
     /// proxy's own applier and the namespace-relay's per-Gateway reconstruction.
     /// When set, `apply` advances it to the envelope `Snapshot.publish_seq` so
     /// the relay's downstream leaves Ack in the controller's seq space.
-    publish: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
+    publish: Option<coxswain_core::publish_index::GatewayPublishIndexHandle>,
 }
 
 impl RoutingApplier {
@@ -249,7 +249,7 @@ impl RoutingApplier {
     #[must_use]
     pub(crate) fn with_publish_index(
         mut self,
-        publish: coxswain_core::publish_index::SharedGatewayPublishIndex,
+        publish: coxswain_core::publish_index::GatewayPublishIndexHandle,
     ) -> Self {
         self.publish = Some(publish);
         self
@@ -327,7 +327,7 @@ pub(crate) struct RoutingCells {
     pub(crate) gateway: SharedGatewayRoutingTable,
     pub(crate) tls: SharedPortTlsStore,
     pub(crate) client_certs: SharedClientCertStore,
-    pub(crate) listener_status: SharedGatewayListenerStatus,
+    pub(crate) listener_status: GatewayListenerStatusHandle,
     pub(crate) listener_hostnames: SharedListenerHostnames,
     pub(crate) passthrough: SharedTlsPassthroughTable,
     pub(crate) terminate: SharedTlsPassthroughTable,
@@ -343,7 +343,7 @@ impl RoutingCells {
             gateway: SharedGatewayRoutingTable::new(),
             tls: SharedPortTlsStore::new(),
             client_certs: SharedClientCertStore::new(),
-            listener_status: SharedGatewayListenerStatus::new(),
+            listener_status: GatewayListenerStatusHandle::new(),
             listener_hostnames: SharedListenerHostnames::new(),
             passthrough: SharedTlsPassthroughTable::new(),
             terminate: SharedTlsPassthroughTable::new(),
@@ -1692,7 +1692,7 @@ mod tests {
         gateway: SharedGatewayRoutingTable,
         tls: SharedPortTlsStore,
         client_certs: SharedClientCertStore,
-        status: SharedGatewayListenerStatus,
+        status: GatewayListenerStatusHandle,
         listener_hostnames: SharedListenerHostnames,
         passthrough: SharedTlsPassthroughTable,
         terminate: SharedTlsPassthroughTable,
@@ -1707,7 +1707,7 @@ mod tests {
                 gateway: SharedGatewayRoutingTable::new(),
                 tls: SharedPortTlsStore::new(),
                 client_certs: SharedClientCertStore::new(),
-                status: SharedGatewayListenerStatus::new(),
+                status: GatewayListenerStatusHandle::new(),
                 listener_hostnames: SharedListenerHostnames::new(),
                 passthrough: SharedTlsPassthroughTable::new(),
                 terminate: SharedTlsPassthroughTable::new(),
@@ -1978,7 +1978,7 @@ mod tests {
     /// no index wired, so this is inert there.
     #[test]
     fn routing_applier_advances_publish_index_from_envelope_seq() {
-        let publish = coxswain_core::publish_index::SharedGatewayPublishIndex::new();
+        let publish = coxswain_core::publish_index::GatewayPublishIndexHandle::new();
         let (applier, _cells) = RoutingApplier::new();
         let mut applier = applier.with_publish_index(publish.clone());
 

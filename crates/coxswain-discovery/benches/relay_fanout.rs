@@ -68,10 +68,10 @@ use tonic::transport::{Endpoint, Server};
 use coxswain_core::dedicated_registry::{
     DedicatedRegistryData, DedicatedRoutingRegistry, DedicatedRoutingSnapshot,
 };
-use coxswain_core::listener_status::SharedGatewayListenerStatus;
-use coxswain_core::node_registry::SharedNodeRegistry;
+use coxswain_core::listener_status::GatewayListenerStatusHandle;
+use coxswain_core::node_registry::NodeRegistryHandle;
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::publish_index::SharedGatewayPublishIndex;
+use coxswain_core::publish_index::GatewayPublishIndexHandle;
 use coxswain_core::routing::{
     BackendGroup, GatewayRoutingTable, GatewayRoutingTableBuilder, IngressRoutingTable,
     IngressRoutingTableBuilder, PortTableBuilder, RouteEntry, SharedGatewayRoutingTable,
@@ -503,7 +503,7 @@ async fn run_server(world_size: usize, churn_rate: f64, scope: BenchScope) {
     let dedicated = source.dedicated.clone();
     let publish = source.publish.clone();
     let (rebuild_tx, rebuild_rx) = watch::channel(0u64);
-    let registry = SharedNodeRegistry::new();
+    let registry = NodeRegistryHandle::new();
 
     // No probe host at startup: idle-mode subscribers must never see a probe
     // marker (there's no churn event to time), and a churning world adds the
@@ -619,13 +619,13 @@ fn empty_source() -> SnapshotSource {
         gateway: SharedGatewayRoutingTable::new(),
         tls: SharedPortTlsStore::new(),
         client_certs: SharedClientCertStore::new(),
-        listener_status: SharedGatewayListenerStatus::new(),
+        listener_status: GatewayListenerStatusHandle::new(),
         dedicated: DedicatedRoutingRegistry::new(),
         passthrough_routes: SharedTlsPassthroughTable::new(),
         terminate_routes: SharedTlsPassthroughTable::new(),
         tcp_routes: SharedTcpRouteTable::new(),
         udp_routes: SharedUdpRouteTable::new(),
-        publish: SharedGatewayPublishIndex::new(),
+        publish: GatewayPublishIndexHandle::new(),
     }
 }
 

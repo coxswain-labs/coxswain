@@ -20,7 +20,8 @@ use super::relay_autoscaler::{
 };
 use super::relay_params::EffectiveRelayPolicy;
 use super::relay_reconcile::{
-    clamp_u32_to_i32, clamp_usize, delete_relay_resources, leadership_changed, registry_changed,
+    clamp_u32_to_i32, clamp_usize_to_u32, delete_relay_resources, leadership_changed,
+    registry_changed,
 };
 use super::render_relay::{self, RelayRenderInputs, RelayVariant};
 use super::render_shared_proxy::{SharedProxyRenderInputs, render_shared_proxy};
@@ -163,7 +164,7 @@ async fn converge_shared_pool(ctx: &ReconcileContext, now: Instant) {
             let snap = reg.load();
             (
                 snap.shared_pool_relay_ready(),
-                clamp_usize(snap.shared_pool_relay_subscriber_count()),
+                clamp_usize_to_u32(snap.shared_pool_relay_subscriber_count()),
             )
         }
         None => (false, 0),

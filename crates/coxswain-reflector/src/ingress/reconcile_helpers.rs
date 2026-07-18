@@ -278,7 +278,7 @@ pub(super) fn resolve_ext_auth_config(
 pub(super) fn resolve_jwt_auth_config(
     annotation: Option<&super::annotations::auth::SecretRef>,
     jwt_auths: &MergedStore<coxswain_core::crd::JwtAuth>,
-    jwks_cache: &crate::jwks::SharedJwksCache,
+    jwks_cache: &crate::jwks::JwksCacheHandle,
     route_id: &str,
 ) -> Option<IngressAuthConfig> {
     let r = annotation?;

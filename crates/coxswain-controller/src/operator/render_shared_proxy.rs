@@ -68,7 +68,7 @@ use super::render::{
 /// not from here.
 #[derive(Clone, Debug)]
 // intentionally open: field-literal constructed in crates/coxswain-bin/src/lib.rs from CLI args, same rationale as OperatorConfig (a closed marker would block that construction).
-pub struct SharedProxyConfig {
+pub struct ProxyPoolConfig {
     /// Whether the controller provisions the shared pool at all
     /// (`--shared-proxy-enabled`, default true). `false` short-circuits the
     /// install reconcile before any apply.
@@ -134,12 +134,12 @@ pub struct SharedProxyConfig {
 }
 
 /// The install-wide, environment-derived inputs the renderer needs beyond
-/// [`SharedProxyConfig`] — borrowed straight from the reconcile context so the
+/// [`ProxyPoolConfig`] — borrowed straight from the reconcile context so the
 /// shared pool inherits the controller's own ports, enablement, image, and
 /// discovery bootstrap material (one install, one source of truth).
 pub(crate) struct SharedProxyRenderInputs<'a> {
     /// The proxy-specific knob bundle.
-    pub config: &'a SharedProxyConfig,
+    pub config: &'a ProxyPoolConfig,
     /// The selector bridge (`--shared-proxy-selector`): the label set stamped on
     /// the pool's pods and used as the Deployment/internal-Service/PDB
     /// `spec.selector`. The same map backs the per-Gateway VIP Services and the
@@ -221,7 +221,7 @@ fn shared_proxy_metadata(
 }
 
 /// The internal Service name: `<name>-internal` (matches the Helm convention).
-fn internal_service_name(config: &SharedProxyConfig) -> String {
+fn internal_service_name(config: &ProxyPoolConfig) -> String {
     format!("{}-internal", config.name)
 }
 
@@ -237,7 +237,7 @@ fn render_shared_proxy_service_account(inputs: &SharedProxyRenderInputs<'_>) -> 
 /// Build the shared-proxy container's [`ResourceRequirements`]. Any empty string
 /// omits that entry; an all-empty set yields `None` (BestEffort). Unlike the
 /// relay, the shared proxy may carry a CPU limit (it is not the fan-out path).
-fn shared_proxy_resources(config: &SharedProxyConfig) -> Option<ResourceRequirements> {
+fn shared_proxy_resources(config: &ProxyPoolConfig) -> Option<ResourceRequirements> {
     let mut requests = BTreeMap::new();
     if !config.cpu_request.is_empty() {
         requests.insert("cpu".to_string(), Quantity(config.cpu_request.clone()));
@@ -615,8 +615,8 @@ mod tests {
         m
     }
 
-    fn config() -> SharedProxyConfig {
-        SharedProxyConfig {
+    fn config() -> ProxyPoolConfig {
+        ProxyPoolConfig {
             enabled: true,
             name: "coxswain-shared-proxy".to_string(),
             replicas: 1,
@@ -644,7 +644,7 @@ mod tests {
         }
     }
 
-    fn inputs(config: &SharedProxyConfig) -> SharedProxyRenderInputs<'_> {
+    fn inputs(config: &ProxyPoolConfig) -> SharedProxyRenderInputs<'_> {
         // Leak a selector so the returned inputs can borrow it for the test's
         // lifetime without threading a separate binding through every call site.
         let selector: &'static BTreeMap<String, String> = Box::leak(Box::new(selector()));

@@ -4,7 +4,7 @@
 //! [`ListenerReadiness`]) are kept here so the discovery wire layer can import
 //! them without pulling in the reflector crate.
 //!
-//! [`SharedGatewayListenerStatus`] is the `ArcSwap` + `watch` wrapper that the
+//! [`GatewayListenerStatusHandle`] is the `ArcSwap` + `watch` wrapper that the
 //! controller writes into and the proxy reads from. It lives here so
 //! `coxswain-discovery` can implement [`crate::RoutingSource`] without
 //! depending on `coxswain-reflector`.
@@ -760,7 +760,7 @@ pub struct GatewayListenerStatus {
     pub backend_client_cert: Option<BackendClientCertOutcome>,
 }
 
-// ── SharedGatewayListenerStatus ───────────────────────────────────────────────
+// ── GatewayListenerStatusHandle ───────────────────────────────────────────────
 
 struct GatewayListenerStatusInner {
     map: ArcSwap<HashMap<ObjectKey, GatewayListenerStatus>>,
@@ -781,15 +781,15 @@ struct GatewayListenerStatusInner {
 /// both requirements that `tokio::sync::Notify` cannot meet simultaneously.
 #[non_exhaustive]
 #[derive(Clone)]
-pub struct SharedGatewayListenerStatus(Arc<GatewayListenerStatusInner>);
+pub struct GatewayListenerStatusHandle(Arc<GatewayListenerStatusInner>);
 
-impl Default for SharedGatewayListenerStatus {
+impl Default for GatewayListenerStatusHandle {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SharedGatewayListenerStatus {
+impl GatewayListenerStatusHandle {
     /// Construct a new shared status map (initially empty, generation 0).
     pub fn new() -> Self {
         let (tx, _) = watch::channel(0u64);

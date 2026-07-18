@@ -7,10 +7,10 @@ use async_trait::async_trait;
 use clap::Parser;
 use coxswain_admin::{AdminServer, EventSources, OperatorAggregator};
 use coxswain_controller::{
-    BootstrapRejectHook, CaMode, ControllerConfig, IngressPorts, KubeTokenAuthenticator,
-    LeaseSettings, OperatorConfig, RELAY_DISCOVERY_PORT, RELAY_SERVICE_ACCOUNT,
-    SHARED_RELAY_SERVICE_ACCOUNT, SharedGatewayListenerStatus, StatusWriterConfig,
-    load_or_generate, spawn_status_writer, spawn_trust_publisher,
+    BootstrapRejectHook, CaMode, ControllerConfig, GatewayListenerStatusHandle, IngressPorts,
+    KubeTokenAuthenticator, LeaseSettings, OperatorConfig, RELAY_DISCOVERY_PORT,
+    RELAY_SERVICE_ACCOUNT, SHARED_RELAY_SERVICE_ACCOUNT, StatusWriterConfig, load_or_generate,
+    spawn_status_writer, spawn_trust_publisher,
 };
 use coxswain_core::health::{HealthRegistry, SubsystemHandle};
 use coxswain_core::identity::{SpiffeId, SvidIssuer};
@@ -27,8 +27,8 @@ use coxswain_discovery::{
 };
 use coxswain_proxy::{
     GatewayProxy, GrpcAuthChannelCache, IngressProxy, ListenerProtocol, ListenerSpec,
-    PassthroughConfig, ProxyAcceptor, RateLimiterRegistry, RoutingEngine, RoutingSource,
-    SharedProxyConfig, SniCertSelector, UpstreamCaCache,
+    PassthroughConfig, ProxyAcceptor, ProxyServices, RateLimiterRegistry, RoutingEngine,
+    RoutingSource, SniCertSelector, UpstreamCaCache,
 };
 use coxswain_reflector::{DebounceSettings, GatewayListenerStatus, ListenerReadiness, WatchScope};
 use pingora_core::apps::HttpServerOptions;
@@ -84,7 +84,7 @@ pub fn run() -> Result<()> {
         Role::Controller(controller_args) => run_controller(controller_args),
         Role::Proxy(proxy_args) => match proxy_args.scope() {
             ProxyScope::Shared => run_proxy_shared(proxy_args),
-            ProxyScope::Gateway { name, namespace } => {
+            ProxyScope::Dedicated { name, namespace } => {
                 run_proxy_gateway(proxy_args, name, namespace)
             }
         },
@@ -170,7 +170,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     // build, and consulted (with the node registry's acked sequences) by both
     // Programmed status writers as the ack half of the readiness gate.
     let publish_index = status_writer.reconciler.publish_index();
-    let node_registry = coxswain_core::node_registry::SharedNodeRegistry::new();
+    let node_registry = coxswain_core::node_registry::NodeRegistryHandle::new();
     let node_registry_for_agg = node_registry.clone();
     let node_registry_for_controller = node_registry.clone();
     let node_registry_for_operator = node_registry.clone();
@@ -487,7 +487,7 @@ fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
 /// Wire and run the `proxy --dedicated` pod role: read-only data plane scoped
 /// to one named Gateway.
 ///
-/// `gateway_name`/`gateway_namespace` are the `ProxyScope::Gateway` payload the
+/// `gateway_name`/`gateway_namespace` are the `ProxyScope::Dedicated` payload the
 /// caller already matched in [`run`] — passed in rather than re-derived via a
 /// second `args.scope()` call, which would re-clone both strings and force a
 /// dead `ProxyScope::Shared` arm that could only be reached by a caller bug.
@@ -578,7 +578,7 @@ fn run_relay(args: RelayRoleArgs) -> Result<()> {
     let relay_scope = args.scope();
     let (scope, scope_label) = match &relay_scope {
         RelayScope::Shared => (Scope::SharedPool, "shared".to_owned()),
-        RelayScope::Namespace { namespace } => (
+        RelayScope::Dedicated { namespace } => (
             Scope::Namespace {
                 namespace: namespace.clone(),
             },
@@ -605,7 +605,7 @@ fn run_relay(args: RelayRoleArgs) -> Result<()> {
     // leaves connect/ack/bind) is the SOURCE of the upstream `RosterReport`
     // (#585). It is retained here — unlike the controller, whose registry is the
     // gate's source of truth — precisely so the reporter below can watch it.
-    let node_registry = coxswain_core::node_registry::SharedNodeRegistry::new();
+    let node_registry = coxswain_core::node_registry::NodeRegistryHandle::new();
 
     // Roster channel: the reporter publishes the downstream registry snapshot;
     // the upstream client forwards it to the controller as a `RosterReport`.
@@ -631,7 +631,7 @@ fn run_relay(args: RelayRoleArgs) -> Result<()> {
         directive_tx,
     } = match &relay_scope {
         RelayScope::Shared => shared_relay(config, relay_handle.clone(), "routing_table_loaded")?,
-        RelayScope::Namespace { .. } => {
+        RelayScope::Dedicated { .. } => {
             namespace_relay(config, relay_handle.clone(), "routing_table_loaded")?
         }
     };
@@ -775,7 +775,7 @@ fn wire_gateway_only_proxy_services(
     common: &CommonArgs,
     proxy: &ProxyArgs,
     source: &dyn RoutingSource,
-    listener_status: &SharedGatewayListenerStatus,
+    listener_status: &GatewayListenerStatusHandle,
     bound_ports_tx: Option<watch::Sender<BTreeSet<u16>>>,
 ) -> Result<()> {
     let default_timeouts = RouteTimeouts {
@@ -793,7 +793,7 @@ fn wire_gateway_only_proxy_services(
         .use_rustls_tls()
         .build()
         .context("building the ext_authz sub-request HTTP client")?;
-    let cfg = SharedProxyConfig::new(
+    let cfg = ProxyServices::new(
         default_timeouts,
         ca_cache,
         proxy.access_log,
@@ -902,7 +902,7 @@ fn wire_proxy_services(
     common: &CommonArgs,
     proxy: &ProxyArgs,
     source: &dyn RoutingSource,
-    listener_status: &SharedGatewayListenerStatus,
+    listener_status: &GatewayListenerStatusHandle,
     bound_ports_tx: Option<watch::Sender<BTreeSet<u16>>>,
 ) -> Result<()> {
     let default_timeouts = RouteTimeouts {
@@ -922,7 +922,7 @@ fn wire_proxy_services(
         .context("building the ext_authz sub-request HTTP client")?;
     // Shared startup-time config for both proxy types.  Clone is cheap:
     // Arc pointer bumps + Copy/Clone values.
-    let mut shared_cfg = SharedProxyConfig::new(
+    let mut shared_cfg = ProxyServices::new(
         default_timeouts,
         ca_cache,
         proxy.access_log,
@@ -1081,7 +1081,7 @@ fn wire_proxy_services(
 
 // ── Listener spec adapter ─────────────────────────────────────────────────────
 
-/// Background service that watches [`SharedGatewayListenerStatus`] and
+/// Background service that watches [`GatewayListenerStatusHandle`] and
 /// publishes the derived `HashSet<ListenerSpec>` to a watch channel consumed
 /// by the [`ProxyAcceptor`].
 ///
@@ -1089,7 +1089,7 @@ fn wire_proxy_services(
 /// acceptor receives the first real spec set as soon as the reflector's
 /// initial reconcile completes.
 struct ListenerSpecsAdapter {
-    listener_status: SharedGatewayListenerStatus,
+    listener_status: GatewayListenerStatusHandle,
     bind_addr: IpAddr,
     /// Ports already owned by a static acceptor (ingress ports in the shared-proxy
     /// case) that must be excluded from the gateway-derived set to avoid conflicts.

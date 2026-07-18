@@ -22,9 +22,6 @@ use coxswain_core::routing::{BackendGroup, Selected};
 use crate::SniCertSelector;
 use crate::edge::accept::{AcceptorBuildError, build_tls_context, observe_tls_handshake};
 
-/// Buffer size for each direction of the TCP splice (~16 KiB).
-const SPLICE_BUF: usize = 16 * 1024;
-
 /// Terminate TLS on one accepted connection and splice the decrypted stream to
 /// `backend`.
 ///
@@ -122,8 +119,13 @@ pub(crate) async fn handle_terminate(
         }
     };
 
-    if let Err(e) =
-        copy_bidirectional_with_sizes(&mut downstream, &mut upstream, SPLICE_BUF, SPLICE_BUF).await
+    if let Err(e) = copy_bidirectional_with_sizes(
+        &mut downstream,
+        &mut upstream,
+        crate::edge::SPLICE_BUF,
+        crate::edge::SPLICE_BUF,
+    )
+    .await
     {
         debug!(
             peer = %peer_addr,
