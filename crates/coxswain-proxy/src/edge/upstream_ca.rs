@@ -231,9 +231,14 @@ impl BackendClientCertCache {
     }
 }
 
-/// Apply all `BackendTLSPolicy`-driven TLS material to `peer`: CA bundle,
-/// (when present) the GEP-3155 backend client certificate, and (when present)
-/// the GEP-1897 `subjectAltNames` identity check.
+/// Apply all upstream-TLS material to `peer` — the single site for upstream-TLS
+/// peer mutation (CLAUDE.md). Sets `verify_cert` / `verify_hostname` / `group_key`,
+/// then (when a `BackendTLSPolicy` is attached) the CA bundle, the GEP-3155 backend
+/// client certificate, and the GEP-1897 `subjectAltNames` identity check.
+///
+/// `btls` is `None` for a cleartext upstream: hostname/cert verification is turned
+/// off and the function returns early. The caller still builds the `HttpPeer` with
+/// its SNI hostname, because the `HttpPeer::new` constructor takes ownership of it.
 ///
 /// All three caches ensure the crypto work runs at most once per distinct
 /// `group_key`; subsequent connections return the cached parsed objects.
@@ -252,11 +257,20 @@ impl BackendClientCertCache {
 /// Returns a `502` error when either PEM fails to parse.
 pub(crate) fn apply_upstream_tls(
     peer: &mut HttpPeer,
-    btls: &UpstreamTls,
+    btls: Option<&UpstreamTls>,
     ca_cache: &UpstreamCaCache,
     client_cert_cache: &BackendClientCertCache,
     san_hook_cache: &SanCheckHookCache,
 ) -> Result<()> {
+    // Verify TLS iff a BackendTLSPolicy originates it; cleartext upstreams turn
+    // both checks off and return before touching any cache.
+    let is_tls = btls.is_some();
+    peer.options.verify_cert = is_tls;
+    peer.options.verify_hostname = is_tls;
+    let Some(btls) = btls else {
+        return Ok(());
+    };
+    peer.group_key = btls.group_key;
     if let UpstreamCa::Bundle(pem) = &btls.ca {
         let ca = ca_cache.get_or_parse(btls.group_key, pem).ok_or_else(|| {
             pingora_core::Error::explain(HTTPStatus(502), "BackendTLSPolicy CA bundle parse failed")

@@ -87,11 +87,17 @@ impl TrafficFilter {
                         rewrite::rewrite_path(upstream_request, pm, original_path);
                     }
                 }
-                // Redirect and response filters are handled elsewhere.
-                FilterAction::RequestRedirect { .. } | FilterAction::ResponseHeaderModifier(_) => {}
-                // Skip unknown filter variants — new types added to the core crate
-                // are handled by the proxy once explicitly wired.
-                _ => {}
+                // Handled in other hooks, never on the upstream request-forward
+                // path: RequestRedirect short-circuits in `request_filter`
+                // (`try_redirect`), ResponseHeaderModifier/Cors act on the
+                // response, and Mirror is set up in `request_filter`. Listed
+                // explicitly (no wildcard) so a new `FilterAction` variant is a
+                // compile error here, not a silent drop — `FilterAction` is a
+                // deliberately-closed enum for exactly this reason.
+                FilterAction::RequestRedirect { .. }
+                | FilterAction::ResponseHeaderModifier(_)
+                | FilterAction::Mirror { .. }
+                | FilterAction::Cors(_) => {}
             }
         }
 
@@ -153,7 +159,13 @@ impl TrafficFilter {
                             .insert_header(hdr::ACCESS_CONTROL_EXPOSE_HEADERS, expose.clone());
                     }
                 }
-                _ => {}
+                // Not applicable to the response path — request-side filters and
+                // redirects act elsewhere. Listed explicitly (no wildcard) so a new
+                // `FilterAction` variant is a compile error here, not a silent drop.
+                FilterAction::RequestHeaderModifier(_)
+                | FilterAction::RequestRedirect { .. }
+                | FilterAction::UrlRewrite { .. }
+                | FilterAction::Mirror { .. } => {}
             }
         }
     }
