@@ -94,13 +94,21 @@ Wait for user approval before writing any code.
 git checkout -b issue-N
 ```
 
-Implement per the approved plan. After each meaningful chunk:
+Implement per the approved plan. Iterate per chunk with a **scoped, cheap** check — do not run the full clippy+test suite after every chunk:
 
 ```bash
 cargo fmt
-cargo clippy --workspace --exclude coxswain-e2e
+cargo check -p <changed-crate>        # --workspace only for cross-crate edits
+```
+
+Run the full gate **once, at the end** (before the commit checkpoint), each command a single time:
+
+```bash
+cargo clippy --workspace --all-targets --exclude coxswain-e2e -- -D warnings
 cargo test --workspace --exclude coxswain-e2e
 ```
+
+`clippy` subsumes `check`, and the subcommands don't share build artifacts — so a standalone `check` before `clippy`, or per-chunk full runs, are wasted multi-minute rebuilds.
 
 Every clippy warning is a blocker. Fix the root cause — never silence with `#[allow(...)]`. For upstream-imposed names that trip a lint, re-export with a project-canonical alias at the crate boundary.
 

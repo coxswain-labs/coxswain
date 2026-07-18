@@ -3,6 +3,8 @@
 //! the request lifecycle applies before forwarding upstream.
 
 use coxswain_core::routing::ForwardedForConfig;
+use pingora_core::Result;
+use pingora_http::ResponseHeader;
 use pingora_proxy::Session;
 
 /// Private and reserved IP ranges that are never treated as a real client IP when
@@ -146,6 +148,55 @@ pub(crate) fn ip_denied(client_ip: Option<std::net::IpAddr>, nets: &[ipnet::IpNe
         let ip = ip.to_canonical();
         nets.iter().any(|n| n.contains(&ip))
     })
+}
+
+/// Enforce a route's source-IP deny-list then allow-list (from an
+/// `IpAccessControl` reference, #553), writing `403 Forbidden` and returning
+/// `Ok(true)` on a block.
+///
+/// The deny-list is evaluated first: a denied IP is blocked even when the
+/// allow-list would admit it. Both checks fail open on a `None` client IP per
+/// [`ip_denied`] / [`ip_allowed`]. The response is written explicitly via
+/// `write_response_header` rather than `Err(Error::explain(...))` because
+/// Pingora's generic `fail_to_proxy` path does not reliably deliver a
+/// client-visible response over HTTP/2, while the low-level write works on both
+/// HTTP/1.1 and HTTP/2.
+///
+/// Returns `Ok(false)` when the request is allowed to proceed.
+///
+/// # Errors
+///
+/// Returns an error only if building the `403` response header fails; the write
+/// itself is logged, not propagated.
+pub(crate) async fn enforce_ip_access(
+    session: &mut Session,
+    deny_nets: Option<&[ipnet::IpNet]>,
+    allow_nets: Option<&[ipnet::IpNet]>,
+    client_ip: Option<std::net::IpAddr>,
+) -> Result<bool> {
+    if let Some(nets) = deny_nets
+        && ip_denied(client_ip, nets)
+    {
+        write_forbidden(session, "deny-list").await?;
+        return Ok(true);
+    }
+    if let Some(nets) = allow_nets
+        && !ip_allowed(client_ip, nets)
+    {
+        write_forbidden(session, "allow-list").await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Write a bodyless `403 Forbidden`, logging (not propagating) a write failure.
+async fn write_forbidden(session: &mut Session, which: &str) -> Result<()> {
+    let resp = ResponseHeader::build(403, Some(0))?;
+    session
+        .write_response_header(Box::new(resp), true)
+        .await
+        .unwrap_or_else(|e| tracing::error!("failed to write {which} response: {e}"));
+    Ok(())
 }
 
 #[cfg(test)]

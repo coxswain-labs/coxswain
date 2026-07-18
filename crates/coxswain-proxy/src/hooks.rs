@@ -31,24 +31,22 @@
 
 use crate::config::AccessLogPathMode;
 use crate::ctx::{CONN_INFO, ProxyCtx, ResolvedRoute};
-use crate::edge::tls::ConnTlsInfo;
-use crate::edge::upstream_ca::{
-    BackendClientCertCache, SanCheckHookCache, UpstreamCaCache, UpstreamSanMismatch,
-    apply_upstream_tls,
-};
+use crate::edge::upstream_ca::{UpstreamSanMismatch, apply_upstream_tls};
 use crate::filters::TrafficFilter;
 use crate::filters::cors::try_cors_preflight;
 use crate::filters::redirect::{extract_host, try_redirect};
-use crate::policy::access_control::{ip_allowed, ip_denied, resolve_client_ip};
+use crate::policy::access_control::{enforce_ip_access, resolve_client_ip};
 use crate::policy::affinity;
+use crate::policy::client_cert::{enforce_client_cert, forward_client_cert};
+use crate::policy::misdirected::check_misdirected;
+use crate::policy::rate_limit::enforce_rate_limit;
 use crate::retry::RetryTrigger;
 use crate::routing::engine::RoutingEngine;
 use crate::routing::outcome::{merge_timeouts, resolve_outcome};
 use bytes::Bytes;
 use coxswain_core::routing::{
-    HashSource, RateLimitKey, RequestContext, SessionAffinity, affinity_hash, affinity_hash_parts,
+    HashSource, RequestContext, SessionAffinity, affinity_hash, affinity_hash_parts,
 };
-use coxswain_core::tls::ClientCertConfigState;
 use http::header;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::{Error, HTTPStatus, Result};
@@ -170,34 +168,9 @@ pub(crate) async fn request_filter<K>(
         })
         .unwrap_or(0);
 
-    // ── GEP-3567 misdirected-request guard (#96) ────────────────────────────
-    //
-    // On HTTPS ports that carry named Gateway listeners, return 421 when the
-    // request Host resolves to a different listener than the one selected by
-    // the negotiated TLS SNI.  This blocks HTTP/2 connection coalescing from
-    // sending a request for host B over a connection whose certificate and
-    // listener were negotiated for a disjoint host A.
-    //
-    // The check is a no-op for: plain-HTTP requests, Ingress-only deployments,
-    // and ports with no HTTPS Gateway listeners (`has_https_port` miss →
-    // `listener_hostnames` default empty snapshot).
-    if proto == "https" {
-        let lh = cfg.listener_hostnames.load();
-        if lh.has_https_port(port) {
-            let sni = session
-                .as_downstream()
-                .digest()
-                .and_then(|d| d.ssl_digest.as_ref())
-                .and_then(|d| d.extension.get::<ConnTlsInfo>())
-                .and_then(|t| t.sni.as_deref());
-            if lh.resolve_sni(port, sni) != lh.resolve(port, &host) {
-                return Err(pingora_core::Error::explain(
-                    HTTPStatus(421),
-                    "request host resolves to a different listener than the negotiated SNI",
-                ));
-            }
-        }
-    }
+    // GEP-3567 misdirected-request guard (#96): 421 when the request Host and the
+    // negotiated SNI resolve to different Gateway listeners on an HTTPS port.
+    check_misdirected(session, &cfg.listener_hostnames, port, &host, proto)?;
 
     let outcome = {
         let route_ctx = RequestContext {
@@ -230,130 +203,39 @@ pub(crate) async fn request_filter<K>(
     // addr or L4 peer is used directly.  All IP-based features below read ctx.client_ip.
     ctx.client_ip = resolve_client_ip(session, ctx.real_client_addr, m.forwarded_for.as_deref());
 
-    // ── Per-Ingress client-certificate mTLS cross-SNI guard (#267) ──────────────
-    //
-    // If this Host requires mTLS, the connection MUST carry a verified client cert in the
-    // `ConnTlsInfo` stored in the TLS digest extension. A TLS connection whose SNI matched
-    // a different (non-mTLS) host will have no peer cert; return 421 Misdirected Request
-    // so the client reconnects on the correct SNI, which will trigger the mTLS handshake.
-    // Plain-HTTP connections (no ssl_digest) are exempt — the operator forces HTTPS via
-    // `ssl-redirect`.
-    //
-    // GEP-91 AllowInsecureFallback (#86): when the host's frontend validation runs in
-    // insecure-fallback mode, the client cert is requested but a missing/invalid cert is
-    // NOT rejected here — authorization is delegated to the backend. The TLS layer already
-    // allowed the handshake to complete without a cert (`set_verify_callback`), so this
-    // HTTP-layer guard must mirror that and let the request through.
-    {
-        let cc_store = cfg.client_certs.load();
-        if let Some(config_state) = cc_store.find_config(port, &host) {
-            let ssl_digest = session
-                .as_downstream()
-                .digest()
-                .and_then(|d| d.ssl_digest.as_ref());
-            if let Some(ssl_digest) = ssl_digest {
-                let cert_info = ssl_digest
-                    .extension
-                    .get::<ConnTlsInfo>()
-                    .and_then(|t| t.client_cert.as_ref());
-                let insecure_fallback = matches!(
-                    config_state.as_ref(),
-                    ClientCertConfigState::Config(cc) if cc.allow_insecure_fallback
-                );
-                if cert_info.is_none() && !insecure_fallback {
-                    return Err(pingora_core::Error::explain(
-                        HTTPStatus(421),
-                        "client certificate required for this host",
-                    ));
-                }
-                if let ClientCertConfigState::Config(cc_cfg) = config_state.as_ref()
-                    && cc_cfg.pass_to_upstream
-                    && let Some(ci) = cert_info
-                {
-                    ctx.client_cert_header = Some(ci.forward_header.clone());
-                }
-            }
-        }
-    }
+    // Per-Ingress client-certificate mTLS cross-SNI guard (#267): 421 when the
+    // host mandates mTLS but the connection presented no verified client cert;
+    // stashes the forward header on `ctx` when `pass_to_upstream` is set.
+    enforce_client_cert(session, &cfg.client_certs, port, &host, ctx)?;
 
-    // Per-route source-IP block list, from an `IpAccessControl` reference —
-    // Ingress `ip-access-control` annotation or Gateway API `ExtensionRef` (#553).
-    // Evaluated BEFORE the allow-list: a denied IP is blocked even when the allow-list
-    // would admit it. A None client IP is fail-open (not denied) — a block list only
-    // acts on IPs it can positively attribute to a listed range.
-    //
-    // Written explicitly via `session.write_response_header` (like the rate-limit
-    // block below) rather than returned as `Err(Error::explain(...))`: Pingora's
-    // generic `fail_to_proxy` error path does not reliably deliver a client-visible
-    // response over HTTP/2 (confirmed via a gRPC client hanging instead of observing
-    // 403 → PermissionDenied), while the explicit low-level write works on both
-    // HTTP/1.1 and HTTP/2.
-    if let Some(nets) = m.deny_source_range.as_deref() {
-        let client_ip = ctx.client_ip;
-        if ip_denied(client_ip, nets) {
-            let resp = ResponseHeader::build(403, Some(0))?;
-            session
-                .write_response_header(Box::new(resp), true)
-                .await
-                .unwrap_or_else(|e| tracing::error!("failed to write deny-list response: {e}"));
-            return Ok(true);
-        }
-    }
-
-    // Per-route source-IP allow-list, from the same `IpAccessControl` reference
-    // as the deny-list above (#553).
-    // Access control runs ahead of redirect and body handling — so a denied client
-    // never receives a redirect (which would leak the canonical host/URL) nor has
-    // its body read. The real client IP is resolved once by resolve_client_ip (above)
-    // and cached on ctx — no per-request allocation for the CIDR scan.
-    //
-    // Written explicitly for the same HTTP/2 reason as the deny-list block above.
-    if let Some(nets) = m.allow_source_range.as_deref()
-        && !ip_allowed(ctx.client_ip, nets)
+    // Per-route source-IP access control (#553): deny-list then allow-list,
+    // ahead of redirect and body handling so a blocked client never receives a
+    // redirect (which would leak the canonical host/URL) nor has its body read.
+    if enforce_ip_access(
+        session,
+        m.deny_source_range.as_deref(),
+        m.allow_source_range.as_deref(),
+        ctx.client_ip,
+    )
+    .await?
     {
-        let resp = ResponseHeader::build(403, Some(0))?;
-        session
-            .write_response_header(Box::new(resp), true)
-            .await
-            .unwrap_or_else(|e| tracing::error!("failed to write allow-list response: {e}"));
         return Ok(true);
     }
 
-    // Per-route rate limiting. Enforcement runs after allow-list (denied clients
-    // never consume a rate-limit slot) and before redirect (a rate-limited client
-    // does not receive a redirect, preventing URL leakage). Fail-open on absent
-    // client key (undeterminable IP or missing header) — matches nginx + Envoy.
-    if let Some(rl_config) = m.rate_limit.as_deref() {
-        let client_ip = ctx.client_ip;
-        let client_key = {
-            // Scope the immutable req borrow so it does not outlive the next mutable
-            // session borrow (write_response_header below).
-            let req = session.req_header();
-            let header_val = if let RateLimitKey::Header(name) = &rl_config.key {
-                req.headers.get(name.as_ref()).and_then(|v| v.to_str().ok())
-            } else {
-                None
-            };
-            crate::policy::rate_limit::extract_client_key(rl_config, client_ip, header_val)
-        };
-        if let Some(key) = client_key
-            && let crate::policy::rate_limit::CheckOutcome::Limited { retry_after_secs } =
-                cfg.rate_limiter.check(&m.metric_route_id, rl_config, key)
-        {
-            let mut resp = ResponseHeader::build(429, Some(1))?;
-            // Render the u16 Retry-After into a stack buffer — matches the
-            // file's itoa label discipline, no heap allocation (#397).
-            let mut retry_after_buf = itoa::Buffer::new();
-            resp.insert_header(
-                header::RETRY_AFTER,
-                retry_after_buf.format(retry_after_secs),
-            )?;
-            session
-                .write_response_header(Box::new(resp), true)
-                .await
-                .unwrap_or_else(|e| tracing::error!("failed to write rate-limit response: {e}"));
-            return Ok(true);
-        }
+    // Per-route rate limiting. Runs after the allow-list (blocked clients never
+    // consume a slot) and before redirect (a limited client does not receive a
+    // redirect leaking the canonical URL). Fail-open on an absent client key.
+    if let Some(rl_config) = m.rate_limit.as_deref()
+        && enforce_rate_limit(
+            session,
+            rl_config,
+            &cfg.rate_limiter,
+            &m.metric_route_id,
+            ctx.client_ip,
+        )
+        .await?
+    {
+        return Ok(true);
     }
 
     // Per-route external auth (#24, #23). The additive chain runs in order — a
@@ -601,12 +483,17 @@ pub(crate) fn request_body_filter(
 /// failures (no resolved route, no active endpoints, expired deadline, bad
 /// `BackendTLSPolicy` CA bundle).
 pub(crate) async fn upstream_peer(
-    ca_cache: &UpstreamCaCache,
-    backend_client_cert_cache: &BackendClientCertCache,
-    san_hook_cache: &SanCheckHookCache,
-    circuit_breakers: &crate::policy::circuit_breaker::CircuitBreakerRegistry,
+    cfg: &crate::config::ProxyServices,
     ctx: &mut ProxyCtx,
 ) -> Result<Box<HttpPeer>> {
+    // `ProxyServices` is the parameter-grouping struct CLAUDE.md prescribes:
+    // take it whole (as `request_filter` does) rather than widening the
+    // signature one field per feature. Bind the fields this hook uses as refs.
+    let ca_cache = &cfg.ca_cache;
+    let backend_client_cert_cache = &cfg.backend_client_cert_cache;
+    let san_hook_cache = &cfg.san_hook_cache;
+    let circuit_breakers = &cfg.circuit_breakers;
+
     let resolved = ctx.resolved.as_ref().ok_or_else(|| {
         pingora_core::Error::explain(HTTPStatus(500), "routing not resolved before upstream_peer")
     })?;
@@ -679,29 +566,26 @@ pub(crate) async fn upstream_peer(
     // Upstream TLS is originated solely by a BackendTLSPolicy (GEP-1897); the
     // `appProtocol`-derived protocol carries no TLS semantics.
     let btls_opt = resolved.backend_group.upstream_tls();
-    let (is_tls, sni_host, group_key) = if let Some(btls) = btls_opt {
+    let (is_tls, sni_host) = if let Some(btls) = btls_opt {
         // SNI must be an owned `String`: `HttpPeer::new` takes ownership, so a
         // fresh allocation is unavoidable here regardless of any cache (#397).
         // This is once per outbound TLS connection, not per request.
-        (true, btls.sni.to_string(), btls.group_key)
+        (true, btls.sni.to_string())
     } else {
-        (false, String::new(), 0u64)
+        (false, String::new())
     };
 
     // Pass SocketAddr directly — avoids the per-request addr.to_string() allocation.
+    // All TLS/verify/group_key mutation happens in `apply_upstream_tls` (CLAUDE.md):
+    // the constructor takes only the SNI it must own.
     let mut peer = HttpPeer::new(addr, is_tls, sni_host);
-    peer.group_key = group_key;
-    peer.options.verify_cert = is_tls;
-    peer.options.verify_hostname = is_tls;
-    if let Some(btls) = btls_opt {
-        apply_upstream_tls(
-            &mut peer,
-            btls,
-            ca_cache,
-            backend_client_cert_cache,
-            san_hook_cache,
-        )?;
-    }
+    apply_upstream_tls(
+        &mut peer,
+        btls_opt.map(AsRef::as_ref),
+        ca_cache,
+        backend_client_cert_cache,
+        san_hook_cache,
+    )?;
     if protocol.is_h2() {
         peer.options.set_http_version(2, 2);
     }
@@ -880,17 +764,9 @@ pub(crate) async fn upstream_request_filter(
         }
     }
 
-    // Verified client-certificate forwarding (#267): when the Ingress annotation
-    // `auth-tls-pass-certificate-to-upstream: "true"` is set and a client cert was
-    // verified at the TLS handshake, forward its PEM as `X-SSL-Client-Cert`
-    // (URL-encoded, per nginx-ingress convention). The value is percent-encoded
-    // once per connection (see `edge::tls::ClientCertInfo`), so this is a cheap
-    // `HeaderValue` clone. Applied after auth-response headers so auth-service
-    // overrides cannot clobber it. `.take()` clears the field so the header is
-    // never duplicated on retries.
-    if let Some(hv) = ctx.client_cert_header.take() {
-        let _ = upstream_request.insert_header("x-ssl-client-cert", hv);
-    }
+    // Verified client-certificate forwarding (#267): applied after auth-response
+    // headers so auth-service overrides cannot clobber it.
+    forward_client_cert(upstream_request, ctx);
 
     Ok(())
 }

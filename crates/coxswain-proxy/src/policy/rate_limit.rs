@@ -20,6 +20,11 @@
 //! high-cardinality client key space.
 
 use coxswain_core::routing::{RateLimitConfig, RateLimitKey};
+use http::header;
+use pingora_core::Result;
+use pingora_http::ResponseHeader;
+use pingora_proxy::Session;
+
 use governor::clock::{Clock, DefaultClock};
 use governor::state::keyed::DashMapStateStore;
 use governor::{Quota, RateLimiter};
@@ -183,6 +188,61 @@ pub(crate) fn extract_client_key(
         RateLimitKey::ClientIp => client_ip.map(ClientKey::Ip),
         RateLimitKey::Header(_) => header_value.map(|v| ClientKey::Header(Box::from(v))),
     }
+}
+
+/// Enforce a route's rate limit, writing `429 Too Many Requests` (with a
+/// stack-rendered `Retry-After`) and returning `Ok(true)` when the client is
+/// limited.
+///
+/// Fail-open on an absent client key (undeterminable IP or missing header):
+/// such requests are not counted and proceed. Extracts the header-keyed value
+/// before the mutable session borrow required to write the response.
+///
+/// Returns `Ok(false)` when the request is within its limit.
+///
+/// # Errors
+///
+/// Returns an error only if building the `429` response header (or inserting
+/// `Retry-After`) fails; the write itself is logged, not propagated.
+pub(crate) async fn enforce_rate_limit(
+    session: &mut Session,
+    rl_config: &RateLimitConfig,
+    rate_limiter: &RateLimiterRegistry,
+    metric_route_id: &Arc<str>,
+    client_ip: Option<IpAddr>,
+) -> Result<bool> {
+    let client_key = {
+        // Scope the immutable req borrow so it does not outlive the next mutable
+        // session borrow (write_response_header below).
+        let req = session.req_header();
+        let header_val = if let RateLimitKey::Header(name) = &rl_config.key {
+            req.headers.get(name.as_ref()).and_then(|v| v.to_str().ok())
+        } else {
+            None
+        };
+        extract_client_key(rl_config, client_ip, header_val)
+    };
+    let Some(key) = client_key else {
+        return Ok(false);
+    };
+    let CheckOutcome::Limited { retry_after_secs } =
+        rate_limiter.check(metric_route_id, rl_config, key)
+    else {
+        return Ok(false);
+    };
+    let mut resp = ResponseHeader::build(429, Some(1))?;
+    // Render the u16 Retry-After into a stack buffer — matches the hot path's
+    // itoa label discipline, no heap allocation (#397).
+    let mut retry_after_buf = itoa::Buffer::new();
+    resp.insert_header(
+        header::RETRY_AFTER,
+        retry_after_buf.format(retry_after_secs),
+    )?;
+    session
+        .write_response_header(Box::new(resp), true)
+        .await
+        .unwrap_or_else(|e| tracing::error!("failed to write rate-limit response: {e}"));
+    Ok(true)
 }
 
 #[cfg(test)]
