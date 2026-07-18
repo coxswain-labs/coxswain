@@ -33,7 +33,9 @@ use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
 use k8s_openapi::api::networking::v1::Ingress;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -1219,6 +1221,149 @@ async fn shared_gateway_removes_infra_label_from_service_account_on_spec_edit() 
     )
     .await?;
 
+    Ok(())
+}
+
+// ── GEP-1713 ListenerSet port provisioning (#93) ─────────────────────────────
+//
+// #93 makes an attached ListenerSet's listeners drive internal-port allocation
+// and the per-Gateway VIP Service ports, exactly like the Gateway's own
+// listeners. `routing.rs` covers that a route on a ListenerSet's new port serves
+// traffic; these two assert the *provisioning* half from the Service object:
+// the new port becomes a ServicePort with an allocated internal targetPort, and
+// attaching a ListenerSet does not remap the live Gateway listener's port (the
+// #529 authoritative-read invariant, via ListenerSet attach rather than the
+// Gateway churn that `resilience.rs` exercises).
+
+/// The owning-Gateway namespace label the shared VIP Service carries.
+const GATEWAY_NAMESPACE_LABEL: &str = "gateway.coxswain-labs.dev/gateway-namespace";
+/// Advertised port of the ListenerSet listener in the attach fixture.
+const LS_ATTACH_PORT: u16 = 8001;
+
+/// `advertised port → internal targetPort` for the shared-mode VIP Service of
+/// `(gw_ns, gw_name)`. The VIP lives in the controller namespace with a hashed
+/// name, so locate it by its gateway-name + gateway-namespace labels (as the
+/// GEP-1867 conformance lister does). Only ports with an allocated integer
+/// `targetPort` are returned; a port mid-allocation is simply absent.
+async fn shared_vip_ports(
+    h: &Harness,
+    gw_ns: &str,
+    gw_name: &str,
+) -> anyhow::Result<Option<BTreeMap<u16, i32>>> {
+    let svcs: Api<Service> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    let lp = ListParams::default().labels(&format!(
+        "{GATEWAY_NAME_LABEL}={gw_name},{GATEWAY_NAMESPACE_LABEL}={gw_ns}"
+    ));
+    let Some(svc) = svcs.list(&lp).await?.items.into_iter().next() else {
+        return Ok(None);
+    };
+    let Some(ports) = svc.spec.and_then(|s| s.ports) else {
+        return Ok(None);
+    };
+    let mut out = BTreeMap::new();
+    for p in ports {
+        let Ok(port) = u16::try_from(p.port) else {
+            continue;
+        };
+        if let Some(IntOrString::Int(target)) = p.target_port {
+            out.insert(port, target);
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Poll until the shared VIP Service for `(gw_ns, gw_name)` exposes `port` with
+/// an allocated internal `targetPort`, returning that internal port.
+async fn wait_for_vip_port(
+    h: &Harness,
+    gw_ns: &str,
+    gw_name: &str,
+    port: u16,
+) -> anyhow::Result<i32> {
+    wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async {
+            format!(
+                "shared VIP Service for {gw_ns}/{gw_name} to expose port {port} \
+                 with an allocated internal targetPort"
+            )
+        },
+        || async {
+            shared_vip_ports(h, gw_ns, gw_name)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|m| m.get(&port).copied())
+        },
+    )
+    .await
+}
+
+/// Happy path — attaching a ListenerSet that adds a new port makes that port a
+/// ServicePort on the VIP with its own allocated internal port, distinct from
+/// the Gateway listener's.
+#[tokio::test]
+async fn listenerset_new_port_provisions_serviceport_and_internal_port() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-ls-newport").await?;
+
+    // Base: a shared Gateway on the Gateway HTTP port, opted into same-ns ListenerSets.
+    fixtures::apply_fixture(gwa::LISTENERSET_PROVISION_BASE, FixtureVars::new(&ns.name)).await?;
+    let base =
+        wait_for_vip_port(&h, &ns.name, "coxswain-test", bootstrap::GATEWAY_HTTP_PORT).await?;
+
+    // Attach a ListenerSet adding a NEW port (8001) the Gateway does not serve.
+    fixtures::apply_fixture(
+        gwa::LISTENERSET_PROVISION_ATTACH,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let ls = wait_for_vip_port(&h, &ns.name, "coxswain-test", LS_ATTACH_PORT).await?;
+
+    assert_ne!(
+        ls, base,
+        "the attached ListenerSet port {LS_ATTACH_PORT} must get its own internal port, \
+         distinct from the Gateway listener's ({base})"
+    );
+    Ok(())
+}
+
+/// Sad path (no-remap) — attaching a ListenerSet must not remap the live Gateway
+/// listener's already-allocated internal port. This is the ListenerSet-attach
+/// variant of the #529 authoritative-read invariant that `resilience.rs` only
+/// covers for Gateway churn.
+#[tokio::test]
+async fn listenerset_attach_preserves_live_gateway_internal_ports() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-ls-noremap").await?;
+
+    // A live shared Gateway: its listener is allocated an internal port first.
+    fixtures::apply_fixture(gwa::LISTENERSET_PROVISION_BASE, FixtureVars::new(&ns.name)).await?;
+    let before =
+        wait_for_vip_port(&h, &ns.name, "coxswain-test", bootstrap::GATEWAY_HTTP_PORT).await?;
+
+    // Attach a ListenerSet adding a new port, then wait for that port to land so
+    // the allocation pass that processed the attach has completed.
+    fixtures::apply_fixture(
+        gwa::LISTENERSET_PROVISION_ATTACH,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let ls = wait_for_vip_port(&h, &ns.name, "coxswain-test", LS_ATTACH_PORT).await?;
+
+    // The Gateway listener's internal port is unchanged after the attach.
+    let after =
+        wait_for_vip_port(&h, &ns.name, "coxswain-test", bootstrap::GATEWAY_HTTP_PORT).await?;
+    assert_eq!(
+        after, before,
+        "attaching a ListenerSet must not remap the Gateway listener's internal port \
+         (was {before}, now {after})"
+    );
+    assert_ne!(
+        ls, before,
+        "the new ListenerSet port must get its own distinct internal port"
+    );
     Ok(())
 }
 

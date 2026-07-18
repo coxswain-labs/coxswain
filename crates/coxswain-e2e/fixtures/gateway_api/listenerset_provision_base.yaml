@@ -1,0 +1,22 @@
+---
+# GEP-1713 provisioning base: a shared Gateway opting into same-namespace
+# ListenerSets, WITHOUT any ListenerSet yet. Its own listener is on the in-cluster
+# Gateway HTTP port. Pair with the attach fixture, which adds a ListenerSet on a
+# new port on top of this — used to assert that attaching a ListenerSet both
+# provisions the new port and leaves the Gateway listener's internal port unmoved.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test
+spec:
+  gatewayClassName: coxswain
+  allowedListeners:
+    namespaces:
+      from: Same
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same

@@ -98,6 +98,39 @@ pub(crate) struct EffectiveGateway {
     pub listeners: Vec<EffectiveListener>,
 }
 
+/// A one-shot snapshot of the cluster Namespace store for a single merge pass.
+///
+/// `merge_effective_gateways` materialises the store's `state()` exactly once and
+/// threads this view instead of calling `.state()` deep in the per-listener call
+/// tree. A single-namespace label lookup (`labels`) is O(1) through `by_name`; the
+/// `allowedRoutes` selector scan reuses the shared `snapshot` slice rather than
+/// re-cloning every `Arc<Namespace>` per listener.
+struct NamespaceView<'a> {
+    /// Every namespace, materialised once — iterated by the selector scan.
+    snapshot: &'a [std::sync::Arc<Namespace>],
+    /// `name → namespace` index for O(1) single-namespace lookups.
+    by_name: HashMap<&'a str, &'a Namespace>,
+}
+
+impl<'a> NamespaceView<'a> {
+    /// Index `snapshot` by namespace name (unnamed namespaces are skipped).
+    fn new(snapshot: &'a [std::sync::Arc<Namespace>]) -> Self {
+        let by_name = snapshot
+            .iter()
+            .filter_map(|ns| Some((ns.metadata.name.as_deref()?, ns.as_ref())))
+            .collect();
+        Self { snapshot, by_name }
+    }
+
+    /// Labels of namespace `name` (O(1)); empty when absent or unlabelled.
+    fn labels(&self, name: &str) -> std::collections::BTreeMap<String, String> {
+        self.by_name
+            .get(name)
+            .and_then(|ns| ns.metadata.labels.clone())
+            .unwrap_or_default()
+    }
+}
+
 /// Build the effective listener set for every owned Gateway (GEP-1713).
 ///
 /// Seeds each owned Gateway with its own listeners, attaches each ListenerSet's
@@ -110,6 +143,11 @@ pub(crate) fn merge_effective_gateways(
     owned_gateway_classes: &std::collections::HashSet<String>,
     namespaces: &MergedStore<Namespace>,
 ) -> HashMap<ObjectKey, EffectiveGateway> {
+    // Materialise the Namespace store ONCE per merge; every namespace lookup and
+    // selector scan below reads this view, never `namespaces.state()` again.
+    let ns_snapshot = namespaces.state();
+    let namespaces = NamespaceView::new(&ns_snapshot);
+
     // 1. Seed owned Gateways with their own listeners.
     let mut effective: HashMap<ObjectKey, EffectiveGateway> = HashMap::new();
     for gw in gateways {
@@ -125,7 +163,7 @@ pub(crate) fn merge_effective_gateways(
             .spec
             .listeners
             .iter()
-            .map(|l| from_gateway_listener(l, &ns, namespaces))
+            .map(|l| from_gateway_listener(l, &ns, &namespaces))
             .collect();
         effective.insert(
             key,
@@ -151,7 +189,7 @@ pub(crate) fn merge_effective_gateways(
         let Some(parent_gw) = effective.get(&parent) else {
             continue;
         };
-        if !listener_set_allowed(&parent_gw.gateway, ls_ns, namespaces) {
+        if !listener_set_allowed(&parent_gw.gateway, ls_ns, &namespaces) {
             continue;
         }
         by_parent
@@ -163,11 +201,10 @@ pub(crate) fn merge_effective_gateways(
     // 3. Append each parent's ListenerSets in precedence order
     //    (creationTimestamp ASC, then "{ns}/{name}" ASC).
     for (parent, mut sets) in by_parent {
-        sets.sort_by(|a, b| {
-            let ta = a.metadata.creation_timestamp.as_ref();
-            let tb = b.metadata.creation_timestamp.as_ref();
-            ta.cmp(&tb).then_with(|| ls_key(a).cmp(&ls_key(b)))
-        });
+        // creationTimestamp ASC, then "{ns}/{name}" ASC. `sort_by_cached_key`
+        // builds each element's key once (one `ls_key` allocation per set) rather
+        // than re-allocating both keys on every comparison.
+        sets.sort_by_cached_key(|ls| (ls.metadata.creation_timestamp.clone(), ls_key(ls)));
         let Some(eff) = effective.get_mut(&parent) else {
             continue;
         };
@@ -179,7 +216,7 @@ pub(crate) fn merge_effective_gateways(
                     l,
                     &ls_ns,
                     &ls_obj_key,
-                    namespaces,
+                    &namespaces,
                 ));
             }
         }
@@ -220,9 +257,16 @@ pub struct EffectiveListenerPort {
 /// listeners plus those merged from attached ListenerSets (GEP-1713), in
 /// precedence order, deduplicated on port and with collision-free names.
 ///
-/// Reuses `merge_effective_gateways` so the provisioning operator and the data
-/// plane derive identical port sets and can never drift. Conflicted listeners
-/// (which lost a port-compatibility conflict and are not programmed) are omitted.
+/// Runs `merge_effective_gateways` over the caller's own store snapshot and
+/// projects each effective listener to its port identity. It does not share a
+/// computation with the data plane: the reflector rebuild (`reconciler/proxy.rs`)
+/// and the provisioning operator (`operator/vip.rs`, `operator/reconciler.rs`)
+/// are independent triggers that each merge from their own consistent read — the
+/// operator deliberately so, since it reads internal-port assignments
+/// authoritatively from the apiserver rather than the watch-lagged store. Same
+/// inputs yield the same ports; the projection here just keeps that derivation in
+/// one place. Conflicted listeners (which lost a port-compatibility conflict and
+/// are not programmed) are omitted.
 /// Precedence-first dedup means a Gateway listener's name and port survive over a
 /// same-port ListenerSet listener, so existing Services don't churn — only new
 /// ListenerSet ports are added.
@@ -297,11 +341,7 @@ fn ls_key(ls: &ListenerSet) -> String {
 /// Default (field absent) is `None` → reject. `Same` accepts only same-namespace
 /// ListenerSets; `All` accepts any; `Selector` matches the ListenerSet's
 /// namespace labels against the selector.
-fn listener_set_allowed(
-    parent: &Gateway,
-    ls_ns: &str,
-    namespaces: &MergedStore<Namespace>,
-) -> bool {
+fn listener_set_allowed(parent: &Gateway, ls_ns: &str, namespaces: &NamespaceView<'_>) -> bool {
     let from = parent
         .spec
         .allowed_listeners
@@ -324,7 +364,7 @@ fn listener_set_allowed(
             else {
                 return false; // Selector requires a selector; absent → match nothing.
             };
-            let labels = namespace_labels(namespaces, ls_ns);
+            let labels = namespaces.labels(ls_ns);
             selector_matches(
                 selector.match_labels.as_ref(),
                 selector.match_expressions.as_deref(),
@@ -332,19 +372,6 @@ fn listener_set_allowed(
             )
         }
     }
-}
-
-/// Read the labels of namespace `ns` from the cluster-wide Namespace store.
-fn namespace_labels(
-    namespaces: &MergedStore<Namespace>,
-    ns: &str,
-) -> std::collections::BTreeMap<String, String> {
-    namespaces
-        .state()
-        .into_iter()
-        .find(|n| n.metadata.name.as_deref() == Some(ns))
-        .and_then(|n| n.metadata.labels.clone())
-        .unwrap_or_default()
 }
 
 /// Evaluate a Kubernetes label selector against a label set, on already-normalised
@@ -420,7 +447,7 @@ fn resolve_route_namespaces(
     match_labels: Option<&std::collections::BTreeMap<String, String>>,
     match_expressions: &[(&str, &str, &[String])],
     owning_ns: &str,
-    namespaces: &MergedStore<Namespace>,
+    namespaces: &NamespaceView<'_>,
 ) -> RouteNamespaceSet {
     match from {
         RouteNsFrom::All => RouteNamespaceSet::All,
@@ -429,12 +456,13 @@ fn resolve_route_namespaces(
         }
         RouteNsFrom::Selector => {
             let mut set = std::collections::BTreeSet::new();
-            for ns in namespaces.state() {
+            let empty = std::collections::BTreeMap::new();
+            for ns in namespaces.snapshot {
                 let Some(name) = ns.metadata.name.as_deref() else {
                     continue;
                 };
-                let labels = ns.metadata.labels.clone().unwrap_or_default();
-                if labels_match_selector(match_labels, match_expressions, &labels) {
+                let labels = ns.metadata.labels.as_ref().unwrap_or(&empty);
+                if labels_match_selector(match_labels, match_expressions, labels) {
                     set.insert(name.to_string());
                 }
             }
@@ -447,7 +475,7 @@ fn resolve_route_namespaces(
 fn from_gateway_listener(
     l: &GatewayListeners,
     gw_ns: &str,
-    namespaces: &MergedStore<Namespace>,
+    namespaces: &NamespaceView<'_>,
 ) -> EffectiveListener {
     let tls = l.tls.as_ref().map(|t| EffectiveTls {
         passthrough: matches!(t.mode, Some(GatewayListenersTlsMode::Passthrough)),
@@ -494,7 +522,7 @@ fn from_listenerset_listener(
     l: &ListenerSetListeners,
     ls_ns: &str,
     ls_key: &ObjectKey,
-    namespaces: &MergedStore<Namespace>,
+    namespaces: &NamespaceView<'_>,
 ) -> EffectiveListener {
     let tls = l.tls.as_ref().map(|t| EffectiveTls {
         passthrough: matches!(t.mode, Some(ListenerSetListenersTlsMode::Passthrough)),
@@ -539,7 +567,7 @@ fn from_listenerset_listener(
 fn gw_route_namespaces(
     l: &GatewayListeners,
     gw_ns: &str,
-    namespaces: &MergedStore<Namespace>,
+    namespaces: &NamespaceView<'_>,
 ) -> RouteNamespaceSet {
     use crate::gw_types::v::gateways::GatewayListenersAllowedRoutesNamespacesFrom as F;
     let cfg = l
@@ -573,7 +601,7 @@ fn gw_route_namespaces(
 fn ls_route_namespaces(
     l: &ListenerSetListeners,
     ls_ns: &str,
-    namespaces: &MergedStore<Namespace>,
+    namespaces: &NamespaceView<'_>,
 ) -> RouteNamespaceSet {
     use crate::gw_types::v::listenersets::ListenerSetListenersAllowedRoutesNamespacesFrom as F;
     let cfg = l
@@ -805,20 +833,22 @@ mod tests {
     fn gw_route_namespaces_resolves_same_all_selector() {
         use crate::gw_types::v::gateways::GatewayListenersAllowedRoutesNamespacesFrom as F;
         let store = ns_store_with(&[("team-a", &[("team", "a")]), ("team-b", &[("team", "b")])]);
+        let snapshot = store.state();
+        let view = NamespaceView::new(&snapshot);
 
         // Absent `allowedRoutes` → Same (the Gateway API default) → only the owner ns.
         assert_eq!(
-            gw_route_namespaces(&gw_listener("l", 80, "HTTP", None), "gw-ns", &store),
+            gw_route_namespaces(&gw_listener("l", 80, "HTTP", None), "gw-ns", &view),
             RouteNamespaceSet::Only(std::iter::once("gw-ns".to_string()).collect()),
         );
         // `from: All` → every namespace.
         assert_eq!(
-            gw_route_namespaces(&gw_listener_with_ns("l", F::All, None), "gw-ns", &store),
+            gw_route_namespaces(&gw_listener_with_ns("l", F::All, None), "gw-ns", &view),
             RouteNamespaceSet::All,
         );
         // `from: Same` → only the declaring (owner) namespace.
         assert_eq!(
-            gw_route_namespaces(&gw_listener_with_ns("l", F::Same, None), "gw-ns", &store),
+            gw_route_namespaces(&gw_listener_with_ns("l", F::Same, None), "gw-ns", &view),
             RouteNamespaceSet::Only(std::iter::once("gw-ns".to_string()).collect()),
         );
         // `from: Selector team=a` → only the matching namespace (NOT all — the bug).
@@ -826,7 +856,7 @@ mod tests {
             gw_route_namespaces(
                 &gw_listener_with_ns("l", F::Selector, Some(("team", "a"))),
                 "gw-ns",
-                &store,
+                &view,
             ),
             RouteNamespaceSet::Only(std::iter::once("team-a".to_string()).collect()),
         );

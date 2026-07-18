@@ -1805,6 +1805,14 @@ async fn reconcile_listenerset_inner(ls: &ListenerSet, ctx: &ReconcileContext) -
 
     let health_map = ctx.listener_status.load();
     let parent_health = health_map.get(&parent_key);
+    if listenerset_status::parent_health_pending(ls, parent_health) {
+        // The parent Gateway is owned and the subsystem is ready, but this parent's
+        // per-listener health has not been published yet. Requeue rather than patch
+        // a positive `Accepted=False/NotAllowed` this ListenerSet never earned — a
+        // genuine allowedListeners rejection has the parent's health present with
+        // this source absent, decided by `listenerset_accepted` below.
+        return StatusOutcome::requeue(DEFERRED_PROGRAMMED_REQUEUE);
+    }
     let accepted = listenerset_status::listenerset_accepted(ls, parent_health);
     if listenerset_status::listenerset_needs_status_patch(
         ls,
