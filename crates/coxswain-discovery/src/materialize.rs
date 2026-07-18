@@ -39,8 +39,8 @@ use crate::wire::{
 
 /// One resource in a [`MaterializedView`]: its content hash and the shared DTO.
 ///
-/// The `Arc` lets the per-generation view cache (commit 7) and each stream's
-/// pending-world snapshot share the resource bytes without cloning.
+/// The `Arc` lets the per-generation view cache and each stream's pending-world
+/// snapshot share the resource bytes without cloning.
 #[non_exhaustive]
 pub struct ResourceEntry {
     /// Lowercase-hex `sha256` of the resource's proto encoding (change oracle).

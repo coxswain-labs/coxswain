@@ -42,6 +42,35 @@ use crate::subscription::Scope;
 use crate::version::WIRE_VERSION;
 use crate::wire::scope_from_wire;
 
+// ── ResolvedUpstream ────────────────────────────────────────────────────────────
+
+/// A resolved routing upstream: the endpoint to dial and the ServiceAccount
+/// short-name the server's serving SVID must present (the `expected_server_sa`).
+///
+/// Named fields so the two `String`s — which are trivially swappable at a call
+/// site — cannot be transposed on the way to a [`BootstrapResponse`] or a
+/// `PreferredUpstream` directive, where a swap would dial the right endpoint while
+/// verifying the wrong identity (or vice versa).
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ResolvedUpstream {
+    /// Routing (Stream) endpoint the client dials (`"https://host:port"`).
+    pub endpoint: String,
+    /// Expected serving-SVID ServiceAccount short-name — the identity axis of the
+    /// client-side mTLS check.
+    pub expected_sa: String,
+}
+
+impl ResolvedUpstream {
+    /// Construct a resolved upstream from its endpoint and expected serving SA.
+    pub(crate) fn new(endpoint: String, expected_sa: String) -> Self {
+        Self {
+            endpoint,
+            expected_sa,
+        }
+    }
+}
+
 // ── UpstreamResolverConfig ──────────────────────────────────────────────────────
 
 /// Inputs the controller injects so the bootstrap handler can resolve each
@@ -92,8 +121,8 @@ pub struct UpstreamResolverConfig {
 }
 
 impl UpstreamResolverConfig {
-    /// Resolve `(endpoint, expected_server_sa)` for a client with the given
-    /// authenticated identity and subscription scope (#601).
+    /// Resolve the [`ResolvedUpstream`] for a client with the given authenticated
+    /// identity and subscription scope (#601).
     ///
     /// Rules, in order:
     /// - A **relay** (its SA matches `relay_sa` *or* `shared_relay_sa`) always
@@ -104,7 +133,7 @@ impl UpstreamResolverConfig {
     /// - A **dedicated** (Gateway/Namespace) client streams from its namespace's
     ///   relay if that namespace is provisioned, else the controller.
     #[must_use]
-    pub fn resolve(&self, spiffe: &SpiffeId, scope: &Scope) -> (String, String) {
+    pub fn resolve(&self, spiffe: &SpiffeId, scope: &Scope) -> ResolvedUpstream {
         if spiffe.service_account() == self.relay_sa
             || spiffe.service_account() == self.shared_relay_sa
         {
@@ -118,17 +147,17 @@ impl UpstreamResolverConfig {
         }
     }
 
-    /// Resolve `(endpoint, expected_server_sa)` for a shared-pool client: the shared
-    /// relay when it is `Active` (Ready and serving), else the controller (#605).
+    /// Resolve the [`ResolvedUpstream`] for a shared-pool client: the shared relay
+    /// when it is `Active` (Ready and serving), else the controller (#605).
     ///
     /// The identity-free counterpart of [`Self::resolve_namespace`] used by the
     /// stream server to compute a shared-pool leaf's live best upstream. Reads the
     /// `Active` gate ([`Self::shared_relay_active`]), so a leaf is never pointed at a
     /// still-provisioning or draining shared relay — the make-before-break invariant.
     #[must_use]
-    pub fn resolve_shared(&self) -> (String, String) {
+    pub fn resolve_shared(&self) -> ResolvedUpstream {
         if *self.shared_relay_active.load() {
-            (
+            ResolvedUpstream::new(
                 self.shared_relay_endpoint.clone(),
                 self.shared_relay_sa.clone(),
             )
@@ -153,9 +182,9 @@ impl UpstreamResolverConfig {
         })
     }
 
-    /// Resolve `(endpoint, expected_server_sa)` for a dedicated (namespace-scoped)
-    /// client: its namespace's relay if that relay is **Active** (Ready and
-    /// serving), else the controller (#601/#602).
+    /// Resolve the [`ResolvedUpstream`] for a dedicated (namespace-scoped) client:
+    /// its namespace's relay if that relay is **Active** (Ready and serving), else
+    /// the controller (#601/#602).
     ///
     /// Used by the controller's stream server to compute a leaf's current best
     /// upstream when deciding whether to push a live repoint directive. Reads the
@@ -165,24 +194,24 @@ impl UpstreamResolverConfig {
     /// never a relay (the relays-never-tier rule is enforced at bootstrap, where the
     /// SA is authenticated).
     #[must_use]
-    pub fn resolve_namespace(&self, namespace: &str) -> (String, String) {
+    pub fn resolve_namespace(&self, namespace: &str) -> ResolvedUpstream {
         if self.active_relays.load().contains(namespace) {
             let endpoint = format!(
                 "https://{}.{}.svc:{}",
                 self.relay_service_name, namespace, self.relay_port
             );
-            (endpoint, self.relay_sa.clone())
+            ResolvedUpstream::new(endpoint, self.relay_sa.clone())
         } else {
             self.controller_target()
         }
     }
 
-    /// The controller's own `(endpoint, sa)` — the always-up fallback anchor, and
+    /// The controller's own [`ResolvedUpstream`] — the always-up fallback anchor, and
     /// the upstream every Gateway-scope client connected directly to the
     /// controller is currently streaming from (#601 seed baseline).
     #[must_use]
-    pub fn controller_target(&self) -> (String, String) {
-        (self.controller_endpoint.clone(), self.controller_sa.clone())
+    pub fn controller_target(&self) -> ResolvedUpstream {
+        ResolvedUpstream::new(self.controller_endpoint.clone(), self.controller_sa.clone())
     }
 }
 
@@ -413,7 +442,10 @@ where
         // (tests/plaintext) or an unparseable scope degrades to an empty pointer,
         // so the client keeps its configured fallback rather than being dialled
         // at a bogus endpoint.
-        let (upstream_endpoint, expected_server_sa) = match &self.upstream {
+        let ResolvedUpstream {
+            endpoint: upstream_endpoint,
+            expected_sa: expected_server_sa,
+        } = match &self.upstream {
             Some(resolver) => {
                 let scope = req
                     .scope
@@ -422,7 +454,7 @@ where
                     .unwrap_or(Scope::SharedPool);
                 resolver.resolve(&spiffe_id, &scope)
             }
-            None => (String::new(), String::new()),
+            None => ResolvedUpstream::new(String::new(), String::new()),
         };
 
         info!(
@@ -718,7 +750,10 @@ mod tests {
     #[test]
     fn dedicated_client_in_provisioned_namespace_points_at_relay() {
         let cfg = resolver(false, &["team-a"]);
-        let (endpoint, sa) = cfg.resolve(
+        let ResolvedUpstream {
+            endpoint,
+            expected_sa: sa,
+        } = cfg.resolve(
             &dedicated_id("team-a"),
             &Scope::Gateway {
                 namespace: "team-a".to_owned(),
@@ -732,7 +767,10 @@ mod tests {
     #[test]
     fn dedicated_client_without_relay_points_at_controller() {
         let cfg = resolver(false, &[]);
-        let (endpoint, sa) = cfg.resolve(
+        let ResolvedUpstream {
+            endpoint,
+            expected_sa: sa,
+        } = cfg.resolve(
             &dedicated_id("team-a"),
             &Scope::Gateway {
                 namespace: "team-a".to_owned(),
@@ -751,7 +789,10 @@ mod tests {
         // A relay bootstraps in a namespace that is itself provisioned; it must
         // still be pointed at the controller, never at itself.
         let cfg = resolver(false, &["team-a"]);
-        let (endpoint, sa) = cfg.resolve(
+        let ResolvedUpstream {
+            endpoint,
+            expected_sa: sa,
+        } = cfg.resolve(
             &relay_id("team-a"),
             &Scope::Namespace {
                 namespace: "team-a".to_owned(),
@@ -767,7 +808,10 @@ mod tests {
     #[test]
     fn shared_pool_client_uses_shared_relay_when_active_else_controller() {
         let active = resolver(true, &[]);
-        let (endpoint, sa) = active.resolve(&proxy_id(), &Scope::SharedPool);
+        let ResolvedUpstream {
+            endpoint,
+            expected_sa: sa,
+        } = active.resolve(&proxy_id(), &Scope::SharedPool);
         assert_eq!(
             endpoint,
             "https://coxswain-relay-shared.coxswain-system.svc:50051"
@@ -775,7 +819,10 @@ mod tests {
         assert_eq!(sa, "coxswain-relay-shared");
 
         let inactive = resolver(false, &[]);
-        let (endpoint, sa) = inactive.resolve(&proxy_id(), &Scope::SharedPool);
+        let ResolvedUpstream {
+            endpoint,
+            expected_sa: sa,
+        } = inactive.resolve(&proxy_id(), &Scope::SharedPool);
         assert_eq!(
             endpoint,
             "https://coxswain-controller-discovery.coxswain-system.svc:50051"
@@ -790,7 +837,10 @@ mod tests {
         let cfg = resolver(true, &[]);
         let shared_relay =
             SpiffeId::from_parts("cluster.local", "coxswain-system", "coxswain-relay-shared");
-        let (endpoint, sa) = cfg.resolve(&shared_relay, &Scope::SharedPool);
+        let ResolvedUpstream {
+            endpoint,
+            expected_sa: sa,
+        } = cfg.resolve(&shared_relay, &Scope::SharedPool);
         assert_eq!(
             endpoint,
             "https://coxswain-controller-discovery.coxswain-system.svc:50051"

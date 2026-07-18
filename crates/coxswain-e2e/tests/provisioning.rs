@@ -182,8 +182,8 @@ async fn namespace_relay_provisioned_and_gcd_over_dedicated_gateway_lifecycle() 
             .as_ref()
             .and_then(|l| l.get("app.kubernetes.io/component"))
             .map(String::as_str),
-        Some("namespace-relay"),
-        "relay carries the namespace-relay component label"
+        Some("relay-namespace"),
+        "relay carries the relay-namespace component label"
     );
     assert!(
         relay_deploy

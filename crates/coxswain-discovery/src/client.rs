@@ -262,10 +262,10 @@ impl DiscoveryClient {
         health: SubsystemHandle,
         health_check: &str,
     ) -> Result<(Self, Supervisor), DiscoveryError> {
-        // Parse-don't-validate: prove every endpoint URI is well-formed once,
-        // here, so the reconnect supervisor's `build_channel` never fails on the
-        // URI axis and a misconfigured endpoint fails loudly at start-up.
-        validate_endpoints(&config.endpoints)?;
+        // Endpoint URIs are validated once, inside `Supervisor::with_applier`
+        // below (parse-don't-validate), so a misconfigured endpoint fails loudly
+        // at construction and the reconnect supervisor's `build_channel` never
+        // fails on the URI axis.
 
         // The proxy applies received snapshots into flat routing cells; build
         // the applier and keep clones of the same `Arc` cells for the client's

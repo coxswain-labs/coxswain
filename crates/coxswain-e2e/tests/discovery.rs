@@ -1867,7 +1867,7 @@ const RELAY_NAME: &str = "coxswain-relay";
 /// GEP-1762 label every dedicated-proxy pod carries; selects the leaf pod.
 const GATEWAY_NAME_LABEL: &str = "gateway.networking.k8s.io/gateway-name";
 /// Selects the namespace-relay pod (`render_relay::RELAY_COMPONENT`).
-const RELAY_POD_SELECTOR: &str = "app.kubernetes.io/component=namespace-relay";
+const RELAY_POD_SELECTOR: &str = "app.kubernetes.io/component=relay-namespace";
 
 /// Controller options that provision a namespace relay for any namespace with a
 /// single servable dedicated Gateway (threshold 1).

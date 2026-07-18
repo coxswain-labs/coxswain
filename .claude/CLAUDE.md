@@ -47,11 +47,11 @@ gateway-api-types   → (none)
 
 ## Operator UI
 
-`ui/` is the operator web UI (Vite + Preact). Full dev loop in DEVELOPMENT.md "Operator UI". Essentials:
+`ui/` is the operator web UI (Vite + Preact). Full dev loop (dev server, mock backend, build/embed chain) in DEVELOPMENT.md "Operator UI". Guardrails:
 
-- Built to one `ui/dist/index.html`, embedded into `coxswain-admin` via `include_str!`, served at `GET /` on the controller admin port (controller role only). `dist/` is gitignored and rebuilt by the Docker `ui-builder` stage — never commit it.
-- Iterate with `cd ui && npm run dev` (`http://localhost:5173`): hot-reload + a mock `/api/v1` backend, no cluster needed. Mocks cover the full UI state matrix — when you add a UI state, extend `ui/mock/generate.mjs` (then `node mock/generate.mjs`) so it stays reachable in dev. See `ui/mock/README.md`.
-- The binary serves the *embedded* build, which only updates on `npm run build`; to test on a cluster, rebuild the image (the full `Dockerfile` builds the UI) and roll out. During a UI review pass, batch the user's comments and rebuild once at the end — not after each comment.
+- Never commit `ui/dist/` — it is gitignored and rebuilt by the Docker `ui-builder` stage.
+- When you add a UI state, extend `ui/mock/generate.mjs` so it stays reachable in dev (see `ui/mock/README.md`).
+- The binary serves the *embedded* build, which only updates on `npm run build`. During a UI review pass, batch the user's comments and rebuild once at the end — not after each comment.
 
 ## Code Quality
 
@@ -117,28 +117,15 @@ Coxswain has four per-event data planes; each is performance-critical at its own
 
 The relay is a data plane, not a control-plane convenience — the codebase already calls it "the delta-fan-out path" (`operator/render_shared_proxy.rs`, `render_relay.rs`) and `crates/coxswain-discovery/benches/relay_fanout.rs` (#603) load-tests it.
 
-HTTP request path (`Proxy::request_filter`, `upstream_peer`, `filter::FilterSet::apply_request_filters`, `filter::FilterSet::apply_response_filters`):
+HTTP request path guardrails (`Proxy::request_filter`, `upstream_peer`, `FilterSet` request/response filters):
 
-- Capture immutable request data at `request_filter` entry: `host` and `path` as `Arc<str>`, `query` as `Option<String>`. Do not assert a per-request allocation count in prose — the counting-allocator budget gate `crates/coxswain-proxy/tests/alloc_budget.rs` (#620) pins the measured counts for `RoutingEngine::find` + the pure filter predicates instead.
-- Routing lookup, upstream selection, metric emission, and access-log path allocate nothing beyond the capture set. Render `u16` labels (port, status) via `itoa::Buffer` — never `.to_string()`.
-- TLS connections allocate one SNI hostname `String` per outbound connection (Pingora's `HttpPeer` requires owned). Per connection, not per request; cleartext upstreams skip it.
-- Access-log `SocketAddr::to_string()` allocates exactly once per request, only when `--access-log=on`. Operators silencing the log skip it.
-- Two opt-in request filters each carry exactly one intentional allocation beyond the capture set, both owned-string sinks that can't be elided: the `Forwarded` header value when `--proxy-accept-proxy-protocol` injects the real client addr, and the rewritten `path_and_query` an `HTTPRoute` `URLRewrite` path modifier feeds to `http::Uri::builder`. Both are single-allocation by construction (no intermediate `format!`); routes without these filters allocate nothing here. The one exception is the Ingress `use-regex` capture-group rewrite (`PathModifier::RegexReplace`), which runs one `Regex::captures` + one `expand` into a fresh `String` — bounded extra work that fires only on routes configured with both `use-regex` and a `rewrite-target`; the `Regex` itself is compiled once at reconcile and `Arc`-shared, never per request.
-- Use `Shared<T>` (the `ArcSwap`-backed wrapper in `coxswain-core`) for lock-free routing/TLS snapshot reads; on the hot path read via `Shared::guard()` (no atomic RMW), reserving `load()` for when an owned `Arc<T>` must outlive the borrow.
-- Never hold a `Mutex` or `RwLock` guard across `.await`.
+- Capture immutable request data once at `request_filter` entry; routing lookup, upstream selection, metric emission, and access-log path allocate nothing beyond that capture set.
+- Use `Shared<T>` (the `ArcSwap`-backed wrapper in `coxswain-core`) for lock-free routing/TLS snapshot reads. Never hold a `Mutex` or `RwLock` guard across `.await`.
+- The exact per-request allocation budget (what each capture, filter, and TLS path costs) lives in the `crates/coxswain-proxy/src/hooks.rs` `//!` header, not in prose here; #620 will pin it with a counting-allocator gate. Do not assert an allocation count in this doc.
 
 ### Proxy module structure
 
-`crates/coxswain-proxy/src/hooks.rs` is a **thin orchestrator** — it sequences the Pingora hook calls and delegates to focused modules. Do not inline feature logic there. The established layout:
-
-| Module | Responsibility |
-|--------|---------------|
-| `edge/upstream_ca.rs` | Upstream TLS material: CA-bundle cache (`UpstreamCaCache`), backend client-cert cache (`BackendClientCertCache`), and `apply_upstream_tls()` which configures both on an `HttpPeer` |
-| `edge/tls.rs` | Downstream (frontend) TLS: SNI cert selection, `SniCertSelector`, mTLS verify callback |
-| `edge/accept.rs` | PROXY-protocol accept, `ConnInfo` extraction |
-| `policy/` | Auth, circuit-breaker, access-control, affinity |
-| `filters/` | Request/response filter execution (`FilterSet`) |
-| `routing/` | Routing engine + outcome resolution |
+`crates/coxswain-proxy/src/hooks.rs` is a **thin orchestrator** — it sequences the Pingora hook calls and delegates to focused modules (`edge/`, `policy/`, `filters/`, `routing/`). Do not inline feature logic there; each module's `//!` header states its responsibility.
 
 When adding a new upstream TLS feature (e.g. a new peer option driven by a `BackendTLSPolicy` field), extend `apply_upstream_tls` in `edge/upstream_ca.rs` — not `upstream_peer` in `hooks.rs`.
 
@@ -147,7 +134,7 @@ When adding a new upstream TLS feature (e.g. a new peer option driven by a `Back
 1. Invoke `/rust-skills` to load Rust coding guidelines.
 2. `git checkout main && git pull --ff-only origin main`. Stop if it fails.
 3. Enter plan mode. Read `gh issue view N`, cross-check code references, grill the user on anything unclear, design the implementation.
-4. After plan approval: `git checkout -b issue-N`, implement per acceptance criteria. For Gateway API features with a **Feature flags** line in the issue body: add the `features.SupportXxx` constant(s) to `opts.SupportedFeatures` in `conformance/main_test.go` AND the bare feature name(s) to `SUPPORTED_FEATURES` in `crates/coxswain-controller/src/controller/gateway_class_status.rs` (sorted). The `check-supported-features.sh` gate enforces parity. For routing, status-condition, or proxy-behaviour changes: add/update scenarios in the by-plane suite `crates/coxswain-e2e/tests/{routing,tls,security,traffic_policy,status_conditions,provisioning,resilience,observability,discovery}.rs` (a test belongs to the plane of its *primary assertion target* — see each file's header).
+4. After plan approval: `git checkout -b issue-N`, implement per acceptance criteria. For Gateway API features with a **Feature flags** line in the issue body: add the SupportedFeatures entries in both the Rust and Go lists (gate: `check-supported-features.sh` — it names both files). For routing, status-condition, or proxy-behaviour changes: add/update scenarios in the by-plane suite `crates/coxswain-e2e/tests/{routing,tls,security,traffic_policy,status_conditions,provisioning,resilience,observability,discovery}.rs` (a test belongs to the plane of its *primary assertion target* — see each file's header).
 5. After each work cycle: `cargo fmt && cargo clippy --workspace --exclude coxswain-e2e && cargo test --workspace --exclude coxswain-e2e`.
 6. **Before every `git push`**, run the doc gate: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude coxswain-e2e --no-deps`. The CI `doc` job is `-D warnings` and fails the PR otherwise; it is *not* caught by fmt/clippy/test. The recurring failure is `rustdoc::private_intra_doc_links` — a `///`/`//!` doc on a **`pub`** item using `[`X`]` to link a `pub(crate)`/private item. **Authoring rule:** an `[`X`]` intra-doc link may only target a **`pub`** item (in this crate or a dependency); for a `pub(crate)`/private/local-fn target, use a plain code span `` `X` `` instead.
 

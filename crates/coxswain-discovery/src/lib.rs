@@ -49,7 +49,9 @@ pub use auth::{
 pub use bootstrap_client::{
     BootstrapClient, BootstrapClientConfig, BootstrapClientHandle, BootstrapRunner,
 };
-pub use bootstrap_server::{BootstrapService, NoOpRejectHook, RejectHook, UpstreamResolverConfig};
+pub use bootstrap_server::{
+    BootstrapService, NoOpRejectHook, RejectHook, ResolvedUpstream, UpstreamResolverConfig,
+};
 pub use client::{
     DiscoveryClient, DiscoveryClientConfig, DiscoverySupervisor, Supervisor,
     UpstreamDirectiveHandler,

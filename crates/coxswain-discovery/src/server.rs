@@ -77,7 +77,7 @@ use coxswain_core::tls::{SharedClientCertStore, SharedPortTlsStore};
 use crate::auth::{PeerSvid, svid_matches_dedicated_gateway};
 use crate::subscription::Scope;
 
-use crate::bootstrap_server::UpstreamResolverConfig;
+use crate::bootstrap_server::{ResolvedUpstream, UpstreamResolverConfig};
 use crate::materialize::{MaterializedView, empty_view, materialize};
 use crate::proto::v1::{
     self as p, client_message::Kind as CKind, discovery_server::Discovery,
@@ -167,8 +167,9 @@ impl Clone for SnapshotSource {
 /// namespace to a single stream, so a wrongly-authorized subscriber gets a much
 /// bigger blast radius than a single `Scope::Gateway` binding — hence a
 /// dedicated seam rather than reusing the private Gateway-scope SVID binding
-/// check. Provisioning-backed implementations land with #584; until then every
-/// [`DiscoveryService`] defaults to [`DenyAllNamespaces`].
+/// check. The shipped provenance-backed implementation is
+/// [`ProvisionedRelayAuthorizer`]; a [`DiscoveryService`] with none wired in
+/// defaults to [`DenyAllNamespaces`].
 pub trait ScopeAuthorizer: Send + Sync {
     /// Returns `true` if `peer` may open a `Namespace{namespace}` subscribe.
     fn allows_namespace(&self, peer: &PeerSvid, namespace: &str) -> bool;
@@ -176,9 +177,9 @@ pub trait ScopeAuthorizer: Send + Sync {
 
 /// Fail-closed default [`ScopeAuthorizer`]: denies every `Namespace` subscribe.
 ///
-/// Safe until a provenance-backed authorizer (#584) is wired in via
-/// [`DiscoveryService::with_scope_authorizer`] — no relay can be provisioned
-/// yet, so there is no legitimate `Namespace` subscriber to allow.
+/// The fail-closed default until the provenance-backed [`ProvisionedRelayAuthorizer`]
+/// is wired in via [`DiscoveryService::with_scope_authorizer`]: without a
+/// provisioned relay there is no legitimate `Namespace` subscriber to allow.
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DenyAllNamespaces;
@@ -289,8 +290,8 @@ pub struct DiscoveryService {
     /// carries a per-stream SVID check). See [`view_for`].
     shared_view: SharedViewCache,
     /// Authorizer for `Scope::Namespace` subscribes (#582). Defaults to
-    /// [`DenyAllNamespaces`]; `coxswain-bin` installs a provenance-backed
-    /// implementation once #584 provisions relays.
+    /// [`DenyAllNamespaces`]; `coxswain-bin` installs the provenance-backed
+    /// [`ProvisionedRelayAuthorizer`] where relays are provisioned.
     authorizer: Arc<dyn ScopeAuthorizer>,
     /// Best-upstream resolver for live repoint directives (#601). When `Some`,
     /// a dedicated (Gateway/Namespace-scope) stream is sent a `PreferredUpstream`
@@ -1025,12 +1026,15 @@ async fn run_stream(
         sent_at: None,
     };
 
-    // Live upstream-repoint baseline (#601): the last `(endpoint, sa)` this stream
-    // was told to use. Seeded (without pushing) on stream open — the client just
-    // bootstrapped to exactly this upstream — then a `PreferredUpstream` is pushed
-    // only when it changes (a relay is provisioned or torn down).
-    let mut last_upstream: Option<(String, String)> = None;
-    // Seeds the baseline on open (no send); the returned Ok is expected.
+    // Live upstream-repoint baseline (#601): the last [`ResolvedUpstream`] this
+    // stream was told to use. Seeded on stream open — the client just bootstrapped
+    // to this upstream — then a `PreferredUpstream` is pushed only when it changes
+    // (a relay is provisioned or torn down).
+    let mut last_upstream: Option<ResolvedUpstream> = None;
+    // Seed the baseline on open. This does send a `PreferredUpstream` when the
+    // leaf's best upstream already diverges from its bootstrap seed (e.g. a relay
+    // came Ready between bootstrap and stream open); a closed channel returns
+    // `Err(())`, which the shutdown path handles, so it is ignored here.
     let _ = seed_or_push_upstream(
         &sub.scope,
         sub.peer_svid.as_ref(),
@@ -1299,7 +1303,7 @@ async fn seed_or_push_upstream(
     scope: &Scope,
     peer_svid: Option<&crate::auth::PeerSvid>,
     resolver: Option<&Arc<UpstreamResolverConfig>>,
-    last: &mut Option<(String, String)>,
+    last: &mut Option<ResolvedUpstream>,
     tx: &mpsc::Sender<Result<p::ServerMessage, Status>>,
 ) -> Result<(), ()> {
     let Some(resolver) = resolver else {
@@ -1337,7 +1341,10 @@ async fn seed_or_push_upstream(
         return Ok(());
     }
     *last = Some(target.clone());
-    let (endpoint, expected_server_sa) = target;
+    let ResolvedUpstream {
+        endpoint,
+        expected_sa: expected_server_sa,
+    } = target;
     debug!(
         %endpoint,
         %expected_server_sa,

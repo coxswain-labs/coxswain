@@ -22,8 +22,8 @@ use coxswain_discovery::{
     BootstrapClient, BootstrapClientConfig, BootstrapRunner, BootstrapService,
     DiscoveryBootstrapServerTls, DiscoveryClient, DiscoveryClientConfig, DiscoveryServerTls,
     DiscoveryService, ProvisionedRelayAuthorizer, RelayUpstream, RotatingServerTls, Scope,
-    SpiffeMatcher, Supervisor, UpstreamResolverConfig, namespace_relay, serve_discovery_with_tls,
-    shared_relay,
+    SharedSvid, SpiffeMatcher, Supervisor, UpstreamResolverConfig, namespace_relay,
+    serve_discovery_with_tls, shared_relay,
 };
 use coxswain_proxy::{
     GatewayProxy, GrpcAuthChannelCache, IngressProxy, ListenerProtocol, ListenerSpec,
@@ -324,17 +324,7 @@ fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         vip_failures: vip_failures.clone(),
         node_registry: Some(node_registry_for_operator),
         publish_index: Some(publish_index.clone()),
-        relay_enabled: args.controller.relay_enabled,
-        relay_replicas: args.controller.relay_replicas,
-        relay_min_proxy_replicas: args.controller.relay_min_proxy_replicas,
-        relay_target_proxies_per_replica: args.controller.relay_target_proxies_per_replica,
-        relay_max_replicas: args.controller.relay_max_replicas,
-        relay_cooldown: args.controller.relay_cooldown,
-        relay_scale_down_stabilization: args.controller.relay_scale_down_stabilization,
-        relay_tolerance: args.controller.relay_tolerance,
-        relay_cpu_request: args.controller.relay_cpu_request.clone(),
-        relay_memory_request: args.controller.relay_memory_request.clone(),
-        relay_memory_limit: args.controller.relay_memory_limit.clone(),
+        relay: args.controller.relay_config(),
         provisioned_relays,
         active_relays,
         // Shared-pool repoint gate (#605): the shared-relay control loop flips this,
@@ -625,17 +615,11 @@ fn run_relay(args: RelayRoleArgs) -> Result<()> {
     // Upstream discovery client config (bootstrap + SVID + expected-server). The
     // relay reports no bound ports of its own (#531) — leaf state reaches the
     // controller via `RosterReport` (#585), wired here as the roster receiver.
-    let (mut config, bootstrap_runner) =
+    // The relay's downstream serving cert IS its rotating bootstrapped SVID; the
+    // builder hands it back (the bootstrap endpoint is `required = true` at clap).
+    let (mut config, bootstrap_runner, svid) =
         build_discovery_client_config(&args.discovery, &args.common, scope, None);
     config.roster_rx = Some(roster_rx);
-
-    // The relay's downstream serving cert IS its rotating bootstrapped SVID, so a
-    // bootstrap endpoint is mandatory — without it there is no serving identity.
-    let svid = config.svid_cell.clone().ok_or_else(|| {
-        anyhow::anyhow!(
-            "serve relay requires --discovery-bootstrap-endpoint to obtain a downstream serving SVID"
-        )
-    })?;
 
     // Assemble the upstream client + the downstream-serving `SnapshotSource` it
     // feeds. `relay_handle` marks `routing_table_loaded` on the first upstream
@@ -670,6 +654,8 @@ fn run_relay(args: RelayRoleArgs) -> Result<()> {
     // relay the counter is stable, `changed()` parks, and the reporter performs
     // no `load()` and no clone.
     {
+        // Debounce a burst of roster changes into one upstream `RosterReport`.
+        const ROSTER_COALESCE: std::time::Duration = std::time::Duration::from_millis(200);
         let registry = node_registry.clone();
         server.add_service(background_service(
             "relay-roster-reporter",
@@ -680,7 +666,7 @@ fn run_relay(args: RelayRoleArgs) -> Result<()> {
                         break; // registry dropped (process shutdown)
                     }
                     // Coalesce a burst of changes into one send.
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    tokio::time::sleep(ROSTER_COALESCE).await;
                     if roster_tx.send(registry.load()).is_err() {
                         break; // upstream client gone
                     }
@@ -710,15 +696,9 @@ fn run_relay(args: RelayRoleArgs) -> Result<()> {
     let acceptor = downstream_tls.acceptor()?;
     let downstream_addr = SocketAddr::new(args.common.management_bind_address, args.discovery_port);
 
-    // Upstream bootstrap + reconnect supervisor as background services.
-    server.add_service(background_service(
-        "discovery-bootstrap",
-        FutureService::new(bootstrap_runner.run()),
-    ));
-    server.add_service(background_service(
-        "discovery-supervisor",
-        FutureService::new(supervisor.run()),
-    ));
+    // Upstream bootstrap + reconnect supervisor as background services (the same
+    // pair both proxy roles register).
+    register_discovery_background_services(&mut server, supervisor, bootstrap_runner);
 
     // Downstream server. The TLS material is already validated (acceptor built),
     // so mark `downstream_serving` ready as the server spawns; a late listener
@@ -1373,22 +1353,22 @@ fn controller_namespace_from_endpoint(endpoint: &str) -> Option<String> {
     (labels.next() == Some("svc")).then(|| namespace.to_owned())
 }
 
-/// Build a [`DiscoveryClientConfig`] (endpoints, scope, bootstrap/SVID wiring,
-/// expected-server identity) shared by the `proxy` and `relay` roles.
+/// Build a [`DiscoveryClientConfig`] (endpoints, scope, bootstrap/SVID wiring)
+/// shared by the `proxy` and `relay` roles.
 ///
-/// The mTLS `Stream` `expected_server` is `spiffe://<td>/ns/<server-ns>/sa/<sa>`
-/// where `<server-ns>` is derived from the **discovery** endpoint's service DNS
-/// (the controller's namespace for a leaf on the controller; the relay's
-/// namespace for a leaf behind a relay) and `<sa>` is
-/// `--discovery-expected-server-sa` (default the controller SA). Bootstrap is
-/// **not** tiered — its server namespace is always derived from the bootstrap
-/// endpoint (the controller), independent of the discovery endpoint.
+/// The routing `Stream` upstream — its endpoint and the `expected_server` SPIFFE
+/// identity the server's SVID must present — is not a CLI flag since #601: the
+/// bootstrap response seeds it and live `PreferredUpstream` directives re-point it
+/// (a leaf on the controller verifies the controller SA; a leaf behind a relay the
+/// relay SA). Bootstrap itself is **not** tiered — its server namespace is always
+/// derived from the bootstrap endpoint (the controller), independent of the
+/// routing upstream.
 fn build_discovery_client_config(
     disco: &DiscoveryClientArgs,
     common: &CommonArgs,
     scope: Scope,
     bound_ports_rx: Option<watch::Receiver<BTreeSet<u16>>>,
-) -> (DiscoveryClientConfig, BootstrapRunner) {
+) -> (DiscoveryClientConfig, BootstrapRunner, SharedSvid) {
     // The routing-stream upstream is delivered by bootstrap, not a CLI flag (#601):
     // start with no static endpoints; the bootstrap loop populates `upstream_cell`.
     let mut config = DiscoveryClientConfig::new(Vec::new(), common.pod_name.clone());
@@ -1416,7 +1396,12 @@ fn build_discovery_client_config(
         common.pod_namespace.clone(),
     );
     let (handle, runner) = BootstrapClient::build(boot_config);
-    config.svid_cell = Some(handle.svid);
+    // `--discovery-bootstrap-endpoint` is `required = true` at the clap layer, so a
+    // bootstrap client — and thus a serving SVID cell — always exists here. Hand it
+    // back so the relay wires its downstream serving cert from it directly, rather
+    // than re-extracting the always-`Some` `config.svid_cell`.
+    let svid = handle.svid;
+    config.svid_cell = Some(svid.clone());
     config.svid_rotated = Some(handle.rotation_rx);
     // Runtime-swappable routing upstream (#601): the bootstrap response seeds the
     // cell + fires `upstream_changed`; a live directive on the stream re-writes it;
@@ -1425,7 +1410,7 @@ fn build_discovery_client_config(
     config.upstream_changed = Some(handle.upstream_rx);
     config.re_bootstrap = Some(handle.re_bootstrap);
 
-    (config, runner)
+    (config, runner, svid)
 }
 
 fn build_discovery_client(
@@ -1435,7 +1420,9 @@ fn build_discovery_client(
     scope: Scope,
     bound_ports_rx: Option<watch::Receiver<BTreeSet<u16>>>,
 ) -> anyhow::Result<(DiscoveryClient, Supervisor, BootstrapRunner)> {
-    let (config, bootstrap_runner) =
+    // A proxy client authenticates with its SVID but does not serve downstream, so
+    // the returned serving-cell handle is unused here (the relay path uses it).
+    let (config, bootstrap_runner, _svid) =
         build_discovery_client_config(disco, common, scope, bound_ports_rx);
     let (client, supervisor) = DiscoveryClient::new(config, proxy_handle, "routing_table_loaded")?;
     Ok((client, supervisor, bootstrap_runner))

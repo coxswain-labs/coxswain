@@ -125,9 +125,9 @@ where
 /// This is the **per-table compile seam** shared by the whole-DTO decode
 /// ([`routing_table_from_wire`], hence `decode_world`) and the client's
 /// staged-cache apply pipeline (`crate::apply`, #383). The client keys its
-/// resource cache by `(table, port, host)` partition; when the partitioned
-/// recompile lands (commit 5) it groups the staged route partitions back into
-/// this per-port shape and calls this function per table kind. Keeping one
+/// resource cache by `(table, port, host)` partition; the partitioned recompile
+/// groups the staged route partitions back into this per-port shape and calls
+/// this function per table kind. Keeping one
 /// compile function means the streamed full decode and the client rebuild can
 /// never diverge in how a host bucket becomes a compiled router.
 ///
