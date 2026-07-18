@@ -46,74 +46,6 @@ use std::time::Duration;
 mod common;
 use common::grpc_echo as grpcecho;
 
-/// Tests both the per-Ingress spec.defaultBackend and the controller-wide
-/// --ingress-default-backend flag. Backends are deployed before the controller
-/// starts so that echo-c is already ready on the first routing-table rebuild.
-#[tokio::test]
-async fn default_backend_serves_unmatched_requests() -> anyhow::Result<()> {
-    // Bootstrap cluster connection and create the namespace before starting the
-    // controller, so the default-backend endpoints are ready on first sync.
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "rt-ing-default").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-
-    // Start the controller with the controller-wide default pointing at echo-c.
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        ingress_default_backend: Some(format!("{}/echo-c:3000", ns.name)),
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-    let http = HttpClient::new(controller.proxy_addr)?;
-
-    // Apply the fixture: rule /api → echo-a, spec.defaultBackend → echo-b.
-    fixtures::apply_fixture(ingress::DEFAULT_BACKEND, FixtureVars::new(&ns.name)).await?;
-
-    let host = format!("app.{}.local", ns.name);
-    let unknown_host = format!("unknown.{}.local", ns.name);
-
-    // Wait until the explicit rule is live with the correct backend.
-    // Use wait_for_backend (not wait_for_route) because the controller-wide catchall
-    // may serve echo-c for this host before the Ingress-specific route is reconciled.
-    wait::wait_for_backend(&http, &host, "/api", "echo-a", Duration::from_secs(60)).await?;
-
-    // Per-Ingress defaultBackend catches path-miss on the rule's host.
-    let resp = http.get(&host, "/other").await?;
-    resp.assert_backend("echo-b");
-
-    // Per-Ingress defaultBackend wins over controller-wide for unmatched hosts too.
-    let resp = http.get(&unknown_host, "/anything").await?;
-    resp.assert_backend("echo-b");
-
-    Ok(())
-}
-
-/// Tests a rules-less Ingress (only spec.defaultBackend, no spec.rules).
-/// The defaultBackend should serve all traffic regardless of host or path.
-#[tokio::test]
-async fn default_backend_alone_serves_all_hosts() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "rt-ing-default-only").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(ingress::DEFAULT_BACKEND_ONLY, FixtureVars::new(&ns.name)).await?;
-
-    // Wait for the defaultBackend to be live, probing an arbitrary host+path.
-    let resp =
-        wait::wait_for_route(&h.http, "random.example", "/", Duration::from_secs(60)).await?;
-    resp.assert_backend("echo-b");
-
-    // Any host and any path should hit echo-b.
-    let resp = h.http.get("other.io", "/api/v1").await?;
-    resp.assert_backend("echo-b");
-
-    Ok(())
-}
-
 #[tokio::test]
 async fn ingress_path_match_routes_to_backend() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -132,102 +64,6 @@ async fn ingress_path_match_routes_to_backend() -> anyhow::Result<()> {
     // wait_for_route rather than a bare get() to tolerate transient timeouts.
     let resp = wait::wait_for_route(&h.http, &host, "/b", Duration::from_secs(15)).await?;
     resp.assert_backend("echo-b");
-
-    Ok(())
-}
-
-/// Route-propagation-time measurement (#513 follow-up): the black-box
-/// "apply -> first successful request" latency, the same metric
-/// github.com/howardjohn/gateway-api-bench's "Route Propagation Time" test
-/// reports for other Gateway API implementations (Agentgateway: 10-30ms;
-/// Istio: 120-300ms; Envoy Gateway/Nginx: ~600-800ms at 3000 routes).
-///
-/// Logs the measured value via [`wait::log_measurement`] (not a direct
-/// `tracing::info!` — see that function's doc comment for why a call from
-/// this file would be silently dropped) so `cargo nextest run ...
-/// --no-capture` surfaces a citable number for a #512 (adaptive debounce)
-/// before/after comparison. The
-/// assertion itself is a generous regression ceiling, not a tight benchmark
-/// gate: this suite's own e2e/OrbStack overhead (kubectl apply round trip,
-/// HTTP client connect setup) means it will never hit the purpose-built
-/// benchmark rig's 10-30ms floor — but a multi-second regression here is real
-/// signal, and today's number (dominated by the reflector's fixed 500ms
-/// debounce floor, see the #513 baseline on issue #513) is the reference
-/// #512 must beat.
-#[tokio::test]
-async fn route_propagation_time_ingress_apply_to_first_success() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "rt-ing-prop-time").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-
-    let host = format!("ingress.{}.local", ns.name);
-    let start = std::time::Instant::now();
-    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-    let resp = wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
-    let elapsed = start.elapsed();
-    resp.assert_backend("echo-a");
-
-    wait::log_measurement(
-        "route propagation time (Ingress): apply -> first successful request \
-         (cf. gateway-api-bench Route Propagation Time; Agentgateway 10-30ms)",
-        elapsed,
-    );
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "route propagation regressed badly: {elapsed:?} \
-         (e2e/OrbStack overhead means low seconds is expected today, not \
-         Agentgateway's purpose-built-rig 10-30ms; anything this far off \
-         signals a real regression, not measurement noise)"
-    );
-
-    Ok(())
-}
-
-/// Gateway API counterpart to
-/// [`route_propagation_time_ingress_apply_to_first_success`] — see its doc
-/// comment for the full rationale, with one architectural difference worth
-/// flagging: Gateway API traffic reaches this test's namespace through a
-/// **per-Gateway VIP** (#472), resolved by [`Harness::gateway_http`] from the
-/// Gateway's `status.addresses` — unlike Ingress, which has no per-resource
-/// provisioning step and rides the shared proxy's single well-known port.
-/// `gwa::PATH_MATCHING` creates the `Gateway` and the `HTTPRoute` together in
-/// one apply (matching every other Gateway API test in this file), so this
-/// number necessarily includes one-time-per-namespace Gateway/VIP
-/// provisioning alongside route propagation — it is not a pure apples-to-apples
-/// match to Agentgateway's route-only benchmark, which measures route changes
-/// against an already-provisioned Gateway. Kept anyway because it is still the
-/// closest black-box number this harness can produce for the Gateway API
-/// surface, and any regression in it is real signal regardless.
-#[tokio::test]
-async fn route_propagation_time_gateway_api_apply_to_first_success() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "rt-gw-prop-time").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-
-    let host = format!("echo.{}.local", ns.name);
-    let start = std::time::Instant::now();
-    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-    let gw = h.gateway_http(&ns.name).await?;
-    let resp = wait::wait_for_route(&gw, &host, "/a", Duration::from_secs(60)).await?;
-    let elapsed = start.elapsed();
-    resp.assert_backend("echo-a");
-
-    wait::log_measurement(
-        "route propagation time (Gateway API): apply -> first successful request \
-         (cf. gateway-api-bench Route Propagation Time; Agentgateway 10-30ms)",
-        elapsed,
-    );
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "route propagation regressed badly: {elapsed:?} \
-         (e2e/OrbStack overhead means low seconds is expected today, not \
-         Agentgateway's purpose-built-rig 10-30ms; anything this far off \
-         signals a real regression, not measurement noise)"
-    );
 
     Ok(())
 }
@@ -1139,58 +975,6 @@ async fn url_rewrite_replaces_request_path() -> anyhow::Result<()> {
     assert_eq!(
         echo_path, "/filter/new/resource",
         "URLRewrite: expected rewritten path /filter/new/resource, got {echo_path:?}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn timeouts_request_returns_504() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "rt-gw-timeouts-req").await?;
-
-    fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
-    fixtures::apply_fixture(gwa::TIMEOUTS, FixtureVars::new(&ns.name)).await?;
-
-    let host = format!("timeout.{}.local", ns.name);
-    let gw = h.gateway_http(&ns.name).await?;
-
-    // Wait until the route is programmed. /request-timeout always returns 504 so we
-    // can't use it as a readiness probe; use /backend-timeout (also 504) instead.
-    wait::wait_for_route_status(&gw, &host, "/backend-timeout", 504, Duration::from_secs(60))
-        .await?;
-
-    let status = gw.get_status(&host, "/request-timeout").await?;
-    assert_eq!(
-        status, 504,
-        "expected 504 from request timeout, got {status}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn timeouts_backend_request_returns_504() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "rt-gw-timeouts-be").await?;
-
-    fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
-    fixtures::apply_fixture(gwa::TIMEOUTS, FixtureVars::new(&ns.name)).await?;
-
-    let host = format!("timeout.{}.local", ns.name);
-    let gw = h.gateway_http(&ns.name).await?;
-
-    // Wait until the route is registered. Both rules time out so we cannot use
-    // wait_for_route; instead we poll until the 504 appears.
-    wait::wait_for_route_status(&gw, &host, "/backend-timeout", 504, Duration::from_secs(60))
-        .await?;
-
-    let status = gw.get_status(&host, "/backend-timeout").await?;
-    assert_eq!(
-        status, 504,
-        "expected 504 from backend request timeout, got {status}"
     );
 
     Ok(())
@@ -3177,4 +2961,247 @@ async fn backend_deletion_tombstones_without_touching_siblings() -> anyhow::Resu
     wait::wait_for_backend(&gw, &host_b, "/", "echo-b", Duration::from_secs(15)).await?;
 
     Ok(())
+}
+
+// Tests that mutate the shared Helm release (non-default ControllerOptions /
+// start_with_options) or that need flake-isolation timing must run serially
+// against the whole e2e job -- see `.config/nextest.toml` `test(/serial::/)`.
+mod serial {
+    use super::*;
+
+    /// Tests both the per-Ingress spec.defaultBackend and the controller-wide
+    /// --ingress-default-backend flag. Backends are deployed before the controller
+    /// starts so that echo-c is already ready on the first routing-table rebuild.
+    #[tokio::test]
+    async fn default_backend_serves_unmatched_requests() -> anyhow::Result<()> {
+        // Bootstrap cluster connection and create the namespace before starting the
+        // controller, so the default-backend endpoints are ready on first sync.
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "rt-ing-default").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+
+        // Start the controller with the controller-wide default pointing at echo-c.
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            ingress_default_backend: Some(format!("{}/echo-c:3000", ns.name)),
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+        let http = HttpClient::new(controller.proxy_addr)?;
+
+        // Apply the fixture: rule /api → echo-a, spec.defaultBackend → echo-b.
+        fixtures::apply_fixture(ingress::DEFAULT_BACKEND, FixtureVars::new(&ns.name)).await?;
+
+        let host = format!("app.{}.local", ns.name);
+        let unknown_host = format!("unknown.{}.local", ns.name);
+
+        // Wait until the explicit rule is live with the correct backend.
+        // Use wait_for_backend (not wait_for_route) because the controller-wide catchall
+        // may serve echo-c for this host before the Ingress-specific route is reconciled.
+        wait::wait_for_backend(&http, &host, "/api", "echo-a", Duration::from_secs(60)).await?;
+
+        // Per-Ingress defaultBackend catches path-miss on the rule's host.
+        let resp = http.get(&host, "/other").await?;
+        resp.assert_backend("echo-b");
+
+        // Per-Ingress defaultBackend wins over controller-wide for unmatched hosts too.
+        let resp = http.get(&unknown_host, "/anything").await?;
+        resp.assert_backend("echo-b");
+
+        Ok(())
+    }
+
+    /// Tests a rules-less Ingress (only spec.defaultBackend, no spec.rules).
+    /// The defaultBackend should serve all traffic regardless of host or path.
+    #[tokio::test]
+    async fn default_backend_alone_serves_all_hosts() -> anyhow::Result<()> {
+        let h = Harness::start().await?;
+        let ns = NamespaceGuard::create(&h.client, "rt-ing-default-only").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(ingress::DEFAULT_BACKEND_ONLY, FixtureVars::new(&ns.name)).await?;
+
+        // Wait for the defaultBackend to be live, probing an arbitrary host+path.
+        let resp =
+            wait::wait_for_route(&h.http, "random.example", "/", Duration::from_secs(60)).await?;
+        resp.assert_backend("echo-b");
+
+        // Any host and any path should hit echo-b.
+        let resp = h.http.get("other.io", "/api/v1").await?;
+        resp.assert_backend("echo-b");
+
+        Ok(())
+    }
+
+    /// Route-propagation-time measurement (#513 follow-up): the black-box
+    /// "apply -> first successful request" latency, the same metric
+    /// github.com/howardjohn/gateway-api-bench's "Route Propagation Time" test
+    /// reports for other Gateway API implementations (Agentgateway: 10-30ms;
+    /// Istio: 120-300ms; Envoy Gateway/Nginx: ~600-800ms at 3000 routes).
+    ///
+    /// Logs the measured value via [`wait::log_measurement`] (not a direct
+    /// `tracing::info!` — see that function's doc comment for why a call from
+    /// this file would be silently dropped) so `cargo nextest run ...
+    /// --no-capture` surfaces a citable number for a #512 (adaptive debounce)
+    /// before/after comparison. The
+    /// assertion itself is a generous regression ceiling, not a tight benchmark
+    /// gate: this suite's own e2e/OrbStack overhead (kubectl apply round trip,
+    /// HTTP client connect setup) means it will never hit the purpose-built
+    /// benchmark rig's 10-30ms floor — but a multi-second regression here is real
+    /// signal, and today's number (dominated by the reflector's fixed 500ms
+    /// debounce floor, see the #513 baseline on issue #513) is the reference
+    /// #512 must beat.
+    ///
+    /// Serial, not a config mutator: under the parallel pass, contention for
+    /// the single shared control plane (watch/debounce/discovery-push
+    /// convergence) inflates this number from ~1.5s to occasionally >10s —
+    /// verified reproducible on `main` without any product change (~1-in-3),
+    /// so it is measurement contention, not a regression. Runs alone so the
+    /// number reflects true uncontended convergence.
+    #[tokio::test]
+    async fn route_propagation_time_ingress_apply_to_first_success() -> anyhow::Result<()> {
+        let h = Harness::start().await?;
+        let ns = NamespaceGuard::create(&h.client, "rt-ing-prop-time").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+
+        let host = format!("ingress.{}.local", ns.name);
+        let start = std::time::Instant::now();
+        fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+        let resp = wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+        let elapsed = start.elapsed();
+        resp.assert_backend("echo-a");
+
+        wait::log_measurement(
+            "route propagation time (Ingress): apply -> first successful request \
+             (cf. gateway-api-bench Route Propagation Time; Agentgateway 10-30ms)",
+            elapsed,
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "route propagation regressed badly: {elapsed:?} \
+             (e2e/OrbStack overhead means low seconds is expected today, not \
+             Agentgateway's purpose-built-rig 10-30ms; anything this far off \
+             signals a real regression, not measurement noise)"
+        );
+
+        Ok(())
+    }
+
+    /// Gateway API counterpart to
+    /// [`route_propagation_time_ingress_apply_to_first_success`] — see its doc
+    /// comment for the full rationale, with one architectural difference worth
+    /// flagging: Gateway API traffic reaches this test's namespace through a
+    /// **per-Gateway VIP** (#472), resolved by [`Harness::gateway_http`] from the
+    /// Gateway's `status.addresses` — unlike Ingress, which has no per-resource
+    /// provisioning step and rides the shared proxy's single well-known port.
+    /// `gwa::PATH_MATCHING` creates the `Gateway` and the `HTTPRoute` together in
+    /// one apply (matching every other Gateway API test in this file), so this
+    /// number necessarily includes one-time-per-namespace Gateway/VIP
+    /// provisioning alongside route propagation — it is not a pure apples-to-apples
+    /// match to Agentgateway's route-only benchmark, which measures route changes
+    /// against an already-provisioned Gateway. Kept anyway because it is still the
+    /// closest black-box number this harness can produce for the Gateway API
+    /// surface, and any regression in it is real signal regardless.
+    ///
+    /// Serial, not a config mutator: same contention rationale as
+    /// [`route_propagation_time_ingress_apply_to_first_success`], plus
+    /// simultaneous per-Gateway VIP provisioning under the parallel pass —
+    /// both inflate this measurement without indicating a real regression.
+    #[tokio::test]
+    async fn route_propagation_time_gateway_api_apply_to_first_success() -> anyhow::Result<()> {
+        let h = Harness::start().await?;
+        let ns = NamespaceGuard::create(&h.client, "rt-gw-prop-time").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+
+        let host = format!("echo.{}.local", ns.name);
+        let start = std::time::Instant::now();
+        fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+        let gw = h.gateway_http(&ns.name).await?;
+        let resp = wait::wait_for_route(&gw, &host, "/a", Duration::from_secs(60)).await?;
+        let elapsed = start.elapsed();
+        resp.assert_backend("echo-a");
+
+        wait::log_measurement(
+            "route propagation time (Gateway API): apply -> first successful request \
+             (cf. gateway-api-bench Route Propagation Time; Agentgateway 10-30ms)",
+            elapsed,
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "route propagation regressed badly: {elapsed:?} \
+             (e2e/OrbStack overhead means low seconds is expected today, not \
+             Agentgateway's purpose-built-rig 10-30ms; anything this far off \
+             signals a real regression, not measurement noise)"
+        );
+
+        Ok(())
+    }
+
+    /// Serial, not a config mutator: this test drives a deliberately slow
+    /// upstream so the proxy holds connections open until a 504 fires. Run
+    /// concurrently with this binary's high-volume `count_backends`
+    /// distribution tests, that raises connection-setup tail latency on the
+    /// single shared proxy enough to trip the 5s client timeout. Runs alone
+    /// purely to keep the parallel routing pass stable.
+    #[tokio::test]
+    async fn timeouts_request_returns_504() -> anyhow::Result<()> {
+        let h = Harness::start().await?;
+        let ns = NamespaceGuard::create(&h.client, "rt-gw-timeouts-req").await?;
+
+        fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
+        fixtures::apply_fixture(gwa::TIMEOUTS, FixtureVars::new(&ns.name)).await?;
+
+        let host = format!("timeout.{}.local", ns.name);
+        let gw = h.gateway_http(&ns.name).await?;
+
+        // Wait until the route is programmed. /request-timeout always returns 504 so we
+        // can't use it as a readiness probe; use /backend-timeout (also 504) instead.
+        wait::wait_for_route_status(&gw, &host, "/backend-timeout", 504, Duration::from_secs(60))
+            .await?;
+
+        let status = gw.get_status(&host, "/request-timeout").await?;
+        assert_eq!(
+            status, 504,
+            "expected 504 from request timeout, got {status}"
+        );
+
+        Ok(())
+    }
+
+    /// Serial for the same reason as
+    /// [`timeouts_request_returns_504`] — see its doc comment.
+    #[tokio::test]
+    async fn timeouts_backend_request_returns_504() -> anyhow::Result<()> {
+        let h = Harness::start().await?;
+        let ns = NamespaceGuard::create(&h.client, "rt-gw-timeouts-be").await?;
+
+        fixtures::apply_fixture(backends::SLOW_ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_deployments(&ns.name, &["slow-echo"]).await?;
+        fixtures::apply_fixture(gwa::TIMEOUTS, FixtureVars::new(&ns.name)).await?;
+
+        let host = format!("timeout.{}.local", ns.name);
+        let gw = h.gateway_http(&ns.name).await?;
+
+        // Wait until the route is registered. Both rules time out so we cannot use
+        // wait_for_route; instead we poll until the 504 appears.
+        wait::wait_for_route_status(&gw, &host, "/backend-timeout", 504, Duration::from_secs(60))
+            .await?;
+
+        let status = gw.get_status(&host, "/backend-timeout").await?;
+        assert_eq!(
+            status, 504,
+            "expected 504 from backend request timeout, got {status}"
+        );
+
+        Ok(())
+    }
 }
