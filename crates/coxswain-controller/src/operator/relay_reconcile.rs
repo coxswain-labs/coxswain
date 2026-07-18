@@ -328,9 +328,9 @@ fn registry_signal(ctx: &ReconcileContext, namespace: &str) -> (u32, bool, u32) 
     };
     let snapshot = registry.load();
     (
-        clamp_usize(snapshot.namespace_leaf_count(namespace)),
+        clamp_usize_to_u32(snapshot.namespace_leaf_count(namespace)),
         snapshot.relay_ready(namespace),
-        clamp_usize(snapshot.relay_subscriber_count(namespace)),
+        clamp_usize_to_u32(snapshot.relay_subscriber_count(namespace)),
     )
 }
 
@@ -399,7 +399,7 @@ pub(super) async fn delete_relay_resources(
 /// Saturating `usize → u32` for a registry count (a count above `u32::MAX` is
 /// nonsensical but must never wrap or panic). `pub(super)` so the shared-relay
 /// convergence reuses the same saturation.
-pub(super) fn clamp_usize(v: usize) -> u32 {
+pub(super) fn clamp_usize_to_u32(v: usize) -> u32 {
     u32::try_from(v).unwrap_or(u32::MAX)
 }
 

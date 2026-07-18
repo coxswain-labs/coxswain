@@ -152,7 +152,7 @@ impl GrpcRouteReconciler {
     /// Compute per-(route, parent) `Accepted` + `ResolvedRefs` status for `GRPCRoute`s.
     ///
     /// Returns a [`RouteStatusMap`] keyed by [`crate::keys::RouteParentKey`] — the map
-    /// type is kind-neutral. Use a **separate** `SharedRouteStatus` instance for GRPCRoute status
+    /// type is kind-neutral. Use a **separate** `RouteStatusHandle` instance for GRPCRoute status
     /// to avoid `RouteParentKey` collisions with HTTPRoute status (same key shape, different kind).
     pub(crate) fn compute_route_health(
         routes: &[Arc<GrpcRoute>],
@@ -190,7 +190,7 @@ impl TlsRouteReconciler {
     ///
     /// Only `protocol: TLS` listeners are considered — routes attached to HTTP/HTTPS
     /// listeners receive `Accepted=False, NotAllowedByListeners`. Use a **separate**
-    /// [`crate::status::SharedRouteStatus`] instance to avoid key collisions with
+    /// [`crate::status::RouteStatusHandle`] instance to avoid key collisions with
     /// HTTP/GRPC route status (same key shape, different kind).
     pub(crate) fn compute_route_health(
         routes: &[Arc<TlsRoute>],
@@ -228,7 +228,7 @@ impl TcpRouteReconciler {
     ///
     /// Only `protocol: TCP` listeners are considered — routes attached to any other
     /// protocol listener receive `Accepted=False, NotAllowedByListeners`. Use a **separate**
-    /// [`crate::status::SharedRouteStatus`] instance to avoid key collisions with other
+    /// [`crate::status::RouteStatusHandle`] instance to avoid key collisions with other
     /// route kinds' status (same key shape, different kind).
     pub(crate) fn compute_route_health(
         routes: &[Arc<TcpRoute>],
@@ -266,7 +266,7 @@ impl UdpRouteReconciler {
     ///
     /// Only `protocol: UDP` listeners are considered — routes attached to any other
     /// protocol listener receive `Accepted=False, NotAllowedByListeners`. Use a **separate**
-    /// [`crate::status::SharedRouteStatus`] instance to avoid key collisions with other
+    /// [`crate::status::RouteStatusHandle`] instance to avoid key collisions with other
     /// route kinds' status (same key shape, different kind).
     pub(crate) fn compute_route_health(
         routes: &[Arc<UdpRoute>],

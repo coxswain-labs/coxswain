@@ -4,7 +4,7 @@
 //!
 //! Unlike [`super::external_auth`], there is no `backendRef` to resolve to
 //! endpoints — the only external dependency is a remote JWKS, and that is
-//! resolved by the controller-side [`crate::jwks::SharedJwksCache`] background
+//! resolved by the controller-side [`crate::jwks::JwksCacheHandle`] background
 //! fetcher, never inline here. `resolve_spec` only ever does synchronous,
 //! infallible-I/O work: look up the cache, or read the CRD's inline JWKS.
 
@@ -32,7 +32,7 @@ use std::sync::Arc;
 #[must_use]
 pub(crate) fn resolve_spec(
     spec: &JwtAuthSpec,
-    jwks_cache: &crate::jwks::SharedJwksCache,
+    jwks_cache: &crate::jwks::JwksCacheHandle,
     route_id: &str,
 ) -> IngressAuthConfig {
     let jwks = match (&spec.jwks.remote, &spec.jwks.inline) {
@@ -111,7 +111,7 @@ mod tests {
     #![allow(missing_docs)]
 
     use super::*;
-    use crate::jwks::SharedJwksCache;
+    use crate::jwks::JwksCacheHandle;
 
     /// Build a `JwtAuthSpec` from a `jwks:` YAML fragment. `JwksSource` and its
     /// nested types are `#[non_exhaustive]` and defined in `coxswain-core` — a
@@ -134,7 +134,7 @@ mod tests {
     #[test]
     fn neither_remote_nor_inline_fails_closed() {
         let spec = spec_with("{}");
-        let cache = SharedJwksCache::new();
+        let cache = JwksCacheHandle::new();
         assert!(matches!(
             resolve_spec(&spec, &cache, "ns/route"),
             IngressAuthConfig::Unavailable
@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn unresolved_remote_jwks_fails_closed() {
         let spec = spec_with("remote:\n  uri: https://issuer.example.com/jwks.json");
-        let cache = SharedJwksCache::new(); // never populated
+        let cache = JwksCacheHandle::new(); // never populated
         assert!(matches!(
             resolve_spec(&spec, &cache, "ns/route"),
             IngressAuthConfig::Unavailable
@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn inline_jwks_resolves() {
         let spec = spec_with("inline:\n  jwks:\n    keys: []");
-        let cache = SharedJwksCache::new();
+        let cache = JwksCacheHandle::new();
         let IngressAuthConfig::Jwt(cfg) = resolve_spec(&spec, &cache, "ns/route") else {
             panic!("expected Jwt config");
         };
@@ -172,7 +172,7 @@ mod tests {
         let spec = spec_with(
             "remote:\n  uri: https://issuer.example.com/jwks.json\ninline:\n  jwks:\n    keys: []",
         );
-        let cache = SharedJwksCache::new();
+        let cache = JwksCacheHandle::new();
         assert!(matches!(
             resolve_spec(&spec, &cache, "ns/route"),
             IngressAuthConfig::Unavailable

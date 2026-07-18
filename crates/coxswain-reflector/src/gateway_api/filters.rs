@@ -958,7 +958,7 @@ pub(super) fn resolve_jwt_auth<F: ExtRefFilter>(
     filters: &[F],
     route_ns: &str,
     jwt_auths: &MergedStore<coxswain_core::crd::JwtAuth>,
-    jwks_cache: &crate::jwks::SharedJwksCache,
+    jwks_cache: &crate::jwks::JwksCacheHandle,
 ) -> Option<Arc<IngressAuthConfig>> {
     ext_refs(filters).find_map(|(g, k, n)| {
         if g != super::COXSWAIN_GROUP || k != "JwtAuth" {

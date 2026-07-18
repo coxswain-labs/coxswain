@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use coxswain_core::health::SubsystemHandle;
-use coxswain_core::listener_status::SharedGatewayListenerStatus;
+use coxswain_core::listener_status::GatewayListenerStatusHandle;
 use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
     SharedTlsPassthroughTable, SharedUdpRouteTable,
@@ -212,7 +212,7 @@ pub struct DiscoveryClient {
     gateway_routes: SharedGatewayRoutingTable,
     tls_store: SharedPortTlsStore,
     client_cert_store: SharedClientCertStore,
-    listener_status: SharedGatewayListenerStatus,
+    listener_status: GatewayListenerStatusHandle,
     listener_hostnames: SharedListenerHostnames,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
@@ -349,7 +349,7 @@ impl DiscoveryClient {
     /// Used by the proxy's `ListenerSpecsAdapter` to drive dynamic Gateway
     /// listener port bind/unbind without any Kubernetes API access.
     #[must_use]
-    pub fn listener_status(&self) -> SharedGatewayListenerStatus {
+    pub fn listener_status(&self) -> GatewayListenerStatusHandle {
         self.listener_status.clone()
     }
 

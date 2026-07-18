@@ -2,10 +2,10 @@
 //!
 //! Remote JWKS resolution happens **here** — never in `coxswain-proxy` — so the
 //! read-only data plane never egresses to an identity provider (the Istio
-//! model, not Envoy's default proxy-side fetch). [`SharedJwksCache`] is a
+//! model, not Envoy's default proxy-side fetch). [`JwksCacheHandle`] is a
 //! cloneable, lock-free-read handle: [`run`] is the sole writer (spawned once,
 //! controller role only — see [`crate::reconciler::ReconcilerOptions::fetch_remote_jwks`]),
-//! and the reconcile rebuild reads it synchronously via [`SharedJwksCache::get`]
+//! and the reconcile rebuild reads it synchronously via [`JwksCacheHandle::get`]
 //! when resolving a `JwtAuth` CR that names a [`coxswain_core::crd::RemoteJwks`].
 //!
 //! Inline JWKS ([`coxswain_core::crd::InlineJwks`]) never touches this cache — the reflector reads
@@ -57,7 +57,7 @@ struct CacheEntry {
     next_due: Instant,
 }
 
-struct SharedJwksCacheInner {
+struct JwksCacheInner {
     entries: ArcSwap<HashMap<Box<str>, CacheState>>,
     tx: watch::Sender<u64>,
 }
@@ -73,20 +73,20 @@ struct SharedJwksCacheInner {
 /// reconcile.
 #[non_exhaustive]
 #[derive(Clone)]
-pub struct SharedJwksCache(Arc<SharedJwksCacheInner>);
+pub struct JwksCacheHandle(Arc<JwksCacheInner>);
 
-impl Default for SharedJwksCache {
+impl Default for JwksCacheHandle {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SharedJwksCache {
+impl JwksCacheHandle {
     /// Construct an empty cache (generation 0).
     #[must_use]
     pub fn new() -> Self {
         let (tx, _) = watch::channel(0u64);
-        Self(Arc::new(SharedJwksCacheInner {
+        Self(Arc::new(JwksCacheInner {
             entries: ArcSwap::from_pointee(HashMap::new()),
             tx,
         }))
@@ -137,7 +137,7 @@ impl SharedJwksCache {
 /// [`crate::reconciler::ReconcilerOptions::fetch_remote_jwks`]) — the proxy
 /// never runs this task, so the read-only data plane never egresses to an
 /// identity provider.
-pub async fn run(cache: SharedJwksCache, jwt_auths: MergedStore<JwtAuth>, client: reqwest::Client) {
+pub async fn run(cache: JwksCacheHandle, jwt_auths: MergedStore<JwtAuth>, client: reqwest::Client) {
     let mut local: HashMap<Box<str>, CacheEntry> = HashMap::new();
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     loop {
@@ -150,7 +150,7 @@ pub async fn run(cache: SharedJwksCache, jwt_auths: MergedStore<JwtAuth>, client
 /// no longer referenced, fetch every due URI concurrently, and publish if
 /// anything changed.
 async fn tick(
-    cache: &SharedJwksCache,
+    cache: &JwksCacheHandle,
     jwt_auths: &MergedStore<JwtAuth>,
     client: &reqwest::Client,
     local: &mut HashMap<Box<str>, CacheEntry>,
@@ -247,13 +247,13 @@ mod tests {
 
     #[test]
     fn empty_cache_resolves_nothing() {
-        let cache = SharedJwksCache::new();
+        let cache = JwksCacheHandle::new();
         assert!(cache.get("https://issuer.example.com/jwks.json").is_none());
     }
 
     #[test]
     fn publish_makes_resolved_entries_visible_and_bumps_generation() {
-        let cache = SharedJwksCache::new();
+        let cache = JwksCacheHandle::new();
         let mut rx = cache.subscribe();
         let initial = *rx.borrow();
 
@@ -276,7 +276,7 @@ mod tests {
 
     #[test]
     fn failed_entry_resolves_to_none() {
-        let cache = SharedJwksCache::new();
+        let cache = JwksCacheHandle::new();
         let mut snapshot = HashMap::new();
         snapshot.insert(
             Box::from("https://issuer.example.com/jwks.json"),
@@ -300,7 +300,7 @@ mod tests {
         rustls::crypto::ring::default_provider()
             .install_default()
             .ok();
-        let cache = SharedJwksCache::new();
+        let cache = JwksCacheHandle::new();
         let jwt_auths = empty_store();
         let client = reqwest::Client::builder().build().expect("client");
         let mut local = HashMap::new();

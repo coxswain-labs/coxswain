@@ -65,7 +65,7 @@ pub(crate) mod status;
 pub(crate) mod vip;
 
 pub use reconciler::{OperatorConfig, RelayConfig};
-pub use render_shared_proxy::SharedProxyConfig;
+pub use render_shared_proxy::ProxyPoolConfig;
 // #574 fold: the operator no longer runs as its own `BackgroundService`. The
 // controller builds the reconcile context off the reflector's `OperatorStores`,
 // the unified worker's dedicated branch calls `reconcile_dedicated`, and the

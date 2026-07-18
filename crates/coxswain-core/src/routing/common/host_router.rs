@@ -482,7 +482,7 @@ impl HostRouterBuilder {
         let mut has_query_predicates = false;
 
         // Track whether any entry uses query predicates.
-        let check_query = |entries: &Vec<(usize, Arc<RouteEntry>)>| {
+        let check_query = |entries: &[(usize, Arc<RouteEntry>)]| {
             entries.iter().any(|(_, e)| !e.predicates.query.is_empty())
         };
 

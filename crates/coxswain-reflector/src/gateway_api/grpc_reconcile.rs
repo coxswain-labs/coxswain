@@ -74,7 +74,7 @@ pub struct GrpcRouteResolution<'a> {
     pub jwt_auths: &'a MergedStore<JwtAuth>,
     /// Controller-fetched remote-JWKS cache (#441), read synchronously when
     /// resolving a `JwtAuth` CR that names a `jwks.remote`. See [`crate::jwks`].
-    pub jwks_cache: &'a crate::jwks::SharedJwksCache,
+    pub jwks_cache: &'a crate::jwks::JwksCacheHandle,
 }
 
 /// Result of looking up a `BackendTLSPolicy` for a rule's backend refs.

@@ -299,7 +299,7 @@ pub(crate) fn listener_route_kind_info(
 /// conformance test asserts.
 ///
 /// `info` is the snapshot for this listener from
-/// `SharedGatewayListenerStatus.load()`; pass `None` for listeners the
+/// `GatewayListenerStatusHandle.load()`; pass `None` for listeners the
 /// reflector hasn't yet computed (initial sync, or a Gateway whose class
 /// isn't claimed) — the defaults degrade to the healthy/empty case.
 #[must_use]

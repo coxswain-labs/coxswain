@@ -5,7 +5,7 @@
 //! to the channel senders; this module also owns the terminal step ([`spawn_mirror_dispatch`]):
 //! the spawned task that streams the body to the mirror backend and discards its response.
 
-use crate::config::SharedProxyConfig;
+use crate::config::ProxyServices;
 use crate::ctx::{MirrorDispatch, ProxyCtx};
 use bytes::Bytes;
 use coxswain_core::routing::{BackendGroup, FilterAction, MirrorFraction};
@@ -40,7 +40,7 @@ const MIRROR_CREDENTIAL_HEADERS: &[&str] = &["authorization", "cookie", "proxy-a
 pub(crate) fn setup(
     session: &Session,
     ctx: &mut ProxyCtx,
-    cfg: &SharedProxyConfig,
+    cfg: &ProxyServices,
     query: Option<&str>,
 ) {
     // Collect all Mirror filters, applying per-filter sampling gates (GEP-3171).

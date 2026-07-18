@@ -33,14 +33,14 @@
 //! `AcceptedOverrides` map is needed because the operator is now the sole
 //! writer of `Gateway.status` on dedicated-mode Gateways (the shared-pool
 //! writer skips them via a `parametersRef` group/kind check). A listener
-//! TLS-health flip is read live from [`SharedGatewayListenerStatus`] on every
+//! TLS-health flip is read live from [`GatewayListenerStatusHandle`] on every
 //! reconcile; under the #574 single watch fabric the reflector's rebuild pass
 //! re-enqueues the owning Gateway's status key when derived route/listener
 //! health drifts, so a cert-ref or route-resolution change reaches the patch
 //! path within watch latency without a dedicated retrigger channel.
 
 use super::relay_params::{self, EffectiveRelayPolicy};
-use super::render_shared_proxy::SharedProxyConfig;
+use super::render_shared_proxy::ProxyPoolConfig;
 use super::{apply, params, relay_autoscaler, render, render_relay, render_shared, status, vip};
 use crate::controller::StatusOutcome;
 use coxswain_core::Shared;
@@ -51,7 +51,7 @@ use coxswain_reflector::gw_types::ListenerSet;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 use coxswain_reflector::ingress::IngressPorts;
-use coxswain_reflector::status::{GatewayListenerStatus, SharedGatewayListenerStatus};
+use coxswain_reflector::status::{GatewayListenerStatus, GatewayListenerStatusHandle};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Service, ServiceAccount};
@@ -136,14 +136,14 @@ impl crate::metrics::ReconcileErrorReason for ReconcileError {
 
 /// The controller-provisioned relay tier's provisioning + control-loop knobs
 /// (#584/#602/#605), grouped so the `--relay-*` flag set threads through the
-/// operator as one value (mirrors [`SharedProxyConfig`]).
+/// operator as one value (mirrors [`ProxyPoolConfig`]).
 ///
 /// Constructed field-by-field in `coxswain-bin` from the CLI flags and carried on
 /// [`OperatorConfig`]. The reconciler-derived runtime state
 /// (`provisioned_relays` / `active_relays` / the repoint watch) is not config and
 /// stays on `OperatorConfig` directly.
 #[derive(Clone, Debug)]
-// intentionally open: field-literal constructed in crates/coxswain-bin/src/args.rs from CLI args, same rationale as SharedProxyConfig.
+// intentionally open: field-literal constructed in crates/coxswain-bin/src/args.rs from CLI args, same rationale as ProxyPoolConfig.
 pub struct RelayConfig {
     /// Relay tiering master switch (`--relay-enabled`, #584). When `true`, each
     /// namespace holding ≥1 dedicated Gateway gets a controller-provisioned
@@ -219,10 +219,10 @@ pub struct OperatorConfig {
     /// for listeners, not TLS: HTTP listeners are present too (with a
     /// `NotApplicable` TLS outcome). Read on every reconcile (the patch builder
     /// maps each listener to its `(readiness, attached_routes)` snapshot) and
-    /// subscribed via [`SharedGatewayListenerStatus::subscribe`] so any health
+    /// subscribed via [`GatewayListenerStatusHandle::subscribe`] so any health
     /// flip (e.g. a TLS-cert resolution change) kicks every owned Gateway through
     /// [`kube::runtime::Controller::reconcile_all_on`].
-    pub listener_status: SharedGatewayListenerStatus,
+    pub listener_status: GatewayListenerStatusHandle,
     /// Ports reserved for the Ingress data plane via `--proxy-http-port` /
     /// `--proxy-https-port`. Forwarded to the listener-status helper so a
     /// dedicated-mode listener whose port collides with the Ingress
@@ -262,7 +262,7 @@ pub struct OperatorConfig {
     /// reconcile (`run_shared_install_reconciler`) renders the pool from this +
     /// the install-wide fields below. `enabled=false` (or an empty selector)
     /// leaves the pool unprovisioned.
-    pub shared_proxy: SharedProxyConfig,
+    pub shared_proxy: ProxyPoolConfig,
     /// Health server port for the rendered shared proxy pool (`--health-port`,
     /// mirrors the controller's own). Also the internal Service's health target.
     pub health_port: u16,
@@ -283,12 +283,12 @@ pub struct OperatorConfig {
     /// actually bound the effective listener ports — pod readiness alone flips
     /// before a listener *added by a spec change* is bound. `None` disables
     /// the gate (tests).
-    pub node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
+    pub node_registry: Option<coxswain_core::node_registry::NodeRegistryHandle>,
     /// Per-Gateway publish-sequence index (#531): the ack half of the
     /// dedicated `Programmed` gate — the Gateway's own proxy must have Ack'd
     /// a snapshot containing the current generation, not merely hold its
     /// (possibly stale) port binds. `None` disables it (tests).
-    pub publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
+    pub publish_index: Option<coxswain_core::publish_index::GatewayPublishIndexHandle>,
     /// Relay tier provisioning + control-loop knobs (#584/#602/#605), grouped from
     /// the `--relay-*` flags. The runtime channels/shared-state below
     /// (`provisioned_relays`, `active_relays`, `shared_relay_active`,
@@ -351,7 +351,7 @@ pub(crate) struct ReconcileContext {
     nodes_store: MergedStore<Node>,
     /// Shared per-listener TLS-health channel — read-only snapshot at each
     /// reconcile.
-    listener_status: SharedGatewayListenerStatus,
+    listener_status: GatewayListenerStatusHandle,
     /// Ports reserved for the Ingress data plane via the controller's CLI.
     /// Forwarded to [`super::status::build_dedicated_gateway_status_patch`]
     /// for the listener `PortUnavailable` precedence check, and rendered onto
@@ -391,7 +391,7 @@ pub(crate) struct ReconcileContext {
     pub(super) shared_vip_service_type: ServiceType,
     /// Controller-owned shared proxy pool config (#604). Read by the serialized
     /// [`super::run_shared_install_reconciler`] to render + apply the pool.
-    pub(super) shared_proxy: SharedProxyConfig,
+    pub(super) shared_proxy: ProxyPoolConfig,
     /// Health port + install-wide surface enablement rendered onto the shared
     /// pool (#604), mirroring the controller's own CLI.
     pub(super) health_port: u16,
@@ -416,9 +416,9 @@ pub(crate) struct ReconcileContext {
     /// the Gateway's own proxy reporting its listener ports bound. Also the relay
     /// control loop's demand signal + make-before-break gates (#602): namespace
     /// leaf count, relay readiness, and relay drain state all read off it.
-    pub(super) node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
+    pub(super) node_registry: Option<coxswain_core::node_registry::NodeRegistryHandle>,
     /// Per-Gateway publish-sequence index (#531): ack half of the gate.
-    publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
+    publish_index: Option<coxswain_core::publish_index::GatewayPublishIndexHandle>,
     /// Relay tier provisioning + control-loop knobs (#584/#602/#605). See
     /// [`RelayConfig`].
     pub(super) relay: RelayConfig,

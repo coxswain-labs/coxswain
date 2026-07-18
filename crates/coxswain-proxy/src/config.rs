@@ -24,7 +24,7 @@ use std::sync::Arc;
 /// `Copy` values, or internally reference-counted types.
 #[non_exhaustive]
 #[derive(Clone)]
-pub struct SharedProxyConfig {
+pub struct ProxyServices {
     /// Global fallback timeouts applied when a matched route has no per-rule
     /// timeouts set.
     pub default_timeouts: RouteTimeouts,
@@ -93,8 +93,8 @@ pub struct SharedProxyConfig {
     pub mirror_tracker: tokio_util::task::TaskTracker,
 }
 
-impl SharedProxyConfig {
-    /// Construct a `SharedProxyConfig` from its collaborators.
+impl ProxyServices {
+    /// Construct a `ProxyServices` from its collaborators.
     #[must_use]
     pub fn new(
         default_timeouts: RouteTimeouts,

@@ -7,7 +7,7 @@
 //!
 //! ## Cross-replica fan-out
 //!
-//! Each controller replica's [`SharedNodeRegistry`] is populated only by the
+//! Each controller replica's [`NodeRegistryHandle`] is populated only by the
 //! proxy discovery connections *that replica* accepted — the discovery server
 //! deliberately has no leader gate (connections load-balance across every
 //! replica, so no single pod becomes a fan-in bottleneck at scale). A read of
@@ -182,21 +182,21 @@ fn fmt_time(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coxswain_core::node_registry::{NodeScope, SharedNodeRegistry};
+    use coxswain_core::node_registry::{NodeRegistryHandle, NodeScope};
     use std::time::SystemTime;
 
     fn epoch() -> SystemTime {
         SystemTime::UNIX_EPOCH
     }
 
-    /// Build a `SharedNodeRegistry` with a single SharedPool node that has the
+    /// Build a `NodeRegistryHandle` with a single SharedPool node that has the
     /// given `target` and `acked` versions.
     fn reg_with_shared(
         node_id: &str,
         target: Option<&str>,
         acked: Option<&str>,
-    ) -> SharedNodeRegistry {
-        let reg = SharedNodeRegistry::new();
+    ) -> NodeRegistryHandle {
+        let reg = NodeRegistryHandle::new();
         reg.connect(node_id, NodeScope::SharedPool, epoch());
         if let Some(t) = target {
             reg.record_target(node_id, t.to_owned());
@@ -209,7 +209,7 @@ mod tests {
 
     #[test]
     fn build_topology_empty_snap_returns_empty_nodes() {
-        let snap = SharedNodeRegistry::new().load();
+        let snap = NodeRegistryHandle::new().load();
         let v = build_topology(&snap);
         assert_eq!(v["nodes"].as_array().unwrap().len(), 0);
     }
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn build_topology_stable_sort_shared_first_then_gateway() {
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect(
             "gw-node",
             NodeScope::Gateway {
@@ -259,7 +259,7 @@ mod tests {
     #[test]
     fn build_topology_exposes_relay_and_folded_leaf_tiers() {
         use coxswain_core::node_registry::RosterChild;
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         // A namespace relay connects and folds one dedicated leaf.
         reg.connect(
             "relay-a",
@@ -314,7 +314,7 @@ mod tests {
     async fn topology_handler_returns_active_with_registry() {
         use coxswain_core::cluster::SharedClusterSummary;
         use coxswain_core::fleet::SharedFleet;
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", NodeScope::SharedPool, epoch());
         reg.record_target("node-a", "v1".to_owned());
         reg.record_ack("node-a", "v1".to_owned(), 1, epoch());
@@ -339,7 +339,7 @@ mod tests {
     async fn topology_local_returns_raw_registry_for_this_pod() {
         use coxswain_core::cluster::SharedClusterSummary;
         use coxswain_core::fleet::SharedFleet;
-        let reg = SharedNodeRegistry::new();
+        let reg = NodeRegistryHandle::new();
         reg.connect("node-a", NodeScope::SharedPool, epoch());
         let agg = super::super::tests::make_agg_with_registry(
             SharedFleet::default(),
@@ -368,7 +368,7 @@ mod tests {
         use coxswain_core::cluster::SharedClusterSummary;
 
         // Peer registry, serialised the same way `topology_local` would emit it.
-        let peer_reg = SharedNodeRegistry::new();
+        let peer_reg = NodeRegistryHandle::new();
         peer_reg.connect("node-b", NodeScope::SharedPool, epoch());
         peer_reg.record_target("node-b", "v1".to_owned());
         let peer_json = serde_json::to_string(&peer_reg.load()).unwrap();
@@ -376,7 +376,7 @@ mod tests {
             super::super::tests::start_mock_http(Box::leak(peer_json.into_boxed_str())).await;
 
         // Local registry has a different node.
-        let local_reg = SharedNodeRegistry::new();
+        let local_reg = NodeRegistryHandle::new();
         local_reg.connect("node-a", NodeScope::SharedPool, epoch());
         local_reg.record_target("node-a", "v1".to_owned());
 
@@ -417,7 +417,7 @@ mod tests {
         use coxswain_core::cluster::SharedClusterSummary;
 
         let dead_port = super::super::tests::refused_port();
-        let local_reg = SharedNodeRegistry::new();
+        let local_reg = NodeRegistryHandle::new();
         local_reg.connect("node-a", NodeScope::SharedPool, epoch());
 
         let dead_pod = super::super::tests::make_pod(

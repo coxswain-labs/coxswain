@@ -25,9 +25,6 @@ use coxswain_core::routing::{BackendGroup, Selected};
 
 use crate::edge::peek::PeekBackoff;
 
-/// Buffer size for each direction of the TCP splice (~16 KiB).
-const SPLICE_BUF: usize = 16 * 1024;
-
 /// Maximum bytes read when peeking the TLS ClientHello.
 ///
 /// A standard ClientHello fits in ~300 bytes; this cap guards against
@@ -44,8 +41,8 @@ const PEEK_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) enum SniPeek {
     /// Need more bytes — caller should grow the peek buffer and retry.
     Incomplete,
-    /// SNI extension found; `host` is borrowed from the peeked buffer so the
-    /// caller converts it to owned.
+    /// SNI extension found; carries the owned server name copied out of the
+    /// peeked buffer.
     Found(String),
     /// A complete ClientHello was parsed but it carried no SNI extension.
     NoSni,
@@ -203,8 +200,13 @@ pub(crate) async fn handle_passthrough(
     // The peeked bytes are still in the kernel queue — the backend connection
     // receives the intact ClientHello as the first bytes of the splice.
     let mut downstream = tcp;
-    if let Err(e) =
-        copy_bidirectional_with_sizes(&mut downstream, &mut upstream, SPLICE_BUF, SPLICE_BUF).await
+    if let Err(e) = copy_bidirectional_with_sizes(
+        &mut downstream,
+        &mut upstream,
+        crate::edge::SPLICE_BUF,
+        crate::edge::SPLICE_BUF,
+    )
+    .await
     {
         // Connection-reset and EOF errors are normal on TLS connections.
         debug!(

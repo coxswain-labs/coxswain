@@ -20,8 +20,8 @@ use tokio::sync::watch;
 // import everything status-related from one place.
 pub use coxswain_core::listener_status::{
     BackendClientCertOutcome, ConflictReason, FrontendValidationOutcome, FrontendValidationStatus,
-    GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerSource, ListenerStatusKey,
-    RouteNamespaceSet, SharedGatewayListenerStatus, is_supported_listener_protocol,
+    GatewayListenerStatus, GatewayListenerStatusHandle, ListenerInfo, ListenerReadiness,
+    ListenerSource, ListenerStatusKey, RouteNamespaceSet, is_supported_listener_protocol,
 };
 
 /// Status record for one (HTTPRoute/GRPCRoute/TLSRoute, parent Gateway) pair.
@@ -56,7 +56,7 @@ impl Default for RouteParentStatus {
 /// Map from `(route, parent)` key to per-parent route status.
 pub type RouteStatusMap = HashMap<RouteParentKey, RouteParentStatus>;
 
-struct SharedRouteStatusInner {
+struct RouteStatusInner {
     map: ArcSwap<RouteStatusMap>,
     tx: watch::Sender<u64>,
 }
@@ -64,23 +64,23 @@ struct SharedRouteStatusInner {
 /// Shared handle to per-(route, parent) status, produced after each reconciler rebuild.
 /// The controller reads this to set accurate `Accepted` and `ResolvedRefs` conditions.
 ///
-/// See [`SharedGatewayListenerStatus`] for the rationale behind the `watch`-based
+/// See [`GatewayListenerStatusHandle`] for the rationale behind the `watch`-based
 /// notification scheme.
 #[non_exhaustive]
 #[derive(Clone)]
-pub struct SharedRouteStatus(Arc<SharedRouteStatusInner>);
+pub struct RouteStatusHandle(Arc<RouteStatusInner>);
 
-impl Default for SharedRouteStatus {
+impl Default for RouteStatusHandle {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SharedRouteStatus {
+impl RouteStatusHandle {
     /// Construct a new shared route status map (initially empty, generation 0).
     pub fn new() -> Self {
         let (tx, _) = watch::channel(0u64);
-        Self(Arc::new(SharedRouteStatusInner {
+        Self(Arc::new(RouteStatusInner {
             map: ArcSwap::from_pointee(HashMap::new()),
             tx,
         }))
@@ -109,7 +109,7 @@ impl SharedRouteStatus {
     }
 
     /// Returns a `watch::Receiver` for subscribing to change notifications.
-    /// See [`SharedGatewayListenerStatus::subscribe`].
+    /// See [`GatewayListenerStatusHandle::subscribe`].
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.0.tx.subscribe()
     }
@@ -150,7 +150,7 @@ impl Default for BackendTlsPolicyStatus {
 /// Map from `(policy_namespace, policy_name)` to its status.
 pub type BackendTlsPolicyStatusMap = HashMap<ObjectKey, BackendTlsPolicyStatus>;
 
-struct SharedBackendTlsPolicyStatusInner {
+struct BackendTlsPolicyStatusInner {
     map: ArcSwap<BackendTlsPolicyStatusMap>,
     tx: watch::Sender<u64>,
 }
@@ -158,23 +158,23 @@ struct SharedBackendTlsPolicyStatusInner {
 /// Shared handle to per-`BackendTLSPolicy` status, produced after each reconciler rebuild.
 /// The controller reads this to write `status.ancestors[]` when leader.
 ///
-/// See [`SharedGatewayListenerStatus`] for the rationale behind the `watch`-based
+/// See [`GatewayListenerStatusHandle`] for the rationale behind the `watch`-based
 /// notification scheme.
 #[non_exhaustive]
 #[derive(Clone)]
-pub struct SharedBackendTlsPolicyStatus(Arc<SharedBackendTlsPolicyStatusInner>);
+pub struct BackendTlsPolicyStatusHandle(Arc<BackendTlsPolicyStatusInner>);
 
-impl Default for SharedBackendTlsPolicyStatus {
+impl Default for BackendTlsPolicyStatusHandle {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SharedBackendTlsPolicyStatus {
+impl BackendTlsPolicyStatusHandle {
     /// Construct a new shared policy status map (initially empty, generation 0).
     pub fn new() -> Self {
         let (tx, _) = watch::channel(0u64);
-        Self(Arc::new(SharedBackendTlsPolicyStatusInner {
+        Self(Arc::new(BackendTlsPolicyStatusInner {
             map: ArcSwap::from_pointee(HashMap::new()),
             tx,
         }))
@@ -192,7 +192,7 @@ impl SharedBackendTlsPolicyStatus {
     }
 
     /// Returns a `watch::Receiver` for subscribing to change notifications.
-    /// See [`SharedGatewayListenerStatus::subscribe`].
+    /// See [`GatewayListenerStatusHandle::subscribe`].
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.0.tx.subscribe()
     }
@@ -229,7 +229,7 @@ impl Default for ClientTrafficPolicyStatus {
 /// Map from `(policy_namespace, policy_name)` to its status.
 pub type ClientTrafficPolicyStatusMap = HashMap<ObjectKey, ClientTrafficPolicyStatus>;
 
-struct SharedClientTrafficPolicyStatusInner {
+struct ClientTrafficPolicyStatusInner {
     map: ArcSwap<ClientTrafficPolicyStatusMap>,
     tx: watch::Sender<u64>,
 }
@@ -239,20 +239,20 @@ struct SharedClientTrafficPolicyStatusInner {
 /// The controller reads this to write `status.ancestors[]` when leader.
 #[non_exhaustive]
 #[derive(Clone)]
-pub struct SharedClientTrafficPolicyStatus(Arc<SharedClientTrafficPolicyStatusInner>);
+pub struct ClientTrafficPolicyStatusHandle(Arc<ClientTrafficPolicyStatusInner>);
 
-impl Default for SharedClientTrafficPolicyStatus {
+impl Default for ClientTrafficPolicyStatusHandle {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SharedClientTrafficPolicyStatus {
+impl ClientTrafficPolicyStatusHandle {
     /// Construct a new shared policy status map (initially empty, generation 0).
     #[must_use]
     pub fn new() -> Self {
         let (tx, _) = watch::channel(0u64);
-        Self(Arc::new(SharedClientTrafficPolicyStatusInner {
+        Self(Arc::new(ClientTrafficPolicyStatusInner {
             map: ArcSwap::from_pointee(HashMap::new()),
             tx,
         }))
@@ -313,7 +313,7 @@ impl Default for CoxswainExternalAuthStatus {
 /// Map from `(policy_namespace, policy_name)` to its status.
 pub type CoxswainExternalAuthStatusMap = HashMap<ObjectKey, CoxswainExternalAuthStatus>;
 
-struct SharedCoxswainExternalAuthStatusInner {
+struct CoxswainExternalAuthStatusInner {
     map: ArcSwap<CoxswainExternalAuthStatusMap>,
     tx: watch::Sender<u64>,
 }
@@ -323,20 +323,20 @@ struct SharedCoxswainExternalAuthStatusInner {
 /// when leader (#23).
 #[non_exhaustive]
 #[derive(Clone)]
-pub struct SharedCoxswainExternalAuthStatus(Arc<SharedCoxswainExternalAuthStatusInner>);
+pub struct CoxswainExternalAuthStatusHandle(Arc<CoxswainExternalAuthStatusInner>);
 
-impl Default for SharedCoxswainExternalAuthStatus {
+impl Default for CoxswainExternalAuthStatusHandle {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SharedCoxswainExternalAuthStatus {
+impl CoxswainExternalAuthStatusHandle {
     /// Construct a new shared policy status map (initially empty, generation 0).
     #[must_use]
     pub fn new() -> Self {
         let (tx, _) = watch::channel(0u64);
-        Self(Arc::new(SharedCoxswainExternalAuthStatusInner {
+        Self(Arc::new(CoxswainExternalAuthStatusInner {
             map: ArcSwap::from_pointee(HashMap::new()),
             tx,
         }))
@@ -392,7 +392,7 @@ impl Default for CoxswainBackendPolicyStatus {
 /// Map from `(policy_namespace, policy_name)` to its status.
 pub type CoxswainBackendPolicyStatusMap = HashMap<ObjectKey, CoxswainBackendPolicyStatus>;
 
-struct SharedCoxswainBackendPolicyStatusInner {
+struct CoxswainBackendPolicyStatusInner {
     map: ArcSwap<CoxswainBackendPolicyStatusMap>,
     tx: watch::Sender<u64>,
 }
@@ -402,20 +402,20 @@ struct SharedCoxswainBackendPolicyStatusInner {
 /// when leader.
 #[non_exhaustive]
 #[derive(Clone)]
-pub struct SharedCoxswainBackendPolicyStatus(Arc<SharedCoxswainBackendPolicyStatusInner>);
+pub struct CoxswainBackendPolicyStatusHandle(Arc<CoxswainBackendPolicyStatusInner>);
 
-impl Default for SharedCoxswainBackendPolicyStatus {
+impl Default for CoxswainBackendPolicyStatusHandle {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SharedCoxswainBackendPolicyStatus {
+impl CoxswainBackendPolicyStatusHandle {
     /// Construct a new shared policy status map (initially empty, generation 0).
     #[must_use]
     pub fn new() -> Self {
         let (tx, _) = watch::channel(0u64);
-        Self(Arc::new(SharedCoxswainBackendPolicyStatusInner {
+        Self(Arc::new(CoxswainBackendPolicyStatusInner {
             map: ArcSwap::from_pointee(HashMap::new()),
             tx,
         }))

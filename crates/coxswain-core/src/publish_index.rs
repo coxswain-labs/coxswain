@@ -49,9 +49,9 @@ pub struct PublishStamp {
 /// controller process, created in `coxswain-bin`.
 #[non_exhaustive]
 #[derive(Clone, Default)]
-pub struct SharedGatewayPublishIndex(Arc<PublishIndexInner>);
+pub struct GatewayPublishIndexHandle(Arc<PublishIndexInner>);
 
-/// Shared state behind [`SharedGatewayPublishIndex`].
+/// Shared state behind [`GatewayPublishIndexHandle`].
 #[derive(Default)]
 struct PublishIndexInner {
     /// `Gateway key → stamp` map, full-replaced by each rebuild.
@@ -61,11 +61,11 @@ struct PublishIndexInner {
     /// that ordering is what lets the discovery server's pre-build capture
     /// prove content inclusion.
     ///
-    /// [`stamp_rebuild`]: SharedGatewayPublishIndex::stamp_rebuild
+    /// [`stamp_rebuild`]: GatewayPublishIndexHandle::stamp_rebuild
     counter: AtomicU64,
 }
 
-impl SharedGatewayPublishIndex {
+impl GatewayPublishIndexHandle {
     /// Construct a new, empty index (sequence starts at 0; the first rebuild
     /// stamps sequence 1).
     #[must_use]
@@ -152,7 +152,7 @@ mod tests {
 
     #[test]
     fn first_stamp_uses_the_rebuild_seq() {
-        let idx = SharedGatewayPublishIndex::new();
+        let idx = GatewayPublishIndexHandle::new();
         let seq = idx.stamp_rebuild([(key("gw"), 1, 9)]);
         assert_eq!(seq, 1);
         assert_eq!(
@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn unchanged_generation_keeps_its_original_seq_under_churn() {
-        let idx = SharedGatewayPublishIndex::new();
+        let idx = GatewayPublishIndexHandle::new();
         idx.stamp_rebuild([(key("gw"), 1, 9)]);
         idx.stamp_rebuild([(key("gw"), 1, 9)]);
         idx.stamp_rebuild([(key("gw"), 1, 9)]);
@@ -187,7 +187,7 @@ mod tests {
 
     #[test]
     fn same_generation_content_change_re_stamps_at_the_current_rebuild() {
-        let idx = SharedGatewayPublishIndex::new();
+        let idx = GatewayPublishIndexHandle::new();
         idx.stamp_rebuild([(key("gw"), 1, 9)]);
         idx.stamp_rebuild([(key("gw"), 1, 9)]);
         // Same generation, new content fingerprint (e.g. a frontendValidation
@@ -205,7 +205,7 @@ mod tests {
 
     #[test]
     fn new_generation_re_stamps_at_the_current_rebuild() {
-        let idx = SharedGatewayPublishIndex::new();
+        let idx = GatewayPublishIndexHandle::new();
         idx.stamp_rebuild([(key("gw"), 1, 9)]);
         idx.stamp_rebuild([(key("gw"), 1, 9)]);
         idx.stamp_rebuild([(key("gw"), 2, 9)]);
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn absent_gateway_drops_out_of_the_index() {
-        let idx = SharedGatewayPublishIndex::new();
+        let idx = GatewayPublishIndexHandle::new();
         idx.stamp_rebuild([(key("gw"), 1, 9), (key("other"), 4, 9)]);
         idx.stamp_rebuild([(key("other"), 4, 9)]);
         assert_eq!(idx.get(&key("gw")), None);
@@ -237,14 +237,14 @@ mod tests {
 
     #[test]
     fn unpublished_gateway_reads_none() {
-        let idx = SharedGatewayPublishIndex::new();
+        let idx = GatewayPublishIndexHandle::new();
         assert_eq!(idx.get(&key("gw")), None);
         assert_eq!(idx.current_seq(), 0);
     }
 
     #[test]
     fn advance_to_moves_counter_forward_monotonically() {
-        let idx = SharedGatewayPublishIndex::new();
+        let idx = GatewayPublishIndexHandle::new();
         idx.advance_to(7);
         assert_eq!(idx.current_seq(), 7, "advance_to raises the counter");
         idx.advance_to(3);
@@ -260,7 +260,7 @@ mod tests {
     #[test]
     fn advance_to_does_not_stamp_gateways() {
         // The relay drives only the counter; it holds no per-Gateway stamps.
-        let idx = SharedGatewayPublishIndex::new();
+        let idx = GatewayPublishIndexHandle::new();
         idx.advance_to(42);
         assert_eq!(idx.get(&key("gw")), None);
         assert_eq!(idx.current_seq(), 42);

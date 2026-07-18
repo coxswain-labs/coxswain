@@ -43,8 +43,8 @@
 //!
 //! # Node registry
 //!
-//! Each stream task calls [`SharedNodeRegistry::connect`] on entry and
-//! [`SharedNodeRegistry::disconnect`] on exit, recording every Ack — and every
+//! Each stream task calls [`NodeRegistryHandle::connect`] on entry and
+//! [`NodeRegistryHandle::disconnect`] on exit, recording every Ack — and every
 //! `NodeStatus` bound-port report (#531) — in between. The registry is read by
 //! the admin UI convergence panel (T8) and by the controller's Gateway
 //! `Programmed` readiness gate (#531).
@@ -64,10 +64,10 @@ use tracing::{debug, warn};
 use coxswain_core::Shared;
 use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
 use coxswain_core::identity::SpiffeId;
-use coxswain_core::listener_status::SharedGatewayListenerStatus;
-use coxswain_core::node_registry::{NodeScope, RosterChild, SharedNodeRegistry};
+use coxswain_core::listener_status::GatewayListenerStatusHandle;
+use coxswain_core::node_registry::{NodeRegistryHandle, NodeScope, RosterChild};
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::publish_index::SharedGatewayPublishIndex;
+use coxswain_core::publish_index::GatewayPublishIndexHandle;
 use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
     SharedTlsPassthroughTable, SharedUdpRouteTable,
@@ -109,7 +109,7 @@ pub struct SnapshotSource {
     /// Per-Gateway listener status map. Serialised into the
     /// `listener_status` wire field so proxy nodes can drive dynamic
     /// Gateway listener port bind/unbind without Kubernetes API access.
-    pub listener_status: SharedGatewayListenerStatus,
+    pub listener_status: GatewayListenerStatusHandle,
     /// Per-cut-over-Gateway routing snapshots, keyed by Gateway [`ObjectKey`].
     /// Read when a client subscribes with [`Scope::Gateway`]; all the other
     /// routing cells (the L7/status cells above and the four L4 tables below)
@@ -137,7 +137,7 @@ pub struct SnapshotSource {
     /// Acks that snapshot has therefore applied every rebuild stamped at a
     /// sequence `<=` the captured value — the content-convergence input to
     /// the `Programmed` ack gate.
-    pub publish: SharedGatewayPublishIndex,
+    pub publish: GatewayPublishIndexHandle,
 }
 
 impl Clone for SnapshotSource {
@@ -275,7 +275,7 @@ impl ScopeAuthorizer for ProvisionedRelayAuthorizer {
 #[derive(Clone)]
 pub struct DiscoveryService {
     source: SnapshotSource,
-    registry: SharedNodeRegistry,
+    registry: NodeRegistryHandle,
     rebuild_rx: watch::Receiver<u64>,
     /// Leadership gate (#531). `Some(rx)`: streams are accepted only while the
     /// watched value is `true`, and live streams are terminated on a
@@ -366,7 +366,7 @@ impl DiscoveryService {
     #[must_use]
     pub fn new(
         source: SnapshotSource,
-        registry: SharedNodeRegistry,
+        registry: NodeRegistryHandle,
         rebuild_rx: watch::Receiver<u64>,
     ) -> Self {
         Self {
@@ -685,7 +685,7 @@ fn cached_view(
     }
 
     // Miss: build outside the lock, then re-check before storing.
-    let view = Arc::new(build_view(source, scope));
+    let view = Arc::new(build_subscriber_view(source, scope));
     let mut guard = cache.lock();
     let entry = slot(&mut guard);
     if let Some((cached_gen, existing)) = entry.as_ref()
@@ -705,7 +705,7 @@ fn cached_view(
 /// between the controller's `Shared` cells and the discovery wire, #383) and
 /// records the build duration. Cache hits ([`view_for`]) skip this, so the
 /// histogram measures real builds, not served-from-cache reads.
-fn build_view(source: &SnapshotSource, scope: &Scope) -> MaterializedView {
+fn build_subscriber_view(source: &SnapshotSource, scope: &Scope) -> MaterializedView {
     let start = Instant::now();
     let view = materialize(source, scope);
     crate::metrics::snapshot_build_seconds().observe(start.elapsed().as_secs_f64());
@@ -940,7 +940,7 @@ struct StreamState {
 /// Grouped so those handlers stay under the 7-argument workspace limit.
 struct StreamServices {
     source: SnapshotSource,
-    registry: SharedNodeRegistry,
+    registry: NodeRegistryHandle,
     rebuild_rx: watch::Receiver<u64>,
     shared_view: SharedViewCache,
     leader_rx: Option<watch::Receiver<bool>>,
@@ -962,7 +962,7 @@ struct StreamServices {
 struct StreamCtx<'a> {
     sub: &'a StreamSubscription,
     source: &'a SnapshotSource,
-    registry: &'a SharedNodeRegistry,
+    registry: &'a NodeRegistryHandle,
     shared_view: &'a SharedViewCache,
     tx: &'a mpsc::Sender<Result<p::ServerMessage, Status>>,
 }
@@ -987,7 +987,7 @@ fn node_scope_from(scope: &Scope) -> NodeScope {
 /// Drive the push-after-Ack state machine for one connected proxy node.
 ///
 /// Exits when the client disconnects, the outbound channel closes, or a stream
-/// error is received. Calls [`SharedNodeRegistry::disconnect`] unconditionally
+/// error is received. Calls [`NodeRegistryHandle::disconnect`] unconditionally
 /// on exit so the registry stays consistent.
 async fn run_stream(
     sub: StreamSubscription,
@@ -1546,7 +1546,7 @@ async fn watch_demotion(rx: &mut Option<watch::Receiver<bool>>) {
 /// debug log rather than rejecting the whole report — a hostile or buggy client
 /// must not be able to wedge its own row, and dropping oversized values fails
 /// closed (the port reads as not-bound).
-fn record_node_status(node_id: &str, status: &p::NodeStatus, registry: &SharedNodeRegistry) {
+fn record_node_status(node_id: &str, status: &p::NodeStatus, registry: &NodeRegistryHandle) {
     let mut ports = std::collections::BTreeSet::new();
     for raw in &status.bound_ports {
         match u16::try_from(*raw) {
@@ -1579,7 +1579,7 @@ fn unix_secs_to_system_time(secs: i64) -> SystemTime {
 /// Fold a relay's `RosterReport` into the registry (#585).
 ///
 /// Each `RosterEntry` is decoded into a [`RosterChild`] and handed to
-/// [`SharedNodeRegistry::apply_roster`], which wholesale-replaces this relay's
+/// [`NodeRegistryHandle::apply_roster`], which wholesale-replaces this relay's
 /// subtree and marks it `is_relay`. An entry with a missing/undecodable scope or
 /// out-of-`u16` port is dropped (fail-closed: that leaf simply won't appear this
 /// round; the relay re-reports), never wedging the whole report. An empty report
@@ -1587,7 +1587,7 @@ fn unix_secs_to_system_time(secs: i64) -> SystemTime {
 fn record_roster_report(
     parent_node_id: &str,
     report: p::RosterReport,
-    registry: &SharedNodeRegistry,
+    registry: &NodeRegistryHandle,
 ) {
     let mut children = Vec::with_capacity(report.children.len());
     for entry in report.children {
@@ -1673,7 +1673,7 @@ mod tests {
     use coxswain_core::dedicated_registry::{DedicatedRegistryData, DedicatedRoutingSnapshot};
     use coxswain_core::endpoints::{EndpointKey, ResolvedEndpoints};
     use coxswain_core::listener_status::GatewayListenerStatus;
-    use coxswain_core::node_registry::SharedNodeRegistry;
+    use coxswain_core::node_registry::NodeRegistryHandle;
     use coxswain_core::routing::{
         BackendGroup, BackendProtocol, GatewayRoutingTable, IngressRoutingTable,
         IngressRoutingTableBuilder, RouteEntry, SharedGatewayRoutingTable,
@@ -1712,7 +1712,7 @@ mod tests {
     /// distinction, the acked seq, and tagging each child with the relay parent.
     #[test]
     fn record_roster_report_folds_children_into_registry() {
-        let registry = SharedNodeRegistry::new();
+        let registry = NodeRegistryHandle::new();
         registry.connect(
             "relay-x",
             NodeScope::Namespace {
@@ -1871,9 +1871,9 @@ mod tests {
 
     struct TestHarness {
         addr: SocketAddr,
-        registry: SharedNodeRegistry,
+        registry: NodeRegistryHandle,
         rebuild_tx: watch::Sender<u64>,
-        publish: SharedGatewayPublishIndex,
+        publish: GatewayPublishIndexHandle,
         /// The live routing source the server reads. Tests mutate it via
         /// [`TestHarness::publish_ingress`] to drive deltas.
         source: SnapshotSource,
@@ -1950,13 +1950,13 @@ mod tests {
             gateway: SharedGatewayRoutingTable::new(),
             tls: SharedPortTlsStore::new(),
             client_certs: SharedClientCertStore::new(),
-            listener_status: SharedGatewayListenerStatus::new(),
+            listener_status: GatewayListenerStatusHandle::new(),
             dedicated: DedicatedRoutingRegistry::new(),
             passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
             terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
             tcp_routes: coxswain_core::routing::SharedTcpRouteTable::new(),
             udp_routes: coxswain_core::routing::SharedUdpRouteTable::new(),
-            publish: SharedGatewayPublishIndex::new(),
+            publish: GatewayPublishIndexHandle::new(),
         }
     }
 
@@ -1986,7 +1986,7 @@ mod tests {
         authorizer: Arc<dyn ScopeAuthorizer>,
     ) -> TestHarness {
         let source = empty_source();
-        let registry = SharedNodeRegistry::new();
+        let registry = NodeRegistryHandle::new();
         let (rebuild_tx, rebuild_rx) = watch::channel(0u64);
 
         let mut svc = DiscoveryService::new(source.clone(), registry.clone(), rebuild_rx)

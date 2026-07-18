@@ -45,9 +45,9 @@ use crate::reference_grants::{
     flatten_ls_cert_grants, flatten_tcp_backend_grants, flatten_udp_backend_grants,
 };
 use crate::status::{
-    GatewayListenerStatus, ListenerSource, SharedBackendTlsPolicyStatus,
-    SharedClientTrafficPolicyStatus, SharedCoxswainBackendPolicyStatus,
-    SharedCoxswainExternalAuthStatus, SharedGatewayListenerStatus, SharedRouteStatus,
+    BackendTlsPolicyStatusHandle, ClientTrafficPolicyStatusHandle,
+    CoxswainBackendPolicyStatusHandle, CoxswainExternalAuthStatusHandle, GatewayListenerStatus,
+    GatewayListenerStatusHandle, ListenerSource, RouteStatusHandle,
 };
 use crate::status_queue::{StatusKey, StatusKind, StatusWorkqueue};
 use async_trait::async_trait;
@@ -66,7 +66,7 @@ use coxswain_core::fleet::{self, SharedFleet};
 use coxswain_core::health::LivenessGate;
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
-use coxswain_core::publish_index::SharedGatewayPublishIndex;
+use coxswain_core::publish_index::GatewayPublishIndexHandle;
 use coxswain_core::routing::{
     BackendClientCert, SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
     SharedTlsPassthroughTable, SharedUdpRouteTable,
@@ -415,7 +415,7 @@ pub struct SharedProxyReconciler {
     client_certs: SharedClientCertStore,
     /// Per-port HTTPS Gateway-listener hostname snapshot (GEP-3567, #96).
     listener_hostnames: SharedListenerHostnames,
-    listener_status: SharedGatewayListenerStatus,
+    listener_status: GatewayListenerStatusHandle,
     cluster_summary: SharedClusterSummary,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
@@ -428,29 +428,29 @@ pub struct SharedProxyReconciler {
     /// Per-cut-over-Gateway routing snapshots. Written by this reconciler on
     /// every rebuild; read by the discovery server to serve `Scope::Gateway` subscribers.
     dedicated_registry: DedicatedRoutingRegistry,
-    route_status: SharedRouteStatus,
+    route_status: RouteStatusHandle,
     /// Per-(GRPCRoute, parent) health — a dedicated instance separate from `route_status`
     /// because `RouteParentKey` is kind-neutral and an HTTPRoute and GRPCRoute with the
     /// same name+ns+gateway would collide in one map.
-    grpc_route_status: SharedRouteStatus,
+    grpc_route_status: RouteStatusHandle,
     /// Per-(TLSRoute, parent) health — separate from `route_status` and `grpc_route_status`
     /// for the same kind-neutrality reason.
-    tls_route_status: SharedRouteStatus,
+    tls_route_status: RouteStatusHandle,
     /// Per-(TCPRoute, parent) health — separate from the other route-kind status
     /// maps for the same kind-neutrality reason.
-    tcp_route_status: SharedRouteStatus,
+    tcp_route_status: RouteStatusHandle,
     /// Per-(UDPRoute, parent) health — separate from the other route-kind status
     /// maps for the same kind-neutrality reason.
-    udp_route_status: SharedRouteStatus,
-    policy_status: SharedBackendTlsPolicyStatus,
-    ctp_status: SharedClientTrafficPolicyStatus,
+    udp_route_status: RouteStatusHandle,
+    policy_status: BackendTlsPolicyStatusHandle,
+    ctp_status: ClientTrafficPolicyStatusHandle,
     /// Per-`CoxswainBackendPolicy` ancestor health (#354).
-    cbp_status: SharedCoxswainBackendPolicyStatus,
+    cbp_status: CoxswainBackendPolicyStatusHandle,
     /// Per-`CoxswainExternalAuth` ancestor health (#23).
-    external_auth_status: SharedCoxswainExternalAuthStatus,
+    external_auth_status: CoxswainExternalAuthStatusHandle,
     /// Per-Gateway publish-sequence stamps for the #531 `Programmed` ack
     /// gate. Stamped at the end of every rebuild, after all cells above.
-    publish_index: SharedGatewayPublishIndex,
+    publish_index: GatewayPublishIndexHandle,
     fleet: SharedFleet,
     owned_gateways: OwnedGateways,
     leader: Arc<AtomicBool>,
@@ -492,7 +492,7 @@ pub struct ReconcilerOutputs {
     /// Per-port HTTPS Gateway-listener hostname snapshot (GEP-3567, #96).
     pub listener_hostnames: SharedListenerHostnames,
     /// Per-listener Gateway health used by status writes and the hot-reloader.
-    pub listener_status: SharedGatewayListenerStatus,
+    pub listener_status: GatewayListenerStatusHandle,
     /// Cluster aggregate (per-Gateway / per-Ingress summary) consumed by the
     /// controller's `/cluster` admin endpoint. Updated on every rebuild.
     pub cluster_summary: SharedClusterSummary,
@@ -870,16 +870,16 @@ impl SharedProxyReconciler {
             terminate_routes,
             tcp_routes,
             udp_routes,
-            route_status: SharedRouteStatus::new(),
-            grpc_route_status: SharedRouteStatus::new(),
-            tls_route_status: SharedRouteStatus::new(),
-            tcp_route_status: SharedRouteStatus::new(),
-            udp_route_status: SharedRouteStatus::new(),
-            policy_status: SharedBackendTlsPolicyStatus::new(),
-            ctp_status: SharedClientTrafficPolicyStatus::new(),
-            cbp_status: SharedCoxswainBackendPolicyStatus::new(),
-            external_auth_status: SharedCoxswainExternalAuthStatus::new(),
-            publish_index: SharedGatewayPublishIndex::new(),
+            route_status: RouteStatusHandle::new(),
+            grpc_route_status: RouteStatusHandle::new(),
+            tls_route_status: RouteStatusHandle::new(),
+            tcp_route_status: RouteStatusHandle::new(),
+            udp_route_status: RouteStatusHandle::new(),
+            policy_status: BackendTlsPolicyStatusHandle::new(),
+            ctp_status: ClientTrafficPolicyStatusHandle::new(),
+            cbp_status: CoxswainBackendPolicyStatusHandle::new(),
+            external_auth_status: CoxswainExternalAuthStatusHandle::new(),
+            publish_index: GatewayPublishIndexHandle::new(),
             fleet: SharedFleet::new(),
             owned_gateways,
             leader,
@@ -910,7 +910,7 @@ impl SharedProxyReconciler {
 
     /// Returns the shared route status handle so other services (e.g. the Controller)
     /// can subscribe to updates published by this reconciler.
-    pub fn route_status(&self) -> SharedRouteStatus {
+    pub fn route_status(&self) -> RouteStatusHandle {
         self.route_status.clone()
     }
 
@@ -918,7 +918,7 @@ impl SharedProxyReconciler {
     /// discovery server captures its counter before each snapshot build, and
     /// both `Programmed` status writers look up stamps from it.
     #[must_use]
-    pub fn publish_index(&self) -> SharedGatewayPublishIndex {
+    pub fn publish_index(&self) -> GatewayPublishIndexHandle {
         self.publish_index.clone()
     }
 
@@ -927,7 +927,7 @@ impl SharedProxyReconciler {
     ///
     /// Separate from [`Self::route_status`] — `RouteParentKey` is kind-neutral, so
     /// HTTPRoute and GRPCRoute status maps must never be merged.
-    pub fn grpc_route_status(&self) -> SharedRouteStatus {
+    pub fn grpc_route_status(&self) -> RouteStatusHandle {
         self.grpc_route_status.clone()
     }
 
@@ -936,7 +936,7 @@ impl SharedProxyReconciler {
     ///
     /// Separate from [`Self::route_status`] and [`Self::grpc_route_status`] —
     /// `RouteParentKey` is kind-neutral, so TLSRoute status must live in its own map.
-    pub fn tls_route_status(&self) -> SharedRouteStatus {
+    pub fn tls_route_status(&self) -> RouteStatusHandle {
         self.tls_route_status.clone()
     }
 
@@ -945,7 +945,7 @@ impl SharedProxyReconciler {
     ///
     /// Separate from the other route-kind status handles — `RouteParentKey` is
     /// kind-neutral, so TCPRoute status must live in its own map.
-    pub fn tcp_route_status(&self) -> SharedRouteStatus {
+    pub fn tcp_route_status(&self) -> RouteStatusHandle {
         self.tcp_route_status.clone()
     }
 
@@ -954,31 +954,31 @@ impl SharedProxyReconciler {
     ///
     /// Separate from the other route-kind status handles — `RouteParentKey` is
     /// kind-neutral, so UDPRoute status must live in its own map.
-    pub fn udp_route_status(&self) -> SharedRouteStatus {
+    pub fn udp_route_status(&self) -> RouteStatusHandle {
         self.udp_route_status.clone()
     }
 
     /// Returns the shared `BackendTLSPolicy` status handle so the Controller can
     /// write `status.ancestors[]` when leader.
-    pub fn policy_status(&self) -> SharedBackendTlsPolicyStatus {
+    pub fn policy_status(&self) -> BackendTlsPolicyStatusHandle {
         self.policy_status.clone()
     }
 
     /// Returns the shared `ClientTrafficPolicy` status handle so the Controller can
     /// write `status.ancestors[]` when leader (#327).
-    pub fn ctp_status(&self) -> SharedClientTrafficPolicyStatus {
+    pub fn ctp_status(&self) -> ClientTrafficPolicyStatusHandle {
         self.ctp_status.clone()
     }
 
     /// Returns the shared `CoxswainBackendPolicy` status handle so the Controller
     /// can write `status.ancestors[]` when leader (#354).
-    pub fn cbp_status(&self) -> SharedCoxswainBackendPolicyStatus {
+    pub fn cbp_status(&self) -> CoxswainBackendPolicyStatusHandle {
         self.cbp_status.clone()
     }
 
     /// Returns the shared `CoxswainExternalAuth` status handle so the Controller
     /// can write `status.ancestors[]` when leader (#23).
-    pub fn external_auth_status(&self) -> SharedCoxswainExternalAuthStatus {
+    pub fn external_auth_status(&self) -> CoxswainExternalAuthStatusHandle {
         self.external_auth_status.clone()
     }
 
@@ -1129,7 +1129,7 @@ pub(super) struct ReflectorStores<'a> {
     /// resolving a `JwtAuth` CR that names a `jwks.remote`. Grouped alongside
     /// `jwt_auths` here (rather than `Ownership`) so `rebuild()` stays within
     /// the workspace `clippy::too_many_arguments` threshold. See [`crate::jwks`].
-    pub(super) jwks_cache: &'a crate::jwks::SharedJwksCache,
+    pub(super) jwks_cache: &'a crate::jwks::JwksCacheHandle,
     /// `RequestSizeLimit` CRs in scope — resolved from `HTTPRouteRule`/`GRPCRouteRule`
     /// `ExtensionRef` filters into a per-route body-size cap (#443).
     pub(super) request_size_limits: &'a MergedStore<RequestSizeLimit>,
@@ -1152,23 +1152,23 @@ pub(super) struct SharedOutputs<'a> {
     pub(super) tls: &'a SharedPortTlsStore,
     pub(super) client_certs: &'a SharedClientCertStore,
     pub(super) listener_hostnames: &'a SharedListenerHostnames,
-    pub(super) listener_status: &'a SharedGatewayListenerStatus,
+    pub(super) listener_status: &'a GatewayListenerStatusHandle,
     pub(super) cluster_summary: &'a SharedClusterSummary,
     pub(super) dedicated_registry: &'a DedicatedRoutingRegistry,
-    pub(super) route_status: &'a SharedRouteStatus,
-    pub(super) grpc_route_status: &'a SharedRouteStatus,
-    pub(super) tls_route_status: &'a SharedRouteStatus,
-    pub(super) tcp_route_status: &'a SharedRouteStatus,
-    pub(super) udp_route_status: &'a SharedRouteStatus,
-    pub(super) policy_status: &'a SharedBackendTlsPolicyStatus,
-    pub(super) ctp_status: &'a SharedClientTrafficPolicyStatus,
-    pub(super) cbp_status: &'a SharedCoxswainBackendPolicyStatus,
-    pub(super) external_auth_status: &'a SharedCoxswainExternalAuthStatus,
+    pub(super) route_status: &'a RouteStatusHandle,
+    pub(super) grpc_route_status: &'a RouteStatusHandle,
+    pub(super) tls_route_status: &'a RouteStatusHandle,
+    pub(super) tcp_route_status: &'a RouteStatusHandle,
+    pub(super) udp_route_status: &'a RouteStatusHandle,
+    pub(super) policy_status: &'a BackendTlsPolicyStatusHandle,
+    pub(super) ctp_status: &'a ClientTrafficPolicyStatusHandle,
+    pub(super) cbp_status: &'a CoxswainBackendPolicyStatusHandle,
+    pub(super) external_auth_status: &'a CoxswainExternalAuthStatusHandle,
     pub(super) passthrough_routes: &'a SharedTlsPassthroughTable,
     pub(super) terminate_routes: &'a SharedTlsPassthroughTable,
     pub(super) tcp_routes: &'a SharedTcpRouteTable,
     pub(super) udp_routes: &'a SharedUdpRouteTable,
-    pub(super) publish_index: &'a SharedGatewayPublishIndex,
+    pub(super) publish_index: &'a GatewayPublishIndexHandle,
     pub(super) ingress_event_tx: Option<&'a tokio::sync::mpsc::Sender<IngressEvent>>,
 }
 
@@ -1486,20 +1486,20 @@ struct SharedHandles {
     tls: SharedPortTlsStore,
     client_certs: SharedClientCertStore,
     listener_hostnames: SharedListenerHostnames,
-    listener_status: SharedGatewayListenerStatus,
+    listener_status: GatewayListenerStatusHandle,
     cluster_summary: SharedClusterSummary,
     dedicated_registry: DedicatedRoutingRegistry,
-    route_status: SharedRouteStatus,
-    grpc_route_status: SharedRouteStatus,
-    tls_route_status: SharedRouteStatus,
-    tcp_route_status: SharedRouteStatus,
-    udp_route_status: SharedRouteStatus,
-    policy_status: SharedBackendTlsPolicyStatus,
-    ctp_status: SharedClientTrafficPolicyStatus,
-    cbp_status: SharedCoxswainBackendPolicyStatus,
-    external_auth_status: SharedCoxswainExternalAuthStatus,
+    route_status: RouteStatusHandle,
+    grpc_route_status: RouteStatusHandle,
+    tls_route_status: RouteStatusHandle,
+    tcp_route_status: RouteStatusHandle,
+    udp_route_status: RouteStatusHandle,
+    policy_status: BackendTlsPolicyStatusHandle,
+    ctp_status: ClientTrafficPolicyStatusHandle,
+    cbp_status: CoxswainBackendPolicyStatusHandle,
+    external_auth_status: CoxswainExternalAuthStatusHandle,
     /// Per-Gateway publish-sequence stamps for the #531 ack gate.
-    publish_index: SharedGatewayPublishIndex,
+    publish_index: GatewayPublishIndexHandle,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
     /// SNI-keyed TLS terminate routing table for TLSRouteModeTerminate (#481).
@@ -2386,7 +2386,7 @@ async fn spawn_tasks(
     // publishing resolved keys into `jwks_cache`. Gated by `fetch_remote_jwks`
     // so the read-only proxy role never egresses to an identity provider (the
     // Istio model, not Envoy's default proxy-side fetch) — see [`crate::jwks`].
-    let jwks_cache = crate::jwks::SharedJwksCache::new();
+    let jwks_cache = crate::jwks::JwksCacheHandle::new();
     if fetch_remote_jwks {
         let cache = jwks_cache.clone();
         let jwt_auths_for_fetch = jwt_auth_reader.clone();

@@ -19,3 +19,10 @@ pub(crate) mod terminate;
 pub(crate) mod tls;
 pub(crate) mod udp;
 pub(crate) mod upstream_ca;
+
+/// Buffer size for each direction of a raw-byte splice (~16 KiB).
+///
+/// Shared by every L4 splice path ([`tcp`], [`passthrough`], [`terminate`]) —
+/// all move raw bytes with no protocol parsing, so they size their copy buffers
+/// identically.
+pub(crate) const SPLICE_BUF: usize = 16 * 1024;

@@ -345,8 +345,8 @@ mod tests {
     use coxswain_core::dedicated_registry::{
         DedicatedRegistryData, DedicatedRoutingRegistry, DedicatedRoutingSnapshot,
     };
-    use coxswain_core::listener_status::SharedGatewayListenerStatus;
-    use coxswain_core::publish_index::SharedGatewayPublishIndex;
+    use coxswain_core::listener_status::GatewayListenerStatusHandle;
+    use coxswain_core::publish_index::GatewayPublishIndexHandle;
     use coxswain_core::routing::{
         BackendGroup, GatewayRoutingTableBuilder, IngressRoutingTableBuilder, RouteEntry,
         SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
@@ -365,13 +365,13 @@ mod tests {
             gateway: SharedGatewayRoutingTable::new(),
             tls: SharedPortTlsStore::new(),
             client_certs: SharedClientCertStore::new(),
-            listener_status: SharedGatewayListenerStatus::new(),
+            listener_status: GatewayListenerStatusHandle::new(),
             dedicated: DedicatedRoutingRegistry::new(),
             passthrough_routes: SharedTlsPassthroughTable::new(),
             terminate_routes: SharedTlsPassthroughTable::new(),
             tcp_routes: SharedTcpRouteTable::new(),
             udp_routes: SharedUdpRouteTable::new(),
-            publish: SharedGatewayPublishIndex::new(),
+            publish: GatewayPublishIndexHandle::new(),
         }
     }
 
@@ -458,7 +458,7 @@ mod tests {
         // (generation, fingerprint) so it stays sticky (per `stamp_rebuild`'s
         // contract) — this is how sequential real-world rebuilds give each
         // Gateway a distinct seq rather than all sharing one call's sequence.
-        let publish = SharedGatewayPublishIndex::new();
+        let publish = GatewayPublishIndexHandle::new();
         let mut accum: Vec<(ObjectKey, i64, u64)> = Vec::new();
         for (ns, name, _) in &entries {
             accum.push((ObjectKey::new((*ns).to_owned(), (*name).to_owned()), 1, 0));
@@ -469,7 +469,7 @@ mod tests {
             gateway: SharedGatewayRoutingTable::new(),
             tls: SharedPortTlsStore::new(),
             client_certs: SharedClientCertStore::new(),
-            listener_status: SharedGatewayListenerStatus::new(),
+            listener_status: GatewayListenerStatusHandle::new(),
             dedicated,
             passthrough_routes: SharedTlsPassthroughTable::new(),
             terminate_routes: SharedTlsPassthroughTable::new(),

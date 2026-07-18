@@ -81,7 +81,7 @@ pub mod bench_internals {
     use crate::apply::{ResourceCache, SnapshotCells, apply_message};
     use crate::error::WireError;
     use crate::proto::v1 as p;
-    use coxswain_core::listener_status::SharedGatewayListenerStatus;
+    use coxswain_core::listener_status::GatewayListenerStatusHandle;
     use coxswain_core::routing::{
         SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
         SharedTlsPassthroughTable, SharedUdpRouteTable,
@@ -99,7 +99,7 @@ pub mod bench_internals {
         gateway: SharedGatewayRoutingTable,
         tls: SharedPortTlsStore,
         client_certs: SharedClientCertStore,
-        status: SharedGatewayListenerStatus,
+        status: GatewayListenerStatusHandle,
         listener_hostnames: SharedListenerHostnames,
         passthrough: SharedTlsPassthroughTable,
         terminate: SharedTlsPassthroughTable,
@@ -123,7 +123,7 @@ pub mod bench_internals {
                 gateway: SharedGatewayRoutingTable::new(),
                 tls: SharedPortTlsStore::new(),
                 client_certs: SharedClientCertStore::new(),
-                status: SharedGatewayListenerStatus::new(),
+                status: GatewayListenerStatusHandle::new(),
                 listener_hostnames: SharedListenerHostnames::new(),
                 passthrough: SharedTlsPassthroughTable::new(),
                 terminate: SharedTlsPassthroughTable::new(),

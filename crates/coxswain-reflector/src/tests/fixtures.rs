@@ -201,8 +201,8 @@ pub(crate) fn make_jwt_auth_store(
 
 /// Empty JWKS cache — every `JwtAuth` resolving a remote JWKS fails closed
 /// (`Unavailable`), matching production behaviour before the first fetch lands.
-pub(crate) fn empty_jwks_cache() -> crate::jwks::SharedJwksCache {
-    crate::jwks::SharedJwksCache::new()
+pub(crate) fn empty_jwks_cache() -> crate::jwks::JwksCacheHandle {
+    crate::jwks::JwksCacheHandle::new()
 }
 
 /// Empty `CoxswainBackendPolicy` index — every backend Service resolves no

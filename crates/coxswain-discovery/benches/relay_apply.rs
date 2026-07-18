@@ -29,9 +29,9 @@ use std::sync::Arc;
 use coxswain_core::dedicated_registry::{
     DedicatedRegistryData, DedicatedRoutingRegistry, DedicatedRoutingSnapshot,
 };
-use coxswain_core::listener_status::SharedGatewayListenerStatus;
+use coxswain_core::listener_status::GatewayListenerStatusHandle;
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::publish_index::SharedGatewayPublishIndex;
+use coxswain_core::publish_index::GatewayPublishIndexHandle;
 use coxswain_core::routing::{
     BackendGroup, GatewayRoutingTableBuilder, RouteEntry, SharedGatewayRoutingTable,
     SharedIngressRoutingTable, SharedTcpRouteTable, SharedTlsPassthroughTable, SharedUdpRouteTable,
@@ -104,13 +104,13 @@ fn dedicated_source(g: usize, bump_gw0: bool) -> SnapshotSource {
         gateway: SharedGatewayRoutingTable::new(),
         tls: SharedPortTlsStore::new(),
         client_certs: SharedClientCertStore::new(),
-        listener_status: SharedGatewayListenerStatus::new(),
+        listener_status: GatewayListenerStatusHandle::new(),
         dedicated,
         passthrough_routes: SharedTlsPassthroughTable::new(),
         terminate_routes: SharedTlsPassthroughTable::new(),
         tcp_routes: SharedTcpRouteTable::new(),
         udp_routes: SharedUdpRouteTable::new(),
-        publish: SharedGatewayPublishIndex::new(),
+        publish: GatewayPublishIndexHandle::new(),
     }
 }
 

@@ -26,7 +26,7 @@ pub(crate) mod policy;
 mod retry;
 pub(crate) mod routing;
 
-pub use config::{AccessLogPathMode, SharedProxyConfig};
+pub use config::{AccessLogPathMode, ProxyServices};
 pub use ctx::{ProxyCtx, ResolvedRoute};
 pub use edge::accept::{
     AcceptorBuildError, ListenerProtocol, ListenerSpec, PassthroughConfig, ProxyAcceptor,

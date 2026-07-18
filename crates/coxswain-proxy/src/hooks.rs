@@ -120,7 +120,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
 /// `Error::explain(404, ...)` when no route matches the host or path.
 pub(crate) async fn request_filter<K>(
     engine: &RoutingEngine<K>,
-    cfg: &crate::config::SharedProxyConfig,
+    cfg: &crate::config::ProxyServices,
     session: &mut Session,
     ctx: &mut ProxyCtx,
 ) -> Result<bool> {

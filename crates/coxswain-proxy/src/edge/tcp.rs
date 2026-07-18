@@ -18,10 +18,6 @@ use tracing::debug;
 
 use coxswain_core::routing::{Selected, SharedTcpRouteTable};
 
-/// Buffer size for each direction of the TCP splice (~16 KiB). Matches the TLS
-/// passthrough splice buffer — both paths move raw bytes with no protocol parsing.
-const SPLICE_BUF: usize = 16 * 1024;
-
 /// Handle one accepted TCP connection on a `protocol: TCP` listener.
 ///
 /// Looks up the bound backend for `listener_port`, dials it, and splices bytes
@@ -86,8 +82,13 @@ pub(crate) async fn handle_tcp_proxy(
     };
 
     let mut downstream = tcp;
-    if let Err(e) =
-        copy_bidirectional_with_sizes(&mut downstream, &mut upstream, SPLICE_BUF, SPLICE_BUF).await
+    if let Err(e) = copy_bidirectional_with_sizes(
+        &mut downstream,
+        &mut upstream,
+        crate::edge::SPLICE_BUF,
+        crate::edge::SPLICE_BUF,
+    )
+    .await
     {
         // Connection-reset and EOF errors are normal.
         debug!(

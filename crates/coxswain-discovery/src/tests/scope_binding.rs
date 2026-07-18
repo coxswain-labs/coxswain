@@ -20,10 +20,10 @@ use tonic::transport::{Endpoint, Server};
 use coxswain_core::dedicated_registry::{
     DedicatedRegistryData, DedicatedRoutingRegistry, DedicatedRoutingSnapshot,
 };
-use coxswain_core::listener_status::{GatewayListenerStatus, SharedGatewayListenerStatus};
-use coxswain_core::node_registry::SharedNodeRegistry;
+use coxswain_core::listener_status::{GatewayListenerStatus, GatewayListenerStatusHandle};
+use coxswain_core::node_registry::NodeRegistryHandle;
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::publish_index::SharedGatewayPublishIndex;
+use coxswain_core::publish_index::GatewayPublishIndexHandle;
 use coxswain_core::routing::{
     GatewayRoutingTable, SharedGatewayRoutingTable, SharedIngressRoutingTable,
 };
@@ -60,13 +60,13 @@ fn source_with_two_gateways() -> SnapshotSource {
         gateway: SharedGatewayRoutingTable::new(),
         tls: SharedPortTlsStore::new(),
         client_certs: SharedClientCertStore::new(),
-        listener_status: SharedGatewayListenerStatus::new(),
+        listener_status: GatewayListenerStatusHandle::new(),
         dedicated: DedicatedRoutingRegistry::new(),
         passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         tcp_routes: coxswain_core::routing::SharedTcpRouteTable::new(),
         udp_routes: coxswain_core::routing::SharedUdpRouteTable::new(),
-        publish: SharedGatewayPublishIndex::new(),
+        publish: GatewayPublishIndexHandle::new(),
     };
 
     let gw_a_key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
@@ -113,7 +113,7 @@ fn source_with_two_gateways() -> SnapshotSource {
 /// `tokio::spawn` task and lives until the test runtime drops.
 async fn start_service(server_tls: &DiscoveryServerTls) -> std::net::SocketAddr {
     let source = source_with_two_gateways();
-    let registry = SharedNodeRegistry::new();
+    let registry = NodeRegistryHandle::new();
     let (_, rebuild_rx) = tokio::sync::watch::channel(0u64);
     let svc = DiscoveryService::new(source, registry, rebuild_rx);
 
