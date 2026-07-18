@@ -33,11 +33,32 @@ fn listenerset_key(ls: &ListenerSet) -> ObjectKey {
     )
 }
 
+/// `true` when the parent Gateway's per-listener health has not been published
+/// yet, so acceptance for a non-empty ListenerSet cannot be decided.
+///
+/// Distinguishes "parent health absent" (the data plane has not computed listener
+/// status for this parent — transient, the caller must requeue) from "present but
+/// this ListenerSet's source is not listed" (a genuine `allowedListeners`
+/// rejection, which `listenerset_accepted` reports as `Accepted=False`). Without
+/// this split, a freshly-created ListenerSet whose parent health merely lags would
+/// be patched with a positive denial it never earned. An empty-listener ListenerSet
+/// is vacuously accepted, so it is never pending.
+#[must_use]
+pub(super) fn parent_health_pending(
+    ls: &ListenerSet,
+    parent_health: Option<&GatewayListenerStatus>,
+) -> bool {
+    !ls.spec.listeners.is_empty() && parent_health.is_none()
+}
+
 /// `true` when this ListenerSet was accepted (merged) by its parent Gateway: the
 /// parent's health holds at least one listener tagged with this ListenerSet's
 /// source, or the ListenerSet declares no listeners (vacuously accepted). A
 /// ListenerSet rejected by the parent's `allowedListeners` contributes no health
 /// entries, so its absence signals rejection (GEP-1713 opt-in gate).
+///
+/// Callers must first gate on `parent_health_pending`: a `false` here is only a
+/// genuine rejection when the parent's health is present.
 #[must_use]
 pub(super) fn listenerset_accepted(
     ls: &ListenerSet,
@@ -46,14 +67,11 @@ pub(super) fn listenerset_accepted(
     if ls.spec.listeners.is_empty() {
         return true;
     }
-    let ls_key = listenerset_key(ls);
     let Some(health) = parent_health else {
         return false;
     };
-    health
-        .listeners
-        .keys()
-        .any(|k| k.source == ListenerSource::ListenerSet(ls_key.clone()))
+    let source = ListenerSource::ListenerSet(listenerset_key(ls));
+    health.listeners.keys().any(|k| k.source == source)
 }
 
 /// Look up the health for one ListenerSet listener in its parent Gateway's map.
@@ -484,6 +502,32 @@ mod tests {
         assert!(!listenerset_accepted(&set, None));
         // A ListenerSet with no listeners is vacuously accepted.
         assert!(listenerset_accepted(&ls(vec![]), None));
+    }
+
+    #[test]
+    fn parent_health_pending_distinguishes_absent_from_not_listed() {
+        let set = ls(vec![http_listener("web", 8080)]);
+        // Absent parent health for a non-empty ListenerSet → pending (requeue).
+        assert!(parent_health_pending(&set, None));
+        // Health present but holds only a DIFFERENT ListenerSet's source (this LS
+        // rejected by allowedListeners) → NOT pending; `listenerset_accepted`
+        // decides the denial. Acceptance keys on the LS source, so the foreign
+        // entry must carry a different ls_key, not merely a different listener name.
+        let mut foreign = GatewayListenerStatus::default();
+        let mut info = ListenerInfo::default();
+        info.port = 8080;
+        foreign.listeners.insert(
+            ListenerStatusKey::listener_set(ObjectKey::new("apps", "other-ls"), "web"),
+            info,
+        );
+        assert!(!parent_health_pending(&set, Some(&foreign)));
+        assert!(!listenerset_accepted(&set, Some(&foreign)));
+        // Health present and this LS listed → not pending, accepted.
+        let listed = parent_health("web", 8080, false);
+        assert!(!parent_health_pending(&set, Some(&listed)));
+        assert!(listenerset_accepted(&set, Some(&listed)));
+        // An empty-listener ListenerSet is never pending (vacuously accepted).
+        assert!(!parent_health_pending(&ls(vec![]), None));
     }
 
     #[test]

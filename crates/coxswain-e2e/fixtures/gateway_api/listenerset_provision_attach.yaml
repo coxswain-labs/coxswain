@@ -1,0 +1,20 @@
+---
+# GEP-1713 provisioning attach: the ListenerSet half applied on top of the base
+# fixture. A same-namespace ListenerSet adds a listener on port 8001 — a new port
+# the parent Gateway does not itself serve — so the operator must expose a new
+# Service port and allocate it a fresh internal port without disturbing the
+# Gateway's own listener.
+apiVersion: gateway.networking.k8s.io/v1
+kind: ListenerSet
+metadata:
+  name: team-ls
+spec:
+  parentRef:
+    name: coxswain-test
+  listeners:
+    - name: ls-http
+      port: 8001
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same

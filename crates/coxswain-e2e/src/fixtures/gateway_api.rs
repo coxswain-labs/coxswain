@@ -93,6 +93,14 @@ pub const PARENT_REF_PORT: &str = fixture!("parent_ref_port.yaml");
 /// listener on a NEW port (8001) + an HTTPRoute attaching via `parentRef.kind:
 /// ListenerSet`. Happy path for ListenerSet routing + new-port provisioning.
 pub const LISTENERSET_BASIC: &str = fixture!("listenerset_basic.yaml");
+/// GEP-1713 provisioning base: a shared Gateway opting into same-namespace
+/// ListenerSets with no ListenerSet attached yet. Pairs with
+/// [`LISTENERSET_PROVISION_ATTACH`] to assert new-port provisioning and
+/// no-remap of the Gateway's own internal port on attach.
+pub const LISTENERSET_PROVISION_BASE: &str = fixture!("listenerset_provision_base.yaml");
+/// GEP-1713 provisioning attach: a same-namespace ListenerSet adding a listener
+/// on a new port (8001), applied on top of [`LISTENERSET_PROVISION_BASE`].
+pub const LISTENERSET_PROVISION_ATTACH: &str = fixture!("listenerset_provision_attach.yaml");
 /// GEP-1713 sad path: the Gateway sets no `allowedListeners` (defaults to None),
 /// so the ListenerSet is rejected (`Accepted=False/NotAllowed`).
 pub const LISTENERSET_OPT_OUT: &str = fixture!("listenerset_opt_out.yaml");
