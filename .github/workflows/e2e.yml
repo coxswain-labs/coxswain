@@ -162,28 +162,61 @@ jobs:
     timeout-minutes: 20
     strategy:
       fail-fast: false
-      # Suites map 1:1 to the by-plane test binaries in crates/coxswain-e2e/tests/
-      # (#321). Each runs in its own kind cluster, so suites stay fully parallel.
+      # Suites map to the by-plane test binaries in crates/coxswain-e2e/tests/
+      # (#321), each in its own kind cluster. The four heaviest suites (#640)
+      # are further split with nextest `--partition count:K/N`: an even-count
+      # split of the profile-filtered test set, applied independently to both
+      # the parallel and serial passes, so each shard gets ~1/N of both. `test:`
+      # is the actual binary name and stays the same across a suite's shards;
+      # `suite:` carries the shard suffix so `name: e2e-${{ matrix.suite }}`
+      # produces distinct job/check names and cluster-name stays unique.
       matrix:
         include:
           - suite: routing
             test: routing
-          - suite: tls
+            partition: ''
+          - suite: tls-1
             test: tls
-          - suite: security
+            partition: 'count:1/2'
+          - suite: tls-2
+            test: tls
+            partition: 'count:2/2'
+          - suite: security-1
             test: security
+            partition: 'count:1/2'
+          - suite: security-2
+            test: security
+            partition: 'count:2/2'
           - suite: traffic-policy
             test: traffic_policy
-          - suite: status-conditions
+            partition: ''
+          - suite: status-conditions-1
             test: status_conditions
-          - suite: provisioning
+            partition: 'count:1/2'
+          - suite: status-conditions-2
+            test: status_conditions
+            partition: 'count:2/2'
+          - suite: provisioning-1
             test: provisioning
+            partition: 'count:1/3'
+          - suite: provisioning-2
+            test: provisioning
+            partition: 'count:2/3'
+          - suite: provisioning-3
+            test: provisioning
+            partition: 'count:3/3'
           - suite: resilience
             test: resilience
+            partition: ''
           - suite: observability
             test: observability
-          - suite: discovery
+            partition: ''
+          - suite: discovery-1
             test: discovery
+            partition: 'count:1/2'
+          - suite: discovery-2
+            test: discovery
+            partition: 'count:2/2'
     steps:
       # Checkout is required because the test binaries embed
       # CARGO_MANIFEST_DIR at compile time and read fixture YAML / Helm chart
@@ -256,13 +289,21 @@ jobs:
       # Two passes (see .config/nextest.toml): the parallel `e2e` profile, then
       # the serial `e2e-serial` profile (global-config mutators + resilience).
       # `--no-tests=pass` makes the empty side a no-op for suites that have
-      # tests in only one pass (e.g. traffic_policy, resilience).
+      # tests in only one pass (e.g. traffic_policy, resilience). A non-empty
+      # `matrix.partition` (heavy suites only, #640) shards both passes with
+      # nextest `--partition`, computed independently per pass over its own
+      # profile-filtered set — each shard gets ~1/N of the parallel tests and
+      # ~1/N of the serial tests.
       - name: Run e2e tests (${{ matrix.suite }})
         run: |
+          partition_args=()
+          if [ -n "${{ matrix.partition }}" ]; then
+            partition_args=(--partition "${{ matrix.partition }}")
+          fi
           cargo-nextest nextest run --profile e2e        --archive-file e2e-archive.tar.zst \
-            -E 'binary(${{ matrix.test }})' --no-tests=pass
+            -E 'binary(${{ matrix.test }})' --no-tests=pass "${partition_args[@]}"
           cargo-nextest nextest run --profile e2e-serial --archive-file e2e-archive.tar.zst \
-            -E 'binary(${{ matrix.test }})' --no-tests=pass
+            -E 'binary(${{ matrix.test }})' --no-tests=pass "${partition_args[@]}"
         env:
           COXSWAIN_E2E_SKIP_BUILD: "1"
           RUST_LOG: coxswain_e2e=debug,warn
@@ -282,17 +323,25 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      # Mirrors the `e2e` matrix's `suite:` values exactly (including shard
+      # suffixes) so every required check name resolves here too.
       matrix:
         include:
           - suite: routing
-          - suite: tls
-          - suite: security
+          - suite: tls-1
+          - suite: tls-2
+          - suite: security-1
+          - suite: security-2
           - suite: traffic-policy
-          - suite: status-conditions
-          - suite: provisioning
+          - suite: status-conditions-1
+          - suite: status-conditions-2
+          - suite: provisioning-1
+          - suite: provisioning-2
+          - suite: provisioning-3
           - suite: resilience
           - suite: observability
-          - suite: discovery
+          - suite: discovery-1
+          - suite: discovery-2
     steps:
       - run: echo "No code changes — skipping suite ${{ matrix.suite }}"
 

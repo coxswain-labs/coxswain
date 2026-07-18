@@ -399,72 +399,6 @@ async fn stage_metrics_are_role_scoped() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// #512 happy path: a single isolated Ingress apply (no concurrent churn)
-/// must settle in well under the reflector's old fixed 500ms debounce floor.
-/// Compares the mean debounce-wait (`_sum`/`_count` delta) against a 300ms
-/// bound — comfortably above the default 20ms quiet window, comfortably below
-/// the 500ms ceiling this replaces — and confirms via `wait_for_route` that
-/// the change actually converged, not just that a metric moved.
-#[tokio::test]
-async fn isolated_route_change_debounces_well_under_fixed_floor() -> anyhow::Result<()> {
-    let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "obs-debounce-fast").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-
-    let before = reqwest::get(h.controller_admin_url("/metrics"))
-        .await?
-        .text()
-        .await?;
-    let before_sum = count_or_zero(
-        &before,
-        "coxswain_controller_reconcile_debounce_seconds_sum",
-    );
-    let before_count = count_or_zero(
-        &before,
-        "coxswain_controller_reconcile_debounce_seconds_count",
-    );
-
-    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-    let host = format!("ingress.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
-
-    let (after_sum, after_count) = wait::poll_until(
-        Duration::from_secs(30),
-        wait::POLL_FAST,
-        || async {
-            "timed out waiting for the debounce-wait histogram to advance past its pre-change baseline"
-                .to_string()
-        },
-        || async {
-            let body = reqwest::get(h.controller_admin_url("/metrics"))
-                .await
-                .ok()?
-                .text()
-                .await
-                .ok()?;
-            let sum = count_or_zero(&body, "coxswain_controller_reconcile_debounce_seconds_sum");
-            let count = count_or_zero(
-                &body,
-                "coxswain_controller_reconcile_debounce_seconds_count",
-            );
-            (count > before_count).then_some((sum, count))
-        },
-    )
-    .await?;
-
-    let mean_wait = (after_sum - before_sum) / (after_count - before_count);
-    assert!(
-        mean_wait < 0.3,
-        "expected an isolated Ingress apply to debounce in well under the old 500ms fixed \
-         floor, got a mean debounce-wait of {mean_wait}s (sum {before_sum}->{after_sum}, \
-         count {before_count}->{after_count})"
-    );
-
-    Ok(())
-}
-
 /// #512 sad-path companion: a rapid burst of annotation patches to ONE owned
 /// Ingress — all dispatched CONCURRENTLY (not one-at-a-time with an awaited
 /// round trip between each, which stretches real inter-event gaps well past
@@ -651,105 +585,6 @@ async fn named_http_rule_surfaces_rule_name_in_route_metric() -> anyhow::Result<
     Ok(())
 }
 
-/// `--access-log-path-mode=pattern` replaces the concrete request path with
-/// the matched rule's `path_pattern`. Same Ingress, same backend, just a
-/// redacted `path` field.
-///
-/// Note: `pattern` is used here intentionally to exercise the mode under test.
-/// The chart default is `full`; production deployments feeding a security
-/// pipeline must retain `full` to keep path-traversal attempts visible.
-#[tokio::test]
-async fn access_log_path_mode_pattern_uses_rule_pattern() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        // pattern is intentional here — this test exercises the mode; it is NOT
-        // a production recommendation (chart default is full).
-        access_log_path_mode: Some("pattern".to_string()),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "obs-access-pattern").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-
-    let host = format!("ingress.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
-    h.http.get(&host, "/a/deep/path").await?;
-
-    // Poll the access log rather than read once: this test reached here via a
-    // `helm upgrade` (access-log-path-mode flip) that rolled the proxy pod, so
-    // the freshly-driven request's log line can lag the first read.
-    let path = wait::poll_until(
-        Duration::from_secs(30),
-        wait::POLL,
-        || async { format!("an access-log row for {host} with status 200 and a path") },
-        || async {
-            let logs = h.controller.shared_proxy_access_logs().await.ok()?;
-            logs.iter()
-                .rev()
-                .find(|line| {
-                    line.get("host").and_then(|h| h.as_str()) == Some(host.as_str())
-                        && line.get("status").and_then(|s| s.as_u64()) == Some(200)
-                })?
-                .get("path")
-                .and_then(|p| p.as_str())
-                .map(str::to_owned)
-        },
-    )
-    .await?;
-    assert!(
-        path.starts_with("/a"),
-        "pattern mode must emit the matched rule pattern, got {path:?}"
-    );
-    assert_ne!(
-        path, "/a/deep/path",
-        "pattern mode must NOT emit the concrete request path"
-    );
-    Ok(())
-}
-
-/// `--access-log-path-mode=none` drops the `path` field entirely while
-/// keeping every other documented field.
-#[tokio::test]
-async fn access_log_path_mode_none_omits_path() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        access_log_path_mode: Some("none".to_string()),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "obs-access-none").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-
-    let host = format!("ingress.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
-    h.http.get(&host, "/a").await?;
-
-    let logs = h.controller.shared_proxy_access_logs().await?;
-    let row = logs
-        .iter()
-        .rev()
-        .find(|line| {
-            line.get("host").and_then(|h| h.as_str()) == Some(host.as_str())
-                && line.get("status").and_then(|s| s.as_u64()) == Some(200)
-        })
-        .expect("at least one matching access-log row");
-    assert!(
-        row.get("path").map(|v| v.is_null()).unwrap_or(true),
-        "none mode must omit `path`, got {row}"
-    );
-    for required in ["host", "method", "status", "route_id", "upstream"] {
-        assert!(
-            !row.get(required).map(|v| v.is_null()).unwrap_or(true),
-            "none mode must still emit `{required}`"
-        );
-    }
-    Ok(())
-}
-
 /// An unmatched host yields a 404 from the proxy; the access log row carries
 /// `status=404` and an `error` field describing why no route matched.
 #[tokio::test]
@@ -782,48 +617,6 @@ async fn access_log_error_path_carries_error_field() -> anyhow::Result<()> {
             .map(|s| !s.is_empty())
             .unwrap_or(false),
         "error path must populate the `error` field on the access log row"
-    );
-    Ok(())
-}
-
-/// `--access-log=false` disables emission entirely — no access-log lines on
-/// any subsequent traffic. Metrics still flow (see `proxy_pod_emits_*`); the
-/// silencing is log-only.
-#[tokio::test]
-async fn access_log_disabled_emits_nothing() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        access_log: Some(false),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "obs-access-off").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-
-    let host = format!("ingress.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
-    for _ in 0..5 {
-        h.http.get(&host, "/a").await?;
-    }
-
-    let logs = h.controller.shared_proxy_access_logs().await?;
-    let recent: Vec<_> = logs
-        .iter()
-        .filter(|line| line.get("host").and_then(|h| h.as_str()) == Some(host.as_str()))
-        .collect();
-    assert!(
-        recent.is_empty(),
-        "access-log disabled must produce zero rows for the driven traffic, got {} rows",
-        recent.len()
-    );
-
-    // Metrics must still be observed even when access logging is off.
-    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
-    assert!(
-        metrics.contains("coxswain_proxy_requests_total{"),
-        "metrics must still emit even with access logging disabled"
     );
     Ok(())
 }
@@ -1895,4 +1688,225 @@ async fn udp_datagram_to_unrouted_port_increments_drop_counter() -> anyhow::Resu
     .await?;
 
     Ok(())
+}
+
+// Tests that mutate the shared Helm release (non-default ControllerOptions /
+// start_with_options) or that need flake-isolation timing must run serially
+// against the whole e2e job -- see `.config/nextest.toml` `test(/serial::/)`.
+mod serial {
+    use super::*;
+
+    /// #512 happy path: a single isolated Ingress apply (no concurrent churn)
+    /// must settle in well under the reflector's old fixed 500ms debounce floor.
+    /// Compares the mean debounce-wait (`_sum`/`_count` delta) against a 300ms
+    /// bound — comfortably above the default 20ms quiet window, comfortably below
+    /// the 500ms ceiling this replaces — and confirms via `wait_for_route` that
+    /// the change actually converged, not just that a metric moved.
+    ///
+    /// Serial, not a config mutator: in the parallel pass, concurrent tests
+    /// churn the shared control plane, so the histogram folds in unrelated
+    /// reconcile cycles (some at the 500ms debounce ceiling), inflating the
+    /// mean past the 300ms bound — measurement contention, not a regression.
+    /// Runs alone so the isolated change is the only load and the bound stays
+    /// a meaningful regression guard rather than a coin flip.
+    #[tokio::test]
+    async fn isolated_route_change_debounces_well_under_fixed_floor() -> anyhow::Result<()> {
+        let h = Harness::start().await?;
+        let ns = NamespaceGuard::create(&h.client, "obs-debounce-fast").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+
+        let before = reqwest::get(h.controller_admin_url("/metrics"))
+            .await?
+            .text()
+            .await?;
+        let before_sum = count_or_zero(
+            &before,
+            "coxswain_controller_reconcile_debounce_seconds_sum",
+        );
+        let before_count = count_or_zero(
+            &before,
+            "coxswain_controller_reconcile_debounce_seconds_count",
+        );
+
+        fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+        let host = format!("ingress.{}.local", ns.name);
+        wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+
+        let (after_sum, after_count) = wait::poll_until(
+            Duration::from_secs(30),
+            wait::POLL_FAST,
+            || async {
+                "timed out waiting for the debounce-wait histogram to advance past its pre-change baseline"
+                    .to_string()
+            },
+            || async {
+                let body = reqwest::get(h.controller_admin_url("/metrics"))
+                    .await
+                    .ok()?
+                    .text()
+                    .await
+                    .ok()?;
+                let sum = count_or_zero(&body, "coxswain_controller_reconcile_debounce_seconds_sum");
+                let count = count_or_zero(
+                    &body,
+                    "coxswain_controller_reconcile_debounce_seconds_count",
+                );
+                (count > before_count).then_some((sum, count))
+            },
+        )
+        .await?;
+
+        let mean_wait = (after_sum - before_sum) / (after_count - before_count);
+        assert!(
+            mean_wait < 0.3,
+            "expected an isolated Ingress apply to debounce in well under the old 500ms fixed \
+             floor, got a mean debounce-wait of {mean_wait}s (sum {before_sum}->{after_sum}, \
+             count {before_count}->{after_count})"
+        );
+
+        Ok(())
+    }
+
+    /// `--access-log-path-mode=pattern` replaces the concrete request path with
+    /// the matched rule's `path_pattern`. Same Ingress, same backend, just a
+    /// redacted `path` field.
+    ///
+    /// Note: `pattern` is used here intentionally to exercise the mode under test.
+    /// The chart default is `full`; production deployments feeding a security
+    /// pipeline must retain `full` to keep path-traversal attempts visible.
+    #[tokio::test]
+    async fn access_log_path_mode_pattern_uses_rule_pattern() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            // pattern is intentional here — this test exercises the mode; it is NOT
+            // a production recommendation (chart default is full).
+            access_log_path_mode: Some("pattern".to_string()),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "obs-access-pattern").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+        let host = format!("ingress.{}.local", ns.name);
+        wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+        h.http.get(&host, "/a/deep/path").await?;
+
+        // Poll the access log rather than read once: this test reached here via a
+        // `helm upgrade` (access-log-path-mode flip) that rolled the proxy pod, so
+        // the freshly-driven request's log line can lag the first read.
+        let path = wait::poll_until(
+            Duration::from_secs(30),
+            wait::POLL,
+            || async { format!("an access-log row for {host} with status 200 and a path") },
+            || async {
+                let logs = h.controller.shared_proxy_access_logs().await.ok()?;
+                logs.iter()
+                    .rev()
+                    .find(|line| {
+                        line.get("host").and_then(|h| h.as_str()) == Some(host.as_str())
+                            && line.get("status").and_then(|s| s.as_u64()) == Some(200)
+                    })?
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .map(str::to_owned)
+            },
+        )
+        .await?;
+        assert!(
+            path.starts_with("/a"),
+            "pattern mode must emit the matched rule pattern, got {path:?}"
+        );
+        assert_ne!(
+            path, "/a/deep/path",
+            "pattern mode must NOT emit the concrete request path"
+        );
+        Ok(())
+    }
+
+    /// `--access-log-path-mode=none` drops the `path` field entirely while
+    /// keeping every other documented field.
+    #[tokio::test]
+    async fn access_log_path_mode_none_omits_path() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            access_log_path_mode: Some("none".to_string()),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "obs-access-none").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+        let host = format!("ingress.{}.local", ns.name);
+        wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+        h.http.get(&host, "/a").await?;
+
+        let logs = h.controller.shared_proxy_access_logs().await?;
+        let row = logs
+            .iter()
+            .rev()
+            .find(|line| {
+                line.get("host").and_then(|h| h.as_str()) == Some(host.as_str())
+                    && line.get("status").and_then(|s| s.as_u64()) == Some(200)
+            })
+            .expect("at least one matching access-log row");
+        assert!(
+            row.get("path").map(|v| v.is_null()).unwrap_or(true),
+            "none mode must omit `path`, got {row}"
+        );
+        for required in ["host", "method", "status", "route_id", "upstream"] {
+            assert!(
+                !row.get(required).map(|v| v.is_null()).unwrap_or(true),
+                "none mode must still emit `{required}`"
+            );
+        }
+        Ok(())
+    }
+
+    /// `--access-log=false` disables emission entirely — no access-log lines on
+    /// any subsequent traffic. Metrics still flow (see `proxy_pod_emits_*`); the
+    /// silencing is log-only.
+    #[tokio::test]
+    async fn access_log_disabled_emits_nothing() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            access_log: Some(false),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "obs-access-off").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+        let host = format!("ingress.{}.local", ns.name);
+        wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+        for _ in 0..5 {
+            h.http.get(&host, "/a").await?;
+        }
+
+        let logs = h.controller.shared_proxy_access_logs().await?;
+        let recent: Vec<_> = logs
+            .iter()
+            .filter(|line| line.get("host").and_then(|h| h.as_str()) == Some(host.as_str()))
+            .collect();
+        assert!(
+            recent.is_empty(),
+            "access-log disabled must produce zero rows for the driven traffic, got {} rows",
+            recent.len()
+        );
+
+        // Metrics must still be observed even when access logging is off.
+        let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+        assert!(
+            metrics.contains("coxswain_proxy_requests_total{"),
+            "metrics must still emit even with access logging disabled"
+        );
+        Ok(())
+    }
 }

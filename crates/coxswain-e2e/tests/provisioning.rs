@@ -140,250 +140,6 @@ async fn gateway_deletion_garbage_collects_resources() -> anyhow::Result<()> {
 /// Service), from `render_relay::RELAY_NAME`.
 const RELAY_NAME: &str = "coxswain-relay";
 
-/// Happy path + GC lifecycle: with relay tiering enabled and a threshold of 1, a
-/// single dedicated Gateway provisions a namespace relay (zero-verb SA, no owner
-/// ref, namespace-relay component) that becomes Ready — proving its `Namespace`
-/// subscribe was authorized by provenance end-to-end. Deleting the last dedicated
-/// Gateway leaves the namespace with no dedicated Gateways, which deactivates the
-/// relay immediately (a genuinely drained namespace bypasses the cooldown) and
-/// garbage-collects it.
-#[tokio::test]
-async fn namespace_relay_provisioned_and_gcd_over_dedicated_gateway_lifecycle() -> anyhow::Result<()>
-{
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(1),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-ded-provision").await?;
-
-    // A dedicated Gateway (1 desired replica) crosses the threshold of 1.
-    apply_and_wait(&h, &ns).await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
-    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
-
-    let relay_deploy =
-        wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
-    wait::wait_for_resource(&services, RELAY_NAME, Duration::from_secs(15)).await?;
-    let relay_sa = wait::wait_for_resource(&sas, RELAY_NAME, Duration::from_secs(15)).await?;
-
-    assert_eq!(
-        relay_sa.automount_service_account_token,
-        Some(false),
-        "relay SA must disable the default token automount (zero-verb identity)"
-    );
-    assert_eq!(
-        relay_deploy
-            .metadata
-            .labels
-            .as_ref()
-            .and_then(|l| l.get("app.kubernetes.io/component"))
-            .map(String::as_str),
-        Some("relay-namespace"),
-        "relay carries the relay-namespace component label"
-    );
-    assert!(
-        relay_deploy
-            .metadata
-            .owner_references
-            .as_ref()
-            .is_none_or(|r| r.is_empty()),
-        "a namespace relay is per-namespace and must carry no owner reference"
-    );
-
-    // Becomes Ready → its Namespace subscribe was authorized (an unauthorized
-    // relay never marks routing_table_loaded, so its pod never goes Ready).
-    wait::poll_until(
-        Duration::from_secs(90),
-        wait::POLL,
-        || async {
-            format!("namespace relay '{RELAY_NAME}' pod Ready (authorized Namespace subscribe)")
-        },
-        || async {
-            let ready = deployments
-                .get(RELAY_NAME)
-                .await
-                .ok()
-                .and_then(|d| d.status)
-                .and_then(|s| s.ready_replicas)
-                .unwrap_or(0);
-            (ready >= 1).then_some(())
-        },
-    )
-    .await?;
-
-    // Delete the last dedicated Gateway → namespace drains to zero → GC.
-    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
-    gateways
-        .delete(GATEWAY_NAME, &DeleteParams::default())
-        .await?;
-
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || async {
-            format!(
-                "namespace relay '{RELAY_NAME}' garbage-collected after the last dedicated Gateway is deleted"
-            )
-        },
-        || async {
-            let gone = deployments.get(RELAY_NAME).await.is_err()
-                && services.get(RELAY_NAME).await.is_err()
-                && sas.get(RELAY_NAME).await.is_err();
-            gone.then_some(())
-        },
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// Sad/negative path — scale-to-zero: relay tiering enabled but with a high
-/// activation threshold, a dedicated Gateway's subscriber count stays below it, so
-/// the namespace must stay direct-to-controller with NO relay. Below the threshold
-/// the control loop's activation check never provisions anything, so the relay's
-/// absence is a decided "not wanted".
-#[tokio::test]
-async fn namespace_relay_not_provisioned_below_threshold() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(100),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-ded-below").await?;
-
-    // The live subscriber count stays far below the activation threshold (100), so
-    // the control loop never provisions a relay for this namespace.
-    apply_and_wait(&h, &ns).await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    assert!(
-        deployments.get(RELAY_NAME).await.is_err(),
-        "a below-threshold namespace must stay direct-to-controller (scale-to-zero), \
-         but relay '{RELAY_NAME}' was provisioned"
-    );
-
-    Ok(())
-}
-
-/// Happy/transition path (#616) — with a namespace relay `Active` and serving
-/// (leaves repointed onto it, make-before-break), disabling the relay tier tears
-/// the relay down and the dedicated proxy repoints its discovery subscribe back to
-/// the controller, which keeps serving — the make-before-break teardown in
-/// reverse, the dedicated-tier analogue of
-/// `shared_pool_repoints_direct_when_relay_disabled`. Before the fix this relay
-/// would be orphaned forever: `rehydrate_provisioned_relays` skipped the LIST while
-/// disabled, so the restarted (Helm-upgraded) controller never re-adopted it.
-#[tokio::test]
-async fn namespace_relay_gcd_and_traffic_continues_when_relay_disabled() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(1),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-ded-disable").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(dedicated::TRAFFIC, FixtureVars::new(&ns.name)).await?;
-
-    let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
-    wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
-    let dedicated_addr =
-        wait::wait_for_dedicated_proxy_endpoint(&ns.name, GATEWAY_NAME, Duration::from_secs(60))
-            .await?;
-    let http = HttpClient::new(dedicated_addr)?;
-    let host = format!("dedicated.{}.local", ns.name);
-    wait::wait_for_route(&http, &host, "/", Duration::from_secs(60))
-        .await?
-        .assert_backend("echo-a");
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
-    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
-
-    // Reach Active (Ready) before disabling — leaves are repointed onto it, so the
-    // teardown below exercises the make-before-break StartDrain path.
-    wait::poll_until(
-        Duration::from_secs(90),
-        wait::POLL,
-        || async { format!("namespace relay '{RELAY_NAME}' pod Ready before disabling the tier") },
-        || async {
-            let ready = deployments
-                .get(RELAY_NAME)
-                .await
-                .ok()
-                .and_then(|d| d.status)
-                .and_then(|s| s.ready_replicas)
-                .unwrap_or(0);
-            (ready >= 1).then_some(())
-        },
-    )
-    .await?;
-
-    // Disable the tier → the relay tears down (force-off bypasses the cooldown).
-    set_relay_enabled(false).await?;
-    wait::poll_until(
-        Duration::from_secs(90),
-        wait::POLL,
-        || async {
-            format!("namespace relay '{RELAY_NAME}' garbage-collected after the tier is disabled")
-        },
-        || async {
-            let gone = deployments.get(RELAY_NAME).await.is_err()
-                && services.get(RELAY_NAME).await.is_err()
-                && sas.get(RELAY_NAME).await.is_err();
-            gone.then_some(())
-        },
-    )
-    .await?;
-
-    // The dedicated proxy repointed its discovery subscribe back to the controller
-    // and keeps serving the same route — no orphan is left degraded.
-    wait::wait_for_route(&http, &host, "/", Duration::from_secs(60))
-        .await
-        .context("dedicated proxy stopped serving after its relay was disabled and torn down")?
-        .assert_backend("echo-a");
-
-    Ok(())
-}
-
-/// Sad/negative path (#616) — the master switch still gates provisioning now that
-/// the control loop and rehydration run unconditionally: a namespace whose demand
-/// meets the activation threshold gets NO relay while the tier is disabled.
-/// Companion to `namespace_relay_not_provisioned_below_threshold` — proves "always
-/// run the loop" did not regress into "always provision" once the guards were
-/// removed to fix the orphan-on-disable bug.
-#[tokio::test]
-async fn namespace_relay_not_provisioned_when_relay_disabled_despite_demand() -> anyhow::Result<()>
-{
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: false,
-        relay_min_proxy_replicas: Some(1),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-ded-off").await?;
-
-    // The fixture's 1 desired replica meets the threshold (1) — would provision if
-    // the tier were enabled.
-    apply_and_wait(&h, &ns).await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    assert!(
-        deployments.get(RELAY_NAME).await.is_err(),
-        "a disabled relay tier must never provision '{RELAY_NAME}', even with demand \
-         at the activation threshold"
-    );
-
-    Ok(())
-}
-
 // ── Shared-pool relay tier (#605) — controller-provisioned shared relay ───────
 //
 // Symmetric with the namespace relay above, but a SINGLE global relay in the
@@ -427,163 +183,6 @@ async fn wait_shared_pool_serves(h: &Harness, ns: &str) -> anyhow::Result<String
     let host = format!("ingress.{ns}.local");
     wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(90)).await?;
     Ok(host)
-}
-
-/// Happy path: with relay tiering enabled and a break-even of 1, the shared proxy
-/// pool (≥1 replica) crosses the threshold, so the controller provisions the single
-/// shared-pool relay in the install namespace — zero-verb SA, no owner ref,
-/// relay-shared component, `serve relay --shared` — that becomes Ready. The pool
-/// keeps serving an Ingress route across the repoint onto the relay.
-#[tokio::test]
-async fn shared_relay_provisioned_when_pool_meets_break_even() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(1),
-        ..Default::default()
-    })
-    .await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
-    let services: Api<Service> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
-    let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
-
-    let deploy =
-        wait::wait_for_resource(&deployments, SHARED_RELAY_NAME, Duration::from_secs(60)).await?;
-    wait::wait_for_resource(&services, SHARED_RELAY_NAME, Duration::from_secs(15)).await?;
-    let sa = wait::wait_for_resource(&sas, SHARED_RELAY_NAME, Duration::from_secs(15)).await?;
-
-    assert_eq!(
-        sa.automount_service_account_token,
-        Some(false),
-        "shared relay SA must disable the default token automount (zero-verb identity)"
-    );
-    assert_eq!(
-        deploy
-            .metadata
-            .labels
-            .as_ref()
-            .and_then(|l| l.get("app.kubernetes.io/component"))
-            .map(String::as_str),
-        Some("relay-shared"),
-        "shared relay carries the relay-shared component label"
-    );
-    assert!(
-        deploy
-            .metadata
-            .owner_references
-            .as_ref()
-            .is_none_or(|r| r.is_empty()),
-        "the shared relay is install infra and must carry no owner reference"
-    );
-    let args = deploy
-        .spec
-        .as_ref()
-        .and_then(|s| s.template.spec.as_ref())
-        .map(|p| &p.containers[0])
-        .and_then(|c| c.args.clone())
-        .unwrap_or_default();
-    assert!(
-        args.iter().any(|a| a == "--shared"),
-        "shared relay must subscribe --shared: {args:?}"
-    );
-    assert!(
-        !args.iter().any(|a| a.starts_with("--namespace")),
-        "shared relay is pool-scoped and must carry no --namespace: {args:?}"
-    );
-
-    wait_for_shared_relay_ready(&deployments).await?;
-
-    // The pool keeps serving across the repoint onto the shared relay.
-    let ns = NamespaceGuard::create(&h.client, "relay-shared-serve").await?;
-    wait_shared_pool_serves(&h, &ns.name)
-        .await
-        .context("shared pool stopped serving traffic across the shared-relay repoint")?;
-
-    Ok(())
-}
-
-/// Sad path — scale-to-zero: relay tiering enabled but with a break-even far above
-/// the shared pool's replica count, so the controller provisions NO shared relay
-/// and the pool streams direct from the controller. A short cooldown makes any
-/// relay left by a prior serial test GC deterministically.
-#[tokio::test]
-async fn shared_relay_below_break_even_stays_direct() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(100),
-        relay_cooldown: Some("10s".to_string()),
-        ..Default::default()
-    })
-    .await?;
-
-    // The pool serves direct-to-controller.
-    let ns = NamespaceGuard::create(&h.client, "relay-shared-below").await?;
-    wait_shared_pool_serves(&h, &ns.name).await?;
-
-    // No shared relay: a below-break-even pool is a decided "not wanted". Poll so a
-    // relay left Active by a prior serial test tears down (short cooldown) rather
-    // than flaking on stale state.
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || async {
-            format!(
-                "no shared relay '{SHARED_RELAY_NAME}' below break-even (pool stays direct-to-controller)"
-            )
-        },
-        || async { deployments.get(SHARED_RELAY_NAME).await.is_err().then_some(()) },
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// Happy/transition: with the shared relay provisioned and serving, disabling the
-/// relay tier tears the shared relay down and repoints the pool back to the
-/// controller, which keeps serving — the make-before-break teardown in reverse.
-#[tokio::test]
-async fn shared_pool_repoints_direct_when_relay_disabled() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(1),
-        ..Default::default()
-    })
-    .await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
-    wait::wait_for_resource(&deployments, SHARED_RELAY_NAME, Duration::from_secs(60)).await?;
-    wait_for_shared_relay_ready(&deployments).await?;
-
-    let ns = NamespaceGuard::create(&h.client, "relay-shared-revert").await?;
-    let host = wait_shared_pool_serves(&h, &ns.name).await?;
-
-    // Disable the tier → the shared relay tears down (force-off bypasses the cooldown).
-    set_relay_enabled(false).await?;
-    wait::poll_until(
-        Duration::from_secs(90),
-        wait::POLL,
-        || async {
-            format!(
-                "shared relay '{SHARED_RELAY_NAME}' garbage-collected after the tier is disabled"
-            )
-        },
-        || async {
-            deployments
-                .get(SHARED_RELAY_NAME)
-                .await
-                .is_err()
-                .then_some(())
-        },
-    )
-    .await?;
-
-    // The pool repointed back to the controller and keeps serving the same route.
-    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60))
-        .await
-        .context("shared pool stopped serving after the relay was disabled and the pool reverted to the controller")?;
-
-    Ok(())
 }
 
 // ── CoxswainRelayPolicy (#589) — per-namespace relay override + tuning ────────
@@ -634,134 +233,6 @@ async fn assert_no_relay_hpa(h: &Harness, ns: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Happy path — `enabled: true` forces the relay on even though the break-even
-/// threshold (set high) would not provision it, and the policy's `replicas` (3) and
-/// `resources` overrides land on the rendered Deployment.
-#[tokio::test]
-async fn relay_policy_force_on_provisions_relay_with_overrides() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(100),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-pol-on").await?;
-    apply_relay_policy(dedicated::RELAY_POLICY_FORCE_ON, &ns.name).await?;
-
-    apply_and_wait(&h, &ns).await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    // Forced on despite the threshold of 100, at the policy's replicas override (3),
-    // not the `--relay-replicas` default (2).
-    wait_for_relay_replicas(&deployments, 3).await?;
-
-    // Resources override landed on the relay container.
-    let d = deployments.get(RELAY_NAME).await?;
-    let container = &d
-        .spec
-        .expect("relay spec")
-        .template
-        .spec
-        .expect("relay pod spec")
-        .containers[0];
-    let cpu = container
-        .resources
-        .as_ref()
-        .and_then(|r| r.requests.as_ref())
-        .and_then(|m| m.get("cpu"));
-    assert_eq!(
-        cpu.map(|q| q.0.as_str()),
-        Some("25m"),
-        "policy resources override must land on the relay container"
-    );
-    Ok(())
-}
-
-/// Sad/veto path — a relay auto-provisions (threshold met), then an `enabled: false`
-/// policy vetoes it and the controller garbage-collects the relay, overriding the
-/// control loop's automatic decision with an explicit operator intent.
-#[tokio::test]
-async fn relay_policy_force_off_gcs_provisioned_relay() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(1),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-pol-off").await?;
-
-    apply_and_wait(&h, &ns).await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
-    // Auto-provisioned first: threshold of 1 is met and no policy exists yet.
-    wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
-
-    // Force-off vetoes it — the relay control loop resolves the policy on its next
-    // pass, sees `enabled: false`, and tears the relay down (drain then GC).
-    apply_relay_policy(dedicated::RELAY_POLICY_FORCE_OFF, &ns.name).await?;
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || async {
-            format!("relay '{RELAY_NAME}' garbage-collected after an enabled:false policy")
-        },
-        || async {
-            let gone = deployments.get(RELAY_NAME).await.is_err()
-                && services.get(RELAY_NAME).await.is_err();
-            gone.then_some(())
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-/// Happy path — controller-driven autoscaling sizes the relay from the namespace
-/// fan-out. With small fan-out the relay sits at the autoscaling floor
-/// (`minReplicas` 3), distinct from the static `--relay-replicas` default (2),
-/// proving the autoscaling path set the count — and NO HPA object is ever created.
-#[tokio::test]
-async fn relay_policy_autoscaling_sizes_relay_without_hpa() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(100),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-pol-hpa").await?;
-    apply_relay_policy(dedicated::RELAY_POLICY_AUTOSCALING, &ns.name).await?;
-
-    apply_and_wait(&h, &ns).await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    wait_for_relay_replicas(&deployments, 3).await?;
-    assert_no_relay_hpa(&h, &ns.name).await?;
-    Ok(())
-}
-
-/// Sad path — an autoscaling stanza missing the mandatory `maxReplicas` is refused
-/// (an uncapped relay would regrow leader fan-out): the controller falls back to the
-/// static `replicas` (3), not the autoscaling floor (`minReplicas` 2), and no HPA is
-/// created.
-#[tokio::test]
-async fn relay_policy_uncapped_autoscaling_falls_back_to_static() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(100),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-pol-uncapped").await?;
-    apply_relay_policy(dedicated::RELAY_POLICY_AUTOSCALING_UNCAPPED, &ns.name).await?;
-
-    apply_and_wait(&h, &ns).await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    wait_for_relay_replicas(&deployments, 3).await?;
-    assert_no_relay_hpa(&h, &ns.name).await?;
-    Ok(())
-}
-
 // ── Relay control loop (#602) — activation/cooldown/stabilization ────────────
 //
 // The dedicated relay is provisioned by an HPA+KEDA-style control loop driven by
@@ -808,98 +279,6 @@ async fn assert_relay_not_scaled_below(
     Ok(())
 }
 
-/// Happy path — the #602 behaviour change: a relay whose namespace drops **below**
-/// break-even but stays at a **nonzero** subscriber count is torn down after the
-/// cooldown. The old keep-until-fully-drained rule would keep it forever; this
-/// proves the KEDA-style cooldown deactivation, and that teardown happens while a
-/// proxy is still connected (make-before-break repoints it back to the controller).
-#[tokio::test]
-async fn relay_deactivated_after_cooldown_below_break_even() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: true,
-        // Break-even 2 so a single remaining subscriber (1) is below it but nonzero.
-        relay_min_proxy_replicas: Some(2),
-        relay_cooldown: Some("5s".to_string()),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-cooldown").await?;
-
-    // The dedicated Gateway's params default to 2 replicas → 2 subscribers ≥ 2.
-    apply_and_wait(&h, &ns).await?;
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
-
-    // Drop to a single subscriber: below break-even (2) but NONZERO.
-    patch_params_replicas(&h.client, &ns.name, "dedicated-params", 1).await?;
-
-    // After the cooldown the relay tears down — even though a proxy is still
-    // connected (the behaviour change: no keep-until-fully-drained).
-    wait::poll_until(
-        Duration::from_secs(90),
-        wait::POLL,
-        || async {
-            format!(
-                "relay '{RELAY_NAME}' torn down after the cooldown at a NONZERO (below-break-even) \
-                 subscriber count"
-            )
-        },
-        || async { deployments.get(RELAY_NAME).await.is_err().then_some(()) },
-    )
-    .await?;
-
-    // The dedicated proxy is still running (1 replica) — teardown fired at a
-    // nonzero subscriber count, not because the namespace drained to zero.
-    let dedicated_ready = deployments
-        .get(RESOURCE_NAME)
-        .await?
-        .status
-        .and_then(|s| s.ready_replicas)
-        .unwrap_or(0);
-    assert!(
-        dedicated_ready >= 1,
-        "the dedicated proxy must still be running when the relay is torn down \
-         (proves teardown at a nonzero subscriber count, not GC-at-zero)"
-    );
-    Ok(())
-}
-
-/// Sad/anti-flap path — a transient subscriber dip must NOT immediately scale the
-/// relay down: the scale-down stabilization window sizes on the trailing-window
-/// maximum. The relay holds its higher count for the window, then settles to the
-/// dip level once the window's peak ages out.
-#[tokio::test]
-async fn relay_scale_down_debounced_by_stabilization_window() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(100),
-        relay_scale_down_stabilization: Some("30s".to_string()),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "relay-debounce").await?;
-    // minReplicas 1, target 1 → replica count tracks the live subscriber count.
-    apply_relay_policy(dedicated::RELAY_POLICY_AUTOSCALING_SCALEDOWN, &ns.name).await?;
-    apply_and_wait(&h, &ns).await?;
-
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    // 3 subscribers → 3 relay replicas (proves 3 proxies connected).
-    patch_params_replicas(&h.client, &ns.name, "dedicated-params", 3).await?;
-    wait_for_relay_replicas(&deployments, 3).await?;
-
-    // Drop to 1 subscriber — a scale-DOWN candidate the stabilization window damps.
-    patch_params_replicas(&h.client, &ns.name, "dedicated-params", 1).await?;
-
-    // Within the 30s window the relay must not scale DOWN below 3 (the trailing-
-    // window peak), rather than dropping straight to 1 — the anti-flap guarantee.
-    // (`>= 3`, not `== 3`: a transient upward spike from convergence churn is fine.)
-    assert_relay_not_scaled_below(&deployments, 3, Duration::from_secs(12)).await?;
-
-    // Once the peak ages out of the window, it settles to the dip level (1).
-    wait_for_relay_replicas(&deployments, 1).await?;
-    Ok(())
-}
-
 // ── Relay-tracking rehydration across a controller restart (#593) ────────────
 //
 // Also global-config mutators (relay.dedicated.*) → serial pass. Restart mirrors
@@ -933,116 +312,6 @@ async fn patch_params_replicas(
         &Patch::Merge(serde_json::json!({ "spec": { "replicas": replicas } })),
     )
     .await?;
-    Ok(())
-}
-
-/// Happy/regression path — a relay whose namespace sits just below break-even (a
-/// live subscriber count under `--relay-min-proxy-replicas`, held within the
-/// deactivation cooldown so the relay is still running) survives a controller
-/// restart AND is still garbage-collected once its namespace drains to zero. Under
-/// #602 rehydration is still load-bearing: without it the restart leaves the running
-/// relay untracked (no state-machine record), so the control loop — whose
-/// provision-from-absent branch can only *provision*, never delete — would never
-/// tear it down even at zero subscribers. Startup rehydration re-adopts the relay as
-/// `Active`, so the below-break-even/zero-subscriber teardown fires.
-#[tokio::test]
-async fn namespace_relay_orphan_gcd_after_controller_restart_in_hysteresis_midrange()
--> anyhow::Result<()> {
-    // Threshold 2: the fixture's `replicas: 2` gives 2 subscribers (≥ 2) → relay;
-    // dropping params to `replicas: 1` puts the signal below break-even but nonzero.
-    let opts = || ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(2),
-        ..Default::default()
-    };
-    let h = Harness::start_with_options(opts()).await?;
-    let ns = NamespaceGuard::create_persistent(&h.client, "relay-restart-orphan").await?;
-
-    apply_and_wait(&h, &ns).await?;
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
-
-    // Drop to 1 subscriber (< threshold 2, nonzero): the default 300s cooldown keeps
-    // the relay running well within the test's runtime — the state the restart must
-    // re-adopt rather than orphan.
-    patch_params_replicas(&h.client, &ns.name, "dedicated-params", 1).await?;
-
-    // Restart the controller (fresh process = empty tracking set pre-fix).
-    drop(h);
-    let h2 = Harness::start_with_options(opts()).await?;
-    // Scrape the LEADER specifically, not an arbitrary Service replica: after a
-    // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
-    // races (#601 CI flake). `wait_for_leader_reconciled` re-resolves the Lease
-    // holder each tick.
-    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
-
-    // Drain the namespace to zero dedicated Gateways.
-    let gateways: Api<Gateway> = Api::namespaced(h2.client.clone(), &ns.name);
-    gateways
-        .delete(GATEWAY_NAME, &DeleteParams::default())
-        .await?;
-
-    // Rehydration adopted the orphan, so drain-to-zero GCs it. Pre-fix: never.
-    let deployments2: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
-    let services2: Api<Service> = Api::namespaced(h2.client.clone(), &ns.name);
-    let sas2: Api<ServiceAccount> = Api::namespaced(h2.client.clone(), &ns.name);
-    wait::poll_until(
-        Duration::from_secs(90),
-        wait::POLL,
-        || async {
-            format!(
-                "relay '{RELAY_NAME}' GC'd after a controller restart below break-even, once the \
-                 namespace drained to zero (proves startup rehydration re-adopted the running relay)"
-            )
-        },
-        || async {
-            let gone = deployments2.get(RELAY_NAME).await.is_err()
-                && services2.get(RELAY_NAME).await.is_err()
-                && sas2.get(RELAY_NAME).await.is_err();
-            gone.then_some(())
-        },
-    )
-    .await?;
-    Ok(())
-}
-
-/// Sad/companion path — a below-threshold namespace with NO relay stays relay-free
-/// across a controller restart. Startup rehydration adopts only relay Deployments
-/// that actually exist (`LIST` by the namespace-relay label), so it can never
-/// fabricate tracking state and spuriously provision or resurrect a relay — the
-/// over-reach risk the fix itself introduces.
-#[tokio::test]
-async fn namespace_relay_not_provisioned_after_restart_below_threshold() -> anyhow::Result<()> {
-    let opts = || ControllerOptions {
-        relay_enabled: true,
-        relay_min_proxy_replicas: Some(100),
-        ..Default::default()
-    };
-    let h = Harness::start_with_options(opts()).await?;
-    let ns = NamespaceGuard::create_persistent(&h.client, "relay-restart-below").await?;
-
-    // Subscriber count (2) < activation threshold 100 → no relay is ever provisioned.
-    apply_and_wait(&h, &ns).await?;
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    assert!(
-        deployments.get(RELAY_NAME).await.is_err(),
-        "a below-threshold namespace must have no relay '{RELAY_NAME}' before restart"
-    );
-
-    drop(h);
-    let h2 = Harness::start_with_options(opts()).await?;
-    // Scrape the LEADER specifically, not an arbitrary Service replica: after a
-    // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
-    // races (#601 CI flake). `wait_for_leader_reconciled` re-resolves the Lease
-    // holder each tick.
-    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
-
-    let deployments2: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
-    assert!(
-        deployments2.get(RELAY_NAME).await.is_err(),
-        "rehydration must not provision relay '{RELAY_NAME}' for a below-threshold namespace \
-         after a controller restart (it adopts only existing relay Deployments)"
-    );
     Ok(())
 }
 
@@ -1843,341 +1112,7 @@ async fn retry_count(h: &Harness, ns_marker: &str, condition: &str) -> u64 {
         .sum()
 }
 
-/// (#492 sad) Gateway API disabled: a Gateway applied while the surface is off
-/// receives no status conditions, proving coxswain does not reconcile Gateway
-/// API resources when `--disable-gateway-api` is set.
-///
-/// Positive control: an Ingress from the still-enabled surface gets its
-/// `loadBalancer` IP, confirming the controller processed the namespace and had
-/// every opportunity to (wrongly) reconcile the Gateway.
-///
-/// At the end the chart default (`controller.gatewayApi.enabled=true`) is
-/// restored so later serial tests run with stock config.
-#[tokio::test]
-async fn gateway_api_disabled_skips_gateway_reconcile() -> anyhow::Result<()> {
-    const STATUS_IP: &str = "203.0.113.81";
-    let h = Harness::start_with_options(ControllerOptions {
-        gateway_api_enabled: Some(false),
-        status_address: Some(STATUS_IP.to_string()),
-        ..Default::default()
-    })
-    .await?;
-
-    // Assert the health endpoint reports the surface as disabled.
-    let health: serde_json::Value = reqwest::get(h.controller_admin_url("/api/v1/health"))
-        .await?
-        .json()
-        .await?;
-    assert_eq!(
-        health["api_surfaces"]["gateway_api"].as_bool(),
-        Some(false),
-        "api_surfaces.gateway_api must be false when --disable-gateway-api is set; got: {health}"
-    );
-    assert_eq!(
-        health["api_surfaces"]["ingress"].as_bool(),
-        Some(true),
-        "api_surfaces.ingress must remain true; got: {health}"
-    );
-
-    let ns = NamespaceGuard::create(&h.client, "prov-gw-disabled").await?;
-
-    // Apply an Ingress (positive control: proves the controller processed the ns).
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(ing::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-
-    // Apply a Gateway that would normally be reconciled.
-    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-
-    // Wait for the Ingress to get an LB IP — proves the controller ran and had
-    // time to reconcile the Gateway if it were going to.
-    wait::wait_for_ingress_lb_ip(
-        &h.client,
-        "echo-ingress",
-        &ns.name,
-        STATUS_IP,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    // Regression guard for #550 (and the identical prior fixes for `auth-jwt`/
-    // `ext-auth`): the `Compression` CR reflector must be spawned always-on,
-    // not only inside the gateway-api-gated reflector set — otherwise the
-    // Ingress `compression` annotation is permanently unresolvable on an
-    // Ingress-only install. Apply a `compression`-referencing Ingress here,
-    // under `--disable-gateway-api`, and prove it still resolves and compresses.
-    //
-    // The route can become routable (via the Ingress reflector) slightly
-    // before the just-restarted controller's Compression reflector finishes
-    // its initial sync, so poll for the compressed response rather than
-    // asserting on the first request after `wait_for_route`.
-    fixtures::apply_fixture(ing::ANNOTATION_COMPRESSION_GZIP, FixtureVars::new(&ns.name)).await?;
-    let compression_host = format!("compression-gzip.{}.local", ns.name);
-    wait::wait_for_route(&h.http, &compression_host, "/", Duration::from_secs(60)).await?;
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || async {
-            format!(
-                "compression annotation to resolve and apply at {compression_host} \
-                 even with gateway-api disabled (Compression CR store must be \
-                 spawned always-on, not gateway-api-gated)"
-            )
-        },
-        || async {
-            let (_, resp_headers, _) = h
-                .http
-                .get_full_raw(&compression_host, "/", &[("Accept-Encoding", "gzip")])
-                .await
-                .ok()?;
-            (resp_headers
-                .get("content-encoding")
-                .and_then(|v| v.to_str().ok())
-                == Some("gzip"))
-            .then_some(())
-        },
-    )
-    .await?;
-
-    // Regression guard for #551 (identical fix, same rationale, for `RetryPolicy`):
-    // the CR reflector must be spawned always-on, not only inside the
-    // gateway-api-gated reflector set — otherwise the Ingress `retry` annotation
-    // is permanently unresolvable (and its health check permanently unregistered,
-    // crash-looping the controller) on an Ingress-only install. Apply a
-    // `retry`-referencing Ingress over go-httpbin here, under
-    // `--disable-gateway-api`, and prove the retry loop actually fires.
-    fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
-    fixtures::apply_fixture(ing::ANNOTATION_RETRY_CODES, FixtureVars::new(&ns.name)).await?;
-    let retry_host = format!("ingretry.{}.local", ns.name);
-    let proxy = h.http.proxy_addr;
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || async { format!("{retry_host} route live (go-httpbin 200)") },
-        || async { (raw_status(proxy, &retry_host, "/status/200").await == 200).then_some(()) },
-    )
-    .await?;
-    let before = retry_count(&h, &ns.name, "http-code").await;
-    // The route can become routable (via the Ingress reflector) slightly before
-    // the just-restarted controller's RetryPolicy reflector finishes its initial
-    // sync, so re-drive the always-503 request inside the poll rather than
-    // asserting on a single attempt right after the route goes live.
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || async {
-            format!(
-                "retry annotation to resolve and retry at {retry_host} even with \
-                 gateway-api disabled (RetryPolicy CR store must be spawned \
-                 always-on, not gateway-api-gated)"
-            )
-        },
-        || async {
-            let _ = raw_status(proxy, &retry_host, "/status/503").await;
-            (retry_count(&h, &ns.name, "http-code").await > before).then_some(())
-        },
-    )
-    .await?;
-
-    // Negative assertion: the Gateway must NOT be reconciled by coxswain.
-    // The Gateway API admission webhook injects Accepted=Unknown / Programmed=Unknown
-    // conditions with observedGeneration=None at object creation time ("Waiting for
-    // controller"). Coxswain always sets observedGeneration when it writes conditions,
-    // so the absence of any condition with observedGeneration.is_some() proves it
-    // never touched the Gateway.
-    let gateways_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
-    let gw = gateways_api.get("coxswain-test").await?;
-    let conditions = gw
-        .status
-        .as_ref()
-        .and_then(|s| s.conditions.as_deref())
-        .unwrap_or(&[]);
-    let coxswain_reconciled = conditions.iter().any(|c| c.observed_generation.is_some());
-    assert!(
-        !coxswain_reconciled,
-        "Gateway must not be reconciled by coxswain when gateway-api surface is disabled; \
-         initial 'Unknown' conditions from the Gateway API admission webhook are expected, \
-         but none with observedGeneration set should appear. Got: {conditions:?}"
-    );
-
-    // Restore the chart-default so later serial tests run with stock config.
-    Harness::start_with_options(ControllerOptions {
-        gateway_api_enabled: Some(true),
-        ..Default::default()
-    })
-    .await?;
-
-    Ok(())
-}
-
-/// (#492 sad) Ingress disabled: an Ingress applied while the surface is off
-/// receives no `loadBalancer` status, proving coxswain does not reconcile
-/// Ingress resources when `--disable-ingress` is set.
-///
-/// Positive control: a Gateway from the still-enabled surface reaches
-/// `Accepted=True`, confirming the controller processed the namespace.
-///
-/// At the end the chart default (`controller.ingress.enabled=true`) is
-/// restored so later serial tests run with stock config.
-#[tokio::test]
-async fn ingress_disabled_skips_ingress_reconcile() -> anyhow::Result<()> {
-    let h = Harness::start_with_options(ControllerOptions {
-        ingress_enabled: Some(false),
-        ..Default::default()
-    })
-    .await?;
-
-    // Assert the health endpoint reports the surface as disabled.
-    let health: serde_json::Value = reqwest::get(h.controller_admin_url("/api/v1/health"))
-        .await?
-        .json()
-        .await?;
-    assert_eq!(
-        health["api_surfaces"]["ingress"].as_bool(),
-        Some(false),
-        "api_surfaces.ingress must be false when --disable-ingress is set; got: {health}"
-    );
-    assert_eq!(
-        health["api_surfaces"]["gateway_api"].as_bool(),
-        Some(true),
-        "api_surfaces.gateway_api must remain true; got: {health}"
-    );
-
-    let ns = NamespaceGuard::create(&h.client, "prov-ing-disabled").await?;
-
-    // Apply a Gateway (positive control: proves the controller processed the ns).
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-
-    // Apply an Ingress that would normally be reconciled.
-    fixtures::apply_fixture(ing::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-
-    // Wait for the Gateway to reach Accepted=True — proves the controller ran.
-    wait::wait_for_gateway_condition(
-        &h.client,
-        "coxswain-test",
-        &ns.name,
-        "Accepted",
-        "True",
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    // Negative assertion: the Ingress must carry no loadBalancer status.
-    let ingresses: Api<Ingress> = Api::namespaced(h.client.clone(), &ns.name);
-    let ingress = ingresses.get("echo-ingress").await?;
-    let lb_entries = ingress
-        .status
-        .as_ref()
-        .and_then(|s| s.load_balancer.as_ref())
-        .and_then(|lb| lb.ingress.as_deref())
-        .unwrap_or(&[]);
-    assert!(
-        lb_entries.is_empty(),
-        "Ingress must have no loadBalancer status when ingress surface is disabled, got: {lb_entries:?}"
-    );
-
-    // Restore the chart-default so later serial tests run with stock config.
-    Harness::start_with_options(ControllerOptions {
-        ingress_enabled: Some(true),
-        ..Default::default()
-    })
-    .await?;
-
-    Ok(())
-}
-
 // ── #59 — Multi-namespace watch scope ────────────────────────────────────────
-
-/// #59 — `--watch-namespace=ns1,ns2` scopes the controller's namespaced watches
-/// to exactly the listed namespaces: HTTPRoutes in a listed namespace serve, an
-/// identical HTTPRoute in an *unlisted* namespace is never observed and never
-/// programs.
-///
-/// Global-config mutator (reconfigures the shared controller via
-/// `start_with_options`), so it runs in the serial pass. The three namespaces
-/// are created BEFORE the controller starts (their names feed `watchNamespace`)
-/// and use `create_persistent` so the `start_with_options` bootstrap purge does
-/// not delete them mid-test.
-///
-/// Happy + sad in one test on the shared (expensive) reconfigure: the same
-/// Gateway + HTTPRoute + echo backend is applied to all three namespaces; the
-/// two listed ones must serve (backend identity asserted), the unlisted one must
-/// 404. Waiting for the listed routes to serve first proves the controller has
-/// completed a full reconcile over its watched set — so the unlisted namespace's
-/// 404 is proof of *ignored*, not merely *not-yet-ready*.
-///
-/// At the end the chart default (cluster-wide) is restored so later serial tests
-/// run with stock config.
-#[tokio::test]
-async fn watch_namespace_list_serves_listed_and_ignores_unlisted() -> anyhow::Result<()> {
-    // Namespaces must exist — and their names be known — before the controller
-    // is configured to watch them, so create them on a standalone client first.
-    let bootstrap_client = kube::Client::try_default().await?;
-    let watched_a = NamespaceGuard::create_persistent(&bootstrap_client, "prov-watch-a").await?;
-    let watched_b = NamespaceGuard::create_persistent(&bootstrap_client, "prov-watch-b").await?;
-    let unwatched = NamespaceGuard::create_persistent(&bootstrap_client, "prov-watch-c").await?;
-
-    // Scope the controller to two of the three namespaces.
-    let h = Harness::start_with_options(ControllerOptions {
-        watch_namespace: Some(format!("{},{}", watched_a.name, watched_b.name)),
-        ..Default::default()
-    })
-    .await?;
-
-    // Apply the same Gateway + HTTPRoute + echo backend into all three namespaces.
-    // The `path_matching` fixture derives its hostname from the namespace
-    // (`echo.${TESTNS}.local`), so each namespace gets a distinct host.
-    for ns in [&watched_a, &watched_b, &unwatched] {
-        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-        wait::wait_for_backends(&ns.name).await?;
-        fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-    }
-
-    // Happy path: routes in the two watched namespaces serve. Each shared-mode
-    // Gateway advertises its OWN per-Gateway VIP (#472), so reach it via
-    // `gateway_http` (the fixed Ingress `proxy_addr` behind `h.http` would not
-    // hit a Gateway listener). Confirm backend identity.
-    for ns in [&watched_a, &watched_b] {
-        let host = format!("echo.{}.local", ns.name);
-        let gw = h.gateway_http(&ns.name).await?;
-        wait::wait_for_route_status(&gw, &host, "/a", 200, Duration::from_secs(60)).await?;
-        gw.get(&host, "/a").await?.assert_backend("echo-a");
-    }
-
-    // Sad path: the Gateway in the unlisted namespace is never observed by the
-    // namespace-scoped controller, so it is never reconciled — asserted on the
-    // control plane (a Gateway in an unwatched namespace has no per-Gateway VIP
-    // to serve from, so serving isn't the signal here). The Gateway API admission
-    // webhook injects initial `Accepted/Programmed=Unknown` conditions with
-    // `observedGeneration=None`; coxswain always sets `observedGeneration` when it
-    // writes, so the absence of any condition with `observedGeneration` set proves
-    // coxswain never touched it (the same probe `gateway_api_disabled_*` uses).
-    // The happy-path waits above prove the controller completed a full reconcile
-    // over its watched set, so this is proof of *ignored*, not *not-yet-processed*.
-    let unwatched_gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &unwatched.name);
-    let gw = unwatched_gateways.get("coxswain-test").await?;
-    let conditions = gw
-        .status
-        .as_ref()
-        .and_then(|s| s.conditions.as_deref())
-        .unwrap_or(&[]);
-    let coxswain_reconciled = conditions.iter().any(|c| c.observed_generation.is_some());
-    assert!(
-        !coxswain_reconciled,
-        "Gateway in the unlisted namespace {} must be ignored by the namespace-scoped \
-         controller; initial 'Unknown' conditions from the admission webhook are expected, \
-         but none with observedGeneration set should appear. Got: {conditions:?}",
-        unwatched.name
-    );
-
-    // Restore the chart default (cluster-wide) so later serial tests run stock.
-    Harness::start_with_options(ControllerOptions::default()).await?;
-
-    Ok(())
-}
 
 // ── #497 — Dedicated-proxy autoscaling (HPA + PDB) ───────────────────────────
 
@@ -2434,83 +1369,1170 @@ async fn shared_proxy_pool_provisioned_at_install_without_gateways() -> anyhow::
     Ok(())
 }
 
-/// #604 idempotency (serial mutator): a second `helm upgrade` must not fight the
-/// controller for ownership of the pool. Because the pool objects left the chart,
-/// Helm never manages them — assert no `Helm` field manager appears and the pool
-/// spec does not churn (generation stable) across an upgrade.
-#[tokio::test]
-async fn shared_proxy_pool_survives_helm_upgrade_without_field_manager_fight() -> anyhow::Result<()>
-{
-    let h = Harness::start().await?;
-    let deploys: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
-    let generation_before = deploys.get(SHARED_PROXY_NAME).await?.metadata.generation;
-    drop(h);
+// Tests that mutate the shared Helm release (non-default ControllerOptions /
+// start_with_options) or that need flake-isolation timing must run serially
+// against the whole e2e job -- see `.config/nextest.toml` `test(/serial::/)`.
+mod serial {
+    use super::*;
 
-    // Force a `helm upgrade` with a benign, default-valued override so the pool
-    // spec is unchanged — any generation bump or Helm manager would signal a fight.
-    let h = Harness::start_with_options(ControllerOptions {
-        access_log: Some(true),
-        ..Default::default()
-    })
-    .await?;
-    let deploys: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
-    let after = deploys.get(SHARED_PROXY_NAME).await?;
+    /// Happy path + GC lifecycle: with relay tiering enabled and a threshold of 1, a
+    /// single dedicated Gateway provisions a namespace relay (zero-verb SA, no owner
+    /// ref, namespace-relay component) that becomes Ready — proving its `Namespace`
+    /// subscribe was authorized by provenance end-to-end. Deleting the last dedicated
+    /// Gateway leaves the namespace with no dedicated Gateways, which deactivates the
+    /// relay immediately (a genuinely drained namespace bypasses the cooldown) and
+    /// garbage-collects it.
+    #[tokio::test]
+    async fn namespace_relay_provisioned_and_gcd_over_dedicated_gateway_lifecycle()
+    -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(1),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "relay-ded-provision").await?;
 
-    let managers: Vec<String> = after
-        .metadata
-        .managed_fields
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|f| f.manager.clone())
-        .collect();
-    assert!(
-        managers.iter().any(|m| m == "coxswain-controller"),
-        "pool must remain controller-owned after a helm upgrade; managers={managers:?}"
-    );
-    assert!(
-        !managers.iter().any(|m| m == "Helm"),
-        "helm upgrade must not reclaim the controller-owned pool (no field-manager fight); managers={managers:?}"
-    );
-    assert_eq!(
-        after.metadata.generation, generation_before,
-        "an idempotent helm upgrade must not churn the pool spec (generation stable)"
-    );
+        // A dedicated Gateway (1 desired replica) crosses the threshold of 1.
+        apply_and_wait(&h, &ns).await?;
 
-    Ok(())
-}
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+        let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
 
-/// #604 sad path (serial mutator): with `proxy.shared.enabled=false` the
-/// controller reclaims a previously-provisioned pool rather than orphaning it —
-/// the Deployment and the chart's Ingress LB Service both vanish.
-#[tokio::test]
-async fn shared_proxy_pool_absent_when_disabled() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
+        let relay_deploy =
+            wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
+        wait::wait_for_resource(&services, RELAY_NAME, Duration::from_secs(15)).await?;
+        let relay_sa = wait::wait_for_resource(&sas, RELAY_NAME, Duration::from_secs(15)).await?;
 
-    // Disabling rolls the controller; its install reconcile then deletes the pool.
-    let _controller = ControllerProcess::start_with_options(ControllerOptions {
-        shared_proxy_enabled: Some(false),
-        ..Default::default()
-    })
-    .await?;
+        assert_eq!(
+            relay_sa.automount_service_account_token,
+            Some(false),
+            "relay SA must disable the default token automount (zero-verb identity)"
+        );
+        assert_eq!(
+            relay_deploy
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("app.kubernetes.io/component"))
+                .map(String::as_str),
+            Some("relay-namespace"),
+            "relay carries the relay-namespace component label"
+        );
+        assert!(
+            relay_deploy
+                .metadata
+                .owner_references
+                .as_ref()
+                .is_none_or(|r| r.is_empty()),
+            "a namespace relay is per-namespace and must carry no owner reference"
+        );
 
-    let deploys: Api<Deployment> = Api::namespaced(client.clone(), leader::SYSTEM_NAMESPACE);
-    let svcs: Api<Service> = Api::namespaced(client.clone(), leader::SYSTEM_NAMESPACE);
-    wait::poll_until(
-        Duration::from_secs(60),
-        wait::POLL,
-        || async {
-            "the disabled shared proxy pool Deployment and its LB Service to be reclaimed"
-                .to_string()
-        },
-        || async {
-            let deploy_gone = deploys.get(SHARED_PROXY_NAME).await.is_err();
-            let lb_gone = svcs.get(SHARED_PROXY_NAME).await.is_err();
-            (deploy_gone && lb_gone).then_some(())
-        },
-    )
-    .await?;
+        // Becomes Ready → its Namespace subscribe was authorized (an unauthorized
+        // relay never marks routing_table_loaded, so its pod never goes Ready).
+        wait::poll_until(
+            Duration::from_secs(90),
+            wait::POLL,
+            || async {
+                format!("namespace relay '{RELAY_NAME}' pod Ready (authorized Namespace subscribe)")
+            },
+            || async {
+                let ready = deployments
+                    .get(RELAY_NAME)
+                    .await
+                    .ok()
+                    .and_then(|d| d.status)
+                    .and_then(|s| s.ready_replicas)
+                    .unwrap_or(0);
+                (ready >= 1).then_some(())
+            },
+        )
+        .await?;
 
-    Ok(())
+        // Delete the last dedicated Gateway → namespace drains to zero → GC.
+        let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+        gateways
+            .delete(GATEWAY_NAME, &DeleteParams::default())
+            .await?;
+
+        wait::poll_until(
+            Duration::from_secs(60),
+            wait::POLL,
+            || async {
+                format!(
+                    "namespace relay '{RELAY_NAME}' garbage-collected after the last dedicated Gateway is deleted"
+                )
+            },
+            || async {
+                let gone = deployments.get(RELAY_NAME).await.is_err()
+                    && services.get(RELAY_NAME).await.is_err()
+                    && sas.get(RELAY_NAME).await.is_err();
+                gone.then_some(())
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Sad/negative path — scale-to-zero: relay tiering enabled but with a high
+    /// activation threshold, a dedicated Gateway's subscriber count stays below it, so
+    /// the namespace must stay direct-to-controller with NO relay. Below the threshold
+    /// the control loop's activation check never provisions anything, so the relay's
+    /// absence is a decided "not wanted".
+    #[tokio::test]
+    async fn namespace_relay_not_provisioned_below_threshold() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(100),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "relay-ded-below").await?;
+
+        // The live subscriber count stays far below the activation threshold (100), so
+        // the control loop never provisions a relay for this namespace.
+        apply_and_wait(&h, &ns).await?;
+
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        assert!(
+            deployments.get(RELAY_NAME).await.is_err(),
+            "a below-threshold namespace must stay direct-to-controller (scale-to-zero), \
+             but relay '{RELAY_NAME}' was provisioned"
+        );
+
+        Ok(())
+    }
+
+    /// Happy/transition path (#616) — with a namespace relay `Active` and serving
+    /// (leaves repointed onto it, make-before-break), disabling the relay tier tears
+    /// the relay down and the dedicated proxy repoints its discovery subscribe back to
+    /// the controller, which keeps serving — the make-before-break teardown in
+    /// reverse, the dedicated-tier analogue of
+    /// `shared_pool_repoints_direct_when_relay_disabled`. Before the fix this relay
+    /// would be orphaned forever: `rehydrate_provisioned_relays` skipped the LIST while
+    /// disabled, so the restarted (Helm-upgraded) controller never re-adopted it.
+    #[tokio::test]
+    async fn namespace_relay_gcd_and_traffic_continues_when_relay_disabled() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(1),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "relay-ded-disable").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(dedicated::TRAFFIC, FixtureVars::new(&ns.name)).await?;
+
+        let gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+        wait_for_cut_over(&gateways, GATEWAY_NAME, Duration::from_secs(60)).await?;
+        let dedicated_addr = wait::wait_for_dedicated_proxy_endpoint(
+            &ns.name,
+            GATEWAY_NAME,
+            Duration::from_secs(60),
+        )
+        .await?;
+        let http = HttpClient::new(dedicated_addr)?;
+        let host = format!("dedicated.{}.local", ns.name);
+        wait::wait_for_route(&http, &host, "/", Duration::from_secs(60))
+            .await?
+            .assert_backend("echo-a");
+
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+        let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), &ns.name);
+
+        // Reach Active (Ready) before disabling — leaves are repointed onto it, so the
+        // teardown below exercises the make-before-break StartDrain path.
+        wait::poll_until(
+            Duration::from_secs(90),
+            wait::POLL,
+            || async {
+                format!("namespace relay '{RELAY_NAME}' pod Ready before disabling the tier")
+            },
+            || async {
+                let ready = deployments
+                    .get(RELAY_NAME)
+                    .await
+                    .ok()
+                    .and_then(|d| d.status)
+                    .and_then(|s| s.ready_replicas)
+                    .unwrap_or(0);
+                (ready >= 1).then_some(())
+            },
+        )
+        .await?;
+
+        // Disable the tier → the relay tears down (force-off bypasses the cooldown).
+        set_relay_enabled(false).await?;
+        wait::poll_until(
+            Duration::from_secs(90),
+            wait::POLL,
+            || async {
+                format!(
+                    "namespace relay '{RELAY_NAME}' garbage-collected after the tier is disabled"
+                )
+            },
+            || async {
+                let gone = deployments.get(RELAY_NAME).await.is_err()
+                    && services.get(RELAY_NAME).await.is_err()
+                    && sas.get(RELAY_NAME).await.is_err();
+                gone.then_some(())
+            },
+        )
+        .await?;
+
+        // The dedicated proxy repointed its discovery subscribe back to the controller
+        // and keeps serving the same route — no orphan is left degraded.
+        wait::wait_for_route(&http, &host, "/", Duration::from_secs(60))
+            .await
+            .context("dedicated proxy stopped serving after its relay was disabled and torn down")?
+            .assert_backend("echo-a");
+
+        Ok(())
+    }
+
+    /// Sad/negative path (#616) — the master switch still gates provisioning now that
+    /// the control loop and rehydration run unconditionally: a namespace whose demand
+    /// meets the activation threshold gets NO relay while the tier is disabled.
+    /// Companion to `namespace_relay_not_provisioned_below_threshold` — proves "always
+    /// run the loop" did not regress into "always provision" once the guards were
+    /// removed to fix the orphan-on-disable bug.
+    #[tokio::test]
+    async fn namespace_relay_not_provisioned_when_relay_disabled_despite_demand()
+    -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: false,
+            relay_min_proxy_replicas: Some(1),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "relay-ded-off").await?;
+
+        // The fixture's 1 desired replica meets the threshold (1) — would provision if
+        // the tier were enabled.
+        apply_and_wait(&h, &ns).await?;
+
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        assert!(
+            deployments.get(RELAY_NAME).await.is_err(),
+            "a disabled relay tier must never provision '{RELAY_NAME}', even with demand \
+             at the activation threshold"
+        );
+
+        Ok(())
+    }
+
+    /// Happy path: with relay tiering enabled and a break-even of 1, the shared proxy
+    /// pool (≥1 replica) crosses the threshold, so the controller provisions the single
+    /// shared-pool relay in the install namespace — zero-verb SA, no owner ref,
+    /// relay-shared component, `serve relay --shared` — that becomes Ready. The pool
+    /// keeps serving an Ingress route across the repoint onto the relay.
+    #[tokio::test]
+    async fn shared_relay_provisioned_when_pool_meets_break_even() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(1),
+            ..Default::default()
+        })
+        .await?;
+
+        let deployments: Api<Deployment> =
+            Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+        let services: Api<Service> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+        let sas: Api<ServiceAccount> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+
+        let deploy =
+            wait::wait_for_resource(&deployments, SHARED_RELAY_NAME, Duration::from_secs(60))
+                .await?;
+        wait::wait_for_resource(&services, SHARED_RELAY_NAME, Duration::from_secs(15)).await?;
+        let sa = wait::wait_for_resource(&sas, SHARED_RELAY_NAME, Duration::from_secs(15)).await?;
+
+        assert_eq!(
+            sa.automount_service_account_token,
+            Some(false),
+            "shared relay SA must disable the default token automount (zero-verb identity)"
+        );
+        assert_eq!(
+            deploy
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("app.kubernetes.io/component"))
+                .map(String::as_str),
+            Some("relay-shared"),
+            "shared relay carries the relay-shared component label"
+        );
+        assert!(
+            deploy
+                .metadata
+                .owner_references
+                .as_ref()
+                .is_none_or(|r| r.is_empty()),
+            "the shared relay is install infra and must carry no owner reference"
+        );
+        let args = deploy
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.spec.as_ref())
+            .map(|p| &p.containers[0])
+            .and_then(|c| c.args.clone())
+            .unwrap_or_default();
+        assert!(
+            args.iter().any(|a| a == "--shared"),
+            "shared relay must subscribe --shared: {args:?}"
+        );
+        assert!(
+            !args.iter().any(|a| a.starts_with("--namespace")),
+            "shared relay is pool-scoped and must carry no --namespace: {args:?}"
+        );
+
+        wait_for_shared_relay_ready(&deployments).await?;
+
+        // The pool keeps serving across the repoint onto the shared relay.
+        let ns = NamespaceGuard::create(&h.client, "relay-shared-serve").await?;
+        wait_shared_pool_serves(&h, &ns.name)
+            .await
+            .context("shared pool stopped serving traffic across the shared-relay repoint")?;
+
+        Ok(())
+    }
+
+    /// Sad path — scale-to-zero: relay tiering enabled but with a break-even far above
+    /// the shared pool's replica count, so the controller provisions NO shared relay
+    /// and the pool streams direct from the controller. A short cooldown makes any
+    /// relay left by a prior serial test GC deterministically.
+    #[tokio::test]
+    async fn shared_relay_below_break_even_stays_direct() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(100),
+            relay_cooldown: Some("10s".to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        // The pool serves direct-to-controller.
+        let ns = NamespaceGuard::create(&h.client, "relay-shared-below").await?;
+        wait_shared_pool_serves(&h, &ns.name).await?;
+
+        // No shared relay: a below-break-even pool is a decided "not wanted". Poll so a
+        // relay left Active by a prior serial test tears down (short cooldown) rather
+        // than flaking on stale state.
+        let deployments: Api<Deployment> =
+            Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+        wait::poll_until(
+            Duration::from_secs(60),
+            wait::POLL,
+            || async {
+                format!(
+                    "no shared relay '{SHARED_RELAY_NAME}' below break-even (pool stays direct-to-controller)"
+                )
+            },
+            || async { deployments.get(SHARED_RELAY_NAME).await.is_err().then_some(()) },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Happy/transition: with the shared relay provisioned and serving, disabling the
+    /// relay tier tears the shared relay down and repoints the pool back to the
+    /// controller, which keeps serving — the make-before-break teardown in reverse.
+    #[tokio::test]
+    async fn shared_pool_repoints_direct_when_relay_disabled() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(1),
+            ..Default::default()
+        })
+        .await?;
+
+        let deployments: Api<Deployment> =
+            Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+        wait::wait_for_resource(&deployments, SHARED_RELAY_NAME, Duration::from_secs(60)).await?;
+        wait_for_shared_relay_ready(&deployments).await?;
+
+        let ns = NamespaceGuard::create(&h.client, "relay-shared-revert").await?;
+        let host = wait_shared_pool_serves(&h, &ns.name).await?;
+
+        // Disable the tier → the shared relay tears down (force-off bypasses the cooldown).
+        set_relay_enabled(false).await?;
+        wait::poll_until(
+            Duration::from_secs(90),
+            wait::POLL,
+            || async {
+                format!(
+                    "shared relay '{SHARED_RELAY_NAME}' garbage-collected after the tier is disabled"
+                )
+            },
+            || async {
+                deployments
+                    .get(SHARED_RELAY_NAME)
+                    .await
+                    .is_err()
+                    .then_some(())
+            },
+        )
+        .await?;
+
+        // The pool repointed back to the controller and keeps serving the same route.
+        wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60))
+            .await
+            .context("shared pool stopped serving after the relay was disabled and the pool reverted to the controller")?;
+
+        Ok(())
+    }
+
+    /// Happy path — `enabled: true` forces the relay on even though the break-even
+    /// threshold (set high) would not provision it, and the policy's `replicas` (3) and
+    /// `resources` overrides land on the rendered Deployment.
+    #[tokio::test]
+    async fn relay_policy_force_on_provisions_relay_with_overrides() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(100),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "relay-pol-on").await?;
+        apply_relay_policy(dedicated::RELAY_POLICY_FORCE_ON, &ns.name).await?;
+
+        apply_and_wait(&h, &ns).await?;
+
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        // Forced on despite the threshold of 100, at the policy's replicas override (3),
+        // not the `--relay-replicas` default (2).
+        wait_for_relay_replicas(&deployments, 3).await?;
+
+        // Resources override landed on the relay container.
+        let d = deployments.get(RELAY_NAME).await?;
+        let container = &d
+            .spec
+            .expect("relay spec")
+            .template
+            .spec
+            .expect("relay pod spec")
+            .containers[0];
+        let cpu = container
+            .resources
+            .as_ref()
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|m| m.get("cpu"));
+        assert_eq!(
+            cpu.map(|q| q.0.as_str()),
+            Some("25m"),
+            "policy resources override must land on the relay container"
+        );
+        Ok(())
+    }
+
+    /// Sad/veto path — a relay auto-provisions (threshold met), then an `enabled: false`
+    /// policy vetoes it and the controller garbage-collects the relay, overriding the
+    /// control loop's automatic decision with an explicit operator intent.
+    #[tokio::test]
+    async fn relay_policy_force_off_gcs_provisioned_relay() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(1),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "relay-pol-off").await?;
+
+        apply_and_wait(&h, &ns).await?;
+
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
+        // Auto-provisioned first: threshold of 1 is met and no policy exists yet.
+        wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
+
+        // Force-off vetoes it — the relay control loop resolves the policy on its next
+        // pass, sees `enabled: false`, and tears the relay down (drain then GC).
+        apply_relay_policy(dedicated::RELAY_POLICY_FORCE_OFF, &ns.name).await?;
+        wait::poll_until(
+            Duration::from_secs(60),
+            wait::POLL,
+            || async {
+                format!("relay '{RELAY_NAME}' garbage-collected after an enabled:false policy")
+            },
+            || async {
+                let gone = deployments.get(RELAY_NAME).await.is_err()
+                    && services.get(RELAY_NAME).await.is_err();
+                gone.then_some(())
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Happy path — controller-driven autoscaling sizes the relay from the namespace
+    /// fan-out. With small fan-out the relay sits at the autoscaling floor
+    /// (`minReplicas` 3), distinct from the static `--relay-replicas` default (2),
+    /// proving the autoscaling path set the count — and NO HPA object is ever created.
+    #[tokio::test]
+    async fn relay_policy_autoscaling_sizes_relay_without_hpa() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(100),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "relay-pol-hpa").await?;
+        apply_relay_policy(dedicated::RELAY_POLICY_AUTOSCALING, &ns.name).await?;
+
+        apply_and_wait(&h, &ns).await?;
+
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        wait_for_relay_replicas(&deployments, 3).await?;
+        assert_no_relay_hpa(&h, &ns.name).await?;
+        Ok(())
+    }
+
+    /// Sad path — an autoscaling stanza missing the mandatory `maxReplicas` is refused
+    /// (an uncapped relay would regrow leader fan-out): the controller falls back to the
+    /// static `replicas` (3), not the autoscaling floor (`minReplicas` 2), and no HPA is
+    /// created.
+    #[tokio::test]
+    async fn relay_policy_uncapped_autoscaling_falls_back_to_static() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(100),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "relay-pol-uncapped").await?;
+        apply_relay_policy(dedicated::RELAY_POLICY_AUTOSCALING_UNCAPPED, &ns.name).await?;
+
+        apply_and_wait(&h, &ns).await?;
+
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        wait_for_relay_replicas(&deployments, 3).await?;
+        assert_no_relay_hpa(&h, &ns.name).await?;
+        Ok(())
+    }
+
+    /// Happy path — the #602 behaviour change: a relay whose namespace drops **below**
+    /// break-even but stays at a **nonzero** subscriber count is torn down after the
+    /// cooldown. The old keep-until-fully-drained rule would keep it forever; this
+    /// proves the KEDA-style cooldown deactivation, and that teardown happens while a
+    /// proxy is still connected (make-before-break repoints it back to the controller).
+    #[tokio::test]
+    async fn relay_deactivated_after_cooldown_below_break_even() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            // Break-even 2 so a single remaining subscriber (1) is below it but nonzero.
+            relay_min_proxy_replicas: Some(2),
+            relay_cooldown: Some("5s".to_string()),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "relay-cooldown").await?;
+
+        // The dedicated Gateway's params default to 2 replicas → 2 subscribers ≥ 2.
+        apply_and_wait(&h, &ns).await?;
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
+
+        // Drop to a single subscriber: below break-even (2) but NONZERO.
+        patch_params_replicas(&h.client, &ns.name, "dedicated-params", 1).await?;
+
+        // After the cooldown the relay tears down — even though a proxy is still
+        // connected (the behaviour change: no keep-until-fully-drained).
+        wait::poll_until(
+            Duration::from_secs(90),
+            wait::POLL,
+            || async {
+                format!(
+                    "relay '{RELAY_NAME}' torn down after the cooldown at a NONZERO (below-break-even) \
+                     subscriber count"
+                )
+            },
+            || async { deployments.get(RELAY_NAME).await.is_err().then_some(()) },
+        )
+        .await?;
+
+        // The dedicated proxy is still running (1 replica) — teardown fired at a
+        // nonzero subscriber count, not because the namespace drained to zero.
+        let dedicated_ready = deployments
+            .get(RESOURCE_NAME)
+            .await?
+            .status
+            .and_then(|s| s.ready_replicas)
+            .unwrap_or(0);
+        assert!(
+            dedicated_ready >= 1,
+            "the dedicated proxy must still be running when the relay is torn down \
+             (proves teardown at a nonzero subscriber count, not GC-at-zero)"
+        );
+        Ok(())
+    }
+
+    /// Sad/anti-flap path — a transient subscriber dip must NOT immediately scale the
+    /// relay down: the scale-down stabilization window sizes on the trailing-window
+    /// maximum. The relay holds its higher count for the window, then settles to the
+    /// dip level once the window's peak ages out.
+    #[tokio::test]
+    async fn relay_scale_down_debounced_by_stabilization_window() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(100),
+            relay_scale_down_stabilization: Some("30s".to_string()),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "relay-debounce").await?;
+        // minReplicas 1, target 1 → replica count tracks the live subscriber count.
+        apply_relay_policy(dedicated::RELAY_POLICY_AUTOSCALING_SCALEDOWN, &ns.name).await?;
+        apply_and_wait(&h, &ns).await?;
+
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        // 3 subscribers → 3 relay replicas (proves 3 proxies connected).
+        patch_params_replicas(&h.client, &ns.name, "dedicated-params", 3).await?;
+        wait_for_relay_replicas(&deployments, 3).await?;
+
+        // Drop to 1 subscriber — a scale-DOWN candidate the stabilization window damps.
+        patch_params_replicas(&h.client, &ns.name, "dedicated-params", 1).await?;
+
+        // Within the 30s window the relay must not scale DOWN below 3 (the trailing-
+        // window peak), rather than dropping straight to 1 — the anti-flap guarantee.
+        // (`>= 3`, not `== 3`: a transient upward spike from convergence churn is fine.)
+        assert_relay_not_scaled_below(&deployments, 3, Duration::from_secs(12)).await?;
+
+        // Once the peak ages out of the window, it settles to the dip level (1).
+        wait_for_relay_replicas(&deployments, 1).await?;
+        Ok(())
+    }
+
+    /// Happy/regression path — a relay whose namespace sits just below break-even (a
+    /// live subscriber count under `--relay-min-proxy-replicas`, held within the
+    /// deactivation cooldown so the relay is still running) survives a controller
+    /// restart AND is still garbage-collected once its namespace drains to zero. Under
+    /// #602 rehydration is still load-bearing: without it the restart leaves the running
+    /// relay untracked (no state-machine record), so the control loop — whose
+    /// provision-from-absent branch can only *provision*, never delete — would never
+    /// tear it down even at zero subscribers. Startup rehydration re-adopts the relay as
+    /// `Active`, so the below-break-even/zero-subscriber teardown fires.
+    #[tokio::test]
+    async fn namespace_relay_orphan_gcd_after_controller_restart_in_hysteresis_midrange()
+    -> anyhow::Result<()> {
+        // Threshold 2: the fixture's `replicas: 2` gives 2 subscribers (≥ 2) → relay;
+        // dropping params to `replicas: 1` puts the signal below break-even but nonzero.
+        let opts = || ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(2),
+            ..Default::default()
+        };
+        let h = Harness::start_with_options(opts()).await?;
+        let ns = NamespaceGuard::create_persistent(&h.client, "relay-restart-orphan").await?;
+
+        apply_and_wait(&h, &ns).await?;
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(30)).await?;
+
+        // Drop to 1 subscriber (< threshold 2, nonzero): the default 300s cooldown keeps
+        // the relay running well within the test's runtime — the state the restart must
+        // re-adopt rather than orphan.
+        patch_params_replicas(&h.client, &ns.name, "dedicated-params", 1).await?;
+
+        // Restart the controller (fresh process = empty tracking set pre-fix).
+        drop(h);
+        let h2 = Harness::start_with_options(opts()).await?;
+        // Scrape the LEADER specifically, not an arbitrary Service replica: after a
+        // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
+        // races (#601 CI flake). `wait_for_leader_reconciled` re-resolves the Lease
+        // holder each tick.
+        leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
+
+        // Drain the namespace to zero dedicated Gateways.
+        let gateways: Api<Gateway> = Api::namespaced(h2.client.clone(), &ns.name);
+        gateways
+            .delete(GATEWAY_NAME, &DeleteParams::default())
+            .await?;
+
+        // Rehydration adopted the orphan, so drain-to-zero GCs it. Pre-fix: never.
+        let deployments2: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
+        let services2: Api<Service> = Api::namespaced(h2.client.clone(), &ns.name);
+        let sas2: Api<ServiceAccount> = Api::namespaced(h2.client.clone(), &ns.name);
+        wait::poll_until(
+            Duration::from_secs(90),
+            wait::POLL,
+            || async {
+                format!(
+                    "relay '{RELAY_NAME}' GC'd after a controller restart below break-even, once the \
+                     namespace drained to zero (proves startup rehydration re-adopted the running relay)"
+                )
+            },
+            || async {
+                let gone = deployments2.get(RELAY_NAME).await.is_err()
+                    && services2.get(RELAY_NAME).await.is_err()
+                    && sas2.get(RELAY_NAME).await.is_err();
+                gone.then_some(())
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Sad/companion path — a below-threshold namespace with NO relay stays relay-free
+    /// across a controller restart. Startup rehydration adopts only relay Deployments
+    /// that actually exist (`LIST` by the namespace-relay label), so it can never
+    /// fabricate tracking state and spuriously provision or resurrect a relay — the
+    /// over-reach risk the fix itself introduces.
+    #[tokio::test]
+    async fn namespace_relay_not_provisioned_after_restart_below_threshold() -> anyhow::Result<()> {
+        let opts = || ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(100),
+            ..Default::default()
+        };
+        let h = Harness::start_with_options(opts()).await?;
+        let ns = NamespaceGuard::create_persistent(&h.client, "relay-restart-below").await?;
+
+        // Subscriber count (2) < activation threshold 100 → no relay is ever provisioned.
+        apply_and_wait(&h, &ns).await?;
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        assert!(
+            deployments.get(RELAY_NAME).await.is_err(),
+            "a below-threshold namespace must have no relay '{RELAY_NAME}' before restart"
+        );
+
+        drop(h);
+        let h2 = Harness::start_with_options(opts()).await?;
+        // Scrape the LEADER specifically, not an arbitrary Service replica: after a
+        // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
+        // races (#601 CI flake). `wait_for_leader_reconciled` re-resolves the Lease
+        // holder each tick.
+        leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
+
+        let deployments2: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
+        assert!(
+            deployments2.get(RELAY_NAME).await.is_err(),
+            "rehydration must not provision relay '{RELAY_NAME}' for a below-threshold namespace \
+             after a controller restart (it adopts only existing relay Deployments)"
+        );
+        Ok(())
+    }
+
+    /// (#492 sad) Gateway API disabled: a Gateway applied while the surface is off
+    /// receives no status conditions, proving coxswain does not reconcile Gateway
+    /// API resources when `--disable-gateway-api` is set.
+    ///
+    /// Positive control: an Ingress from the still-enabled surface gets its
+    /// `loadBalancer` IP, confirming the controller processed the namespace and had
+    /// every opportunity to (wrongly) reconcile the Gateway.
+    ///
+    /// At the end the chart default (`controller.gatewayApi.enabled=true`) is
+    /// restored so later serial tests run with stock config.
+    #[tokio::test]
+    async fn gateway_api_disabled_skips_gateway_reconcile() -> anyhow::Result<()> {
+        const STATUS_IP: &str = "203.0.113.81";
+        let h = Harness::start_with_options(ControllerOptions {
+            gateway_api_enabled: Some(false),
+            status_address: Some(STATUS_IP.to_string()),
+            ..Default::default()
+        })
+        .await?;
+
+        // Assert the health endpoint reports the surface as disabled.
+        let health: serde_json::Value = reqwest::get(h.controller_admin_url("/api/v1/health"))
+            .await?
+            .json()
+            .await?;
+        assert_eq!(
+            health["api_surfaces"]["gateway_api"].as_bool(),
+            Some(false),
+            "api_surfaces.gateway_api must be false when --disable-gateway-api is set; got: {health}"
+        );
+        assert_eq!(
+            health["api_surfaces"]["ingress"].as_bool(),
+            Some(true),
+            "api_surfaces.ingress must remain true; got: {health}"
+        );
+
+        let ns = NamespaceGuard::create(&h.client, "prov-gw-disabled").await?;
+
+        // Apply an Ingress (positive control: proves the controller processed the ns).
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(ing::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+        // Apply a Gateway that would normally be reconciled.
+        fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+        // Wait for the Ingress to get an LB IP — proves the controller ran and had
+        // time to reconcile the Gateway if it were going to.
+        wait::wait_for_ingress_lb_ip(
+            &h.client,
+            "echo-ingress",
+            &ns.name,
+            STATUS_IP,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        // Regression guard for #550 (and the identical prior fixes for `auth-jwt`/
+        // `ext-auth`): the `Compression` CR reflector must be spawned always-on,
+        // not only inside the gateway-api-gated reflector set — otherwise the
+        // Ingress `compression` annotation is permanently unresolvable on an
+        // Ingress-only install. Apply a `compression`-referencing Ingress here,
+        // under `--disable-gateway-api`, and prove it still resolves and compresses.
+        //
+        // The route can become routable (via the Ingress reflector) slightly
+        // before the just-restarted controller's Compression reflector finishes
+        // its initial sync, so poll for the compressed response rather than
+        // asserting on the first request after `wait_for_route`.
+        fixtures::apply_fixture(ing::ANNOTATION_COMPRESSION_GZIP, FixtureVars::new(&ns.name))
+            .await?;
+        let compression_host = format!("compression-gzip.{}.local", ns.name);
+        wait::wait_for_route(&h.http, &compression_host, "/", Duration::from_secs(60)).await?;
+        wait::poll_until(
+            Duration::from_secs(60),
+            wait::POLL,
+            || async {
+                format!(
+                    "compression annotation to resolve and apply at {compression_host} \
+                     even with gateway-api disabled (Compression CR store must be \
+                     spawned always-on, not gateway-api-gated)"
+                )
+            },
+            || async {
+                let (_, resp_headers, _) = h
+                    .http
+                    .get_full_raw(&compression_host, "/", &[("Accept-Encoding", "gzip")])
+                    .await
+                    .ok()?;
+                (resp_headers
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    == Some("gzip"))
+                .then_some(())
+            },
+        )
+        .await?;
+
+        // Regression guard for #551 (identical fix, same rationale, for `RetryPolicy`):
+        // the CR reflector must be spawned always-on, not only inside the
+        // gateway-api-gated reflector set — otherwise the Ingress `retry` annotation
+        // is permanently unresolvable (and its health check permanently unregistered,
+        // crash-looping the controller) on an Ingress-only install. Apply a
+        // `retry`-referencing Ingress over go-httpbin here, under
+        // `--disable-gateway-api`, and prove the retry loop actually fires.
+        fixtures::apply_fixture(backends::GO_HTTPBIN, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_deployments(&ns.name, &["go-httpbin"]).await?;
+        fixtures::apply_fixture(ing::ANNOTATION_RETRY_CODES, FixtureVars::new(&ns.name)).await?;
+        let retry_host = format!("ingretry.{}.local", ns.name);
+        let proxy = h.http.proxy_addr;
+        wait::poll_until(
+            Duration::from_secs(60),
+            wait::POLL,
+            || async { format!("{retry_host} route live (go-httpbin 200)") },
+            || async { (raw_status(proxy, &retry_host, "/status/200").await == 200).then_some(()) },
+        )
+        .await?;
+        let before = retry_count(&h, &ns.name, "http-code").await;
+        // The route can become routable (via the Ingress reflector) slightly before
+        // the just-restarted controller's RetryPolicy reflector finishes its initial
+        // sync, so re-drive the always-503 request inside the poll rather than
+        // asserting on a single attempt right after the route goes live.
+        wait::poll_until(
+            Duration::from_secs(60),
+            wait::POLL,
+            || async {
+                format!(
+                    "retry annotation to resolve and retry at {retry_host} even with \
+                     gateway-api disabled (RetryPolicy CR store must be spawned \
+                     always-on, not gateway-api-gated)"
+                )
+            },
+            || async {
+                let _ = raw_status(proxy, &retry_host, "/status/503").await;
+                (retry_count(&h, &ns.name, "http-code").await > before).then_some(())
+            },
+        )
+        .await?;
+
+        // Negative assertion: the Gateway must NOT be reconciled by coxswain.
+        // The Gateway API admission webhook injects Accepted=Unknown / Programmed=Unknown
+        // conditions with observedGeneration=None at object creation time ("Waiting for
+        // controller"). Coxswain always sets observedGeneration when it writes conditions,
+        // so the absence of any condition with observedGeneration.is_some() proves it
+        // never touched the Gateway.
+        let gateways_api: Api<Gateway> = Api::namespaced(h.client.clone(), &ns.name);
+        let gw = gateways_api.get("coxswain-test").await?;
+        let conditions = gw
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_deref())
+            .unwrap_or(&[]);
+        let coxswain_reconciled = conditions.iter().any(|c| c.observed_generation.is_some());
+        assert!(
+            !coxswain_reconciled,
+            "Gateway must not be reconciled by coxswain when gateway-api surface is disabled; \
+             initial 'Unknown' conditions from the Gateway API admission webhook are expected, \
+             but none with observedGeneration set should appear. Got: {conditions:?}"
+        );
+
+        // Restore the chart-default so later serial tests run with stock config.
+        Harness::start_with_options(ControllerOptions {
+            gateway_api_enabled: Some(true),
+            ..Default::default()
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// (#492 sad) Ingress disabled: an Ingress applied while the surface is off
+    /// receives no `loadBalancer` status, proving coxswain does not reconcile
+    /// Ingress resources when `--disable-ingress` is set.
+    ///
+    /// Positive control: a Gateway from the still-enabled surface reaches
+    /// `Accepted=True`, confirming the controller processed the namespace.
+    ///
+    /// At the end the chart default (`controller.ingress.enabled=true`) is
+    /// restored so later serial tests run with stock config.
+    #[tokio::test]
+    async fn ingress_disabled_skips_ingress_reconcile() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            ingress_enabled: Some(false),
+            ..Default::default()
+        })
+        .await?;
+
+        // Assert the health endpoint reports the surface as disabled.
+        let health: serde_json::Value = reqwest::get(h.controller_admin_url("/api/v1/health"))
+            .await?
+            .json()
+            .await?;
+        assert_eq!(
+            health["api_surfaces"]["ingress"].as_bool(),
+            Some(false),
+            "api_surfaces.ingress must be false when --disable-ingress is set; got: {health}"
+        );
+        assert_eq!(
+            health["api_surfaces"]["gateway_api"].as_bool(),
+            Some(true),
+            "api_surfaces.gateway_api must remain true; got: {health}"
+        );
+
+        let ns = NamespaceGuard::create(&h.client, "prov-ing-disabled").await?;
+
+        // Apply a Gateway (positive control: proves the controller processed the ns).
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+        // Apply an Ingress that would normally be reconciled.
+        fixtures::apply_fixture(ing::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+        // Wait for the Gateway to reach Accepted=True — proves the controller ran.
+        wait::wait_for_gateway_condition(
+            &h.client,
+            "coxswain-test",
+            &ns.name,
+            "Accepted",
+            "True",
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        // Negative assertion: the Ingress must carry no loadBalancer status.
+        let ingresses: Api<Ingress> = Api::namespaced(h.client.clone(), &ns.name);
+        let ingress = ingresses.get("echo-ingress").await?;
+        let lb_entries = ingress
+            .status
+            .as_ref()
+            .and_then(|s| s.load_balancer.as_ref())
+            .and_then(|lb| lb.ingress.as_deref())
+            .unwrap_or(&[]);
+        assert!(
+            lb_entries.is_empty(),
+            "Ingress must have no loadBalancer status when ingress surface is disabled, got: {lb_entries:?}"
+        );
+
+        // Restore the chart-default so later serial tests run with stock config.
+        Harness::start_with_options(ControllerOptions {
+            ingress_enabled: Some(true),
+            ..Default::default()
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    /// #59 — `--watch-namespace=ns1,ns2` scopes the controller's namespaced watches
+    /// to exactly the listed namespaces: HTTPRoutes in a listed namespace serve, an
+    /// identical HTTPRoute in an *unlisted* namespace is never observed and never
+    /// programs.
+    ///
+    /// Global-config mutator (reconfigures the shared controller via
+    /// `start_with_options`), so it runs in the serial pass. The three namespaces
+    /// are created BEFORE the controller starts (their names feed `watchNamespace`)
+    /// and use `create_persistent` so the `start_with_options` bootstrap purge does
+    /// not delete them mid-test.
+    ///
+    /// Happy + sad in one test on the shared (expensive) reconfigure: the same
+    /// Gateway + HTTPRoute + echo backend is applied to all three namespaces; the
+    /// two listed ones must serve (backend identity asserted), the unlisted one must
+    /// 404. Waiting for the listed routes to serve first proves the controller has
+    /// completed a full reconcile over its watched set — so the unlisted namespace's
+    /// 404 is proof of *ignored*, not merely *not-yet-ready*.
+    ///
+    /// At the end the chart default (cluster-wide) is restored so later serial tests
+    /// run with stock config.
+    #[tokio::test]
+    async fn watch_namespace_list_serves_listed_and_ignores_unlisted() -> anyhow::Result<()> {
+        // Namespaces must exist — and their names be known — before the controller
+        // is configured to watch them, so create them on a standalone client first.
+        let bootstrap_client = kube::Client::try_default().await?;
+        let watched_a =
+            NamespaceGuard::create_persistent(&bootstrap_client, "prov-watch-a").await?;
+        let watched_b =
+            NamespaceGuard::create_persistent(&bootstrap_client, "prov-watch-b").await?;
+        let unwatched =
+            NamespaceGuard::create_persistent(&bootstrap_client, "prov-watch-c").await?;
+
+        // Scope the controller to two of the three namespaces.
+        let h = Harness::start_with_options(ControllerOptions {
+            watch_namespace: Some(format!("{},{}", watched_a.name, watched_b.name)),
+            ..Default::default()
+        })
+        .await?;
+
+        // Apply the same Gateway + HTTPRoute + echo backend into all three namespaces.
+        // The `path_matching` fixture derives its hostname from the namespace
+        // (`echo.${TESTNS}.local`), so each namespace gets a distinct host.
+        for ns in [&watched_a, &watched_b, &unwatched] {
+            fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+            wait::wait_for_backends(&ns.name).await?;
+            fixtures::apply_fixture(gwa::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+        }
+
+        // Happy path: routes in the two watched namespaces serve. Each shared-mode
+        // Gateway advertises its OWN per-Gateway VIP (#472), so reach it via
+        // `gateway_http` (the fixed Ingress `proxy_addr` behind `h.http` would not
+        // hit a Gateway listener). Confirm backend identity.
+        for ns in [&watched_a, &watched_b] {
+            let host = format!("echo.{}.local", ns.name);
+            let gw = h.gateway_http(&ns.name).await?;
+            wait::wait_for_route_status(&gw, &host, "/a", 200, Duration::from_secs(60)).await?;
+            gw.get(&host, "/a").await?.assert_backend("echo-a");
+        }
+
+        // Sad path: the Gateway in the unlisted namespace is never observed by the
+        // namespace-scoped controller, so it is never reconciled — asserted on the
+        // control plane (a Gateway in an unwatched namespace has no per-Gateway VIP
+        // to serve from, so serving isn't the signal here). The Gateway API admission
+        // webhook injects initial `Accepted/Programmed=Unknown` conditions with
+        // `observedGeneration=None`; coxswain always sets `observedGeneration` when it
+        // writes, so the absence of any condition with `observedGeneration` set proves
+        // coxswain never touched it (the same probe `gateway_api_disabled_*` uses).
+        // The happy-path waits above prove the controller completed a full reconcile
+        // over its watched set, so this is proof of *ignored*, not *not-yet-processed*.
+        let unwatched_gateways: Api<Gateway> = Api::namespaced(h.client.clone(), &unwatched.name);
+        let gw = unwatched_gateways.get("coxswain-test").await?;
+        let conditions = gw
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_deref())
+            .unwrap_or(&[]);
+        let coxswain_reconciled = conditions.iter().any(|c| c.observed_generation.is_some());
+        assert!(
+            !coxswain_reconciled,
+            "Gateway in the unlisted namespace {} must be ignored by the namespace-scoped \
+             controller; initial 'Unknown' conditions from the admission webhook are expected, \
+             but none with observedGeneration set should appear. Got: {conditions:?}",
+            unwatched.name
+        );
+
+        // Restore the chart default (cluster-wide) so later serial tests run stock.
+        Harness::start_with_options(ControllerOptions::default()).await?;
+
+        Ok(())
+    }
+
+    /// #604 idempotency (serial mutator): a second `helm upgrade` must not fight the
+    /// controller for ownership of the pool. Because the pool objects left the chart,
+    /// Helm never manages them — assert no `Helm` field manager appears and the pool
+    /// spec does not churn (generation stable) across an upgrade.
+    #[tokio::test]
+    async fn shared_proxy_pool_survives_helm_upgrade_without_field_manager_fight()
+    -> anyhow::Result<()> {
+        let h = Harness::start().await?;
+        let deploys: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+        let generation_before = deploys.get(SHARED_PROXY_NAME).await?.metadata.generation;
+        drop(h);
+
+        // Force a `helm upgrade` with a benign, default-valued override so the pool
+        // spec is unchanged — any generation bump or Helm manager would signal a fight.
+        let h = Harness::start_with_options(ControllerOptions {
+            access_log: Some(true),
+            ..Default::default()
+        })
+        .await?;
+        let deploys: Api<Deployment> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+        let after = deploys.get(SHARED_PROXY_NAME).await?;
+
+        let managers: Vec<String> = after
+            .metadata
+            .managed_fields
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|f| f.manager.clone())
+            .collect();
+        assert!(
+            managers.iter().any(|m| m == "coxswain-controller"),
+            "pool must remain controller-owned after a helm upgrade; managers={managers:?}"
+        );
+        assert!(
+            !managers.iter().any(|m| m == "Helm"),
+            "helm upgrade must not reclaim the controller-owned pool (no field-manager fight); managers={managers:?}"
+        );
+        assert_eq!(
+            after.metadata.generation, generation_before,
+            "an idempotent helm upgrade must not churn the pool spec (generation stable)"
+        );
+
+        Ok(())
+    }
+
+    /// #604 sad path (serial mutator): with `proxy.shared.enabled=false` the
+    /// controller reclaims a previously-provisioned pool rather than orphaning it —
+    /// the Deployment and the chart's Ingress LB Service both vanish.
+    #[tokio::test]
+    async fn shared_proxy_pool_absent_when_disabled() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+
+        // Disabling rolls the controller; its install reconcile then deletes the pool.
+        let _controller = ControllerProcess::start_with_options(ControllerOptions {
+            shared_proxy_enabled: Some(false),
+            ..Default::default()
+        })
+        .await?;
+
+        let deploys: Api<Deployment> = Api::namespaced(client.clone(), leader::SYSTEM_NAMESPACE);
+        let svcs: Api<Service> = Api::namespaced(client.clone(), leader::SYSTEM_NAMESPACE);
+        wait::poll_until(
+            Duration::from_secs(60),
+            wait::POLL,
+            || async {
+                "the disabled shared proxy pool Deployment and its LB Service to be reclaimed"
+                    .to_string()
+            },
+            || async {
+                let deploy_gone = deploys.get(SHARED_PROXY_NAME).await.is_err();
+                let lb_gone = svcs.get(SHARED_PROXY_NAME).await.is_err();
+                (deploy_gone && lb_gone).then_some(())
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
 }

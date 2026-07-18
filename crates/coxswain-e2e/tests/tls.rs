@@ -225,223 +225,6 @@ async fn cert_manager_ingress_provisioning() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Verifies the HTTP-01 ACME challenge passthrough end-to-end (#184):
-/// 1. Pebble (a test ACME server) runs in the test namespace.
-/// 2. An `Ingress` with a cert-manager `Issuer` annotation triggers an HTTP-01 Order.
-/// 3. cert-manager creates a temporary solver `Ingress` (copying `ingressClassName`);
-///    Coxswain picks it up and routes `/.well-known/acme-challenge/<token>` to the
-///    cert-manager solver pod.
-/// 4. Pebble validates the challenge by connecting to the proxy FQDN on port 80 — the
-///    FQDN resolves via cluster DNS to the proxy's ClusterIP, so no external DNS is needed.
-/// 5. cert-manager creates the `kubernetes.io/tls` Secret and deletes the solver `Ingress`.
-/// 6. Coxswain serves TLS using the Pebble-issued certificate.
-///
-/// `--status-address` is a hard requirement: Coxswain only patches
-/// `Ingress.status.loadBalancer` when a status address is configured (the
-/// reconciler returns early and writes nothing when it is absent). cert-manager's
-/// HTTP-01 controller waits for `Ingress.status.loadBalancer.ingress` to be
-/// populated before presenting the challenge to Pebble. Here `status_address` is
-/// the proxy's in-cluster FQDN; Pebble resolves it via cluster DNS.
-#[tokio::test]
-async fn cert_manager_http01_challenge_issues_and_serves_certificate() -> anyhow::Result<()> {
-    // The proxy's in-cluster FQDN serves three roles simultaneously:
-    //   • the Ingress `host` / TLS SNI name (what we request)
-    //   • the `status_address` Coxswain writes into Ingress.status (hostname form)
-    //   • the domain Pebble resolves via cluster DNS to reach the challenge endpoint
-    const PROXY_FQDN: &str = "coxswain-shared-proxy.coxswain-system.svc.cluster.local";
-
-    let h = Harness::start_with_options(ControllerOptions {
-        status_address: Some(PROXY_FQDN.to_string()),
-        ..Default::default()
-    })
-    .await?;
-    let ns = NamespaceGuard::create(&h.client, "tls-ing-acme-h1").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-
-    // Generate a self-signed cert whose SAN is Pebble's in-cluster DNS name.
-    // The same PEM is used as the cert-manager Issuer's caBundle, so cert-manager
-    // trusts Pebble's ACME directory TLS endpoint without a cluster-wide CA change.
-    let pebble_sni = format!("pebble.{}.svc.cluster.local", ns.name);
-    let pebble_cert = GeneratedCert::for_host(&pebble_sni);
-
-    fixtures::apply_fixture(
-        ingress::ACME_PEBBLE,
-        FixtureVars::new(&ns.name)
-            .with("PEBBLE_CERT_B64", pebble_cert.cert_b64())
-            .with("PEBBLE_KEY_B64", pebble_cert.key_b64()),
-    )
-    .await?;
-    wait::wait_for_deployments(&ns.name, &["pebble"]).await?;
-
-    let secret_name = "acme-http01-tls";
-    fixtures::apply_fixture(
-        ingress::ACME_HTTP01_INGRESS,
-        FixtureVars::new(&ns.name)
-            .with("PROXY_FQDN", PROXY_FQDN)
-            .with("PEBBLE_CA_B64", pebble_cert.cert_b64())
-            .with("SECRET_NAME", secret_name)
-            .with("BACKEND_NAME", "echo-a"),
-    )
-    .await?;
-
-    // Wait for cert-manager to complete the HTTP-01 flow through Coxswain.
-    // Full chain: Issuer registers with Pebble → Order → Challenge → solver Ingress
-    // (ingressClassName: coxswain) → Coxswain routes /.well-known/acme-challenge/<token>
-    // → cert-manager solver pod → Pebble validates via proxy FQDN → Secret created.
-    wait::wait_for_tls_secret(&h.client, secret_name, &ns.name, Duration::from_secs(180)).await?;
-
-    // Coxswain picks up the Secret via its Secret watch; wait for HTTPS to become live.
-    let resp =
-        wait::wait_for_https_route(h.tls_addr, PROXY_FQDN, "/", Duration::from_secs(60)).await?;
-    resp.assert_backend("echo-a");
-
-    // Negative: cert-manager deletes the solver Ingress after issuance.
-    // The challenge path now falls through to the parent Ingress's `/` Prefix rule
-    // (echo-a) — confirming the solver route was removed and did not leak.
-    let (status, body) =
-        http::https_get(PROXY_FQDN, "/.well-known/acme-challenge/probe", h.tls_addr).await?;
-    assert_eq!(
-        status, 200,
-        "expected 200 from parent Ingress after solver Ingress cleanup; got {status}"
-    );
-    body.expect("expected echo-a JSON body on challenge path after solver cleanup")
-        .assert_backend("echo-a");
-
-    Ok(())
-}
-
-/// Verifies PROXY protocol v1 on the plain-HTTP listener:
-/// - Controller started with --proxy-accept-proxy-protocol and 127.0.0.1/32 trusted.
-/// - Raw TCP connection sends "PROXY TCP4 198.51.100.42 ... \r\n" then HTTP/1.1 GET.
-/// - Echo response must include a `forwarded` header with `for="198.51.100.42:12345"`.
-#[tokio::test]
-async fn proxy_protocol_http_v1_forwarded() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "pp-http-v1").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("ingress.{}.local", ns.name);
-
-    // Send PROXY v1 header + HTTP/1.1 request over raw TCP.
-    let proxy_line = "PROXY TCP4 198.51.100.42 10.0.0.1 12345 80\r\n";
-    let http_req = format!("GET /a HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-
-    // Retry until the route is live (controller may still be syncing).
-    let body = wait_for_proxy_v1_route(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    let echo: serde_json::Value = serde_json::from_str(&body)?;
-    // echo-basic returns headers as Title-Case keys with array values.
-    let forwarded = echo["headers"]["Forwarded"][0]
-        .as_str()
-        .unwrap_or_default()
-        .to_lowercase();
-    assert!(
-        forwarded.contains("198.51.100.42") && forwarded.contains("12345"),
-        "expected forwarded header with 198.51.100.42:12345, got: {forwarded}"
-    );
-    assert!(
-        forwarded.contains("proto=http"),
-        "expected proto=http in forwarded, got: {forwarded}"
-    );
-
-    Ok(())
-}
-
-/// Verifies PROXY protocol v2 on the HTTPS listener:
-/// - Raw TCP sends a v2 binary header (AF_INET, src=192.0.2.7:54321), then TLS handshake.
-/// - Echo response must include `forwarded: for="192.0.2.7:54321";proto=https`.
-#[tokio::test]
-async fn proxy_protocol_https_v2_forwarded() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "pp-https-v2").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-
-    let host = format!("tls-pp.{}.local", ns.name);
-    let cert = GeneratedCert::for_host(&host);
-
-    fixtures::apply_fixture(
-        ingress::TLS_TERMINATION,
-        FixtureVars::new(&ns.name)
-            .with("INGRESS_NAME", "pp-ingress")
-            .with("SECRET_NAME", "pp-cert")
-            .with("TLS_HOST", &host)
-            .with("BACKEND_NAME", "echo-a")
-            .with("TLS_CRT_B64", cert.cert_b64())
-            .with("TLS_KEY_B64", cert.key_b64()),
-    )
-    .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    // Build PROXY v2 binary header: src=192.0.2.7:54321, dst=10.0.0.1:443
-    let mut v2_header = Vec::with_capacity(28);
-    v2_header.extend_from_slice(b"\r\n\r\n\0\r\nQUIT\n"); // 12-byte signature
-    v2_header.push(0x21); // version 2, command PROXY
-    v2_header.push(0x11); // AF_INET, STREAM
-    v2_header.extend_from_slice(&12u16.to_be_bytes()); // address block length
-    v2_header.extend_from_slice(&[192, 0, 2, 7]); // src IP 192.0.2.7
-    v2_header.extend_from_slice(&[10, 0, 0, 1]); // dst IP 10.0.0.1
-    v2_header.extend_from_slice(&54321u16.to_be_bytes()); // src port
-    v2_header.extend_from_slice(&443u16.to_be_bytes()); // dst port
-
-    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-
-    let body = wait_for_proxy_v2_tls_route(
-        controller.tls_addr,
-        &host,
-        &v2_header,
-        &http_req,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    let echo: serde_json::Value = serde_json::from_str(&body)?;
-    // echo-basic returns headers as Title-Case keys with array values.
-    let forwarded = echo["headers"]["Forwarded"][0]
-        .as_str()
-        .unwrap_or_default()
-        .to_lowercase();
-    assert!(
-        forwarded.contains("192.0.2.7") && forwarded.contains("54321"),
-        "expected forwarded header with 192.0.2.7:54321, got: {forwarded}"
-    );
-    assert!(
-        forwarded.contains("proto=https"),
-        "expected proto=https in forwarded, got: {forwarded}"
-    );
-
-    Ok(())
-}
-
 // `proxy_protocol_strict_drop` removed: the trusted-sources enforcement logic
 // (accept-only-from-CIDR, drop-plain-HTTP-from-trusted-source) is covered by
 // unit tests in `coxswain-proxy` against the CIDR matcher and PROXY-protocol
@@ -4447,4 +4230,229 @@ async fn try_tls_passthrough(
         .split_once("\r\n\r\n")
         .map(|(_, body)| body.to_string())
         .unwrap_or_default())
+}
+
+// Tests that mutate the shared Helm release (non-default ControllerOptions /
+// start_with_options) or that need flake-isolation timing must run serially
+// against the whole e2e job — see `.config/nextest.toml` `test(/serial::/)`.
+mod serial {
+    use super::*;
+
+    /// Verifies the HTTP-01 ACME challenge passthrough end-to-end (#184):
+    /// 1. Pebble (a test ACME server) runs in the test namespace.
+    /// 2. An `Ingress` with a cert-manager `Issuer` annotation triggers an HTTP-01 Order.
+    /// 3. cert-manager creates a temporary solver `Ingress` (copying `ingressClassName`);
+    ///    Coxswain picks it up and routes `/.well-known/acme-challenge/<token>` to the
+    ///    cert-manager solver pod.
+    /// 4. Pebble validates the challenge by connecting to the proxy FQDN on port 80 — the
+    ///    FQDN resolves via cluster DNS to the proxy's ClusterIP, so no external DNS is needed.
+    /// 5. cert-manager creates the `kubernetes.io/tls` Secret and deletes the solver `Ingress`.
+    /// 6. Coxswain serves TLS using the Pebble-issued certificate.
+    ///
+    /// `--status-address` is a hard requirement: Coxswain only patches
+    /// `Ingress.status.loadBalancer` when a status address is configured (the
+    /// reconciler returns early and writes nothing when it is absent). cert-manager's
+    /// HTTP-01 controller waits for `Ingress.status.loadBalancer.ingress` to be
+    /// populated before presenting the challenge to Pebble. Here `status_address` is
+    /// the proxy's in-cluster FQDN; Pebble resolves it via cluster DNS.
+    #[tokio::test]
+    async fn cert_manager_http01_challenge_issues_and_serves_certificate() -> anyhow::Result<()> {
+        // The proxy's in-cluster FQDN serves three roles simultaneously:
+        //   • the Ingress `host` / TLS SNI name (what we request)
+        //   • the `status_address` Coxswain writes into Ingress.status (hostname form)
+        //   • the domain Pebble resolves via cluster DNS to reach the challenge endpoint
+        const PROXY_FQDN: &str = "coxswain-shared-proxy.coxswain-system.svc.cluster.local";
+
+        let h = Harness::start_with_options(ControllerOptions {
+            status_address: Some(PROXY_FQDN.to_string()),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "tls-ing-acme-h1").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+
+        // Generate a self-signed cert whose SAN is Pebble's in-cluster DNS name.
+        // The same PEM is used as the cert-manager Issuer's caBundle, so cert-manager
+        // trusts Pebble's ACME directory TLS endpoint without a cluster-wide CA change.
+        let pebble_sni = format!("pebble.{}.svc.cluster.local", ns.name);
+        let pebble_cert = GeneratedCert::for_host(&pebble_sni);
+
+        fixtures::apply_fixture(
+            ingress::ACME_PEBBLE,
+            FixtureVars::new(&ns.name)
+                .with("PEBBLE_CERT_B64", pebble_cert.cert_b64())
+                .with("PEBBLE_KEY_B64", pebble_cert.key_b64()),
+        )
+        .await?;
+        wait::wait_for_deployments(&ns.name, &["pebble"]).await?;
+
+        let secret_name = "acme-http01-tls";
+        fixtures::apply_fixture(
+            ingress::ACME_HTTP01_INGRESS,
+            FixtureVars::new(&ns.name)
+                .with("PROXY_FQDN", PROXY_FQDN)
+                .with("PEBBLE_CA_B64", pebble_cert.cert_b64())
+                .with("SECRET_NAME", secret_name)
+                .with("BACKEND_NAME", "echo-a"),
+        )
+        .await?;
+
+        // Wait for cert-manager to complete the HTTP-01 flow through Coxswain.
+        // Full chain: Issuer registers with Pebble → Order → Challenge → solver Ingress
+        // (ingressClassName: coxswain) → Coxswain routes /.well-known/acme-challenge/<token>
+        // → cert-manager solver pod → Pebble validates via proxy FQDN → Secret created.
+        wait::wait_for_tls_secret(&h.client, secret_name, &ns.name, Duration::from_secs(180))
+            .await?;
+
+        // Coxswain picks up the Secret via its Secret watch; wait for HTTPS to become live.
+        let resp = wait::wait_for_https_route(h.tls_addr, PROXY_FQDN, "/", Duration::from_secs(60))
+            .await?;
+        resp.assert_backend("echo-a");
+
+        // Negative: cert-manager deletes the solver Ingress after issuance.
+        // The challenge path now falls through to the parent Ingress's `/` Prefix rule
+        // (echo-a) — confirming the solver route was removed and did not leak.
+        let (status, body) =
+            http::https_get(PROXY_FQDN, "/.well-known/acme-challenge/probe", h.tls_addr).await?;
+        assert_eq!(
+            status, 200,
+            "expected 200 from parent Ingress after solver Ingress cleanup; got {status}"
+        );
+        body.expect("expected echo-a JSON body on challenge path after solver cleanup")
+            .assert_backend("echo-a");
+
+        Ok(())
+    }
+
+    /// Verifies PROXY protocol v1 on the plain-HTTP listener:
+    /// - Controller started with --proxy-accept-proxy-protocol and 127.0.0.1/32 trusted.
+    /// - Raw TCP connection sends "PROXY TCP4 198.51.100.42 ... \r\n" then HTTP/1.1 GET.
+    /// - Echo response must include a `forwarded` header with `for="198.51.100.42:12345"`.
+    #[tokio::test]
+    async fn proxy_protocol_http_v1_forwarded() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "pp-http-v1").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("ingress.{}.local", ns.name);
+
+        // Send PROXY v1 header + HTTP/1.1 request over raw TCP.
+        let proxy_line = "PROXY TCP4 198.51.100.42 10.0.0.1 12345 80\r\n";
+        let http_req = format!("GET /a HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+        // Retry until the route is live (controller may still be syncing).
+        let body = wait_for_proxy_v1_route(
+            controller.proxy_addr,
+            proxy_line,
+            &http_req,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        let echo: serde_json::Value = serde_json::from_str(&body)?;
+        // echo-basic returns headers as Title-Case keys with array values.
+        let forwarded = echo["headers"]["Forwarded"][0]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(
+            forwarded.contains("198.51.100.42") && forwarded.contains("12345"),
+            "expected forwarded header with 198.51.100.42:12345, got: {forwarded}"
+        );
+        assert!(
+            forwarded.contains("proto=http"),
+            "expected proto=http in forwarded, got: {forwarded}"
+        );
+
+        Ok(())
+    }
+
+    /// Verifies PROXY protocol v2 on the HTTPS listener:
+    /// - Raw TCP sends a v2 binary header (AF_INET, src=192.0.2.7:54321), then TLS handshake.
+    /// - Echo response must include `forwarded: for="192.0.2.7:54321";proto=https`.
+    #[tokio::test]
+    async fn proxy_protocol_https_v2_forwarded() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "pp-https-v2").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+
+        let host = format!("tls-pp.{}.local", ns.name);
+        let cert = GeneratedCert::for_host(&host);
+
+        fixtures::apply_fixture(
+            ingress::TLS_TERMINATION,
+            FixtureVars::new(&ns.name)
+                .with("INGRESS_NAME", "pp-ingress")
+                .with("SECRET_NAME", "pp-cert")
+                .with("TLS_HOST", &host)
+                .with("BACKEND_NAME", "echo-a")
+                .with("TLS_CRT_B64", cert.cert_b64())
+                .with("TLS_KEY_B64", cert.key_b64()),
+        )
+        .await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        // Build PROXY v2 binary header: src=192.0.2.7:54321, dst=10.0.0.1:443
+        let mut v2_header = Vec::with_capacity(28);
+        v2_header.extend_from_slice(b"\r\n\r\n\0\r\nQUIT\n"); // 12-byte signature
+        v2_header.push(0x21); // version 2, command PROXY
+        v2_header.push(0x11); // AF_INET, STREAM
+        v2_header.extend_from_slice(&12u16.to_be_bytes()); // address block length
+        v2_header.extend_from_slice(&[192, 0, 2, 7]); // src IP 192.0.2.7
+        v2_header.extend_from_slice(&[10, 0, 0, 1]); // dst IP 10.0.0.1
+        v2_header.extend_from_slice(&54321u16.to_be_bytes()); // src port
+        v2_header.extend_from_slice(&443u16.to_be_bytes()); // dst port
+
+        let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+        let body = wait_for_proxy_v2_tls_route(
+            controller.tls_addr,
+            &host,
+            &v2_header,
+            &http_req,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        let echo: serde_json::Value = serde_json::from_str(&body)?;
+        // echo-basic returns headers as Title-Case keys with array values.
+        let forwarded = echo["headers"]["Forwarded"][0]
+            .as_str()
+            .unwrap_or_default()
+            .to_lowercase();
+        assert!(
+            forwarded.contains("192.0.2.7") && forwarded.contains("54321"),
+            "expected forwarded header with 192.0.2.7:54321, got: {forwarded}"
+        );
+        assert!(
+            forwarded.contains("proto=https"),
+            "expected proto=https in forwarded, got: {forwarded}"
+        );
+
+        Ok(())
+    }
 }

@@ -55,249 +55,6 @@ mod grpcecho {
     }
 }
 
-/// `ip-access-control` allow-list: a request whose **real client IP** (carried in
-/// the PROXY header) is inside the allow-listed CIDR is served normally (#264,
-/// #553 happy path).
-#[tokio::test]
-async fn allow_source_range_in_range_allowed() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "allow-range-in").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_ALLOW_SOURCE_RANGE,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("allowrange.{}.local", ns.name);
-    // 203.0.113.10 ∈ 203.0.113.0/24 — admitted.
-    let proxy_line = "PROXY TCP4 203.0.113.10 10.0.0.1 12345 80\r\n";
-    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-
-    // Poll until 200 — handles route-install latency; once installed, the in-range
-    // client stays admitted.
-    let body = wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        200,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    // Assert backend identity so a mis-route can't masquerade as a pass.
-    let echo: EchoResponse = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
-    echo.assert_backend("echo-a");
-
-    Ok(())
-}
-
-/// `ip-access-control` allow-list: a request whose real client IP is outside every
-/// allow-listed CIDR is rejected with 403 before reaching any backend (#264,
-/// #553 sad path).
-#[tokio::test]
-async fn allow_source_range_out_of_range_rejected() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "allow-range-out").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_ALLOW_SOURCE_RANGE,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("allowrange.{}.local", ns.name);
-    // 192.0.2.1 ∉ 203.0.113.0/24 — rejected. Polling until 403 absorbs route-install
-    // latency: before the route exists the proxy answers 404, never 403, so a 403 is an
-    // unambiguous signal that the route is live AND the allow-list denied this client.
-    let proxy_line = "PROXY TCP4 192.0.2.1 10.0.0.1 12345 80\r\n";
-    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-
-    wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        403,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// `ip-access-control` deny-list: a request whose **real client IP** (carried in the
-/// PROXY header) is inside the deny-listed CIDR is rejected with 403 before reaching
-/// any backend (#268, #553 happy path — block in effect).
-#[tokio::test]
-async fn deny_source_range_blocks_listed_client() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "deny-range-in").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_DENY_SOURCE_RANGE,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("denyrange.{}.local", ns.name);
-    // 203.0.113.10 ∈ 203.0.113.0/24 — blocked.
-    // Polling until 403 absorbs route-install latency: before the route exists the
-    // proxy answers 404, so a 403 is an unambiguous signal that the route is live
-    // AND the deny-list blocked this client.
-    let proxy_line = "PROXY TCP4 203.0.113.10 10.0.0.1 12345 80\r\n";
-    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-
-    wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        403,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// `ip-access-control` deny-list: a request whose real client IP is **outside** the
-/// deny-listed CIDR is served normally (#268, #553 negative path — block list does
-/// not over-block).
-#[tokio::test]
-async fn deny_source_range_allows_unlisted_client() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "deny-range-out").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_DENY_SOURCE_RANGE,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("denyrange.{}.local", ns.name);
-    // 192.0.2.1 ∉ 203.0.113.0/24 — admitted.
-    let proxy_line = "PROXY TCP4 192.0.2.1 10.0.0.1 12345 80\r\n";
-    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-
-    let body = wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        200,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    let echo: EchoResponse = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
-    echo.assert_backend("echo-a");
-
-    Ok(())
-}
-
-/// `ip-access-control` with both `deny` and `allow` set: deny is evaluated first —
-/// a client matching both lists is rejected with 403 (#268, #553 precedence test).
-/// A client in the allow range but not the deny range is admitted normally.
-#[tokio::test]
-async fn deny_takes_precedence_over_allow_when_both_match() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "deny-allow-prec").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_DENY_AND_ALLOW_SOURCE_RANGE,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("denyallow.{}.local", ns.name);
-
-    // 203.0.113.5 ∈ deny-list (203.0.113.5/32) AND ∈ allow-list (203.0.113.0/24) — blocked.
-    // Deny wins: polling until 403 confirms the route is live and deny has priority.
-    let deny_line = "PROXY TCP4 203.0.113.5 10.0.0.1 12345 80\r\n";
-    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-
-    wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        deny_line,
-        &http_req,
-        403,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    // 203.0.113.9 ∉ deny-list AND ∈ allow-list — admitted.
-    let allow_line = "PROXY TCP4 203.0.113.9 10.0.0.1 12345 80\r\n";
-    let body = wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        allow_line,
-        &http_req,
-        200,
-        Duration::from_secs(10),
-    )
-    .await?;
-
-    let echo: EchoResponse = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
-    echo.assert_backend("echo-a");
-
-    Ok(())
-}
-
 /// `ip-access-control` naming an `IpAccessControl` CR that does not exist: the
 /// reflector warns and fails-open — all requests are admitted regardless of
 /// client IP (#553 sad path, mirrors the rate-limit/compression/retry
@@ -329,300 +86,6 @@ async fn ip_access_control_missing_cr_fails_open() -> anyhow::Result<()> {
 }
 
 // ── Trusted proxy headers (trust-forwarded-for / forwarded-for-header / -trusted-cidrs) ──
-
-/// `trust-forwarded-for` fail-closed: when the annotation is `"true"` but no
-/// `forwarded-for-trusted-cidrs` are configured, the forwarded header is **ignored**
-/// (trust no peer). A client cannot spoof an in-range IP via the header; the L4 peer
-/// address is used, so an out-of-range L4 peer is rejected even though the header
-/// carries an allow-listed IP (#271 / S2 — empty trusted-cidrs is fail-closed).
-#[tokio::test]
-async fn forwarded_header_ignored_without_trusted_cidrs_fail_closed() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "trust-fwd-failclosed").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_TRUST_FORWARDED_FOR,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    // L4 peer 10.0.0.1 is outside the allow-range; the header carries an in-range IP
-    // (203.0.113.10). With no trusted-cidrs the proxy is fail-closed and ignores the
-    // header, so the effective IP is 10.0.0.1 ∉ 203.0.113.0/24 → 403. Polling to 403 is
-    // an unambiguous signal that the route is live AND the header was NOT trusted.
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("trustfwd.{}.local", ns.name);
-    let proxy_line = "PROXY TCP4 10.0.0.1 10.0.0.2 12345 80\r\n";
-    let http_req = format!(
-        "GET / HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-For: 203.0.113.10\r\nConnection: close\r\n\r\n"
-    );
-
-    wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        403,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// `trust-forwarded-for` with trusted-cidrs: when the L4 peer IS a trusted proxy but
-/// the forwarded header carries only private/reserved hops, no untrusted address can be
-/// resolved, so the proxy falls back to the (trusted) L4 peer IP. Here that L4 IP is
-/// itself allow-listed, so the request is admitted — proving the private-hop skip +
-/// L4 fallback path (#271 — trusted peer, header all-private).
-#[tokio::test]
-async fn forwarded_header_all_private_under_trusted_peer_falls_back_to_l4() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "trust-fwd-priv").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_TRUST_FORWARDED_FOR_CIDRS,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("trustfwdcidr.{}.local", ns.name);
-    // L4 peer 10.0.0.1 ∈ trusted-cidrs (10.0.0.1/32) → header trusted. Header carries
-    // only 10.0.0.5 (private) → no untrusted address → fall back to L4 10.0.0.1, which
-    // ∈ allow-source-range (10.0.0.1/32) → 200. Polling to 200 + backend identity
-    // confirms the fallback resolved to the trusted L4 peer.
-    let proxy_line = "PROXY TCP4 10.0.0.1 10.0.0.2 12345 80\r\n";
-    let http_req = format!(
-        "GET / HTTP/1.1\r\nHost: {host}\r\nX-Real-IP: 10.0.0.5\r\nConnection: close\r\n\r\n"
-    );
-
-    let body = wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        200,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    let echo: EchoResponse = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
-    echo.assert_backend("echo-a");
-
-    Ok(())
-}
-
-/// `forwarded-for-header` + `forwarded-for-trusted-cidrs`: when the L4 peer is inside the
-/// trusted CIDR gate, the proxy reads the custom header and uses its IP as the effective
-/// client IP (#271 happy path — custom header, trusted peer).
-#[tokio::test]
-async fn custom_forwarded_header_from_trusted_peer_resolves_client_ip() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "trust-fwd-cidr-ok").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_TRUST_FORWARDED_FOR_CIDRS,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("trustfwdcidr.{}.local", ns.name);
-    // L4 peer 10.0.0.1 ∈ forwarded-for-trusted-cidrs (10.0.0.1/32) → header trusted.
-    // X-Real-IP: 203.0.113.10 ∈ allow-source-range (203.0.113.0/24) → admitted.
-    let proxy_line = "PROXY TCP4 10.0.0.1 10.0.0.2 12345 80\r\n";
-    let http_req = format!(
-        "GET / HTTP/1.1\r\nHost: {host}\r\nX-Real-IP: 203.0.113.10\r\nConnection: close\r\n\r\n"
-    );
-
-    let body = wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        200,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    let echo: EchoResponse = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
-    echo.assert_backend("echo-a");
-
-    Ok(())
-}
-
-/// `forwarded-for-trusted-cidrs` anti-spoofing gate: when the L4 peer is **outside** the
-/// trusted CIDR the forwarded header is ignored; the proxy uses the L4 IP and rejects a
-/// request that would have been admitted via the (forged) header (#271 sad path — spoofing
-/// attempt blocked).
-#[tokio::test]
-async fn spoofed_forwarded_header_from_untrusted_peer_is_rejected() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "trust-fwd-spoof").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_TRUST_FORWARDED_FOR_CIDRS,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("trustfwdcidr.{}.local", ns.name);
-    // L4 peer 192.168.1.1 ∉ forwarded-for-trusted-cidrs (10.0.0.1/32) → header ignored.
-    // Effective IP = 192.168.1.1, which is private and ∉ allow-source-range → 403.
-    // Polling to 403 unambiguously signals the route is live AND the anti-spoofing gate fired.
-    let proxy_line = "PROXY TCP4 192.168.1.1 10.0.0.2 12345 80\r\n";
-    let http_req = format!(
-        "GET / HTTP/1.1\r\nHost: {host}\r\nX-Real-IP: 203.0.113.10\r\nConnection: close\r\n\r\n"
-    );
-
-    wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        403,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// Rightmost-untrusted resolution: a client that forges a leftmost token in the
-/// trusted forwarded header cannot bypass `allow-source-range`. The trusted LB appends
-/// the client's real (out-of-range) IP to the right; the proxy resolves the rightmost
-/// untrusted address, ignoring the in-range value the client injected on the left, and
-/// rejects the request (S1 — leftmost-XFF spoofing defeated).
-#[tokio::test]
-async fn forwarded_header_forged_leftmost_cannot_bypass_allow_list() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "trust-fwd-forge").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_TRUST_FORWARDED_FOR_CIDRS,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("trustfwdcidr.{}.local", ns.name);
-    // L4 peer 10.0.0.1 ∈ trusted-cidrs → header trusted. The client forges an in-range
-    // leftmost token (203.0.113.10 ∈ allow-range) hoping to be admitted; the trusted LB
-    // appends the real client 8.8.8.8 to the right. Rightmost-untrusted resolves 8.8.8.8
-    // ∉ allow-range → 403. The old leftmost-wins scan would have picked 203.0.113.10 and
-    // admitted (200) — polling to 403 proves the forgery is defeated.
-    let proxy_line = "PROXY TCP4 10.0.0.1 10.0.0.2 12345 80\r\n";
-    let http_req = format!(
-        "GET / HTTP/1.1\r\nHost: {host}\r\nX-Real-IP: 203.0.113.10, 8.8.8.8\r\nConnection: close\r\n\r\n"
-    );
-
-    wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        403,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    Ok(())
-}
-
-/// IPv4-mapped IPv6 deny-list canonicalization: a client whose real IP arrives in the
-/// `::ffff:a.b.c.d` mapped form is canonicalized before the CIDR check, so it cannot
-/// evade an IPv4 `deny-source-range` by presenting the mapped form (SEC-1 — no
-/// mapped-v6 deny evasion).
-#[tokio::test]
-async fn mapped_v6_client_matches_deny_v4_cidr() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "deny-mapped-v6").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(
-        ingress::ANNOTATION_DENY_SOURCE_RANGE,
-        FixtureVars::new(&ns.name),
-    )
-    .await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("denyrange.{}.local", ns.name);
-    // L4 peer arrives as the IPv4-mapped IPv6 form of 203.0.113.10, which ∈ the denied
-    // 203.0.113.0/24 after canonicalization → 403. Without canonicalization the mapped
-    // form would not match the v4 CIDR and slip through (200) — polling to 403 proves
-    // the mapped-v6 evasion is closed.
-    let proxy_line = "PROXY TCP6 ::ffff:203.0.113.10 ::ffff:10.0.0.1 12345 80\r\n";
-    let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
-
-    wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        403,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    Ok(())
-}
 
 /// Poll: send a v1 PROXY header + HTTP request over raw TCP until the response status
 /// equals `want_status`; returns the response body. Self-diagnosing on timeout (renders
@@ -2458,76 +1921,6 @@ async fn client_injected_forwarding_headers_are_stripped() -> anyhow::Result<()>
     Ok(())
 }
 
-/// Proxy-generated `Forwarded` header (derived from PROXY-protocol data) reaches
-/// the backend and overrides any client-supplied spoof (#409 — strip-then-replace
-/// path). Verifies the strip and the proxy-generated replacement in one assertion.
-#[tokio::test]
-async fn proxy_generated_forwarded_reaches_backend_and_overrides_spoof() -> anyhow::Result<()> {
-    bootstrap().await?;
-    let client = kube::Client::try_default().await?;
-    let ns = NamespaceGuard::create(&client, "fwd-override").await?;
-
-    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
-    wait::wait_for_backends(&ns.name).await?;
-    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
-
-    let controller = ControllerProcess::start_with_options(ControllerOptions {
-        accept_proxy_protocol: true,
-        trusted_sources: vec!["0.0.0.0/0".to_string()],
-        ..Default::default()
-    })
-    .await?;
-    wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
-
-    let host = format!("ingress.{}.local", ns.name);
-    // PROXY line carries the real client IP 203.0.113.10.
-    // The HTTP request also sends a spoofed Forwarded header; the proxy must strip
-    // it and replace with its own value derived from the PROXY-protocol address.
-    let proxy_line = "PROXY TCP4 203.0.113.10 10.0.0.1 12345 80\r\n";
-    let http_req = format!(
-        "GET /a HTTP/1.1\r\nHost: {host}\r\nForwarded: for=1.2.3.4;by=spoof\r\nConnection: close\r\n\r\n"
-    );
-
-    let body = wait_for_proxy_v1_status(
-        controller.proxy_addr,
-        proxy_line,
-        &http_req,
-        200,
-        Duration::from_secs(60),
-    )
-    .await?;
-
-    let echo: EchoResponse = serde_json::from_str(&body)
-        .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
-    echo.assert_backend("echo-a");
-
-    // The backend must see the proxy-generated Forwarded (from PROXY-protocol data),
-    // not the spoofed client value.
-    // echo-basic returns headers as Title-Case keys with array values (Go net/http canonical form).
-    let forwarded = echo
-        .headers
-        .get("Forwarded")
-        .and_then(|v| v[0].as_str())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "backend did not receive a `Forwarded` header — \
-                 proxy must inject one on the PROXY-protocol path (issue #409)"
-            )
-        })?;
-    anyhow::ensure!(
-        forwarded.contains("203.0.113.10"),
-        "expected proxy-generated Forwarded to contain the real client IP 203.0.113.10, \
-         got {forwarded:?} — wrong value injected or PROXY-protocol data not used"
-    );
-    anyhow::ensure!(
-        !forwarded.contains("1.2.3.4"),
-        "spoofed IP 1.2.3.4 found in Forwarded header {forwarded:?} — \
-         client spoof was not stripped before proxy-generated value was inserted (issue #409)"
-    );
-
-    Ok(())
-}
-
 /// A `RequestHeaderModifier` that attempts to `set` a proxy-owned forwarding header
 /// must be silently ignored (#410). The strip-before-filters step (#409) removes any
 /// client-supplied value; the modifier must not re-add it.
@@ -2602,4 +1995,619 @@ async fn raw_http_status(
     let body = s.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
 
     Ok((status, body))
+}
+
+// Tests that mutate the shared Helm release (non-default ControllerOptions /
+// start_with_options) or that need flake-isolation timing must run serially
+// against the whole e2e job — see `.config/nextest.toml` `test(/serial::/)`.
+mod serial {
+    use super::*;
+
+    /// `ip-access-control` allow-list: a request whose **real client IP** (carried in
+    /// the PROXY header) is inside the allow-listed CIDR is served normally (#264,
+    /// #553 happy path).
+    #[tokio::test]
+    async fn allow_source_range_in_range_allowed() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "allow-range-in").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(
+            ingress::ANNOTATION_ALLOW_SOURCE_RANGE,
+            FixtureVars::new(&ns.name),
+        )
+        .await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("allowrange.{}.local", ns.name);
+        // 203.0.113.10 ∈ 203.0.113.0/24 — admitted.
+        let proxy_line = "PROXY TCP4 203.0.113.10 10.0.0.1 12345 80\r\n";
+        let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+        // Poll until 200 — handles route-install latency; once installed, the in-range
+        // client stays admitted.
+        let body = wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            proxy_line,
+            &http_req,
+            200,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        // Assert backend identity so a mis-route can't masquerade as a pass.
+        let echo: EchoResponse = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+        echo.assert_backend("echo-a");
+
+        Ok(())
+    }
+
+    /// `ip-access-control` allow-list: a request whose real client IP is outside every
+    /// allow-listed CIDR is rejected with 403 before reaching any backend (#264,
+    /// #553 sad path).
+    #[tokio::test]
+    async fn allow_source_range_out_of_range_rejected() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "allow-range-out").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(
+            ingress::ANNOTATION_ALLOW_SOURCE_RANGE,
+            FixtureVars::new(&ns.name),
+        )
+        .await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("allowrange.{}.local", ns.name);
+        // 192.0.2.1 ∉ 203.0.113.0/24 — rejected. Polling until 403 absorbs route-install
+        // latency: before the route exists the proxy answers 404, never 403, so a 403 is an
+        // unambiguous signal that the route is live AND the allow-list denied this client.
+        let proxy_line = "PROXY TCP4 192.0.2.1 10.0.0.1 12345 80\r\n";
+        let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+        wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            proxy_line,
+            &http_req,
+            403,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// `ip-access-control` deny-list: a request whose **real client IP** (carried in the
+    /// PROXY header) is inside the deny-listed CIDR is rejected with 403 before reaching
+    /// any backend (#268, #553 happy path — block in effect).
+    #[tokio::test]
+    async fn deny_source_range_blocks_listed_client() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "deny-range-in").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(
+            ingress::ANNOTATION_DENY_SOURCE_RANGE,
+            FixtureVars::new(&ns.name),
+        )
+        .await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("denyrange.{}.local", ns.name);
+        // 203.0.113.10 ∈ 203.0.113.0/24 — blocked.
+        // Polling until 403 absorbs route-install latency: before the route exists the
+        // proxy answers 404, so a 403 is an unambiguous signal that the route is live
+        // AND the deny-list blocked this client.
+        let proxy_line = "PROXY TCP4 203.0.113.10 10.0.0.1 12345 80\r\n";
+        let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+        wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            proxy_line,
+            &http_req,
+            403,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// `ip-access-control` deny-list: a request whose real client IP is **outside** the
+    /// deny-listed CIDR is served normally (#268, #553 negative path — block list does
+    /// not over-block).
+    #[tokio::test]
+    async fn deny_source_range_allows_unlisted_client() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "deny-range-out").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(
+            ingress::ANNOTATION_DENY_SOURCE_RANGE,
+            FixtureVars::new(&ns.name),
+        )
+        .await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("denyrange.{}.local", ns.name);
+        // 192.0.2.1 ∉ 203.0.113.0/24 — admitted.
+        let proxy_line = "PROXY TCP4 192.0.2.1 10.0.0.1 12345 80\r\n";
+        let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+        let body = wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            proxy_line,
+            &http_req,
+            200,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        let echo: EchoResponse = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+        echo.assert_backend("echo-a");
+
+        Ok(())
+    }
+
+    /// `ip-access-control` with both `deny` and `allow` set: deny is evaluated first —
+    /// a client matching both lists is rejected with 403 (#268, #553 precedence test).
+    /// A client in the allow range but not the deny range is admitted normally.
+    #[tokio::test]
+    async fn deny_takes_precedence_over_allow_when_both_match() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "deny-allow-prec").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(
+            ingress::ANNOTATION_DENY_AND_ALLOW_SOURCE_RANGE,
+            FixtureVars::new(&ns.name),
+        )
+        .await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("denyallow.{}.local", ns.name);
+
+        // 203.0.113.5 ∈ deny-list (203.0.113.5/32) AND ∈ allow-list (203.0.113.0/24) — blocked.
+        // Deny wins: polling until 403 confirms the route is live and deny has priority.
+        let deny_line = "PROXY TCP4 203.0.113.5 10.0.0.1 12345 80\r\n";
+        let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+        wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            deny_line,
+            &http_req,
+            403,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        // 203.0.113.9 ∉ deny-list AND ∈ allow-list — admitted.
+        let allow_line = "PROXY TCP4 203.0.113.9 10.0.0.1 12345 80\r\n";
+        let body = wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            allow_line,
+            &http_req,
+            200,
+            Duration::from_secs(10),
+        )
+        .await?;
+
+        let echo: EchoResponse = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+        echo.assert_backend("echo-a");
+
+        Ok(())
+    }
+
+    /// `trust-forwarded-for` fail-closed: when the annotation is `"true"` but no
+    /// `forwarded-for-trusted-cidrs` are configured, the forwarded header is **ignored**
+    /// (trust no peer). A client cannot spoof an in-range IP via the header; the L4 peer
+    /// address is used, so an out-of-range L4 peer is rejected even though the header
+    /// carries an allow-listed IP (#271 / S2 — empty trusted-cidrs is fail-closed).
+    #[tokio::test]
+    async fn forwarded_header_ignored_without_trusted_cidrs_fail_closed() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "trust-fwd-failclosed").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(
+            ingress::ANNOTATION_TRUST_FORWARDED_FOR,
+            FixtureVars::new(&ns.name),
+        )
+        .await?;
+
+        // L4 peer 10.0.0.1 is outside the allow-range; the header carries an in-range IP
+        // (203.0.113.10). With no trusted-cidrs the proxy is fail-closed and ignores the
+        // header, so the effective IP is 10.0.0.1 ∉ 203.0.113.0/24 → 403. Polling to 403 is
+        // an unambiguous signal that the route is live AND the header was NOT trusted.
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("trustfwd.{}.local", ns.name);
+        let proxy_line = "PROXY TCP4 10.0.0.1 10.0.0.2 12345 80\r\n";
+        let http_req = format!(
+            "GET / HTTP/1.1\r\nHost: {host}\r\nX-Forwarded-For: 203.0.113.10\r\nConnection: close\r\n\r\n"
+        );
+
+        wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            proxy_line,
+            &http_req,
+            403,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// `trust-forwarded-for` with trusted-cidrs: when the L4 peer IS a trusted proxy but
+    /// the forwarded header carries only private/reserved hops, no untrusted address can be
+    /// resolved, so the proxy falls back to the (trusted) L4 peer IP. Here that L4 IP is
+    /// itself allow-listed, so the request is admitted — proving the private-hop skip +
+    /// L4 fallback path (#271 — trusted peer, header all-private).
+    #[tokio::test]
+    async fn forwarded_header_all_private_under_trusted_peer_falls_back_to_l4() -> anyhow::Result<()>
+    {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "trust-fwd-priv").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(
+            ingress::ANNOTATION_TRUST_FORWARDED_FOR_CIDRS,
+            FixtureVars::new(&ns.name),
+        )
+        .await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("trustfwdcidr.{}.local", ns.name);
+        // L4 peer 10.0.0.1 ∈ trusted-cidrs (10.0.0.1/32) → header trusted. Header carries
+        // only 10.0.0.5 (private) → no untrusted address → fall back to L4 10.0.0.1, which
+        // ∈ allow-source-range (10.0.0.1/32) → 200. Polling to 200 + backend identity
+        // confirms the fallback resolved to the trusted L4 peer.
+        let proxy_line = "PROXY TCP4 10.0.0.1 10.0.0.2 12345 80\r\n";
+        let http_req = format!(
+            "GET / HTTP/1.1\r\nHost: {host}\r\nX-Real-IP: 10.0.0.5\r\nConnection: close\r\n\r\n"
+        );
+
+        let body = wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            proxy_line,
+            &http_req,
+            200,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        let echo: EchoResponse = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+        echo.assert_backend("echo-a");
+
+        Ok(())
+    }
+
+    /// `forwarded-for-header` + `forwarded-for-trusted-cidrs`: when the L4 peer is inside the
+    /// trusted CIDR gate, the proxy reads the custom header and uses its IP as the effective
+    /// client IP (#271 happy path — custom header, trusted peer).
+    #[tokio::test]
+    async fn custom_forwarded_header_from_trusted_peer_resolves_client_ip() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "trust-fwd-cidr-ok").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(
+            ingress::ANNOTATION_TRUST_FORWARDED_FOR_CIDRS,
+            FixtureVars::new(&ns.name),
+        )
+        .await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("trustfwdcidr.{}.local", ns.name);
+        // L4 peer 10.0.0.1 ∈ forwarded-for-trusted-cidrs (10.0.0.1/32) → header trusted.
+        // X-Real-IP: 203.0.113.10 ∈ allow-source-range (203.0.113.0/24) → admitted.
+        let proxy_line = "PROXY TCP4 10.0.0.1 10.0.0.2 12345 80\r\n";
+        let http_req = format!(
+            "GET / HTTP/1.1\r\nHost: {host}\r\nX-Real-IP: 203.0.113.10\r\nConnection: close\r\n\r\n"
+        );
+
+        let body = wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            proxy_line,
+            &http_req,
+            200,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        let echo: EchoResponse = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+        echo.assert_backend("echo-a");
+
+        Ok(())
+    }
+
+    /// `forwarded-for-trusted-cidrs` anti-spoofing gate: when the L4 peer is **outside** the
+    /// trusted CIDR the forwarded header is ignored; the proxy uses the L4 IP and rejects a
+    /// request that would have been admitted via the (forged) header (#271 sad path — spoofing
+    /// attempt blocked).
+    #[tokio::test]
+    async fn spoofed_forwarded_header_from_untrusted_peer_is_rejected() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "trust-fwd-spoof").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(
+            ingress::ANNOTATION_TRUST_FORWARDED_FOR_CIDRS,
+            FixtureVars::new(&ns.name),
+        )
+        .await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("trustfwdcidr.{}.local", ns.name);
+        // L4 peer 192.168.1.1 ∉ forwarded-for-trusted-cidrs (10.0.0.1/32) → header ignored.
+        // Effective IP = 192.168.1.1, which is private and ∉ allow-source-range → 403.
+        // Polling to 403 unambiguously signals the route is live AND the anti-spoofing gate fired.
+        let proxy_line = "PROXY TCP4 192.168.1.1 10.0.0.2 12345 80\r\n";
+        let http_req = format!(
+            "GET / HTTP/1.1\r\nHost: {host}\r\nX-Real-IP: 203.0.113.10\r\nConnection: close\r\n\r\n"
+        );
+
+        wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            proxy_line,
+            &http_req,
+            403,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Rightmost-untrusted resolution: a client that forges a leftmost token in the
+    /// trusted forwarded header cannot bypass `allow-source-range`. The trusted LB appends
+    /// the client's real (out-of-range) IP to the right; the proxy resolves the rightmost
+    /// untrusted address, ignoring the in-range value the client injected on the left, and
+    /// rejects the request (S1 — leftmost-XFF spoofing defeated).
+    #[tokio::test]
+    async fn forwarded_header_forged_leftmost_cannot_bypass_allow_list() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "trust-fwd-forge").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(
+            ingress::ANNOTATION_TRUST_FORWARDED_FOR_CIDRS,
+            FixtureVars::new(&ns.name),
+        )
+        .await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("trustfwdcidr.{}.local", ns.name);
+        // L4 peer 10.0.0.1 ∈ trusted-cidrs → header trusted. The client forges an in-range
+        // leftmost token (203.0.113.10 ∈ allow-range) hoping to be admitted; the trusted LB
+        // appends the real client 8.8.8.8 to the right. Rightmost-untrusted resolves 8.8.8.8
+        // ∉ allow-range → 403. The old leftmost-wins scan would have picked 203.0.113.10 and
+        // admitted (200) — polling to 403 proves the forgery is defeated.
+        let proxy_line = "PROXY TCP4 10.0.0.1 10.0.0.2 12345 80\r\n";
+        let http_req = format!(
+            "GET / HTTP/1.1\r\nHost: {host}\r\nX-Real-IP: 203.0.113.10, 8.8.8.8\r\nConnection: close\r\n\r\n"
+        );
+
+        wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            proxy_line,
+            &http_req,
+            403,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// IPv4-mapped IPv6 deny-list canonicalization: a client whose real IP arrives in the
+    /// `::ffff:a.b.c.d` mapped form is canonicalized before the CIDR check, so it cannot
+    /// evade an IPv4 `deny-source-range` by presenting the mapped form (SEC-1 — no
+    /// mapped-v6 deny evasion).
+    #[tokio::test]
+    async fn mapped_v6_client_matches_deny_v4_cidr() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "deny-mapped-v6").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(
+            ingress::ANNOTATION_DENY_SOURCE_RANGE,
+            FixtureVars::new(&ns.name),
+        )
+        .await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("denyrange.{}.local", ns.name);
+        // L4 peer arrives as the IPv4-mapped IPv6 form of 203.0.113.10, which ∈ the denied
+        // 203.0.113.0/24 after canonicalization → 403. Without canonicalization the mapped
+        // form would not match the v4 CIDR and slip through (200) — polling to 403 proves
+        // the mapped-v6 evasion is closed.
+        let proxy_line = "PROXY TCP6 ::ffff:203.0.113.10 ::ffff:10.0.0.1 12345 80\r\n";
+        let http_req = format!("GET / HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+        wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            proxy_line,
+            &http_req,
+            403,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Proxy-generated `Forwarded` header (derived from PROXY-protocol data) reaches
+    /// the backend and overrides any client-supplied spoof (#409 — strip-then-replace
+    /// path). Verifies the strip and the proxy-generated replacement in one assertion.
+    #[tokio::test]
+    async fn proxy_generated_forwarded_reaches_backend_and_overrides_spoof() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let ns = NamespaceGuard::create(&client, "fwd-override").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            accept_proxy_protocol: true,
+            trusted_sources: vec!["0.0.0.0/0".to_string()],
+            ..Default::default()
+        })
+        .await?;
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        let host = format!("ingress.{}.local", ns.name);
+        // PROXY line carries the real client IP 203.0.113.10.
+        // The HTTP request also sends a spoofed Forwarded header; the proxy must strip
+        // it and replace with its own value derived from the PROXY-protocol address.
+        let proxy_line = "PROXY TCP4 203.0.113.10 10.0.0.1 12345 80\r\n";
+        let http_req = format!(
+            "GET /a HTTP/1.1\r\nHost: {host}\r\nForwarded: for=1.2.3.4;by=spoof\r\nConnection: close\r\n\r\n"
+        );
+
+        let body = wait_for_proxy_v1_status(
+            controller.proxy_addr,
+            proxy_line,
+            &http_req,
+            200,
+            Duration::from_secs(60),
+        )
+        .await?;
+
+        let echo: EchoResponse = serde_json::from_str(&body)
+            .map_err(|e| anyhow::anyhow!("expected echo JSON body, got {body:?}: {e}"))?;
+        echo.assert_backend("echo-a");
+
+        // The backend must see the proxy-generated Forwarded (from PROXY-protocol data),
+        // not the spoofed client value.
+        // echo-basic returns headers as Title-Case keys with array values (Go net/http canonical form).
+        let forwarded = echo
+            .headers
+            .get("Forwarded")
+            .and_then(|v| v[0].as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "backend did not receive a `Forwarded` header — \
+                     proxy must inject one on the PROXY-protocol path (issue #409)"
+                )
+            })?;
+        anyhow::ensure!(
+            forwarded.contains("203.0.113.10"),
+            "expected proxy-generated Forwarded to contain the real client IP 203.0.113.10, \
+             got {forwarded:?} — wrong value injected or PROXY-protocol data not used"
+        );
+        anyhow::ensure!(
+            !forwarded.contains("1.2.3.4"),
+            "spoofed IP 1.2.3.4 found in Forwarded header {forwarded:?} — \
+             client spoof was not stripped before proxy-generated value was inserted (issue #409)"
+        );
+
+        Ok(())
+    }
 }
