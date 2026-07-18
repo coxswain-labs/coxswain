@@ -16,7 +16,7 @@
 //! This binary re-execs itself into two roles:
 //!
 //! - **Server** (`--server`, spawned internally — never invoke by hand): runs
-//!   the actual [`coxswain_discovery::server::DiscoveryService`] fan-out
+//!   the actual [`coxswain_discovery::DiscoveryService`] fan-out
 //!   engine (the exact broadcast/serialize/push code path a real relay runs
 //!   downstream) plaintext on a loopback port, over a synthetic
 //!   `--world-size`-route ingress world. `serve relay` itself can't run

@@ -21,22 +21,28 @@
 //! [`Shared`]: coxswain_core::Shared
 
 pub(crate) mod apply;
-pub mod auth;
-pub mod bootstrap_client;
-pub mod bootstrap_server;
-pub mod client;
-pub mod error;
-pub mod materialize;
-pub mod metrics;
+pub(crate) mod auth;
+pub(crate) mod bootstrap_client;
+pub(crate) mod bootstrap_server;
+pub(crate) mod client;
+pub(crate) mod error;
+pub(crate) mod materialize;
+pub(crate) mod metrics;
+// `proto` and `wire` stay public: they are the serialization boundary — `proto`
+// the generated tonic contract (consumed cross-crate by `coxswain-bin` and by this
+// crate's benches via `coxswain_discovery::proto::v1`), `wire` the encode/decode
+// codec whose symmetric surface is exercised by round-trip tests. Every other
+// module is reachable only through the crate-root re-exports below
+// (`pub(crate)`-by-default, CLAUDE.md).
 pub mod proto;
-pub mod registry;
-pub mod relay;
-pub mod server;
-pub mod subscription;
-pub mod svid;
-pub mod transport;
-pub mod upstream;
-pub mod version;
+pub(crate) mod registry;
+pub(crate) mod relay;
+pub(crate) mod server;
+pub(crate) mod subscription;
+pub(crate) mod svid;
+pub(crate) mod transport;
+pub(crate) mod upstream;
+pub(crate) mod version;
 pub mod wire;
 
 #[cfg(test)]
@@ -57,8 +63,15 @@ pub use client::{
     UpstreamDirectiveHandler,
 };
 pub use error::{AuthError, DiscoveryError, WireError};
+// `materialize` is `pub(crate)`, but its view type + builder are the one internal
+// surface the external benches (`benches/relay_apply.rs`) legitimately need, so
+// they ride the crate-root re-export like everything else.
+pub use materialize::{MaterializedView, materialize};
 pub use relay::{RelayUpstream, namespace_relay, shared_relay};
-pub use server::{DiscoveryService, ProvisionedRelayAuthorizer, ScopeAuthorizer, SnapshotSource};
+pub use server::{
+    DenyAllNamespaces, DiscoveryService, ProvisionedRelayAuthorizer, ScopeAuthorizer,
+    SnapshotSource,
+};
 pub use subscription::Scope;
 pub use svid::{SharedSvid, SvidMaterial};
 pub use transport::serve_discovery_with_tls;

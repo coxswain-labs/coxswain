@@ -40,9 +40,8 @@ use coxswain_core::tls::{
     ClientCertStore, PortTlsStore, SharedClientCertStore, SharedPortTlsStore,
 };
 use coxswain_discovery::bench_internals::RelayHarness;
-use coxswain_discovery::materialize::{MaterializedView, materialize};
 use coxswain_discovery::proto::v1 as p;
-use coxswain_discovery::{Scope, SnapshotSource};
+use coxswain_discovery::{MaterializedView, Scope, SnapshotSource, materialize};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 const NS: &str = "prod";

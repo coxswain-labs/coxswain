@@ -38,7 +38,7 @@ use crate::proto::v1::discovery_server::{Discovery, DiscoveryServer};
 // ── PeerSvidStream ─────────────────────────────────────────────────────────────
 
 /// Thin wrapper over a server-side TLS stream that implements
-/// [`tonic::transport::server::Connected`] with [`PeerSvid`] as the connect-info
+/// [`tonic::transport::server::Connected`] with `PeerSvid` as the connect-info
 /// type.
 ///
 /// tonic calls `connect_info()` on every accepted stream and stores the result
@@ -103,7 +103,7 @@ impl AsyncWrite for PeerSvidStream {
 /// Serve a [`Discovery`] service on `addr`, wrapping every connection in `acceptor`.
 ///
 /// Each accepted TLS stream is wrapped in `PeerSvidStream`, which implements
-/// [`Connected`] and injects [`PeerSvid`] into request extensions — the
+/// [`Connected`] and injects `PeerSvid` into request extensions — the
 /// discovery handler uses it to enforce the Gateway scope-binding check.
 ///
 /// Returns when `shutdown` resolves (graceful drain) or the server errors.

@@ -245,7 +245,7 @@ fn build_namespace_view(source: &SnapshotSource, namespace: &str, seq: u64) -> M
 
 /// A deliberately-empty world at seq 0 (fail-closed dedicated branches).
 ///
-/// Also the per-subscriber SVID-mismatch result served by [`crate::server::view_for`]:
+/// Also the per-subscriber SVID-mismatch result served by the server's `view_for`:
 /// the Gateway view cache holds the SVID-independent real world, and a denied
 /// peer is handed this uncached empty world instead (never advancing its #531
 /// convergence stamp).

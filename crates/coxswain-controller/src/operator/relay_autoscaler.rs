@@ -24,7 +24,7 @@
 //!
 //! ## Make-before-break lifecycle
 //!
-//! [`RelayNsState`] is the level-triggered state machine the reconciler advances.
+//! [`RelayState`] is the level-triggered state machine the reconciler advances.
 //! `Provisioning` and `Draining` exist so a relay is authorized to subscribe
 //! upstream (and thus can become Ready) *before* leaves repoint onto it, and so
 //! leaves repoint *away* before the relay is deleted — the two sets the reconciler
@@ -44,7 +44,7 @@ use super::relay_params::EffectiveRelayPolicy;
 /// A namespace with no relay is simply absent from the reconciler's state map;
 /// the three variants here are the states in which a relay Deployment exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RelayNsState {
+pub(super) enum RelayState {
     /// Relay Deployment applied and authorized to subscribe upstream; awaiting
     /// its own registry entry to report Ready (upstream cache loaded). Leaves are
     /// **not** yet repointed onto it.
@@ -58,7 +58,7 @@ pub(super) enum RelayNsState {
 }
 
 /// The I/O the reconciler must perform for a namespace this pass, decided purely
-/// from the current [`RelayNsRecord`] and the live registry inputs (#602).
+/// from the current [`RelayRecord`] and the live registry inputs (#602).
 ///
 /// The reconciler commits the record's `next_state`/replica count **after** the
 /// I/O succeeds, so a failed apply/delete is simply retried on the next tick with
@@ -172,25 +172,26 @@ pub(super) struct RelayInputs {
     pub(super) ready: bool,
     /// Downstream subscribers still folded behind the relay (drain gate).
     pub(super) subscribers: u32,
-    /// Whether the namespace still holds ≥1 owned active dedicated Gateway (a
-    /// spec-level fact, stable across proxy churn). Distinguishes a namespace that
-    /// genuinely drained (no Gateways → tear down at once) from one whose live
-    /// subscriber count merely blipped to 0 (relay restart / control-stream
-    /// reconnect) while its Gateways remain (→ hold, cooldown applies). Without this
-    /// a transient 0 would delete a relay mid-restart.
-    pub(super) has_dedicated_gateways: bool,
+    /// Whether real demand for the relay still exists (a spec-level fact, stable
+    /// across proxy churn): for a namespace relay, ≥1 owned active dedicated
+    /// Gateway; for the shared relay, an enabled and non-empty shared pool.
+    /// Distinguishes a genuinely-drained cell (no demand → tear down at once) from
+    /// one whose live subscriber count merely blipped to 0 (relay restart /
+    /// control-stream reconnect) while demand remains (→ hold, cooldown applies).
+    /// Without this a transient 0 would delete a relay mid-restart.
+    pub(super) demand_present: bool,
 }
 
 /// Per-namespace control-loop record the reconciler holds across passes (#602).
 ///
-/// Carries the make-before-break [`RelayNsState`], the last-applied replica count
+/// Carries the make-before-break [`RelayState`], the last-applied replica count
 /// (the HPA sizing baseline), the trailing signal history (for scale-down
 /// stabilization), and the instant the signal first dropped below `H` (for the
 /// deactivation cooldown).
 #[derive(Clone, Debug)]
-pub(super) struct RelayNsRecord {
+pub(super) struct RelayRecord {
     /// Current lifecycle state.
-    pub(super) state: RelayNsState,
+    pub(super) state: RelayState,
     /// Replica count last applied to the Deployment — the sizing baseline.
     pub(super) current_replicas: u32,
     /// Trailing `(instant, signal)` samples within the stabilization window,
@@ -201,10 +202,10 @@ pub(super) struct RelayNsRecord {
     below_since: Option<Instant>,
 }
 
-impl RelayNsRecord {
+impl RelayRecord {
     /// A record for a namespace whose relay already exists at `replicas` and is
     /// treated as `state` (used on rehydration: a running relay is `Active`).
-    pub(super) fn existing(state: RelayNsState, replicas: u32) -> Self {
+    pub(super) fn existing(state: RelayState, replicas: u32) -> Self {
         Self {
             state,
             current_replicas: replicas.max(1),
@@ -242,25 +243,25 @@ impl RelayNsRecord {
     }
 
     /// Whether an existing relay should tear down. Force-off is immediate; a
-    /// genuinely drained namespace (no dedicated Gateways left) is immediate;
-    /// otherwise the signal must have held below `H` for the whole cooldown.
+    /// genuinely drained cell (no demand left) is immediate; otherwise the signal
+    /// must have held below `H` for the whole cooldown.
     ///
-    /// Crucially this keys the immediate path on `has_dedicated_gateways` (a stable
+    /// Crucially this keys the immediate path on `demand_present` (a stable
     /// spec fact), NOT on `signal == 0`: a relay restart or control-stream reconnect
-    /// blips the live subscriber count to 0 while the Gateways remain, and deleting
+    /// blips the live subscriber count to 0 while demand remains, and deleting
     /// the relay on that transient would drop it mid-restart. Such a blip instead
     /// waits out the cooldown, by which time the leaves have reconnected.
     fn should_deactivate(
         &self,
         now: Instant,
         signal: u32,
-        has_dedicated_gateways: bool,
+        demand_present: bool,
         tuning: &RelayTuning,
     ) -> bool {
         if tuning.enabled_override == Some(false) {
             return true;
         }
-        if !has_dedicated_gateways {
+        if !demand_present {
             return true;
         }
         if tuning.enabled_override == Some(true) {
@@ -294,27 +295,27 @@ impl RelayNsRecord {
     ) -> Decision {
         let signal = inputs.signal;
         match self.state {
-            RelayNsState::Provisioning => {
-                if self.should_deactivate(now, signal, inputs.has_dedicated_gateways, tuning) {
+            RelayState::Provisioning => {
+                if self.should_deactivate(now, signal, inputs.demand_present, tuning) {
                     // Demand evaporated (or force-off) before the relay ever served
                     // a leaf: no repoint happened, so tear it down directly.
                     Decision::delete()
                 } else if inputs.ready {
-                    Decision::new(RelayNsState::Active, RelayAction::Activate)
+                    Decision::new(RelayState::Active, RelayAction::Activate)
                 } else {
-                    Decision::hold(RelayNsState::Provisioning)
+                    Decision::hold(RelayState::Provisioning)
                 }
             }
-            RelayNsState::Active => {
-                if self.should_deactivate(now, signal, inputs.has_dedicated_gateways, tuning) {
-                    Decision::new(RelayNsState::Draining, RelayAction::StartDrain)
+            RelayState::Active => {
+                if self.should_deactivate(now, signal, inputs.demand_present, tuning) {
+                    Decision::new(RelayState::Draining, RelayAction::StartDrain)
                 } else {
                     let (replicas, pdb_ceiling) = self.autoscaled_size(tuning);
                     if replicas == self.current_replicas {
-                        Decision::hold(RelayNsState::Active)
+                        Decision::hold(RelayState::Active)
                     } else {
                         Decision {
-                            next_state: RelayNsState::Active,
+                            next_state: RelayState::Active,
                             action: RelayAction::Resize {
                                 replicas,
                                 pdb_ceiling,
@@ -324,27 +325,27 @@ impl RelayNsRecord {
                     }
                 }
             }
-            RelayNsState::Draining => {
+            RelayState::Draining => {
                 // Re-adopt only when demand GENUINELY returns (the signal crosses the
                 // activation threshold again with Gateways present) — NOT merely
                 // because `should_deactivate` is false: during the drain itself the
                 // signal sits below `H` and the cooldown clock makes `should_deactivate`
                 // false, which must not be read as "demand returned".
-                if inputs.has_dedicated_gateways && Self::should_activate(signal, tuning) {
+                if inputs.demand_present && Self::should_activate(signal, tuning) {
                     // A relay can lose readiness mid-drain (pod restart / node drain);
                     // repointing leaves onto a not-yet-serving relay is exactly the
                     // make-before-break violation the `Provisioning` gate guards
                     // against, so hold de-repointed (leaves on the controller) until
                     // it is Ready again.
                     if inputs.ready {
-                        Decision::new(RelayNsState::Active, RelayAction::Activate)
+                        Decision::new(RelayState::Active, RelayAction::Activate)
                     } else {
-                        Decision::hold(RelayNsState::Draining)
+                        Decision::hold(RelayState::Draining)
                     }
                 } else if inputs.subscribers == 0 {
                     Decision::delete()
                 } else {
-                    Decision::hold(RelayNsState::Draining)
+                    Decision::hold(RelayState::Draining)
                 }
             }
         }
@@ -412,7 +413,7 @@ fn autoscaling_bounds(tuning: &RelayTuning) -> Option<(u32, u32, u32)> {
 /// Whether a namespace with no relay should provision one this pass (#602) — the
 /// activation half of the KEDA on/off model, exposed for the reconciler.
 pub(super) fn should_provision(signal: u32, tuning: &RelayTuning) -> bool {
-    RelayNsRecord::should_activate(signal, tuning)
+    RelayRecord::should_activate(signal, tuning)
 }
 
 /// HPA desired replicas from a single signal reading, with the usage-ratio
@@ -447,7 +448,7 @@ fn desired_from_signal(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Decision {
     /// State to commit after the action succeeds.
-    pub(super) next_state: RelayNsState,
+    pub(super) next_state: RelayState,
     /// The I/O to perform.
     pub(super) action: RelayAction,
     /// Replica count to commit as the new sizing baseline, when the action changed it.
@@ -455,7 +456,7 @@ pub(super) struct Decision {
 }
 
 impl Decision {
-    fn new(next_state: RelayNsState, action: RelayAction) -> Self {
+    fn new(next_state: RelayState, action: RelayAction) -> Self {
         Self {
             next_state,
             action,
@@ -463,14 +464,14 @@ impl Decision {
         }
     }
 
-    fn hold(state: RelayNsState) -> Self {
+    fn hold(state: RelayState) -> Self {
         Self::new(state, RelayAction::None)
     }
 
     /// Terminal delete: the caller drops the record entirely, so `next_state` is
     /// unused (kept as `Draining` for debug legibility).
     fn delete() -> Self {
-        Self::new(RelayNsState::Draining, RelayAction::Delete)
+        Self::new(RelayState::Draining, RelayAction::Delete)
     }
 }
 
@@ -518,7 +519,7 @@ mod tests {
             signal,
             ready,
             subscribers,
-            has_dedicated_gateways: true,
+            demand_present: true,
         }
     }
 
@@ -528,7 +529,7 @@ mod tests {
             signal: 0,
             ready: true,
             subscribers,
-            has_dedicated_gateways: false,
+            demand_present: false,
         }
     }
 
@@ -619,7 +620,7 @@ mod tests {
     fn active_relay_holds_until_cooldown_elapses_below_break_even() {
         let t = static_tuning();
         let start = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Active, 2);
+        let mut rec = RelayRecord::existing(RelayState::Active, 2);
         // Signal drops below H; the cooldown clock starts.
         rec.observe(start, 5, &t);
         let d = rec.decide(start, inputs(5, true, 2), &t);
@@ -646,7 +647,7 @@ mod tests {
     fn recovery_above_break_even_resets_the_cooldown_clock() {
         let t = static_tuning();
         let start = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Active, 2);
+        let mut rec = RelayRecord::existing(RelayState::Active, 2);
         rec.observe(start, 5, &t); // below H, clock starts
         let recovered = start + Duration::from_secs(200);
         rec.observe(recovered, 9, &t); // back above H → clock resets
@@ -663,7 +664,7 @@ mod tests {
     fn drained_namespace_deactivates_immediately() {
         let t = static_tuning();
         let now = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Active, 2);
+        let mut rec = RelayRecord::existing(RelayState::Active, 2);
         rec.observe(now, 0, &t);
         assert_eq!(
             rec.decide(now, drained(3), &t).action,
@@ -679,7 +680,7 @@ mod tests {
         // (that would drop it mid-restart) — the cooldown applies.
         let t = static_tuning();
         let now = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Active, 2);
+        let mut rec = RelayRecord::existing(RelayState::Active, 2);
         rec.observe(now, 0, &t);
         assert_eq!(
             rec.decide(now, inputs(0, true, 0), &t).action,
@@ -694,7 +695,7 @@ mod tests {
     fn provisioning_waits_for_ready_before_activating() {
         let t = static_tuning();
         let now = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Provisioning, 2);
+        let mut rec = RelayRecord::existing(RelayState::Provisioning, 2);
         rec.observe(now, 20, &t);
         assert_eq!(
             rec.decide(now, inputs(20, false, 0), &t).action,
@@ -703,14 +704,14 @@ mod tests {
         );
         let d = rec.decide(now, inputs(20, true, 0), &t);
         assert_eq!(d.action, RelayAction::Activate);
-        assert_eq!(d.next_state, RelayNsState::Active);
+        assert_eq!(d.next_state, RelayState::Active);
     }
 
     #[test]
     fn draining_deletes_only_after_subscribers_reach_zero() {
         let t = static_tuning();
         let now = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Draining, 2);
+        let mut rec = RelayRecord::existing(RelayState::Draining, 2);
         rec.observe(now, 0, &t);
         assert_eq!(
             rec.decide(now, inputs(0, true, 3), &t).action,
@@ -728,7 +729,7 @@ mod tests {
     fn draining_readopts_when_demand_returns_and_relay_is_ready() {
         let t = static_tuning();
         let now = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Draining, 2);
+        let mut rec = RelayRecord::existing(RelayState::Draining, 2);
         rec.observe(now, 20, &t); // demand back above H
         let d = rec.decide(now, inputs(20, true, 1), &t);
         assert_eq!(
@@ -736,7 +737,7 @@ mod tests {
             RelayAction::Activate,
             "re-adopt the still-running, Ready relay rather than delete/recreate",
         );
-        assert_eq!(d.next_state, RelayNsState::Active);
+        assert_eq!(d.next_state, RelayState::Active);
     }
 
     #[test]
@@ -745,7 +746,7 @@ mod tests {
         // onto even when demand returns — make-before-break holds through re-adopt.
         let t = static_tuning();
         let now = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Draining, 2);
+        let mut rec = RelayRecord::existing(RelayState::Draining, 2);
         rec.observe(now, 20, &t);
         let d = rec.decide(now, inputs(20, false, 1), &t);
         assert_eq!(
@@ -753,14 +754,14 @@ mod tests {
             RelayAction::None,
             "not Ready → leaves stay on the controller until the relay re-syncs",
         );
-        assert_eq!(d.next_state, RelayNsState::Draining);
+        assert_eq!(d.next_state, RelayState::Draining);
     }
 
     #[test]
     fn provisioning_aborts_if_namespace_drains_before_ready() {
         let t = static_tuning();
         let now = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Provisioning, 2);
+        let mut rec = RelayRecord::existing(RelayState::Provisioning, 2);
         rec.observe(now, 0, &t);
         assert_eq!(
             rec.decide(now, drained(0), &t).action,
@@ -775,7 +776,7 @@ mod tests {
         // NOT be deleted while Gateways remain — it is still coming up.
         let t = static_tuning();
         let now = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Provisioning, 2);
+        let mut rec = RelayRecord::existing(RelayState::Provisioning, 2);
         rec.observe(now, 0, &t);
         assert_eq!(
             rec.decide(now, inputs(0, false, 0), &t).action,
@@ -790,7 +791,7 @@ mod tests {
     fn sizing_scales_up_on_instantaneous_signal() {
         let t = autoscaled_tuning(Some(1), 10, Some(50));
         let now = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Active, 1);
+        let mut rec = RelayRecord::existing(RelayState::Active, 1);
         rec.observe(now, 200, &t); // ceil(200/50)=4
         let d = rec.decide(now, inputs(200, true, 200), &t);
         assert_eq!(
@@ -806,7 +807,7 @@ mod tests {
     fn sizing_holds_within_tolerance_deadband() {
         let t = autoscaled_tuning(Some(1), 10, Some(50));
         let now = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Active, 4);
+        let mut rec = RelayRecord::existing(RelayState::Active, 4);
         // current=4, target=50 → capacity 200; signal 210 → usage 1.05 ≤ 0.10.
         rec.observe(now, 210, &t);
         assert_eq!(
@@ -830,7 +831,7 @@ mod tests {
         };
         let t = RelayTuning::resolve(&policy, defaults());
         let start = Instant::now();
-        let mut rec = RelayNsRecord::existing(RelayNsState::Active, 4); // sized for ~200
+        let mut rec = RelayRecord::existing(RelayState::Active, 4); // sized for ~200
 
         // Signal drops to 50 (→1 replica), but the window still holds the 200 peak.
         rec.observe(start, 200, &t);
