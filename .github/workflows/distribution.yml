@@ -29,6 +29,12 @@ jobs:
       - uses: dorny/paths-filter@v4
         id: filter
         with:
+          # Force git-history detection instead of the GitHub REST API: the API
+          # path has no retry, so a transient API blip fails `changes` and skips
+          # the whole pipeline (#635). An empty token switches the action to diff
+          # the checked-out git history; `base` pins it to the PR base branch.
+          token: ''
+          base: ${{ github.base_ref }}
           filters: |
             docker:
               - 'Dockerfile'
