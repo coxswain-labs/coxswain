@@ -10,6 +10,8 @@ _staging/
 __pycache__/
 conformance/reports/*.yaml
 conformance/conformance.test
+crates/coxswain-e2e/fixtures/scheme-authz/scheme-authz
+crates/coxswain-e2e/fixtures/malformed-authz/malformed-authz
 graphify-out/
 site/
 target/
