@@ -17,7 +17,9 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Endpoint, Server};
 
-use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
+use coxswain_core::dedicated_registry::{
+    DedicatedRegistryData, DedicatedRoutingRegistry, DedicatedRoutingSnapshot,
+};
 use coxswain_core::listener_status::{GatewayListenerStatus, SharedGatewayListenerStatus};
 use coxswain_core::node_registry::SharedNodeRegistry;
 use coxswain_core::ownership::ObjectKey;
@@ -98,7 +100,9 @@ fn source_with_two_gateways() -> SnapshotSource {
         }),
     );
 
-    source.dedicated.store(Arc::new(map));
+    source
+        .dedicated
+        .store(Arc::new(DedicatedRegistryData::from_map(map)));
     source
 }
 

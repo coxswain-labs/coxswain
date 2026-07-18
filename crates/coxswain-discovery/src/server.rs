@@ -78,7 +78,7 @@ use crate::auth::{PeerSvid, svid_matches_dedicated_gateway};
 use crate::subscription::Scope;
 
 use crate::bootstrap_server::UpstreamResolverConfig;
-use crate::materialize::{MaterializedView, materialize};
+use crate::materialize::{MaterializedView, empty_view, materialize};
 use crate::proto::v1::{
     self as p, client_message::Kind as CKind, discovery_server::Discovery,
     server_message::Kind as SKind,
@@ -333,6 +333,12 @@ struct ViewCacheState {
     /// `namespace → (generation, view)`, most recently materialized per
     /// namespace; entries are created lazily on first subscribe.
     namespace: HashMap<String, Option<(u64, Arc<MaterializedView>)>>,
+    /// `Gateway ObjectKey → (generation, view)`, the SVID-independent real
+    /// world per dedicated Gateway. HA replicas of the same Gateway — and every
+    /// leaf behind the same relay — share one build per generation instead of
+    /// re-hashing the Gateway's whole world per subscriber; the per-peer SVID
+    /// decision is a cheap post-cache filter in [`view_for`].
+    gateway: HashMap<ObjectKey, Option<(u64, Arc<MaterializedView>)>>,
 }
 
 /// Stream-rejection message sent by a non-leader replica (#531).
@@ -461,7 +467,7 @@ struct PendingWorld {
     version: String,
     /// Canonical-key → per-resource-hash map — the diff baseline. Shared with the
     /// view behind an `Arc`, so retaining it per stream is a cheap clone.
-    resources: Arc<BTreeMap<String, String>>,
+    resources: Arc<BTreeMap<String, Arc<str>>>,
     /// Publish sequence captured before the cells were read (never on the wire);
     /// recorded into the node registry when this world is Ack'd (#531).
     seq: u64,
@@ -494,7 +500,7 @@ struct Outbound {
 /// per-resource version self-check reproduces it exactly.
 fn build_outbound(
     view: &MaterializedView,
-    acked: Option<&BTreeMap<String, String>>,
+    acked: Option<&BTreeMap<String, Arc<str>>>,
 ) -> Option<Outbound> {
     // The post-apply world a client reaches once it Acks this message. Built ONLY
     // on a send path (never on the empty-delta no-op below), and cheap regardless:
@@ -535,9 +541,7 @@ fn build_outbound(
             let resources: Vec<p::Resource> = view
                 .resources
                 .iter()
-                .filter(|(key, entry)| {
-                    base.get(*key).map(String::as_str) != Some(entry.hash.as_str())
-                })
+                .filter(|(key, entry)| base.get(*key) != Some(&entry.hash))
                 .map(|(_, entry)| (*entry.resource).clone())
                 .collect();
             // Tombstones: baseline keys the view no longer carries. `base` is a
@@ -602,17 +606,59 @@ fn view_for(
     generation: u64,
 ) -> Arc<MaterializedView> {
     match scope {
-        // Gateway scope: per-stream SVID binding, never cached.
-        Scope::Gateway { .. } => Arc::new(build_view(source, scope, peer_svid)),
-        Scope::SharedPool => cached_view(cache, source, scope, peer_svid, generation, |state| {
+        // Gateway scope: the SVID-independent real world is cached by
+        // (generation, ObjectKey) and shared across every subscriber of this
+        // Gateway; only the empty-vs-real decision is per-peer (#427).
+        Scope::Gateway { name, namespace } => {
+            if gateway_svid_denied(source, namespace, name, peer_svid) {
+                return Arc::new(empty_view());
+            }
+            let key = ObjectKey::new(namespace.clone(), name.clone());
+            cached_view(cache, source, scope, generation, move |state| {
+                state.gateway.entry(key.clone()).or_default()
+            })
+        }
+        Scope::SharedPool => cached_view(cache, source, scope, generation, |state| {
             &mut state.shared_pool
         }),
         Scope::Namespace { namespace } => {
             let namespace = namespace.clone();
-            cached_view(cache, source, scope, peer_svid, generation, move |state| {
+            cached_view(cache, source, scope, generation, move |state| {
                 state.namespace.entry(namespace.clone()).or_default()
             })
         }
+    }
+}
+
+/// Per-subscriber SVID gate for a `Scope::Gateway` view: `true` when `peer_svid`
+/// must be denied this Gateway's real world (served [`empty_view`] instead).
+///
+/// The build-time complement to the open-time `PERMISSION_DENIED` check in
+/// [`DiscoveryService::stream`] — it closes the appear-after-open race (#427)
+/// where a Gateway's dedicated-registry entry materializes *after* a stream with a
+/// non-matching SVID was already accepted (accepted because, at open time, the
+/// absent entry made the world fail-closed empty regardless).
+///
+/// - No `peer_svid` (plaintext / test path): never denied — mTLS is mandatory in
+///   production, so this mirrors the open-time fail-open.
+/// - Entry absent: never denied here — the cached real build is already
+///   [`empty_view`], so there is nothing to withhold.
+/// - Entry present but SVID does not match its `expected_proxy_sa`: denied.
+pub(crate) fn gateway_svid_denied(
+    source: &SnapshotSource,
+    namespace: &str,
+    name: &str,
+    peer_svid: Option<&PeerSvid>,
+) -> bool {
+    let Some(peer) = peer_svid else {
+        return false;
+    };
+    let key = ObjectKey::new(namespace.to_owned(), name.to_owned());
+    match source.dedicated.load().map.get(&key) {
+        Some(snap) => {
+            !svid_matches_dedicated_gateway(&peer.uri_sans, namespace, &snap.expected_proxy_sa)
+        }
+        None => false,
     }
 }
 
@@ -624,7 +670,6 @@ fn cached_view(
     cache: &SharedViewCache,
     source: &SnapshotSource,
     scope: &Scope,
-    peer_svid: Option<&PeerSvid>,
     generation: u64,
     slot: impl Fn(&mut ViewCacheState) -> &mut Option<(u64, Arc<MaterializedView>)>,
 ) -> Arc<MaterializedView> {
@@ -639,7 +684,7 @@ fn cached_view(
     }
 
     // Miss: build outside the lock, then re-check before storing.
-    let view = Arc::new(build_view(source, scope, peer_svid));
+    let view = Arc::new(build_view(source, scope));
     let mut guard = cache.lock();
     let entry = slot(&mut guard);
     if let Some((cached_gen, existing)) = entry.as_ref()
@@ -659,13 +704,9 @@ fn cached_view(
 /// between the controller's `Shared` cells and the discovery wire, #383) and
 /// records the build duration. Cache hits ([`view_for`]) skip this, so the
 /// histogram measures real builds, not served-from-cache reads.
-fn build_view(
-    source: &SnapshotSource,
-    scope: &Scope,
-    peer_svid: Option<&PeerSvid>,
-) -> MaterializedView {
+fn build_view(source: &SnapshotSource, scope: &Scope) -> MaterializedView {
     let start = Instant::now();
-    let view = materialize(source, scope, peer_svid);
+    let view = materialize(source, scope);
     crate::metrics::snapshot_build_seconds().observe(start.elapsed().as_secs_f64());
     view
 }
@@ -755,7 +796,7 @@ impl Discovery for DiscoveryService {
             && let Scope::Gateway { name, namespace } = &scope
         {
             let key = ObjectKey::new(namespace.clone(), name.clone());
-            if let Some(entry) = self.source.dedicated.load().get(&key)
+            if let Some(entry) = self.source.dedicated.load().map.get(&key)
                 && !svid_matches_dedicated_gateway(
                     &peer.uri_sans,
                     namespace,
@@ -875,7 +916,7 @@ struct StreamState {
     /// baseline. `None` until the first Ack, which is exactly when the next
     /// outbound must be a full: on connect (no baseline yet) and on any defensive
     /// path that clears it. Every delta is diffed against this map.
-    acked_resources: Option<Arc<BTreeMap<String, String>>>,
+    acked_resources: Option<Arc<BTreeMap<String, Arc<str>>>>,
     /// Version hash of the snapshot currently awaiting an Ack from the client;
     /// `None` when no snapshot is in-flight (safe to push the next one).
     in_flight: Option<String>,
@@ -1622,7 +1663,7 @@ mod tests {
         ClientMessage, ServerMessage, Snapshot, client_message::Kind as CKind,
         discovery_server::DiscoveryServer, server_message::Kind as SrvKind,
     };
-    use coxswain_core::dedicated_registry::DedicatedRoutingSnapshot;
+    use coxswain_core::dedicated_registry::{DedicatedRegistryData, DedicatedRoutingSnapshot};
     use coxswain_core::endpoints::{EndpointKey, ResolvedEndpoints};
     use coxswain_core::listener_status::GatewayListenerStatus;
     use coxswain_core::node_registry::SharedNodeRegistry;
@@ -2632,7 +2673,9 @@ mod tests {
         });
         let mut map = HashMap::new();
         map.insert(key.clone(), snap);
-        source.dedicated.store(Arc::new(map));
+        source
+            .dedicated
+            .store(Arc::new(DedicatedRegistryData::from_map(map)));
         source
     }
 
@@ -2647,9 +2690,6 @@ mod tests {
                 name: "gw-a".to_owned(),
                 namespace: "prod".to_owned(),
             },
-            // No peer SVID in plaintext unit tests; SVID binding is exercised in
-            // tests/scope_binding.rs over real TLS.
-            None,
         );
 
         let listener_keys: Vec<&String> = view
@@ -2688,7 +2728,6 @@ mod tests {
                 name: "gw-b".to_owned(),
                 namespace: "prod".to_owned(),
             },
-            None,
         );
 
         assert!(
@@ -2704,11 +2743,82 @@ mod tests {
         let key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
         let source = source_with_dedicated_entry(&key);
 
-        let view = materialize(&source, &Scope::SharedPool, None);
+        let view = materialize(&source, &Scope::SharedPool);
 
         assert!(
             view.resources.is_empty(),
             "SharedPool reads the shared cells (empty here), never the dedicated registry"
+        );
+    }
+
+    // ── Gateway view cache + SVID post-cache gate (#621) ──────────────────────
+
+    fn gw_scope() -> Scope {
+        Scope::Gateway {
+            name: "gw-a".to_owned(),
+            namespace: "prod".to_owned(),
+        }
+    }
+
+    /// Two `view_for` calls for the same Gateway at the same generation share one
+    /// `Arc<MaterializedView>`: the SVID-independent world is built once and reused
+    /// across subscribers, not re-materialized (re-hashed) per stream.
+    #[test]
+    fn gateway_view_is_cached_per_generation() {
+        let key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
+        let source = source_with_dedicated_entry(&key);
+        let cache: SharedViewCache = Arc::new(Mutex::new(ViewCacheState::default()));
+
+        let a = view_for(&cache, &source, &gw_scope(), None, 7);
+        let b = view_for(&cache, &source, &gw_scope(), None, 7);
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "same generation must share one cached view Arc"
+        );
+        assert!(
+            !a.resources.is_empty(),
+            "the cached Gateway world is the real (non-empty) one"
+        );
+    }
+
+    /// A newer generation invalidates the cached Gateway view (fresh build).
+    #[test]
+    fn gateway_view_rebuilds_on_new_generation() {
+        let key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
+        let source = source_with_dedicated_entry(&key);
+        let cache: SharedViewCache = Arc::new(Mutex::new(ViewCacheState::default()));
+
+        let a = view_for(&cache, &source, &gw_scope(), None, 1);
+        let b = view_for(&cache, &source, &gw_scope(), None, 2);
+        assert!(!Arc::ptr_eq(&a, &b), "a newer generation must rebuild");
+    }
+
+    /// A non-matching peer SVID is served an empty seq-0 world by the post-cache
+    /// filter — never the cached real world (the #427 appear-after-open guard) —
+    /// while a matching SVID is served the real world.
+    #[test]
+    fn gateway_view_svid_gate_denies_mismatch_serves_match() {
+        let key = ObjectKey::new("prod".to_owned(), "gw-a".to_owned());
+        let source = source_with_dedicated_entry(&key);
+        let cache: SharedViewCache = Arc::new(Mutex::new(ViewCacheState::default()));
+
+        let wrong = PeerSvid {
+            uri_sans: vec!["spiffe://cluster.local/ns/prod/sa/someone-else".to_owned()],
+        };
+        let denied = view_for(&cache, &source, &gw_scope(), Some(&wrong), 1);
+        assert!(
+            denied.resources.is_empty() && denied.seq == 0,
+            "mismatched SVID must get an empty seq-0 world"
+        );
+
+        // expected_proxy_sa is "gw-a-coxswain" (see source_with_dedicated_entry).
+        let matching = PeerSvid {
+            uri_sans: vec!["spiffe://cluster.local/ns/prod/sa/gw-a-coxswain".to_owned()],
+        };
+        let served = view_for(&cache, &source, &gw_scope(), Some(&matching), 1);
+        assert!(
+            !served.resources.is_empty(),
+            "matching SVID must be served the real Gateway world"
         );
     }
 

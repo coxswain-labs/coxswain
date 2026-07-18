@@ -825,12 +825,18 @@ impl Supervisor {
                     match changed {
                         Ok(()) => {
                             let Some(rx) = roster.as_mut() else { continue };
-                            let registry = rx.borrow_and_update().clone();
-                            debug!(
-                                children = registry.nodes.len(),
-                                "discovery client: leaf roster changed; sending RosterReport"
-                            );
-                            if tx.send(roster_report_message(&registry)).await.is_err() {
+                            // Build the report from the watch borrow directly — no
+                            // owned registry clone (#621) — then drop the borrow
+                            // before the `.await` so it never spans a send.
+                            let message = {
+                                let registry = rx.borrow_and_update();
+                                debug!(
+                                    children = registry.nodes.len(),
+                                    "discovery client: leaf roster changed; sending RosterReport"
+                                );
+                                roster_report_message(&registry)
+                            };
+                            if tx.send(message).await.is_err() {
                                 debug!("discovery client: outbound channel closed after RosterReport");
                                 break;
                             }

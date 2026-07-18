@@ -45,6 +45,10 @@ harness = false
 name = "relay_fanout"
 harness = false
 
+[[bench]]
+name = "relay_apply"
+harness = false
+
 [build-dependencies]
 protox            = { workspace = true }
 tonic-prost-build = { workspace = true }

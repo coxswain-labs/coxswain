@@ -26,7 +26,6 @@ use coxswain_core::routing::{
 };
 use coxswain_core::tls::{ClientCertStore, PortTlsStore};
 
-use crate::auth::{PeerSvid, svid_matches_dedicated_gateway};
 use crate::proto::v1 as p;
 use crate::server::SnapshotSource;
 use crate::subscription::Scope;
@@ -45,7 +44,11 @@ use crate::wire::{
 #[non_exhaustive]
 pub struct ResourceEntry {
     /// Lowercase-hex `sha256` of the resource's proto encoding (change oracle).
-    pub hash: String,
+    ///
+    /// `Arc<str>` so the per-generation `resource_hashes` baseline and the global
+    /// version input share this digest allocation instead of deep-copying the
+    /// 64-byte hex string once per stream.
+    pub hash: Arc<str>,
     /// The resource DTO, shared behind an `Arc`.
     pub resource: Arc<p::Resource>,
 }
@@ -74,7 +77,7 @@ pub struct MaterializedView {
     /// which keys moved, and the upsert bodies are cloned lazily from the view at
     /// send time. Precomputing it here (rather than re-deriving per send) means each
     /// stream's pending world is a cheap `Arc` clone, never a full map copy.
-    pub resource_hashes: Arc<BTreeMap<String, String>>,
+    pub resource_hashes: Arc<BTreeMap<String, Arc<str>>>,
 }
 
 /// References to the nine routing cells a view is built from, grouped to keep the
@@ -96,21 +99,21 @@ struct ViewInputs<'a> {
 /// - [`Scope::SharedPool`] reads the six shared L7/status cells plus the four L4
 ///   cells (these deliberately exclude cut-over Gateways).
 /// - [`Scope::Gateway`] reads only the Gateway's dedicated-registry slice (empty
-///   Ingress, empty L4). An absent entry — or a `peer_svid` that does not match
-///   the entry's `expected_proxy_sa` — yields an empty world at **seq 0**, so an
+///   Ingress, empty L4). An absent entry yields an empty world at **seq 0**, so an
 ///   Ack of a fail-closed world never advances the node's #531 convergence stamp.
-///   This is the build-time complement to the open-time `PERMISSION_DENIED` check
-///   in `server::stream` and closes the appear-after-open race (#427).
+///
+/// The build is deliberately **SVID-independent**: the per-subscriber
+/// `Scope::Gateway` binding check (the #427 appear-after-open race guard) lives in
+/// `server::view_for` as a post-cache filter, so this expensive build can be
+/// shared across every subscriber of the same Gateway at one generation. The
+/// open-time `PERMISSION_DENIED` check in `server::stream` remains the primary
+/// gate.
 ///
 /// The publish sequence is captured BEFORE any cell load: every rebuild stamped
 /// at a sequence `<=` the captured value stored its cells before bumping the
 /// counter, so the loaded content is at least that new.
 #[must_use = "the materialized view is the wire payload; discarding it drops the snapshot"]
-pub fn materialize(
-    source: &SnapshotSource,
-    scope: &Scope,
-    peer_svid: Option<&PeerSvid>,
-) -> MaterializedView {
+pub fn materialize(source: &SnapshotSource, scope: &Scope) -> MaterializedView {
     let seq = source.publish.current_seq();
     match scope {
         Scope::SharedPool => {
@@ -141,20 +144,8 @@ pub fn materialize(
         Scope::Gateway { name, namespace } => {
             let key = ObjectKey::new(namespace.clone(), name.clone());
             let registry = source.dedicated.load();
-            match registry.get(&key) {
+            match registry.map.get(&key) {
                 Some(snap) => {
-                    // Build-time SVID binding: a Gateway entry that appeared after
-                    // the open-time check must still be served only to its bound
-                    // proxy identity, else an empty (seq-0) world.
-                    if let Some(peer) = peer_svid
-                        && !svid_matches_dedicated_gateway(
-                            &peer.uri_sans,
-                            namespace,
-                            &snap.expected_proxy_sa,
-                        )
-                    {
-                        return empty_view();
-                    }
                     let empty_ingress = IngressRoutingTable::default();
                     let empty_pt = TlsPassthroughTable::default();
                     let empty_tcp = TcpRouteTable::default();
@@ -203,15 +194,23 @@ fn build_namespace_view(source: &SnapshotSource, namespace: &str, seq: u64) -> M
     let mut all: Vec<p::Resource> = Vec::new();
     let mut any_gateway = false;
 
-    let mut matching: Vec<_> = registry
-        .iter()
-        .filter(|(key, _)| key.ns == namespace)
-        .collect();
-    // Deterministic iteration order (the registry is a HashMap): sort by name
-    // so repeated materializations of the same cells fold identically.
-    matching.sort_by(|(a, _), (b, _)| a.name.cmp(&b.name));
+    // Namespace fan-out via the prebuilt `by_ns` index (#621) — O(gateways in ns)
+    // instead of scanning every dedicated Gateway in the cluster per namespace.
+    let mut keys: Vec<&ObjectKey> = registry
+        .by_ns
+        .get(namespace)
+        .map(|keys| keys.iter().collect())
+        .unwrap_or_default();
+    // Deterministic iteration order (the index Vec follows HashMap insertion):
+    // sort by name so repeated materializations of the same cells fold identically.
+    keys.sort_by(|a, b| a.name.cmp(&b.name));
 
-    for (key, snap) in matching {
+    for key in keys {
+        // Always present — `by_ns` is derived from `map` at construction — but a
+        // missing entry degrades to one skipped Gateway rather than a panic.
+        let Some(snap) = registry.map.get(key) else {
+            continue;
+        };
         any_gateway = true;
         let mut gw_resources: Vec<p::Resource> = Vec::new();
         gw_resources.extend(gateway_route_resources(&snap.gateway, &mut endpoints));
@@ -245,9 +244,14 @@ fn build_namespace_view(source: &SnapshotSource, namespace: &str, seq: u64) -> M
 }
 
 /// A deliberately-empty world at seq 0 (fail-closed dedicated branches).
-fn empty_view() -> MaterializedView {
+///
+/// Also the per-subscriber SVID-mismatch result served by [`crate::server::view_for`]:
+/// the Gateway view cache holds the SVID-independent real world, and a denied
+/// peer is handed this uncached empty world instead (never advancing its #531
+/// convergence stamp).
+pub(crate) fn empty_view() -> MaterializedView {
     MaterializedView {
-        version: ContentHash::from_per_resource(Vec::new())
+        version: ContentHash::from_per_resource(std::iter::empty())
             .as_str()
             .to_owned(),
         seq: 0,
@@ -297,7 +301,7 @@ fn fold_resources(all: Vec<p::Resource>, seq: u64) -> MaterializedView {
         let Ok(key) = canonical_key(&resource) else {
             continue;
         };
-        let hash = resource_hash(&resource);
+        let hash: Arc<str> = Arc::from(resource_hash(&resource));
         let prev = resources.insert(
             key,
             ResourceEntry {
@@ -319,11 +323,11 @@ fn fold_resources(all: Vec<p::Resource>, seq: u64) -> MaterializedView {
     // are consistent-by-construction with `resources` even under a hypothetical
     // duplicate-key overwrite. `from_per_resource` is order-independent, so the
     // BTreeMap iteration order is irrelevant.
-    let resource_hashes: BTreeMap<String, String> = resources
+    let resource_hashes: BTreeMap<String, Arc<str>> = resources
         .iter()
-        .map(|(key, entry)| (key.clone(), entry.hash.clone()))
+        .map(|(key, entry)| (key.clone(), Arc::clone(&entry.hash)))
         .collect();
-    let version = ContentHash::from_per_resource(resource_hashes.values().cloned().collect())
+    let version = ContentHash::from_per_resource(resource_hashes.values().map(|h| &**h))
         .as_str()
         .to_owned();
 
@@ -338,7 +342,9 @@ fn fold_resources(all: Vec<p::Resource>, seq: u64) -> MaterializedView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use coxswain_core::dedicated_registry::{DedicatedRoutingRegistry, DedicatedRoutingSnapshot};
+    use coxswain_core::dedicated_registry::{
+        DedicatedRegistryData, DedicatedRoutingRegistry, DedicatedRoutingSnapshot,
+    };
     use coxswain_core::listener_status::SharedGatewayListenerStatus;
     use coxswain_core::publish_index::SharedGatewayPublishIndex;
     use coxswain_core::routing::{
@@ -387,8 +393,8 @@ mod tests {
     #[test]
     fn materialize_is_deterministic() {
         let source = source_with_ingress(ingress_with_route());
-        let a = materialize(&source, &Scope::SharedPool, None);
-        let b = materialize(&source, &Scope::SharedPool, None);
+        let a = materialize(&source, &Scope::SharedPool);
+        let b = materialize(&source, &Scope::SharedPool);
         assert_eq!(a.version, b.version, "same cells → same global version");
         let ka: Vec<&String> = a.resources.keys().collect();
         let kb: Vec<&String> = b.resources.keys().collect();
@@ -410,7 +416,6 @@ mod tests {
                 name: "gw".to_owned(),
                 namespace: "prod".to_owned(),
             },
-            None,
         );
         assert!(view.resources.is_empty(), "fail-closed empty world");
         assert_eq!(view.seq, 0, "empty world records seq 0");
@@ -446,7 +451,7 @@ mod tests {
             let key = ObjectKey::new((*ns).to_owned(), (*name).to_owned());
             map.insert(key, Arc::new(dedicated_snapshot(host, name)));
         }
-        dedicated.store(Arc::new(map));
+        dedicated.store(Arc::new(DedicatedRegistryData::from_map(map)));
 
         // Stamp each Gateway's publish-seq via its own incremental rebuild call,
         // always re-including every previously-stamped Gateway at the same
@@ -489,7 +494,6 @@ mod tests {
             &Scope::Namespace {
                 namespace: "prod".to_owned(),
             },
-            None,
         );
         assert!(
             view.resources
@@ -543,7 +547,6 @@ mod tests {
             &Scope::Namespace {
                 namespace: "other-ns".to_owned(),
             },
-            None,
         );
         assert!(view.resources.is_empty(), "fail-closed empty world");
         assert_eq!(view.seq, 0, "empty world records seq 0");
@@ -564,8 +567,8 @@ mod tests {
         let scope = Scope::Namespace {
             namespace: "prod".to_owned(),
         };
-        let view_before = materialize(&before, &scope, None);
-        let view_after = materialize(&after, &scope, None);
+        let view_before = materialize(&before, &scope);
+        let view_after = materialize(&after, &scope);
 
         let gw_a_key = "gw|prod|gw-a|route|gateway|443|exact|a.example.com";
         assert_eq!(

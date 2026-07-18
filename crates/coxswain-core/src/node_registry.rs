@@ -451,6 +451,13 @@ struct RegistryInner {
     /// Deliberately NOT bumped on ack/target stamps: those arrive on every
     /// snapshot push and would re-drive gate consumers on unrelated traffic.
     notify: watch::Sender<u64>,
+    /// Roster-change channel bumped on **every** mutation — including the ack and
+    /// target stamps [`Self::notify`] deliberately skips (#621). Its sole consumer
+    /// is the relay's roster reporter, which republishes the whole registry
+    /// upstream: it must observe ack-only changes (they carry the `acked_seq` the
+    /// controller's #531 gate needs) yet must not re-drive the gate consumers. A
+    /// separate channel keeps the two firing policies independent.
+    roster: watch::Sender<u64>,
 }
 
 impl Default for SharedNodeRegistry {
@@ -458,6 +465,7 @@ impl Default for SharedNodeRegistry {
         Self(Arc::new(RegistryInner {
             map: Mutex::new(NodeRegistry::default()),
             notify: watch::Sender::new(0),
+            roster: watch::Sender::new(0),
         }))
     }
 }
@@ -476,6 +484,12 @@ impl SharedNodeRegistry {
         self.0.notify.send_modify(|v| *v = v.wrapping_add(1));
     }
 
+    /// Bump the roster-change watch (#621). Same lock-release discipline as
+    /// [`Self::bump`]: the caller must have dropped the map guard first.
+    fn bump_roster(&self) {
+        self.0.roster.send_modify(|v| *v = v.wrapping_add(1));
+    }
+
     /// Subscribe to membership and bound-port changes.
     ///
     /// The carried `u64` is an opaque change counter — consumers should treat
@@ -484,6 +498,17 @@ impl SharedNodeRegistry {
     #[must_use]
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.0.notify.subscribe()
+    }
+
+    /// Subscribe to the roster-change watch — fires on **every** mutation,
+    /// including the ack/target stamps [`Self::subscribe`] skips (#621).
+    ///
+    /// The carried `u64` is an opaque change counter; treat any change as
+    /// "re-read the registry via [`Self::load`]". The relay's roster reporter is
+    /// the only intended consumer.
+    #[must_use]
+    pub fn subscribe_roster(&self) -> watch::Receiver<u64> {
+        self.0.roster.subscribe()
     }
 
     /// Register a freshly-connected node within a discovery scope.
@@ -507,6 +532,7 @@ impl SharedNodeRegistry {
         };
         self.0.map.lock().nodes.insert(node_id.to_owned(), entry);
         self.bump();
+        self.bump_roster();
     }
 
     /// Record a successful ACK from a node, updating its convergence state.
@@ -519,10 +545,20 @@ impl SharedNodeRegistry {
     /// re-evaluate within seconds.
     pub fn record_ack(&self, node_id: &str, version: String, seq: u64, now: SystemTime) {
         let mut guard = self.0.map.lock();
-        if let Some(entry) = guard.nodes.get_mut(node_id) {
+        let changed = if let Some(entry) = guard.nodes.get_mut(node_id) {
             entry.last_acked_version = Some(version);
             entry.last_ack_at = Some(now);
             entry.last_acked_seq = Some(entry.last_acked_seq.unwrap_or(0).max(seq));
+            true
+        } else {
+            false
+        };
+        drop(guard);
+        // Roster-only (#621): an Ack changes the roster the relay republishes
+        // (its `acked_seq`), but must NOT fire `notify` — that would re-drive the
+        // #531 gate consumers on every snapshot push.
+        if changed {
+            self.bump_roster();
         }
     }
 
@@ -536,8 +572,16 @@ impl SharedNodeRegistry {
     /// of the last *content-changing* push. Monotone: never moves backwards.
     pub fn advance_acked_seq(&self, node_id: &str, seq: u64) {
         let mut guard = self.0.map.lock();
-        if let Some(entry) = guard.nodes.get_mut(node_id) {
+        let changed = if let Some(entry) = guard.nodes.get_mut(node_id) {
             entry.last_acked_seq = Some(entry.last_acked_seq.unwrap_or(0).max(seq));
+            true
+        } else {
+            false
+        };
+        drop(guard);
+        // Roster-only (#621): advances the roster's `acked_seq`, no `notify`.
+        if changed {
+            self.bump_roster();
         }
     }
 
@@ -549,8 +593,17 @@ impl SharedNodeRegistry {
     /// [`Self::record_ack`]).
     pub fn record_target(&self, node_id: &str, version: String) {
         let mut guard = self.0.map.lock();
-        if let Some(entry) = guard.nodes.get_mut(node_id) {
+        let changed = if let Some(entry) = guard.nodes.get_mut(node_id) {
             entry.target_version = Some(version);
+            true
+        } else {
+            false
+        };
+        drop(guard);
+        // Roster-only (#621): a target stamp changes the republished roster, no
+        // `notify` (it arrives on every snapshot build).
+        if changed {
+            self.bump_roster();
         }
     }
 
@@ -570,6 +623,7 @@ impl SharedNodeRegistry {
         entry.bound_ports = Some(ports);
         drop(guard);
         self.bump();
+        self.bump_roster();
     }
 
     /// Fold a relay's `RosterReport` into the registry (#585): wholesale-replace
@@ -629,6 +683,7 @@ impl SharedNodeRegistry {
         }
         drop(guard);
         self.bump();
+        self.bump_roster();
     }
 
     /// Evict a relay's entire subtree (#585): remove every entry whose `parent`
@@ -647,6 +702,7 @@ impl SharedNodeRegistry {
         drop(guard);
         if removed {
             self.bump();
+            self.bump_roster();
         }
     }
 
@@ -661,7 +717,9 @@ impl SharedNodeRegistry {
     /// None — this is infallible.
     #[must_use]
     pub fn all_in_sync(&self) -> bool {
-        self.load().nodes.values().all(NodeEntry::in_sync)
+        // Lock-only (#621): reconcile passes ask this per cycle; cloning the whole
+        // node map just to fold a bool over it was O(nodes) of pure waste.
+        self.0.map.lock().nodes.values().all(NodeEntry::in_sync)
     }
 
     /// Content hash of the controller's current SharedPool snapshot, derived
@@ -674,7 +732,9 @@ impl SharedNodeRegistry {
     /// deterministic pick avoids returning a different value on each call.
     #[must_use]
     pub fn controller_version(&self) -> Option<String> {
-        self.load().controller_version()
+        // Lock-only (#621): fold the min-node's version under the mutex instead of
+        // deep-cloning the map to read one field.
+        self.0.map.lock().controller_version()
     }
 
     /// Quorum query without a snapshot clone (#531): evaluates
@@ -718,6 +778,15 @@ impl SharedNodeRegistry {
             .gateway_node_acked(namespace, name, min_seq)
     }
 
+    /// Live per-Gateway leaf count without a snapshot clone (#621): evaluates
+    /// [`NodeRegistry::gateway_node_count`] under the mutex. The reconciler sets
+    /// the `coxswain_gateway_dataplane_proxies` gauge from this every pass, so
+    /// cloning the whole map for a count was O(nodes) of waste.
+    #[must_use]
+    pub fn gateway_node_count(&self, namespace: &str, name: &str) -> usize {
+        self.0.map.lock().gateway_node_count(namespace, name)
+    }
+
     /// Remove a node's row on stream exit.
     ///
     /// No-op if the node is not present.
@@ -725,6 +794,7 @@ impl SharedNodeRegistry {
         let removed = self.0.map.lock().nodes.remove(node_id).is_some();
         if removed {
             self.bump();
+            self.bump_roster();
         }
     }
 
@@ -1556,5 +1626,35 @@ mod tests {
         assert_eq!(entry.target_version.as_deref(), Some("v1"));
         assert_eq!(entry.last_acked_version.as_deref(), Some("v1"));
         assert!(entry.in_sync());
+    }
+
+    /// #621: an Ack fires the roster-change channel (the relay must republish the
+    /// new `acked_seq`) but NOT the #531 gate channel; and a no-op Ack on an
+    /// absent node bumps neither — an idle relay's reporter stays parked.
+    #[test]
+    fn roster_channel_fires_on_ack_while_gate_channel_stays_quiet() {
+        let reg = SharedNodeRegistry::new();
+        reg.connect("node-a", shared(), now());
+        // Subscribe AFTER connect so both channels start caught-up.
+        let notify = reg.subscribe();
+        let mut roster = reg.subscribe_roster();
+
+        reg.record_ack("node-a", "v1".to_owned(), 5, now());
+        assert!(
+            !notify.has_changed().expect("notify alive"),
+            "an Ack must not re-drive the #531 gate consumers"
+        );
+        assert!(
+            roster.has_changed().expect("roster alive"),
+            "an Ack must fire the roster-change channel"
+        );
+
+        // A no-op Ack on an absent node bumps nothing (the idle-relay guarantee).
+        let _ = roster.borrow_and_update();
+        reg.record_ack("ghost", "v1".to_owned(), 9, now());
+        assert!(
+            !roster.has_changed().expect("roster alive"),
+            "a no-op Ack on an absent node must not bump the roster counter"
+        );
     }
 }

@@ -68,13 +68,18 @@ impl ContentHash {
 
     /// Compute the global hash from a set of per-resource hex hashes.
     ///
-    /// Sorts `hashes` in place before concatenating so the result is
+    /// Borrows the digests (they live in the caller's `Arc<str>`-valued digest
+    /// maps) and sorts a `&str` view before concatenating, so the result is
     /// independent of the order the controller's HashMap/BTreeMap iterators
-    /// happened to yield the resources.
+    /// happened to yield the resources — without cloning any digest string.
     #[must_use]
-    pub fn from_per_resource(mut hashes: Vec<String>) -> Self {
+    pub fn from_per_resource<'a>(hashes: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut hashes: Vec<&str> = hashes.into_iter().collect();
         hashes.sort_unstable();
-        let combined: String = hashes.concat();
+        let mut combined = String::with_capacity(hashes.iter().map(|h| h.len()).sum());
+        for h in hashes {
+            combined.push_str(h);
+        }
         Self::compute(combined.as_bytes())
     }
 
@@ -119,8 +124,8 @@ mod tests {
 
     #[test]
     fn from_per_resource_is_order_independent() {
-        let h1 = ContentHash::from_per_resource(vec!["aaa".to_string(), "bbb".to_string()]);
-        let h2 = ContentHash::from_per_resource(vec!["bbb".to_string(), "aaa".to_string()]);
+        let h1 = ContentHash::from_per_resource(["aaa", "bbb"]);
+        let h2 = ContentHash::from_per_resource(["bbb", "aaa"]);
         assert_eq!(h1.as_str(), h2.as_str());
     }
 }
