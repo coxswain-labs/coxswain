@@ -19,7 +19,9 @@ use super::relay_autoscaler::{
     should_provision,
 };
 use super::relay_params::EffectiveRelayPolicy;
-use super::relay_reconcile::{clamp_u32_to_i32, clamp_usize, delete_relay_resources};
+use super::relay_reconcile::{
+    clamp_u32_to_i32, clamp_usize, delete_relay_resources, leadership_changed, registry_changed,
+};
 use super::render_relay::{self, RelayRenderInputs, RelayVariant};
 use super::render_shared_proxy::{SharedProxyRenderInputs, render_shared_proxy};
 use coxswain_core::crd::RelayAutoscaling;
@@ -86,30 +88,6 @@ pub(crate) async fn run_shared_install_reconciler(
             // pass, so its provision/GC decision sees the pool's current state.
             converge_shared_pool(&ctx, Instant::now()).await;
         }
-    }
-}
-
-/// Await the next node-registry membership change, or park forever when the
-/// registry is unwired (tests) so the `select!` arm never fires.
-async fn registry_changed(registry: &mut Option<watch::Receiver<u64>>) {
-    match registry {
-        Some(rx) => {
-            let _ = rx.changed().await;
-        }
-        None => std::future::pending().await,
-    }
-}
-
-/// Await the next leadership change, or park forever when leadership is unwired
-/// (tests) so the `select!` arm never fires.
-async fn leadership_changed(leadership: &mut Option<watch::Receiver<bool>>) {
-    match leadership {
-        Some(rx) => {
-            // A closed sender (controller shutting down) ends the wait; the
-            // shutdown arm handles teardown, so treat it as a benign no-op.
-            let _ = rx.changed().await;
-        }
-        None => std::future::pending().await,
     }
 }
 
@@ -277,16 +255,16 @@ async fn converge_shared_pool(ctx: &ReconcileContext, now: Instant) {
 /// tolerance fall back to their flag defaults. `enabled: Some(false)` when tiering
 /// is off force-tears-down any running shared relay (the KEDA force-off path).
 fn shared_relay_tuning(ctx: &ReconcileContext) -> RelayTuning {
-    let floor = ctx.relay_replicas.max(1);
+    let floor = ctx.relay.replicas.max(1);
     let policy = EffectiveRelayPolicy {
-        enabled: (!ctx.relay_enabled).then_some(false),
+        enabled: (!ctx.relay.enabled).then_some(false),
         replicas: None,
         resources: None,
         pod_template: None,
         autoscaling: Some(RelayAutoscaling::capped(
             floor,
-            ctx.relay_max_replicas.max(floor),
-            ctx.relay_target_proxies_per_replica.max(1),
+            ctx.relay.max_replicas.max(floor),
+            ctx.relay.target_proxies_per_replica.max(1),
         )),
     };
     RelayTuning::resolve(&policy, ctx.relay_tuning_defaults())
@@ -334,9 +312,9 @@ async fn apply_shared_relay_at(
     pdb_ceiling: u32,
 ) -> Result<(), super::apply::ApplyError> {
     let resources = render_relay::relay_resources(
-        &ctx.relay_cpu_request,
-        &ctx.relay_memory_request,
-        &ctx.relay_memory_limit,
+        &ctx.relay.cpu_request,
+        &ctx.relay.memory_request,
+        &ctx.relay.memory_limit,
     );
     let rendered = render_relay::render_relay(&RelayRenderInputs {
         variant: RelayVariant::Shared {

@@ -32,6 +32,7 @@
 //! leaves) can therefore diverge in timing without ever pointing a proxy at a
 //! not-yet-serving or already-deleted relay.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use coxswain_core::crd::RelayAutoscaling;
@@ -192,8 +193,10 @@ pub(super) struct RelayNsRecord {
     pub(super) state: RelayNsState,
     /// Replica count last applied to the Deployment — the sizing baseline.
     pub(super) current_replicas: u32,
-    /// Trailing `(instant, signal)` samples within the stabilization window.
-    history: Vec<(Instant, u32)>,
+    /// Trailing `(instant, signal)` samples within the stabilization window,
+    /// oldest-first. Samples are appended in time order, so expiry is always
+    /// front-only ([`Self::observe`] pops the expired head instead of an O(n) scan).
+    history: VecDeque<(Instant, u32)>,
     /// Instant the signal first fell below `H`, or `None` while at/above it.
     below_since: Option<Instant>,
 }
@@ -205,7 +208,7 @@ impl RelayNsRecord {
         Self {
             state,
             current_replicas: replicas.max(1),
-            history: Vec::new(),
+            history: VecDeque::new(),
             below_since: None,
         }
     }
@@ -215,10 +218,16 @@ impl RelayNsRecord {
     /// called before [`Self::decide`]; observations advance regardless of the I/O
     /// outcome.
     pub(super) fn observe(&mut self, now: Instant, signal: u32, tuning: &RelayTuning) {
-        self.history.push((now, signal));
+        self.history.push_back((now, signal));
         let window = tuning.stabilization;
-        self.history
-            .retain(|(t, _)| now.duration_since(*t) <= window);
+        // Samples are appended in time order, so every expired entry is at the
+        // front — pop the head until the oldest is inside the window.
+        while let Some(&(t, _)) = self.history.front() {
+            if now.duration_since(t) <= window {
+                break;
+            }
+            self.history.pop_front();
+        }
         if signal >= tuning.activation_threshold {
             self.below_since = None;
         } else if self.below_since.is_none() {
@@ -345,19 +354,9 @@ impl RelayNsRecord {
     /// relays return their fixed count; autoscaled relays apply the tolerance
     /// deadband and scale-down stabilization.
     fn autoscaled_size(&self, tuning: &RelayTuning) -> (u32, u32) {
-        let Some(a) = &tuning.autoscaling else {
+        let Some((min, max, target)) = autoscaling_bounds(tuning) else {
             return (tuning.static_replicas, tuning.static_replicas);
         };
-        // `resolve` only keeps an autoscaling policy with a set cap.
-        let Some(max) = a.max_replicas else {
-            return (tuning.static_replicas, tuning.static_replicas);
-        };
-        let max = max.max(1);
-        let min = a
-            .min_replicas
-            .unwrap_or(tuning.static_replicas)
-            .clamp(1, max);
-        let target = a.target_proxies_per_replica.unwrap_or(tuning.target).max(1);
         let signal = self.latest_signal();
         let current = self.current_replicas.clamp(min, max);
         let up = desired_from_signal(signal, target, min, max, current, tuning.tolerance);
@@ -379,7 +378,7 @@ impl RelayNsRecord {
     }
 
     fn latest_signal(&self) -> u32 {
-        self.history.last().map_or(0, |(_, s)| *s)
+        self.history.back().map_or(0, |(_, s)| *s)
     }
 }
 
@@ -387,19 +386,27 @@ impl RelayNsRecord {
 /// enter `Provisioning` (#602). A fresh relay has no sizing baseline, so it starts
 /// at the clamped `ceil(signal/target)` (autoscaled) or the static count.
 pub(super) fn initial_size(signal: u32, tuning: &RelayTuning) -> (u32, u32) {
-    let Some(a) = &tuning.autoscaling else {
+    let Some((min, max, target)) = autoscaling_bounds(tuning) else {
         return (tuning.static_replicas, tuning.static_replicas);
     };
-    let Some(max) = a.max_replicas else {
-        return (tuning.static_replicas, tuning.static_replicas);
-    };
-    let max = max.max(1);
+    (signal.div_ceil(target).clamp(min, max), max)
+}
+
+/// The resolved `(min, max, target-proxies-per-replica)` autoscaling bounds for a
+/// relay, or `None` when it is static — no autoscaling policy, or a policy without
+/// a cap (`resolve` only keeps a capped one). A `None` return means the caller
+/// sizes to `(static_replicas, static_replicas)`. `max` is floored at 1, `min` is
+/// clamped into `[1, max]`, and `target` at 1, so the returned triple is always a
+/// valid sizing domain.
+fn autoscaling_bounds(tuning: &RelayTuning) -> Option<(u32, u32, u32)> {
+    let a = tuning.autoscaling.as_ref()?;
+    let max = a.max_replicas?.max(1);
     let min = a
         .min_replicas
         .unwrap_or(tuning.static_replicas)
         .clamp(1, max);
     let target = a.target_proxies_per_replica.unwrap_or(tuning.target).max(1);
-    (signal.div_ceil(target).clamp(min, max), max)
+    Some((min, max, target))
 }
 
 /// Whether a namespace with no relay should provision one this pass (#602) — the

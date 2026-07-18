@@ -596,37 +596,17 @@ impl Controller {
                             // fencing margin; on timeout/error the pass proceeds with
                             // the current set (no worse than pre-#593).
                             if let Some(op_ctx) = &op_ctx_promotion {
-                                match tokio::time::timeout(
-                                    REHYDRATE_BOUND,
+                                rehydrate_on_promotion(
+                                    "relay-tracking",
                                     op_ctx.rehydrate_provisioned_relays(),
                                 )
-                                .await
-                                {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(e)) => tracing::warn!(
-                                        error = %e,
-                                        "operator: relay-tracking rehydration on promotion failed"
-                                    ),
-                                    Err(_) => tracing::warn!(
-                                        "operator: relay-tracking rehydration on promotion timed out"
-                                    ),
-                                }
+                                .await;
                                 // Same for the shared-relay cell (#605).
-                                match tokio::time::timeout(
-                                    REHYDRATE_BOUND,
+                                rehydrate_on_promotion(
+                                    "shared-relay",
                                     op_ctx.rehydrate_shared_relay(),
                                 )
-                                .await
-                                {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(e)) => tracing::warn!(
-                                        error = %e,
-                                        "operator: shared-relay rehydration on promotion failed"
-                                    ),
-                                    Err(_) => tracing::warn!(
-                                        "operator: shared-relay rehydration on promotion timed out"
-                                    ),
-                                }
+                                .await;
                             }
                             // Re-enqueue the whole world so objects observed while we
                             // were standby (status writes gated off) are reconciled
@@ -939,6 +919,24 @@ async fn dispatch(
         // degrade, never a panic (the control plane must not crash on a new
         // variant). See memory `non_exhaustive_wildcard_panic`.
         _ => StatusOutcome::AwaitChange,
+    }
+}
+
+/// Run one relay-rehydration future on the leader-promotion edge under
+/// [`REHYDRATE_BOUND`], logging (never failing the promotion) on error or timeout.
+/// `what` names the subsystem for the warn line (e.g. `relay-tracking`,
+/// `shared-relay`). The bound keeps a hung LIST from eroding the lease-renewal
+/// fencing margin; on timeout/error the pass proceeds with the current set.
+async fn rehydrate_on_promotion(
+    what: &str,
+    fut: impl std::future::Future<Output = Result<(), kube::Error>>,
+) {
+    match tokio::time::timeout(REHYDRATE_BOUND, fut).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "operator: {what} rehydration on promotion failed")
+        }
+        Err(_) => tracing::warn!("operator: {what} rehydration on promotion timed out"),
     }
 }
 

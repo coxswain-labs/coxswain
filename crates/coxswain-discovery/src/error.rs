@@ -4,9 +4,8 @@ use thiserror::Error;
 
 /// Errors raised by the discovery server, client, and wire codec.
 ///
-/// Variants are seeded minimally here; subsequent tickets (T4 client, T5 server,
-/// T6 mTLS) extend this set. The type is `#[non_exhaustive]` so additions are
-/// not breaking changes for downstream crates.
+/// Covers the client, server, and mTLS paths. The type is `#[non_exhaustive]` so
+/// new variants are not breaking changes for downstream crates.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum DiscoveryError {

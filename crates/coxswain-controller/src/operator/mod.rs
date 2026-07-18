@@ -64,7 +64,7 @@ pub(crate) mod shared_install;
 pub(crate) mod status;
 pub(crate) mod vip;
 
-pub use reconciler::OperatorConfig;
+pub use reconciler::{OperatorConfig, RelayConfig};
 pub use render_shared_proxy::SharedProxyConfig;
 // #574 fold: the operator no longer runs as its own `BackgroundService`. The
 // controller builds the reconcile context off the reflector's `OperatorStores`,

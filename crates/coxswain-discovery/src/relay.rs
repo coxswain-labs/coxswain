@@ -32,7 +32,7 @@ use coxswain_core::ownership::ObjectKey;
 use coxswain_core::publish_index::SharedGatewayPublishIndex;
 use tokio::sync::{broadcast, watch};
 
-use crate::apply::{ApplyStats, RoutingApplier, SnapshotApplier};
+use crate::apply::{ApplyStats, RoutingApplier, SnapshotApplier, wire_from_key_err};
 use crate::client::{DiscoveryClientConfig, Supervisor, UpstreamDirectiveHandler};
 use crate::error::{DiscoveryError, WireError};
 use crate::proto::v1 as p;
@@ -196,8 +196,6 @@ pub(crate) struct NamespaceDemux {
     /// than the whole staged world on every message (#621). The version self-check
     /// folds this map order-independently.
     resource_hashes: HashMap<Arc<str>, Arc<str>>,
-    /// Whether a full has been applied on this session-spanning cache.
-    has_full: bool,
     /// Downstream-serving registry (shared with the relay's `SnapshotSource`).
     dedicated: DedicatedRoutingRegistry,
     /// Downstream-serving publish index (shared with the `SnapshotSource`). The
@@ -212,7 +210,6 @@ impl NamespaceDemux {
         Self {
             resources: HashMap::new(),
             resource_hashes: HashMap::new(),
-            has_full: false,
             dedicated: DedicatedRoutingRegistry::new(),
             publish: SharedGatewayPublishIndex::new(),
         }
@@ -327,7 +324,6 @@ impl SnapshotApplier for NamespaceDemux {
         self.publish.advance_to(rebuilt.max_publish_seq);
         self.resources = staged.resources;
         self.resource_hashes = staged.hashes;
-        self.has_full = true;
         Ok(ApplyStats::default())
     }
 }
@@ -477,14 +473,6 @@ fn dedicated_snapshot_from_resources(
         listener_status: (**cells.listener_status.load()).clone(),
         expected_proxy_sa,
     })
-}
-
-/// Map a resource-key error into the crate's wire error, mirroring the proxy
-/// apply path's own conversion so both fail closed on an unkeyable resource.
-fn wire_from_key_err(_e: crate::wire::resource::ResourceKeyError) -> WireError {
-    WireError::UnknownResourceKey {
-        reason: "namespace-view resource could not be canonically keyed",
-    }
 }
 
 #[cfg(test)]

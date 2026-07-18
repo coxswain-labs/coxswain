@@ -58,8 +58,10 @@ pub(crate) use crate::RELAY_SERVICE_ACCOUNT as RELAY_NAME;
 /// upstream resolver, and the pool's `expected_server_sa` share one source.
 pub(crate) use crate::SHARED_RELAY_SERVICE_ACCOUNT as SHARED_RELAY_NAME;
 
-/// `app.kubernetes.io/component` value stamped on every per-namespace relay resource.
-const RELAY_COMPONENT: &str = "namespace-relay";
+/// `app.kubernetes.io/component` value stamped on every per-namespace relay resource
+/// (`relay-namespace` — same `relay-<qualifier>` shape as [`SHARED_RELAY_COMPONENT`]
+/// and the `coxswain-relay*` resource names).
+const RELAY_COMPONENT: &str = "relay-namespace";
 
 /// `app.kubernetes.io/component` value stamped on every shared-pool relay resource
 /// (#605) — distinct from [`RELAY_COMPONENT`] so the two tiers' resources never
@@ -190,11 +192,7 @@ pub(crate) struct RenderedRelay {
 /// rehydration `LIST` in [`super::reconciler`] so the query can never drift from
 /// the labels [`relay_labels`] stamps.
 pub(super) fn relay_component_label_selector() -> String {
-    component_label_selector(RELAY_COMPONENT)
-}
-
-fn component_label_selector(component: &str) -> String {
-    format!("app.kubernetes.io/name=coxswain,app.kubernetes.io/component={component}")
+    format!("app.kubernetes.io/name=coxswain,app.kubernetes.io/component={RELAY_COMPONENT}")
 }
 
 /// The reserved label set every relay resource carries. The Service/Deployment

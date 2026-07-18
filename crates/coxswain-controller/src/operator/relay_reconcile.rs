@@ -33,6 +33,8 @@ use kube::{Api, Client, Resource as _, api::DeleteParams};
 use pingora_core::server::ShutdownWatch;
 use tokio::sync::watch;
 
+use coxswain_core::crd::CoxswainGatewayParameters;
+use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 
 use super::reconciler::{ReconcileContext, ignore_not_found, namespace_is_terminating};
@@ -92,10 +94,13 @@ pub(crate) async fn run_relay_reconciler(
 }
 
 /// Await the next leadership change, or park forever when leadership is unwired
-/// (tests) so the `select!` arm never fires.
-async fn leadership_changed(leadership: &mut Option<watch::Receiver<bool>>) {
+/// (tests) so the `select!` arm never fires. Shared by both serialized
+/// single-writer passes (this loop and [`super::run_shared_install_reconciler`]).
+pub(super) async fn leadership_changed(leadership: &mut Option<watch::Receiver<bool>>) {
     match leadership {
         Some(rx) => {
+            // A closed sender (controller shutting down) ends the wait; the
+            // shutdown arm handles teardown, so treat it as a benign no-op.
             let _ = rx.changed().await;
         }
         None => std::future::pending().await,
@@ -103,8 +108,10 @@ async fn leadership_changed(leadership: &mut Option<watch::Receiver<bool>>) {
 }
 
 /// Await the next node-registry membership change, or park forever when the
-/// registry is unwired (tests).
-async fn registry_changed(registry: &mut Option<watch::Receiver<u64>>) {
+/// registry is unwired (tests) so the `select!` arm never fires. Shared by both
+/// serialized single-writer passes (this loop and
+/// [`super::run_shared_install_reconciler`]).
+pub(super) async fn registry_changed(registry: &mut Option<watch::Receiver<u64>>) {
     match registry {
         Some(rx) => {
             let _ = rx.changed().await;
@@ -139,10 +146,16 @@ async fn relay_pass(ctx: &Arc<ReconcileContext>) {
 /// relay candidates), by the same class-match + `params::resolve` decision the
 /// per-Gateway reconcile makes.
 fn namespaces_with_dedicated_gateways(ctx: &ReconcileContext) -> BTreeSet<String> {
+    // Snapshot the class and params stores once for the whole pass: each `state()`
+    // call allocates a fresh `Vec` (`coxswain_reflector::MergedStore::state`), so
+    // re-reading them inside the per-Gateway (and per-ParamsRef) match below would be
+    // O(gateways × store-size) snapshot allocations per relay pass.
+    let classes = ctx.class_store.state();
+    let params = ctx.params_store.state();
     let mut set = BTreeSet::new();
     for gw in ctx.gateways_store.state().iter() {
         if let Some(namespace) = gw.metadata.namespace.as_deref()
-            && is_owned_active_dedicated(ctx, gw)
+            && is_owned_active_dedicated(gw, &ctx.controller_name, &classes, &params)
         {
             set.insert(namespace.to_owned());
         }
@@ -152,27 +165,30 @@ fn namespaces_with_dedicated_gateways(ctx: &ReconcileContext) -> BTreeSet<String
 
 /// Whether `gw` is an owned, non-terminating, dedicated-mode Gateway — the same
 /// class-match + `params::resolve` decision the per-Gateway reconcile makes, read
-/// only for candidate enumeration.
-fn is_owned_active_dedicated(ctx: &ReconcileContext, gw: &Gateway) -> bool {
+/// only for candidate enumeration. Takes the class and params snapshots by slice so
+/// the caller reads each store once per pass, not once per Gateway.
+fn is_owned_active_dedicated(
+    gw: &Gateway,
+    controller_name: &str,
+    classes: &[Arc<GatewayClass>],
+    params: &[Arc<CoxswainGatewayParameters>],
+) -> bool {
     if gw.metadata.deletion_timestamp.is_some() {
         return false;
     }
     let class_name = &gw.spec.gateway_class_name;
-    let Some(class) = ctx
-        .class_store
-        .state()
-        .into_iter()
+    let Some(class) = classes
+        .iter()
         .find(|gc| gc.meta().name.as_deref() == Some(class_name.as_str()))
     else {
         return false;
     };
-    if class.spec.controller_name != ctx.controller_name {
+    if class.spec.controller_name != controller_name {
         return false;
     }
     matches!(
-        params::resolve(gw, &class, |r: &params::ParamsRef| {
-            ctx.params_store
-                .state()
+        params::resolve(gw, class, |r: &params::ParamsRef| {
+            params
                 .iter()
                 .find(|p| {
                     p.meta().namespace.as_deref() == Some(r.namespace.as_str())
@@ -202,7 +218,7 @@ async fn process_namespace(
     // namespace's own `enabled: false` uses (mirrors `shared_relay_tuning` in
     // `shared_install.rs`). Without this, `enabled_override` stays `None` here
     // (no per-namespace policy) and `should_deactivate` never force-triggers (#616).
-    if !ctx.relay_enabled {
+    if !ctx.relay.enabled {
         policy.enabled = Some(false);
     }
     let tuning = RelayTuning::resolve(&policy, ctx.relay_tuning_defaults());
@@ -329,9 +345,9 @@ async fn apply_relay_at(
 ) -> Result<(), apply::ApplyError> {
     let resources = policy.resources.clone().or_else(|| {
         render_relay::relay_resources(
-            &ctx.relay_cpu_request,
-            &ctx.relay_memory_request,
-            &ctx.relay_memory_limit,
+            &ctx.relay.cpu_request,
+            &ctx.relay.memory_request,
+            &ctx.relay.memory_limit,
         )
     });
     let rendered = render_relay::render_relay(&RelayRenderInputs {
@@ -364,7 +380,7 @@ pub(super) async fn delete_relay_resources(
     client: &Client,
     namespace: &str,
     name: &str,
-) -> Result<(), kube::Error> {
+) -> Result<(), apply::ApplyError> {
     let dp = DeleteParams::default();
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
     let services: Api<Service> = Api::namespaced(client.clone(), namespace);
@@ -372,10 +388,11 @@ pub(super) async fn delete_relay_resources(
     // The PDB is optional (rendered only at ceiling ≥2); delete it unconditionally so GC is
     // complete whether or not one was ever provisioned (NotFound is success).
     let pdbs: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
-    ignore_not_found(deployments.delete(name, &dp).await)?;
-    ignore_not_found(services.delete(name, &dp).await)?;
-    ignore_not_found(service_accounts.delete(name, &dp).await)?;
-    ignore_not_found(pdbs.delete(name, &dp).await)?;
+    ignore_not_found(deployments.delete(name, &dp).await).map_err(apply::ApplyError::Deployment)?;
+    ignore_not_found(services.delete(name, &dp).await).map_err(apply::ApplyError::Service)?;
+    ignore_not_found(service_accounts.delete(name, &dp).await)
+        .map_err(apply::ApplyError::ServiceAccount)?;
+    ignore_not_found(pdbs.delete(name, &dp).await).map_err(apply::ApplyError::Pdb)?;
     Ok(())
 }
 

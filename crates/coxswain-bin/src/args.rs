@@ -26,7 +26,9 @@ use std::net::IpAddr;
 use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
-use coxswain_controller::{IngressDefaultBackend, SharedProxyConfig};
+use coxswain_controller::{
+    IngressDefaultBackend, RELAY_DISCOVERY_PORT, RelayConfig, SharedProxyConfig,
+};
 use ipnet::IpNet;
 
 /// Log output format selector.
@@ -802,7 +804,7 @@ pub(crate) struct ControllerArgs {
     /// no leader election gate applies to this listener.
     ///
     /// The bind address is controlled by `--management-bind-address`.
-    #[arg(long, env = "COXSWAIN_DISCOVERY_PORT", default_value_t = 50051)]
+    #[arg(long, env = "COXSWAIN_DISCOVERY_PORT", default_value_t = RELAY_DISCOVERY_PORT)]
     pub discovery_port: u16,
 
     /// Port the bootstrap gRPC server binds to.
@@ -1098,6 +1100,26 @@ impl ControllerArgs {
             pod_template: self.shared_proxy_pod_template.clone(),
         }
     }
+
+    /// Build the [`RelayConfig`] the operator carries (#584/#602/#605) from the
+    /// `--relay-*` flags. Plain scalars (no pre-formatting needed — the relay
+    /// renderer/control-loop consume `Duration`/`u32`/`String` directly), grouped
+    /// so the flag set threads through as one value like [`SharedProxyConfig`].
+    pub(crate) fn relay_config(&self) -> RelayConfig {
+        RelayConfig {
+            enabled: self.relay_enabled,
+            replicas: self.relay_replicas,
+            min_proxy_replicas: self.relay_min_proxy_replicas,
+            target_proxies_per_replica: self.relay_target_proxies_per_replica,
+            max_replicas: self.relay_max_replicas,
+            cooldown: self.relay_cooldown,
+            scale_down_stabilization: self.relay_scale_down_stabilization,
+            tolerance: self.relay_tolerance,
+            cpu_request: self.relay_cpu_request.clone(),
+            memory_request: self.relay_memory_request.clone(),
+            memory_limit: self.relay_memory_limit.clone(),
+        }
+    }
 }
 
 /// CA provisioning mode selector.
@@ -1317,7 +1339,7 @@ pub(crate) struct RelayRoleArgs {
 
     /// Port the relay's **downstream** discovery server binds, for leaf proxies
     /// to subscribe. Mirrors the controller's `--discovery-port`.
-    #[arg(long, env = "COXSWAIN_DISCOVERY_PORT", default_value_t = 50051)]
+    #[arg(long, env = "COXSWAIN_DISCOVERY_PORT", default_value_t = RELAY_DISCOVERY_PORT)]
     pub discovery_port: u16,
 }
 

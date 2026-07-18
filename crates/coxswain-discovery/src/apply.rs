@@ -377,8 +377,8 @@ pub(crate) struct ResourceCache {
     /// Endpoint references of each backend-carrying resource, walked at stage.
     refs: HashMap<ResourceId, Arc<HashSet<EndpointKey>>>,
     /// Reverse index: which resources reference each endpoint key. Rebuilt
-    /// wholesale from `refs` on every commit; the delta path (commit 6) uses it
-    /// to dirty only the partitions an endpoint change touches.
+    /// wholesale from `refs` on every commit; the delta path uses it to dirty
+    /// only the partitions an endpoint change touches.
     ep_index: HashMap<EndpointKey, HashSet<ResourceId>>,
     /// Per-resource content digests (`canonical_key → resource_hash`); the
     /// change oracle for the whole-snapshot skip and the version self-check.
@@ -1516,7 +1516,11 @@ fn decode_udp_cell(
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Map a canonical-keying failure to the wire error the decode path surfaces.
-fn wire_from_key_err(e: ResourceKeyError) -> WireError {
+/// Map a [`ResourceKeyError`] onto the wire error, preserving the failing variant
+/// as a distinct reason string. Shared by the proxy apply path and the
+/// namespace-relay's per-Gateway reconstruction (`crate::relay`) so both fail
+/// closed on an unkeyable resource with the same diagnostic.
+pub(crate) fn wire_from_key_err(e: ResourceKeyError) -> WireError {
     WireError::UnknownResourceKey {
         reason: match e {
             ResourceKeyError::MissingPayload => {
@@ -2215,7 +2219,7 @@ mod tests {
         );
     }
 
-    /// A delta (`full = false`) is rejected until commit 6 lifts the guard.
+    /// A delta (`full = false`) with no prior full snapshot is rejected.
     #[test]
     fn delta_before_full_is_rejected() {
         let mut cache = ResourceCache::new();
@@ -2293,7 +2297,7 @@ mod tests {
         );
     }
 
-    // ── partitioned recompile (commit 5) ──────────────────────────────────────
+    // ── partitioned recompile ─────────────────────────────────────────────────
 
     /// (a) A full changing exactly one host among several recompiles only that
     /// partition; every sibling's compiled `Arc<HostRouter>` is ptr_eq-reused,
@@ -2664,7 +2668,7 @@ mod tests {
         );
     }
 
-    // ── delta apply (commit 6) ────────────────────────────────────────────────
+    // ── delta apply ───────────────────────────────────────────────────────────
 
     /// A TLS-passthrough or -terminate port resource with one SNI entry backed by
     /// `bg`.

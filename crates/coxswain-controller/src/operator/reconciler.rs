@@ -134,6 +134,65 @@ impl crate::metrics::ReconcileErrorReason for ReconcileError {
     }
 }
 
+/// The controller-provisioned relay tier's provisioning + control-loop knobs
+/// (#584/#602/#605), grouped so the `--relay-*` flag set threads through the
+/// operator as one value (mirrors [`SharedProxyConfig`]).
+///
+/// Constructed field-by-field in `coxswain-bin` from the CLI flags and carried on
+/// [`OperatorConfig`]. The reconciler-derived runtime state
+/// (`provisioned_relays` / `active_relays` / the repoint watch) is not config and
+/// stays on `OperatorConfig` directly.
+#[derive(Clone, Debug)]
+// intentionally open: field-literal constructed in crates/coxswain-bin/src/args.rs from CLI args, same rationale as SharedProxyConfig.
+pub struct RelayConfig {
+    /// Relay tiering master switch (`--relay-enabled`, #584). When `true`, each
+    /// namespace holding ≥1 dedicated Gateway gets a controller-provisioned
+    /// namespace relay; when `false` (default) no relays are provisioned and the
+    /// provenance authorizer's set stays empty, so the install is byte-identical
+    /// to a non-relay one.
+    pub enabled: bool,
+    /// Static replica count for a non-autoscaled namespace relay
+    /// (`--relay-replicas`, #584). Clamped to a minimum of 1. Default 2 (HA). An
+    /// autoscaled relay (`CoxswainRelayPolicy` with a capped `RelayAutoscaling`)
+    /// instead sizes to live demand (#602).
+    pub replicas: u32,
+    /// Break-even activation threshold `H` (`--relay-min-proxy-replicas`, #584).
+    /// A relay is provisioned once the namespace's live dedicated-proxy subscriber
+    /// count reaches this and torn down after it holds below for the cooldown
+    /// (#602). A break-even control — a relay only cuts leader load when it fronts
+    /// more streams than its own replica count costs.
+    pub min_proxy_replicas: u32,
+    /// Capacity ratio (`--relay-target-proxies-per-replica`, #602): downstream
+    /// proxies per relay replica the sizing loop targets, decoupled from the
+    /// break-even `H`. The flag default (50) a namespace without a
+    /// `RelayAutoscaling.targetProxiesPerReplica` override falls back to.
+    pub target_proxies_per_replica: u32,
+    /// Autoscaling ceiling for the **shared-pool** relay (`--relay-max-replicas`,
+    /// #605). The shared relay has no `CoxswainRelayPolicy` (it is global, not
+    /// namespaced), so its control loop autoscales directly off the flags:
+    /// `clamp(ceil(pool-signal / target), replicas, max_replicas)`. The
+    /// dedicated tier ignores this (it caps via `RelayAutoscaling.maxReplicas`).
+    pub max_replicas: u32,
+    /// Deactivation cooldown (`--relay-cooldown`, #602): how long the signal must
+    /// hold below `H` before an active relay tears down. Flag-default fallback.
+    pub cooldown: Duration,
+    /// Scale-down stabilization window (`--relay-scale-down-stabilization`, #602):
+    /// scale-down sizes on the trailing-window maximum signal. Flag-default fallback.
+    pub scale_down_stabilization: Duration,
+    /// Relative sizing deadband (`--relay-tolerance`, #602). Flag-default fallback.
+    pub tolerance: f64,
+    /// Relay container CPU-request quantity string (`--relay-cpu-request`, #584).
+    /// Empty omits the entry. Global default; per-namespace overrides come from
+    /// `CoxswainRelayPolicy`.
+    pub cpu_request: String,
+    /// Relay container memory-request quantity string (`--relay-memory-request`,
+    /// #584). Empty omits it. See [`Self::cpu_request`].
+    pub memory_request: String,
+    /// Relay container memory-limit quantity string (`--relay-memory-limit`, #584).
+    /// Empty omits it. See [`Self::cpu_request`].
+    pub memory_limit: String,
+}
+
 /// Bundle of inputs the operator's [`pingora_core::services::background::BackgroundService::start`] needs from
 /// the bin layer. Carries the leader flag so the operator shares one
 /// truth-source with the [`crate::Controller`] status writer.
@@ -230,51 +289,11 @@ pub struct OperatorConfig {
     /// a snapshot containing the current generation, not merely hold its
     /// (possibly stale) port binds. `None` disables it (tests).
     pub publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
-    /// Relay tiering master switch (`--relay-enabled`, #584). When `true`, each
-    /// namespace holding ≥1 dedicated Gateway gets a controller-provisioned
-    /// namespace relay; when `false` (default) no relays are provisioned and the
-    /// provenance authorizer's set stays empty, so the install is byte-identical
-    /// to a non-relay one.
-    pub relay_enabled: bool,
-    /// Static replica count for a non-autoscaled namespace relay
-    /// (`--relay-replicas`, #584). Clamped to a minimum of 1. Default 2 (HA). An
-    /// autoscaled relay (`CoxswainRelayPolicy` with a capped `RelayAutoscaling`)
-    /// instead sizes to live demand (#602).
-    pub relay_replicas: u32,
-    /// Break-even activation threshold `H` (`--relay-min-proxy-replicas`, #584).
-    /// A relay is provisioned once the namespace's live dedicated-proxy subscriber
-    /// count reaches this and torn down after it holds below for the cooldown
-    /// (#602). A break-even control — a relay only cuts leader load when it fronts
-    /// more streams than its own replica count costs.
-    pub relay_min_proxy_replicas: u32,
-    /// Capacity ratio (`--relay-target-proxies-per-replica`, #602): downstream
-    /// proxies per relay replica the sizing loop targets, decoupled from the
-    /// break-even `H`. The flag default (50) a namespace without a
-    /// `RelayAutoscaling.targetProxiesPerReplica` override falls back to.
-    pub relay_target_proxies_per_replica: u32,
-    /// Autoscaling ceiling for the **shared-pool** relay (`--relay-max-replicas`,
-    /// #605). The shared relay has no `CoxswainRelayPolicy` (it is global, not
-    /// namespaced), so its control loop autoscales directly off the flags:
-    /// `clamp(ceil(pool-signal / target), relay_replicas, relay_max_replicas)`. The
-    /// dedicated tier ignores this (it caps via `RelayAutoscaling.maxReplicas`).
-    pub relay_max_replicas: u32,
-    /// Deactivation cooldown (`--relay-cooldown`, #602): how long the signal must
-    /// hold below `H` before an active relay tears down. Flag-default fallback.
-    pub relay_cooldown: Duration,
-    /// Scale-down stabilization window (`--relay-scale-down-stabilization`, #602):
-    /// scale-down sizes on the trailing-window maximum signal. Flag-default fallback.
-    pub relay_scale_down_stabilization: Duration,
-    /// Relative sizing deadband (`--relay-tolerance`, #602). Flag-default fallback.
-    pub relay_tolerance: f64,
-    /// Relay container resource requests/limits, as raw quantity strings from
-    /// `--relay-cpu-request` / `--relay-memory-request` / `--relay-memory-limit`
-    /// (#584). Empty strings omit the corresponding entry. Global default;
-    /// per-namespace overrides come from `CoxswainRelayPolicy`.
-    pub relay_cpu_request: String,
-    /// See [`Self::relay_cpu_request`].
-    pub relay_memory_request: String,
-    /// See [`Self::relay_cpu_request`].
-    pub relay_memory_limit: String,
+    /// Relay tier provisioning + control-loop knobs (#584/#602/#605), grouped from
+    /// the `--relay-*` flags. The runtime channels/shared-state below
+    /// (`provisioned_relays`, `active_relays`, `shared_relay_active`,
+    /// `relay_changed_tx`) are reconciler-derived, not config, so they stay flat.
+    pub relay: RelayConfig,
     /// Authz set of relay-fronted namespaces (#584/#602). Written by the relay
     /// reconciler (derived from its state map) and read lock-free by
     /// `coxswain_discovery::ProvisionedRelayAuthorizer` in `coxswain-bin` — the
@@ -400,30 +419,9 @@ pub(crate) struct ReconcileContext {
     pub(super) node_registry: Option<coxswain_core::node_registry::SharedNodeRegistry>,
     /// Per-Gateway publish-sequence index (#531): ack half of the gate.
     publish_index: Option<coxswain_core::publish_index::SharedGatewayPublishIndex>,
-    /// Relay tiering master switch (#584). See [`OperatorConfig::relay_enabled`].
-    pub(super) relay_enabled: bool,
-    /// Static per-relay replica count for a non-autoscaled relay (#584). See
-    /// [`OperatorConfig::relay_replicas`].
-    pub(super) relay_replicas: u32,
-    /// Break-even activation threshold `H` (#584/#602). See
-    /// [`OperatorConfig::relay_min_proxy_replicas`].
-    pub(super) relay_min_proxy_replicas: u32,
-    /// Control-loop tuning defaults (#602): the capacity ratio, deactivation
-    /// cooldown, scale-down stabilization window, and sizing tolerance a namespace
-    /// without a `CoxswainRelayPolicy` override falls back to. See the matching
-    /// `--relay-*` flags on [`OperatorConfig`].
-    pub(super) relay_target_proxies_per_replica: u32,
-    /// Shared-pool relay autoscaling ceiling (`--relay-max-replicas`, #605). See
-    /// [`OperatorConfig::relay_max_replicas`].
-    pub(super) relay_max_replicas: u32,
-    pub(super) relay_cooldown: Duration,
-    pub(super) relay_scale_down_stabilization: Duration,
-    pub(super) relay_tolerance: f64,
-    /// Relay container resource quantity strings (#584). See
-    /// [`OperatorConfig::relay_cpu_request`].
-    pub(super) relay_cpu_request: String,
-    pub(super) relay_memory_request: String,
-    pub(super) relay_memory_limit: String,
+    /// Relay tier provisioning + control-loop knobs (#584/#602/#605). See
+    /// [`RelayConfig`].
+    pub(super) relay: RelayConfig,
     /// Authz set (#584/#602): namespaces with a relay record in any state — read
     /// lock-free by the discovery server's provenance authorizer to admit a relay's
     /// own upstream `Namespace` subscribe. Derived from [`Self::relay_states`] by
@@ -505,17 +503,7 @@ impl ReconcileContext {
             vip_failures: config.vip_failures,
             node_registry: config.node_registry,
             publish_index: config.publish_index,
-            relay_enabled: config.relay_enabled,
-            relay_replicas: config.relay_replicas,
-            relay_min_proxy_replicas: config.relay_min_proxy_replicas,
-            relay_target_proxies_per_replica: config.relay_target_proxies_per_replica,
-            relay_max_replicas: config.relay_max_replicas,
-            relay_cooldown: config.relay_cooldown,
-            relay_scale_down_stabilization: config.relay_scale_down_stabilization,
-            relay_tolerance: config.relay_tolerance,
-            relay_cpu_request: config.relay_cpu_request,
-            relay_memory_request: config.relay_memory_request,
-            relay_memory_limit: config.relay_memory_limit,
+            relay: config.relay,
             provisioned_relays: config.provisioned_relays,
             active_relays: config.active_relays,
             shared_relay_active: config.shared_relay_active,
@@ -540,12 +528,12 @@ impl ReconcileContext {
     /// `CoxswainRelayPolicy` override falls back to.
     pub(super) fn relay_tuning_defaults(&self) -> relay_autoscaler::RelayTuningDefaults {
         relay_autoscaler::RelayTuningDefaults {
-            activation_threshold: self.relay_min_proxy_replicas,
-            cooldown: self.relay_cooldown,
-            stabilization: self.relay_scale_down_stabilization,
-            tolerance: self.relay_tolerance,
-            target: self.relay_target_proxies_per_replica,
-            static_replicas: self.relay_replicas,
+            activation_threshold: self.relay.min_proxy_replicas,
+            cooldown: self.relay.cooldown,
+            stabilization: self.relay.scale_down_stabilization,
+            tolerance: self.relay.tolerance,
+            target: self.relay.target_proxies_per_replica,
+            static_replicas: self.relay.replicas,
         }
     }
 
@@ -604,7 +592,7 @@ impl ReconcileContext {
     /// the task is live, but the caller triggers a pass immediately after, which
     /// re-derives every namespace's desired state from the registry within one pass.
     ///
-    /// Runs **regardless of `relay_enabled`** (#616) — the master switch gates
+    /// Runs **regardless of `relay.enabled`** (#616) — the master switch gates
     /// provisioning, never convergence. A namespace relay left over from before the
     /// tier was disabled must still be adopted here; [`super::run_relay_reconciler`]'s
     /// force-off teardown then GCs it. Skipping rehydration when disabled would strand
@@ -665,7 +653,7 @@ impl ReconcileContext {
     /// live `spec.replicas` (it was serving before the restart), then publishes the
     /// gate.
     ///
-    /// Runs **regardless of `relay_enabled`**, same as
+    /// Runs **regardless of `relay.enabled`**, same as
     /// [`Self::rehydrate_provisioned_relays`] (#616) — [`super::converge_shared_pool`]
     /// runs every pass whether or not tiering is enabled, so a shared relay left over
     /// from before the tier was disabled must still be adopted here; its force-off

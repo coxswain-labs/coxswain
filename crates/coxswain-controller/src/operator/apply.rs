@@ -27,6 +27,7 @@
 //! `ignore_not_found`) so transitions between autoscaling-on and
 //! autoscaling-off are handled on every reconcile without extra bookkeeping.
 
+use super::reconciler::ignore_not_found;
 use super::render::RenderedSpecs;
 use super::render_relay::RenderedRelay;
 use super::render_shared_proxy::RenderedSharedProxy;
@@ -423,18 +424,6 @@ pub(super) async fn delete_shared_proxy(
     ignore_not_found(sa_api.delete(name, &dp).await).map_err(ApplyError::ServiceAccount)?;
 
     Ok(())
-}
-
-/// Collapse a 404 Not Found into `Ok(())`. All other errors propagate.
-///
-/// Used by delete-on-`None` branches in `apply_rendered` so that
-/// disabled-but-never-created resources don't surface as spurious errors.
-fn ignore_not_found<T>(result: Result<T, kube::Error>) -> Result<(), kube::Error> {
-    match result {
-        Ok(_) => Ok(()),
-        Err(kube::Error::Api(ae)) if ae.code == 404 => Ok(()),
-        Err(e) => Err(e),
-    }
 }
 
 /// Server-side-apply a single shared-mode per-Gateway VIP Service (#472).
