@@ -14,10 +14,8 @@
 //! signal retries from cluster state).
 
 use super::reconciler::ReconcileContext;
-use super::relay_autoscaler::{
-    RelayAction, RelayInputs, RelayNsRecord, RelayNsState, RelayTuning, initial_size,
-    should_provision,
-};
+use super::relay_autoscaler::{RelayInputs, RelayRecord, RelayTuning};
+use super::relay_converge::{self, Converge, RelayCell};
 use super::relay_params::EffectiveRelayPolicy;
 use super::relay_reconcile::{
     clamp_u32_to_i32, clamp_usize_to_u32, delete_relay_resources, leadership_changed,
@@ -154,7 +152,7 @@ async fn reconcile_shared_pool(ctx: &ReconcileContext) {
 async fn converge_shared_pool(ctx: &ReconcileContext, now: Instant) {
     // The shared relay exists only when tiering is on AND the pool exists. When the
     // pool is gone the relay tears down at once (bypassing the cooldown), exactly as
-    // a genuinely-drained namespace does via `has_dedicated_gateways`.
+    // a genuinely-drained namespace does via `demand_present`.
     let pool_present = ctx.shared_proxy.enabled && !ctx.shared_proxy_selector.is_empty();
     let tuning = shared_relay_tuning(ctx);
 
@@ -173,79 +171,87 @@ async fn converge_shared_pool(ctx: &ReconcileContext, now: Instant) {
         signal,
         ready,
         subscribers,
-        has_dedicated_gateways: pool_present,
+        demand_present: pool_present,
     };
 
-    let existing = ctx.shared_relay_state.lock().clone();
-    match existing {
-        None => {
-            if should_provision(signal, &tuning) {
-                let (replicas, pdb_ceiling) = initial_size(signal, &tuning);
-                if let Err(e) = apply_shared_relay_at(ctx, replicas, pdb_ceiling).await {
-                    tracing::warn!(
-                        error = %e,
-                        "shared relay: provision apply failed; retrying next pass"
-                    );
-                    return;
-                }
-                let mut record = RelayNsRecord::existing(RelayNsState::Provisioning, replicas);
-                record.observe(now, signal, &tuning);
-                *ctx.shared_relay_state.lock() = Some(record);
-                tracing::info!(replicas, "shared relay: provisioned (awaiting Ready)");
-            }
-        }
-        Some(mut record) => {
-            record.observe(now, signal, &tuning);
-            let decision = record.decide(now, inputs, &tuning);
-            match decision.action {
-                RelayAction::None => commit_shared(ctx, record, decision.next_state, None),
-                RelayAction::Activate => {
-                    tracing::info!("shared relay: Ready — repointing the pool onto it");
-                    commit_shared(ctx, record, decision.next_state, None);
-                }
-                RelayAction::Resize {
-                    replicas,
-                    pdb_ceiling,
-                } => {
-                    if let Err(e) = apply_shared_relay_at(ctx, replicas, pdb_ceiling).await {
-                        tracing::warn!(
-                            error = %e,
-                            "shared relay: resize apply failed; retrying next pass"
-                        );
-                        return;
-                    }
-                    tracing::info!(replicas, "shared relay: resized to live pool demand");
-                    commit_shared(ctx, record, decision.next_state, Some(replicas));
-                }
-                RelayAction::StartDrain => {
-                    tracing::info!(
-                        "shared relay: below break-even past cooldown — repointing the pool back to the controller, then draining"
-                    );
-                    commit_shared(ctx, record, decision.next_state, None);
-                }
-                RelayAction::Delete => {
-                    if let Err(e) = delete_relay_resources(
-                        &ctx.client,
-                        &ctx.controller_namespace,
-                        render_relay::SHARED_RELAY_NAME,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            "shared relay: teardown delete failed; retrying next pass"
-                        );
-                        return;
-                    }
-                    *ctx.shared_relay_state.lock() = None;
-                    tracing::info!("shared relay: drained (0 subscribers) — deleted");
-                }
-            }
-        }
+    // Publish the repoint gate once per pass — but only when the pass settled. A
+    // failed apply/delete (`Converge::Retry`) changed nothing on the cluster, so the
+    // pool must not be repointed off a half-applied state; the next pass retries.
+    // (Bumps the discovery watch only on a real Active transition, so the pool is
+    // repointed exactly then.)
+    if relay_converge::advance(&SharedCell { ctx }, inputs, &tuning, now).await == Converge::Done {
+        ctx.publish_shared_relay();
     }
-    // Publish the repoint gate once per pass (bumps the discovery watch only on a
-    // real Active transition, so the pool is repointed exactly then).
-    ctx.publish_shared_relay();
+}
+
+/// The shared-pool [`RelayCell`]: a single record in
+/// [`ReconcileContext::shared_relay_state`]; resources rendered from the `--relay-*`
+/// flags (no namespaced policy) into the install namespace and named
+/// [`render_relay::SHARED_RELAY_NAME`].
+struct SharedCell<'a> {
+    ctx: &'a ReconcileContext,
+}
+
+#[async_trait::async_trait]
+impl RelayCell for SharedCell<'_> {
+    fn load(&self) -> Option<RelayRecord> {
+        self.ctx.shared_relay_state.lock().clone()
+    }
+
+    fn store(&self, record: RelayRecord) {
+        *self.ctx.shared_relay_state.lock() = Some(record);
+    }
+
+    fn clear(&self) {
+        *self.ctx.shared_relay_state.lock() = None;
+    }
+
+    async fn apply(&self, replicas: u32, pdb_ceiling: u32) -> Result<(), super::apply::ApplyError> {
+        apply_shared_relay_at(self.ctx, replicas, pdb_ceiling).await
+    }
+
+    async fn delete(&self) -> Result<(), super::apply::ApplyError> {
+        delete_relay_resources(
+            &self.ctx.client,
+            &self.ctx.controller_namespace,
+            render_relay::SHARED_RELAY_NAME,
+        )
+        .await
+    }
+
+    fn log_provision_failed(&self, error: &super::apply::ApplyError) {
+        tracing::warn!(error = %error, "shared relay: provision apply failed; retrying next pass");
+    }
+
+    fn log_provisioned(&self, replicas: u32) {
+        tracing::info!(replicas, "shared relay: provisioned (awaiting Ready)");
+    }
+
+    fn log_activate(&self) {
+        tracing::info!("shared relay: Ready — repointing the pool onto it");
+    }
+
+    fn log_resize_failed(&self, error: &super::apply::ApplyError) {
+        tracing::warn!(error = %error, "shared relay: resize apply failed; retrying next pass");
+    }
+
+    fn log_resized(&self, replicas: u32) {
+        tracing::info!(replicas, "shared relay: resized to live pool demand");
+    }
+
+    fn log_start_drain(&self) {
+        tracing::info!(
+            "shared relay: below break-even past cooldown — repointing the pool back to the controller, then draining"
+        );
+    }
+
+    fn log_delete_failed(&self, error: &super::apply::ApplyError) {
+        tracing::warn!(error = %error, "shared relay: teardown delete failed; retrying next pass");
+    }
+
+    fn log_deleted(&self) {
+        tracing::info!("shared relay: drained (0 subscribers) — deleted");
+    }
 }
 
 /// Synthesize the shared relay's [`RelayTuning`] from the `--relay-*` flags (#605).
@@ -332,20 +338,4 @@ async fn apply_shared_relay_at(
         pdb_replica_ceiling: clamp_u32_to_i32(pdb_ceiling),
     });
     super::apply::apply_relay(&ctx.client, &ctx.controller_namespace, &rendered).await
-}
-
-/// Commit a transitioned single-cell record: set its state and, when the action
-/// resized the Deployment, its sizing baseline (#605). Mirrors the per-namespace
-/// `commit` in [`super::relay_reconcile`].
-fn commit_shared(
-    ctx: &ReconcileContext,
-    mut record: RelayNsRecord,
-    next_state: RelayNsState,
-    replicas: Option<u32>,
-) {
-    record.state = next_state;
-    if let Some(r) = replicas {
-        record.current_replicas = r;
-    }
-    *ctx.shared_relay_state.lock() = Some(record);
 }

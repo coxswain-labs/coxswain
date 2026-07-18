@@ -53,6 +53,7 @@ pub(crate) mod merge;
 pub(crate) mod params;
 pub(crate) mod reconciler;
 pub(crate) mod relay_autoscaler;
+pub(crate) mod relay_converge;
 pub(crate) mod relay_params;
 pub(crate) mod relay_reconcile;
 pub(crate) mod render;

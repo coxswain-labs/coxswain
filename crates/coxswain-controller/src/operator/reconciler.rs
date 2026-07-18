@@ -437,7 +437,7 @@ pub(crate) struct ReconcileContext {
     /// make-before-break lifecycle + signal history + cooldown clock the serialized
     /// [`super::run_relay_reconciler`] advances. Both derived sets above are
     /// recomputed from this. Guard is never held across an `.await`.
-    pub(super) relay_states: Mutex<HashMap<String, relay_autoscaler::RelayNsRecord>>,
+    pub(super) relay_states: Mutex<HashMap<String, relay_autoscaler::RelayRecord>>,
     /// Shared-pool repoint gate (#605): `Active` once the shared relay is Ready and
     /// serving — read lock-free by the discovery server. Derived from
     /// [`Self::shared_relay_state`] by [`Self::publish_shared_relay`].
@@ -446,7 +446,7 @@ pub(crate) struct ReconcileContext {
     /// make-before-break lifecycle for the one shared relay, advanced by
     /// [`super::converge_shared_pool`]. `None` = no shared relay provisioned. Guard is
     /// never held across an `.await`.
-    pub(super) shared_relay_state: Mutex<Option<relay_autoscaler::RelayNsRecord>>,
+    pub(super) shared_relay_state: Mutex<Option<relay_autoscaler::RelayRecord>>,
     /// Bumped on every repoint change (#601/#602/#605) to wake the discovery server's
     /// live streams for a repoint push. `None` disables live repoint.
     relay_changed_tx: Option<watch::Sender<u64>>,
@@ -558,7 +558,7 @@ impl ReconcileContext {
             let authz: HashSet<String> = states.keys().cloned().collect();
             let repoint: HashSet<String> = states
                 .iter()
-                .filter(|(_, r)| r.state == relay_autoscaler::RelayNsState::Active)
+                .filter(|(_, r)| r.state == relay_autoscaler::RelayState::Active)
                 .map(|(ns, _)| ns.clone())
                 .collect();
             (authz, repoint)
@@ -579,7 +579,7 @@ impl ReconcileContext {
     /// rehydrates them, so a controller restart while a relay is running leaves it
     /// untracked: the control loop would see no record and never re-adopt or tear it
     /// down. This LISTs the running relay `Deployment`s and seeds each as an
-    /// [`Active`](relay_autoscaler::RelayNsState::Active) record (a relay that
+    /// [`Active`](relay_autoscaler::RelayState::Active) record (a relay that
     /// already exists was serving before the restart), sized to its live
     /// `spec.replicas`, then publishes both derived sets.
     ///
@@ -624,7 +624,7 @@ impl ReconcileContext {
     /// [`Self::publish_relay_sets`].
     ///
     /// Sets [`Self::shared_relay_active`] to whether the cell is in
-    /// [`Active`](relay_autoscaler::RelayNsState::Active) — "the shared relay is
+    /// [`Active`](relay_autoscaler::RelayState::Active) — "the shared relay is
     /// Ready, the pool should point here" — and bumps [`Self::relay_changed_tx`]
     /// only on a change, so the discovery server repoints the pool exactly when the
     /// shared relay enters or leaves `Active`. The guard is never held across an
@@ -634,7 +634,7 @@ impl ReconcileContext {
             .shared_relay_state
             .lock()
             .as_ref()
-            .is_some_and(|r| r.state == relay_autoscaler::RelayNsState::Active);
+            .is_some_and(|r| r.state == relay_autoscaler::RelayState::Active);
         if *self.shared_relay_active.load() != active {
             self.shared_relay_active.store(Arc::new(active));
             if let Some(tx) = &self.relay_changed_tx {
@@ -649,7 +649,7 @@ impl ReconcileContext {
     /// [`Self::shared_relay_state`] starts `None` on every process start; nothing
     /// else rehydrates it, so a controller restart while the shared relay is running
     /// would leave it untracked. GETs the shared-relay `Deployment` and, if present,
-    /// seeds an [`Active`](relay_autoscaler::RelayNsState::Active) cell sized to its
+    /// seeds an [`Active`](relay_autoscaler::RelayState::Active) cell sized to its
     /// live `spec.replicas` (it was serving before the restart), then publishes the
     /// gate.
     ///
@@ -679,8 +679,8 @@ impl ReconcileContext {
                     .and_then(|s| s.replicas)
                     .and_then(|r| u32::try_from(r).ok())
                     .unwrap_or(1);
-                relay_autoscaler::RelayNsRecord::existing(
-                    relay_autoscaler::RelayNsState::Active,
+                relay_autoscaler::RelayRecord::existing(
+                    relay_autoscaler::RelayState::Active,
                     replicas,
                 )
             });
@@ -698,13 +698,13 @@ impl ReconcileContext {
 /// Seed relay control-loop records from the running relay `Deployment`s (#593,
 /// #602). Split out from [`ReconcileContext::rehydrate_provisioned_relays`] so the
 /// extraction is unit-testable without a live apiserver. Each namespaced relay
-/// Deployment becomes an [`Active`](relay_autoscaler::RelayNsState::Active) record
+/// Deployment becomes an [`Active`](relay_autoscaler::RelayState::Active) record
 /// sized to its `spec.replicas` (default 1). A Deployment with no
 /// `metadata.namespace` (an apiserver invariant that never holds for a namespaced
 /// object) is skipped rather than panicking.
 fn records_from_relay_deployments(
     items: &[Deployment],
-) -> HashMap<String, relay_autoscaler::RelayNsRecord> {
+) -> HashMap<String, relay_autoscaler::RelayRecord> {
     items
         .iter()
         .filter_map(|d| {
@@ -717,8 +717,8 @@ fn records_from_relay_deployments(
                 .unwrap_or(1);
             Some((
                 namespace,
-                relay_autoscaler::RelayNsRecord::existing(
-                    relay_autoscaler::RelayNsState::Active,
+                relay_autoscaler::RelayRecord::existing(
+                    relay_autoscaler::RelayState::Active,
                     replicas,
                 ),
             ))
@@ -1720,10 +1720,7 @@ mod tests {
         ];
         let got = records_from_relay_deployments(&items);
         assert_eq!(got.len(), 2);
-        assert_eq!(
-            got["tenant-a"].state,
-            relay_autoscaler::RelayNsState::Active
-        );
+        assert_eq!(got["tenant-a"].state, relay_autoscaler::RelayState::Active);
         assert_eq!(got["tenant-a"].current_replicas, 3);
         assert_eq!(got["tenant-b"].current_replicas, 1);
     }

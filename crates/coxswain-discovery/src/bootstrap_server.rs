@@ -80,7 +80,7 @@ impl ResolvedUpstream {
 /// on this crate, not the reverse, so the endpoint templates and relay/controller
 /// ServiceAccount names are passed in from `coxswain-bin`, which knows both sides.
 /// The `active_relays` set is the controller's **repoint** set — namespaces whose
-/// relay is Ready and serving (`RelayNsState::Active`), the make-before-break gate
+/// relay is Ready and serving (`RelayState::Active`), the make-before-break gate
 /// that a leaf may repoint onto the relay. It is distinct from the authz set the
 /// `ScopeAuthorizer` reads (which also covers provisioning/draining relays): a leaf
 /// must never point at a not-yet-Ready or already-draining relay (#602).

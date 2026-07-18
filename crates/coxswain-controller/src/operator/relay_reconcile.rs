@@ -8,8 +8,10 @@
 //! single serialized task (the third of the operator's whole-world single-writer
 //! passes, next to [`super::run_vip_reconciler`] and
 //! [`super::run_shared_install_reconciler`]) advances every candidate namespace's
-//! [`RelayNsState`] machine each pass. The pure decision logic lives in
-//! [`super::relay_autoscaler`]; this module is the I/O around it.
+//! [`RelayState`](super::relay_autoscaler::RelayState) machine each pass. The pure
+//! decision logic lives in [`super::relay_autoscaler`] and the shared state-machine
+//! driver in [`super::relay_converge`]; this module is the per-namespace substrate
+//! around them.
 //!
 //! ## Make-before-break
 //!
@@ -38,10 +40,8 @@ use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 
 use super::reconciler::{ReconcileContext, ignore_not_found, namespace_is_terminating};
-use super::relay_autoscaler::{
-    RelayAction, RelayInputs, RelayNsRecord, RelayNsState, RelayTuning, initial_size,
-    should_provision,
-};
+use super::relay_autoscaler::{RelayInputs, RelayRecord, RelayTuning};
+use super::relay_converge::{self, RelayCell};
 use super::relay_params::EffectiveRelayPolicy;
 use super::render_relay::{self, RelayRenderInputs, RelayVariant};
 use super::{apply, params};
@@ -136,8 +136,8 @@ async fn relay_pass(ctx: &Arc<ReconcileContext>) {
     let mut namespaces: BTreeSet<String> = gateway_namespaces.clone();
     namespaces.extend(ctx.relay_states.lock().keys().cloned());
     for namespace in namespaces {
-        let has_dedicated_gateways = gateway_namespaces.contains(&namespace);
-        process_namespace(ctx, &namespace, has_dedicated_gateways, now).await;
+        let demand_present = gateway_namespaces.contains(&namespace);
+        process_namespace(ctx, &namespace, demand_present, now).await;
     }
     ctx.publish_relay_sets();
 }
@@ -204,7 +204,7 @@ fn is_owned_active_dedicated(
 async fn process_namespace(
     ctx: &Arc<ReconcileContext>,
     namespace: &str,
-    has_dedicated_gateways: bool,
+    demand_present: bool,
     now: Instant,
 ) {
     // An SSA/delete into a terminating namespace is doomed (403) and its relay GCs
@@ -227,96 +227,86 @@ async fn process_namespace(
         signal,
         ready,
         subscribers,
-        has_dedicated_gateways,
+        demand_present,
     };
-
-    let existing = ctx.relay_states.lock().get(namespace).cloned();
-    match existing {
-        None => {
-            if !should_provision(signal, &tuning) {
-                return;
-            }
-            let (replicas, pdb_ceiling) = initial_size(signal, &tuning);
-            if let Err(e) = apply_relay_at(ctx, namespace, &policy, replicas, pdb_ceiling).await {
-                tracing::warn!(
-                    namespace = %namespace,
-                    error = %e,
-                    "relay: provision apply failed; retrying next pass"
-                );
-                return;
-            }
-            let mut record = RelayNsRecord::existing(RelayNsState::Provisioning, replicas);
-            record.observe(now, signal, &tuning);
-            ctx.relay_states.lock().insert(namespace.to_owned(), record);
-            tracing::info!(namespace = %namespace, replicas, "relay: provisioned (awaiting Ready)");
-        }
-        Some(mut record) => {
-            record.observe(now, signal, &tuning);
-            let decision = record.decide(now, inputs, &tuning);
-            match decision.action {
-                RelayAction::None => commit(ctx, namespace, record, decision.next_state, None),
-                RelayAction::Activate => {
-                    tracing::info!(namespace = %namespace, "relay: Ready — repointing leaves onto it");
-                    commit(ctx, namespace, record, decision.next_state, None);
-                }
-                RelayAction::Resize {
-                    replicas,
-                    pdb_ceiling,
-                } => {
-                    if let Err(e) =
-                        apply_relay_at(ctx, namespace, &policy, replicas, pdb_ceiling).await
-                    {
-                        tracing::warn!(
-                            namespace = %namespace,
-                            error = %e,
-                            "relay: resize apply failed; retrying next pass"
-                        );
-                        return;
-                    }
-                    tracing::info!(namespace = %namespace, replicas, "relay: resized to live demand");
-                    commit(ctx, namespace, record, decision.next_state, Some(replicas));
-                }
-                RelayAction::StartDrain => {
-                    tracing::info!(
-                        namespace = %namespace,
-                        "relay: below break-even past cooldown — repointing leaves back to the controller, then draining"
-                    );
-                    commit(ctx, namespace, record, decision.next_state, None);
-                }
-                RelayAction::Delete => {
-                    if let Err(e) =
-                        delete_relay_resources(&ctx.client, namespace, render_relay::RELAY_NAME)
-                            .await
-                    {
-                        tracing::warn!(
-                            namespace = %namespace,
-                            error = %e,
-                            "relay: teardown delete failed; retrying next pass"
-                        );
-                        return;
-                    }
-                    ctx.relay_states.lock().remove(namespace);
-                    tracing::info!(namespace = %namespace, "relay: drained (0 subscribers) — deleted");
-                }
-            }
-        }
-    }
+    let cell = NamespaceCell {
+        ctx,
+        namespace,
+        policy: &policy,
+    };
+    // No tail work per namespace (the repoint sets are published once for the whole
+    // pass by the caller), so the `Converge` outcome is not consulted here.
+    let _ = relay_converge::advance(&cell, inputs, &tuning, now).await;
 }
 
-/// Commit a transitioned record back to the state map: set its state and, when the
-/// action resized the Deployment, its sizing baseline.
-fn commit(
-    ctx: &ReconcileContext,
-    namespace: &str,
-    mut record: RelayNsRecord,
-    next_state: RelayNsState,
-    replicas: Option<u32>,
-) {
-    record.state = next_state;
-    if let Some(r) = replicas {
-        record.current_replicas = r;
+/// The per-namespace [`RelayCell`]: record keyed by namespace in
+/// [`ReconcileContext::relay_states`]; resources rendered with the namespace's
+/// `CoxswainRelayPolicy` overlay and named [`render_relay::RELAY_NAME`].
+struct NamespaceCell<'a> {
+    ctx: &'a Arc<ReconcileContext>,
+    namespace: &'a str,
+    policy: &'a EffectiveRelayPolicy,
+}
+
+#[async_trait::async_trait]
+impl RelayCell for NamespaceCell<'_> {
+    fn load(&self) -> Option<RelayRecord> {
+        self.ctx.relay_states.lock().get(self.namespace).cloned()
     }
-    ctx.relay_states.lock().insert(namespace.to_owned(), record);
+
+    fn store(&self, record: RelayRecord) {
+        self.ctx
+            .relay_states
+            .lock()
+            .insert(self.namespace.to_owned(), record);
+    }
+
+    fn clear(&self) {
+        self.ctx.relay_states.lock().remove(self.namespace);
+    }
+
+    async fn apply(&self, replicas: u32, pdb_ceiling: u32) -> Result<(), apply::ApplyError> {
+        apply_relay_at(self.ctx, self.namespace, self.policy, replicas, pdb_ceiling).await
+    }
+
+    async fn delete(&self) -> Result<(), apply::ApplyError> {
+        delete_relay_resources(&self.ctx.client, self.namespace, render_relay::RELAY_NAME).await
+    }
+
+    fn log_provision_failed(&self, error: &apply::ApplyError) {
+        tracing::warn!(namespace = %self.namespace, error = %error, "relay: provision apply failed; retrying next pass");
+    }
+
+    fn log_provisioned(&self, replicas: u32) {
+        tracing::info!(namespace = %self.namespace, replicas, "relay: provisioned (awaiting Ready)");
+    }
+
+    fn log_activate(&self) {
+        tracing::info!(namespace = %self.namespace, "relay: Ready — repointing leaves onto it");
+    }
+
+    fn log_resize_failed(&self, error: &apply::ApplyError) {
+        tracing::warn!(namespace = %self.namespace, error = %error, "relay: resize apply failed; retrying next pass");
+    }
+
+    fn log_resized(&self, replicas: u32) {
+        tracing::info!(namespace = %self.namespace, replicas, "relay: resized to live demand");
+    }
+
+    fn log_start_drain(&self) {
+        tracing::info!(
+            namespace = %self.namespace,
+            "relay: below break-even past cooldown — repointing leaves back to the controller, then draining"
+        );
+    }
+
+    fn log_delete_failed(&self, error: &apply::ApplyError) {
+        tracing::warn!(namespace = %self.namespace, error = %error, "relay: teardown delete failed; retrying next pass");
+    }
+
+    fn log_deleted(&self) {
+        tracing::info!(namespace = %self.namespace, "relay: drained (0 subscribers) — deleted");
+    }
 }
 
 /// Read the namespace's `(signal, relay_ready, subscriber_count)` off the node
