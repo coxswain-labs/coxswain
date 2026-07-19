@@ -7,10 +7,28 @@
 // The coxswain-proprietary CRD group (`BasicAuth`, `RateLimit`, … ExtensionRef CRDs);
 // re-uses the single definition in `gateway_api` rather than a second local copy.
 use crate::gateway_api::COXSWAIN_GROUP;
-use crate::gw_types::v::referencegrants::ReferenceGrant;
+use crate::gw_types::v::referencegrants::ReferenceGrantSpec;
 use coxswain_core::reference_grants::ReferenceGrantKey;
+use kube::core::{NotUsed, Object};
 use std::collections::HashSet;
 use std::sync::Arc;
+
+/// A `ReferenceGrant` whose API version is negotiated at runtime rather than
+/// fixed at compile time.
+///
+/// `ReferenceGrant` is the one Gateway API kind whose *served version* moves
+/// across the versions Coxswain supports: v1.4 serves only `v1beta1`, v1.5+
+/// serve both `v1` and `v1beta1`. The generated typed binding is pinned to
+/// `v1`, so watching it against a v1.4 cluster 404s on every relist forever —
+/// the capability gate cannot help, because the kind *is* present, just at a
+/// different version.
+///
+/// [`kube::core::Object`] carries its [`kube::core::discovery::ApiResource`] as
+/// runtime data, so the reflector watches whichever version discovery reported.
+/// Only `spec.from` / `spec.to` are ever read and those are byte-identical
+/// between the two versions, so nothing downstream needs to know which one it
+/// got. `NotUsed` for the status: `ReferenceGrant` has none.
+pub type DynamicReferenceGrant = Object<ReferenceGrantSpec, NotUsed>;
 
 /// A flattened set of permitted cross-namespace references, keyed for O(1)
 /// lookup via [`ReferenceGrantKey`].
@@ -30,7 +48,7 @@ pub type GrantSet = HashSet<ReferenceGrantKey>;
 /// [`ReferenceGrantKey::wildcard`]; a `Some(name)` flattens to a
 /// [`ReferenceGrantKey::specific`].
 #[must_use]
-pub fn flatten_grants(grants: &[Arc<ReferenceGrant>]) -> (GrantSet, GrantSet) {
+pub fn flatten_grants(grants: &[Arc<DynamicReferenceGrant>]) -> (GrantSet, GrantSet) {
     let backend_grants = flatten(grants, GATEWAY_API_GROUP, "HTTPRoute", "Service");
     let cert_grants = flatten(grants, GATEWAY_API_GROUP, "Gateway", "Secret");
     (backend_grants, cert_grants)
@@ -48,7 +66,7 @@ const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
 /// not by the route kind. Without a matching grant a cross-namespace `secretRef`
 /// fails closed, so a tenant cannot bind another namespace's auth Secret.
 #[must_use]
-pub fn flatten_basic_auth_secret_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
+pub fn flatten_basic_auth_secret_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet {
     flatten(grants, COXSWAIN_GROUP, "BasicAuth", "Secret")
 }
 
@@ -56,7 +74,7 @@ pub fn flatten_basic_auth_secret_grants(grants: &[Arc<ReferenceGrant>]) -> Grant
 /// client-certificate validation when a `caCertificateRefs` entry points at a
 /// ConfigMap in another namespace (#86). Same filter rules as [`flatten_grants`].
 #[must_use]
-pub fn flatten_ca_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
+pub fn flatten_ca_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet {
     flatten(grants, GATEWAY_API_GROUP, "Gateway", "ConfigMap")
 }
 
@@ -66,7 +84,7 @@ pub fn flatten_ca_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
 /// cross-namespace cert grant's `from.kind` is `ListenerSet` — not `Gateway`
 /// (which [`flatten_grants`] handles for Gateway-owned listeners).
 #[must_use]
-pub fn flatten_ls_cert_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
+pub fn flatten_ls_cert_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet {
     flatten(grants, GATEWAY_API_GROUP, "ListenerSet", "Secret")
 }
 
@@ -78,7 +96,7 @@ pub fn flatten_ls_cert_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
 /// permit a TCPRoute's backendRef between the same namespace pair — the same
 /// per-kind isolation [`flatten_ls_cert_grants`] applies to `ListenerSet`.
 #[must_use]
-pub fn flatten_tcp_backend_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
+pub fn flatten_tcp_backend_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet {
     flatten(grants, GATEWAY_API_GROUP, "TCPRoute", "Service")
 }
 
@@ -90,12 +108,12 @@ pub fn flatten_tcp_backend_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
 /// grant silently also permit a UDPRoute's backendRef between the same
 /// namespace pair.
 #[must_use]
-pub fn flatten_udp_backend_grants(grants: &[Arc<ReferenceGrant>]) -> GrantSet {
+pub fn flatten_udp_backend_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet {
     flatten(grants, GATEWAY_API_GROUP, "UDPRoute", "Service")
 }
 
 fn flatten(
-    grants: &[Arc<ReferenceGrant>],
+    grants: &[Arc<DynamicReferenceGrant>],
     from_group: &str,
     from_kind: &str,
     to_kind: &str,
@@ -140,19 +158,26 @@ fn flatten(
 #[cfg(test)]
 mod tests {
     use crate::gw_types::v::referencegrants::{
-        ReferenceGrant, ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
+        ReferenceGrantFrom, ReferenceGrantSpec, ReferenceGrantTo,
     };
-    use crate::reference_grants::flatten_grants;
+    use crate::reference_grants::{DynamicReferenceGrant, flatten_grants};
+    use coxswain_core::gateway_api_capability::{GATEWAY_API_GROUP, GatewayApiKind};
     use coxswain_core::reference_grants::ReferenceGrantKey;
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+    use kube::core::TypeMeta;
     use std::sync::Arc;
 
     fn grant(
         ns: &str,
         from: Vec<(&str, &str, Option<&str>)>,
         to: Vec<(&str, &str, Option<&str>)>,
-    ) -> Arc<ReferenceGrant> {
-        Arc::new(ReferenceGrant {
+    ) -> Arc<DynamicReferenceGrant> {
+        Arc::new(DynamicReferenceGrant {
+            types: Some(TypeMeta {
+                api_version: format!("{GATEWAY_API_GROUP}/v1"),
+                kind: GatewayApiKind::ReferenceGrant.as_str().to_string(),
+            }),
+            status: None,
             metadata: ObjectMeta {
                 namespace: Some(ns.to_string()),
                 name: Some("grant".to_string()),

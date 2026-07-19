@@ -1,0 +1,22 @@
+[
+  {
+    "gatewayApiVersion": "v1.4.0",
+    "reportDir": "v1.4.0",
+    "latest": false
+  },
+  {
+    "gatewayApiVersion": "v1.4.1",
+    "reportDir": "v1.4.1",
+    "latest": false
+  },
+  {
+    "gatewayApiVersion": "v1.5.1",
+    "reportDir": "v1.5",
+    "latest": false
+  },
+  {
+    "gatewayApiVersion": "v1.6.1",
+    "reportDir": "v1.6",
+    "latest": true
+  }
+]

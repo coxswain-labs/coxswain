@@ -135,16 +135,29 @@ fn repo_root() -> Result<PathBuf> {
 }
 
 /// The Gateway API tag to generate against: an explicit CLI override, or the
-/// repo-root `.gateway-api-version` file — the single version knob shared
-/// with `scripts/setup-conformance.sh` and `coxswain-e2e`'s bootstrap harness.
+/// repo-root `.gateway-api-versions.json` manifest — specifically the entry
+/// marked `"latest": true`, the same knob `scripts/gateway-api-versions.sh` and
+/// `coxswain-e2e`'s bootstrap harness read.
 fn resolve_version(root: &Path, version_override: Option<&str>) -> Result<String> {
     if let Some(v) = version_override {
         return Ok(v.to_string());
     }
-    let path = root.join(".gateway-api-version");
+    let path = root.join(".gateway-api-versions.json");
     let raw =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    Ok(raw.trim().to_string())
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&raw)
+        .with_context(|| format!("{} is not valid JSON", path.display()))?;
+    entries
+        .iter()
+        .find(|e| e["latest"] == serde_json::Value::Bool(true))
+        .and_then(|e| e["gatewayApiVersion"].as_str())
+        .map(str::to_owned)
+        .with_context(|| {
+            format!(
+                "{} must mark exactly one entry \"latest\": true",
+                path.display()
+            )
+        })
 }
 
 // -----------------------------------------------------------------------------

@@ -6,8 +6,6 @@ import (
 
 	v1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 	"sigs.k8s.io/gateway-api/conformance"
-	"sigs.k8s.io/gateway-api/conformance/utils/suite"
-	"sigs.k8s.io/gateway-api/pkg/features"
 )
 
 // TestConformance runs the Gateway API HTTP conformance suite against Coxswain.
@@ -25,106 +23,32 @@ import (
 //   - GatewayClass "coxswain" created
 //   - Coxswain running with --status-address set to the reachable proxy IP
 func TestConformance(t *testing.T) {
-	opts := conformance.DefaultOptions(t)
-	opts.GatewayClassName = "coxswain"
-	opts.ConformanceProfiles = []suite.ConformanceProfileName{
-		suite.GatewayHTTPConformanceProfileName,
-		suite.GatewayGRPCConformanceProfileName,
-		suite.GatewayTLSConformanceProfileName,
-		suite.GatewayTCPConformanceProfileName,
-		suite.GatewayUDPConformanceProfileName,
+	caps, err := detectCapabilities(t.Context())
+	if err != nil {
+		t.Fatalf("could not determine the cluster's Gateway API capabilities: %v", err)
 	}
 
-	// Declare only features that are currently implemented.
-	// Add entries here as each feature issue closes.
-	opts.SupportedFeatures = []features.FeatureName{
-		// Core (required for HTTP profile conformance claim)
-		features.SupportGateway,   // #34
-		features.SupportHTTPRoute, // #34
-		// Extended: matching (#7)
-		features.SupportHTTPRouteQueryParamMatching,
-		features.SupportHTTPRouteMethodMatching,
-		// Extended: header modification (#13, #167)
-		features.SupportHTTPRouteBackendRequestHeaderModification,
-		features.SupportHTTPRouteResponseHeaderModification,
-		// Extended: redirect and rewrite (#13)
-		features.SupportHTTPRoutePortRedirect,
-		features.SupportHTTPRouteSchemeRedirect,
-		features.SupportHTTPRoutePathRedirect,
-		features.SupportHTTPRouteHostRewrite,
-		features.SupportHTTPRoutePathRewrite,
-		// Extended: timeouts (#14)
-		features.SupportHTTPRouteRequestTimeout,
-		features.SupportHTTPRouteBackendTimeout,
-		// Extended: redirect status codes (#34)
-		features.SupportHTTPRoute303RedirectStatusCode,
-		features.SupportHTTPRoute307RedirectStatusCode,
-		features.SupportHTTPRoute308RedirectStatusCode,
-		// Extended: named route rules (#34)
-		features.SupportHTTPRouteNamedRouteRule,
-		// Extended: HTTP listener isolation (#34)
-		features.SupportGatewayHTTPListenerIsolation,
-		// Extended: CORS filter — GEP-1767 (#41)
-		features.SupportHTTPRouteCORS,
-		// Extended: RequestMirror filter — GEP-3171 (#261)
-		features.SupportHTTPRouteRequestMirror,
-		features.SupportHTTPRouteRequestMultipleMirrors,
-		features.SupportHTTPRouteRequestPercentageMirror,
-		// Extended: HTTPS misdirected-request detection — GEP-3567 (#96)
-		features.SupportGatewayHTTPSListenerDetectMisdirectedRequests,
-		// Extended: port 8080 listener (#34)
-		features.SupportGatewayPort8080,
-		// Extended: empty Gateway address value (#34)
-		features.SupportGatewayAddressEmpty,
-		// Extended: static Gateway addresses — GatewayStaticAddresses (#260).
-		// Coxswain honors a requested IPAddress by pinning it as the per-Gateway
-		// VIP Service clusterIP (deterministic accept/reject vs the apiserver
-		// service-CIDR). Requires UsableNetworkAddresses/UnusableNetworkAddresses
-		// below, injected by scripts/setup-conformance.sh.
-		features.SupportGatewayStaticAddresses,
-		// Standard: backend client-certificate (mTLS to upstream) — GEP-3155 (#87)
-		features.SupportGatewayBackendClientCertificate,
-		// Standard: frontend client-certificate validation — GEP-91 (#86)
-		features.SupportGatewayFrontendClientCertificateValidation,
-		features.SupportGatewayFrontendClientCertificateValidationInsecureFallback,
-		// Extended: parentRef port mismatch → NoMatchingParent (#34)
-		features.SupportHTTPRouteDestinationPortMatching,
-		// Extended: per-port listener routing (#82, #98)
-		features.SupportHTTPRouteParentRefPort,
-		// Extended: backend protocol selection — GEP-1911 (#90, #32)
-		features.SupportHTTPRouteBackendProtocolH2C,
-		features.SupportHTTPRouteBackendProtocolWebSocket,
-		// Core: BackendTLSPolicy — GEP-1897 (#16)
-		// Extended: BackendTLSPolicy subjectAltNames — GEP-1897 (#133)
-		features.SupportBackendTLSPolicy,
-		features.SupportBackendTLSPolicySANValidation,
-		// Standard: ReferenceGrant — GEP-709 (#3, declaration: #166)
-		// Implementation in coxswain-core/src/reference_grants.rs is already complete;
-		// previously omitted from the SupportedFeatures set, so the GatewayClass status
-		// did not advertise it. This declaration is paperwork only.
-		features.SupportReferenceGrant,
-		// Standard: GRPCRoute — GEP-1016 (#33)
-		features.SupportGRPCRoute,
-		// Extended: named route rules — GEP-995 (#504)
-		features.SupportGRPCRouteNamedRouteRule,
-		// Standard: TLSRoute passthrough — GEP-2643 (#70)
-		features.SupportTLSRoute,
-		// Extended: TLSRoute terminate mode — #481
-		features.SupportTLSRouteModeTerminate,
-		// Extended: TLSRoute mixed (passthrough+terminate on same port) — #481
-		features.SupportTLSRouteModeMixed,
-		// Standard: TCPRoute — GEP-1901 (#505)
-		features.SupportTCPRoute,
-		// Standard: UDPRoute — GEP-2645 (#506)
-		features.SupportUDPRoute,
-		// Standard: ListenerSet — GEP-1713 (#93)
-		features.SupportListenerSet,
-		// Extended: Gateway infrastructure metadata propagation — GEP-1867 (#482).
-		// spec.infrastructure.{labels,annotations} propagate onto provisioned
-		// resources; in shared mode the carrier is a per-Gateway identity
-		// ServiceAccount in the Gateway's namespace.
-		features.SupportGatewayInfrastructurePropagation,
-	}
+	opts := conformance.DefaultOptions(t)
+	opts.GatewayClassName = "coxswain"
+
+	// Profiles are constructed from strings, not from `suite.Gateway*ProfileName`
+	// constants. `GatewayTCPConformanceProfileName` and its UDP sibling do not
+	// exist in the Gateway API v1.4 Go module, so naming them would make this
+	// file fail to *compile* against the suite version matching a v1.4 cluster —
+	// which is exactly the configuration #641 exists to support.
+	//
+	// A profile is claimed only when the CRDs backing it are installed: the
+	// suite runs every test in a claimed profile, and those tests create the
+	// route kind.
+	opts.ConformanceProfiles = profilesFor(caps)
+
+	// Declare only features that are currently implemented AND that the
+	// installed CRDs can express. Add entries here as each feature issue closes;
+	// give an entry a `requires` guard when its CRD kind or schema field is
+	// absent below Gateway API v1.6.
+	opts.SupportedFeatures = supportedFeatures(caps)
+
+	ipType := v1beta1.IPAddressType
 
 	// GatewayStaticAddresses (#260, #558): the suite overlays these onto the
 	// test's `PLACEHOLDER_USABLE_ADDRS`/`PLACEHOLDER_UNUSABLE_ADDRS` manifest
@@ -138,7 +62,6 @@ func TestConformance(t *testing.T) {
 	// Programmed=False/AddressNotUsable. The CI run-conformance action and
 	// scripts/setup-conformance.sh both select a free static-band clusterIP and
 	// inject it via env so the usable IP tracks the live cluster.
-	ipType := v1beta1.IPAddressType
 	usable := os.Getenv("CONFORMANCE_USABLE_ADDR")
 	unusable := os.Getenv("CONFORMANCE_UNUSABLE_ADDR")
 	if usable != "" && unusable != "" {

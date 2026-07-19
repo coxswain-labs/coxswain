@@ -42,6 +42,7 @@ criterion = { workspace = true }
 rustls = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true }
 tracing-test = { workspace = true }
 
 [[bench]]

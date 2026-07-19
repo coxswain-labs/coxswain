@@ -33,17 +33,30 @@ Run the binary directly on your machine. It discovers the cluster via `~/.kube/c
 ### 1. Install the Gateway API CRDs
 
 ```bash
-kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$(cat .gateway-api-version)/standard-install.yaml"
+kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/download/$(scripts/gateway-api-versions.sh --latest)/standard-install.yaml"
 ```
 
-`.gateway-api-version` is the **single** version knob for the whole repo — the same file also pins the CRD version installed by `coxswain-e2e`'s bootstrap harness and drives regeneration of the `gateway-api-types` crate (see below). Bumping it does not require any other file to change in lockstep.
+`.gateway-api-versions.json` is the single source of truth for Gateway API versions. Each entry pairs a CRD release tag with its upstream conformance report directory (not a mechanical transform: upstream keeps per-patch directories through v1.4.x but unified minor directories from v1.5), and exactly one entry is marked `"latest": true`:
+
+```json
+[
+  { "gatewayApiVersion": "v1.4.1", "reportDir": "v1.4.1", "latest": false },
+  { "gatewayApiVersion": "v1.6.1", "reportDir": "v1.6",   "latest": true  }
+]
+```
+
+The `latest` entry is what `coxswain-e2e`'s bootstrap installs, what `kubeconform` validates against, and what `gateway-api-types` is generated from. The rest are versions conformance reports are published for; the controller detects at runtime which kinds and schema fields the installed CRDs actually serve — see `docs/src/reference/capability-matrix.md`.
+
+Read it via `scripts/gateway-api-versions.sh` (`--latest`, `--versions`, `--list`, `--report-dir vX.Y.Z`). That script is the only JSON parser in the shell/CI surface, so no consumer needs `jq` and none can disagree about the schema. `scripts/check-gateway-api-versions.sh` validates it.
+
+This replaced a `.gateway-api-version` pin plus a separate plural manifest. A `"latest": true` flag makes "the pin is not in the manifest" unrepresentable rather than merely gated.
 
 #### Regenerating `gateway-api-types`
 
 `crates/gateway-api-types` (Gateway API Rust bindings) is generated wholesale — never hand-edited — by the `xtask` crate, a repo-root sibling of `crates/` (the classic `cargo xtask` layout; not part of the runtime dependency graph, same non-runtime category as `coxswain-e2e`). To bump the Gateway API version:
 
 1. Requires the [`kopium`](https://github.com/kube-rs/kopium) CLI (`cargo install kopium`) and an authenticated `gh` CLI (used for GitHub API tree listings that drive CRD-kind and condition-constant discovery).
-2. Edit `.gateway-api-version` at the repo root.
+2. Edit `.gateway-api-versions.json` at the repo root: add the new version's entry and move `"latest": true` onto it.
 3. Run the generator:
    ```bash
    cargo run -p xtask -- gateway-api-types
@@ -272,7 +285,7 @@ Examples for other clusters:
 - kind: `--reset 'kind delete cluster --name kind && kind create cluster --name kind'`
 - minikube: `--reset 'minikube delete && minikube start'`
 
-`main_test.go` is the entrypoint; `opts.SupportedFeatures` lists the feature flags this release claims to pass. Reports are written to `reports/` (`local-report.yaml` is gitignored). Verify compilation without a cluster via `cd conformance && go vet ./...`.
+`main_test.go` is the entrypoint. The claimed profiles and features are derived from the cluster's installed CRDs rather than hard-coded: `capabilities.go` reads the Gateway API CRD definitions (kind presence plus two schema-field probes) and `features.go` holds the `gatedFeatures` table naming what each declaration requires. Profiles are built from strings rather than `suite.Gateway*ConformanceProfileName` constants because the TCP/UDP constants do not exist in the Gateway API v1.4 Go module, and this file must compile against it. Reports are written to `reports/` (`local-report.yaml` is gitignored). Verify compilation without a cluster via `cd conformance && go vet ./...`.
 
 ### Tips
 

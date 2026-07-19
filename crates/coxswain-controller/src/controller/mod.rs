@@ -26,6 +26,7 @@ use coxswain_core::crd::coxswain_backend_policy::CoxswainBackendPolicy;
 use coxswain_core::crd::coxswain_external_auth::CoxswainExternalAuth;
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
+use coxswain_reflector::capabilities::SharedGatewayApiCapabilities;
 use coxswain_reflector::gw_types::ListenerSet;
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
@@ -375,6 +376,7 @@ impl Controller {
             ctp_status: self.channels.ctp.clone(),
             cbp_status: self.channels.cbp.clone(),
             external_auth_status: self.channels.external_auth.clone(),
+            gateway_api_capabilities: stores.gateway_api_capabilities.clone(),
             gateway_classes: stores.gateway_classes.clone(),
             ingress_classes: stores.ingress_classes.clone(),
             gateways: stores.gateways.clone(),
@@ -1003,6 +1005,10 @@ struct ReconcileContext {
     ctp_status: ClientTrafficPolicyStatusHandle,
     cbp_status: CoxswainBackendPolicyStatusHandle,
     external_auth_status: CoxswainExternalAuthStatusHandle,
+    /// Gateway API capabilities detected by the reflector (#641), read when
+    /// building `GatewayClass.status.supportedFeatures` so a cluster on an older
+    /// CRD set is not advertised features its schema cannot express.
+    gateway_api_capabilities: SharedGatewayApiCapabilities,
     /// Synced GatewayClass store, read for Gateway ownership at reconcile time.
     gateway_classes: MergedStore<GatewayClass>,
     /// Synced IngressClass store, read for Ingress ownership at reconcile time.
@@ -1838,7 +1844,14 @@ async fn reconcile_gateway_class_inner(gc: &GatewayClass, ctx: &ReconcileContext
     if gc.spec.controller_name != ctx.controller_name {
         return StatusOutcome::await_change();
     }
-    if gateway_class_needs_status_patch(gc) {
+    let caps = ctx.gateway_api_capabilities.load();
+    // An empty set means detection has not succeeded yet, not that the cluster
+    // supports nothing. Patching now would publish an empty `supportedFeatures`
+    // over a correct one; the reflector bumps a rebuild once detection lands.
+    if !caps.group_present() {
+        return StatusOutcome::await_change();
+    }
+    if gateway_class_needs_status_patch(gc, &caps) {
         let Some(generation) = gc.metadata.generation else {
             tracing::warn!(
                 name = gc.metadata.name.as_deref().unwrap_or(""),
@@ -1848,7 +1861,8 @@ async fn reconcile_gateway_class_inner(gc: &GatewayClass, ctx: &ReconcileContext
         };
         let name = gc.metadata.name.as_deref().unwrap_or_default();
         if leader_write_fence(ctx) {
-            gateway_class_events::patch_gateway_class_status(&ctx.client, name, generation).await;
+            gateway_class_events::patch_gateway_class_status(&ctx.client, name, generation, &caps)
+                .await;
         }
     }
     StatusOutcome::await_change()

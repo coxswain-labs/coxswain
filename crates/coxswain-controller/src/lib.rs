@@ -57,7 +57,7 @@ pub const RELAY_DISCOVERY_PORT: u16 = 50051;
 pub use coxswain_core::cluster::SharedClusterSummary;
 pub use coxswain_reflector::{
     BackendTlsPolicyStatusHandle, GatewayListenerStatus, GatewayListenerStatusHandle, IngressPorts,
-    ListenerInfo, ListenerReadiness, RouteStatusHandle, gateway_api_crds_present,
+    ListenerInfo, ListenerReadiness, RouteStatusHandle,
 };
 
 // The status writer no longer instantiates a reconciler directly — bin owns

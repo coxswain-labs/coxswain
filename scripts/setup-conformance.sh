@@ -16,6 +16,12 @@
 #
 # Usage:
 #   scripts/setup-conformance.sh --reset '<cluster-reset-command>'
+#                                [--gateway-api-version vX.Y.Z]
+#
+# `--gateway-api-version` installs a CRD set other than the current latest, to
+# reproduce the reduced-capability configurations Coxswain also supports.
+# Gateway API CRDs are cluster-scoped singletons, so each version needs its own
+# fresh cluster. Valid values are the versions in `.gateway-api-versions.json`.
 #
 # Examples:
 #   scripts/setup-conformance.sh --reset 'orb delete -f k8s && orb start k8s'
@@ -33,6 +39,7 @@
 set -euo pipefail
 
 RESET_CMD=""
+GATEWAY_API_VERSION=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,8 +47,12 @@ while [[ $# -gt 0 ]]; do
       RESET_CMD="$2"
       shift 2
       ;;
+    --gateway-api-version)
+      GATEWAY_API_VERSION="$2"
+      shift 2
+      ;;
     -h|--help)
-      sed -n '2,32p' "$0" | sed 's/^# \{0,1\}//'
+      sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     *)
@@ -57,11 +68,14 @@ if [ -z "${RESET_CMD-}" ] && [ -z "${SKIP_RESET-}" ]; then
   exit 2
 fi
 
-if [ ! -f .gateway-api-version ]; then
-  echo "error: .gateway-api-version not found; run from the repo root" >&2
-  exit 1
+if [ -z "$GATEWAY_API_VERSION" ]; then
+  GATEWAY_API_VERSION=$(scripts/gateway-api-versions.sh --latest)
+else
+  # Fail fast on a version we do not claim support for: the suite would then run
+  # against an untested CRD set and its report could not be published.
+  # `--report-dir` errors (listing the valid versions) if the version is unknown.
+  scripts/gateway-api-versions.sh --report-dir "$GATEWAY_API_VERSION" >/dev/null
 fi
-GATEWAY_API_VERSION=$(cat .gateway-api-version)
 
 if [ -n "$RESET_CMD" ]; then
   echo ">>> reset cluster: $RESET_CMD"

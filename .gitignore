@@ -12,6 +12,8 @@
 .DS_Store
 _staging/
 __pycache__/
+# Local scratch reports only. Published per-version reports live under
+# conformance/reports/<report-dir>/coxswain-coxswain/ and ARE tracked.
 conformance/reports/*.yaml
 conformance/conformance.test
 crates/coxswain-e2e/fixtures/scheme-authz/scheme-authz

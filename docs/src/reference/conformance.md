@@ -4,15 +4,24 @@ Coxswain is tested against the official [Gateway API conformance suite](https://
 
 ## Claimed profiles and features
 
-Coxswain claims three conformance profiles:
+Coxswain claims up to five conformance profiles. Which ones are claimed depends
+on the **installed Gateway API CRDs**, not on a compiled-in list — a profile
+whose route kind is absent cannot be claimed, because the suite would create
+that kind and fail:
 
-| Profile | Description |
-|---------|-------------|
-| `GATEWAY-HTTP` | HTTPRoute routing, header/path manipulation, redirects, mirroring, timeouts |
-| `GATEWAY-GRPC` | GRPCRoute routing |
-| `GATEWAY-TLS` | TLSRoute passthrough, terminate, and mixed-mode listeners |
+| Profile | Requires | Description |
+|---------|----------|-------------|
+| `GATEWAY-HTTP` | always | HTTPRoute routing, header/path manipulation, redirects, mirroring, timeouts |
+| `GATEWAY-GRPC` | `GRPCRoute` | GRPCRoute routing |
+| `GATEWAY-TLS` | `TLSRoute` (v1.5+) | TLSRoute passthrough, terminate, and mixed-mode listeners |
+| `GATEWAY-TCP` | `TCPRoute` (v1.6+) | TCPRoute routing |
+| `GATEWAY-UDP` | `UDPRoute` (v1.6+) | UDPRoute routing |
 
-Extended features are listed in `conformance/main_test.go` (`opts.SupportedFeatures`) and kept in sync with the Rust `SUPPORTED_FEATURES` constant in `crates/coxswain-controller/src/controller/gateway_class_status.rs`. The `scripts/check-supported-features.sh` script enforces this parity in CI — a mismatch is a build error.
+So a run against Gateway API v1.4 claims two profiles (HTTP and GRPC — it has
+no TLSRoute, TCPRoute or UDPRoute CRD) and a run against v1.6 claims all five.
+See the [capability matrix](capability-matrix.md).
+
+Extended features are listed in `conformance/features.go` (`gatedFeatures`) and kept in sync with the Rust `SUPPORTED_FEATURES` table in `crates/coxswain-controller/src/controller/gateway_class_status.rs`. The `scripts/check-supported-features.sh` script enforces this parity in CI — a mismatch is a build error. Each entry carries what the cluster must install for the declaration to be true, so both sides shrink identically on an older CRD set.
 
 ## Prerequisites
 
@@ -82,9 +91,48 @@ cd conformance && CONFORMANCE_USABLE_ADDR=<ip> CONFORMANCE_UNUSABLE_ADDR=192.0.2
   --report-output=reports/local-report.yaml
 ```
 
-`reports/local-report.yaml` is gitignored. A CI-generated report for each release is published to `conformance/reports/`.
+Or use the wrapper, which resolves the upstream report path for you:
+
+```bash
+bash scripts/run-conformance.sh
+```
+
+A loose `reports/*.yaml` is gitignored. Published reports live under
+`conformance/reports/<report-dir>/coxswain-coxswain/` and are tracked — see
+`conformance/reports/README.md` for the layout.
 
 A full run takes 8–15 minutes on a clean cluster.
+
+## Running against an older Gateway API version
+
+Coxswain supports several Gateway API versions (see the
+[capability matrix](capability-matrix.md)), and publishes a report for each.
+Because Gateway API CRDs are cluster-scoped singletons, **every version needs
+its own fresh cluster**:
+
+```bash
+for v in $(scripts/gateway-api-versions.sh --versions); do
+  kind create cluster --name coxswain-conf
+  bash scripts/setup-conformance.sh --gateway-api-version "$v" --reset ''
+  bash scripts/run-conformance.sh   --gateway-api-version "$v"
+  kind delete cluster --name coxswain-conf
+done
+```
+
+`run-conformance.sh` pins the Go suite module to the matching version in a
+temporary copy of `conformance/`, so no tracked file is modified — a pinned
+`go.mod` left behind would look like an intentional downgrade of the project's
+own dependency.
+
+Expect fewer profiles and a shorter `supportedFeatures` list on older versions.
+That is the mechanism working. The versions come from
+`.gateway-api-versions.json`, whose `"latest": true` entry is also what drives
+codegen, e2e and kubeconform; `scripts/check-gateway-api-versions.sh` validates
+the manifest.
+
+The same matrix runs in CI via the `Conformance reports (all Gateway API versions)`
+workflow, which is `workflow_dispatch` only and emits one combined,
+repo-tree-shaped artifact.
 
 ### Running a subset of tests
 
@@ -130,11 +178,19 @@ A test is **skipped** (not failed) when the implementation explicitly claims the
 
 ## Adding a new claimed feature
 
-1. Add the `features.SupportXxx` constant to `opts.SupportedFeatures` in `conformance/main_test.go`.
+1. Add a `{name: features.SupportXxx}` entry to the `gatedFeatures` table in `conformance/features.go`, with a `requiresKind` or `requiresField` guard if the CRD kind or schema field is absent below the newest supported Gateway API version.
 2. Add the bare feature name (e.g. `"TLSRouteModeTerminate"`) to the sorted `SUPPORTED_FEATURES` slice in `crates/coxswain-controller/src/controller/gateway_class_status.rs`.
 3. Run `scripts/check-supported-features.sh` — it must report the feature count in sync.
 4. Add or update e2e tests for the new behaviour (`crates/coxswain-e2e/tests/`).
 
 ## CI
 
-The conformance suite runs in CI against a kind cluster with cloud-provider-kind on every PR. The CI job uses `Dockerfile.ci` (Linux-only fast path) and `VIP_SERVICE_TYPE=LoadBalancer` (the default). Reports for merged releases are committed to `conformance/reports/`.
+The conformance suite runs in CI against a kind cluster with cloud-provider-kind on every PR, at the pinned latest Gateway API version. The CI job uses `Dockerfile.ci` (Linux-only fast path) and `VIP_SERVICE_TYPE=LoadBalancer` (the default).
+
+Reports for every supported version are produced by the `Conformance reports (all Gateway API versions)` workflow (`workflow_dispatch`), which uploads one bundle laid out as the repo tree.
+
+Nothing in CI commits reports back to this repository. Run that workflow with `publish_release: true` and the bundle is attached to a GitHub release instead — release assets never expire, whereas Actions artifacts are capped at 90 days on a public repo. Publishing upstream is then: download the release asset, unpack at the root of a `kubernetes-sigs/gateway-api` checkout, open a PR.
+
+Every report is traceable to its source tree. `implementation.version` and the report filename both carry a `git describe --tags --always --long` string, so the commit ref is present even for a build on an exact release tag, and the release body names the full source commit.
+
+The release workflow separately attaches the latest-version report to each product release, where conformance also acts as a **gate** — a build that fails conformance is never published.

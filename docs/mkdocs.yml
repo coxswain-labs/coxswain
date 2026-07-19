@@ -99,6 +99,7 @@ nav:
     - Relay policy: reference/relay-policy.md
     - Observability: reference/observability.md
     - Conformance: reference/conformance.md
+    - Gateway API capability matrix: reference/capability-matrix.md
   - Architecture:
     - Overview: architecture.md
     - Deployment models: architecture/deployment-models.md

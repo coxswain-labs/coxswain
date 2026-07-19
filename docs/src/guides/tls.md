@@ -53,7 +53,7 @@ kubectl create secret tls app-tls \
 |-----------|-----------------|-------|
 | cert-manager | v1.14 | For Ingress only |
 | cert-manager | v1.16 | For Gateway API |
-| Gateway API CRDs | v1.0 | For Gateway API usage |
+| Gateway API CRDs | v1.4.0 | For Gateway API usage |
 
 ```bash
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.18.0/cert-manager.yaml

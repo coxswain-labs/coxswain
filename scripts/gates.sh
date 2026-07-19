@@ -98,6 +98,10 @@ for raw in "${paths[@]}"; do
     crates/coxswain-controller/src/controller/gateway_class_status.rs|conformance/*)
       add scripts/check-supported-features.sh ;;
   esac
+  case "$p" in
+    .gateway-api-versions.json|scripts/gateway-api-versions.sh)
+      add scripts/check-gateway-api-versions.sh ;;
+  esac
 done
 
 [ "${#gates[@]}" -eq 0 ] && exit 0

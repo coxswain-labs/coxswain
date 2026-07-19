@@ -120,6 +120,7 @@ static_assertions  = { version = "1.1" }
 sysinfo            = { version = "0.39", default-features = false, features = ["system"] }
 tempfile           = { version = "3" }
 thiserror          = { version = "2.0" }
+tower              = { version = "0.5", features = ["util"] }
 tls-parser         = { version = "0.12" }
 time               = { version = "0.3" }
 tokio              = { version = "1", features = ["full"] }

@@ -5,10 +5,24 @@ description: >
   already been loaded into the local Docker daemon by the calling job.
   Outputs the workspace-relative path of the generated report YAML.
 
+inputs:
+  gateway-api-version:
+    description: >
+      Gateway API version to install and pin the conformance suite to. Defaults
+      to the current latest. Must be listed in
+      `.gateway-api-versions.json`.
+    required: false
+    default: ''
+
 outputs:
   report-file:
     description: Workspace-relative path to the generated conformance report YAML.
     value: ${{ steps.conformance.outputs.report-file }}
+  report-dir:
+    description: >
+      Upstream report directory for the tested version (e.g. `v1.5` for
+      v1.5.1) — the directory the report is published under.
+    value: ${{ steps.gw-version.outputs.report-dir }}
 
 runs:
   using: composite
@@ -27,10 +41,24 @@ runs:
         cluster-name: coxswain-conformance
         include-busybox: 'false'
 
-    - name: Read Gateway API version
+    - name: Resolve Gateway API version and report directory
       id: gw-version
       shell: bash
-      run: echo "version=$(cat .gateway-api-version)" >> "$GITHUB_OUTPUT"
+      run: |
+        VERSION="${{ inputs.gateway-api-version }}"
+        if [ -z "$VERSION" ]; then
+          VERSION=$(scripts/gateway-api-versions.sh --latest)
+        fi
+        # The report directory is not derivable from the version (per-patch
+        # through v1.4.x, unified minors from v1.5), so it is looked up. This
+        # also rejects a version we do not claim support for.
+        if ! REPORT_DIR=$(scripts/gateway-api-versions.sh --report-dir "$VERSION"); then
+          echo "::error::$VERSION is not a supported Gateway API version"
+          exit 1
+        fi
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+        echo "report-dir=$REPORT_DIR" >> "$GITHUB_OUTPUT"
+        echo "Gateway API $VERSION -> reports/$REPORT_DIR"
 
     - name: Load coxswain image into kind
       shell: bash
@@ -54,6 +82,9 @@ runs:
       shell: bash
       run: |
         kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/${{ steps.gw-version.outputs.version }}/standard-install.yaml
+        # Only kinds present at EVERY supported version may be waited on here:
+        # ListenerSet/TLSRoute/TCPRoute/UDPRoute are absent below v1.5/v1.6 by
+        # design, and waiting on them would fail the legs #641 exists to prove.
         kubectl wait --for=condition=Established --timeout=60s \
           crd/gatewayclasses.gateway.networking.k8s.io \
           crd/httproutes.gateway.networking.k8s.io \
@@ -175,19 +206,49 @@ runs:
         CONFORMANCE_USABLE_ADDR: ${{ steps.static-addr.outputs.usable }}
         CONFORMANCE_UNUSABLE_ADDR: "192.0.2.1"
       run: |
+        # Clean `v0.5.0` on the tagged release commit (the tag is the ref);
+        # `v0.5.0-40-g6352459` off-tag, where the hash is what identifies the
+        # tree. Needs the full checkout above — shallow loses the tag entirely.
+        IMPL_VERSION=$(git describe --tags --always --dirty)
+        LATEST=$(scripts/gateway-api-versions.sh --latest)
+        VERSION="${{ steps.gw-version.outputs.version }}"
+        REPORT_DIR="${{ steps.gw-version.outputs.report-dir }}"
+        # Upstream's expected layout, so publishing is copy-the-tree.
+        REPORT_FILE="conformance/reports/${REPORT_DIR}/coxswain-coxswain/standard-${IMPL_VERSION}-default-report.yaml"
+        mkdir -p "$(dirname "$REPORT_FILE")"
+        REPORT_ABS="$(cd "$(dirname "$REPORT_FILE")" && pwd)/$(basename "$REPORT_FILE")"
+
         cd conformance
+        if [ "$VERSION" != "$LATEST" ]; then
+          # Pin the suite module to match the installed CRDs. `go.mod` is
+          # restored below so the job cannot leave the tree looking like an
+          # intentional downgrade of the project's own dependency.
+          cp go.mod go.mod.orig
+          cp go.sum go.sum.orig
+          # Restore on ANY exit, not just after `go test`: `go mod edit` and the
+          # `go mod tidy` below run under `bash -e`, and a downgrade that fails
+          # to resolve would otherwise abort the step leaving the tree pinned to
+          # the older version.
+          trap 'if [ -f go.mod.orig ]; then mv go.mod.orig go.mod; mv go.sum.orig go.sum; fi' EXIT
+          go mod edit -require="sigs.k8s.io/gateway-api@${VERSION}"
+          go mod edit -require="sigs.k8s.io/gateway-api/conformance@${VERSION}"
+        fi
         go mod tidy
-        REPORT_FILE="reports/gateway-api-conformance-$(git describe --tags --always --dirty).yaml"
+        set +e
         go test -v -timeout 55m -run TestConformance \
           -args \
           --organization=coxswain-labs \
           --project=coxswain \
           --url=https://github.com/coxswain-labs/coxswain \
-          --version=$(git describe --tags --always --dirty) \
+          --version="${IMPL_VERSION}" \
           --contact=https://github.com/coxswain-labs/coxswain/issues \
-          --report-output="${REPORT_FILE}" \
+          --report-output="${REPORT_ABS}" \
           --cleanup-base-resources=true
-        echo "report-file=conformance/${REPORT_FILE}" >> "$GITHUB_OUTPUT"
+        STATUS=$?
+        set -e
+        # go.mod/go.sum are restored by the EXIT trap above.
+        echo "report-file=${REPORT_FILE}" >> "$GITHUB_OUTPUT"
+        exit "$STATUS"
 
     - uses: ./.github/actions/dump-cluster-state
       if: failure()
