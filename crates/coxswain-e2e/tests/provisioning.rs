@@ -1572,8 +1572,36 @@ mod serial {
             Duration::from_secs(90),
             wait::POLL,
             || async {
+                // Render which objects actually survived, and the relay's replica
+                // state: GC is gated on the relay draining to zero subscribers, so
+                // "Deployment still present with 1 ready replica" and "Service
+                // lingering after the Deployment went" are entirely different
+                // failures and the bare sentence distinguished neither.
+                let survivors = [
+                    ("Deployment", deployments.get(RELAY_NAME).await.is_ok()),
+                    ("Service", services.get(RELAY_NAME).await.is_ok()),
+                    ("ServiceAccount", sas.get(RELAY_NAME).await.is_ok()),
+                ]
+                .iter()
+                .filter(|(_, present)| *present)
+                .map(|(kind, _)| *kind)
+                .collect::<Vec<_>>()
+                .join(", ");
+                let replicas = match deployments.get(RELAY_NAME).await {
+                    Ok(d) => {
+                        let s = d.status.unwrap_or_default();
+                        format!(
+                            "ready={}/{} unavailable={}",
+                            s.ready_replicas.unwrap_or(0),
+                            s.replicas.unwrap_or(0),
+                            s.unavailable_replicas.unwrap_or(0),
+                        )
+                    }
+                    Err(_) => "<deployment gone>".to_string(),
+                };
                 format!(
-                    "namespace relay '{RELAY_NAME}' garbage-collected after the tier is disabled"
+                    "namespace relay '{RELAY_NAME}' garbage-collected after the tier is disabled \
+                     — still present: [{survivors}]; relay deployment {replicas}"
                 )
             },
             || async {

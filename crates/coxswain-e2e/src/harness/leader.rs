@@ -121,6 +121,15 @@ pub async fn wait_for_new_leader(
     .await
 }
 
+/// Per-tick ceiling on establishing the admin port-forward in
+/// [`wait_for_leader_reconciled`].
+///
+/// [`pod_admin_forward`] polls up to 30 s for the local port to bind, which is
+/// right for a one-shot caller and wrong inside a poll loop: one bad tick would
+/// consume half a 60 s budget. Capping it keeps the tick cost near the poll
+/// interval, so the wait actually gets the ~120 attempts its interval implies.
+const FORWARD_TICK_BUDGET: Duration = Duration::from_secs(4);
+
 /// Wait until the CURRENT Lease holder reports `leader=1` plus at least one
 /// successful reconcile — the post-restart convergence gate for HA installs.
 ///
@@ -131,6 +140,12 @@ pub async fn wait_for_new_leader(
 /// window where the pod is Ready but the admin listener isn't up yet (the
 /// forward accepts the local connection, fails the upstream dial once, and
 /// never recovers — starving the entire wait on a dead tunnel).
+///
+/// The per-tick forward is capped at [`FORWARD_TICK_BUDGET`]. Without that cap
+/// the defence starves itself: [`pod_admin_forward`] waits up to 30 s for the
+/// port to bind, so in exactly the post-outage window this gate exists for — the
+/// pod Ready before its admin listener is up — a 60 s budget is two attempts
+/// deep, not the ~120 the 500 ms poll interval suggests.
 ///
 /// # Errors
 ///
@@ -144,15 +159,59 @@ pub async fn wait_for_leader_reconciled(client: &Client, timeout: Duration) -> a
         wait::POLL,
         || {
             let lease_api = lease_api.clone();
+            let pods_api = pods_api.clone();
             async move {
+                // Render what was actually observed, not just what was wanted:
+                // "the leader never reconciled" and "we never managed to scrape
+                // it" are different failures and the holder name alone
+                // distinguished neither.
                 let holder = lease_api
                     .get(LEASE_NAME)
                     .await
                     .ok()
                     .and_then(|l| l.spec.and_then(|s| s.holder_identity));
+                let Some(holder) = holder.filter(|h| !h.is_empty()) else {
+                    return "a Lease holder to exist; the Lease has no holder_identity".to_string();
+                };
+                let ready = match pods_api.get(&holder).await {
+                    Ok(p) => {
+                        if pod_is_ready(&p) {
+                            "Ready=True"
+                        } else {
+                            "Ready!=True"
+                        }
+                    }
+                    Err(_) => "<holder pod not found>",
+                };
+                let scrape =
+                    match tokio::time::timeout(FORWARD_TICK_BUDGET, pod_admin_forward(&holder))
+                        .await
+                    {
+                        Ok(Ok(pf)) => {
+                            match reqwest::get(format!("{}/metrics", pf.base_url)).await {
+                                Ok(r) => match r.text().await {
+                                    Ok(body) => format!(
+                                        "leader={:?} reconcile_ok_total={:?}",
+                                        wait::parse_metric_value(
+                                            &body,
+                                            "coxswain_controller_leader"
+                                        ),
+                                        wait::reconcile_ok_total(&body),
+                                    ),
+                                    Err(e) => format!("<metrics body unreadable: {e}>"),
+                                },
+                                Err(e) => format!("<metrics scrape failed: {e}>"),
+                            }
+                        }
+                        Ok(Err(e)) => format!("<admin port-forward failed: {e}>"),
+                        Err(_) => format!(
+                            "<admin port-forward did not bind within {FORWARD_TICK_BUDGET:?} — \
+                         the admin listener is not accepting yet>"
+                        ),
+                    };
                 format!(
-                    "the current Lease holder to report leader=1 with a successful \
-                     reconcile; holder: {holder:?}"
+                    "the current Lease holder to report leader=1 with a successful reconcile; \
+                     holder={holder} ({ready}); last scrape: {scrape}"
                 )
             }
         },
@@ -171,7 +230,12 @@ pub async fn wait_for_leader_reconciled(client: &Client, timeout: Duration) -> a
                 if !pod_is_ready(&pod) {
                     return None;
                 }
-                let pf = pod_admin_forward(&holder).await.ok()?;
+                // Bounded: a tick that cannot bind costs one poll interval, not
+                // half the caller's budget. See FORWARD_TICK_BUDGET.
+                let pf = tokio::time::timeout(FORWARD_TICK_BUDGET, pod_admin_forward(&holder))
+                    .await
+                    .ok()?
+                    .ok()?;
                 let body = reqwest::get(format!("{}/metrics", pf.base_url))
                     .await
                     .ok()?

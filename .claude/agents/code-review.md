@@ -89,6 +89,35 @@ feature spanning route types (HTTPRoute and GRPCRoute) needs both, separately �
 shared enforcement code does not discharge it, because reconcile wiring and
 status paths differ. Unit tests do not substitute for e2e.
 
+**E2E test construction.** Applies to any change under `crates/coxswain-e2e/`.
+These four rules each have a failure mode that is silent — a test that violates
+them still passes, so nothing surfaces until the bug it should have caught ships:
+
+- *Assert identity and the negative.* `assert!(status == 200)` passes on a
+  **mis-route**. Flag any assertion that does not pin the response to the
+  expected backend (echo-server identity headers), and any teardown that does
+  not assert the negative — a deleted route stops serving (404 / refused), a
+  migrated-away endpoint goes dark. This is the highest-value rule here: a test
+  without it cannot fail for the reason it exists.
+- *Self-diagnosing failures.* Every waiter's `on_timeout` closure must fetch and
+  render the last-observed world state — expected vs actual vs conditions / pod
+  status / HTTP code. Flag any closure rendering only what was expected. A CI
+  timeout that says `"deployments not ready in {ns}"` and nothing else is a
+  defect in the test, not bad luck.
+- *Black-box only.* A test may know only what an operator or HTTP client knows:
+  apply YAML, observe status conditions and live responses. Flag any reach into
+  controller/proxy internals, in-process state, or private types — it makes the
+  test green while the public contract is broken.
+- *Mutate only what you own.* A test creates and mutates resources in its own
+  namespace (via `NamespaceGuard`) and nothing else. Flag edits to shared or
+  cluster-scoped state, or to another test's namespace: that is the failure mode
+  where one test breaks twenty unrelated ones and the cause looks like a routing
+  bug. `check-e2e-mutators-serialized.sh` covers only the `ControllerOptions`
+  case; cross-namespace mutation is yours.
+
+A flaky test is a failing test — never a longer wait or a retry-to-green.
+Quarantine with a tracking issue, or name the post-condition that was not polled.
+
 **Crate boundaries.** `coxswain-proxy` and `coxswain-controller` must never
 import each other; `proxy` depends on `core` only. New items default to
 `pub(crate)`, `pub(super)` when crossing one module boundary, bare `pub` only
