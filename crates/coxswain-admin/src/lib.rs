@@ -94,7 +94,6 @@ const UI_HTML: &str = include_str!(concat!(
 /// [`HttpServerApp`] directly: it streams those two paths and reproduces the
 /// buffered request/response pipeline (including the response-compression
 /// module) for every other endpoint.
-#[non_exhaustive]
 pub struct AdminServer {
     /// Shared health registry surfaced under `/api/v1/health`.
     pub health: HealthRegistry,
@@ -429,7 +428,6 @@ impl AdminServer {
 /// automated tooling can detect Ingress-only or Gateway-API-only deployments
 /// without inspecting flags or Helm values.
 #[derive(Clone, Copy, Serialize)]
-#[non_exhaustive]
 pub struct ApiSurfaces {
     /// `true` when the Gateway API surface (HTTPRoute, GatewayClass, etc.) is
     /// active on this pod. `false` when `--disable-gateway-api` was set.

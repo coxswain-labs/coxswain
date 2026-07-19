@@ -45,9 +45,8 @@ pub const WIRE_VERSION: u32 = 2;
 ///
 /// # Construction
 ///
-/// Use [`ContentHash::compute`] — direct construction is intentionally blocked
-/// by `#[non_exhaustive]`.
-#[non_exhaustive]
+/// Use [`ContentHash::compute`] — the inner field is private, so the hash can
+/// only originate from an actual sha256 computation.
 pub struct ContentHash(String);
 
 impl ContentHash {

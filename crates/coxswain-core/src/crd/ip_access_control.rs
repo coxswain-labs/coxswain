@@ -55,7 +55,6 @@ use serde::{Deserialize, Serialize};
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct IpAccessControlSpec {
     /// CIDR blocks (IPv4 or IPv6) whose client IPs are **blocked** with `403`.
     ///

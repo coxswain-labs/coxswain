@@ -1831,9 +1831,11 @@ mod tests {
         readiness: ListenerReadiness,
         port: u16,
     ) -> (ListenerStatusKey, ListenerInfo) {
-        let mut info = ListenerInfo::default();
-        info.readiness = readiness;
-        info.port = port;
+        let info = ListenerInfo {
+            readiness,
+            port,
+            ..Default::default()
+        };
         (ListenerStatusKey::gateway(name), info)
     }
 
@@ -1841,8 +1843,10 @@ mod tests {
     fn health(
         listeners: Vec<(ListenerStatusKey, ListenerInfo)>,
     ) -> HashMap<ObjectKey, GatewayListenerStatus> {
-        let mut gw = GatewayListenerStatus::default();
-        gw.listeners = listeners.into_iter().collect();
+        let gw = GatewayListenerStatus {
+            listeners: listeners.into_iter().collect(),
+            ..Default::default()
+        };
         std::iter::once((ObjectKey::new("default", "gw"), gw)).collect()
     }
 
@@ -2020,12 +2024,16 @@ mod tests {
         // Parent Gateway health holds two same-named "tls" passthrough listeners:
         // one its own, one belonging to the ListenerSet.
         let mut gw = GatewayListenerStatus::default();
-        let mut gw_info = ListenerInfo::default();
-        gw_info.readiness = ListenerReadiness::TlsPassthrough;
-        gw_info.port = 443;
-        let mut ls_info = ListenerInfo::default();
-        ls_info.readiness = ListenerReadiness::TlsPassthrough;
-        ls_info.port = 8443;
+        let gw_info = ListenerInfo {
+            readiness: ListenerReadiness::TlsPassthrough,
+            port: 443,
+            ..Default::default()
+        };
+        let ls_info = ListenerInfo {
+            readiness: ListenerReadiness::TlsPassthrough,
+            port: 8443,
+            ..Default::default()
+        };
         gw.listeners = [
             (ListenerStatusKey::gateway("tls"), gw_info),
             (

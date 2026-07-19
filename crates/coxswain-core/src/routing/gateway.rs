@@ -12,7 +12,6 @@ use crate::shared::Shared;
 /// Phantom marker identifying Gateway-API-flavored routing tables.
 ///
 /// Uninhabited; only ever appears as a type parameter, never as a value.
-#[non_exhaustive]
 pub enum Gateway {}
 
 /// Compiled routing table built from Gateway-API resources.

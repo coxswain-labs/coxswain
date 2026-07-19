@@ -1,7 +1,7 @@
 //! Single source of truth for the external container images the e2e fixtures run.
 //!
 //! Every image is pinned by `tag@sha256:<index-digest>` so a registry tag mutation
-//! or a `:latest` re-push can't silently change what a test exercises (rubric #7).
+//! or a `:latest` re-push can't silently change what a test exercises.
 //! The digests are the **multi-arch image-index** digests (not a per-platform
 //! manifest), so they match on both arm64 (local OrbStack) and amd64 (CI).
 //!
@@ -54,7 +54,7 @@ pub(crate) const GO_HTTPBIN: &str = "ghcr.io/mccutchen/go-httpbin:latest@sha256:
 /// Coxswain proxy, and issues short-lived certificates without a real domain.
 ///
 /// GHCR publishes only `:latest` for Pebble; pinned by index digest so a re-push
-/// cannot silently change what the test exercises (rubric #7).
+/// cannot silently change what the test exercises.
 pub(crate) const PEBBLE: &str = "ghcr.io/letsencrypt/pebble:latest@sha256:ddf230642b1a584f519f32e347de1b05a6e4c1f6c35c1863b33effeab5f78199";
 
 /// `istio/ext-authz` — Istio's sample external-authorization server (#23). Serves

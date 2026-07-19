@@ -168,16 +168,17 @@ pub(crate) fn reconcile_frontend_validation(
     }
 
     if any_validation {
-        let mut fv_health = FrontendValidationStatus::default();
-        fv_health.insecure_fallback = any_insecure_fallback;
-        fv_health.resolved_refs = !any_failed;
-        fv_health.message = if any_failed {
-            format!(
-                "gateway {gw_ns}/{gw_name}: one or more frontend CA refs failed to resolve — \
-                 affected HTTPS listeners fail-close until corrected"
-            )
-        } else {
-            String::new()
+        let fv_health = FrontendValidationStatus {
+            insecure_fallback: any_insecure_fallback,
+            resolved_refs: !any_failed,
+            message: if any_failed {
+                format!(
+                    "gateway {gw_ns}/{gw_name}: one or more frontend CA refs failed to resolve — \
+                     affected HTTPS listeners fail-close until corrected"
+                )
+            } else {
+                String::new()
+            },
         };
         health.frontend_validation = Some(fv_health);
     }
@@ -396,8 +397,10 @@ mod tests {
     /// runs — the config is keyed under that port.
     fn health_with_bind_port(listener: &str, internal_port: u16) -> GatewayListenerStatus {
         let mut health = GatewayListenerStatus::default();
-        let mut li = coxswain_core::listener_status::ListenerInfo::default();
-        li.internal_port = internal_port;
+        let li = coxswain_core::listener_status::ListenerInfo {
+            internal_port,
+            ..Default::default()
+        };
         health
             .listeners
             .insert(ListenerStatusKey::gateway(listener), li);

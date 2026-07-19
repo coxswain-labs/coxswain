@@ -45,7 +45,6 @@ use crate::wire::resource::{canonical_key, resource_hash};
 /// The caller (`coxswain-bin`) drives [`Self::supervisor`] as a background
 /// service, hands [`Self::source`] + [`Self::rebuild_rx`] to a
 /// [`crate::DiscoveryService`], and serves that downstream.
-// intentionally open: field-literal consumed at the bin layer
 pub struct RelayUpstream {
     /// The downstream-serving snapshot source, populated by the upstream client.
     pub source: SnapshotSource,

@@ -25,7 +25,6 @@ use crate::proto::v1 as p;
 /// it. The decoder (`decode_world`) does not call back here — it validates each
 /// incoming resource independently against its own guards and fails an unkeyable
 /// snapshot closed (Nack + last-good) on the wire it received.
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ResourceKeyError {
     /// The `Resource.payload` oneof arm was absent.

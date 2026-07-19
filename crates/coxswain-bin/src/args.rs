@@ -96,12 +96,7 @@ pub(crate) struct ServeArgs {
 }
 
 /// Pod role — selects which subsystems run and which flags are accepted.
-///
-/// `#[non_exhaustive]` reserves room for future roles (e.g. an xDS sink) without
-/// breaking exhaustive matches in downstream code; same-crate matches still
-/// remain exhaustive without a wildcard arm.
 #[derive(Subcommand, Debug)]
-#[non_exhaustive]
 pub(crate) enum Role {
     /// Reconciler + status writer pod.
     Controller(ControllerRoleArgs),

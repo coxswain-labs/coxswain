@@ -339,7 +339,7 @@ impl HttpClient {
 ///
 /// Lives in the harness (not a test body): the inter-attempt backoff is a poll
 /// interval, not a blind wait on a post-condition, so it is exempt from the
-/// "no bare sleeps in test bodies" rule (e2e rubric #4).
+/// "no bare sleeps in test bodies" rule.
 pub async fn get_with_transient_retry(
     client: &reqwest::Client,
     url: &str,

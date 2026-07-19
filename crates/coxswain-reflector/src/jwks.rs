@@ -71,7 +71,6 @@ struct JwksCacheInner {
 /// or a healthy URI starts failing), so a route's `Unavailable` → `Jwt`
 /// transition (or vice versa) is picked up without waiting for an unrelated
 /// reconcile.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct JwksCacheHandle(Arc<JwksCacheInner>);
 

@@ -147,19 +147,6 @@ fn listener_info_to_wire(info: &ListenerInfo) -> p::ListenerInfo {
         // HTTPS/TLS listener, so degrading it to the plaintext-HTTP `NotApplicable`
         // would bind the wrong protocol during the transient window.
         ListenerReadiness::VipPending => (p::ListenerReadiness::Unsupported, String::new()),
-        // Data-plane safety: `ListenerReadiness` is a `#[non_exhaustive]` core
-        // enum, so this wildcard is reachable the moment a *future* variant is
-        // added. A panic here would take down the controller's discovery snapshot
-        // push and stall the whole data plane, so degrade an unmapped readiness to
-        // `NotApplicable` — the safe "proxy does nothing special with this
-        // listener" default — and log it instead.
-        other => {
-            tracing::warn!(
-                readiness = ?other,
-                "unmapped ListenerReadiness in discovery wire encode; degrading to NotApplicable"
-            );
-            (p::ListenerReadiness::NotApplicable, String::new())
-        }
     };
     p::ListenerInfo {
         readiness: outcome as i32,
@@ -271,25 +258,29 @@ mod tests {
         let mut map = std::collections::HashMap::new();
         let mut status = GatewayListenerStatus::default();
 
-        let mut http_info = ListenerInfo::default();
-        http_info.readiness = ListenerReadiness::NotApplicable;
-        http_info.attached_routes = 3;
-        http_info.hostname = "example.com".to_string();
-        http_info.port = 80;
+        let http_info = ListenerInfo {
+            readiness: ListenerReadiness::NotApplicable,
+            attached_routes: 3,
+            hostname: "example.com".to_string(),
+            port: 80,
+            ..Default::default()
+        };
         status
             .listeners
             .insert(ListenerStatusKey::gateway("http"), http_info);
 
-        let mut https_info = ListenerInfo::default();
-        https_info.readiness = ListenerReadiness::Resolved;
-        https_info.attached_routes = 5;
-        https_info.hostname = "example.com".to_string();
-        https_info.route_namespaces = RouteNamespaceSet::All;
-        https_info.port = 443;
-        // Shared-mode per-Gateway addressing (#472): advertised :443 binds an
-        // allocated internal targetPort — it must survive the wire round-trip so
-        // the proxy binds and keys routing on the right port.
-        https_info.internal_port = 30007;
+        let https_info = ListenerInfo {
+            readiness: ListenerReadiness::Resolved,
+            attached_routes: 5,
+            hostname: "example.com".to_string(),
+            route_namespaces: RouteNamespaceSet::All,
+            port: 443,
+            // Shared-mode per-Gateway addressing (#472): advertised :443 binds an
+            // allocated internal targetPort — it must survive the wire round-trip so
+            // the proxy binds and keys routing on the right port.
+            internal_port: 30007,
+            ..Default::default()
+        };
         status
             .listeners
             .insert(ListenerStatusKey::gateway("https"), https_info);
@@ -299,18 +290,22 @@ mod tests {
         // round-trip — encoding an Unsupported listener previously hit an
         // `unreachable!()` in `listener_info_to_wire` and crashed the controller's
         // discovery server, starving the proxy of every snapshot.
-        let mut terminate_info = ListenerInfo::default();
-        terminate_info.readiness = ListenerReadiness::Unsupported {
-            message: "tls.mode: Terminate is not supported".to_string(),
+        let terminate_info = ListenerInfo {
+            readiness: ListenerReadiness::Unsupported {
+                message: "tls.mode: Terminate is not supported".to_string(),
+            },
+            port: 8443,
+            ..Default::default()
         };
-        terminate_info.port = 8443;
         status
             .listeners
             .insert(ListenerStatusKey::gateway("tls-terminate"), terminate_info);
 
-        let mut passthrough_info = ListenerInfo::default();
-        passthrough_info.readiness = ListenerReadiness::TlsPassthrough;
-        passthrough_info.port = 8444;
+        let passthrough_info = ListenerInfo {
+            readiness: ListenerReadiness::TlsPassthrough,
+            port: 8444,
+            ..Default::default()
+        };
         status.listeners.insert(
             ListenerStatusKey::gateway("tls-passthrough"),
             passthrough_info,
@@ -323,11 +318,13 @@ mod tests {
         // value: the proxy makes no functional distinction, so it encodes as the
         // existing `Unsupported` and decodes back to `Unsupported` (lossy by design —
         // the k8s status reason is written by the controller, never carried here).
-        let mut unsupported_proto_info = ListenerInfo::default();
-        unsupported_proto_info.readiness = ListenerReadiness::UnsupportedProtocol {
-            message: "protocol \"FOO\" is not supported".to_string(),
+        let unsupported_proto_info = ListenerInfo {
+            readiness: ListenerReadiness::UnsupportedProtocol {
+                message: "protocol \"FOO\" is not supported".to_string(),
+            },
+            port: 5555,
+            ..Default::default()
         };
-        unsupported_proto_info.port = 5555;
         status.listeners.insert(
             ListenerStatusKey::gateway("unsupported-protocol"),
             unsupported_proto_info,
@@ -337,9 +334,11 @@ mod tests {
         // resolves to `VipPending`. Like `UnsupportedProtocol` it has no dedicated
         // wire value; it encodes as `Unsupported` (→ HTTPS on the proxy) and must
         // not hit the panic the old `unreachable!()` wildcard would have raised.
-        let mut vip_pending_info = ListenerInfo::default();
-        vip_pending_info.readiness = ListenerReadiness::VipPending;
-        vip_pending_info.port = 6666;
+        let vip_pending_info = ListenerInfo {
+            readiness: ListenerReadiness::VipPending,
+            port: 6666,
+            ..Default::default()
+        };
         status
             .listeners
             .insert(ListenerStatusKey::gateway("vip-pending"), vip_pending_info);
@@ -349,19 +348,23 @@ mod tests {
         // and on a different port. It must survive the round-trip as its own entry.
         // Both ConflictReason variants must round-trip correctly.
         let ls_key = ObjectKey::new("apps", "team-a");
-        let mut ls_http = ListenerInfo::default();
-        ls_http.readiness = ListenerReadiness::NotApplicable;
-        ls_http.attached_routes = 7;
-        ls_http.port = 8080;
-        ls_http.conflict = ConflictReason::HostnameConflict;
+        let ls_http = ListenerInfo {
+            readiness: ListenerReadiness::NotApplicable,
+            attached_routes: 7,
+            port: 8080,
+            conflict: ConflictReason::HostnameConflict,
+            ..Default::default()
+        };
         status.listeners.insert(
             ListenerStatusKey::listener_set(ls_key.clone(), "http"),
             ls_http,
         );
-        let mut ls_proto = ListenerInfo::default();
-        ls_proto.readiness = ListenerReadiness::NotApplicable;
-        ls_proto.port = 9090;
-        ls_proto.conflict = ConflictReason::ProtocolConflict;
+        let ls_proto = ListenerInfo {
+            readiness: ListenerReadiness::NotApplicable,
+            port: 9090,
+            conflict: ConflictReason::ProtocolConflict,
+            ..Default::default()
+        };
         status.listeners.insert(
             ListenerStatusKey::listener_set(ls_key.clone(), "proto-conflict"),
             ls_proto,

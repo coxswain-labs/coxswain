@@ -23,7 +23,6 @@ pub use coxswain_core::RoutingSource;
 /// will be threaded into the per-source proxies, so the `RoutingSource`
 /// trait is purely a passive view over what the rest of the binary already
 /// owns — no new lifecycle, no new spawned tasks.
-#[non_exhaustive]
 pub struct KubernetesSource {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
@@ -40,7 +39,6 @@ pub struct KubernetesSource {
 /// the workspace 7-argument limit: TLS passthrough, TLS terminate (#481),
 /// TCP proxy (#505), and UDP proxy (#506) — the four port-keyed tables that
 /// bypass the L7 routing tables entirely.
-// intentionally open: field-literal constructed by callers of `KubernetesSource::new`.
 pub struct L4RoutingTables {
     /// SNI-keyed routing table for TLSRoute `mode: Passthrough` listeners.
     pub passthrough_routes: SharedTlsPassthroughTable,

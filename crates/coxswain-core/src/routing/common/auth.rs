@@ -19,12 +19,6 @@ use zeroize::ZeroizeOnDrop;
 /// Carried as `Option<Arc<IngressAuthConfig>>` on [`RouteEntry`][super::entry::RouteEntry]
 /// so the common case (no auth annotation) has zero size impact on the hot
 /// `RouteEntry` beyond an 8-byte niche pointer.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Debug)]
 pub enum IngressAuthConfig {
     /// Forward a sub-request to an external authorization service.
@@ -54,7 +48,6 @@ pub enum IngressAuthConfig {
 /// coxswain uses for every other backend, so the proxy connects to a pod
 /// directly (no DNS). `timeout` and `fail_closed` are transport-independent and
 /// live here; per-transport knobs live inside the [`ExtAuthTransport`] variant.
-#[non_exhaustive]
 #[derive(Debug)]
 pub struct ExtAuthConfig {
     /// Maximum time to wait for the auth service to respond. Defaults to 2 s
@@ -94,10 +87,6 @@ impl ExtAuthConfig {
 }
 
 /// Transport-specific ext_authz wiring.
-///
-/// `#[non_exhaustive]` so a future transport is a backwards-compatible change:
-/// existing `match` arms with `_ => …` continue to compile.
-#[non_exhaustive]
 #[derive(Debug)]
 pub enum ExtAuthTransport {
     /// HTTP forward-auth — Envoy `ext_authz`-HTTP semantics.
@@ -126,7 +115,6 @@ pub enum ExtAuthTransport {
 
 /// HTTP forward-auth wiring: the response-header allow-list knobs. The check
 /// target endpoints live on the parent [`ExtAuthConfig`].
-#[non_exhaustive]
 #[derive(Debug)]
 pub struct HttpExtAuthConfig {
     /// Header names to copy from the auth *response* onto the upstream *request*
@@ -156,7 +144,6 @@ impl HttpExtAuthConfig {
 /// endpoints live on the parent [`ExtAuthConfig`]. The Envoy proto forwards the
 /// full downstream request context to the auth service, so — unlike the HTTP
 /// transport — there is no request-header allow-list knob here.
-#[non_exhaustive]
 #[derive(Debug)]
 pub struct GrpcExtAuthConfig {
     /// Header names to copy from the auth service's `OkHttpResponse.headers` onto
@@ -183,7 +170,6 @@ impl GrpcExtAuthConfig {
 /// cached by the controller. `coxswain-proxy` parses it into verification keys
 /// (via `jsonwebtoken`) and caches the parse result keyed by content, so the
 /// same JWKS is parsed once regardless of how many routes reference it.
-#[non_exhaustive]
 #[derive(Debug)]
 pub struct JwtConfig {
     /// Expected token `iss` claim.
@@ -234,7 +220,6 @@ impl JwtConfig {
 
 /// One request location to look for the bearer token in — mirrors the CRD's
 /// `JwtHeaderLoc`.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JwtHeaderLoc {
     /// Header name to read the token from.
@@ -264,7 +249,6 @@ impl JwtHeaderLoc {
 /// sensitive values).
 ///
 /// `Debug` is hand-implemented to redact both the hash and the username.
-#[non_exhaustive]
 #[derive(ZeroizeOnDrop)]
 pub struct BasicCredential {
     /// Username from the htpasswd entry.
@@ -275,10 +259,6 @@ pub struct BasicCredential {
 
 impl BasicCredential {
     /// Construct a credential entry from a parsed htpasswd line.
-    ///
-    /// Both fields are owned; call sites in `coxswain-reflector` use this
-    /// constructor because `#[non_exhaustive]` prevents struct literals from
-    /// outside the defining crate.
     #[must_use]
     pub fn new(username: impl Into<Box<str>>, hash: PasswordHash) -> Self {
         Self {
@@ -299,15 +279,10 @@ impl std::fmt::Debug for BasicCredential {
 
 /// Supported htpasswd hash algorithms.
 ///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so a new format (MD5 `$apr1$`, etc.) is a
-/// compiler-enforced change rather than a silent runtime drop. `#[non_exhaustive]`
-/// would force a wildcard arm there and defeat that. Unknown formats are
-/// WARN+skipped at parse time.
+/// Unknown formats are WARN+skipped at parse time.
 ///
 /// Hash bytes are zeroed on drop via [`ZeroizeOnDrop`].
 /// `Debug` is hand-implemented to redact the hash value.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(ZeroizeOnDrop)]
 pub enum PasswordHash {
     /// bcrypt hash (`$2a$`, `$2b$`, or `$2y$` prefix).

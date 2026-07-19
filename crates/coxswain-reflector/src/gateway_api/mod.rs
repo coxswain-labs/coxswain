@@ -71,7 +71,6 @@ use std::sync::Arc;
 /// `reconcile`, `status`); this struct exposes the surfaces that consumers
 /// (the [`crate::reconciler::SharedProxyReconciler`] rebuild loop, the controller crate's
 /// status writer) call into.
-#[non_exhaustive]
 pub struct GatewayApiReconciler;
 
 impl GatewayApiReconciler {
@@ -114,7 +113,6 @@ impl GatewayApiReconciler {
 ///
 /// Parallel sibling to [`GatewayApiReconciler`] — not a trait, not a generic, just a second
 /// concrete handle. Both feed the same [`coxswain_core::routing::GatewayRoutingTableBuilder`].
-#[non_exhaustive]
 pub struct GrpcRouteReconciler;
 
 impl GrpcRouteReconciler {
@@ -182,7 +180,6 @@ impl GrpcRouteReconciler {
 /// Parallel sibling to [`GatewayApiReconciler`] and [`GrpcRouteReconciler`] — not a trait,
 /// not a generic, just a concrete handle. Consumes only protocol-filtered listeners
 /// (`protocol: TLS, tls.mode: Passthrough`).
-#[non_exhaustive]
 pub struct TlsRouteReconciler;
 
 impl TlsRouteReconciler {
@@ -220,7 +217,6 @@ impl TlsRouteReconciler {
 /// Parallel sibling to [`TlsRouteReconciler`] — not a trait, not a generic, just a concrete
 /// handle. Consumes only protocol-filtered listeners (`protocol: TCP`). Unlike `TLSRoute`
 /// there is no passthrough/terminate mode split and no SNI/hostname dimension.
-#[non_exhaustive]
 pub struct TcpRouteReconciler;
 
 impl TcpRouteReconciler {
@@ -258,7 +254,6 @@ impl TcpRouteReconciler {
 /// Parallel sibling to [`TcpRouteReconciler`] — not a trait, not a generic, just a concrete
 /// handle. Consumes only protocol-filtered listeners (`protocol: UDP`). Like `TCPRoute`
 /// there is no passthrough/terminate mode split and no SNI/hostname dimension.
-#[non_exhaustive]
 pub struct UdpRouteReconciler;
 
 impl UdpRouteReconciler {

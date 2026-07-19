@@ -92,7 +92,6 @@ use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 /// Error returned when parsing `--ingress-default-backend`.
-#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum IngressDefaultBackendParseError {
     /// No `:` separator found; expected `<namespace>/<service>:<port>`.
@@ -114,7 +113,6 @@ pub enum IngressDefaultBackendParseError {
 /// Set via `--ingress-default-backend=<namespace>/<service>:<port>`.
 /// Implements [`std::str::FromStr`]; parsing errors are reported as
 /// [`IngressDefaultBackendParseError`].
-#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct IngressDefaultBackend {
     /// Kubernetes namespace of the backend service.
@@ -156,7 +154,6 @@ impl std::str::FromStr for IngressDefaultBackend {
 /// [`ReconcilerOptions::ingress_event_tx`]). The proxy role passes `None`,
 /// so no events are emitted and no `events` RBAC is required on the proxy
 /// `ServiceAccount`.
-#[non_exhaustive]
 pub enum IngressEvent {
     /// Two Ingresses claimed the same `(port, host, path)` slot; the loser is
     /// silently ignored. The controller emits a `Warning` Event on the losing
@@ -188,7 +185,6 @@ pub enum IngressEvent {
 }
 
 /// Optional configuration for a [`SharedProxyReconciler`].
-#[non_exhaustive]
 pub struct ReconcilerOptions {
     /// Which namespaces the namespaced watches are scoped to (multi-namespace
     /// watch, #59). [`WatchScope::ClusterWide`] watches every namespace
@@ -381,7 +377,6 @@ impl WatchClientSource<'_> {
 /// has emitted its first `InitDone` (the authoritative "initial sync complete"
 /// signal). After the first successful routing-table publish, the reconciler
 /// also flips `controller.routing_table_built` and `proxy.routing_table_loaded`.
-#[non_exhaustive]
 pub struct ReconcilerHealth {
     /// Handle for the `controller` subsystem (per-reflector + `routing_table_built`).
     pub controller: SubsystemHandle,
@@ -406,7 +401,6 @@ impl ReconcilerHealth {
 /// When [`ReconcilerOptions::watch_fleet`] is `true` (controller role only), a
 /// 12th reflector watches `Pod` objects and publishes a [`SharedFleet`] snapshot
 /// immediately on every change.
-#[non_exhaustive]
 pub struct SharedProxyReconciler {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
@@ -478,7 +472,6 @@ pub struct SharedProxyReconciler {
 /// Bundling them lets [`SharedProxyReconciler::new`] stay under the workspace
 /// `clippy::too_many_arguments` threshold; callers pass one
 /// `ReconcilerOutputs` struct instead of several positional handles.
-// intentionally open: field-literal constructed in coxswain-controller/status_writer.rs and coxswain-bin/lib.rs.
 pub struct ReconcilerOutputs {
     /// Ingress-flavored routing table snapshot, updated on every successful Ingress build.
     pub ingress_routes: SharedIngressRoutingTable,
@@ -528,7 +521,6 @@ pub struct ReconcilerOutputs {
 /// stores the reflector's rebuild pass reads and enqueues from — one authoritative
 /// cache, no duplicate watch. Cheap to [`Clone`] (each field is an `Arc`-backed
 /// store handle). Obtained once from [`SharedProxyReconciler::status_stores`].
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct StatusStores {
     /// `Gateway` store reader.
@@ -659,7 +651,6 @@ impl StatusStoreWriters {
 /// and `Node` are watched only for the operator; the rest are shared with routing
 /// and status. The operator filters the (superset) fleet-Pod and bulk-Service
 /// stores in memory to its dedicated-proxy Pods / VIP Services.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct OperatorStores {
     /// `GatewayClass` reader (shared with [`StatusStores`]).

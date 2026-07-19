@@ -30,7 +30,6 @@ use crate::status::{ConflictReason, ListenerSource, RouteNamespaceSet};
 use coxswain_core::ownership::ObjectKey;
 
 /// One normalised `certificateRefs` entry (Gateway/ListenerSet share the shape).
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EffectiveCertRef {
     /// Ref group; `None`/empty/`core` → the core API group.
@@ -44,7 +43,6 @@ pub(crate) struct EffectiveCertRef {
 }
 
 /// Normalised listener TLS config (mode + cert refs), shared across spec types.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EffectiveTls {
     /// `true` for `tls.mode: Passthrough`; `false` for `Terminate` (the default).
@@ -55,7 +53,6 @@ pub(crate) struct EffectiveTls {
 
 /// One listener in a Gateway's effective set, normalised from either spec type
 /// and tagged with its provenance and cert-resolution namespace (GEP-1713).
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EffectiveListener {
     /// Which resource declared this listener (drives status attribution + the
@@ -90,7 +87,6 @@ pub(crate) struct EffectiveListener {
 }
 
 /// An owned Gateway plus its computed effective listener set.
-#[non_exhaustive]
 pub(crate) struct EffectiveGateway {
     /// The parent Gateway (carries class, namespace, infra, frontend/backend TLS).
     pub gateway: std::sync::Arc<Gateway>,
@@ -239,7 +235,6 @@ pub(crate) fn merge_effective_gateways(
 /// reachable. This carries the minimum the operator needs (`name`, `port`,
 /// `protocol`); the heavier `EffectiveGateway`/`EffectiveListener` stay
 /// crate-private.
-// intentionally open: a port-identity DTO that may gain fields (e.g. appProtocol).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EffectiveListenerPort {
     /// ServicePort name — unique within the returned set (collisions from

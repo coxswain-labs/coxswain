@@ -115,7 +115,6 @@ const RESERVED_LABEL_KEYS: &[&str] = &[
 ];
 
 /// Inputs to the renderer.
-#[non_exhaustive]
 pub(super) struct RenderInputs<'a> {
     /// The Gateway whose dedicated proxy is being rendered.
     pub(super) gateway: &'a Gateway,
@@ -181,7 +180,6 @@ const DISCOVERY_TRUST_VOLUME: &str = "trust-bundle";
 const DISCOVERY_TRUST_MOUNT_DIR: &str = "/var/run/secrets/coxswain/trust-bundle";
 
 /// The rendered resources for one dedicated-mode Gateway.
-#[non_exhaustive]
 #[derive(Debug)]
 pub(super) struct RenderedSpecs {
     /// `ServiceAccount` the proxy pod runs as.
@@ -442,8 +440,7 @@ fn render_service(
 /// Render the K8s string form of a [`ServiceType`] variant. Serde's
 /// `Serialize` impl already produces the right strings (`LoadBalancer`,
 /// `NodePort`, `ClusterIP`); we route through it so any future variant
-/// added to the `#[non_exhaustive]` enum gets the K8s-canonical name
-/// without code changes here. Falls back to `LoadBalancer` only if
+/// gets the K8s-canonical name without code changes here. Falls back to `LoadBalancer` only if
 /// serialisation produces something unexpected (which can't happen for
 /// well-formed `ServiceType` values — the fallback is a defensive default,
 /// not a forward-compat hatch that would silently misroute traffic).

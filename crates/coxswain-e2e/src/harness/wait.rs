@@ -509,21 +509,88 @@ pub async fn wait_for_route_endpoints(
     .await
 }
 
-/// Poll until the named Deployments in `namespace` have `condition=Available`.
+/// How long [`wait_for_deployments`] gives a namespace's backends to come up.
+///
+/// Generous because it covers a cold image pull on a fresh node, not because the
+/// condition is racy — [`poll_until`] returns the instant every Deployment is
+/// Available.
+const DEPLOYMENTS_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Poll until every named Deployment in `namespace` reports `Available=True`.
+///
+/// Routes through the canonical [`poll_until`] rather than shelling out to
+/// `kubectl wait`. The subprocess form was a shadow poller with its own
+/// hardcoded timeout, and its failure was the bare string `deployments not ready
+/// in {namespace}` — no expected-vs-actual, no conditions, no replica counts, so
+/// a CI timeout said nothing about *which* Deployment was stuck or why. Charter
+/// point #12 calls that a bug in the test rather than bad luck.
 pub async fn wait_for_deployments(namespace: &str, names: &[&str]) -> anyhow::Result<()> {
-    let deployments: Vec<String> = names.iter().map(|n| format!("deployment/{n}")).collect();
-    let mut args = vec!["wait", "--for=condition=available", "--timeout=300s"];
-    for d in &deployments {
-        args.push(d.as_str());
-    }
-    args.extend(["-n", namespace]);
-    let status = tokio::process::Command::new("kubectl")
-        .args(&args)
-        .status()
-        .await
-        .context("kubectl wait deployments")?;
-    anyhow::ensure!(status.success(), "deployments not ready in {namespace}");
-    Ok(())
+    let client = kube::Client::try_default().await.context("kube client")?;
+    let api: Api<Deployment> = Api::namespaced(client, namespace);
+
+    poll_until(
+        DEPLOYMENTS_TIMEOUT,
+        POLL,
+        || async {
+            // Render what each Deployment actually looks like right now, so the
+            // failure is diagnosable from the CI log alone.
+            let mut out = format!("Deployments {names:?} in '{namespace}' to be Available\n");
+            for name in names {
+                match api.get(name).await {
+                    Ok(d) => {
+                        let status = d.status.unwrap_or_default();
+                        let conds = status
+                            .conditions
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|c| {
+                                format!(
+                                    "{}={}{}",
+                                    c.type_,
+                                    c.status,
+                                    c.reason
+                                        .as_deref()
+                                        .map(|r| format!("({r})"))
+                                        .unwrap_or_default()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        out.push_str(&format!(
+                            "  {name}: ready={}/{} updated={} unavailable={} [{}]\n",
+                            status.ready_replicas.unwrap_or(0),
+                            status.replicas.unwrap_or(0),
+                            status.updated_replicas.unwrap_or(0),
+                            status.unavailable_replicas.unwrap_or(0),
+                            if conds.is_empty() {
+                                "no conditions"
+                            } else {
+                                &conds
+                            },
+                        ));
+                    }
+                    Err(e) => out.push_str(&format!("  {name}: <not found: {e}>\n")),
+                }
+            }
+            out
+        },
+        || async {
+            for name in names {
+                let d = api.get(name).await.ok()?;
+                let available = d
+                    .status?
+                    .conditions
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|c| c.type_ == "Available" && c.status == "True");
+                if !available {
+                    return None;
+                }
+            }
+            Some(())
+        },
+    )
+    .await
 }
 
 /// Poll until the named namespaced resource exists, returning it.

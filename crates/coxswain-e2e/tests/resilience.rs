@@ -217,7 +217,7 @@ async fn run_load(
                 // A real client retries a transient connection blip; only a
                 // SUSTAINED inability to reach the proxy is a routing gap. The
                 // bounded transient-retry (with its backoff) lives in the harness
-                // so the test body stays free of bare sleeps (e2e rubric #4).
+                // so the test body stays free of bare sleeps (e2e charter).
                 let response =
                     coxswain_e2e::harness::http::get_with_transient_retry(&client, &url, &host, 3)
                         .await;

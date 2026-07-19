@@ -1,7 +1,11 @@
 .cargo/config.toml
 .claude/*
 !.claude/skills/
+!.claude/agents/
 !.claude/CLAUDE.md
+# Shared project hooks (scripts/gates.sh at authoring time). settings.local.json
+# stays ignored — that one is per-developer.
+!.claude/settings.json
 .idea/
 .venv/
 .wip/

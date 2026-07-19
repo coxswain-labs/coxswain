@@ -275,22 +275,28 @@ mod tests {
         // advertised port from the internal accept port for BOTH — the HTTP one is
         // exactly the redirect path that regressed.
         let mut listeners = BTreeMap::new();
-        let mut http = coxswain_reflector::status::ListenerInfo::default();
-        http.port = 80;
-        http.internal_port = 30000;
+        let http = coxswain_reflector::status::ListenerInfo {
+            port: 80,
+            internal_port: 30000,
+            ..Default::default()
+        };
         listeners.insert(
             coxswain_reflector::status::ListenerStatusKey::gateway("http"),
             http,
         );
-        let mut https = coxswain_reflector::status::ListenerInfo::default();
-        https.port = 443;
-        https.internal_port = 30001;
+        let https = coxswain_reflector::status::ListenerInfo {
+            port: 443,
+            internal_port: 30001,
+            ..Default::default()
+        };
         listeners.insert(
             coxswain_reflector::status::ListenerStatusKey::gateway("https"),
             https,
         );
-        let mut glh = GatewayListenerStatus::default();
-        glh.listeners = listeners;
+        let glh = GatewayListenerStatus {
+            listeners,
+            ..Default::default()
+        };
 
         let mut health = HashMap::new();
         health.insert(ObjectKey::new("ns", "gw"), glh);
@@ -313,15 +319,19 @@ mod tests {
         // the spec port and the entry maps it to itself — a redirect then preserves
         // the real advertised port unchanged.
         let mut listeners = BTreeMap::new();
-        let mut li = coxswain_reflector::status::ListenerInfo::default();
-        li.port = 8080;
-        li.internal_port = 0;
+        let li = coxswain_reflector::status::ListenerInfo {
+            port: 8080,
+            internal_port: 0,
+            ..Default::default()
+        };
         listeners.insert(
             coxswain_reflector::status::ListenerStatusKey::gateway("http"),
             li,
         );
-        let mut glh = GatewayListenerStatus::default();
-        glh.listeners = listeners;
+        let glh = GatewayListenerStatus {
+            listeners,
+            ..Default::default()
+        };
 
         let mut health = HashMap::new();
         health.insert(ObjectKey::new("ns", "gw"), glh);

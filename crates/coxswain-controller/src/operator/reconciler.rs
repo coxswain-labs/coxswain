@@ -113,7 +113,6 @@ const MIGRATION_HANDOFF_REQUEUE: Duration = Duration::from_secs(1);
 /// Errors that can be returned from [`reconcile`]. They are observed only by
 /// the controller framework's error policy (which converts them into a
 /// re-queue) and the operator's own logs — the K8s API does not see them.
-#[non_exhaustive]
 #[derive(Debug, Error)]
 pub(super) enum ReconcileError {
     /// Kubernetes API error encountered outside the SSA path (e.g. by future
@@ -143,7 +142,6 @@ impl crate::metrics::ReconcileErrorReason for ReconcileError {
 /// (`provisioned_relays` / `active_relays` / the repoint watch) is not config and
 /// stays on `OperatorConfig` directly.
 #[derive(Clone, Debug)]
-// intentionally open: field-literal constructed in crates/coxswain-bin/src/args.rs from CLI args, same rationale as ProxyPoolConfig.
 pub struct RelayConfig {
     /// Relay tiering master switch (`--relay-enabled`, #584). When `true`, each
     /// namespace holding ≥1 dedicated Gateway gets a controller-provisioned
@@ -197,10 +195,7 @@ pub struct RelayConfig {
 /// the bin layer. Carries the leader flag so the operator shares one
 /// truth-source with the [`crate::Controller`] status writer.
 ///
-/// Not `#[non_exhaustive]` — same rationale as
-/// [`crate::StatusWriterConfig`]: it's an internal wiring struct that only
-/// `coxswain-bin` instantiates.
-// intentionally open: field-literal constructed in crates/coxswain-bin/src/main.rs from CLI args.
+/// An internal wiring struct that only `coxswain-bin` instantiates.
 pub struct OperatorConfig {
     /// `GatewayClass.spec.controllerName` claim — same string the status
     /// writer uses; we only reconcile Gateways whose class matches.
@@ -325,7 +320,6 @@ pub struct OperatorConfig {
 /// to the [`crate::Controller`] in `serve controller`; shares the controller
 /// pod's process and leader-election truth-source but owns its own kube-rs
 /// `Controller` and reflector stores.
-#[non_exhaustive]
 pub(crate) struct ReconcileContext {
     pub(super) controller_name: String,
     pub(super) controller_image: String,
@@ -1530,6 +1524,11 @@ async fn delete_shared_gateway_service_account(
 /// Collapse a `404 NotFound` delete result to success; propagate every other
 /// error. Lets [`delete_dedicated_resources`] be safely re-run on every
 /// hand-off re-queue.
+///
+/// # Errors
+///
+/// Propagates any [`kube::Error`] other than a `404 NotFound` — an RBAC denial
+/// or apiserver outage must not be mistaken for "already deleted".
 pub(super) fn ignore_not_found<T>(result: Result<T, kube::Error>) -> Result<(), kube::Error> {
     match result {
         Ok(_) => Ok(()),

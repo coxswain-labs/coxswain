@@ -5,7 +5,6 @@
 /// Both fields are optional; when both are `None` no listener is configured
 /// and the Ingress is skipped with a warning.
 // No dedicated tests/ports.rs: trivial struct fully covered by tests/reconcile.rs.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IngressPorts {
     /// Port for plain HTTP Ingress routes, if configured.

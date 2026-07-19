@@ -100,7 +100,6 @@ pub(super) async fn run(client: Client, reporter: Reporter, mut rx: mpsc::Receiv
                     tracing::warn!(error = %e, "Failed to publish InvalidAnnotation Warning Event");
                 }
             }
-            _ => {}
         }
     }
 }

@@ -10,7 +10,6 @@ use coxswain_core::Shared;
 // ── SvidMaterial ─────────────────────────────────────────────────────────────
 
 /// A freshly-issued SVID, ready to configure an mTLS discovery channel.
-// intentionally open: field-literal constructed in bootstrap_client.rs
 pub struct SvidMaterial {
     /// PEM-encoded SVID certificate chain (proxy client cert).
     pub cert_pem: Vec<u8>,

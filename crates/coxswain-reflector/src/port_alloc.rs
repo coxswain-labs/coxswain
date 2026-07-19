@@ -50,7 +50,6 @@ pub type ListenerKey = (ObjectKey, u16);
 ///
 /// Maps each `(Gateway, listenerPort)` to its allocated internal `targetPort`,
 /// and records pairs that could not be placed because the range was exhausted.
-#[non_exhaustive]
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct PortAllocation {
     assignments: HashMap<ListenerKey, u16>,

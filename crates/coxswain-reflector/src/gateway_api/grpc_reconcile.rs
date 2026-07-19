@@ -50,7 +50,6 @@ use std::time::SystemTime;
 /// `Copy` (every field is a shared reference) — same rationale as
 /// [`super::reconcile::RouteResolution`].
 #[derive(Clone, Copy)]
-#[non_exhaustive]
 pub struct GrpcRouteResolution<'a> {
     /// `(gw_ns, gw_name, listener_name) → (hostname, port)` for every listener on owned Gateways.
     pub listener_info: &'a HashMap<ListenerKey, ListenerBinding>,
@@ -1160,7 +1159,6 @@ mod tests {
         }
     }
 
-    // `IpAccessControlSpec` is `#[non_exhaustive]` — deserialize a CR instead.
     fn ip_access_cr(ns: &str, name: &str, allow: &[&str], deny: &[&str]) -> IpAccessControl {
         let list = |items: &[&str]| -> String {
             if items.is_empty() {
@@ -1243,7 +1241,6 @@ mod tests {
         }
     }
 
-    // `RateLimitSpec` is `#[non_exhaustive]` — deserialize a CR instead.
     fn rate_limit_cr(ns: &str, name: &str, rps: u32) -> RateLimit {
         let yaml = format!(
             "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
@@ -1309,7 +1306,6 @@ mod tests {
         }
     }
 
-    // `JwtAuthSpec` is `#[non_exhaustive]` — deserialize a CR instead.
     fn grpc_jwt_auth_cr(ns: &str, name: &str) -> JwtAuth {
         let yaml = format!(
             "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\

@@ -65,7 +65,6 @@ struct CachedChannel {
 ///
 /// Cheap to clone: the inner map is `Arc`-shared, so both `IngressProxy` and
 /// `GatewayProxy` hold a clone of the same pool via [`crate::ProxyServices`].
-#[non_exhaustive]
 #[derive(Clone, Default)]
 pub struct GrpcAuthChannelCache {
     inner: Arc<DashMap<SocketAddr, CachedChannel>>,

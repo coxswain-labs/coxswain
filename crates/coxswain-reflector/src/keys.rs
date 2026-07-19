@@ -12,7 +12,6 @@ use coxswain_core::ownership::ObjectKey;
 /// route's `parentRef` (which targets either a Gateway or a ListenerSet) resolves
 /// to a listener key directly from `(kind, namespace, name, sectionName)`, and a
 /// Gateway listener never collides with a same-named ListenerSet listener.
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ListenerKey {
     /// The resource kind that declares this listener (Gateway or ListenerSet).
@@ -57,7 +56,6 @@ impl ListenerKey {
 ///
 /// `section` is the `sectionName` from `parentRef`, or an empty string when
 /// no `sectionName` was specified.
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RouteParentKey {
     /// Namespace of the HTTPRoute.

@@ -50,7 +50,6 @@ use serde::{Deserialize, Serialize};
     status = "CoxswainExternalAuthStatus"
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct CoxswainExternalAuthSpec {
     /// The external authorization service. Must speak [`protocol`](Self::protocol)
     /// on the referenced port. A cross-namespace `backendRef` requires a matching
@@ -104,7 +103,6 @@ pub struct CoxswainExternalAuthSpec {
 ///
 /// Serialized verbatim as the Gateway API / GEP-1494 spec strings (`GRPC`,
 /// `HTTP`) — never re-cased.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum ExternalAuthProtocol {
@@ -118,7 +116,6 @@ pub enum ExternalAuthProtocol {
 ///
 /// Mirrors the Gateway API `BackendObjectReference` shape without importing the
 /// generated types, so we control the schema. Only a core `Service` is supported.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalAuthBackendRef {
@@ -143,7 +140,6 @@ pub struct ExternalAuthBackendRef {
 }
 
 /// Include (part of) the request body in the auth check.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ForwardBodyConfig {
@@ -158,7 +154,6 @@ pub struct ForwardBodyConfig {
 /// Mirrors the Gateway API `LocalPolicyTargetReference` shape. Section-name
 /// (per-listener) targeting is intentionally omitted — a policy applies to every
 /// HTTPRoute on the Gateway.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalAuthTargetRef {
@@ -188,7 +183,6 @@ fn default_gateway_kind() -> String {
 }
 
 /// Status written back to the `CoxswainExternalAuth` by the controller.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CoxswainExternalAuthStatus {
@@ -200,7 +194,6 @@ pub struct CoxswainExternalAuthStatus {
 }
 
 /// Status of this policy with respect to one ancestor (a targeted `Gateway`).
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalAuthAncestorStatus {
@@ -215,7 +208,6 @@ pub struct ExternalAuthAncestorStatus {
 
 /// Identifies the ancestor (targeted `Gateway`) an [`ExternalAuthAncestorStatus`]
 /// entry corresponds to.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalAuthAncestorRef {

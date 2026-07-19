@@ -29,7 +29,6 @@ pub const GATEWAY_NAME_LABEL: &str = "gateway.networking.k8s.io/gateway-name";
 // ── Component ────────────────────────────────────────────────────────────────
 
 /// The role a coxswain pod plays in the cluster.
-#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Component {
     /// A controller-role pod (`serve controller`).
@@ -58,7 +57,6 @@ impl Component {
 // ── FleetEntry / FleetSnapshot ────────────────────────────────────────────────
 
 /// A single pod in the coxswain fleet.
-#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct FleetEntry {
     /// Value of `metadata.name`.
@@ -92,7 +90,6 @@ pub struct FleetEntry {
 ///
 /// Published into a [`SharedFleet`] on every `Pod` watch event by the
 /// controller's reflector pipeline.
-#[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct FleetSnapshot {
     /// Controller-role pods.

@@ -25,7 +25,6 @@ use crate::auth::SpiffeMatcher;
 /// are stored as one atomically-swapped unit — never a torn (endpoint, matcher)
 /// pair that could dial a relay while verifying the controller's identity.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
 pub struct UpstreamTarget {
     /// Routing Service endpoint(s) to dial (`"https://host:port"`). More than
     /// one enables HA via `Channel::balance_list`; a runtime directive supplies

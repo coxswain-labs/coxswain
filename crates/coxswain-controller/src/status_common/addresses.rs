@@ -22,7 +22,6 @@ use coxswain_reflector::gw_types::v::gateways::GatewayAddresses;
 
 /// An address `type` coxswain can place in `status.addresses`. Per the Gateway
 /// API spec an absent `spec.addresses[*].type` defaults to `IPAddress`.
-#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SupportedAddressType {
     /// A bare IPv4/IPv6 address.
@@ -67,7 +66,6 @@ impl TypedAddress {
 /// The two `*_override` fields are `None` on the legacy / happy path (the caller
 /// keeps emitting `Accepted=True`/`Programmed=True`); `Some(reason)` forces the
 /// corresponding condition to `False` with that reason.
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StaticAddressOutcome {
     /// `Some(GatewayConditionReason::UnsupportedAddress)` forces

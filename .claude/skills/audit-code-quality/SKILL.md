@@ -38,7 +38,7 @@ Each agent's prompt MUST include:
   - (a) idiomatic Rust failures: `.unwrap()`/`.expect()` outside tests, clones over borrows, `&String`/`&Vec<T>` params, `format!()` in hot paths, locks across `.await`, stringly-typed APIs, large unboxed enum variants.
   - (b) naming consistency: acronym casing (rust-skills `name-acronym-word`), `as_`/`to_`/`into_` prefix conventions, rename leftovers.
   - (c) module organization: file size, conceptual coherence, flat-vs-subdirectory mix.
-  - (d) documentation gaps: missing `//!`, missing `///`, missing `#[must_use]`, missing `#[non_exhaustive]`, missing `# Errors`, missing `# Panics`.
+  - (d) documentation *quality*: a `///` that restates the name instead of explaining why, a non-obvious invariant left uncommented, a fallible `pub fn` whose `# Errors` says only *that* it fails and not *when*. Do NOT report bare missing-doc counts — `///`-presence is a proxy satisfiable with pure noise, and chasing it mass-produces narrating comments this project forbids.
   - (e) AI-slop / over-engineering / dead code / "for future use" hooks.
   - (f) error handling consistency.
   - For runtime/hot-path agents also: (g) async correctness (locks across await, bounded channels, cancellation tokens) and (h) hot-path performance (allocations in request path, format!() vs itoa::Buffer).
@@ -49,11 +49,35 @@ Each agent's prompt MUST include:
 
 ## Phase 3 — Verify
 
-For EACH `BLOCKER` claim:
-- Read the actual `file:line` with the `Read` tool. Primary sources are authoritative.
-- If the claim doesn't match source state, demote the severity or drop the finding entirely. Agents sometimes hallucinate or over-state.
+Verify **every** claim that will appear in the output, not only `BLOCKER`s. An
+audit's findings become an issue that someone executes weeks later, so a wrong
+claim costs more than a missing one.
 
-**Yellow flag on over-clean reports.** If an agent returns "everything is fine" or claims a category has zero findings, audit a sample yourself: pick three representative files in the agent's scope and Read them. Agents that miss work are worse than agents that over-claim — at least over-claims show up in verification. (In a recent audit, one agent reported `#[non_exhaustive]` coverage as "perfect compliance" while actual coverage was 13/107. Never trust silence.)
+For each finding:
+- Read the actual `file:line`. Primary sources are authoritative.
+- **Re-derive every number.** Never pass through a count an agent reported.
+  Counts and percentages are the least reliable thing agents produce and the
+  most quotable thing in the output.
+- **Confirm the referenced symbol is what the claim says it is.** A `file:line`
+  that points at a different function than the claim describes means the audit
+  ran against a tree that has since moved.
+- If the claim doesn't match source, drop it. Do not demote-and-keep.
+
+**Line references go stale fast.** A refactor wave invalidates them wholesale.
+Anchor findings to a symbol name (`wait_for_deployments`, `TlsLoadError`) with
+the line as a hint, never the line alone — and re-verify against `main` at the
+moment the audit is written, noting the commit SHA in the output.
+
+This is not hypothetical: an audit of this workspace produced an issue in which
+three of four cited `# Errors` sites pointed at functions that don't return
+`Result`, a claimed panic site was `pub fn new`, and the headline doc-coverage
+figures did not reproduce. Every one of those would have been caught by opening
+the file.
+
+**Yellow flag on over-clean reports.** If an agent returns "everything is fine"
+or claims a category has zero findings, audit a sample yourself: pick three
+representative files in its scope and Read them. Agents that miss work are worse
+than agents that over-claim — at least over-claims surface in verification.
 
 Cross-check findings against the project's GitHub issues, by label rather than free-text search:
 
@@ -70,7 +94,7 @@ Accumulate a list of non-obvious design decisions worth recording as project mem
 
 Ask the user one `AskUserQuestion` at a time. Required sequence:
 
-1. **Scope breadth.** Which finding buckets are IN: critical-only (BLOCKER + MAJOR), critical + workspace-wide mechanical sweeps (e.g. `#[non_exhaustive]` coverage), all + invasive perf work, all + CI shift-left tooling. Recommend based on the severity profile of the findings.
+1. **Scope breadth.** Which finding buckets are IN: critical-only (BLOCKER + MAJOR), critical + workspace-wide mechanical sweeps, all + invasive perf work, all + CI shift-left tooling. Recommend based on the severity profile of the findings.
 2. **Sequencing.** Multi-issue / multi-workstream PRs (per `feedback_refactor_branch_strategy`) vs single bundled PR. Default to multi when the workstreams are loosely coupled; single bundle only when they're tightly coupled and reviewers benefit from seeing them together. Echo the recommendation with the trade-off explicit.
 3. **CI shift-left for NEW rules.** For each prose rule the audit proposes, ask: clippy lint, `scripts/check-*.sh` grep, `deny.toml` policy, or doc-only-because-X. This is the `/add-rule` decision tree — invoke it once per proposed rule.
 4. **Known-deferred handling.** For each finding that overlaps an OPEN issue: drop (already tracked), reference (link in this PR's plan as out-of-scope), or fold (absorb into this PR's commits).

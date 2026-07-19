@@ -1,0 +1,24 @@
+$ cargo nextest run --profile e2e -E 'binary(routing)'
+   Starting 61 tests across 1 binary
+     FAIL [   4.203s] routing::wildcard_host_matches_multi_label_subdomain
+   Summary [  38.114s] 61 tests run: 60 passed, 1 failed
+
+--- failure detail ---
+assertion failed: response came from the wrong backend
+  host:     a.b.example.com
+  path:     /
+  expected: echo-a  (matched by wildcard listener '*.example.com')
+  actual:   echo-default  (catchall)
+  status:   200
+  X-Echo-Pod: echo-default-5f7c9-2ntgd
+
+--- re-run, same result ---
+$ cargo nextest run --profile e2e -E 'test(wildcard_host_matches_multi_label_subdomain)'
+     FAIL [   4.115s] routing::wildcard_host_matches_multi_label_subdomain
+$ cargo nextest run --profile e2e -E 'test(wildcard_host_matches_multi_label_subdomain)'
+     FAIL [   4.198s] routing::wildcard_host_matches_multi_label_subdomain
+
+--- context ---
+The change under test refactored HostRouter wildcard matching.
+Unit tests in coxswain-core pass.
+Proxy pod is Running, image digest matches the build from this run.

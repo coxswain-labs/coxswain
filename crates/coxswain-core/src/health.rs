@@ -27,7 +27,6 @@ const SEV_FAILED: u8 = 3;
 /// `Pending` is the initial value, before any reporter has run the check. The
 /// reason carried by `Degraded` and `Failed` is human-readable and not stable
 /// for machine parsing.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CheckState {
     /// The check has not yet been reported.
@@ -95,7 +94,6 @@ impl Serialize for CheckState {
 /// `state` is derived from `checks` — it is always the highest-severity entry
 /// in the map, preserving the reason if the worst check is `Degraded` or
 /// `Failed`. An empty subsystem has aggregate `Ready`.
-#[non_exhaustive]
 #[derive(Clone, Debug, Serialize)]
 pub struct SubsystemSnapshot {
     /// Aggregate state of this subsystem (highest-severity check).
@@ -107,7 +105,6 @@ pub struct SubsystemSnapshot {
 /// Snapshot of every registered subsystem, suitable for `/status` output.
 ///
 /// Iteration order is stable (`BTreeMap`) so the JSON output is reproducible.
-#[non_exhaustive]
 #[derive(Clone, Debug, Serialize)]
 pub struct HealthSnapshot {
     /// Per-subsystem snapshot keyed by subsystem name.
@@ -128,7 +125,6 @@ struct SubsystemInner {
 /// methods to register new checks — the set of check names is fixed at
 /// [`HealthRegistry::register`] time so that misspelled names panic instead
 /// of silently creating a check that never flips.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct SubsystemHandle {
     inner: Arc<SubsystemInner>,
@@ -203,7 +199,6 @@ impl SubsystemHandle {
 /// the binary, register each subsystem at startup, hand the resulting
 /// [`SubsystemHandle`]s to the subsystem owners, and share clones of the
 /// registry itself with the `/readyz` and `/status` HTTP handlers.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct HealthRegistry {
     subsystems: Arc<Mutex<BTreeMap<Arc<str>, Arc<SubsystemInner>>>>,
@@ -343,7 +338,6 @@ fn severity_is_ready(sev: u8) -> bool {
 /// Tripping is intentionally irreversible: the process cannot self-repair a
 /// wedged watch fabric in place, so the gate stays down until the restart
 /// replaces the process.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct LivenessGate {
     alive: Arc<AtomicBool>,

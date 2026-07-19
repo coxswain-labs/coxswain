@@ -6,7 +6,6 @@
 /// in sync. Epic design decision #5 in #238 defines the recursive
 /// "discovery node" model this enum supports.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum Scope {
     /// The shared proxy pool's full routing world (all namespaces).
     SharedPool,

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Enforce e2e rubric #8 (execution class by behaviour plane): every top-level
+# Enforce the e2e charter's execution-class-by-behaviour-plane rule: every top-level
 # integration-test file under `crates/coxswain-e2e/tests/` must be one of the
 # approved planes. The by-plane layout is what makes the parallel/serial boundary
 # fall out of the file structure; an unclassified grab-bag file (`misc.rs`,
@@ -44,7 +44,7 @@ if [ "${#offenders[@]}" -gt 0 ]; then
   echo "FAIL: ${#offenders[@]} e2e test file(s) outside the approved plane set:" >&2
   printf '  %s\n' "${offenders[@]}" >&2
   echo "" >&2
-  echo "Per e2e rubric #8, place the test in the plane of its primary assertion" >&2
+  echo "Per the e2e charter, place the test in the plane of its primary assertion" >&2
   echo "target. Approved planes: ${ALLOWED[*]}." >&2
   exit 1
 fi

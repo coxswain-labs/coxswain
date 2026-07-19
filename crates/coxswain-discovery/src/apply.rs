@@ -321,7 +321,6 @@ impl SnapshotApplier for RoutingApplier {
 /// Grouped so the proxy (via `DiscoveryClient`) and a shared-pool relay (via
 /// [`crate::relay`]) can each read the same `Arc`s the applier writes without a
 /// ten-argument constructor.
-// intentionally open: field-literal read by DiscoveryClient and relay glue
 pub(crate) struct RoutingCells {
     pub(crate) ingress: SharedIngressRoutingTable,
     pub(crate) gateway: SharedGatewayRoutingTable,

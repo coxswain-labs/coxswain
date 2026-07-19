@@ -147,9 +147,6 @@ fn scope_sort_key(scope: &NodeScope) -> (u8, &str, &str) {
         NodeScope::SharedPool => (0, "", ""),
         NodeScope::Gateway { namespace, name } => (1, namespace.as_str(), name.as_str()),
         NodeScope::Namespace { namespace } => (2, namespace.as_str(), ""),
-        // Future `NodeScope` variants (the enum is `#[non_exhaustive]`): sort last with
-        // an empty key rather than fail to compile on every downstream addition.
-        _ => (3, "", ""),
     }
 }
 

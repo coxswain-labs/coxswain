@@ -21,7 +21,6 @@ use pingora_proxy::{FailToProxy, Session};
 /// `upstream_response_filter` after the connection already delivered a response) must be
 /// preserved unconditionally, whereas a connection-error retry re-runs Pingora's reuse
 /// check.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetryTrigger {
     /// Upstream TCP/TLS connection failure on a fresh connection — always replay-safe.

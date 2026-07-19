@@ -8,12 +8,6 @@ use http::{HeaderName, HeaderValue};
 use std::sync::Arc;
 
 /// How a path is modified by `URLRewrite` or `RequestRedirect`.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug)]
 pub enum PathModifier {
     /// Discard the entire original path and use this fixed value instead.
@@ -90,7 +84,6 @@ impl PathModifier {
 }
 
 /// Error produced when a header name or value is invalid at routing-table build time.
-#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum HeaderModError {
     /// A header name string is not a valid HTTP token.
@@ -117,7 +110,6 @@ pub enum HeaderModError {
 ///
 /// Headers are pre-parsed at routing-table build time — no per-request
 /// `HeaderName::from_bytes` / `HeaderValue::from_str` parsing on the hot path.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct HeaderMod {
     /// Headers appended to any existing values.
@@ -187,12 +179,6 @@ impl HeaderMod {
 ///
 /// A bare `*` entry (match-all) is expressed via
 /// [`CorsConfig::allow_all_origins`] rather than this enum.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug)]
 pub enum CorsOrigin {
     /// Exact origin string (lowercased at construction time).
@@ -241,7 +227,6 @@ impl CorsOrigin {
 /// Origin matching always echoes the concrete request `Origin` back rather than
 /// `*`, which is spec-correct in all cases and is required when
 /// [`allow_credentials`][Self::allow_credentials] is `true` (Fetch spec §3.2.5).
-#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct CorsConfig {
     /// Parsed origin allow-list. Empty means "match none".
@@ -321,7 +306,6 @@ impl CorsConfig {
 /// `numerator ≤ denominator` and `denominator > 0`.  [`MirrorFraction::new`] returns `None`
 /// when these do not hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct MirrorFraction {
     /// Requests to mirror out of `denominator`.  0 means never mirror.
     numerator: u32,
@@ -363,12 +347,6 @@ impl MirrorFraction {
 }
 
 /// A filter action evaluated per-request on the proxy hot path.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug)]
 pub enum FilterAction {
     /// Modify request headers before forwarding upstream.

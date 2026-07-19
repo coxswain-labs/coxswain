@@ -43,7 +43,6 @@ mod topology;
 ///
 /// Constructed once in `run_controller` and stored behind an
 /// [`Option`] in [`super::AdminServer`]; proxy roles leave it `None`.
-#[non_exhaustive]
 pub struct OperatorAggregator {
     /// HTTP client with a 2-second per-request timeout for fan-out calls.
     http: reqwest::Client,
@@ -343,7 +342,6 @@ pub(super) fn component_str(c: Component) -> &'static str {
         Component::SharedProxy => "shared-proxy",
         Component::DedicatedProxy => "dedicated-proxy",
         Component::Relay => "relay",
-        _ => "unknown",
     }
 }
 
@@ -395,8 +393,6 @@ pub(super) mod tests {
 
     /// Build an [`OperatorAggregator`] with a short (200 ms) timeout for tests.
     ///
-    /// Struct literal is allowed here because tests live inside the defining
-    /// crate (`#[non_exhaustive]` only blocks external-crate construction).
     /// Routing tables/registry always default to empty.
     pub(crate) fn make_agg(
         fleet: SharedFleet,

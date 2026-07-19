@@ -105,7 +105,6 @@ pub mod bench_internals {
     /// publishes, so a bench can apply successive messages against a warm world
     /// and read back the partition-reuse accounting. Mirrors the inline-test
     /// `Cells` helper, made non-`#[cfg(test)]` for the bench.
-    #[non_exhaustive]
     pub struct Harness {
         cache: ResourceCache,
         ingress: SharedIngressRoutingTable,
@@ -207,7 +206,6 @@ pub mod bench_internals {
     /// reconstruction that skips the redundant self-check) so
     /// `benches/relay_apply.rs` can time it without reaching the `pub(crate)`
     /// type. Same `#[doc(hidden)]`, non-API status as [`Harness`].
-    #[non_exhaustive]
     pub struct RelayHarness {
         demux: crate::relay::NamespaceDemux,
         expect_full: bool,

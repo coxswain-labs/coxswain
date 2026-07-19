@@ -16,12 +16,6 @@ use std::sync::Arc;
 /// `UpstreamTls::sni` (the `hostname` field) is then used **solely** for SNI
 /// and cert selection and **MUST NOT** be used for authentication — Pingora's
 /// built-in hostname check is disabled in favour of this SAN check.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SubjectAltName {
     /// DNS-type SAN (`type: Hostname` in the policy).
@@ -85,12 +79,6 @@ fn dns_san_matches(expected: &str, cert_san: &str) -> bool {
 }
 
 /// CA certificate source for a [`BackendTLSPolicy`](https://gateway-api.sigs.k8s.io/references/spec/#gateway.networking.k8s.io/v1alpha3.BackendTLSPolicy) attachment.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug)]
 pub enum UpstreamCa {
     /// `wellKnownCACertificates: System` — use the OS trust store.
@@ -107,7 +95,6 @@ pub enum UpstreamCa {
 /// connections — the only spec-sanctioned upstream-TLS-origination path). The
 /// PEM bytes are resolved controller-side from a `kubernetes.io/tls` Secret and
 /// travel the discovery wire; the proxy parses them into a Pingora `CertKey` lazily.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BackendClientCert {
     /// PEM-encoded client certificate chain (`tls.crt`).
@@ -136,7 +123,6 @@ impl BackendClientCert {
 /// the **sole** trigger for upstream TLS origination (GEP-1897): the proxy speaks
 /// TLS to the backend if and only if the group carries an `UpstreamTls`. The
 /// `appProtocol`-derived [`BackendProtocol`] carries no TLS semantics.
-#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct UpstreamTls {
     /// Hostname used for SNI and certificate verification on the upstream connection.
@@ -244,12 +230,6 @@ impl UpstreamTls {
 /// [`UpstreamTls`] on the [`BackendGroup`](super::backend::BackendGroup); see that
 /// type. `appProtocol` values that imply TLS (`https`, `kubernetes.io/wss`) have no
 /// Gateway API basis and map to [`Http1`](Self::Http1) (cleartext).
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BackendProtocol {
     /// Plain HTTP/1.1 — the default when `appProtocol` is absent or unrecognised.

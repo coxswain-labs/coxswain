@@ -19,7 +19,6 @@ pub type SharedUdpRouteTable = Shared<UdpRouteTable>;
 /// Built once per reconcile cycle and published via [`SharedUdpRouteTable`].
 /// The proxy loads it with a single atomic pointer read per datagram session —
 /// no SNI peek is possible or required before the lookup.
-#[non_exhaustive]
 #[derive(Default, Debug)]
 pub struct UdpRouteTable {
     by_port: HashMap<u16, Arc<BackendGroup>>,
@@ -48,7 +47,6 @@ impl UdpRouteTable {
 ///
 /// Typical usage: create one builder per reconcile cycle, call
 /// [`Self::add_route`] for every bound `UDPRoute`, then call [`Self::build`].
-#[non_exhaustive]
 #[derive(Default, Debug)]
 pub struct UdpRouteTableBuilder {
     by_port: HashMap<u16, Arc<BackendGroup>>,

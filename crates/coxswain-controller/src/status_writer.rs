@@ -35,11 +35,7 @@ use thiserror::Error;
 /// Carries everything the controller pod needs to wire up its reflector
 /// pipeline and the leader-elected [`Controller`]. Construction is the bin
 /// layer's responsibility; the `controller` role of the CLI builds this from
-/// `ControllerRoleArgs` plus `CommonArgs`. Not `#[non_exhaustive]` —
-/// it's an internal wiring struct that only `coxswain-bin` instantiates, and
-/// the construction-site convenience outweighs the (nonexistent) downstream
-/// compatibility win.
-// intentionally open: field-literal constructed in crates/coxswain-bin/src/main.rs from CLI args.
+/// `ControllerRoleArgs` plus `CommonArgs`.
 pub struct StatusWriterConfig {
     /// Identity, leader-election parameters, and status-write address.
     pub controller: ControllerConfig,
@@ -76,7 +72,6 @@ pub struct StatusWriterConfig {
 
 /// Error returned from [`spawn_status_writer`] when the wiring fails before
 /// the background services have a chance to start.
-#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum StatusWriterError {
     /// Forwarded configuration error from the underlying `ControllerConfig`.
@@ -90,9 +85,7 @@ pub enum StatusWriterError {
 /// registers with the Pingora server, plus the shared handles the bin needs to
 /// expose via the admin server (the leader flag and the routing-table snapshots,
 /// which the controller pod does not serve traffic from but does aggregate
-/// for the admin `/api/v1` endpoints and operator UI). Same rationale as
-/// [`StatusWriterConfig`] for the lack of `#[non_exhaustive]`.
-#[non_exhaustive]
+/// for the admin `/api/v1` endpoints and operator UI).
 pub struct SpawnedStatusWriter {
     /// Reflector + rebuild background service.
     pub reconciler: ControllerReconciler,
@@ -268,32 +261,30 @@ pub fn spawn_status_writer(
         Arc::clone(&leader),
         ReconcilerHealth::new(controller_handle, proxy_handle),
         controller_name.clone(),
-        {
-            let mut opts = ReconcilerOptions::default();
-            opts.watch_scope = watch_scope;
+        ReconcilerOptions {
+            watch_scope,
             // The install namespace: widens the fleet-Pod / params watches to
             // `watch_scope ∪ {pod_namespace}` so they stay namespaced (#59).
-            opts.pod_namespace = controller.pod_namespace.clone();
-            opts.ingress_default_backend = ingress_default_backend;
-            opts.ingress_ports = ingress_ports;
-            opts.metrics_prefix = coxswain_reflector::MetricsPrefix::Controller;
-            opts.watch_fleet = true;
+            pod_namespace: controller.pod_namespace.clone(),
+            ingress_default_backend,
+            ingress_ports,
+            metrics_prefix: coxswain_reflector::MetricsPrefix::Controller,
+            watch_fleet: true,
             // Pre-create the status-relevant stores so the worker reads them and
             // the rebuild pass enqueues from them, instead of duplicating watches
             // (#347, #574).
-            opts.status_stores = true;
-            opts.status_queue = Some(status_queue.clone());
-            opts.ingress_event_tx = Some(ingress_event_tx);
-            opts.enable_gateway_api = enable_gateway_api;
-            opts.enable_ingress = enable_ingress;
+            status_stores: true,
+            status_queue: Some(status_queue.clone()),
+            ingress_event_tx: Some(ingress_event_tx),
+            enable_gateway_api,
+            enable_ingress,
             // Controller role only (#441) — the read-only proxy must never
             // egress to a JWKS identity provider; see `coxswain_reflector::jwks`.
-            opts.fetch_remote_jwks = true;
-            opts.debounce = debounce;
+            fetch_remote_jwks: true,
+            debounce,
             // Relist wedge backstop (#573): the reconciler spawns the monitor
             // that trips this gate on a stuck relist.
-            opts.liveness_gate = liveness_gate;
-            opts
+            liveness_gate,
         },
     );
 

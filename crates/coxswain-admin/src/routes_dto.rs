@@ -14,9 +14,7 @@
 //! `serde_json::json!` path emitted them key-sorted; every consumer parses
 //! JSON, so this is structurally identical.
 //!
-//! These types are `pub(crate)` (crate-internal, not a cross-crate API), so they are
-//! exempt from the `#[non_exhaustive]` stability gate and are constructed via field
-//! literals throughout the crate.
+//! These types are `pub(crate)` — crate-internal, not a cross-crate API.
 
 use coxswain_core::routing::{RouteConflict, RouteInfo};
 use serde::{Deserialize, Serialize};

@@ -27,7 +27,6 @@ use tokio::sync::watch;
 /// admin must stay free of any discovery dependency). The discovery server owns
 /// the conversion from its own `Scope` into this core-local mirror at the
 /// crate boundary.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind")]
 pub enum NodeScope {
@@ -53,7 +52,6 @@ pub enum NodeScope {
 // ── NodeEntry ────────────────────────────────────────────────────────────────
 
 /// Snapshot of a single connected proxy node.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NodeEntry {
     /// Opaque identifier supplied by the proxy in its `Subscribe` message.
@@ -115,11 +113,9 @@ pub struct NodeEntry {
 ///
 /// Mirrors the subset of [`NodeEntry`] a relay knows about a downstream leaf;
 /// `parent`/`is_relay` are stamped by the registry on fold, so they are not
-/// carried here. Lives in `coxswain-core` because [`NodeEntry`] is
-/// `#[non_exhaustive]` and so cannot be constructed at the `coxswain-discovery`
-/// boundary — the server decodes a `RosterEntry` wire message into this and
-/// hands it to the registry, which owns [`NodeEntry`] construction.
-// intentionally open: field-literal built at the coxswain-discovery boundary from a RosterEntry
+/// carried here. Lives in `coxswain-core` alongside [`NodeEntry`]: the discovery
+/// server decodes a `RosterEntry` wire message into this and hands it to the
+/// registry, which owns [`NodeEntry`] construction.
 pub struct RosterChild {
     /// The leaf's `node_id` (as it reported to the relay).
     pub node_id: String,
@@ -160,7 +156,6 @@ impl NodeEntry {
 /// This is a plain value type — create a point-in-time copy via
 /// [`NodeRegistryHandle::load`] and hold it briefly; do not cache it across
 /// reconcile cycles.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct NodeRegistry {
     /// Map of `node_id` → per-node entry.
@@ -438,7 +433,6 @@ impl NodeRegistry {
 /// allows N concurrent stream tasks to upsert their own rows. The interior
 /// [`Mutex`] is held only for the duration of the map operation, never across
 /// an `.await`. Freely `Clone`d into each stream task.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct NodeRegistryHandle(Arc<RegistryInner>);
 

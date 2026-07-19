@@ -475,13 +475,15 @@ mod tests {
     /// Health for the parent Gateway holding this LS's listener, optionally conflicted.
     fn parent_health(name: &str, port: u16, conflicted: bool) -> GatewayListenerStatus {
         let mut h = GatewayListenerStatus::default();
-        let mut info = ListenerInfo::default();
-        info.port = port;
-        info.attached_routes = 2;
-        info.conflict = if conflicted {
-            ConflictReason::HostnameConflict
-        } else {
-            ConflictReason::None
+        let info = ListenerInfo {
+            port,
+            attached_routes: 2,
+            conflict: if conflicted {
+                ConflictReason::HostnameConflict
+            } else {
+                ConflictReason::None
+            },
+            ..Default::default()
         };
         h.listeners.insert(
             ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), name),
@@ -514,8 +516,10 @@ mod tests {
         // decides the denial. Acceptance keys on the LS source, so the foreign
         // entry must carry a different ls_key, not merely a different listener name.
         let mut foreign = GatewayListenerStatus::default();
-        let mut info = ListenerInfo::default();
-        info.port = 8080;
+        let info = ListenerInfo {
+            port: 8080,
+            ..Default::default()
+        };
         foreign.listeners.insert(
             ListenerStatusKey::listener_set(ObjectKey::new("apps", "other-ls"), "web"),
             info,
@@ -650,9 +654,11 @@ mod tests {
         let mut health = parent_health("ok", 80, false);
         // Add a second, conflicted listener "dup" under the same ListenerSet source
         // key the `parent_health` helper uses (ObjectKey "apps"/"team").
-        let mut dup = ListenerInfo::default();
-        dup.port = 81;
-        dup.conflict = ConflictReason::HostnameConflict;
+        let dup = ListenerInfo {
+            port: 81,
+            conflict: ConflictReason::HostnameConflict,
+            ..Default::default()
+        };
         health.listeners.insert(
             ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), "dup"),
             dup,
@@ -741,9 +747,11 @@ mod tests {
             ..Default::default()
         }]);
         let mut healthy = GatewayListenerStatus::default();
-        let mut info = ListenerInfo::default();
-        info.readiness = ListenerReadiness::Resolved;
-        info.port = 8443;
+        let info = ListenerInfo {
+            readiness: ListenerReadiness::Resolved,
+            port: 8443,
+            ..Default::default()
+        };
         healthy.listeners.insert(
             ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), "web"),
             info,
@@ -768,11 +776,13 @@ mod tests {
 
         // Cert deleted → outcome unhealthy, same generation. Must require a patch.
         let mut broken = GatewayListenerStatus::default();
-        let mut bad = ListenerInfo::default();
-        bad.readiness = ListenerReadiness::InvalidCertificateRef {
-            message: "secret missing".to_string(),
+        let bad = ListenerInfo {
+            readiness: ListenerReadiness::InvalidCertificateRef {
+                message: "secret missing".to_string(),
+            },
+            port: 8443,
+            ..Default::default()
         };
-        bad.port = 8443;
         broken.listeners.insert(
             ListenerStatusKey::listener_set(ObjectKey::new("apps", "team"), "web"),
             bad,

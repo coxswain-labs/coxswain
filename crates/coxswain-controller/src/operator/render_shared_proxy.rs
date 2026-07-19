@@ -67,7 +67,6 @@ use super::render::{
 /// bootstrap material come from the controller's own config (shared install-wide),
 /// not from here.
 #[derive(Clone, Debug)]
-// intentionally open: field-literal constructed in crates/coxswain-bin/src/lib.rs from CLI args, same rationale as OperatorConfig (a closed marker would block that construction).
 pub struct ProxyPoolConfig {
     /// Whether the controller provisions the shared pool at all
     /// (`--shared-proxy-enabled`, default true). `false` short-circuits the

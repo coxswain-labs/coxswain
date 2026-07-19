@@ -41,7 +41,6 @@ use crate::wire::{
 ///
 /// The `Arc` lets the per-generation view cache and each stream's pending-world
 /// snapshot share the resource bytes without cloning.
-#[non_exhaustive]
 pub struct ResourceEntry {
     /// Lowercase-hex `sha256` of the resource's proto encoding (change oracle).
     ///
@@ -59,7 +58,6 @@ pub struct ResourceEntry {
 /// hashes) — formally identical to the v1 whole-table hash, so NodeRegistry /
 /// #531 convergence is untouched. `seq` is the pre-load publish-sequence capture
 /// used by the #531 ack gate.
-#[non_exhaustive]
 pub struct MaterializedView {
     /// Global content hash of the post-apply world (sha256 hex).
     pub version: String,

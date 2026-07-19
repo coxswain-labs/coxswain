@@ -28,7 +28,6 @@ use thiserror::Error;
 ///
 /// Components are stored pre-parsed so getters are O(1) with no runtime failures.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub struct SpiffeId {
     /// The full canonical URI.
     uri: String,
@@ -170,7 +169,6 @@ fn parse_spiffe_offsets(s: &str) -> Result<SpiffeOffsets, SpiffeIdError> {
 
 /// Error returned when a SPIFFE ID string cannot be parsed.
 #[derive(Debug, Error, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum SpiffeIdError {
     /// String does not start with `spiffe://` or lacks the `/ns/<ns>/sa/<sa>` path.
     #[error("invalid SPIFFE ID format; expected spiffe://<trust-domain>/ns/<ns>/sa/<sa>")]
@@ -189,7 +187,6 @@ pub enum SpiffeIdError {
 /// Validation (well-formed PEM block present) is deferred to the CA at signing
 /// time; this type is an ownership wrapper used as a parameter type so callers
 /// can't pass raw bytes into issuance functions by accident.
-// intentionally open: callers need to construct this to call SvidIssuer::sign_csr
 #[derive(Debug, Clone)]
 pub struct CsrPem(pub Vec<u8>);
 
@@ -212,7 +209,6 @@ impl CsrPem {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// A freshly signed SVID returned by [`SvidIssuer::sign_csr`].
-// intentionally open: new fields (chain, serial, issuer) can be added without breaking callers
 #[derive(Debug, Clone)]
 pub struct IssuedSvid {
     /// PEM-encoded end-entity certificate with the SPIFFE URI-SAN.
@@ -246,7 +242,6 @@ pub trait SvidIssuer: Send + Sync {
 
 /// Error returned by [`SvidIssuer::sign_csr`].
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum IssuerError {
     /// The supplied CSR bytes are not a valid PEM/DER PKCS#10 request.
     #[error("malformed CSR: {0}")]
@@ -283,7 +278,6 @@ pub trait TokenAuthenticator: Send + Sync {
 
 /// Error returned by [`TokenAuthenticator::authenticate`].
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum AuthnError {
     /// The token was rejected (expired, wrong audience, or not authenticated).
     #[error("token not authenticated: {0}")]

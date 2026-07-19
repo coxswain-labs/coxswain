@@ -1,0 +1,15 @@
+$ VIP_SERVICE_TYPE=ClusterIP make conformance
+--- FAIL: TestGatewayAPIConformance/UDPRouteWeightedBackends (42.11s)
+    udproute.go:118: expected traffic split approximately 50/50 across backends
+        got: backend-a=100 backend-b=0 (200 datagrams sent, 100 received)
+    udproute.go:131: 100 of 200 datagrams were never received
+
+--- PASS: TestGatewayAPIConformance/UDPRouteSingleBackend (8.02s)
+--- PASS: TestGatewayAPIConformance/HTTPRouteWeightedBackends (11.40s)
+--- PASS: TestGatewayAPIConformance/TCPRouteSingleBackend (7.91s)
+
+$ kubectl config current-context
+orbstack
+$ kubectl get nodes -o wide
+NAME       STATUS   ROLES           VERSION   INTERNAL-IP
+orbstack   Ready    control-plane   v1.32.1   198.19.249.2

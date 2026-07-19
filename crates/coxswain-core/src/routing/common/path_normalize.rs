@@ -31,12 +31,6 @@ use std::borrow::Cow;
 /// disabled level re-opens route-match bypass / path-traversal attacks).
 /// Gateway API routes always use the default (`Base`) — the shared
 /// `HostRouter` default materialises this without any annotation.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NormalizeLevel {
     /// Percent-decode unreserved characters (RFC 3986 §2.3), convert `\` to

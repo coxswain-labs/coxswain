@@ -1,0 +1,20 @@
+$ cargo nextest run --profile e2e -E 'binary(status_conditions)'
+     FAIL [   9.612s] status_conditions::gateway_reports_unsupported_protocol_reason
+
+--- failure detail ---
+assertion failed: condition reason mismatch
+  expected: "UnsupportedProtocol"
+  actual:   "UnsupportedValue"
+  Gateway test-c3d4/gw-1 listener 'mesh' conditions:
+    Accepted=False reason=UnsupportedValue message="protocol MESH is not supported"
+    Programmed=False reason=Invalid
+
+--- context ---
+The change under test added the `UnsupportedProtocol` reason variant and the
+reflector mapping for it. `cargo test -p coxswain-reflector` passes, including
+the new unit test asserting the mapping emits `UnsupportedProtocol`.
+The e2e image was rebuilt with `docker build -t coxswain:e2e .` before the run;
+the shared Helm release was not touched.
+$ kubectl get pod -n coxswain -l app=coxswain-controller -o jsonpath='{..image}{"\n"}{..imageID}'
+coxswain:e2e
+docker.io/library/coxswain@sha256:1f0c...  (pulled 3 days ago)

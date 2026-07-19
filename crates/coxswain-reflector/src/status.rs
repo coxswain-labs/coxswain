@@ -28,7 +28,6 @@ pub use coxswain_core::listener_status::{
 ///
 /// Produced after each reconciler rebuild and consumed by the controller's
 /// leader-gated status writer to emit `Accepted` and `ResolvedRefs` conditions.
-#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct RouteParentStatus {
     /// True when all backend refs are valid and resolvable.
@@ -66,7 +65,6 @@ struct RouteStatusInner {
 ///
 /// See [`GatewayListenerStatusHandle`] for the rationale behind the `watch`-based
 /// notification scheme.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct RouteStatusHandle(Arc<RouteStatusInner>);
 
@@ -119,7 +117,6 @@ impl RouteStatusHandle {
 ///
 /// Produced during each reconciler rebuild and consumed by the controller's
 /// leader-gated status writer.
-#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct BackendTlsPolicyStatus {
     /// Owned Gateways that reference the policy's target Service via an HTTPRoute.
@@ -160,7 +157,6 @@ struct BackendTlsPolicyStatusInner {
 ///
 /// See [`GatewayListenerStatusHandle`] for the rationale behind the `watch`-based
 /// notification scheme.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct BackendTlsPolicyStatusHandle(Arc<BackendTlsPolicyStatusInner>);
 
@@ -202,7 +198,6 @@ impl BackendTlsPolicyStatusHandle {
 ///
 /// Produced during each reconciler rebuild and consumed by the controller's
 /// leader-gated status writer to patch `status.ancestors[]`.
-#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct ClientTrafficPolicyStatus {
     /// `true` when the policy is accepted (no conflict on any targeted listener).
@@ -237,7 +232,6 @@ struct ClientTrafficPolicyStatusInner {
 /// Shared handle to per-`ClientTrafficPolicy` status, produced after each reconciler rebuild.
 ///
 /// The controller reads this to write `status.ancestors[]` when leader.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct ClientTrafficPolicyStatusHandle(Arc<ClientTrafficPolicyStatusInner>);
 
@@ -284,7 +278,6 @@ impl ClientTrafficPolicyStatusHandle {
 /// per-ancestor `Accepted`/`Conflicted` conditions. An `extensionRef`-only policy
 /// (no `targetRefs`) never appears here; its resolution is reflected on the
 /// referencing route's own status instead.
-#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct CoxswainExternalAuthStatus {
     /// `true` when the policy is accepted (won conflict resolution on every
@@ -321,7 +314,6 @@ struct CoxswainExternalAuthStatusInner {
 /// Shared handle to per-`CoxswainExternalAuth` status, produced after each
 /// reconciler rebuild. The controller reads this to write `status.ancestors[]`
 /// when leader (#23).
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct CoxswainExternalAuthStatusHandle(Arc<CoxswainExternalAuthStatusInner>);
 
@@ -365,7 +357,6 @@ impl CoxswainExternalAuthStatusHandle {
 /// leader-gated status writer to patch `status.ancestors[]` (one ancestor per
 /// targeted `Service`). Mirrors [`ClientTrafficPolicyStatus`] — the controller
 /// turns these flags into per-ancestor `Accepted`/`Conflicted` conditions.
-#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub struct CoxswainBackendPolicyStatus {
     /// `true` when the policy is accepted (no conflict on any targeted Service).
@@ -400,7 +391,6 @@ struct CoxswainBackendPolicyStatusInner {
 /// Shared handle to per-`CoxswainBackendPolicy` status, produced after each
 /// reconciler rebuild. The controller reads this to write `status.ancestors[]`
 /// when leader.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct CoxswainBackendPolicyStatusHandle(Arc<CoxswainBackendPolicyStatusInner>);
 

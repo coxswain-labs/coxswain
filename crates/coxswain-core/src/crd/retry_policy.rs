@@ -42,7 +42,6 @@ use serde::{Deserialize, Serialize};
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct RetryPolicySpec {
     /// Maximum number of retries after the initial attempt (GEP-1731 `attempts`).
     ///

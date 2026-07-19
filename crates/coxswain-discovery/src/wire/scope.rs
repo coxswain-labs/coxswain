@@ -95,6 +95,13 @@ pub fn scope_from_wire(dto: &p::Scope) -> Result<Scope, WireError> {
     }
 }
 
+/// Decode a wire [`p::ListenerInfo`] into its core form.
+///
+/// # Errors
+///
+/// Returns [`WireError`] if a required field is absent or an enum discriminant
+/// carries no in-band detail the core type requires. The proxy fails the whole
+/// snapshot closed rather than applying a half-decoded listener.
 pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerInfo, WireError> {
     let readiness = match p::ListenerReadiness::try_from(dto.readiness)
         .unwrap_or(p::ListenerReadiness::Unspecified)
@@ -124,37 +131,39 @@ pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerI
         p::ListenerReadiness::UdpProxy => ListenerReadiness::UdpProxy,
     };
 
-    let mut li = ListenerInfo::default();
-    li.readiness = readiness;
-    li.attached_routes = dto.attached_routes;
-    li.hostname = dto.hostname.clone();
-    // Lossy inverse of `to_wire`: a non-all listener becomes `Only({})` (deny all,
-    // fail closed). The proxy never reads this for routing, so loss is harmless;
-    // the reflector always holds the full resolved set in-process.
-    li.route_namespaces = if dto.allows_all_namespaces {
-        RouteNamespaceSet::All
-    } else {
-        RouteNamespaceSet::Only(std::collections::BTreeSet::new())
+    let li = ListenerInfo {
+        readiness,
+        attached_routes: dto.attached_routes,
+        hostname: dto.hostname.clone(),
+        // Lossy inverse of `to_wire`: a non-all listener becomes `Only({})` (deny all,
+        // fail closed). The proxy never reads this for routing, so loss is harmless;
+        // the reflector always holds the full resolved set in-process.
+        route_namespaces: if dto.allows_all_namespaces {
+            RouteNamespaceSet::All
+        } else {
+            RouteNamespaceSet::Only(std::collections::BTreeSet::new())
+        },
+        port: dto.port as u16,
+        internal_port: dto.internal_port as u16,
+        conflict: if dto.protocol_conflict {
+            ConflictReason::ProtocolConflict
+        } else if dto.conflicted {
+            ConflictReason::HostnameConflict
+        } else {
+            ConflictReason::None
+        },
+        proxy_protocol: dto.proxy_protocol.as_ref().map(|pp| {
+            // Parse CIDR strings; drop malformed ones (fail-safe: fewer trusted peers
+            // → connection rejected, which is the correct safe direction).
+            let nets: Vec<ipnet::IpNet> = pp
+                .trusted_sources
+                .iter()
+                .filter_map(|s| s.parse().ok())
+                .collect();
+            ProxyProtocolListenerConfig::new(pp.enabled, nets)
+        }),
+        ..Default::default()
     };
-    li.port = dto.port as u16;
-    li.internal_port = dto.internal_port as u16;
-    li.conflict = if dto.protocol_conflict {
-        ConflictReason::ProtocolConflict
-    } else if dto.conflicted {
-        ConflictReason::HostnameConflict
-    } else {
-        ConflictReason::None
-    };
-    li.proxy_protocol = dto.proxy_protocol.as_ref().map(|pp| {
-        // Parse CIDR strings; drop malformed ones (fail-safe: fewer trusted peers
-        // → connection rejected, which is the correct safe direction).
-        let nets: Vec<ipnet::IpNet> = pp
-            .trusted_sources
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
-        ProxyProtocolListenerConfig::new(pp.enabled, nets)
-    });
     Ok(li)
 }
 

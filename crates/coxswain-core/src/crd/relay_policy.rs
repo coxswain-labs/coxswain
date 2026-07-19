@@ -65,7 +65,6 @@ use super::preserve_unknown_fields_schema;
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 #[derive(Default)]
 pub struct CoxswainRelayPolicySpec {
     /// Tri-state override of the controller's automatic provisioning decision:
@@ -118,7 +117,6 @@ pub struct CoxswainRelayPolicySpec {
 /// back to the static [`CoxswainRelayPolicySpec::replicas`] — an uncapped relay never runs.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct RelayAutoscaling {
     /// When `true`, the controller sizes the relay to downstream fan-out (subject to a set
     /// `max_replicas`). Must be set explicitly; the `Default` is `false`.

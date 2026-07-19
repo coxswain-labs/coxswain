@@ -45,7 +45,6 @@ const CB_DEFAULT_MIN_REQUESTS: u32 = 10;
 const DEFAULT_SESSION_COOKIE_NAME: &str = "__coxswain_session";
 
 /// Resolved per-`Service` connection policy from the winning policy.
-#[non_exhaustive]
 pub struct ResolvedBackendPolicy {
     /// Upstream TCP-connect timeout, if the policy set a parseable `connect`.
     pub(crate) connect: Option<Duration>,

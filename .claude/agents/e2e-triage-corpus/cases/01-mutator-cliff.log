@@ -1,0 +1,27 @@
+$ cargo nextest run --profile e2e -E 'binary(routing) + binary(tls) + binary(security) + binary(traffic_policy)'
+   Starting 148 tests across 4 binaries
+
+     PASS [   2.104s] security::serial::proxy_protocol_required_rejects_plain_tcp
+     FAIL [  30.021s] routing::path_prefix_routes_to_expected_backend
+     FAIL [  30.019s] routing::host_pool_round_robins
+     FAIL [  30.044s] routing::deleted_route_stops_serving
+     FAIL [  30.011s] tls::sni_selects_matching_certificate
+     FAIL [  30.033s] tls::terminate_serves_https_on_443
+     FAIL [  30.008s] traffic_policy::rate_limit_rejects_over_budget
+     FAIL [  30.027s] traffic_policy::ip_allow_list_permits_listed_cidr
+     ... 19 more FAIL, all 30.0s
+   Summary [  31.882s] 26 tests run: 1 passed, 25 failed
+
+--- failure detail (representative; all 25 are identical in shape) ---
+Error: timed out after 30s waiting for at least 1 distinct backend pod to answer on echo.test-a1b2/
+Caused by: error sending request for url (http://127.0.0.1:8080/): connection closed before message completed
+
+--- operator ran afterwards ---
+$ kubectl get pods -n coxswain
+NAME                                READY   STATUS    RESTARTS   AGE
+coxswain-controller-7d9f8c-x2k4l    1/1     Running   0          14m
+coxswain-shared-proxy-6b8d4f-9wqzt  1/1     Running   0          2m
+$ kubectl logs -n coxswain coxswain-shared-proxy-6b8d4f-9wqzt --tail=5
+INFO listening on 0.0.0.0:8080 proxy_protocol=required
+INFO routing snapshot applied generation=41 hosts=63
+INFO listening on 0.0.0.0:8443

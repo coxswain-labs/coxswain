@@ -26,7 +26,6 @@ use std::time::SystemTime;
 /// backend ref; [`PortRoutingTable::find`](super::port::PortRoutingTable) peels
 /// it off into [`RouteOutcome::Error`](super::table::RouteOutcome::Error), so it
 /// is always `None` once a `RouteMatch` is wrapped in `Found`.
-#[non_exhaustive]
 pub struct RouteMatch {
     /// Backend group to forward matching requests to.
     pub backend_group: Arc<BackendGroup>,
@@ -179,7 +178,6 @@ pub fn compile_bounded(pattern: &str) -> Result<regex::Regex, regex::Error> {
 pub(crate) type WireTableEntry = (Box<str>, RouteKind, Arc<RouteEntry>);
 
 /// Compiled path router for a single hostname, supporting exact, prefix, and regex patterns.
-#[non_exhaustive]
 pub struct HostRouter {
     router: Router<Box<[Arc<RouteEntry>]>>,
     regex_routes: Vec<(RegexSet, Box<[Arc<RouteEntry>]>)>,
@@ -403,7 +401,6 @@ fn sort_and_freeze(entries: Vec<(usize, Arc<RouteEntry>)>) -> Box<[Arc<RouteEntr
 }
 
 /// Builder for a [`HostRouter`]; accumulates routes then compiles them in one pass.
-#[non_exhaustive]
 #[derive(Default)]
 pub struct HostRouterBuilder {
     exact_routes: Vec<(String, Arc<RouteEntry>)>,
@@ -644,12 +641,6 @@ impl HostRouterBuilder {
 ///
 /// Routes registered from Ingress resources use `SingleLabel`; routes from
 /// Gateway API resources use `MultiLabel`.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WildcardKind {
     /// Ingress spec: the wildcard matches exactly one subdomain label.

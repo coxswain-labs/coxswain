@@ -39,7 +39,6 @@ use std::sync::Arc;
 /// `i32` service-port representation — always in `1..=65535` by API-server
 /// validation, so the narrower width loses no valid input.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub struct EndpointKey {
     /// Namespace of the referenced Service.
     pub namespace: Arc<str>,
@@ -68,7 +67,6 @@ impl EndpointKey {
 /// `Service` stores; read by every route builder via an [`EndpointPool`]
 /// lookup instead of a direct store scan.
 #[derive(Debug, Clone, PartialEq)]
-#[non_exhaustive]
 pub struct ResolvedEndpoints {
     /// Ready pod addresses backing the service port, at the pod-facing target port.
     pub addrs: Vec<SocketAddr>,
@@ -81,10 +79,7 @@ pub struct ResolvedEndpoints {
 }
 
 impl ResolvedEndpoints {
-    /// Builds a resolved result from its three fields. `#[non_exhaustive]`
-    /// blocks cross-crate struct-literal construction, so callers outside
-    /// this module (route builders constructing a deliberately-empty result
-    /// for a denied/invalid backendRef) go through this constructor instead.
+    /// Builds a resolved result from its three fields.
     #[must_use]
     pub fn new(
         addrs: Vec<SocketAddr>,

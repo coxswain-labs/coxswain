@@ -50,7 +50,6 @@ pub(super) const FIELD_MANAGER: &str = "coxswain-controller";
 /// Errors returned by [`apply_rendered`]. Each variant carries the underlying
 /// [`kube::Error`] from the failing SSA call so callers can surface the
 /// API-server message.
-#[non_exhaustive]
 #[derive(Debug, Error)]
 pub(super) enum ApplyError {
     /// SSA of the `ServiceAccount` failed.

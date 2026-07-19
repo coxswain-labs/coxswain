@@ -19,7 +19,6 @@
 ///
 /// Shared as an `Arc` on the hot path so cloning into the per-request
 /// `ResolvedRoute` is a refcount bump, not a heap copy.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompressionConfig {
     /// Compress responses with gzip when the client advertises `gzip` in

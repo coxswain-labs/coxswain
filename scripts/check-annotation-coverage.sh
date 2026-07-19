@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Enforce e2e rubric #11 (knob coverage): every `ingress.coxswain-labs.dev/*`
+# Enforce the e2e charter's knob-coverage rule: every `ingress.coxswain-labs.dev/*`
 # annotation constant must carry BOTH
 #   (a) a parsing unit test — the const is referenced in the `#[cfg(test)]`
 #       region of ANY file under the annotations module (flat or split), AND
@@ -13,7 +13,7 @@
 #   Flat:  crates/coxswain-reflector/src/ingress/annotations.rs
 #   Split: crates/coxswain-reflector/src/ingress/annotations/*.rs
 #
-# Quarantine-with-ticket (rubric #10): annotations whose e2e effect test is not
+# Quarantine-with-ticket (zero-tolerance-flakes rule): annotations whose e2e effect test is not
 # yet written are listed in E2E_ALLOWLIST below, each tied to a tracking issue.
 # An allowlisted annotation still REQUIRES a parsing unit test — only the e2e
 # half is deferred. A NEW annotation is never auto-exempt: it must ship an e2e
@@ -155,7 +155,7 @@ if [ "${#missing_e2e[@]}" -gt 0 ]; then
   echo "FAIL: ${#missing_e2e[@]} annotation(s) missing a named e2e effect test (and not allowlisted):" >&2
   printf '  %s\n' "${missing_e2e[@]}" >&2
   echo "" >&2
-  echo "Per e2e rubric #11, add an effect test under $E2E_DIR/tests/ that applies the" >&2
+  echo "Per the e2e charter, add an effect test under $E2E_DIR/tests/ that applies the" >&2
   echo "annotation and asserts its runtime effect. If deferred, add the key to" >&2
   echo "E2E_ALLOWLIST in this script with a tracking issue reference." >&2
   fail=1

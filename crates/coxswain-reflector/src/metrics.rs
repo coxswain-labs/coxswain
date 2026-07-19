@@ -40,7 +40,6 @@ const DEBOUNCE_WAIT_BUCKETS: &[f64] = &[
 ///
 /// Selects the `coxswain_proxy_*` vs `coxswain_controller_*` series prefix at
 /// metric-handle construction time.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MetricsPrefix {
     /// Proxy pod (`serve proxy --shared` or `serve proxy --dedicated`). Emits
@@ -55,7 +54,6 @@ pub enum MetricsPrefix {
 ///
 /// Cheap to construct (`MetricsPrefix` is `Copy`); cheap to call (each emission
 /// is a `OnceLock::get_or_init` followed by a label lookup).
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct ReflectorMetrics {
     prefix: MetricsPrefix,

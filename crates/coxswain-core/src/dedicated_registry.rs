@@ -47,7 +47,6 @@ use crate::tls::{ClientCertStore, PortTlsStore};
 ///
 /// Constructed in `coxswain-reflector` by the shared reconciler; read in
 /// `coxswain-discovery` to build per-subscriber snapshots.
-// intentionally open: field-literal constructed in coxswain-reflector
 pub struct DedicatedRoutingSnapshot {
     /// Gateway-API routing table for this Gateway only.
     pub gateway: Arc<GatewayRoutingTable>,
@@ -81,7 +80,6 @@ pub struct DedicatedRoutingSnapshot {
 /// namespace-view fan-out (#582, the relay tier's upstream) reads
 /// `by_ns[namespace]` instead of scanning every Gateway in the cluster on every
 /// per-namespace materialization (#621). Single-key readers index into `map`.
-#[non_exhaustive]
 #[derive(Default)]
 pub struct DedicatedRegistryData {
     /// Cut-over Gateway [`ObjectKey`] → its [`DedicatedRoutingSnapshot`].

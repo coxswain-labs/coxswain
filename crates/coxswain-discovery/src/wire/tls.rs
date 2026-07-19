@@ -163,7 +163,6 @@ fn key_algorithm_to_wire(algo: KeyAlgorithm) -> p::KeyAlgorithm {
         KeyAlgorithm::Rsa => p::KeyAlgorithm::Rsa,
         KeyAlgorithm::Ecdsa => p::KeyAlgorithm::Ecdsa,
         KeyAlgorithm::Other => p::KeyAlgorithm::Other,
-        _ => p::KeyAlgorithm::Unspecified,
     }
 }
 

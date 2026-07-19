@@ -34,7 +34,6 @@ pub(super) struct ParamsRef {
 }
 
 /// Errors that can occur while resolving `CoxswainGatewayParameters`.
-#[non_exhaustive]
 #[derive(Debug, Error, PartialEq)]
 pub(super) enum ParamsError {
     /// A `parametersRef` is set but the target object does not exist in the
@@ -285,10 +284,8 @@ mod tests {
         assert!(result.is_none());
     }
 
-    /// Build a [`CoxswainGatewayParametersSpec`] from a JSON fragment.
-    /// `CoxswainGatewayParametersSpec` is `#[non_exhaustive]` (so the CRD can
-    /// grow fields without breaking downstream construction) — tests in this
-    /// crate can't use struct-literal syntax, so we go through serde.
+    /// Build a [`CoxswainGatewayParametersSpec`] from a JSON fragment, exercising
+    /// the same serde path the CRD itself is deserialized through.
     fn spec_from_json(v: serde_json::Value) -> CoxswainGatewayParametersSpec {
         serde_json::from_value(v).expect("valid CoxswainGatewayParametersSpec JSON")
     }

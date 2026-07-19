@@ -27,7 +27,6 @@ use serde::{Deserialize, Serialize};
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct PathRewriteRegexSpec {
     /// Regular expression pattern to match against the request path.
     ///

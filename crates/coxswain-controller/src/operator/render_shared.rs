@@ -157,7 +157,6 @@ pub(super) fn requested_static_cluster_ip(gw: &Gateway) -> Option<std::net::IpAd
 }
 
 /// Inputs to [`render_shared_gateway_service`].
-#[non_exhaustive]
 pub(super) struct SharedServiceInputs<'a> {
     /// The shared-mode Gateway getting its own VIP.
     pub(super) gateway: &'a Gateway,

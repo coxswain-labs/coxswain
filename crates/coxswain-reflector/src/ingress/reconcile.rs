@@ -34,7 +34,6 @@ use std::sync::Arc;
 /// resolved from `IngressClass.spec.parameters` (#190, #279) — so the
 /// reconcile entry point stays under the workspace argument-count limit and so
 /// callers thread one borrow instead of three.
-#[non_exhaustive]
 pub struct IngressClassContext<'a> {
     owned: &'a HashSet<String>,
     default: Option<&'a str>,
@@ -66,7 +65,6 @@ impl<'a> IngressClassContext<'a> {
 /// join this family: it is a GEP-713 direct-attachment policy targeting the
 /// backend `Service` itself, not referenced by a `namespace/name` annotation —
 /// see `IngressExtensionStores::backend_policy_index`.
-#[non_exhaustive]
 pub struct IngressCrRefStores<'a> {
     pub(crate) compressions: &'a MergedStore<Compression>,
     pub(crate) retry_policies: &'a MergedStore<RetryPolicy>,
@@ -103,7 +101,6 @@ impl<'a> IngressCrRefStores<'a> {
 /// (`backend_policy_index`, #554) — so `reconcile` stays under the workspace
 /// argument-count limit. Not auth-specific despite the auth-heavy history —
 /// every extension-CRD input an Ingress reconcile pass needs lands here.
-#[non_exhaustive]
 pub struct IngressExtensionStores<'a> {
     pub(crate) auth_secrets: &'a MergedStore<Secret>,
     pub(crate) external_auths: &'a MergedStore<CoxswainExternalAuth>,

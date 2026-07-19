@@ -26,7 +26,6 @@ use crate::ownership::ObjectKey;
 /// The publish stamp for one Gateway: the rebuild sequence at which its
 /// current `(generation, content fingerprint)` pair was first included in
 /// the published routing cells.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublishStamp {
     /// `metadata.generation` of the Gateway as of the stamping rebuild.
@@ -47,7 +46,6 @@ pub struct PublishStamp {
 
 /// Shared handle to the publish index. Cheap to clone; one instance per
 /// controller process, created in `coxswain-bin`.
-#[non_exhaustive]
 #[derive(Clone, Default)]
 pub struct GatewayPublishIndexHandle(Arc<PublishIndexInner>);
 

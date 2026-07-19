@@ -11,7 +11,6 @@ use thiserror::Error;
 ///
 /// Parsed from `--status-address` at startup: if the value is a valid
 /// `IpAddr` it becomes `Ip`, otherwise it is treated as a DNS hostname.
-#[non_exhaustive]
 #[derive(Clone, Debug)]
 pub enum StatusAddress {
     /// A bare IP address written to `.ip` in the status block.
@@ -25,7 +24,6 @@ pub enum StatusAddress {
 /// Grouped so [`ControllerConfig::new`] stays under the workspace
 /// `clippy::too_many_arguments` threshold and the lease-related cross-checks
 /// (renewal ≤ TTL/3) live next to the values they constrain.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct LeaseSettings {
     /// How long the lease stays valid without renewal.
@@ -50,7 +48,6 @@ impl LeaseSettings {
 }
 
 /// Error returned by [`ControllerConfig::new`].
-#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum ControllerConfigError {
     /// The lease renewal interval is too fast relative to the TTL.
@@ -71,7 +68,6 @@ pub enum ControllerConfigError {
 /// Validated on construction: `lease.renew_interval * 3` must not exceed
 /// `lease.ttl`, which keeps the renewal rate safely below the threshold where
 /// a live leader could be evicted by a standby.
-#[non_exhaustive]
 #[derive(Debug)]
 pub struct ControllerConfig {
     /// `GatewayClass.spec.controllerName` this instance claims.

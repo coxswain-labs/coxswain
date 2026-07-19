@@ -13,7 +13,6 @@ use coxswain_core::workqueue::RateLimitingWorkqueue;
 
 /// The resource kind a [`StatusKey`] refers to. Drives the worker's dispatch to
 /// the matching `reconcile_*` handler and store reader.
-#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StatusKind {
     /// `Gateway` — shared-pool status and, for dedicated-class Gateways, the
@@ -52,7 +51,6 @@ pub enum StatusKind {
 /// The worker resolves the live object from the matching reflector store at
 /// dispatch time (never carrying a stale copy through the queue), so a key
 /// whose object has since been deleted resolves to nothing and is dropped.
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StatusKey {
     /// Which resource kind — selects the dispatch handler and store.

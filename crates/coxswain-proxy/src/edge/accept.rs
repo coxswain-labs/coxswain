@@ -71,7 +71,6 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 4096;
 // ── Public types ─────────────────────────────────────────────────────────────
 
 /// Error returned when building a [`ProxyAcceptor`].
-#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum AcceptorBuildError {
     /// The TLS acceptor builder could not be initialised.
@@ -80,7 +79,6 @@ pub enum AcceptorBuildError {
 }
 
 /// Typed errors from reading a PROXY protocol v1 or v2 header.
-#[non_exhaustive]
 #[derive(Debug, Error)]
 pub(crate) enum ProxyHeaderError {
     /// No complete header arrived within the 5 s deadline.
@@ -103,7 +101,6 @@ pub(crate) enum ProxyHeaderError {
 ///
 /// Extracted into a struct so `ProxyAcceptor::new` stays under the 7-argument
 /// workspace limit enforced by `clippy::too_many_arguments`.
-// intentionally open: callers construct this directly in coxswain-bin.
 pub struct PassthroughConfig {
     /// SNI-keyed routing table for TLSRoute `mode: Passthrough` listeners.
     ///
@@ -141,7 +138,6 @@ pub struct PassthroughConfig {
 const MAX_PROXY_PEEK: usize = 552;
 
 /// Whether a listener speaks plain HTTP, HTTPS, or TLS L4 (passthrough and/or terminate).
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ListenerProtocol {
     /// Plain HTTP/1.1 (no TLS).
@@ -173,7 +169,6 @@ pub enum ListenerProtocol {
 }
 
 /// One listen address with its associated protocol and per-listener PROXY config.
-// intentionally open: field-literal constructed in crates/coxswain-bin/src/main.rs while assembling the desired listener set.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ListenerSpec {
     /// The socket address to bind.
@@ -276,7 +271,6 @@ impl ListenerSpec {
 /// HTTP proxy entirely and forward raw encrypted streams by SNI, using the
 /// [`SharedTlsPassthroughTable`] snapshot. If PROXY config is enabled on a
 /// TLS L4 listener, the PROXY header is stripped before SNI peeking.
-#[non_exhaustive]
 pub struct ProxyAcceptor<P>
 where
     P: ProxyHttp + Send + Sync + 'static,

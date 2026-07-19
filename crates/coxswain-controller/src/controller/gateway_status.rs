@@ -797,9 +797,10 @@ mod tests {
     }
 
     fn health_with_backend(outcome: BackendClientCertOutcome) -> GatewayListenerStatus {
-        let mut h = GatewayListenerStatus::default();
-        h.backend_client_cert = Some(outcome);
-        h
+        GatewayListenerStatus {
+            backend_client_cert: Some(outcome),
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -1068,8 +1069,10 @@ mod tests {
     fn health_with_readiness(pairs: &[(&str, ListenerReadiness)]) -> GatewayListenerStatus {
         let mut h = GatewayListenerStatus::default();
         for (name, readiness) in pairs {
-            let mut info = ListenerInfo::default();
-            info.readiness = readiness.clone();
+            let info = ListenerInfo {
+                readiness: readiness.clone(),
+                ..Default::default()
+            };
             h.listeners.insert(ListenerStatusKey::gateway(*name), info);
         }
         h

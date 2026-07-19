@@ -34,7 +34,6 @@ use serde::{Deserialize, Serialize};
     status = "ClientTrafficPolicyStatus"
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct ClientTrafficPolicySpec {
     /// Gateways (and optionally specific listeners) this policy targets.
     ///
@@ -55,7 +54,6 @@ pub struct ClientTrafficPolicySpec {
 ///
 /// Mirrors the Gateway API `LocalPolicyTargetReferenceWithSectionName` shape
 /// without importing the generated types, so we control the schema.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LocalPolicyTargetRef {
@@ -72,7 +70,6 @@ pub struct LocalPolicyTargetRef {
 }
 
 /// PROXY protocol acceptance settings for a listener.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyProtocolSpec {
@@ -90,7 +87,6 @@ pub struct ProxyProtocolSpec {
 }
 
 /// Status written back to the `ClientTrafficPolicy` by the controller.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientTrafficPolicyStatus {
@@ -100,7 +96,6 @@ pub struct ClientTrafficPolicyStatus {
 }
 
 /// Status of this policy with respect to one ancestor (Gateway or listener).
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyAncestorStatus {
@@ -116,7 +111,6 @@ pub struct PolicyAncestorStatus {
 
 /// Identifies the ancestor (Gateway + optional sectionName) to which a
 /// `PolicyAncestorStatus` entry corresponds.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PolicyAncestorRef {

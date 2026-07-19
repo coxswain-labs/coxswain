@@ -18,7 +18,6 @@ pub use reconcile::{IngressClassContext, IngressCrRefStores, IngressExtensionSto
 
 /// Zero-sized handle namespacing the Ingress reconciliation entry points.
 /// The actual translation logic lives in the `reconcile` and `tls` submodules.
-#[non_exhaustive]
 pub struct IngressReconciler;
 
 #[cfg(test)]

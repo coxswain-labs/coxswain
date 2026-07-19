@@ -20,7 +20,6 @@ use std::time::SystemTime;
 /// Classified once at load time from the Subject Public Key Info (SPKI) of
 /// the leaf certificate. Used by the proxy to prefer ECDSA over RSA when both
 /// are available for the same SNI — mirroring Envoy's key-type selection logic.
-#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum KeyAlgorithm {
     /// RSA public key.
@@ -36,7 +35,6 @@ pub enum KeyAlgorithm {
 ///
 /// Validation happens once in the controller before insertion; the proxy re-parses
 /// on each SNI handshake (cheap relative to the handshake itself).
-#[non_exhaustive]
 #[derive(Debug)]
 pub struct TlsCert {
     /// Raw PEM-encoded certificate chain.
@@ -106,7 +104,6 @@ impl PartialEq for TlsCert {
 /// then Other; within the same algorithm, newest `notAfter` first; then by
 /// `source` for a fully deterministic order. The sort is established once at
 /// [`TlsStoreBuilder::build`] time and never mutated.
-#[non_exhaustive]
 #[derive(Debug, Default, PartialEq)]
 pub struct TlsStore {
     exact: HashMap<String, Vec<Arc<TlsCert>>>,
@@ -343,7 +340,6 @@ fn dedup_cert_vec(certs: &mut Vec<Arc<TlsCert>>) {
 }
 
 /// Builder for [`TlsStore`]. Not thread-safe; used only inside the debounced rebuild.
-#[non_exhaustive]
 #[derive(Default)]
 pub struct TlsStoreBuilder {
     exact: HashMap<String, Vec<Arc<TlsCert>>>,
@@ -447,7 +443,6 @@ pub type SharedTlsStore = Shared<TlsStore>;
 /// Keys are bind ports: Ingress and dedicated-mode listeners key by their spec
 /// port (internal == spec); shared-mode Gateway listeners key by their allocated
 /// internal port. A port with no entry presents no terminate cert.
-#[non_exhaustive]
 #[derive(Debug, Default, PartialEq)]
 pub struct PortTlsStore {
     by_port: HashMap<u16, TlsStore>,
@@ -500,7 +495,6 @@ impl PortTlsStore {
 
 /// Builder for [`PortTlsStore`]: accumulates certs into a per-port
 /// [`TlsStoreBuilder`], compiled together at [`Self::build`].
-#[non_exhaustive]
 #[derive(Default)]
 pub struct PortTlsStoreBuilder {
     by_port: HashMap<u16, TlsStoreBuilder>,
@@ -548,12 +542,6 @@ pub type SharedPortTlsStore = Shared<PortTlsStore>;
 /// Keyed by SNI host pattern in [`ClientCertStore`] and read by the proxy during
 /// every TLS handshake. The enum is crypto-free; PEM parsing happens at reconcile
 /// time (reflector) and at handshake time (proxy).
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Debug, PartialEq)]
 pub enum ClientCertConfigState {
     /// mTLS configured and the CA bundle was resolved successfully.
@@ -568,7 +556,6 @@ pub enum ClientCertConfigState {
 ///
 /// Sources: Ingress `auth-tls-*` annotations (via [`ClientCertStoreBuilder`]) or
 /// Gateway `spec.tls.frontend.default.validation` (GEP-91, #86).
-#[non_exhaustive]
 #[derive(Debug)]
 pub struct ClientCertConfig {
     /// PEM-encoded CA certificate bundle.
@@ -636,14 +623,12 @@ impl PartialEq for ClientCertConfig {
 /// Built once per reconcile cycle and shared read-only with the proxy via
 /// [`SharedClientCertStore`]. Swapped independently of [`SharedTlsStore`] so
 /// CA rotation does not churn the server-cert snapshot.
-#[non_exhaustive]
 #[derive(Debug, Default, PartialEq)]
 pub struct ClientCertStore {
     by_port: HashMap<u16, HostClientCertConfigs>,
 }
 
 /// One bind port's SNI-pattern → mTLS-config map.
-#[non_exhaustive]
 #[derive(Debug, Default, PartialEq)]
 pub struct HostClientCertConfigs {
     exact: HashMap<String, Arc<ClientCertConfigState>>,
@@ -738,7 +723,6 @@ impl HostClientCertConfigs {
 
 /// Builder for [`ClientCertStore`]. Not thread-safe; used only inside the
 /// debounced rebuild, mirroring [`TlsStoreBuilder`].
-#[non_exhaustive]
 #[derive(Default)]
 pub struct ClientCertStoreBuilder {
     by_port: HashMap<u16, HostConfigsBuilder>,
@@ -884,7 +868,6 @@ fn listener_specificity(pattern: &str) -> usize {
 /// [`ListenerHostnames`] snapshot. Because Gateway API requires distinct
 /// hostname patterns per port, the pattern string is a unique listener key.
 /// `MatchAll` represents the no-hostname (`""`) Gateway HTTPS listener.
-#[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum ListenerId<'a> {
     /// A named hostname pattern (exact or wildcard) identifies the listener.
@@ -917,7 +900,6 @@ struct PortListeners {
 /// Empty by default — non-HTTPS ports and Ingress-only deployments leave the
 /// snapshot empty so [`Self::has_https_port`] short-circuits with no allocation
 /// overhead on the request hot-path.
-#[non_exhaustive]
 #[derive(Debug, Default, PartialEq)]
 pub struct ListenerHostnames {
     ports: HashMap<u16, PortListeners>,
@@ -974,7 +956,6 @@ impl ListenerHostnames {
 
 /// Builder for [`ListenerHostnames`]. Not thread-safe; used only inside the
 /// debounced reconcile rebuild, mirroring [`TlsStoreBuilder`].
-#[non_exhaustive]
 #[derive(Default)]
 pub struct ListenerHostnamesBuilder {
     ports: HashMap<u16, (Vec<String>, bool)>,

@@ -78,7 +78,6 @@ pub(crate) struct ConnTlsInfo {
 /// so a shared-mode Gateway's VIP port can never present a sibling Gateway's
 /// overlapping-SNI cert. The acceptor builds an unscoped selector once and calls
 /// [`Self::for_port`] per connection.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct SniCertSelector {
     tls: SharedPortTlsStore,

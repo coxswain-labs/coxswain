@@ -66,9 +66,7 @@ pub(super) async fn patch_coxswain_external_auth_status(
 
 /// Build the `status.ancestors[]` JSON list for a policy.
 ///
-/// One ancestor per `targetRef` pointing at a `Gateway`. Uses raw
-/// `serde_json::Value` to avoid struct-literal construction of `#[non_exhaustive]`
-/// types across crate boundaries.
+/// One ancestor per `targetRef` pointing at a `Gateway`.
 fn build_ancestors(
     health: &CoxswainExternalAuthStatus,
     policy: &CoxswainExternalAuth,

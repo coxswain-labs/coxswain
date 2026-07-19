@@ -456,6 +456,13 @@ pub(crate) fn bg_from_wire(
     })
 }
 
+/// Decode a wire [`p::UpstreamTls`] into its core form.
+///
+/// # Errors
+///
+/// Returns [`WireError::MissingRequiredField`] if the CA block is absent, or a
+/// parse error if the embedded PEM/SNI values are malformed. Failing closed here
+/// keeps a malformed policy from silently downgrading upstream TLS.
 pub(crate) fn upstream_tls_from_wire(dto: &p::UpstreamTls) -> Result<UpstreamTls, WireError> {
     let ca = match dto.ca.as_ref().ok_or(WireError::MissingRequiredField {
         field: "upstream_tls.ca",
@@ -641,7 +648,6 @@ fn header_mod_from_wire(dto: &p::HeaderMod) -> Result<HeaderMod, WireError> {
         coxswain_core::routing::HeaderModError::InvalidValue { source, .. } => {
             WireError::InvalidHeaderValue(source)
         }
-        other => WireError::InvalidHeaderMod(other.to_string()),
     })
 }
 
@@ -785,6 +791,13 @@ fn duration_from_wire(dto: &p::Duration) -> Duration {
 // Per-route config: from_wire
 // ────────────────────────────────────────────────────────────────────────────
 
+/// Decode a wire [`p::RateLimitConfig`] into its core form.
+///
+/// # Errors
+///
+/// Returns [`WireError::ZeroRps`] if `requests_per_second` is zero — a limiter
+/// admitting zero requests would blackhole the route, so it is rejected rather
+/// than applied.
 pub(crate) fn rate_limit_from_wire(dto: &p::RateLimitConfig) -> Result<RateLimitConfig, WireError> {
     let rps = NonZeroU32::new(dto.requests_per_second).ok_or(WireError::ZeroRps)?;
     let key = dto
@@ -994,6 +1007,12 @@ fn normalize_level_from_wire(v: i32) -> Result<NormalizeLevel, WireError> {
     }
 }
 
+/// Decode a wire backend-protocol discriminant into its core form.
+///
+/// # Errors
+///
+/// Returns [`WireError`] for a discriminant this build cannot route. An unknown
+/// protocol fails the entry closed rather than silently defaulting to HTTP/1.
 pub(crate) fn protocol_from_wire(v: i32) -> Result<BackendProtocol, WireError> {
     match p::BackendProtocol::try_from(v).unwrap_or(p::BackendProtocol::Unspecified) {
         p::BackendProtocol::Unspecified | p::BackendProtocol::Http1 => Ok(BackendProtocol::Http1),
