@@ -6,6 +6,13 @@ use k8s_openapi::api::core::v1::Secret;
 use kube::runtime::reflector;
 use thiserror::Error;
 
+/// Why a Gateway listener's `kubernetes.io/tls` Secret could not be turned into
+/// a usable certificate.
+///
+/// Every variant is a tenant-authored mistake (missing Secret, wrong `type`,
+/// absent or non-PEM key material), never an internal fault — so each maps to a
+/// listener status condition the user can act on rather than to a reflector
+/// failure.
 #[derive(Debug, Error)]
 pub(crate) enum TlsLoadError {
     #[error("secret not found in store")]

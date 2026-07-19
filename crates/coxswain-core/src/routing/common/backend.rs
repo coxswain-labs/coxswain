@@ -25,12 +25,6 @@ use std::time::Duration;
 /// replicas — which is exactly the contract. Populated today only from the Ingress
 /// `ingress.coxswain-labs.dev/session-*` annotations; a backend with no affinity
 /// binding keeps plain weighted round-robin.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug)]
 pub enum SessionAffinity {
     /// Cookie mode: the proxy injects a cookie whose value is the endpoint token
@@ -56,12 +50,6 @@ pub enum SessionAffinity {
 /// upstream via rendezvous (HRW) hashing — only the keys whose owner is removed remap
 /// on endpoint changes. All variants fall back to round-robin when the attribute is
 /// absent or empty.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HashSource {
     /// Path + query of the request URI (`/path?query`).
@@ -83,7 +71,6 @@ pub enum HashSource {
 /// route referencing the service. Entries built by the pre-#383 constructors carry
 /// `key: None` (addresses inlined literally, as before). Never read on the request
 /// hot path — the spec exists only for wire serialisation and admin introspection.
-#[non_exhaustive]
 pub struct WeightedBackendSpec {
     /// Resolved pod addresses + protocol/service-existence metadata for this ref.
     ///
@@ -105,7 +92,6 @@ pub struct WeightedBackendSpec {
 /// faithfully reconstruct the exact per-backend (addresses, provenance, weight)
 /// grouping that was passed to the constructors. The spec is never read on the
 /// request hot path — it exists only for `to_wire` and admin introspection.
-#[non_exhaustive]
 pub struct BackendGroupSpec {
     /// Per-backend refs, in construction order.
     ///
@@ -123,12 +109,6 @@ pub struct BackendGroupSpec {
 /// `ingress.coxswain-labs.dev/load-balance` annotation.
 ///
 /// Gateway API routes always carry `RoundRobin` (the annotation is Ingress-only).
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum LoadBalance {
     /// Standard weighted round-robin (the default; current behaviour).
@@ -209,7 +189,6 @@ impl LoadBalance {
 /// Each variant maps to a distinct operator-facing diagnostic at the call site;
 /// the offending input string is held by the caller, so the variants are
 /// fieldless.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum LoadBalanceParseError {
     /// The selector matched no known algorithm or `hash:` form.
@@ -328,7 +307,6 @@ struct LbEndpoint {
 
 /// Result of [`BackendGroup::select_upstream`]: the chosen endpoint, any per-backend
 /// filters, and an optional tracking index for `LeastConn`/`Ewma` accounting.
-#[non_exhaustive]
 pub struct Selected {
     /// Pod address to connect to.
     pub addr: SocketAddr,
@@ -381,7 +359,6 @@ type PerBackendFilterSlot = Option<Arc<[FilterAction]>>;
 ///
 /// This gives exact per-backend traffic ratios regardless of pod count, and fair
 /// pod distribution within each backend.
-#[non_exhaustive]
 pub struct BackendGroup {
     /// Service identity — used for logging only.
     name: String,

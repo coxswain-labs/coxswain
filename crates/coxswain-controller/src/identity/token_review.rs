@@ -20,7 +20,6 @@ use coxswain_core::identity::{AuthnError, SpiffeId, TokenAuthenticator};
 ///
 /// Requires a `kube::Client` with permission to `create` `tokenreviews` in the
 /// `authentication.k8s.io` API group (ClusterRole — TokenReviews are cluster-scoped).
-#[non_exhaustive]
 pub struct KubeTokenAuthenticator {
     client: Client,
     /// Expected token audience; passed as `spec.audiences` to the TokenReview.

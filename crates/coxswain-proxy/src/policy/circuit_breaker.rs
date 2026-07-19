@@ -186,7 +186,6 @@ impl failsafe::Instrument for MetricsInstrument {
 /// breaker pool. A Gateway-API route carries a `CircuitBreakerConfig` only when a
 /// `CoxswainBackendPolicy` with `spec.circuitBreaker` targets its backend Service
 /// (#478); routes without one never touch the registry.
-#[non_exhaustive]
 #[derive(Clone, Default)]
 pub struct CircuitBreakerRegistry {
     inner: Arc<BreakerMap>,

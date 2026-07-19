@@ -60,7 +60,6 @@ struct EndpointGroup {
 /// it. [`Self::refresh`] is the one caller that legitimately owns `&mut self`
 /// (called once, at the top of a rebuild, before any `get`).
 #[derive(Default)]
-#[non_exhaustive]
 pub struct EndpointCache {
     groups: HashMap<(Arc<str>, Arc<str>), EndpointGroup>,
     pool: std::cell::RefCell<HashMap<EndpointKey, (GroupFingerprint, Arc<ResolvedEndpoints>)>>,

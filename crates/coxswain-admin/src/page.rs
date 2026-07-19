@@ -24,7 +24,6 @@ pub(crate) const MAX_LIMIT: usize = 1000;
 
 /// Parsed list-endpoint query parameters. All optional; an all-default value
 /// (see [`ListParams::is_empty`]) reproduces the legacy full dump.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ListParams {
     /// Case-insensitive substring filter against each resource's object name —
@@ -135,7 +134,6 @@ impl ListParams {
 
 /// A windowed page of already-filtered rows plus the counts the UI needs to show
 /// "showing `offset`–`offset+returned` of `total`".
-#[non_exhaustive]
 pub(crate) struct Page {
     /// The rows in this window.
     pub items: Vec<serde_json::Value>,

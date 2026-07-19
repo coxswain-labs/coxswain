@@ -30,7 +30,6 @@ fn empty_auth_chain() -> Arc<[Arc<IngressAuthConfig>]> {
 /// API). `connect` / `read` / `send` are parsed from the Ingress
 /// `ingress.coxswain-labs.dev/{connect,read,send}-timeout` annotations and map to the
 /// upstream TCP-connect, response-read, and request-send phases respectively.
-// intentionally open: field-literal constructed in crates/coxswain-reflector (gateway_api/timeouts.rs and ingress/annotations.rs) and merged in crates/coxswain-proxy/src/common/outcome.rs.
 #[derive(Clone, Debug, Default)]
 pub struct RouteTimeouts {
     /// Total request timeout (client → proxy → upstream → proxy → client). 504 on expiry.
@@ -46,12 +45,6 @@ pub struct RouteTimeouts {
 }
 
 /// How a path rule was registered — for introspection only.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteKind {
     /// Exact path match (must equal the request path character for character).
@@ -74,7 +67,6 @@ impl RouteKind {
 }
 
 /// Snapshot of a single path rule insertion, kept for inspection.
-#[non_exhaustive]
 pub struct RouteInfo {
     /// Registered path string (exact, prefix, or regex).
     pub path: String,
@@ -89,7 +81,6 @@ pub struct RouteInfo {
 }
 
 /// A path rule that was silently dropped because an earlier rule already claimed the same slot.
-#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct RouteConflict {
     /// Listener port on which the conflict occurred.
@@ -116,7 +107,6 @@ pub struct RouteConflict {
 
 /// A single routing candidate: a backend group plus the predicates that must hold
 /// for this candidate to be selected, along with metadata for precedence ordering.
-#[non_exhaustive]
 pub struct RouteEntry {
     /// Backend group to forward matching requests to.
     pub backend_group: Arc<BackendGroup>,
@@ -262,7 +252,6 @@ pub struct RouteEntry {
 /// header is ignored and the L4 address is used — a client cannot forge its source IP by
 /// setting the header when no trusted proxy is configured. Within a trusted chain the
 /// proxy reads the header rightmost-untrusted, so a forged leftmost token is ignored.
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardedForConfig {
     /// Header name to read the client IP from (case-insensitive; e.g. `X-Forwarded-For`).

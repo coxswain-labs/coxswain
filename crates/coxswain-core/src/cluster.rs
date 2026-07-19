@@ -24,7 +24,6 @@ use serde::Serialize;
 /// Drives the operator UI's per-row status badge, the `?status=problem` list
 /// filter, and (aggregated per category) the routing-tab warning icon and the
 /// Dashboard tiles. Ordered so `worst` reductions take the max variant.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -58,7 +57,6 @@ impl Severity {
 /// Returned by the `fleet/summary` and `routing/summary` endpoints so the
 /// operator UI can render tab counts + a warning icon without fetching the full
 /// (potentially huge) resource lists.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct CategorySummary {
     /// Total resources in this category.
@@ -82,7 +80,6 @@ impl CategorySummary {
 }
 
 /// Per-category aggregate for the routing axis (`GET /api/v1/routing/summary`).
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct RoutingSummary {
     /// Gateway resources.
@@ -109,7 +106,6 @@ pub const PARAMETERS_REF_KIND: &str = "CoxswainGatewayParameters";
 ///
 /// Built once per reconcile cycle and published into a [`SharedClusterSummary`]
 /// for the admin server to read. Serialises as the `/cluster` JSON response.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct ClusterSummary {
     /// All Gateways owned by this controller (filtered by `GatewayClass.controllerName`).
@@ -125,8 +121,6 @@ pub struct ClusterSummary {
 
 impl ClusterSummary {
     /// Assemble a summary from its components.
-    ///
-    /// External-crate constructor for the `#[non_exhaustive]` struct.
     #[must_use]
     pub fn new(
         gateways: Vec<GatewaySummary>,
@@ -155,7 +149,6 @@ impl ClusterSummary {
 }
 
 /// Per-Gateway summary entry.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct GatewaySummary {
     /// Gateway object name.
@@ -238,7 +231,6 @@ impl GatewaySummary {
 ///
 /// In v0 the only populated field is [`Self::pool`]; #221 will add
 /// `deployment`, `replicas`, and `ready` siblings as proxy provisioning lands.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ProxyAssignment {
     /// Which proxy pool this Gateway is served by.
@@ -269,7 +261,6 @@ impl ProxyAssignment {
 /// present and pointing at [`PARAMETERS_REF_GROUP`] / [`PARAMETERS_REF_KIND`] →
 /// dedicated. Any other `parametersRef` group/kind is treated as shared (not
 /// our CRD).
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyPool {
@@ -286,7 +277,6 @@ pub enum ProxyPool {
 /// `observedGeneration` from the summary view to keep responses small. Reason
 /// and message are empty-skipped to avoid noisy `""` values when a controller
 /// hasn't set them.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct GatewayCondition {
     /// Condition type (e.g. `Accepted`, `Programmed`). Serialised as `"type"`
@@ -317,7 +307,6 @@ impl GatewayCondition {
 }
 
 /// Per-Ingress summary entry.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct IngressSummary {
     /// Ingress object name.
@@ -392,7 +381,6 @@ impl IngressSummary {
 /// listener-precise parent propagation — a route bound to a listener whose
 /// `Programmed=False`, or attached to a Gateway whose dedicated proxy isn't
 /// ready, is surfaced as degraded/dark here even when its own `Accepted` is true.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct HttpRouteSummary {
     /// HTTPRoute object name.
@@ -458,7 +446,6 @@ impl HttpRouteSummary {
 ///
 /// Today carries just the leader flag; #221 adds `lease_holder` once
 /// `kube-leader-election`'s holder identity is plumbed through.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct ControllerSummary {
     /// `true` when this pod currently holds the leader-election lease.

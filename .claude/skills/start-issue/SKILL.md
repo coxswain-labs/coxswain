@@ -54,7 +54,7 @@ Apply crate-boundary discipline throughout:
 - New types default to `pub(crate)`; `pub` only at crate-root re-exports
 - Library crates use `thiserror`; `anyhow` is forbidden in library crates
 - No `.unwrap()` / `.expect()` outside test code
-- `#[non_exhaustive]` on all new public error types and enums
+- No `#[non_exhaustive]` — nothing outside this workspace consumes these crates, and it costs cross-crate exhaustiveness checking
 - Every new `pub` item gets a `///` doc comment explaining invariants; fallible fns get `# Errors`
 
 For issues with a **Feature flags** line, the plan must include:
@@ -94,7 +94,13 @@ Wait for user approval before writing any code.
 git checkout -b issue-N
 ```
 
-Implement per the approved plan. Iterate per chunk with a **scoped, cheap** check — do not run the full clippy+test suite after every chunk:
+Implement per the approved plan.
+
+Gates run automatically on every Edit/Write via the `PostToolUse` hook in `.claude/settings.json`, which dispatches through `scripts/gates.sh`. If one fires, fix the cause before continuing — do not proceed with a failing gate. To run them manually for a path: `bash scripts/gates.sh <path>`.
+
+After each meaningful chunk, dispatch the `code-review` agent (`.claude/agents/code-review.md`) over the chunk's diff. It covers what no gate can decide: panic reachability, per-event allocation on the four data planes, tenant-controlled input, doc quality, architectural-vs-work-saving.
+
+Iterate per chunk with a **scoped, cheap** check — do not run the full clippy+test suite after every chunk:
 
 ```bash
 cargo fmt
@@ -111,6 +117,8 @@ cargo test --workspace --exclude coxswain-e2e
 `clippy` subsumes `check`, and the subcommands don't share build artifacts — so a standalone `check` before `clippy`, or per-chunk full runs, are wasted multi-minute rebuilds.
 
 Every clippy warning is a blocker. Fix the root cause — never silence with `#[allow(...)]`. For upstream-imposed names that trip a lint, re-export with a project-canonical alias at the crate boundary.
+
+If the change touches `scripts/check-*.sh`, run `bash scripts/tests/run.sh`: every gate must reject its `bad/` fixture and accept its `good/` one. A new gate needs a new fixture pair — a gate with no negative test is indistinguishable from one that cannot fail. Use `/add-rule` when adding a rule rather than reaching for a script by default.
 
 ### E2e tests
 

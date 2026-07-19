@@ -33,7 +33,6 @@ use serde::{Deserialize, Serialize};
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct RateLimitSpec {
     /// Sustained request rate in requests per second (must be ≥ 1).
     ///

@@ -142,7 +142,6 @@ fn port_host_entries(
             HostPattern::Exact(h) => exact_entries.push((h, router)),
             HostPattern::Wildcard(suffix, kind) => wildcard_entries.push((suffix, kind, router)),
             HostPattern::Catchall => catchall_entry = Some(router),
-            _ => {} // future HostPattern variants: skip (won't be wired until wire.rs is updated)
         }
     }
     exact_entries.sort_by_key(|(h, _)| *h);
@@ -622,9 +621,9 @@ fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfig {
     let a = match auth {
         IngressAuthConfig::External(ext) => {
             // Exactly one of `http`/`grpc` is set per the resolved transport. A
-            // future `#[non_exhaustive]` transport encodes as neither: the decoder
-            // then fails that auth entry closed (Unavailable) rather than the
-            // encoder panicking and taking down the whole routing stream.
+            // transport that encodes as neither fails that auth entry closed
+            // (Unavailable) at decode rather than panicking the encoder and
+            // taking down the whole routing stream.
             let (http, grpc) = match &ext.transport {
                 ExtAuthTransport::Http(h) => (
                     Some(p::HttpExtAuthConfig {
@@ -647,7 +646,6 @@ fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfig {
                             .collect(),
                     }),
                 ),
-                _ => (None, None),
             };
             p::ingress_auth_config::Auth::External(p::ExtAuthConfig {
                 timeout: Some(duration_to_wire(ext.timeout)),

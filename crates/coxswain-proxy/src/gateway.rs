@@ -26,7 +26,6 @@ use std::sync::Arc;
 pub type GatewayEngine = RoutingEngine<Gateway>;
 
 /// Pingora `ProxyHttp` implementation that routes Gateway-API traffic.
-#[non_exhaustive]
 pub struct GatewayProxy {
     /// Lock-free routing engine reading the Gateway snapshot.
     pub engine: Arc<GatewayEngine>,

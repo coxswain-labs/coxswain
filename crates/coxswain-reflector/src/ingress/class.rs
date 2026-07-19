@@ -51,7 +51,6 @@ pub fn claimed_ingress_class(ingress: &Ingress) -> Option<&str> {
 ///
 /// Groups all per-class knobs so the class store is walked once and every
 /// caller gets a consistent view without duplicate WARN logging.
-#[non_exhaustive]
 pub(crate) struct ResolvedClassParams {
     /// Default `ingress.coxswain-labs.dev/*` annotation values applied to
     /// every Ingress claiming this class. Empty when the CR carries no (or an
@@ -324,8 +323,10 @@ mod tests {
         for (k, v) in anns {
             map.insert((*k).to_string(), (*v).to_string());
         }
-        let mut spec = CoxswainIngressClassParametersSpec::default();
-        spec.default_annotations = Some(map);
+        let spec = CoxswainIngressClassParametersSpec {
+            default_annotations: Some(map),
+            ..Default::default()
+        };
         let mut cr = CoxswainIngressClassParameters::new(name, spec);
         cr.metadata.namespace = Some(ns.to_string());
         cr
@@ -466,8 +467,10 @@ mod tests {
         name: &str,
         access_log: Option<bool>,
     ) -> CoxswainIngressClassParameters {
-        let mut spec = CoxswainIngressClassParametersSpec::default();
-        spec.access_log = access_log;
+        let spec = CoxswainIngressClassParametersSpec {
+            access_log,
+            ..Default::default()
+        };
         let mut cr = CoxswainIngressClassParameters::new(name, spec);
         cr.metadata.namespace = Some(ns.to_string());
         cr

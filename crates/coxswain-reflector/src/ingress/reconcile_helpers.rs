@@ -507,7 +507,6 @@ mod tests {
     use coxswain_core::crd::{IpAccessControl, RateLimit};
     use coxswain_core::routing::RateLimitKey;
 
-    // `IpAccessControlSpec` is `#[non_exhaustive]` — deserialize a CR instead.
     fn ip_access_cr(ns: &str, name: &str, allow: &[&str], deny: &[&str]) -> IpAccessControl {
         let fmt_list = |xs: &[&str]| xs.iter().map(|x| format!("\n  - {x}")).collect::<String>();
         let yaml = format!(
@@ -521,7 +520,6 @@ mod tests {
         serde_yaml::from_str(&yaml).expect("valid IpAccessControl")
     }
 
-    // `RateLimitSpec` is `#[non_exhaustive]` — deserialize a CR instead.
     fn rate_limit_cr(ns: &str, name: &str, by_header: Option<&str>) -> RateLimit {
         let by_header_field = by_header
             .map(|h| format!("\n  byHeader: {h}"))

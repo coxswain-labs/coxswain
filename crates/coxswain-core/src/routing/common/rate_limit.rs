@@ -16,12 +16,6 @@ use std::sync::Arc;
 /// Both variants yield one `String`-like key per request (client IP or header
 /// value). The proxy uses this key to look up the per-client bucket inside the
 /// keyed governor limiter for the route.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RateLimitKey {
     /// Limit by real client IP address (the default).
@@ -48,7 +42,6 @@ pub enum RateLimitKey {
 /// reconcile time and snapshotted into [`RouteMatch`](super::host_router::RouteMatch)
 /// on each request — immutable config only. Mutable bucket state lives
 /// separately in the per-process `RateLimiterRegistry`.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RateLimitConfig {
     /// Sustained request rate — cells allowed per second in steady state.

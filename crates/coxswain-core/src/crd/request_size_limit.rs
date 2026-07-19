@@ -38,7 +38,6 @@ use serde::{Deserialize, Serialize};
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct RequestSizeLimitSpec {
     /// Maximum request body size — a byte count or `k`/`m`/`g`-suffixed size
     /// (case-insensitive, binary multipliers), e.g. `"8m"`. Matches the

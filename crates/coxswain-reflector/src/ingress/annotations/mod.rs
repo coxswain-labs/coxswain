@@ -52,7 +52,6 @@ use std::collections::BTreeMap;
 /// The controller consumer converts these into `Warning` Kubernetes Events on the
 /// owning Ingress; the proxy discards them silently.  The `tracing::warn!` is emitted
 /// by the parse helper itself (both roles); the K8s Event is controller-only.
-#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct AnnotationIssue {
     /// Full annotation key string (e.g. `"ingress.coxswain-labs.dev/connect-timeout"`).

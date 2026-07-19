@@ -21,7 +21,6 @@ use tokio::sync::watch;
 /// ceiling measured from the *first* event of the cycle — it never resets,
 /// so a rebuild fires within `max` even under continuous churn (e.g. a
 /// rolling deploy). Setting `min == max` reproduces a fixed-window debounce.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct DebounceSettings {
     min: Duration,
@@ -29,7 +28,6 @@ pub struct DebounceSettings {
 }
 
 /// Error returned by [`DebounceSettings::new`].
-#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum DebounceSettingsError {
     /// `min` exceeds `max` — the quiet window could never fire before the

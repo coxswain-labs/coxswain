@@ -22,7 +22,6 @@ use std::sync::Arc;
 /// while the engine (which is typed differently per proxy) remains a separate
 /// argument.  All fields are low-cost to clone: `Arc<T>` pointer bumps,
 /// `Copy` values, or internally reference-counted types.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct ProxyServices {
     /// Global fallback timeouts applied when a matched route has no per-rule
@@ -131,7 +130,6 @@ impl ProxyServices {
 /// genuinely cannot filter, and the `Pattern` mode, which records the
 /// *matched rule's path pattern* — information only the proxy holds cheaply
 /// without duplicating route config downstream.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccessLogPathMode {
     /// Emit the concrete request path as received (default).

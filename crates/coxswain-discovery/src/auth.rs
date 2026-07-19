@@ -50,7 +50,6 @@ use crate::svid::SharedSvid;
 /// - `Prefix` is used for pools of peers where a common path prefix identifies
 ///   the role: `spiffe://cluster.local/ns/coxswain-system/sa/coxswain-proxy`
 ///   matches any SVID whose URI SAN starts with that string.
-#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpiffeMatcher {
     /// The URI SAN must be exactly this string.
@@ -79,7 +78,6 @@ impl SpiffeMatcher {
 /// Injected into tonic request extensions by `transport::PeerSvidStream`
 /// at TLS accept time.  Absent → plaintext connection (test/degraded path); the
 /// discovery server skips scope-binding checks when this is not present.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct PeerSvid {
     /// URI SANs from the peer end-entity certificate (SPIFFE IDs).
@@ -328,7 +326,6 @@ fn build_root_cert_store(ca_pem: &[u8]) -> Result<RootCertStore, AuthError> {
 ///
 /// Fields are PEM-encoded bytes so they can be loaded from files or Kubernetes
 /// Secrets without an intermediate on-disk format.
-// intentionally open: field-literal constructed at the bin layer
 pub struct DiscoveryServerTls {
     /// PEM-encoded TLS certificate chain for the server.
     pub server_cert_pem: Vec<u8>,
@@ -415,7 +412,6 @@ fn spiffe_client_verifier(
 /// trust-domain prefix — the relay enforces the same peer identity the
 /// controller's `Stream` acceptor does; per-scope binding stays in the
 /// `DiscoveryService`.
-// intentionally open: field-literal constructed at the bin layer
 pub struct RotatingServerTls {
     /// The relay's rotating bootstrapped SVID cell (serving cert source).
     pub svid: SharedSvid,
@@ -518,7 +514,6 @@ fn certified_key_from_pem(
 ///
 /// Fields are PEM-encoded bytes so they can be loaded from files or Kubernetes
 /// Secrets without an intermediate on-disk format.
-// intentionally open: field-literal constructed at the bin layer
 pub struct DiscoveryClientTls {
     /// PEM-encoded mTLS client certificate chain presented to the server.
     pub client_cert_pem: Vec<u8>,
@@ -578,7 +573,6 @@ impl DiscoveryClientTls {
 /// `ServerConfig` that mandates client certs.  Mixing optional-and-mandatory
 /// client auth on one `ServerConfig` is fragile and would weaken the hard-fail
 /// SAN guarantee on the mTLS `Stream` port.
-// intentionally open: field-literal constructed at the bin layer
 pub struct DiscoveryBootstrapServerTls {
     /// PEM-encoded TLS certificate chain for the server (typically a controller SVID).
     pub server_cert_pem: Vec<u8>,
@@ -631,7 +625,6 @@ impl DiscoveryBootstrapServerTls {
 /// the proxy has no SVID yet; that is the whole point of bootstrapping.
 ///
 /// Distinct from [`DiscoveryClientTls`] (which requires a client cert for mTLS).
-// intentionally open: field-literal constructed in bootstrap_client
 pub struct DiscoveryBootstrapClientTls {
     /// PEM-encoded CA bundle from the trust-bundle ConfigMap.
     pub server_ca_pem: Vec<u8>,
@@ -722,7 +715,7 @@ pub(crate) mod tests {
         (cert, key, params)
     }
 
-    fn gen_leaf(spiffe_uri: &str, issuer: &Issuer<KeyPair>) -> (rcgen::Certificate, KeyPair) {
+    fn gen_leaf(spiffe_uri: &str, issuer: &Issuer<'_, KeyPair>) -> (rcgen::Certificate, KeyPair) {
         let uri_san: SanType = SanType::URI(
             spiffe_uri
                 .try_into()

@@ -5,12 +5,6 @@ use regex::Regex;
 use smallvec::SmallVec;
 
 /// How a value is compared in a predicate — used by header and query matchers.
-///
-/// Deliberately closed: matched exhaustively across the crate boundary on the
-/// discovery wire-encode path, so adding a variant is a compiler-enforced change
-/// rather than a silent runtime drop. `#[non_exhaustive]` would force a wildcard
-/// arm there and defeat that.
-// intentionally open: closed enum matched exhaustively cross-crate on the wire-encode path; see doc above.
 #[derive(Clone)]
 pub enum ValueMatch {
     /// Case-sensitive equality comparison.
@@ -32,7 +26,6 @@ impl ValueMatch {
 ///
 /// `name` is the canonical (lowercased) `HeaderName`, enabling O(1) lookup in
 /// `HeaderMap`. The comparison is against the header value string.
-// intentionally open: field-literal constructed in crates/coxswain-reflector/src/gateway_api/filters.rs while translating HTTPRoute matches.
 #[derive(Clone)]
 pub struct HeaderPredicate {
     /// Canonical (lowercased) header name for O(1) `HeaderMap` lookup.
@@ -44,7 +37,6 @@ pub struct HeaderPredicate {
 /// Matches a single query parameter by name and value.
 ///
 /// Query parameter names are case-sensitive per RFC 3986.
-// intentionally open: field-literal constructed in crates/coxswain-reflector/src/gateway_api/filters.rs while translating HTTPRoute matches.
 #[derive(Clone)]
 pub struct QueryPredicate {
     /// Query parameter name (case-sensitive).
@@ -57,7 +49,6 @@ pub struct QueryPredicate {
 ///
 /// Every predicate in this struct must pass for the match to succeed
 /// (AND semantics). Empty fields pass unconditionally.
-// intentionally open: field-literal constructed in crates/coxswain-reflector/src/gateway_api/filters.rs while translating HTTPRoute matches.
 #[derive(Clone, Default)]
 pub struct MatchPredicates {
     /// Required HTTP method, or `None` to match any method.
@@ -95,7 +86,7 @@ impl MatchPredicates {
             let query_str = ctx.query.unwrap_or("");
             // Collect once per call to avoid re-parsing for each predicate.
             // SmallVec avoids heap allocation for the typical case of ≤4 pairs.
-            let pairs: SmallVec<[(std::borrow::Cow<str>, std::borrow::Cow<str>); 4]> =
+            let pairs: SmallVec<[(std::borrow::Cow<'_, str>, std::borrow::Cow<'_, str>); 4]> =
                 form_urlencoded::parse(query_str.as_bytes()).collect();
             for q in &self.query {
                 let found = pairs
@@ -113,7 +104,6 @@ impl MatchPredicates {
 /// Per-request context passed into the hot-path route lookup.
 ///
 /// All fields are borrows from the live request — no allocations.
-// intentionally open: field-literal constructed per-request in crates/coxswain-proxy/src/common/hooks.rs (proxy hot path).
 pub struct RequestContext<'a> {
     /// HTTP method of the incoming request.
     pub method: &'a Method,

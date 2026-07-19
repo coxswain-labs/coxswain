@@ -53,7 +53,6 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// Cheap to clone (every field is an `Arc`-backed handle or a `watch::Receiver`);
 /// [`AdminServer`](crate::AdminServer) holds one instance and each connection
 /// clones the rebuild receiver so consumers never starve one another.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct EventSources {
     /// Generation counter that advances on every successful reconciler rebuild.
@@ -171,7 +170,6 @@ fn pool_str(pool: ProxyPool) -> &'static str {
     match pool {
         ProxyPool::Shared => "shared",
         ProxyPool::Dedicated => "dedicated",
-        _ => "unknown",
     }
 }
 
@@ -419,8 +417,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     /// Build a fake [`Pod`] recognised by [`build_snapshot`] — mirrors the
-    /// aggregator test helper. `#[non_exhaustive]` on `FleetEntry` blocks direct
-    /// struct construction from this crate, so snapshots are built from Pods.
+    /// aggregator test helper.
     fn make_pod(name: &str, component: &str, pod_ip: &str, gateway_name: Option<&str>) -> Pod {
         let mut labels = BTreeMap::new();
         labels.insert(COMPONENT_LABEL.to_string(), component.to_string());

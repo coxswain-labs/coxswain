@@ -32,7 +32,6 @@ pub trait ScopeAuthorizer: Send + Sync {
 /// The fail-closed default until the provenance-backed [`ProvisionedRelayAuthorizer`]
 /// is wired in via [`DiscoveryService::with_scope_authorizer`](crate::DiscoveryService::with_scope_authorizer): without a
 /// provisioned relay there is no legitimate `Namespace` subscriber to allow.
-#[non_exhaustive]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DenyAllNamespaces;
 
@@ -64,7 +63,6 @@ impl ScopeAuthorizer for DenyAllNamespaces {
 /// server's mTLS client-cert verifier); re-checking it here is defense-in-depth,
 /// not the primary control.
 #[derive(Clone)]
-// intentionally open: constructed only via `new`; all fields private
 pub struct ProvisionedRelayAuthorizer {
     /// Namespaces with a controller-provisioned relay, kept live by the operator.
     provisioned: Shared<HashSet<String>>,

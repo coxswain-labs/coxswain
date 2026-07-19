@@ -55,20 +55,25 @@ gateway-api-types   → (none)
 
 ## Code Quality
 
-**Rule additions go to CI first.** If a new project rule can be expressed as a clippy lint, a `scripts/check-*.sh` grep, or a `deny.toml` policy, encode it there and link from this doc. Don't restate CI-enforced rules in prose. Add prose here only when the rule is a behavioural policy that can't be checked mechanically.
+**A rule goes to the weakest mechanism that can actually decide it, and that mechanism must be provably able to fail.** In order: the compiler (a clippy lint or `clippy.toml` entry — it parses Rust, so it has no regex blind spots, and it runs in the authoring loop for free) → a `scripts/check-*.sh` gate *with a `scripts/tests/<gate>/{good,bad}` fixture pair* → a dimension in `.claude/agents/code-review.md` for rules needing judgment → prose here, last resort. Use `/add-rule` to walk the decision.
+
+Two things this project learned the hard way, both non-obvious:
+
+- **A gate with no negative test is not a check.** Four gates here passed unconditionally for their whole life (dead path filters, definition-only matching, a bare-`pub`-only regex) and nothing revealed it, because a broken gate and a working gate both print `OK`. `scripts/tests/run.sh` makes "this gate fires" executable; a rule may only be listed as enforced above once its fixture exists.
+- **`forbid` is unusable here.** It overrules `#[allow]` injected by dependency macros, and `#[tokio::test]` emits `allow(clippy::expect_used)` while clap's `derive(Parser)` emits `allow(clippy::style)`. Use `deny`.
+
+Gates run at authoring time via `scripts/gates.sh`, wired as a `PostToolUse` hook in `.claude/settings.json` — CI alone is too late to shape code as it is written. Don't restate mechanically-enforced rules in prose.
 
 ### Enforced rules
 
 | Rule | Enforced by |
 |---|---|
 | No `.unwrap()` / `.expect()` in non-test code | `unwrap_used = "deny"`, `expect_used = "deny"` (clippy) |
-| Every public type carries `#[non_exhaustive]` or a `// intentionally open:` rationale | `scripts/check-public-types-stability.sh` |
-| `//!` header on every non-test, non-bench `.rs` | `scripts/check-module-headers.sh` |
 | Library crates never use `anyhow` | `scripts/check-no-anyhow-libs.sh` |
 | `[lints] workspace = true` in every `crates/*/Cargo.toml` | `scripts/check-workspace-lints-decl.sh` |
 | No per-site `#[allow]` / `#[expect]` in non-test source | `scripts/check-no-per-site-allow.sh` |
-| Builder `with_*` methods + `is_/has_/can_` predicates carry `#[must_use]` | `scripts/check-must-use-builders.sh` |
-| Crate-public `pub fn … -> Result` carry `#[must_use = "…"]` (message form; bare trips `double_must_use`) | `scripts/check-must-use-results.sh` |
+| Builder methods returning `Self` carry `#[must_use]` | `clippy::return_self_not_must_use` |
+| An unused `Result` is an error | `unused_must_use` (std — `Result` is already `#[must_use]`; annotating the fn is redundant) |
 | No unused crate dependencies | `cargo-machete` (CI step) |
 | Gateway API SupportedFeatures Rust↔Go parity | `scripts/check-supported-features.sh` |
 | No bare sleeps in e2e test bodies; waits poll a real post-condition | `scripts/check-no-e2e-sleeps.sh` |
@@ -85,6 +90,7 @@ gateway-api-types   → (none)
 | No `panic!`/`unreachable!`/`todo!` in a `_ =>`/bound catch-all arm in the data-plane crates (`coxswain-proxy`, `coxswain-discovery`); degrade instead | `scripts/check-no-wildcard-panic.sh` |
 | Shipped CRD manifests (coxswain's own + the pinned upstream Gateway API CRDs) pass `kubeconform -strict` | `scripts/check-crd-kubeconform.sh` |
 | `cargo doc` is warning-free (no broken or private intra-doc links) | `.github/workflows/ci.yml` `doc` job (`RUSTDOCFLAGS=-D warnings`) |
+| Every `scripts/check-*.sh` gate rejects a known-bad fixture and accepts a known-good one | `scripts/tests/run.sh` (CI job `gate-self-tests`) |
 
 `[workspace.lints]` in `Cargo.toml` is the source of truth for lint configuration. Workspace-wide opt-outs in `[workspace.lints]` are acceptable when an entire lint *group* is too broad for the project (current: `clippy::pedantic = "allow"`). For upstream-imposed names that trip a lint (e.g. `HTTPRoute` from codegen tripping `upper_case_acronyms`): re-export with a project-canonical alias at the crate boundary (`gw_types.rs`) and use the alias everywhere internally — a one-time fix; per-site annotations lock the inconsistency in forever.
 
@@ -98,7 +104,9 @@ gateway-api-types   → (none)
 
 - **Visibility.** Default to `pub(crate)` for items reachable within the workspace; `pub(super)` for items only crossing one module boundary; bare `pub` only for items re-exported at the crate root for cross-crate consumption.
 
-- **Error types.** Every crate-defined error type uses `#[derive(thiserror::Error)]` with `#[error("…")]` on each variant, and `#[non_exhaustive]`. Library crates emit typed errors via `thiserror`; only `coxswain-bin` may use `anyhow` at the binary boundary.
+- **Error types.** Every crate-defined error type uses `#[derive(thiserror::Error)]` with `#[error("…")]` on each variant. Library crates emit typed errors via `thiserror`; only `coxswain-bin` may use `anyhow` at the binary boundary.
+
+- **No `#[non_exhaustive]`.** Nothing outside this workspace consumes these crates, so it buys no semver headroom — and it costs exhaustiveness checking, which is the point of matching on an enum at all. It forces a `_ =>` arm in every cross-crate `match`, so adding a `coxswain-core` variant silently falls through at runtime instead of failing the build at each site that must handle it. That convention manufactured 17 dead wildcard arms and a whole issue's worth of crash-site cleanup. Add a variant and let the compiler enumerate the work.
 
 - **Full e2e coverage.** Every user-visible feature ships with e2e for **both the happy path and the sad/error path** — a merge without both is incomplete, not a follow-up. When a feature applies to more than one route type (e.g. a protocol-agnostic `ExtensionRef` filter or `CoxswainBackendPolicy` behaviour that works on `HTTPRoute` **and** `GRPCRoute`), **each supported route type gets its own happy + sad e2e** — HTTPRoute coverage does not substitute for GRPCRoute coverage even when the enforcement code is shared, because the reconcile wiring and status/acceptance path differ per route type. If a route type is *deliberately* excluded (e.g. `PathRewriteRegex` is nonsensical for gRPC), state why in the feature's docs and the reconciler skips it. `IpAccessControl` / `RateLimit` (#479, #25) are the reference: HTTP allow/deny/precedence tests **and** gRPC allow/deny + rate-limit tests. Unit tests and shared-code reuse do **not** discharge this — they complement it.
 

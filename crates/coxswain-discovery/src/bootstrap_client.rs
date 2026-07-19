@@ -39,7 +39,6 @@ use crate::version::WIRE_VERSION;
 // ── BootstrapClientConfig ─────────────────────────────────────────────────────
 
 /// Configuration for the proxy-side bootstrap loop.
-// intentionally open: field-literal constructed by coxswain-bin
 pub struct BootstrapClientConfig {
     /// Endpoint for the bootstrap gRPC service (server-auth-only TLS).
     ///
@@ -101,7 +100,6 @@ impl BootstrapClientConfig {
 // ── BootstrapClientHandle ─────────────────────────────────────────────────────
 
 /// Handle returned by [`BootstrapClient::spawn`].
-#[non_exhaustive]
 pub struct BootstrapClientHandle {
     /// The latest SVID, or `None` until the first successful bootstrap.
     pub svid: SharedSvid,
@@ -126,7 +124,6 @@ pub struct BootstrapClientHandle {
 /// Drive it by awaiting [`BootstrapRunner::run`] — typically from a Pingora
 /// background service so it runs on a Pingora runtime. `run` never returns under
 /// normal operation (it loops across SVID refreshes for the process lifetime).
-#[non_exhaustive]
 pub struct BootstrapRunner {
     config: BootstrapClientConfig,
     svid_cell: SharedSvid,
@@ -166,7 +163,6 @@ struct BootstrapLoop {
 
 /// Proxy-side bootstrap loop. Zero-sized namespace for the `build`/`spawn`
 /// constructors; never instantiated as a value.
-#[non_exhaustive]
 pub struct BootstrapClient;
 
 impl BootstrapClient {

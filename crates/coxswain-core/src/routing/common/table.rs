@@ -17,7 +17,6 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 /// Errors that can occur while building a routing table.
-#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum RouterError {
     /// A path pattern could not be inserted into the `matchit` router.
@@ -29,7 +28,6 @@ pub enum RouterError {
 }
 
 /// Result of a two-level host+path routing lookup.
-#[non_exhaustive]
 pub enum RouteOutcome {
     /// Route matched; the [`RouteMatch`] carries the backend group, filters,
     /// timeouts, path pattern, metric route id, max body size, and source-IP
@@ -49,7 +47,6 @@ pub enum RouteOutcome {
 /// Generic over a phantom `Kind` marker so the type-checker treats
 /// `RoutingTable<Ingress>` and `RoutingTable<Gateway>` as incompatible — a
 /// proxy that expects one will not accidentally accept the other.
-#[non_exhaustive]
 pub struct RoutingTable<Kind> {
     pub(crate) by_port: HashMap<u16, PortRoutingTable>,
     /// Rules dropped due to un-insertable matchit patterns, across all ports.
@@ -168,7 +165,6 @@ impl<Kind> RoutingTable<Kind> {
 ///
 /// Use [`for_port`](Self::for_port) to obtain a [`PortTableBuilder`] for a
 /// specific port, then call its host-level methods to register routes.
-#[non_exhaustive]
 pub struct RoutingTableBuilder<Kind> {
     by_port: HashMap<u16, PortTableBuilder>,
     /// Conflicts carried over from a partitioned rebuild's reused (cached)

@@ -45,7 +45,6 @@ pub(super) struct BackendStores<'a> {
 /// both mean "this ref was a hit" — whether that stops the scan (first-match-wins) is
 /// each wrapper's choice (all stop except `resolve_basic_auth`, which preserves its
 /// historical keep-scanning-on-missing-CR behaviour).
-#[non_exhaustive]
 pub(super) enum RefResolution<T> {
     /// The ref does not target this resolver's kind — keep scanning.
     NotMine,
@@ -1637,8 +1636,6 @@ mod tests {
         }
     }
 
-    // `IpAccessControlSpec` is `#[non_exhaustive]`, so it cannot be built with a
-    // struct literal from this crate — deserialize a CR instead.
     fn ip_access_cr(ns: &str, name: &str, allow: &[&str], deny: &[&str]) -> IpAccessControl {
         let list = |items: &[&str]| -> String {
             if items.is_empty() {
@@ -1743,7 +1740,6 @@ mod tests {
         }
     }
 
-    // `BasicAuthSpec` is `#[non_exhaustive]` — deserialize a CR instead.
     fn basic_auth_cr(ns: &str, name: &str, secret_ns: &str, secret_name: &str) -> BasicAuth {
         let yaml = format!(
             "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\
@@ -2069,7 +2065,6 @@ mod tests {
         }
     }
 
-    // `RetryPolicySpec` is `#[non_exhaustive]` — deserialize a CR instead.
     fn retry_cr(ns: &str, name: &str, spec_body: &str) -> RetryPolicy {
         let indented = spec_body.replace('\n', "\n  ");
         let yaml = format!(
@@ -2166,7 +2161,6 @@ mod tests {
         }
     }
 
-    // `JwtAuthSpec` is `#[non_exhaustive]` — deserialize a CR instead.
     fn jwt_auth_cr(ns: &str, name: &str) -> coxswain_core::crd::JwtAuth {
         let yaml = format!(
             "apiVersion: gateway.coxswain-labs.dev/v1alpha1\n\

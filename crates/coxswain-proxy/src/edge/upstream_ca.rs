@@ -74,7 +74,6 @@ pub(crate) struct UpstreamSanMismatch;
 /// allocating a fresh `Arc<closure>` each time would hit the hot path.  This
 /// cache ensures the `Arc` is built at most once per distinct SAN policy
 /// (`group_key`).  Reads take only a `DashMap` shard lock, never across `.await`.
-#[non_exhaustive]
 #[derive(Default)]
 pub struct SanCheckHookCache {
     inner: GroupKeyCache<HandshakeCompleteHook>,
@@ -152,7 +151,6 @@ impl SanCheckHookCache {
 ///
 /// Entries accumulate until process restart; the number of distinct CA bundles is
 /// bounded by the number of `BackendTLSPolicy` resources, which is small in practice.
-#[non_exhaustive]
 #[derive(Default)]
 pub struct UpstreamCaCache {
     inner: GroupKeyCache<Arc<CaType>>,
@@ -188,7 +186,6 @@ impl UpstreamCaCache {
 /// the number of distinct gateway client certs is bounded in practice.
 ///
 /// Reads take only a `DashMap` shard lock, never across `.await` — `upstream_peer` is synchronous.
-#[non_exhaustive]
 #[derive(Default)]
 pub struct BackendClientCertCache {
     inner: GroupKeyCache<Arc<CertKey>>,

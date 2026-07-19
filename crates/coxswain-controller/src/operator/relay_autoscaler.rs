@@ -494,8 +494,8 @@ mod tests {
         RelayTuning::resolve(&EffectiveRelayPolicy::default(), defaults())
     }
 
-    /// Build a `RelayAutoscaling` via serde — the type is `#[non_exhaustive]`, so a
-    /// struct literal is illegal outside `coxswain-core`.
+    /// Build a `RelayAutoscaling` via serde, exercising the CRD's own
+    /// deserialization path.
     fn autoscaling(spec: serde_json::Value) -> RelayAutoscaling {
         serde_json::from_value(spec).expect("valid RelayAutoscaling")
     }

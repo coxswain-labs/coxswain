@@ -12,7 +12,6 @@ use crate::shared::Shared;
 /// Phantom marker identifying Ingress-flavored routing tables.
 ///
 /// Uninhabited; only ever appears as a type parameter, never as a value.
-#[non_exhaustive]
 pub enum Ingress {}
 
 /// Compiled routing table built from `Ingress` resources.

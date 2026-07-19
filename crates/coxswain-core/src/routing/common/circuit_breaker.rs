@@ -28,7 +28,6 @@ use std::time::Duration;
 /// have been observed in the window.
 ///
 /// [`ResolvedRoute`]: https://docs.rs/coxswain-proxy/latest/coxswain_proxy/ctx/struct.ResolvedRoute.html
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CircuitBreakerConfig {
     /// Error rate (%) that trips the breaker (1–100).

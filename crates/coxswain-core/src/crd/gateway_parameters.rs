@@ -32,7 +32,6 @@ use super::preserve_unknown_fields_schema;
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 #[derive(Default)]
 pub struct CoxswainGatewayParametersSpec {
     /// Desired replica count for the provisioned proxy Deployment. When
@@ -99,7 +98,6 @@ pub struct CoxswainGatewayParametersSpec {
 /// provisioned.
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct AutoscalingParams {
     /// When `true`, the controller provisions an HPA for the dedicated proxy
     /// Deployment. Must be set explicitly; the `Default` is `false`.
@@ -129,7 +127,6 @@ pub struct AutoscalingParams {
 
 /// Service type for the provisioned proxy Service.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
-#[non_exhaustive]
 pub enum ServiceType {
     /// Provision a cloud LoadBalancer (default).
     #[default]

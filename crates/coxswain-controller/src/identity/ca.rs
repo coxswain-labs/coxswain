@@ -32,7 +32,6 @@ use coxswain_core::identity::{CsrPem, IssuedSvid, IssuerError, SpiffeId, SvidIss
 
 /// Error produced by [`CertAuthority`] operations.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum CaError {
     /// The PEM bytes are not a valid certificate or key.
     #[error("invalid PEM: {0}")]
@@ -51,7 +50,6 @@ pub enum CaError {
 ///
 /// Used to configure the discovery and bootstrap listeners with a valid SPIFFE
 /// server certificate signed by the controller's own CA.
-// intentionally open: field-literal used in bin wiring
 pub struct IssuedServerSvid {
     /// PEM-encoded server certificate.
     pub cert_pem: Vec<u8>,
@@ -81,7 +79,6 @@ struct CaInner {
 /// trust-bundle reads are a single atomic pointer load.  A background task
 /// (driven by [`super::store`]) calls `reload()` when the CA
 /// Secret changes; running streams see the new CA on their next sign call.
-#[non_exhaustive]
 pub struct CertAuthority {
     inner: Shared<CaInner>,
 }
@@ -238,7 +235,7 @@ fn load_inner(cert_pem: &[u8], key_pem: &[u8], svid_ttl: Duration) -> Result<CaI
 
 /// Sign a leaf certificate for self-issuance of server SVIDs.
 fn sign_leaf(
-    issuer: &Issuer<KeyPair>,
+    issuer: &Issuer<'_, KeyPair>,
     key: &KeyPair,
     id: &SpiffeId,
     ttl: Duration,

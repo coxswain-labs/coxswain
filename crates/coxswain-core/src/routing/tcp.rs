@@ -21,7 +21,6 @@ pub type SharedTcpRouteTable = Shared<TcpRouteTable>;
 /// Built once per reconcile cycle and published via [`SharedTcpRouteTable`].
 /// The proxy loads it with a single atomic pointer read on each accepted TCP
 /// connection — no SNI peek is required before the lookup.
-#[non_exhaustive]
 #[derive(Default, Debug)]
 pub struct TcpRouteTable {
     by_port: HashMap<u16, Arc<BackendGroup>>,
@@ -50,7 +49,6 @@ impl TcpRouteTable {
 ///
 /// Typical usage: create one builder per reconcile cycle, call
 /// [`Self::add_route`] for every bound `TCPRoute`, then call [`Self::build`].
-#[non_exhaustive]
 #[derive(Default, Debug)]
 pub struct TcpRouteTableBuilder {
     by_port: HashMap<u16, Arc<BackendGroup>>,

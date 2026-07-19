@@ -42,7 +42,6 @@ use serde::{Deserialize, Serialize};
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct BasicAuthSpec {
     /// Reference to the htpasswd `Secret` carrying credentials.
     pub secret_ref: BasicAuthSecretRef,
@@ -57,7 +56,6 @@ pub struct BasicAuthSpec {
 /// surfaces.
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct BasicAuthSecretRef {
     /// Secret name.
     pub name: String,

@@ -46,7 +46,6 @@ pub const DEFAULT_GRPC_RETRY_CODES: [u16; 1] = [14];
 /// policy with `attempts == 0` never retries. Note that an empty `http_codes` /
 /// `grpc_codes` no longer disables retries — connection and connect-timeout
 /// failures are still retried whenever `attempts >= 1`.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetryPolicyConfig {
     /// Maximum number of retries after the initial attempt (GEP-1731 `attempts`).

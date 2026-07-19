@@ -23,7 +23,6 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       parity: ${{ steps.filter.outputs.parity }}
-      stability: ${{ steps.filter.outputs.stability }}
       crd_manifests: ${{ steps.filter.outputs.crd_manifests }}
       anti_drift: ${{ steps.filter.outputs.anti_drift }}
     steps:
@@ -50,10 +49,6 @@ jobs:
               - 'conformance/main_test.go'
               - 'scripts/check-supported-features.sh'
               - '.github/workflows/ci.yml'
-            stability:
-              - 'crates/**/src/**'
-              - 'scripts/check-public-types-stability.sh'
-              - '.github/workflows/ci.yml'
             crd_manifests:
               - 'deploy/manifests/crds/**'
               - 'charts/coxswain/crds/**'
@@ -63,13 +58,10 @@ jobs:
             anti_drift:
               - 'crates/**'
               - 'Cargo.toml'
-              - 'scripts/check-module-headers.sh'
               - 'scripts/check-no-anyhow-libs.sh'
               - 'scripts/check-reflector-health-checks.sh'
               - 'scripts/check-workspace-lints-decl.sh'
               - 'scripts/check-no-per-site-allow.sh'
-              - 'scripts/check-must-use-builders.sh'
-              - 'scripts/check-must-use-results.sh'
               - 'scripts/check-bounded-regex.sh'
               - 'scripts/check-no-peek-readable.sh'
               - 'scripts/check-no-wildcard-panic.sh'
@@ -196,15 +188,17 @@ jobs:
       - name: Check Rust SUPPORTED_FEATURES matches Go opts.SupportedFeatures
         run: bash scripts/check-supported-features.sh
 
-  public-types-stability:
-    name: public-types-stability
-    needs: changes
-    if: needs.changes.outputs.stability == 'true'
+
+  # Deliberately unfiltered: a gate that stops firing is invisible on the real
+  # tree (it just reports OK), so these run on every change rather than only
+  # when scripts/ is touched.
+  gate-self-tests:
+    name: gate-self-tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Check every public type carries #[non_exhaustive] or an open rationale
-        run: bash scripts/check-public-types-stability.sh
+      - name: Every gate accepts its good/ fixture and rejects its bad/ fixture
+        run: bash scripts/tests/run.sh
 
   crd-kubeconform:
     name: crd-kubeconform
@@ -223,8 +217,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: Module headers (every non-test .rs opens with //!)
-        run: bash scripts/check-module-headers.sh
       - name: No anyhow in library crates
         run: bash scripts/check-no-anyhow-libs.sh
       - name: Reflector readiness checks are registered on the controller subsystem
@@ -233,10 +225,6 @@ jobs:
         run: bash scripts/check-workspace-lints-decl.sh
       - name: No per-site #[allow] / #[expect] in non-test source
         run: bash scripts/check-no-per-site-allow.sh
-      - name: Builders / predicates carry #[must_use]
-        run: bash scripts/check-must-use-builders.sh
-      - name: Result-returning pub fns carry #[must_use]
-        run: bash scripts/check-must-use-results.sh
       - name: Tenant-supplied regexes compile via compile_bounded (bounded size)
         run: bash scripts/check-bounded-regex.sh
       - name: MSG_PEEK retry loops wait via PeekBackoff, never readable()

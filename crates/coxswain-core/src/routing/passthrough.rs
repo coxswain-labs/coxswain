@@ -25,7 +25,6 @@ pub type SharedTlsPassthroughTable = Shared<TlsPassthroughTable>;
 ///
 /// Built once per reconcile cycle and published via [`SharedTlsPassthroughTable`].
 /// The proxy loads it with a single atomic pointer read on each accepted TCP connection.
-#[non_exhaustive]
 #[derive(Default, Debug)]
 pub struct TlsPassthroughTable {
     by_port: HashMap<u16, SniRouter>,
@@ -53,7 +52,6 @@ impl TlsPassthroughTable {
 /// Per-port SNI matcher for TLS passthrough.
 ///
 /// Lookup order: exact → wildcard (multi-label, sorted longest-suffix-first) → catch-all.
-#[non_exhaustive]
 #[derive(Debug)]
 pub struct SniRouter {
     exact: HashMap<Arc<str>, Arc<BackendGroup>>,
@@ -118,7 +116,6 @@ impl SniRouter {
 ///
 /// Typical usage: create one builder per reconcile cycle, call [`Self::add_route`]
 /// for every `TLSRoute` rule, then call [`Self::build`].
-#[non_exhaustive]
 #[derive(Default, Debug)]
 pub struct TlsPassthroughTableBuilder {
     by_port: HashMap<u16, SniRouterBuilder>,

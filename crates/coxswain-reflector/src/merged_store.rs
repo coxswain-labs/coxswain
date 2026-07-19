@@ -28,7 +28,6 @@ use std::sync::Arc;
 /// cluster-scoped store, or [`MergedStore::new`] with one `(namespace, store)`
 /// pair per watched namespace. Namespaces are disjoint by object key, so the
 /// merge needs no de-duplication.
-#[non_exhaustive]
 pub struct MergedStore<K>
 where
     K: Lookup + 'static,

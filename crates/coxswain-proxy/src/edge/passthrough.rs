@@ -49,7 +49,6 @@ pub(crate) enum SniPeek {
 }
 
 /// Error variants for [`client_hello_sni`].
-#[non_exhaustive]
 #[derive(Debug, Error)]
 pub(crate) enum SniParseError {
     /// The record is not a TLS handshake / ClientHello.
@@ -86,7 +85,7 @@ pub(crate) fn client_hello_sni(buf: &[u8]) -> Result<SniPeek, SniParseError> {
         Some(_) => {}
     }
 
-    let record: TlsPlaintext = match parse_tls_plaintext(buf) {
+    let record: TlsPlaintext<'_> = match parse_tls_plaintext(buf) {
         Ok((_, r)) => r,
         Err(NomErr::Incomplete(_)) => return Ok(SniPeek::Incomplete),
         Err(_) => return Err(SniParseError::NotClientHello),

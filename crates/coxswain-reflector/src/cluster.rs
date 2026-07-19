@@ -35,7 +35,6 @@ const DEDICATED_PROXY_READY: &str = "gateway.coxswain-labs.dev/DedicatedProxyRea
 /// `clippy::too_many_arguments` threshold and to let unit tests construct
 /// fixtures in one place. Borrowed from the reconciler's already-materialised
 /// rebuild state — no kube API calls.
-#[non_exhaustive]
 pub struct ClusterSummaryInputs<'a> {
     /// Snapshot of all Gateways in scope (from `Store<Gateway>::state()`).
     pub gateways: &'a [Arc<Gateway>],
@@ -512,15 +511,18 @@ mod tests {
 
     fn listener_health_with_routes(routes: i32) -> GatewayListenerStatus {
         let mut listeners = BTreeMap::new();
-        let mut li = ListenerInfo::default();
-        li.attached_routes = routes;
-        li.hostname = String::new();
-        li.route_namespaces = crate::status::RouteNamespaceSet::All;
-        li.port = 80;
+        let li = ListenerInfo {
+            attached_routes: routes,
+            hostname: String::new(),
+            route_namespaces: crate::status::RouteNamespaceSet::All,
+            port: 80,
+            ..Default::default()
+        };
         listeners.insert(ListenerStatusKey::gateway("default"), li);
-        let mut glh = GatewayListenerStatus::default();
-        glh.listeners = listeners;
-        glh
+        GatewayListenerStatus {
+            listeners,
+            ..Default::default()
+        }
     }
 
     fn ingress(
@@ -924,15 +926,18 @@ mod tests {
     use coxswain_core::cluster::Severity;
 
     fn listener(name: &str, outcome: ListenerReadiness) -> (ListenerStatusKey, ListenerInfo) {
-        let mut li = ListenerInfo::default();
-        li.readiness = outcome;
+        let li = ListenerInfo {
+            readiness: outcome,
+            ..Default::default()
+        };
         (ListenerStatusKey::gateway(name), li)
     }
 
     fn health_with(listeners: Vec<(ListenerStatusKey, ListenerInfo)>) -> GatewayListenerStatus {
-        let mut glh = GatewayListenerStatus::default();
-        glh.listeners = listeners.into_iter().collect();
-        glh
+        GatewayListenerStatus {
+            listeners: listeners.into_iter().collect(),
+            ..Default::default()
+        }
     }
 
     #[test]

@@ -4,10 +4,8 @@ use thiserror::Error;
 
 /// Errors raised by the discovery server, client, and wire codec.
 ///
-/// Covers the client, server, and mTLS paths. The type is `#[non_exhaustive]` so
-/// new variants are not breaking changes for downstream crates.
+/// Covers the client, server, and mTLS paths.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum DiscoveryError {
     /// The peer advertised a wire-protocol version this build cannot speak.
     ///
@@ -63,7 +61,6 @@ pub enum DiscoveryError {
 /// the TLS acceptor or channel; runtime handshake rejections are signalled via
 /// [`rustls::Error`] directly through the TLS stack.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum AuthError {
     /// PEM-encoded certificate or key material could not be parsed.
     #[error("invalid PEM: {0}")]
@@ -92,7 +89,6 @@ pub enum AuthError {
 /// `from_wire` is given untrusted bytes (coming over the gRPC stream) and must
 /// validate every field; these variants cover the recoverable failure modes.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum WireError {
     /// A regex pattern string could not be compiled.
     #[error("invalid regex: {0}")]

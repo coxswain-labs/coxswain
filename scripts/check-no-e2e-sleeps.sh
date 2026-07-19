@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Enforce e2e rubric #4 ("poll the real post-condition, never sleep"): no bare
+# Enforce the e2e charter's "poll the real post-condition, never sleep" rule: no bare
 # sleep CALL in the e2e test bodies under `crates/coxswain-e2e/tests/`. A fixed
 # wait races with the cluster — every blind wait must route through
 # `wait::poll_until`, which polls a real post-condition with a generous deadline.
@@ -27,7 +27,7 @@ if [ -n "$offenders" ]; then
   echo "FAIL: $count bare sleep call(s) in e2e test bodies:" >&2
   printf '%s\n' "$offenders" | sed 's/^/  /' >&2
   echo "" >&2
-  echo "Per e2e rubric #4, replace the fixed wait with a real post-condition:" >&2
+  echo "Per the e2e charter, replace the fixed wait with a real post-condition:" >&2
   echo "route the wait through 'wait::poll_until' (or a wait_for_* wrapper)." >&2
   exit 1
 fi

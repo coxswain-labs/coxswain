@@ -70,7 +70,7 @@ async fn ingress_path_match_routes_to_backend() -> anyhow::Result<()> {
 
 /// Deleting the Ingress object stops the data plane serving its route: apply →
 /// serves echo-a → delete the Ingress → the path 404s. Asserts the teardown
-/// negative (rubric #5) that the Ingress API otherwise lacks — withdrawal of a
+/// negative that the Ingress API otherwise lacks — withdrawal of a
 /// route object, not just a backend, must take the route out of the table.
 #[tokio::test]
 async fn ingress_deleted_route_stops_serving() -> anyhow::Result<()> {

@@ -129,7 +129,6 @@ const SETTLED_NEGATIVE_REQUEUE: Duration = Duration::from_secs(15);
 /// (a `.load()` snapshot per reconcile) and subscribe to (to re-drive the
 /// affected work-queue when a TLS-resolution / route-health / policy-health
 /// outcome flips).
-// intentionally open: field-literal constructed in crate::spawn_status_writer.
 pub struct StatusChannels {
     /// Per-listener Gateway TLS health.
     pub tls: GatewayListenerStatusHandle,
@@ -165,7 +164,6 @@ pub struct StatusChannels {
 /// Leader-elected status writer. Registered as a Pingora `BackgroundService`
 /// next to the reflector (whose shared informers it consumes) in
 /// `serve controller`.
-#[non_exhaustive]
 pub struct Controller {
     health: HealthRegistry,
     leader: Arc<AtomicBool>,
@@ -914,11 +912,6 @@ async fn dispatch(
                 None => StatusOutcome::AwaitChange,
             }
         }
-        // `StatusKind` is `#[non_exhaustive]`: a kind added upstream but not yet
-        // wired here simply isn't reconciled until this match is extended — a
-        // degrade, never a panic (the control plane must not crash on a new
-        // variant). See memory `non_exhaustive_wildcard_panic`.
-        _ => StatusOutcome::AwaitChange,
     }
 }
 
@@ -2249,16 +2242,20 @@ mod tests {
             GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerStatusKey,
         };
         let mut health = GatewayListenerStatus::default();
-        let mut invalid = ListenerInfo::default();
-        invalid.readiness = ListenerReadiness::InvalidCertificateRef {
-            message: "bad pem".to_string(),
+        let invalid = ListenerInfo {
+            readiness: ListenerReadiness::InvalidCertificateRef {
+                message: "bad pem".to_string(),
+            },
+            internal_port: 30001,
+            ..Default::default()
         };
-        invalid.internal_port = 30001;
         health
             .listeners
             .insert(ListenerStatusKey::gateway("bad"), invalid);
-        let mut valid = ListenerInfo::default();
-        valid.internal_port = 30002;
+        let valid = ListenerInfo {
+            internal_port: 30002,
+            ..Default::default()
+        };
         health
             .listeners
             .insert(ListenerStatusKey::gateway("good"), valid);

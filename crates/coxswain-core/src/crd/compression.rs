@@ -41,7 +41,6 @@ use serde::{Deserialize, Serialize};
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct CompressionSpec {
     /// Compress responses with gzip when the client advertises `gzip` in
     /// `Accept-Encoding`. Defaults to `false`.

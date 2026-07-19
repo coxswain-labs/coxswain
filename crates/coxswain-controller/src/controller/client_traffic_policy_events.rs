@@ -65,9 +65,7 @@ pub(super) async fn patch_client_traffic_policy_status(
 /// Build the `status.ancestors[]` JSON list for a policy.
 ///
 /// Filters to `targetRefs` that point at `gateway.networking.k8s.io/Gateway`
-/// only; other kinds are not ours to write. Uses raw `serde_json::Value` to
-/// avoid struct-literal construction of `#[non_exhaustive]` types across crate
-/// boundaries.
+/// only; other kinds are not ours to write.
 fn build_ancestors(
     health: &ClientTrafficPolicyStatus,
     policy: &ClientTrafficPolicy,

@@ -26,13 +26,9 @@ use tokio::sync::watch;
 /// rather than name alone. The source also lets the controller attribute each
 /// per-listener status back to the resource that declared it.
 ///
-/// This is deliberately a closed two-variant enum: it is constructed via literal
-/// by the reflector merge and the controller status writer and matched
-/// exhaustively in both, so a third origin would be a deliberate, breaking model
-/// change — never a silently-added variant. Hence the `// intentionally open:`
-/// opt-out below rather than `#[non_exhaustive]` (which would force wildcard arms
-/// and defeat the cross-crate exhaustiveness this relies on).
-// intentionally open: closed enum matched exhaustively cross-crate; see doc above.
+/// A third origin would be a deliberate, breaking model change: this enum is
+/// constructed via literal by the reflector merge and the controller status
+/// writer and matched exhaustively in both.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ListenerSource {
     /// Declared in the parent Gateway's own `spec.listeners`.
@@ -48,7 +44,6 @@ pub enum ListenerSource {
 /// (Gateway before ListenerSet, then by [`ObjectKey`], then by name) only fixes a
 /// deterministic map/wire iteration order — it is **not** the GEP-1713 merge
 /// precedence (creationTimestamp-first), which is computed explicitly in the merge.
-// intentionally open: constructed via field literal at every producer/lookup site; no invariant to enforce.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ListenerStatusKey {
     /// The resource that declared this listener.
@@ -85,7 +80,6 @@ impl ListenerStatusKey {
 /// remaining variants record the TLS/certificate states that are the only way a
 /// listener fails readiness today. [`Self::is_healthy`] gates the per-listener
 /// `Programmed` condition for every listener, HTTP included.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub enum ListenerReadiness {
     /// Non-HTTPS listener (or otherwise nothing to resolve) — ready by default.
@@ -341,7 +335,6 @@ pub fn is_supported_listener_protocol(protocol: &str) -> bool {
 /// `perPort[listener.port]` override if present, else the gateway-wide `default`.
 /// Each variant drives the listener's `ResolvedRefs`/`Accepted`/`Programmed`
 /// status conditions to the exact reasons the GEP-91 conformance suite asserts.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub enum FrontendValidationOutcome {
     /// Non-HTTPS listener, or no frontend validation applies to it.
@@ -412,9 +405,7 @@ impl FrontendValidationOutcome {
 /// Used as a single field replacing the former `(conflicted: bool, protocol_conflict:
 /// bool)` pair so the three-way state is expressed as a closed enum rather than two
 /// independent booleans. The enum is matched exhaustively cross-crate; a future variant
-/// would be a deliberate, breaking model change (hence the opt-out below rather than
-/// `#[non_exhaustive]`).
-// intentionally open: closed enum matched exhaustively cross-crate; adding a variant is a model change.
+/// would be a deliberate, breaking model change.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ConflictReason {
     /// No conflict — listener is programmed normally (the common case / proto zero-value).
@@ -478,7 +469,6 @@ impl ConflictReason {
 /// routing table and never matches namespaces, so the wire collapses this to a
 /// single "all" bit (`Only(_)` → not-all). The reflector always holds the full set
 /// in-process — it never reconstructs this from the wire.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RouteNamespaceSet {
     /// `from: All` — routes from any namespace attach.
@@ -520,7 +510,6 @@ impl RouteNamespaceSet {
 /// or from the `--ingress-accept-proxy-protocol` flag (Ingress-origin listeners).
 /// Consumed by the acceptor in `coxswain-proxy` to decide whether to parse and
 /// strip a PROXY v1/v2 header before dispatching each connection.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ProxyProtocolListenerConfig {
     /// When `true`, every accepted connection must carry a valid PROXY v1/v2 header.
@@ -553,7 +542,6 @@ impl ProxyProtocolListenerConfig {
 }
 
 /// Consolidated per-listener metadata for one Gateway listener.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct ListenerInfo {
     /// Readiness outcome for this listener — gates its `Programmed` condition.
@@ -649,7 +637,6 @@ impl ListenerInfo {
 /// Produced during each reconciler rebuild and consumed by the controller's
 /// status writer to emit the `InsecureFrontendValidationMode` condition.
 /// `None` on a [`GatewayListenerStatus`] means no frontend validation is configured.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct FrontendValidationStatus {
     /// `true` when the effective mode is `AllowInsecureFallback`.
@@ -677,7 +664,6 @@ pub struct FrontendValidationStatus {
 /// to the spec's `InvalidClientCertificateRef`; a denied cross-namespace ref maps to
 /// `RefNotPermitted`. `None` on a [`GatewayListenerStatus`] means the ref is absent and
 /// no `ResolvedRefs` condition is emitted.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum BackendClientCertOutcome {
     /// The ref is absent — no condition. (Default so the enum has a sensible zero.)
@@ -739,7 +725,6 @@ impl BackendClientCertOutcome {
 }
 
 /// Per-listener status for one Gateway, keyed by [`ListenerStatusKey`] (source + name).
-#[non_exhaustive]
 #[derive(Clone, Debug, Default)]
 pub struct GatewayListenerStatus {
     /// The Gateway's effective listeners (its own plus those merged from attached
@@ -779,7 +764,6 @@ struct GatewayListenerStatusInner {
 /// `changed()` call, which compares the receiver's last-seen generation to the
 /// sender's current one) and supports any number of consumers without starving —
 /// both requirements that `tokio::sync::Notify` cannot meet simultaneously.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct GatewayListenerStatusHandle(Arc<GatewayListenerStatusInner>);
 

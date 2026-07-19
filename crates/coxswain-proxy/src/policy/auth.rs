@@ -150,14 +150,6 @@ async fn enforce_ext_authz(
             )
             .await
         }
-        // `ExtAuthTransport` is #[non_exhaustive]: a transport not yet wired on the
-        // data plane must fail closed (503), never open. Reachable the moment a new
-        // variant is added — degrade, don't panic.
-        _ => {
-            tracing::warn!("unsupported ext_authz transport — refusing request (503)");
-            write_simple(session, 503).await?;
-            Ok(true)
-        }
     }
 }
 
@@ -494,7 +486,6 @@ async fn challenge_401_bearer(session: &mut Session) -> Result<bool> {
 /// live `JwtAuth` CRs (operator-authored config), not by request volume —
 /// unlike the gRPC ext_authz channel cache, which is bounded by resolved pod
 /// `SocketAddr`s and can grow with pod churn.
-#[non_exhaustive]
 #[derive(Clone, Default)]
 pub struct JwksKeyCache {
     parsed: Arc<dashmap::DashMap<Arc<str>, Arc<jsonwebtoken::jwk::JwkSet>>>,

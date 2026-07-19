@@ -47,7 +47,6 @@ use serde::{Deserialize, Serialize};
     status = "CoxswainBackendPolicyStatus"
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct CoxswainBackendPolicySpec {
     /// Services this policy targets.
     ///
@@ -92,7 +91,6 @@ pub struct CoxswainBackendPolicySpec {
 /// the generated types, so we control the schema. Section-name (per-port)
 /// targeting is intentionally omitted for #354 — a policy applies to the whole
 /// Service.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendPolicyTargetRef {
@@ -111,7 +109,6 @@ pub struct BackendPolicyTargetRef {
 /// `"1m"`). They are intentionally **not** schema-pattern-validated: an
 /// unparseable value reaches the reflector, which WARNs and falls back to the
 /// default connection behaviour rather than the apiserver rejecting the resource.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendTimeouts {
@@ -146,7 +143,6 @@ pub struct BackendTimeouts {
 ///
 /// Accepted values: `round_robin` (default), `least_conn`, `ewma`, `ip_hash`,
 /// `hash:uri`, `hash:source-ip`, `hash:header=<name>`, `hash:cookie=<name>`.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendLoadBalancer {
@@ -160,7 +156,6 @@ pub struct BackendLoadBalancer {
 /// breaker (WARN + default). Durations are free-form GEP-2257 strings, **not**
 /// schema-pattern-validated — an unparseable value WARNs and falls back to the
 /// per-field default at the reflector (matching [`BackendTimeouts`]).
-#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendCircuitBreaker {
@@ -200,7 +195,6 @@ pub struct BackendCircuitBreaker {
 /// expire early; accepting those fields without enforcing them would be
 /// dishonest. `idleTimeout` is also omitted: Gateway API itself removed it
 /// from `SessionPersistence` in v1.6.0.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendSessionPersistence {
@@ -220,7 +214,6 @@ pub struct BackendSessionPersistence {
 }
 
 /// Status written back to the `CoxswainBackendPolicy` by the controller.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CoxswainBackendPolicyStatus {
@@ -230,7 +223,6 @@ pub struct CoxswainBackendPolicyStatus {
 }
 
 /// Status of this policy with respect to one ancestor (a targeted `Service`).
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendPolicyAncestorStatus {
@@ -245,7 +237,6 @@ pub struct BackendPolicyAncestorStatus {
 
 /// Identifies the ancestor (targeted `Service`) a [`BackendPolicyAncestorStatus`]
 /// entry corresponds to.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendPolicyAncestorRef {

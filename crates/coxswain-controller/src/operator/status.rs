@@ -1065,11 +1065,13 @@ mod tests {
         use coxswain_reflector::status::{ListenerInfo, ListenerReadiness};
         let gw = gateway(2, vec![("https", 443)], None);
         let mut health = GatewayListenerStatus::default();
-        let mut info = ListenerInfo::default();
-        info.readiness = ListenerReadiness::InvalidCertificateRef {
-            message: "malformed PEM".to_string(),
+        let info = ListenerInfo {
+            readiness: ListenerReadiness::InvalidCertificateRef {
+                message: "malformed PEM".to_string(),
+            },
+            port: 443,
+            ..Default::default()
         };
-        info.port = 443;
         health
             .listeners
             .insert(ListenerStatusKey::gateway("https"), info);

@@ -51,7 +51,6 @@ use serde::{Deserialize, Serialize};
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct JwtAuthSpec {
     /// Expected token `iss` (issuer) claim. Required — Envoy `JwtProvider.issuer`.
     pub issuer: String,
@@ -100,7 +99,6 @@ pub struct JwtAuthSpec {
 /// both fields are schema-optional, and "neither set" / "both set" is caught
 /// at reconcile time (WARN + [`IngressAuthConfig::Unavailable`][crate::routing::IngressAuthConfig::Unavailable],
 /// fail-closed) rather than by the apiserver.
-#[non_exhaustive]
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct JwksSource {
@@ -115,7 +113,6 @@ pub struct JwksSource {
 }
 
 /// A remote JWKS endpoint, refreshed by the controller.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteJwks {
@@ -130,7 +127,6 @@ pub struct RemoteJwks {
 }
 
 /// A JWKS supplied inline in the spec.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct InlineJwks {
@@ -151,7 +147,6 @@ fn preserve_unknown_fields_schema(_: &mut SchemaGenerator) -> Schema {
 
 /// One request location to look for the bearer token in — Envoy
 /// `JwtProvider.from_headers` entry.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct JwtHeaderLocation {
@@ -165,7 +160,6 @@ pub struct JwtHeaderLocation {
 
 /// Copies one verified claim onto an upstream request header — Envoy
 /// `JwtProvider.claim_to_headers` entry.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ClaimToHeader {

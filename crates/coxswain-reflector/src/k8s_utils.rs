@@ -31,7 +31,6 @@ where
 /// Cluster-scoped resources (e.g. `GatewayClass`, `Namespace`) are always
 /// watched cluster-wide regardless of this scope; only namespaced resources
 /// honour it.
-#[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatchScope {
     /// Watch every namespace (`Api::all`). The flag was omitted or empty.
@@ -42,7 +41,6 @@ pub enum WatchScope {
 }
 
 /// Error returned by [`WatchScope::parse`].
-#[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum WatchScopeError {
     /// A comma-delimited `--watch-namespace` entry was empty after trimming

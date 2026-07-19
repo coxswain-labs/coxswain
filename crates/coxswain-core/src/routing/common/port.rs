@@ -20,7 +20,6 @@ use super::backend::BackendGroup;
 /// Mirrors the three host-bucket kinds in [`PortTableBuilder`] so the discovery
 /// wire layer can round-trip hostname class through `to_wire` / `from_wire`
 /// without losing the wildcard kind.
-#[non_exhaustive]
 pub enum HostPattern<'a> {
     /// An exact hostname, e.g. `"api.example.com"`.
     Exact(&'a str),
@@ -36,7 +35,6 @@ pub enum HostPattern<'a> {
 /// Shared between Ingress and Gateway-API top-level routing tables — the per-rule
 /// matching machinery is identical; only the top-level container distinguishes
 /// the two specs at the type level.
-#[non_exhaustive]
 pub struct PortRoutingTable {
     /// `Arc`-wrapped so an unchanged host bucket can be reused by a partitioned
     /// rebuild (#511) without re-running `HostRouterBuilder::build` — the
@@ -80,7 +78,7 @@ impl PortRoutingTable {
         // `Borrowed` on the common (already-canonical) path costs one linear
         // scan and zero allocation; `Owned` allocates exactly one `String` only
         // when the path actually changes.
-        let normalized: Cow<str> = router.normalize().apply(path);
+        let normalized: Cow<'_, str> = router.normalize().apply(path);
 
         match router.route(&normalized, ctx) {
             Some(mut m) => {
@@ -196,7 +194,6 @@ impl PortRoutingTable {
 /// [`host_for`](Self::host_for)) to obtain a [`HostRouterBuilder`] for the
 /// hostname class you want, then call its `add_*_route` methods to register
 /// path rules.
-#[non_exhaustive]
 #[derive(Default)]
 pub struct PortTableBuilder {
     exact_hosts: HashMap<String, HostRouterBuilder>,

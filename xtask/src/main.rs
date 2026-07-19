@@ -18,9 +18,6 @@
 //! fetches) is what lets CRD-kind and Go-source discovery work off a directory
 //! listing instead of a hand-maintained list.
 
-#![deny(unsafe_code)]
-#![warn(clippy::all, rust_2018_idioms)]
-
 use std::{
     collections::{BTreeMap, HashSet},
     env,

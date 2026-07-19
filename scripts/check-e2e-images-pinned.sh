@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Enforce e2e rubric #7 (hermetic SUT; external images digest-pinned): every
+# Enforce the e2e charter's hermetic-SUT rule (external images digest-pinned): every
 # external container image the e2e fixtures run must be pinned by `@sha256:`
 # digest, so a registry tag mutation or `:latest` re-push can't silently change
 # what a test exercises.
@@ -56,7 +56,7 @@ if [ "${#offenders[@]}" -gt 0 ]; then
   echo "FAIL: ${#offenders[@]} unpinned e2e image reference(s):" >&2
   printf '  %s\n' "${offenders[@]}" >&2
   echo "" >&2
-  echo "Per e2e rubric #7, pin by '@sha256:' index digest. Resolve with:" >&2
+  echo "Per the e2e charter, pin by '@sha256:' index digest. Resolve with:" >&2
   echo "  docker buildx imagetools inspect <ref> --format '{{.Manifest.Digest}}'" >&2
   echo "Fixtures should reference a \${IMAGE} token defined in $IMAGES_RS." >&2
   exit 1

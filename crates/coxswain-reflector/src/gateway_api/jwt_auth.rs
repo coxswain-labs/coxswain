@@ -113,11 +113,8 @@ mod tests {
     use super::*;
     use crate::jwks::JwksCacheHandle;
 
-    /// Build a `JwtAuthSpec` from a `jwks:` YAML fragment. `JwksSource` and its
-    /// nested types are `#[non_exhaustive]` and defined in `coxswain-core` — a
-    /// different crate — so cross-crate struct literals are unavailable here;
-    /// deserializing from YAML is the only construction path, mirroring the
-    /// CRD's own test convention (`crd::jwt_auth::tests::parse_cr`).
+    /// Build a `JwtAuthSpec` from a `jwks:` YAML fragment, mirroring the CRD's
+    /// own test convention (`crd::jwt_auth::tests::parse_cr`).
     fn spec_with(jwks_yaml: &str) -> JwtAuthSpec {
         let indented = jwks_yaml.replace('\n', "\n    ");
         let yaml = format!(

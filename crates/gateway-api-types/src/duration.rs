@@ -43,7 +43,6 @@ use regex::Regex;
 /// larger than 99999h59m59s999ms. Since there's no meaningful way in Rust to
 /// allow string formatting to fail, these conditions are checked instead when
 /// instantiating `gateway_api_types::Duration`.
-#[non_exhaustive]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub struct Duration(StdDuration);
 

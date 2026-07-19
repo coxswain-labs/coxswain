@@ -94,7 +94,6 @@ use view_cache::{SharedViewCache, ViewCacheState};
 /// `source` and `registry` via `Clone`.
 ///
 /// Cloneable because tonic requires the service to be `Clone`.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct DiscoveryService {
     source: SnapshotSource,

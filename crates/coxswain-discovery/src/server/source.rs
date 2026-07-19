@@ -23,7 +23,6 @@ use coxswain_core::tls::{SharedClientCertStore, SharedPortTlsStore};
 /// happens at serve time.
 ///
 /// [`Shared`]: coxswain_core::Shared
-// intentionally open: field-literal constructed in coxswain-bin
 #[derive(Clone)]
 pub struct SnapshotSource {
     /// Ingress routing table shared cell.

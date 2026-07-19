@@ -25,17 +25,15 @@ default-members = [
     "crates/gateway-api-types"
 ]
 
+# No crate here is published: every member sets `publish = false`. The
+# crates.io-only fields (homepage/readme/repository/categories/keywords) were
+# inherited by zero members and are omitted rather than wired up.
 [workspace.package]
 version = "0.5.0"
 edition = "2024"
 authors = ["Matteo Giaccone"]
 description = "A pure-Rust Kubernetes Ingress & Gateway API Controller built on Pingora"
-homepage = "https://github.com/coxswain-labs/coxswain"
-readme = "README.md"
 license = "Apache-2.0"
-repository = "https://github.com/coxswain-labs/coxswain"
-categories = ["network-programming", "web-programming::http-server"]
-keywords = ["kubernetes", "ingress", "gateway-api", "pingora", "proxy"]
 
 [workspace.dependencies]
 coxswain-admin      = { path = "./crates/coxswain-admin" }
@@ -139,6 +137,14 @@ tracing-test       = { version = "0.2" }
 ureq               = { version = "3" }
 
 [workspace.lints.rust]
+# `forbid`, not `deny`: an `#[allow]` for a forbidden lint is a hard E0453
+# compile error, so these cannot be silenced at a call site. This replaces
+# scripts/check-no-per-site-allow.sh, which grepped for `#[allow]` and had two
+# dead filters that made it pass unconditionally.
+rust_2018_idioms = { level = "warn", priority = -1 }
+# `deny`, not `forbid`: the alloc-budget test and the relay_fanout bench install
+# a counting global allocator, which requires `unsafe impl GlobalAlloc` behind a
+# local opt-out. `forbid` overrules any `#[allow]`, including that one.
 unsafe_code = "deny"
 missing_docs = "warn"
 
@@ -150,8 +156,23 @@ complexity      = { level = "warn", priority = -1 }
 perf            = { level = "warn", priority = -1 }
 pedantic        = { level = "allow", priority = -1 }
 type_complexity = "deny"
+# `deny` throughout, never `forbid`. `forbid` cannot be overridden by any
+# `#[allow]` — including ones injected by dependency macros — which makes it
+# unusable here: `#[tokio::test]` emits `allow(clippy::expect_used)`, and clap's
+# `#[derive(Parser)]` emits `allow(clippy::style)`, which covers the
+# `disallowed_*` lints. Per-site opt-outs are a review concern, not a lint-level
+# one; see scripts/check-no-per-site-allow.sh.
 unwrap_used     = "deny"
 expect_used     = "deny"
+# Lists live in clippy.toml: parking_lot over std::sync, DashMap::entry off the
+# hot path.
+disallowed_types   = "deny"
+disallowed_methods = "deny"
+disallowed_macros  = "deny"
+# Replaces scripts/check-must-use-builders.sh. `Result` is already `#[must_use]`
+# in std, so Result-returning fns need no annotation and check-must-use-results.sh
+# was enforcing a redundant one (hence its `double_must_use` workaround).
+return_self_not_must_use = "deny"
 
 [profile.release]
 opt-level = 3

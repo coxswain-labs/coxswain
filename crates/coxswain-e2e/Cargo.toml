@@ -1,10 +1,10 @@
 [package]
 name = "coxswain-e2e"
-version = { workspace = true }
-edition = { workspace = true }
-authors = { workspace = true }
-description = { workspace = true }
-license = { workspace = true }
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+license.workspace = true
 publish = false
 
 [lib]

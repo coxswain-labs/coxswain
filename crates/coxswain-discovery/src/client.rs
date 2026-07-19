@@ -40,9 +40,7 @@ use crate::version::WIRE_VERSION;
 /// Configuration for the discovery gRPC client supervisor.
 ///
 /// Construct with [`DiscoveryClientConfig::new`] for sensible defaults, or fill
-/// all fields explicitly (the type is not `#[non_exhaustive]` so struct-literal
-/// construction is stable at the bin-layer call site).
-// intentionally open: field-literal constructed in coxswain-bin when wiring --source=discovery.
+/// all fields explicitly via a struct literal.
 pub struct DiscoveryClientConfig {
     /// Controller discovery Service endpoints (`"http://host:port"` strings).
     ///
@@ -150,7 +148,6 @@ pub struct DiscoveryClientConfig {
 }
 
 /// How a client reacts to a server-pushed `PreferredUpstream` directive (#601).
-#[non_exhaustive]
 pub enum UpstreamDirectiveHandler {
     /// Leaf proxy: apply the directive to this client's own upstream — write the
     /// new target into `upstream_cell` and force a reconnect to it.
@@ -206,7 +203,6 @@ impl DiscoveryClientConfig {
 ///
 /// [`Shared`]: coxswain_core::Shared
 /// [`listener_status`]: DiscoveryClient::listener_status
-#[non_exhaustive]
 pub struct DiscoveryClient {
     ingress_routes: SharedIngressRoutingTable,
     gateway_routes: SharedGatewayRoutingTable,
@@ -441,7 +437,6 @@ impl coxswain_core::RoutingSource for DiscoveryClient {
 /// by awaiting [`Supervisor::run`] — typically from a Pingora background service
 /// so it runs on a Pingora runtime. `run` never returns under normal operation
 /// (it loops across reconnects for the process lifetime).
-#[non_exhaustive]
 pub struct Supervisor {
     config: DiscoveryClientConfig,
     /// The pluggable apply target (#583). A proxy holds a
@@ -464,7 +459,6 @@ pub struct Supervisor {
 /// Must be driven inside a Tokio runtime — register it as a Pingora background
 /// service so it starts after the runtime is up. Dropping it stops the reconnect
 /// loop and ceases snapshot delivery.
-#[non_exhaustive]
 pub struct DiscoverySupervisor(Supervisor);
 
 impl DiscoverySupervisor {
@@ -1107,11 +1101,6 @@ fn system_time_to_unix(t: std::time::SystemTime) -> i64 {
 
 /// Encode a core [`NodeScope`] as the wire [`Scope`] for a `RosterEntry` (#585).
 ///
-/// [`NodeScope`] is `#[non_exhaustive]`; a future variant with no wire
-/// representation degrades to `SharedPool` (which the controller also decodes
-/// from an absent scope) rather than dropping the child — the data plane never
-/// panics on a cross-crate enum addition.
-///
 /// [`NodeScope`]: coxswain_core::node_registry::NodeScope
 /// [`Scope`]: p::Scope
 fn node_scope_to_wire(scope: &coxswain_core::node_registry::NodeScope) -> p::Scope {
@@ -1124,9 +1113,7 @@ fn node_scope_to_wire(scope: &coxswain_core::node_registry::NodeScope) -> p::Sco
         NodeScope::Namespace { namespace } => p::scope::Kind::Namespace(p::NamespaceScope {
             namespace: namespace.clone(),
         }),
-        // `SharedPool`, plus any future `#[non_exhaustive]` variant we can't
-        // express on the wire, degrade to `SharedPool`.
-        _ => p::scope::Kind::SharedPool(p::SharedPoolScope {}),
+        NodeScope::SharedPool => p::scope::Kind::SharedPool(p::SharedPoolScope {}),
     };
     p::Scope { kind: Some(kind) }
 }

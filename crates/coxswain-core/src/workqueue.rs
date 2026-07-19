@@ -51,7 +51,6 @@ use tokio::time::Instant;
 /// `base << attempts`, saturating, floored at nothing and capped at `max`. With
 /// the controller's `base = 500ms`, `max = 15s` this reproduces the #570/#572
 /// per-object error backoff (0.5s, 1s, 2s, 4s, 8s, then 15s).
-#[non_exhaustive]
 #[derive(Debug, Clone, Copy)]
 pub struct RateLimitConfig {
     /// Delay for the first rate-limited add of a key (`attempts == 0`).
@@ -181,7 +180,6 @@ impl<K: Eq + Hash + Clone> Inner<K> {
 /// consumer hold their own handles.
 ///
 /// See the [module docs](self) for the ordering and consumer guarantees.
-#[non_exhaustive]
 pub struct RateLimitingWorkqueue<K> {
     inner: Arc<Mutex<Inner<K>>>,
     notify: Arc<Notify>,

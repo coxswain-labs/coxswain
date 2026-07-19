@@ -55,7 +55,6 @@ use std::collections::BTreeMap;
     namespaced
 )]
 #[serde(rename_all = "camelCase")]
-#[non_exhaustive]
 pub struct CoxswainIngressClassParametersSpec {
     /// Default `ingress.coxswain-labs.dev/*` annotation values applied to
     /// every Ingress claiming this class.

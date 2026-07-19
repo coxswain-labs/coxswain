@@ -51,7 +51,6 @@ use std::time::SystemTime;
 /// and `reconcile` (translation, by value) for #511's partitioned rebuild
 /// without constructing it twice.
 #[derive(Clone, Copy)]
-#[non_exhaustive]
 pub struct RouteResolution<'a> {
     /// `(gw_ns, gw_name, listener_name) → (hostname, port)` mapping for every
     /// listener on every Gateway we own.
@@ -1187,14 +1186,16 @@ impl GatewayApiReconciler {
                     other => other,
                 }
             };
-            let mut li = ListenerInfo::default();
-            li.readiness = readiness;
-            li.attached_routes = 0;
-            li.hostname = listener.hostname.clone().unwrap_or_default();
-            li.route_namespaces = listener.route_namespaces.clone();
-            li.port = listener_port;
-            li.internal_port = internal_port;
-            li.conflict = listener.conflict.clone();
+            let li = ListenerInfo {
+                readiness,
+                attached_routes: 0,
+                hostname: listener.hostname.clone().unwrap_or_default(),
+                route_namespaces: listener.route_namespaces.clone(),
+                port: listener_port,
+                internal_port,
+                conflict: listener.conflict.clone(),
+                ..Default::default()
+            };
             map.insert(
                 ListenerStatusKey {
                     source: listener.source.clone(),
@@ -1204,9 +1205,10 @@ impl GatewayApiReconciler {
             );
         }
 
-        let mut glh = GatewayListenerStatus::default();
-        glh.listeners = map;
-        glh
+        GatewayListenerStatus {
+            listeners: map,
+            ..Default::default()
+        }
     }
 }
 

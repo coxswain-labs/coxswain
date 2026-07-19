@@ -69,7 +69,6 @@ struct RouteLimiterEntry {
 /// Cloning is cheap (the inner `Arc<Mutex<…>>` is reference-counted). Both
 /// `IngressProxy` and `GatewayProxy` hold a clone of the same registry so
 /// they share a single limit pool.
-#[non_exhaustive]
 #[derive(Clone)]
 pub struct RateLimiterRegistry {
     inner: Arc<DashMap<Arc<str>, RouteLimiterEntry>>,

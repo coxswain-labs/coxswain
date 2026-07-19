@@ -86,15 +86,6 @@ pub(crate) fn resolve_spec(
             // sends the request context and maps the CheckResponse.
             ExtAuthTransport::Grpc(GrpcExtAuthConfig::new(response_headers))
         }
-        // `ExternalAuthProtocol` is #[non_exhaustive]: a future protocol variant
-        // must fail closed, never open, until it is wired here.
-        _ => {
-            tracing::warn!(
-                policy_ns,
-                "unknown CoxswainExternalAuth protocol — failing closed (503)"
-            );
-            return IngressAuthConfig::Unavailable;
-        }
     };
     IngressAuthConfig::External(ExtAuthConfig::new(
         timeout,

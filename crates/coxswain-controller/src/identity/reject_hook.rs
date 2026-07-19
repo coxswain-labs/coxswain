@@ -25,7 +25,6 @@ use coxswain_discovery::RejectHook;
 ///
 /// The `reference` is set to the controller Pod so `kubectl describe pod <name>`
 /// and `kubectl get events` in the controller namespace both surface rejections.
-#[non_exhaustive]
 pub struct BootstrapRejectHook {
     recorder: Recorder,
     /// `ObjectReference` pointing at the controller Pod (populated from

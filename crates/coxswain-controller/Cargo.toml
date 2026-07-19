@@ -5,6 +5,7 @@ edition.workspace = true
 authors.workspace = true
 description.workspace = true
 license.workspace = true
+publish = false
 
 [lints]
 workspace = true
@@ -37,5 +38,4 @@ x509-parser = { workspace = true }
 [dev-dependencies]
 rustls = { workspace = true }
 tracing-test = { workspace = true }
-x509-parser = { workspace = true }
 

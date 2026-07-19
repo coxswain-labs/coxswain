@@ -35,7 +35,6 @@ use super::ca::{CaError, CertAuthority};
 
 /// How the controller acquires its CA.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
 pub enum CaMode {
     /// Generate a fresh self-signed CA if the Secret is absent.
     Auto,
@@ -47,7 +46,6 @@ pub enum CaMode {
 
 /// Error loading or initialising the CA Secret.
 #[derive(Debug, Error)]
-#[non_exhaustive]
 pub enum CaStoreError {
     /// A Kubernetes API call failed.
     #[error("kubernetes API error: {0}")]

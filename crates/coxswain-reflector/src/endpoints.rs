@@ -87,7 +87,6 @@ pub(crate) fn port_for_name(
 /// `pub` and `#[doc(hidden)]` only so `crates/coxswain-reflector/benches/convergence.rs`
 /// (#513) can call this directly with a synthetic store — not a supported
 /// external entry point; no semver guarantee.
-// intentionally open: benchmark entry point, not semver API (#513)
 #[doc(hidden)]
 pub fn resolve(
     ns: &str,

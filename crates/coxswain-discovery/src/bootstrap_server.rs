@@ -52,7 +52,6 @@ use crate::wire::scope_from_wire;
 /// `PreferredUpstream` directive, where a swap would dial the right endpoint while
 /// verifying the wrong identity (or vice versa).
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[non_exhaustive]
 pub struct ResolvedUpstream {
     /// Routing (Stream) endpoint the client dials (`"https://host:port"`).
     pub endpoint: String,
@@ -84,7 +83,6 @@ impl ResolvedUpstream {
 /// that a leaf may repoint onto the relay. It is distinct from the authz set the
 /// `ScopeAuthorizer` reads (which also covers provisioning/draining relays): a leaf
 /// must never point at a not-yet-Ready or already-draining relay (#602).
-// intentionally open: field-literal constructed in coxswain-bin
 pub struct UpstreamResolverConfig {
     /// The controller's own routing (Stream) endpoint — the always-up fallback.
     pub controller_endpoint: String,
@@ -240,7 +238,6 @@ pub trait RejectHook: Send + Sync {
 }
 
 /// No-op reject hook used as the default when no event recorder is available.
-// intentionally open: constructed as a unit struct literal `NoOpRejectHook` by callers
 pub struct NoOpRejectHook;
 
 impl RejectHook for NoOpRejectHook {
@@ -258,7 +255,6 @@ impl RejectHook for NoOpRejectHook {
 /// Serve this on a *separate* tonic listener with server-auth-only TLS.
 /// The `Stream` RPC always returns `Unimplemented`; proxy clients must
 /// connect to the Stream listener (port 50051) for routing snapshots.
-#[non_exhaustive]
 pub struct BootstrapService<I, A, H = NoOpRejectHook> {
     issuer: Arc<I>,
     authenticator: Arc<A>,
@@ -386,14 +382,6 @@ where
                     "unexpected principal: {msg}"
                 )));
             }
-            // AuthnError is #[non_exhaustive]; treat unknown variants as internal errors.
-            Err(e) => {
-                let msg = e.to_string();
-                warn!(reason = %msg, "bootstrap: unexpected auth error");
-                reject("internal");
-                self.reject_hook.on_reject("<unknown>", &msg).await;
-                return Err(Status::internal(format!("authentication error: {msg}")));
-            }
         };
 
         info!(spiffe_id = %spiffe_id, "bootstrap: SA token authenticated");
@@ -419,14 +407,6 @@ where
                 reject("signing_error");
                 self.reject_hook.on_reject(spiffe_id.as_str(), &msg).await;
                 return Err(Status::internal(format!("signing error: {msg}")));
-            }
-            // IssuerError is #[non_exhaustive]; treat unknown variants as internal errors.
-            Err(e) => {
-                let msg = e.to_string();
-                warn!(spiffe_id = %spiffe_id, reason = %msg, "bootstrap: unexpected issuer error");
-                reject("internal");
-                self.reject_hook.on_reject(spiffe_id.as_str(), &msg).await;
-                return Err(Status::internal(format!("issuer error: {msg}")));
             }
         };
 
@@ -521,8 +501,6 @@ mod tests {
                 IssuerError::NotReady => IssuerError::NotReady,
                 IssuerError::MalformedCsr(m) => IssuerError::MalformedCsr(m.clone()),
                 IssuerError::Signing(m) => IssuerError::Signing(m.clone()),
-                // #[non_exhaustive]: propagate any future variants as a Signing error.
-                _ => IssuerError::Signing("unexpected variant in test".into()),
             })
         }
         fn trust_bundle(&self) -> Vec<u8> {

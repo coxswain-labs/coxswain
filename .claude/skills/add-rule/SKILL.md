@@ -1,69 +1,119 @@
 ---
 name: add-rule
-description: Before adding a new policy rule to CLAUDE.md, decide whether a CI mechanism could enforce it. Encodes the "rules go to CI first" principle. Use when about to write a new bullet in CLAUDE.md's Code Quality section, when generalising a recurring code-review correction, or when a recent bug suggests a project-wide invariant should be guarded. Triggers on phrases like "add a rule that X", "let's document X", "no one should do X anymore", or "we keep getting hit by X".
+description: Before adding a project rule, pick the weakest mechanism that can actually decide it, and prove that mechanism can fail. Use when about to write a new rule into CLAUDE.md, when generalising a recurring review correction, or when a bug suggests a project-wide invariant. Triggers on "add a rule that X", "let's document X", "no one should do X anymore", "we keep getting hit by X".
 ---
 
-When a new project rule is being proposed, this skill walks through the enforcement decision BEFORE the rule lands as prose in CLAUDE.md. The premise: every rule that can be checked mechanically should be, so the doc stays a tight set of behavioural policies — not a wishlist.
+Walk the enforcement decision BEFORE a rule lands anywhere.
 
-## Step 1 — Read the proposed rule back
+## The failure this skill exists to prevent
 
-State the rule clearly in imperative form: "X must happen" or "X must not happen". If the user gave the rule as a phenomenon ("we keep hitting X"), restate it as the corresponding invariant. Do not skip this step — vague rule statements lead to prose that doesn't enforce anything.
+This repo once had 19 `scripts/check-*.sh` gates and **no test for any of them**.
+Four passed unconditionally for their entire life:
 
-## Step 2 — Determine the enforcement mechanism
+- `check-no-per-site-allow.sh` filtered two paths that could never appear in its
+  own output — dead code, green forever.
+- `check-e2e-single-poller.sh` matched `fn poll_until` *definitions only*, so a
+  `kubectl wait --timeout=300s` shell-out lived inside the canonical waiter
+  module, invisible to the gate whose stated purpose was preventing it.
+- `check-public-types-stability.sh` matched `^\s*pub (enum|struct)` — bare `pub`
+  only — so every `pub(crate)` type escaped it.
+- `check-no-anyhow-libs.sh` grepped `src/` usage, not `Cargo.toml`.
 
-Use `AskUserQuestion` with a single-select question (header "Enforcement"):
+The previous version of this skill told you to verify a new script by *running
+it against the current tree to confirm it passes*. All four pass that check. A
+gate reporting OK is indistinguishable from a gate that cannot fail.
 
-- **Clippy lint** — the rule maps to an existing clippy lint (or to `unwrap_used`/`expect_used`/`type_complexity`/etc. in workspace lints) and can be promoted from `warn` to `deny`. Cheapest enforcement; runs on every commit. Recommended when the rule is about Rust idioms.
-- **`scripts/check-*.sh` grep** — the rule is a workspace-wide structural property checkable by a shell + Python script (analogous to `scripts/check-public-types-stability.sh`). Recommended when the rule is project-specific (naming, file structure, attribute presence).
-- **`deny.toml` policy** — the rule constrains the dependency tree or licence/source policy. Recommended for supply-chain rules.
-- **Doc-only, because no mechanical check is tractable** — the rule is a behavioural policy that depends on judgment (e.g. hot-path allocation budgets, panic-message form, parameter-grouping struct naming). Recommended ONLY when the previous three were genuinely considered and rejected.
+**A green gate is worse than no gate: it certifies compliance nobody verified.**
 
-If the answer is "doc-only", ask a follow-up: "What's the trigger condition under which a future contributor will discover this rule applies?" If the answer is "they have to read CLAUDE.md cover-to-cover and remember it", the rule is too weak — push back: either tighten it to a checkable form, or accept that it will drift.
+## Step 1 — State the rule as an invariant
 
-## Step 3 — Draft the artefact
+Imperative form: "X must happen" / "X must not happen". If given as a phenomenon
+("we keep hitting X"), restate it as the invariant. Then ask the question that
+kills most proposed rules:
 
-Based on the answer:
+> **What breaks if this is violated, and would anyone notice?**
 
-- **Clippy lint**: identify the lint name and the target level (`warn`/`deny`). Show the diff to `[workspace.lints.clippy]` in `Cargo.toml`. Also propose the row to add to CLAUDE.md's "Enforced rules" table.
+Mechanical enforcement is justified when the failure is **silent or delayed** and
+traceable to a real incident. If violating the rule produces something a reviewer
+sees immediately, it is a convention — write it down if you like, but do not
+build machinery for it. Consistency is not a defect.
 
-- **`scripts/check-*.sh`**: draft the script template, modelled on `scripts/check-public-types-stability.sh`. The template should:
-  - Bash heredoc preamble explaining the rule.
-  - Set `-euo pipefail`.
-  - Implement the check (typically `find` + grep, or a Python heredoc for structural walks).
-  - Print `OK: <count> things checked.` on success.
-  - Print `FAIL: <count> offenders:` + the offender list, then a remediation hint.
-  - `exit 1` on failure.
-  Also draft the CI job entry for `.github/workflows/ci.yml` (paths filter + single-step job). Also propose the row to add to CLAUDE.md's "Enforced rules" table.
+## Step 2 — Pick the weakest sufficient mechanism
 
-- **`deny.toml`**: identify the section (`bans`, `licenses`, `advisories`) and the entry. Show the diff. Propose the row to add to CLAUDE.md's "Enforced rules" table.
+In order. Stop at the first one that can actually decide the rule.
 
-- **Doc-only**: draft the CLAUDE.md prose (one paragraph max, in the "Policies the CI gates don't cover" section). The prose should state the rule in imperative form, the rationale in one sentence, and the trigger condition for when the rule applies.
+**1. The compiler.** A clippy lint or `[workspace.lints]` entry, or a
+`clippy.toml` `disallowed-{types,methods,macros}` entry. Best by far: it parses
+Rust (no regex blind spots), and it runs inside the authoring loop for free.
+Check whether the lint already exists before writing anything — `Result` is
+already `#[must_use]`, `unused_must_use` is on by default, and
+`return_self_not_must_use` covers builders.
 
-## Step 4 — Verify before committing
+Do **not** reach for `forbid`. It cannot be overridden by any `#[allow]`,
+including ones injected by dependency macros: `#[tokio::test]` emits
+`allow(clippy::expect_used)` and clap's `derive(Parser)` emits
+`allow(clippy::style)`. Nothing here compiles under `forbid`.
 
-If a script was drafted, run it against the current tree to confirm it passes (or to enumerate pre-existing offenders that need fixing in the same commit). If a clippy lint was promoted, run `cargo clippy --workspace --all-targets --no-deps -- -D warnings` to confirm zero new errors.
+**2. `deny.toml`.** For genuine dependency-graph rules (licences, sources,
+advisories). Note `[bans]` + `wrappers` operates on the *graph*, so it cannot
+express "our crates must not use X in their source" without enumerating every
+vendor crate that happens to depend on X.
 
-## Step 5 — Commit advice
+**3. A `scripts/check-*.sh` gate — only if it comes with a negative test.**
+For cross-file, project-specific properties no compiler can see. See Step 3.
 
-A new rule's commit should typically be split into:
-1. Fix any pre-existing offenders.
-2. Add the enforcement (lint promotion, script + CI job, or deny.toml entry).
-3. Update CLAUDE.md to mention the rule and link to its enforcer.
+**4. A dimension in `.claude/agents/code-review.md`.** For rules that need
+judgment: panic reachability, per-event allocation, doc quality,
+architectural-vs-work-saving. These cannot be grepped and should not be faked
+with a proxy metric — counting `///` presence measures nothing, since it is
+satisfiable with pure noise.
 
-Steps 1 and 2 can be the same commit when the offender list is short (≤5 sites). Step 3 lands in the doc-trim commit alongside other CLAUDE.md edits, or as its own one-line `docs(claude): record new <X> rule` commit.
+**5. Prose in CLAUDE.md.** Last resort. Prose competes with the task for
+attention and is followed unreliably. If you land here, ask: "what trigger makes
+a future contributor discover this rule applies?" If the answer is "read
+CLAUDE.md cover to cover and remember", the rule will drift — accept that
+explicitly or tighten it.
 
-## How to invoke
+## Step 3 — If it is a script, the fixture comes first
 
-The skill is conversational + minimally interventional. It is NOT a one-shot generator. Walk the user through each step using `AskUserQuestion` for the enforcement-mechanism choice; show drafts using normal text output and offer to write them to files (the user accepts via the standard tool-call flow). Do not auto-write files without the user's explicit go-ahead per step.
+**Write `scripts/tests/<gate-name>/bad/` before writing the gate.** The `bad/`
+tree is a miniature repo (mirroring `crates/<crate>/src/...`, since gates resolve
+roots relative to cwd) containing the defect the rule forbids — ideally the one
+that actually shipped, not a synthetic stand-in. Add a `good/` tree that must
+pass. `scripts/tests/run.sh` picks both up automatically.
 
-## When to use
+Then write the gate until `bad/` fails and `good/` passes.
 
-- A user proposes a new rule for CLAUDE.md.
-- A recurring code-review correction has been seen 2+ times.
-- A recent bug or regression suggests a project-wide invariant that should be guarded.
+Scope the gate from the real layout: `crates/*/{src,benches,tests}` and
+`xtask/src`. Do not glob `crates/*/src/` and then filter paths that cannot appear
+in that output — that is the exact bug in three of the four broken gates.
+
+Wire it into `scripts/gates.sh` so it runs at authoring time via the
+`PostToolUse` hook, not only in CI after a push.
+
+## Step 4 — Verify by breaking it
+
+Running the gate on a clean tree proves nothing. Two required checks:
+
+1. `bash scripts/tests/run.sh` — the gate rejects `bad/` and accepts `good/`.
+2. **Neuter the gate** (delete a grep clause, or point its root somewhere
+   unmatchable) and confirm the self-test goes red. If it stays green, the
+   fixture does not exercise the gate.
+
+For a lint: introduce a real violation and confirm `cargo clippy` fails.
+
+## Step 5 — Record it
+
+Add a row to CLAUDE.md's "Enforced rules" table naming the mechanism — but only
+once its negative test exists. A rule listed as enforced when it is not is worse
+than an unlisted rule, because it stops anyone from looking.
+
+Commit shape: fix pre-existing offenders, add the enforcement plus its fixture,
+update the doc. First two can share a commit when the offender list is short.
 
 ## When NOT to use
 
-- The user is just asking a question about an existing rule. Use normal conversation, not this skill.
-- The "rule" is actually a docs-site improvement (clearer prose in `docs/src/`). That's not a policy decision.
-- The user is mid-implementation and the proposed rule is really a one-off design decision in the current PR. Capture it in the PR description, not CLAUDE.md.
+- A question about an existing rule — just answer it.
+- A `docs/src/` prose improvement — not a policy decision.
+- A one-off design decision in the current PR — put it in the PR description.
+- A consistency preference with no failure mode. Say so and move on.

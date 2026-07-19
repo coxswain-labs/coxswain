@@ -27,7 +27,6 @@ use std::sync::Arc;
 pub type IngressEngine = RoutingEngine<Ingress>;
 
 /// Pingora `ProxyHttp` implementation that routes Ingress traffic.
-#[non_exhaustive]
 pub struct IngressProxy {
     /// Lock-free routing engine reading the Ingress snapshot.
     pub engine: Arc<IngressEngine>,
