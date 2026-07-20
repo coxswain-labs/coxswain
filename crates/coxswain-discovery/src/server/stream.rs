@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tonic::{Status, Streaming};
 use tracing::{debug, warn};
 
@@ -267,9 +267,10 @@ pub(super) struct StreamServices {
     pub(super) upstream_resolver: Option<Arc<UpstreamResolverConfig>>,
     /// Relay-provisioning change signal (#601); `None` when directives are off.
     pub(super) relay_changed_rx: Option<watch::Receiver<u64>>,
-    /// Relay directive-forwarding fan-out (#601); `Some` only on a relay's
-    /// downstream server. Each stream subscribes a receiver from it.
-    pub(super) directive_tx: Option<broadcast::Sender<p::PreferredUpstream>>,
+    /// Relay latest-directive cell (#601/#652); `Some` only on a relay's downstream
+    /// server. Each stream subscribes a receiver and reads the retained directive on
+    /// open (late-subscriber replay) and on change.
+    pub(super) directive_tx: Option<watch::Sender<Option<p::PreferredUpstream>>>,
 }
 
 /// Immutable references the outbound handlers need, borrowed from the stream
@@ -325,10 +326,12 @@ pub(super) async fn run_stream(
         mut relay_changed_rx,
         directive_tx,
     } = services;
-    // Relay directive-forwarding (#601): a relay's downstream leaf subscribes to
-    // the fan-out its upstream client feeds, and forwards directives targeting
-    // this leaf's Gateway. `None` on the controller (it originates, never forwards).
-    let mut directive_rx = directive_tx.as_ref().map(broadcast::Sender::subscribe);
+    // Relay directive-forwarding (#601/#652): a relay's downstream leaf subscribes
+    // to the latest-directive cell its upstream client publishes into, and forwards
+    // directives targeting this leaf's Gateway. `None` on the controller (it
+    // originates, never forwards). The retained value is replayed on open below so a
+    // leaf that subscribed after the directive was published still repoints.
+    let mut directive_rx = directive_tx.as_ref().map(watch::Sender::subscribe);
     let ctx = StreamCtx {
         sub: &sub,
         source: &source,
@@ -361,6 +364,16 @@ pub(super) async fn run_stream(
         &tx,
     )
     .await;
+
+    // Late-subscriber replay (#652): a relay leaf that subscribed *after* the
+    // controller's teardown directive was published must still be repointed, or the
+    // relay's drain wedges (its subscriber count never reaches 0). Read the retained
+    // directive on open and forward it if it targets this leaf. `borrow_and_update`
+    // marks it seen so the `changed()` arm below does not re-forward the same value.
+    // A closed channel is handled by the shutdown path, so the error is ignored here.
+    if let Some(rx) = directive_rx.as_mut() {
+        let _ = forward_retained_directive(rx, &sub.scope, &sub.node_id, &tx).await;
+    }
 
     // Send the initial snapshot immediately on stream open. With no baseline yet
     // (`acked_resources == None`) this is always a full; `build_outbound`
@@ -498,37 +511,22 @@ pub(super) async fn run_stream(
                 }
             }
 
-            // Relay directive-forwarding (#601): the upstream client fanned a
-            // controller directive here — forward it to this leaf if it targets
-            // this leaf's Gateway. Inert (`pending`) when not a relay.
-            directive = recv_directive(&mut directive_rx) => {
-                match directive {
-                    Ok(directive) if directive_targets_leaf(&directive, &sub.scope) => {
-                        debug!(
-                            node_id = %sub.node_id,
-                            endpoint = %directive.endpoint,
-                            "discovery: relay forwarding PreferredUpstream to leaf"
-                        );
-                        if tx
-                            .send(Ok(p::ServerMessage {
-                                kind: Some(SKind::PreferredUpstream(directive)),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    // Directive for a different Gateway, or the fan-out lagged
-                    // (dropped messages): ignore. A dropped forward is not stuck —
-                    // the only live forward case is a relay teardown, which also
-                    // drops this leaf's stream, so the leaf reconnects and (via the
-                    // re-bootstrap fallback) converges onto the controller anyway.
-                    // A fresh controller-originated directive re-drives the rest.
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => {
-                        directive_rx = None;
-                    }
+            // Relay directive-forwarding (#601/#652): the upstream client published a
+            // controller directive into the latest-directive cell — read it and
+            // forward to this leaf if it targets this leaf's Gateway. Inert (pends
+            // forever) when not a relay.
+            changed = wait_directive(&mut directive_rx) => {
+                if changed.is_err() {
+                    // Sender dropped (relay upstream client gone): stop watching.
+                    directive_rx = None;
+                    continue;
+                }
+                if let Some(rx) = directive_rx.as_mut()
+                    && forward_retained_directive(rx, &sub.scope, &sub.node_id, &tx)
+                        .await
+                        .is_err()
+                {
+                    break;
                 }
             }
         }
@@ -551,15 +549,50 @@ pub(super) async fn wait_relay_changed(
     }
 }
 
-/// Await a forwarded directive on an optional broadcast receiver (#601), standing
-/// in a never-resolving future when this stream is not a relay leaf.
-pub(super) async fn recv_directive(
-    rx: &mut Option<broadcast::Receiver<p::PreferredUpstream>>,
-) -> Result<p::PreferredUpstream, broadcast::error::RecvError> {
+/// Await a change on the optional latest-directive cell (#601/#652), standing in a
+/// never-resolving future when this stream is not a relay leaf. `Err` means the
+/// relay's upstream client dropped the sender (relay shutting down).
+pub(super) async fn wait_directive(
+    rx: &mut Option<watch::Receiver<Option<p::PreferredUpstream>>>,
+) -> Result<(), watch::error::RecvError> {
     match rx.as_mut() {
-        Some(r) => r.recv().await,
+        Some(r) => r.changed().await,
         None => std::future::pending().await,
     }
+}
+
+/// Read the retained directive from the latest-directive cell and, if it targets
+/// this leaf, forward it (#601/#652).
+///
+/// `borrow_and_update` marks the current value seen, so a later
+/// [`wait_directive`]/`changed()` only fires on a genuinely newer directive — the
+/// same retained value is never forwarded twice. Called both on stream open (the
+/// late-subscriber replay) and on every subsequent change. An empty cell (`None`,
+/// before the first directive) or a directive for a different Gateway forwards
+/// nothing.
+///
+/// Returns `Err(StreamClosed)` if the outbound channel closed.
+pub(super) async fn forward_retained_directive(
+    rx: &mut watch::Receiver<Option<p::PreferredUpstream>>,
+    scope: &Scope,
+    node_id: &str,
+    tx: &mpsc::Sender<Result<p::ServerMessage, Status>>,
+) -> Result<(), StreamClosed> {
+    // Clone out of the borrow so the watch guard is not held across the `.await`.
+    let directive = match rx.borrow_and_update().as_ref() {
+        Some(d) if directive_targets_leaf(d, scope) => d.clone(),
+        _ => return Ok(()),
+    };
+    debug!(
+        node_id = %node_id,
+        endpoint = %directive.endpoint,
+        "discovery: relay forwarding PreferredUpstream to leaf"
+    );
+    tx.send(Ok(p::ServerMessage {
+        kind: Some(SKind::PreferredUpstream(directive)),
+    }))
+    .await
+    .map_err(|_| StreamClosed)
 }
 
 /// Whether a relay-forwarded directive targets the leaf on this stream (#601).
@@ -606,14 +639,18 @@ pub(super) fn directive_targets_leaf(directive: &p::PreferredUpstream, scope: &S
 /// - `Gateway` (dedicated leaf streaming directly from the controller): seed from
 ///   the controller; target its namespace's best upstream; untargeted directive —
 ///   the leaf is the sole recipient.
-/// - `Namespace` (a dedicated relay's aggregate stream): seed and target from the
-///   namespace's best upstream; the directive carries `target_namespace` so the
-///   relay forwards it to its downstream leaves in that namespace.
-/// - `SharedPool` (#605): the shared relay (peer SA == `shared_relay_sa`) seeds
-///   from the shared best upstream and forwards to its downstream shared-pool
-///   leaves on change; a direct shared proxy seeds from the controller and
-///   repoints itself. Both target the shared best upstream; the directive is
-///   untargeted (a shared relay serves only shared-pool leaves, so
+/// - `Namespace` (a dedicated relay's aggregate stream): seed from the relay
+///   endpoint UNGATED (#652), target from the namespace's active-gated best
+///   upstream; the directive carries `target_namespace` so the relay forwards it to
+///   its downstream leaves in that namespace. Seeding from the ungated relay
+///   endpoint (not `resolve_namespace`, which returns the controller once the relay
+///   is deactivated) is what makes a stream re-seeding after teardown diverge from
+///   the controller target and push the repoint — the fix for the wedged-GC race.
+/// - `SharedPool` (#605/#652): the shared relay (peer SA == `shared_relay_sa`) seeds
+///   from the shared relay endpoint UNGATED and forwards to its downstream
+///   shared-pool leaves on change; a direct shared proxy seeds from the controller
+///   and repoints itself. Both target the shared active-gated best upstream; the
+///   directive is untargeted (a shared relay serves only shared-pool leaves, so
 ///   `directive_targets_leaf` matches them without a namespace).
 ///
 /// Returns `Err(StreamClosed)` if the outbound channel closed.
@@ -639,13 +676,22 @@ pub(super) async fn seed_or_push_upstream(
             String::new(),
         ),
         Scope::Namespace { namespace } => (
-            resolver.resolve_namespace(namespace),
+            // Seed from the relay endpoint UNGATED (#652), not the active-gated
+            // `resolve_namespace` — a stream re-seeding after the relay left
+            // `active_relays` must still diverge from the now-controller target so
+            // the teardown directive fires; else `seed == target` wedges relay GC.
+            resolver.namespace_relay_endpoint(namespace),
             resolver.resolve_namespace(namespace),
             namespace.clone(),
         ),
         Scope::SharedPool => {
+            // Shared RELAY: seed from the shared relay endpoint UNGATED (#652), same
+            // reasoning as the `Namespace` arm. Direct shared PROXY: seed from the
+            // controller — it is the sole recipient and repoints itself; keeping the
+            // `is_shared_relay` split is what lets a direct proxy still repoint ONTO
+            // a newly-active shared relay.
             let seed = if resolver.is_shared_relay(peer_svid) {
-                resolver.resolve_shared()
+                resolver.shared_relay_endpoint()
             } else {
                 resolver.controller_target()
             };

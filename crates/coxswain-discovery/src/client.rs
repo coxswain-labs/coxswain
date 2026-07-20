@@ -18,7 +18,7 @@ use coxswain_core::routing::{
     SharedTlsPassthroughTable, SharedUdpRouteTable,
 };
 use coxswain_core::tls::{SharedClientCertStore, SharedListenerHostnames, SharedPortTlsStore};
-use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Channel, Endpoint};
 use tracing::{debug, warn};
@@ -152,12 +152,16 @@ pub enum UpstreamDirectiveHandler {
     /// Leaf proxy: apply the directive to this client's own upstream — write the
     /// new target into `upstream_cell` and force a reconnect to it.
     RepointSelf,
-    /// Relay: fan the controller-originated directive to the relay's downstream
-    /// `DiscoveryService` instead of repointing the relay's own upstream (a relay
-    /// always streams from the controller). Each downstream leaf stream subscribes
-    /// to this broadcast and forwards the directive to the leaf whose Gateway scope
-    /// matches the directive's target.
-    Forward(broadcast::Sender<p::PreferredUpstream>),
+    /// Relay: publish the controller-originated directive into the relay's
+    /// downstream `DiscoveryService` latest-directive cell instead of repointing the
+    /// relay's own upstream (a relay always streams from the controller). Each
+    /// downstream leaf stream reads this `watch` on open and on change, forwarding
+    /// the directive to the leaf whose Gateway scope matches its target. A `watch`
+    /// (not a `broadcast`) so a leaf subscribing *after* the directive was published
+    /// still reads it — the late-subscriber replay that closes the wedged-GC race
+    /// (#652). Holding the latest value also re-arms a leaf for free when a directive
+    /// points back at the relay (make-before-break re-provision).
+    Forward(watch::Sender<Option<p::PreferredUpstream>>),
 }
 
 impl DiscoveryClientConfig {
@@ -865,13 +869,14 @@ impl Supervisor {
                             }
                             continue;
                         }
-                        // Relay: fan the controller-originated directive to the
-                        // downstream leaf streams; the relay itself always streams
-                        // from the controller, so it never repoints here. A send
-                        // error means no leaf is currently subscribed — nothing to
-                        // forward to, which is fine.
+                        // Relay: publish the controller-originated directive into the
+                        // downstream latest-directive cell; the relay itself always
+                        // streams from the controller, so it never repoints here.
+                        // `send_replace` retains the value for leaves that subscribe
+                        // later (and never errors on zero current receivers), so a
+                        // leaf connecting after the directive still reads it on open.
                         UpstreamDirectiveHandler::Forward(tx) => {
-                            let _ = tx.send(directive);
+                            tx.send_replace(Some(directive));
                             continue;
                         }
                     }
@@ -976,6 +981,20 @@ impl Supervisor {
             &self.config.fallback_namespace,
         );
         let target = UpstreamTarget::new(directive.endpoint.clone(), matcher);
+        // No-op when the directive names the upstream we are already on. A repoint
+        // to the current endpoint must NOT tear down a healthy stream: doing so
+        // reconnects to the same place, and if the peer re-sends the same directive
+        // on every open (a relay that retains a self-pointing directive and replays
+        // it to a leaf already on the relay — #658), the client loops forever and
+        // never reads a snapshot. Endpoint identity is sufficient: the endpoint and
+        // its expected SA change together on a controller↔relay repoint.
+        if upstream_cell_points_at(cell, &target) {
+            debug!(
+                endpoint = %directive.endpoint,
+                "discovery client: PreferredUpstream names the current upstream; not repointing"
+            );
+            return false;
+        }
         debug!(
             endpoint = %directive.endpoint,
             expected_server_sa = %directive.expected_server_sa,
@@ -983,6 +1002,20 @@ impl Supervisor {
         );
         cell.store(Arc::new(Some(target)));
         true
+    }
+}
+
+/// Whether `cell` already points at `target`'s endpoint(s) (#658).
+///
+/// The guard for `apply_repoint`'s no-op: a `PreferredUpstream` naming the upstream
+/// the client is already on must not trigger a reconnect. Compares endpoints only —
+/// the endpoint and its expected-server SA move together on a controller↔relay
+/// repoint, so endpoint identity implies the whole target is unchanged. An unset
+/// cell (no upstream yet) is never "already there", so the first directive applies.
+fn upstream_cell_points_at(cell: &SharedUpstream, target: &UpstreamTarget) -> bool {
+    match &*cell.load() {
+        Some(current) => current.endpoints == target.endpoints,
+        None => false,
     }
 }
 
@@ -1646,6 +1679,48 @@ mod tests {
         assert!(
             matches!(build_channel(&config), Err(DiscoveryError::TlsConfig(_))),
             "malformed TLS material must surface as TlsConfig, never panic"
+        );
+    }
+
+    #[test]
+    fn apply_repoint_noop_when_directive_names_current_upstream() {
+        // #658 regression: a shared relay retains a self-pointing `PreferredUpstream`
+        // (its own endpoint) and, via the open-stream replay, hands it to a leaf
+        // ALREADY on the relay. The repoint decision must treat "go where you already
+        // are" as a no-op — else the client tears down and reconnects on every open,
+        // never reading a snapshot (the infinite no-op-repoint loop behind the
+        // shared-pool provisioning 404).
+        let relay = "https://coxswain-relay-shared.coxswain-system.svc:50051";
+        let controller = "https://coxswain-controller-discovery.coxswain-system.svc:50051";
+        let matcher =
+            |endpoint: &str, sa: &str| expected_server_matcher("cluster.local", endpoint, sa, "");
+        let cell: SharedUpstream = coxswain_core::Shared::from_value(Some(UpstreamTarget::new(
+            relay.to_owned(),
+            matcher(relay, "coxswain-relay-shared"),
+        )));
+
+        // Same endpoint → no-op (must NOT repoint / tear down the stream).
+        let same = UpstreamTarget::new(relay.to_owned(), matcher(relay, "coxswain-relay-shared"));
+        assert!(
+            upstream_cell_points_at(&cell, &same),
+            "a directive naming the current upstream must be recognised as a no-op"
+        );
+
+        // Different endpoint (teardown → controller) → genuine repoint must still fire.
+        let other = UpstreamTarget::new(
+            controller.to_owned(),
+            matcher(controller, "coxswain-controller"),
+        );
+        assert!(
+            !upstream_cell_points_at(&cell, &other),
+            "a directive naming a different upstream must repoint (teardown evacuation)"
+        );
+
+        // An unset cell (pre-bootstrap) is never 'already there' → first directive applies.
+        let empty: SharedUpstream = coxswain_core::Shared::from_value(None);
+        assert!(
+            !upstream_cell_points_at(&empty, &same),
+            "an unset upstream cell must apply the first directive"
         );
     }
 
