@@ -378,7 +378,7 @@ const RELAY_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(3);
 /// mode renders as text naming *why* the state is unknown. That distinction is
 /// the point — "the controller reports no relay series" (an orphaned relay, a
 /// real finding) must not be confused with "we could not reach the controller".
-pub async fn relay_diagnostics(client: &Client, namespace: &str) -> String {
+pub async fn relay_diagnostics(client: &Client, scope: RelayScope<'_>) -> String {
     let pod = match live_leader_pod_name(client).await {
         Ok(p) => p,
         Err(e) => return format!("relay state unknown (no reachable leader: {e})"),
@@ -402,29 +402,56 @@ pub async fn relay_diagnostics(client: &Client, namespace: &str) -> String {
         Err(e) => return format!("relay state unknown (scrape of {pod} failed: {e})"),
     };
 
-    let states =
-        wait::labelled_metric_samples(&body, "coxswain_relay_state", &[("namespace", namespace)]);
+    let selector = scope.label_selector();
+    let states = wait::labelled_metric_samples(&body, "coxswain_relay_state", &selector);
     let active: Vec<&str> = states
         .iter()
         .filter(|(_, v)| *v > 0.0)
         .filter_map(|(block, _)| wait::label_value(block, "state"))
         .collect();
-    let subscribers = wait::labelled_metric_value(
-        &body,
-        "coxswain_relay_subscribers",
-        &[("namespace", namespace)],
-    );
+    let subscribers = wait::labelled_metric_value(&body, "coxswain_relay_subscribers", &selector);
 
     match (states.is_empty(), active.as_slice(), subscribers) {
         // No series at all while a relay Deployment still exists is the
         // orphan shape: nothing in the control loop is tracking it.
-        (true, _, _) => format!("relay state on {pod}: NO SERIES (no cell tracks this namespace)"),
+        (true, _, _) => format!(
+            "relay state on {pod}: NO SERIES ({})",
+            scope.no_series_hint()
+        ),
         (false, [], _) => format!("relay state on {pod}: series present but no state set to 1"),
         (false, states, subs) => format!(
             "relay state on {pod}: {} (subscribers={})",
             states.join("+"),
             subs.map_or_else(|| "<absent>".to_string(), |v| v.to_string()),
         ),
+    }
+}
+
+/// Which relay cell [`relay_diagnostics`] reads. The two tiers key their
+/// `coxswain_relay_*` series differently: a namespace relay carries
+/// `namespace="<ns>"`, the single shared-pool relay carries `scope="shared"`
+/// with an empty namespace.
+#[derive(Clone, Copy)]
+pub enum RelayScope<'a> {
+    /// A per-namespace relay, selected by its namespace label.
+    Namespace(&'a str),
+    /// The shared-pool relay — there is exactly one, selected by `scope`.
+    Shared,
+}
+
+impl<'a> RelayScope<'a> {
+    fn label_selector(self) -> Vec<(&'a str, &'a str)> {
+        match self {
+            RelayScope::Namespace(ns) => vec![("namespace", ns)],
+            RelayScope::Shared => vec![("scope", "shared")],
+        }
+    }
+
+    fn no_series_hint(self) -> &'static str {
+        match self {
+            RelayScope::Namespace(_) => "no cell tracks this namespace",
+            RelayScope::Shared => "no cell tracks the shared pool",
+        }
     }
 }
 

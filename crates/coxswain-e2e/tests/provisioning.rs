@@ -1567,6 +1567,9 @@ mod serial {
         .await?;
 
         // Disable the tier → the relay tears down (force-off bypasses the cooldown).
+        // `set_relay_enabled` already blocks through the full rollout (helm --wait +
+        // leader handover + shared-proxy ready), so the GC clock below starts on a
+        // settled control plane.
         set_relay_enabled(false).await?;
         wait::poll_until(
             Duration::from_secs(90),
@@ -1606,7 +1609,9 @@ mod serial {
                 // never repointed", and "no cell tracks this relay at all" are
                 // indistinguishable from outside the controller process, and a
                 // recurrence needs a live reproduction to tell apart.
-                let relay_state = leader::relay_diagnostics(&h.client, &ns.name).await;
+                let relay_state =
+                    leader::relay_diagnostics(&h.client, leader::RelayScope::Namespace(&ns.name))
+                        .await;
                 format!(
                     "namespace relay '{RELAY_NAME}' garbage-collected after the tier is disabled \
                      — still present: [{survivors}]; relay deployment {replicas}; {relay_state}"
@@ -1796,13 +1801,23 @@ mod serial {
         let host = wait_shared_pool_serves(&h, &ns.name).await?;
 
         // Disable the tier → the shared relay tears down (force-off bypasses the cooldown).
+        // `set_relay_enabled` already blocks through the full rollout, so the GC clock
+        // starts on a settled control plane.
         set_relay_enabled(false).await?;
         wait::poll_until(
             Duration::from_secs(90),
             wait::POLL,
             || async {
+                // Name the shared relay's control-loop state on timeout: teardown is
+                // gated on draining to zero subscribers and StartDrain does no cluster
+                // I/O, so "still active" (never decided to drain) and "draining with
+                // subscribers>0" (a proxy never repointed) are otherwise
+                // indistinguishable from the survivor list alone.
+                let relay_state =
+                    leader::relay_diagnostics(&h.client, leader::RelayScope::Shared).await;
                 format!(
-                    "shared relay '{SHARED_RELAY_NAME}' garbage-collected after the tier is disabled"
+                    "shared relay '{SHARED_RELAY_NAME}' garbage-collected after the tier is \
+                     disabled; {relay_state}"
                 )
             },
             || async {
@@ -1893,7 +1908,13 @@ mod serial {
             Duration::from_secs(60),
             wait::POLL,
             || async {
-                format!("relay '{RELAY_NAME}' garbage-collected after an enabled:false policy")
+                let relay_state =
+                    leader::relay_diagnostics(&h.client, leader::RelayScope::Namespace(&ns.name))
+                        .await;
+                format!(
+                    "relay '{RELAY_NAME}' garbage-collected after an enabled:false policy; \
+                     {relay_state}"
+                )
             },
             || async {
                 let gone = deployments.get(RELAY_NAME).await.is_err()
@@ -1982,9 +2003,12 @@ mod serial {
             Duration::from_secs(90),
             wait::POLL,
             || async {
+                let relay_state =
+                    leader::relay_diagnostics(&h.client, leader::RelayScope::Namespace(&ns.name))
+                        .await;
                 format!(
                     "relay '{RELAY_NAME}' torn down after the cooldown at a NONZERO (below-break-even) \
-                     subscriber count"
+                     subscriber count; {relay_state}"
                 )
             },
             || async { deployments.get(RELAY_NAME).await.is_err().then_some(()) },
@@ -2097,9 +2121,13 @@ mod serial {
             Duration::from_secs(90),
             wait::POLL,
             || async {
+                let relay_state =
+                    leader::relay_diagnostics(&h2.client, leader::RelayScope::Namespace(&ns.name))
+                        .await;
                 format!(
                     "relay '{RELAY_NAME}' GC'd after a controller restart below break-even, once the \
-                     namespace drained to zero (proves startup rehydration re-adopted the running relay)"
+                     namespace drained to zero (proves startup rehydration re-adopted the running \
+                     relay); {relay_state}"
                 )
             },
             || async {
