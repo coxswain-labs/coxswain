@@ -49,6 +49,40 @@ pub async fn leader_pod_name(client: &Client) -> anyhow::Result<String> {
         .ok_or_else(|| anyhow::anyhow!("Lease {LEASE_NAME} has no holderIdentity (no leader)"))
 }
 
+/// Current lease holder's pod name, verified to still exist.
+///
+/// [`leader_pod_name`] reads the Lease alone, which lags reality: after a helm
+/// upgrade rolls the controller, `holderIdentity` still names the **deleted**
+/// pod until the lease expires. Port-forwarding to that name then burns
+/// [`pod_admin_forward`]'s full bind deadline before failing — long enough to
+/// swallow a test's timeout message. Cross-checking the live pod list turns that
+/// into an immediate, accurate error.
+///
+/// # Errors
+///
+/// Fails when the Lease is missing or unheld, when the pod list cannot be read,
+/// or when the holder no longer exists (a rollover in flight).
+#[must_use = "the leader pod name identifies which pod to scrape"]
+pub async fn live_leader_pod_name(client: &Client) -> anyhow::Result<String> {
+    let holder = leader_pod_name(client).await?;
+    let api: Api<Pod> = Api::namespaced(client.clone(), SYSTEM_NAMESPACE);
+    let exists = api
+        .list(&ListParams::default().labels("app.kubernetes.io/component=controller"))
+        .await
+        .context("list controller pods")?
+        .items
+        .into_iter()
+        .filter_map(|p| p.metadata.name)
+        .any(|name| name == holder);
+    if exists {
+        Ok(holder)
+    } else {
+        Err(anyhow::anyhow!(
+            "Lease holder '{holder}' no longer exists — leadership is rolling over"
+        ))
+    }
+}
+
 /// Resolve the name of a live shared-proxy pod (#537).
 ///
 /// Needed to target the controller's per-proxy routes view
@@ -297,6 +331,100 @@ impl PodAdminForward {
             .text()
             .await?;
         Ok(wait::parse_metric_value(&body, metric))
+    }
+
+    /// Scrape the raw `/metrics` exposition through this forward, bounded by
+    /// `timeout`.
+    ///
+    /// Unlike [`Self::metric_value`] this returns the whole body, so a caller
+    /// can select by label — necessary for any family carrying several series
+    /// per subject, where a name-only match reports an arbitrary one.
+    ///
+    /// The explicit timeout is load-bearing where this is called from a
+    /// `poll_until` timeout renderer: `reqwest` has no default timeout and the
+    /// renderer is awaited unbounded, so a half-open port-forward (the state a
+    /// rolled controller leaves behind) would hang the test and suppress the
+    /// very message being built.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the client cannot be built, or the scrape errors or exceeds
+    /// `timeout` — e.g. the forwarded pod died.
+    #[must_use = "the exposition is the assertion input"]
+    pub async fn metrics_text(&self, timeout: Duration) -> anyhow::Result<String> {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .context("build timed metrics client")?;
+        Ok(client
+            .get(format!("{}/metrics", self.base_url))
+            .send()
+            .await
+            .context("GET /metrics through the pod forward")?
+            .text()
+            .await?)
+    }
+}
+
+/// How long a relay diagnostic scrape may take. Comfortably above a healthy
+/// scrape, far below any caller's own timeout, so a dead forward reports as an
+/// error instead of consuming the budget for reporting it.
+const RELAY_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// One-line human-readable summary of a namespace's relay control-loop state and
+/// subscriber count, read from the leader's `coxswain_relay_*` gauges.
+///
+/// Written for failure messages, so it never returns an error: every failure
+/// mode renders as text naming *why* the state is unknown. That distinction is
+/// the point — "the controller reports no relay series" (an orphaned relay, a
+/// real finding) must not be confused with "we could not reach the controller".
+pub async fn relay_diagnostics(client: &Client, namespace: &str) -> String {
+    let pod = match live_leader_pod_name(client).await {
+        Ok(p) => p,
+        Err(e) => return format!("relay state unknown (no reachable leader: {e})"),
+    };
+    // Bounded by the same per-tick budget the poll loops use. `pod_admin_forward`
+    // alone waits up to 30 s for the local port to bind — spending that inside a
+    // timeout renderer delays the failure message by half a minute for no gain,
+    // since a forward that has not bound quickly here is not going to.
+    let forward = match tokio::time::timeout(FORWARD_TICK_BUDGET, pod_admin_forward(&pod)).await {
+        Ok(Ok(f)) => f,
+        Ok(Err(e)) => return format!("relay state unknown (port-forward to {pod} failed: {e})"),
+        Err(_) => {
+            return format!(
+                "relay state unknown (port-forward to {pod} did not bind within \
+                 {FORWARD_TICK_BUDGET:?})"
+            );
+        }
+    };
+    let body = match forward.metrics_text(RELAY_DIAGNOSTIC_TIMEOUT).await {
+        Ok(b) => b,
+        Err(e) => return format!("relay state unknown (scrape of {pod} failed: {e})"),
+    };
+
+    let states =
+        wait::labelled_metric_samples(&body, "coxswain_relay_state", &[("namespace", namespace)]);
+    let active: Vec<&str> = states
+        .iter()
+        .filter(|(_, v)| *v > 0.0)
+        .filter_map(|(block, _)| wait::label_value(block, "state"))
+        .collect();
+    let subscribers = wait::labelled_metric_value(
+        &body,
+        "coxswain_relay_subscribers",
+        &[("namespace", namespace)],
+    );
+
+    match (states.is_empty(), active.as_slice(), subscribers) {
+        // No series at all while a relay Deployment still exists is the
+        // orphan shape: nothing in the control loop is tracking it.
+        (true, _, _) => format!("relay state on {pod}: NO SERIES (no cell tracks this namespace)"),
+        (false, [], _) => format!("relay state on {pod}: series present but no state set to 1"),
+        (false, states, subs) => format!(
+            "relay state on {pod}: {} (subscribers={})",
+            states.join("+"),
+            subs.map_or_else(|| "<absent>".to_string(), |v| v.to_string()),
+        ),
     }
 }
 

@@ -1599,9 +1599,17 @@ mod serial {
                     }
                     Err(_) => "<deployment gone>".to_string(),
                 };
+                // Which objects survived says WHAT is stuck; the control-loop
+                // state says WHY. GC is gated on draining to zero subscribers,
+                // and deciding to drain performs no cluster I/O — so without
+                // the gauges, "never decided to drain", "decided but a proxy
+                // never repointed", and "no cell tracks this relay at all" are
+                // indistinguishable from outside the controller process, and a
+                // recurrence needs a live reproduction to tell apart.
+                let relay_state = leader::relay_diagnostics(&h.client, &ns.name).await;
                 format!(
                     "namespace relay '{RELAY_NAME}' garbage-collected after the tier is disabled \
-                     — still present: [{survivors}]; relay deployment {replicas}"
+                     — still present: [{survivors}]; relay deployment {replicas}; {relay_state}"
                 )
             },
             || async {

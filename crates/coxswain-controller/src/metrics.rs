@@ -16,6 +16,8 @@ use prometheus::{
 };
 use std::sync::OnceLock;
 
+use crate::operator::relay_autoscaler::RelayState;
+
 /// Histogram buckets shared by `reconcile_duration_seconds` and
 /// `status_patch_duration_seconds`. Same shape as the reflector's
 /// `routing_table_rebuild_duration_seconds` — operators dashboard on
@@ -115,6 +117,115 @@ pub(crate) fn dataplane_proxies() -> &'static IntGaugeVec {
         )
         .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
     })
+}
+
+/// Gauge: `1` on the relay cell's current control-loop state, `0` on the others.
+///
+/// The relay's state machine is otherwise invisible from outside the process —
+/// `StartDrain` performs no cluster I/O, so `Active` and `Draining` look
+/// identical to anything reading the API server. That distinction is exactly
+/// what separates the three ways a relay teardown fails: never entered
+/// `StartDrain` (a convergence-decision problem), entered it but subscribers
+/// never reached zero (a proxy-repoint problem), or no cell existed at all so
+/// the loop only ever provisioned. Pair with [`relay_subscribers`], which is the
+/// value the drain gate itself reads.
+///
+/// `scope` is `namespace` or `shared`; the shared tier carries an empty
+/// `namespace` because there is exactly one such cell. **Absence** of the series
+/// while a relay Deployment still exists is itself diagnostic — it means no cell
+/// is tracking that relay. Series are removed when the cell is cleared, so
+/// labels do not grow unbounded.
+///
+/// Only the leader publishes: the relay control loop runs leader-only, so a
+/// follower reporting state would double-count under `sum by (namespace,state)`.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`leader`].
+pub(crate) fn relay_state() -> &'static IntGaugeVec {
+    static GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        register_int_gauge_vec!(
+            Opts::new(
+                "coxswain_relay_state",
+                "1 on the relay cell's current control-loop state (provisioning/active/draining), \
+                 0 on the others"
+            ),
+            &["scope", "namespace", "state"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Gauge: downstream subscribers still folded behind the relay — the exact value
+/// the teardown drain gate reads.
+///
+/// Teardown completes only once this reaches 0, so a relay stuck in `draining`
+/// with this pinned above 0 is a proxy that never repointed back to the
+/// controller. See [`relay_state`] for the label scheme and the leader-only rule.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`leader`].
+pub(crate) fn relay_subscribers() -> &'static IntGaugeVec {
+    static GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        register_int_gauge_vec!(
+            Opts::new(
+                "coxswain_relay_subscribers",
+                "Downstream subscribers still folded behind the relay (the drain gate's input)"
+            ),
+            &["scope", "namespace"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Publish a relay cell's `(state, subscribers)` under `scope`/`namespace`, or
+/// remove its series entirely when `state` is `None` (no cell — never
+/// provisioned, or torn down).
+///
+/// Removal must happen at the moment the cell is cleared: the relay pass
+/// iterates the union of Gateway-holding and currently-tracked namespaces, so a
+/// cleared namespace drops out of that set and never gets a later chance to
+/// clean up after itself.
+pub(crate) fn publish_relay(
+    scope: &str,
+    namespace: &str,
+    state: Option<RelayState>,
+    subscribers: u32,
+) {
+    let Some(state) = state else {
+        clear_relay(scope, namespace);
+        return;
+    };
+    for candidate in RelayState::ALL {
+        relay_state()
+            .with_label_values(&[scope, namespace, candidate.metric_label()])
+            .set(i64::from(candidate == state));
+    }
+    relay_subscribers()
+        .with_label_values(&[scope, namespace])
+        .set(i64::from(subscribers));
+}
+
+/// Drop every series for one relay cell. `Err` = the series was never emitted;
+/// ignore it, exactly as `clear_dataplane_gauge` does.
+pub(crate) fn clear_relay(scope: &str, namespace: &str) {
+    for candidate in RelayState::ALL {
+        let _ = relay_state().remove_label_values(&[scope, namespace, candidate.metric_label()]);
+    }
+    let _ = relay_subscribers().remove_label_values(&[scope, namespace]);
+}
+
+/// Drop **all** relay series on this replica.
+///
+/// Called on demotion: the relay loop stops on a lease loss, so without this the
+/// demoted replica would keep exporting its final values forever and
+/// `sum by (namespace, state)` would count two leaders' worth of state.
+pub(crate) fn reset_relay_gauges() {
+    relay_state().reset();
+    relay_subscribers().reset();
 }
 
 /// Histogram: reconcile-loop wall-clock duration, by controller key.

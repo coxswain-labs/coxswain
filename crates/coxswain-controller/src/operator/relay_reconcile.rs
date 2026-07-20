@@ -210,6 +210,17 @@ async fn process_namespace(
     // An SSA/delete into a terminating namespace is doomed (403) and its relay GCs
     // with the namespace regardless — skip to avoid warn-log churn.
     if namespace_is_terminating(&ctx.namespaces_store, namespace) {
+        // Drop the record, not just the series. This path never reaches
+        // `advance`, so the series would otherwise keep exporting the last state
+        // — and clearing the series alone is not enough either: once the
+        // Namespace object finishes deleting it leaves the store, and
+        // `namespace_is_terminating` then reports false for an ABSENT namespace,
+        // so the next pass would fall through to `advance` and re-create
+        // `state="draining"` for a namespace that no longer exists. Dropping the
+        // record also takes the namespace out of the pass's iteration set, which
+        // is correct: the relay GCs with the namespace either way.
+        ctx.relay_states.lock().remove(namespace);
+        crate::metrics::clear_relay("namespace", namespace);
         return;
     }
     let mut policy = ctx.resolve_relay_policy(namespace);
@@ -271,6 +282,14 @@ impl RelayCell for NamespaceCell<'_> {
 
     async fn delete(&self) -> Result<(), apply::ApplyError> {
         delete_relay_resources(&self.ctx.client, self.namespace, render_relay::RELAY_NAME).await
+    }
+
+    fn metric_labels(&self) -> (&'static str, &str) {
+        ("namespace", self.namespace)
+    }
+
+    fn is_leader(&self) -> bool {
+        self.ctx.leader.load(Ordering::Acquire)
     }
 
     fn log_provision_failed(&self, error: &apply::ApplyError) {

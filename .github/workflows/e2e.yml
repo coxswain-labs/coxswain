@@ -286,6 +286,11 @@ jobs:
           COXSWAIN_E2E_SKIP_BUILD: "1"
           RUST_LOG: coxswain_e2e=debug,warn
 
+      # Must start BEFORE the tests: the serial pass rolls the controller
+      # Deployment between tests, so a post-hoc `kubectl logs` cannot reach the
+      # pod that logged an earlier failure.
+      - uses: ./.github/actions/stream-cluster-logs
+
       # Two passes (see .config/nextest.toml): the parallel `e2e` profile, then
       # the serial `e2e-serial` profile (global-config mutators + resilience).
       # `--no-tests=pass` makes the empty side a no-op for suites that have
@@ -310,6 +315,20 @@ jobs:
 
       - uses: ./.github/actions/dump-cluster-state
         if: failure()
+
+      # The dump prints only a bounded tail inline; the complete stream — which
+      # is what covers a failure window early in a long suite — rides here.
+      # The env guard covers a failure BEFORE the streamer starts (e.g. cluster
+      # bootstrap): upload-artifact rejects an empty `path` input outright,
+      # which `if-no-files-found: ignore` does not cover.
+      - name: Upload streamed cluster logs
+        if: failure() && env.COXSWAIN_CLUSTER_LOG_FILE != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: cluster-logs-${{ matrix.suite }}
+          path: ${{ env.COXSWAIN_CLUSTER_LOG_FILE }}
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Mirror of `e2e` that runs only on docs-only (no-code-change) PRs. Its
   # `name:` resolves to the same `e2e-<suite>` strings as the real matrix, so

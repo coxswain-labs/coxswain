@@ -584,6 +584,13 @@ impl Controller {
                         self.leader.store(is_leader, Ordering::Release);
                         crate::metrics::leader().set(i64::from(is_leader));
                         crate::metrics::leader_transitions_total().inc();
+                        if !is_leader {
+                            // The relay control loop stops on demotion, so its
+                            // gauges would otherwise freeze at their last values
+                            // and a `sum by (namespace, state)` would count this
+                            // replica alongside the new leader's.
+                            crate::metrics::reset_relay_gauges();
+                        }
                         self.publish_leadership(is_leader);
                         if is_leader {
                             // Promotion: rehydrate the operator's provisioned-relay

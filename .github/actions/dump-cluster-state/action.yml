@@ -24,14 +24,46 @@ runs:
         kubectl get pods -n coxswain-system -o wide || true
         echo "=== Describe coxswain pods ==="
         kubectl describe pods -n coxswain-system -l app.kubernetes.io/name=coxswain || true
-        echo "=== Current container logs (controller) ==="
-        kubectl logs -n coxswain-system deploy/coxswain-controller --tail=200 --all-containers --ignore-errors || true
-        echo "=== Previous container logs (controller, if crashed) ==="
-        kubectl logs -n coxswain-system deploy/coxswain-controller --tail=200 --all-containers --previous --ignore-errors || true
-        echo "=== Current container logs (shared-proxy) ==="
-        kubectl logs -n coxswain-system deploy/coxswain-shared-proxy --tail=200 --all-containers --ignore-errors || true
-        echo "=== Previous container logs (shared-proxy, if crashed) ==="
-        kubectl logs -n coxswain-system deploy/coxswain-shared-proxy --tail=200 --all-containers --previous --ignore-errors || true
+        # The primary log source is the continuous stream started by
+        # `stream-cluster-logs` — it is the only one that survives a pod being
+        # deleted between the failing assertion and this step. The full stream
+        # is uploaded as an artifact; a bounded tail goes inline so the failure
+        # is readable without leaving the job page.
+        # Three outcomes, kept distinct: a job that never wired the streamer, a
+        # streamer that started but captured nothing, and the normal case. They
+        # need different fixes, so reporting one as another sends the reader
+        # after workflow wiring that is already correct.
+        if [ -s "${COXSWAIN_CLUSTER_LOG_FILE:-/nonexistent}" ]; then
+          echo "=== Streamed cluster logs (last 2000 lines; full stream in the job artifact) ==="
+          tail -n 2000 "${COXSWAIN_CLUSTER_LOG_FILE}" || true
+        elif [ -n "${COXSWAIN_CLUSTER_LOG_FILE:-}" ]; then
+          echo "=== Streamed cluster logs: EMPTY ==="
+          echo "The streamer ran but captured nothing. Streamer stderr:"
+          cat /tmp/coxswain-log-streamer.err 2>/dev/null || echo "(no stderr file)"
+          echo "Pods matching the selector right now:"
+          kubectl get pods --all-namespaces -l app.kubernetes.io/name=coxswain || true
+        else
+          echo "=== Streamed cluster logs: NOT STARTED ==="
+          echo "This job did not run ./.github/actions/stream-cluster-logs."
+          echo "Logs below cover only pods still alive right now."
+        fi
+
+        # Live-pod logs, as a supplement. Two things the obvious form gets
+        # wrong: `deploy/<name>` reads exactly ONE of the controller's two
+        # replicas (and the relay control loop only runs on the leader), and
+        # `-n coxswain-system` misses namespace relays and dedicated proxies,
+        # which are rendered into the tenant namespace.
+        NAMESPACES=$(kubectl get pods --all-namespaces \
+          -l app.kubernetes.io/name=coxswain \
+          -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' 2>/dev/null | sort -u) || true
+        for NS in $NAMESPACES; do
+          echo "=== Current container logs (namespace $NS) ==="
+          kubectl logs -n "$NS" -l app.kubernetes.io/name=coxswain \
+            --prefix --timestamps --all-containers --ignore-errors --tail=200 || true
+          echo "=== Previous container logs (namespace $NS, if crashed) ==="
+          kubectl logs -n "$NS" -l app.kubernetes.io/name=coxswain \
+            --prefix --timestamps --all-containers --ignore-errors --previous --tail=200 || true
+        done
         # Controller /metrics (#570): the metric families that distinguish the
         # known failure shapes without needing to catch them live in logs —
         # reconcile_errors_total{reason} (transient vs persistent apiserver

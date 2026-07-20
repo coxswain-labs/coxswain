@@ -92,6 +92,8 @@ The `listener` label is the **local port the proxy accepted the connection on**.
 | `coxswain_controller_routing_table_rebuild_duration_seconds` | Histogram | — |
 | `coxswain_controller_tls_certs_loaded` | Gauge | `bucket` |
 | `coxswain_gateway_dataplane_proxies` | Gauge | `namespace`, `gateway` (connected proxies serving a dedicated Gateway; live, alert on `== 0`) |
+| `coxswain_relay_state` | Gauge | `scope` (`namespace`/`shared`), `namespace`, `state` (`provisioning`/`active`/`draining`) |
+| `coxswain_relay_subscribers` | Gauge | `scope`, `namespace` (subscribers still folded behind the relay) |
 
 `coxswain_controller_reconcile_errors_total`'s `reason` label is a bounded classification of the underlying Kubernetes API error: `namespace_terminating` (SSA into a namespace mid-deletion — a self-resolving race), `conflict` (409), `forbidden` (RBAC), `not_found`, `invalid` (422 validation/webhook rejection), `api_other`, `transport`, `internal`. Errors classified `forbidden`/`invalid` are persistent — the operator polls them at a flat 15 s because retrying faster cannot fix RBAC or a rejected spec; every other class retries with a per-Gateway exponential backoff (0.5 s doubling to a 15 s cap, reset on the first success). A sustained non-zero rate on a persistent reason is an operator-action signal, not a transient blip.
 
@@ -104,6 +106,22 @@ The `listener` label is the **local port the proxy accepted the connection on**.
 `coxswain_gateway_dataplane_proxies{namespace,gateway}` is the **live** count of data-plane proxies serving a dedicated Gateway — folded-behind-relay or directly connected. It is the counterpart to the Gateway's latched `Programmed` status: `Programmed` is a spec-observation signal that deliberately stays `True` through data-plane churn (rollouts, HPA, relay blips, leader failover) and only re-arms on a spec change, so it does **not** go `False` when every proxy behind a Gateway dies. Alert on `coxswain_gateway_dataplane_proxies == 0 for N s` to catch that total-loss blind spot; alert on `Programmed` for spec observation, never for liveness. (See [How `Programmed` status is gated](../architecture/discovery-protocol.md#how-programmed-status-is-gated).)
 
 The series is **dedicated Gateways only**: every shared proxy serves every shared Gateway, so a per-shared-Gateway series would be pool-size × Gateways cardinality for no added signal — shared-pool total loss is the global `coxswain_discovery_connected_proxies` (below) reaching 0. The controller removes a Gateway's series on deprovision/delete, so labels do not grow unbounded.
+
+#### Relay lifecycle
+
+`coxswain_relay_state{scope,namespace,state}` reports `1` on a relay cell's current control-loop state and `0` on the others; `coxswain_relay_subscribers{scope,namespace}` reports how many downstream subscribers are still folded behind it. `scope` is `namespace` or `shared`, and the shared tier carries an empty `namespace` because there is exactly one such cell.
+
+The pair exists because relay teardown is otherwise opaque. Deciding to drain performs **no** cluster I/O — it only repoints leaves back to the controller in memory — so `active` and `draining` look identical to anything reading the Kubernetes API, and a relay that fails to disappear gives no clue as to why. The three failure shapes are distinguishable only here:
+
+| Observation | Meaning |
+|---|---|
+| `state="active"` persists, relay Deployment still up | Teardown was never decided — a convergence problem |
+| `state="draining"` with `coxswain_relay_subscribers > 0` | Teardown decided, but a proxy never repointed back to the controller |
+| Relay Deployment exists with **no** `coxswain_relay_*` series | No cell is tracking it — an orphan the control loop will only ever provision, never reclaim |
+
+That last row is why absence is meaningful: series are removed the moment a cell is cleared, so a relay with no series is a real finding rather than a scrape gap. Alert on `state="draining"` persisting beyond a few minutes.
+
+Only the leader publishes, since the relay control loop is leader-only; a demoted replica clears its relay series rather than freezing them, so `sum by (namespace, state) (coxswain_relay_state)` stays at 1 per live relay across a failover.
 
 ### Discovery channel metrics (`coxswain_discovery_*`)
 

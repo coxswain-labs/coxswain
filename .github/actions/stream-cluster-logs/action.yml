@@ -1,0 +1,110 @@
+name: Stream cluster logs
+description: >
+  Starts a background follower that streams every coxswain pod's logs to a file
+  for the remainder of the job. Call once, after the cluster is bootstrapped and
+  before the step whose failure needs diagnosing.
+
+  Retrospective collection (`kubectl logs` at `if: failure()`) cannot capture a
+  failure window in these suites: a job-level `if: failure()` runs only after
+  every test finishes, and the e2e mutators roll the controller Deployment
+  between tests — so by dump time the pod that logged the failure has been
+  deleted, and no `--tail` or `--since` can reach it. Following continuously is
+  the only collection that survives pod replacement.
+
+inputs:
+  log-file:
+    description: Path the combined stream is appended to.
+    required: false
+    default: /tmp/coxswain-cluster-logs.txt
+  selector:
+    description: Label selector matching the pods to follow.
+    required: false
+    default: app.kubernetes.io/name=coxswain
+
+runs:
+  using: composite
+  steps:
+    - name: Start cluster log stream
+      shell: bash
+      env:
+        LOG_FILE: ${{ inputs.log-file }}
+        SELECTOR: ${{ inputs.selector }}
+      run: |
+        # Never fail the job from a diagnostic: a lost log stream must not turn
+        # a passing suite red.
+        set +e
+
+        : > "$LOG_FILE"
+
+        cat > /tmp/coxswain-log-streamer.sh <<'STREAMER'
+        #!/usr/bin/env bash
+        LOG_FILE="$1"
+        SELECTOR="$2"
+
+        # One follower per POD, not per selector. `kubectl logs -f -l <sel>`
+        # attaches to the pods matching at that instant and never re-lists —
+        # verified against a live cluster: delete one of two controller pods
+        # and the follower happily keeps streaming the survivor while the
+        # replacement is never picked up. Since surviving a pod replacement is
+        # the entire point here, discovery has to be its own loop.
+        follow_pod() {
+          ns="$1"
+          pod="$2"
+          # `--tail=-1` is not redundant: kubectl defaults --tail to 10 when a
+          # selector is involved. First attach takes the pod's full history;
+          # reattaches (container restart, transient API error) take a short
+          # overlap window, so a blip duplicates a few lines instead of
+          # replaying the whole log.
+          since=""
+          while true; do
+            # shellcheck disable=SC2086
+            kubectl logs -f -n "$ns" "$pod" \
+              --prefix --timestamps --all-containers --ignore-errors \
+              --tail=-1 $since >> "$LOG_FILE" 2>/dev/null
+            since="--since=15s"
+            # Stop ONLY on a confirmed NotFound. Treating any non-zero exit as
+            # "pod is gone" would let a single apiserver blip retire the
+            # follower permanently — and since `seen` is never pruned, that pod
+            # would never be re-attached, silently losing exactly the logs this
+            # action exists to collect. Under a loaded kind runner those blips
+            # are routine.
+            case "$(kubectl get pod -n "$ns" "$pod" 2>&1)" in
+              *NotFound*) return ;;
+            esac
+            # Also covers a pod still Pending: retry until it has a container
+            # to stream, or until the pod goes away.
+            sleep 2
+          done
+        }
+
+        # Pod names carry a random suffix and are never reused, so a flat seen
+        # list needs no eviction.
+        seen=" "
+        while true; do
+          # `kubectl logs` has no --all-namespaces; only `get` does. Namespace
+          # relays and dedicated proxies are rendered into the TENANT
+          # namespace, so a coxswain-system-only stream would miss the pods
+          # most e2e failures are actually about.
+          for entry in $(kubectl get pods --all-namespaces -l "$SELECTOR" \
+                           -o jsonpath='{range .items[*]}{.metadata.namespace}/{.metadata.name}{"\n"}{end}' \
+                           2>/dev/null); do
+            case "$seen" in
+              *" $entry "*) ;;
+              *)
+                seen="$seen$entry "
+                follow_pod "${entry%%/*}" "${entry##*/}" &
+                ;;
+            esac
+          done
+          sleep 3
+        done
+        STREAMER
+        chmod +x /tmp/coxswain-log-streamer.sh
+
+        # Detached so it outlives this composite step and keeps following for
+        # the rest of the job (same pattern as setup-kind-cluster's
+        # cloud-provider-kind).
+        nohup /tmp/coxswain-log-streamer.sh "$LOG_FILE" "$SELECTOR" \
+          > /tmp/coxswain-log-streamer.err 2>&1 &
+        echo "cluster log streamer started (PID $!) → $LOG_FILE"
+        echo "COXSWAIN_CLUSTER_LOG_FILE=$LOG_FILE" >> "$GITHUB_ENV"
