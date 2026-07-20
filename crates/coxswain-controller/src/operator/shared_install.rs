@@ -219,6 +219,14 @@ impl RelayCell for SharedCell<'_> {
         .await
     }
 
+    fn metric_labels(&self) -> (&'static str, &str) {
+        ("shared", "")
+    }
+
+    fn is_leader(&self) -> bool {
+        self.ctx.leader.load(Ordering::Acquire)
+    }
+
     fn log_provision_failed(&self, error: &super::apply::ApplyError) {
         tracing::warn!(error = %error, "shared relay: provision apply failed; retrying next pass");
     }

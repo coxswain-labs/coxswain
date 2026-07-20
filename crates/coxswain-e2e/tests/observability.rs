@@ -41,9 +41,10 @@ use anyhow::Context as _;
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, Harness, IngressClassGuard, NamespaceGuard,
     fixtures::{self, backends, gateway_api as gwa, ingress},
-    harness::{capability, wait},
+    harness::{capability, leader, wait},
 };
 use gateway_api_types::apis::standard::gateways::Gateway;
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::events::v1::Event as K8sEvent;
 use k8s_openapi::api::networking::v1::Ingress;
 use kube::Api;
@@ -51,6 +52,9 @@ use kube::api::{DeleteParams, Patch, PatchParams};
 use std::time::Duration;
 
 mod common;
+
+/// The namespace relay's fixed resource name (mirrors `render_relay::RELAY_NAME`).
+const RELAY_NAME: &str = "coxswain-relay";
 
 /// Controller-subsystem checks asserted in `/status.subsystems.controller.checks`.
 ///
@@ -2030,6 +2034,220 @@ mod serial {
         assert!(
             metrics.contains("coxswain_proxy_requests_total{"),
             "metrics must still emit even with access logging disabled"
+        );
+        Ok(())
+    }
+
+    /// Happy path: a provisioned namespace relay reports `state="active"` and a
+    /// live subscriber count.
+    ///
+    /// Asserts per LABEL, not per metric name. `coxswain_relay_state` carries one
+    /// series per lifecycle state, so a name-only read (`parse_metric_value`)
+    /// returns whichever series is printed first and would be satisfied by any
+    /// state reading 1 — this would pass against a gauge that never leaves
+    /// `provisioning`. Checking `draining == 0` in the same breath is what makes
+    /// "exactly one state is set" an actual assertion.
+    #[tokio::test]
+    async fn relay_state_and_subscriber_metrics_track_the_control_loop() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(1),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "obs-relay-metrics").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        common::dedicated::apply_and_wait(&h, &ns).await?;
+
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(60)).await?;
+
+        // Scrape the LEADER: the relay control loop is leader-gated, so the
+        // follower never registers these series and a Service-level forward
+        // (which pins an arbitrary replica) would fail ~half the time.
+        let leader_pod = leader::live_leader_pod_name(&h.client).await?;
+        let forward = leader::pod_admin_forward(&leader_pod).await?;
+
+        wait::poll_until(
+            Duration::from_secs(90),
+            wait::POLL,
+            || async {
+                // Render a scrape error as an error. `unwrap_or_default()` here
+                // would print `state=[]` — which reads as "the series are gone",
+                // a claim about the controller rather than about the tunnel.
+                let rendered = match forward.metrics_text(Duration::from_secs(3)).await {
+                    Ok(body) => format!(
+                        "state={:?} subscribers={:?}",
+                        wait::labelled_metric_samples(
+                            &body,
+                            "coxswain_relay_state",
+                            &[("namespace", &ns.name)],
+                        ),
+                        wait::labelled_metric_value(
+                            &body,
+                            "coxswain_relay_subscribers",
+                            &[("namespace", &ns.name)],
+                        ),
+                    ),
+                    Err(e) => format!("<scrape of {leader_pod} failed: {e}>"),
+                };
+                format!(
+                    "relay '{RELAY_NAME}' in '{}' to report state=active with >=1 folded \
+                     subscriber on {leader_pod}; now: {rendered}",
+                    ns.name
+                )
+            },
+            // Both conditions come from ONE scrape, and both must hold. They
+            // cannot be split: `Provisioning -> Active` is gated on the relay's
+            // own readiness, and leaves only fold behind it after the pass that
+            // flips the state publishes its repoint sets. So on the pass where
+            // `active=1` first appears, `subscribers` is necessarily still 0 —
+            // asserting it separately, right after the state poll returns, reads
+            // 0 and fails until the next resync tick.
+            || async {
+                let body = forward.metrics_text(Duration::from_secs(3)).await.ok()?;
+                let active = wait::labelled_metric_value(
+                    &body,
+                    "coxswain_relay_state",
+                    &[("namespace", &ns.name), ("state", "active")],
+                )?;
+                let subscribers = wait::labelled_metric_value(
+                    &body,
+                    "coxswain_relay_subscribers",
+                    &[("namespace", &ns.name)],
+                )?;
+                (active == 1.0 && subscribers >= 1.0).then_some(())
+            },
+        )
+        .await?;
+
+        let body = forward.metrics_text(Duration::from_secs(3)).await?;
+        let draining = wait::labelled_metric_value(
+            &body,
+            "coxswain_relay_state",
+            &[("namespace", &ns.name), ("state", "draining")],
+        );
+        assert_eq!(
+            draining,
+            Some(0.0),
+            "an active relay must report draining=0, got {draining:?} — a gauge that sets \
+             several states at once cannot distinguish a stuck teardown"
+        );
+        Ok(())
+    }
+
+    /// Sad path: tearing the relay down removes its series.
+    ///
+    /// Teardown is driven by a namespaced `CoxswainRelayPolicy{enabled: false}`,
+    /// **not** by flipping the tier off through Helm. That distinction is the
+    /// whole test: `relay.enabled` is a controller pod env var, so a Helm route
+    /// would roll the controller — and Prometheus series live in the process, so
+    /// they would vanish with the old pod no matter what the code does. Such a
+    /// test passes against a completely unimplemented removal. Driving teardown
+    /// via a CR keeps the same process alive, so absence proves removal.
+    /// Re-asserting the leader pod is unchanged closes the same hole from the
+    /// other side (an incidental restart mid-test).
+    #[tokio::test]
+    async fn relay_metrics_removed_when_relay_torn_down() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(1),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "obs-relay-gc-metrics").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_backends(&ns.name).await?;
+        common::dedicated::apply_and_wait(&h, &ns).await?;
+
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(60)).await?;
+
+        let leader_pod = leader::live_leader_pod_name(&h.client).await?;
+        let forward = leader::pod_admin_forward(&leader_pod).await?;
+
+        // The series must exist first, or "absent" proves nothing.
+        wait::poll_until(
+            Duration::from_secs(90),
+            wait::POLL,
+            || async { format!("relay series for '{}' to appear before teardown", ns.name) },
+            || async {
+                let body = forward.metrics_text(Duration::from_secs(3)).await.ok()?;
+                let present = !wait::labelled_metric_samples(
+                    &body,
+                    "coxswain_relay_state",
+                    &[("namespace", &ns.name)],
+                )
+                .is_empty();
+                present.then_some(())
+            },
+        )
+        .await?;
+
+        fixtures::apply_fixture(
+            fixtures::dedicated_proxy::RELAY_POLICY_FORCE_OFF,
+            FixtureVars::new(&ns.name),
+        )
+        .await?;
+
+        wait::poll_until(
+            Duration::from_secs(90),
+            wait::POLL,
+            || async {
+                // A failed scrape must NOT render as empty sample lists: this
+                // test is waiting for exactly that emptiness, so collapsing an
+                // error into it would print the success condition as the reason
+                // for failure and send the reader after a controller bug that
+                // does not exist.
+                let rendered = match forward.metrics_text(Duration::from_secs(3)).await {
+                    Ok(body) => format!(
+                        "state={:?} subscribers={:?}",
+                        wait::labelled_metric_samples(
+                            &body,
+                            "coxswain_relay_state",
+                            &[("namespace", &ns.name)],
+                        ),
+                        wait::labelled_metric_samples(
+                            &body,
+                            "coxswain_relay_subscribers",
+                            &[("namespace", &ns.name)],
+                        ),
+                    ),
+                    Err(e) => format!("<scrape of {leader_pod} failed: {e}>"),
+                };
+                format!(
+                    "every coxswain_relay_* series for '{}' to be removed after an \
+                     enabled:false policy; now: {rendered}",
+                    ns.name
+                )
+            },
+            || async {
+                let body = forward.metrics_text(Duration::from_secs(3)).await.ok()?;
+                let gone = wait::labelled_metric_samples(
+                    &body,
+                    "coxswain_relay_state",
+                    &[("namespace", &ns.name)],
+                )
+                .is_empty()
+                    && wait::labelled_metric_samples(
+                        &body,
+                        "coxswain_relay_subscribers",
+                        &[("namespace", &ns.name)],
+                    )
+                    .is_empty();
+                gone.then_some(())
+            },
+        )
+        .await?;
+
+        let still_leader = leader::live_leader_pod_name(&h.client).await?;
+        assert_eq!(
+            still_leader, leader_pod,
+            "the leader must not have rolled during this test — a restarted controller \
+             loses all in-memory series, which would make the removal assertion vacuous"
         );
         Ok(())
     }

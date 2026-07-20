@@ -199,6 +199,10 @@ runs:
         echo "usable=${USABLE}" >> "$GITHUB_OUTPUT"
         echo "GatewayStaticAddresses usable=${USABLE} unusable=192.0.2.1"
 
+    # Before the suite: the dump runs after the full 55 min, by which point a
+    # crashed-and-replaced pod is unreachable by `kubectl logs`.
+    - uses: ./.github/actions/stream-cluster-logs
+
     - name: Run Gateway API conformance suite
       id: conformance
       shell: bash
@@ -265,3 +269,16 @@ runs:
 
     - uses: ./.github/actions/dump-cluster-state
       if: failure()
+
+    # In the action so all three callers collect it. Name is per-leg because
+    # upload-artifact rejects duplicate names across parallel matrix jobs. The
+    # env guard covers an EMPTY path (rejected outright), which
+    # `if-no-files-found` does not.
+    - name: Upload streamed cluster logs
+      if: failure() && env.COXSWAIN_CLUSTER_LOG_FILE != ''
+      uses: actions/upload-artifact@v7
+      with:
+        name: cluster-logs-conformance-${{ inputs.gateway-api-version || 'default' }}
+        path: ${{ env.COXSWAIN_CLUSTER_LOG_FILE }}
+        if-no-files-found: ignore
+        retention-days: 7

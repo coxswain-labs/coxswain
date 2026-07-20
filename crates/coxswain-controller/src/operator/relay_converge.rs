@@ -52,6 +52,20 @@ pub(super) trait RelayCell {
     /// and the next pass retries.
     async fn delete(&self) -> Result<(), ApplyError>;
 
+    /// The `(scope, namespace)` Prometheus label pair identifying this cell's
+    /// series. The shared tier carries an empty namespace — there is exactly one
+    /// such cell, so a name would add cardinality without adding information.
+    fn metric_labels(&self) -> (&'static str, &str);
+
+    /// Whether this replica still holds the leader lease.
+    ///
+    /// Checked on both sides of the metric publish rather than trusted from the
+    /// top of the pass: the relay loop reads leadership once and then `.await`s
+    /// cluster I/O, so a lease lost mid-apply would otherwise have a demoted
+    /// replica publish state it is no longer authoritative for — and apiserver
+    /// pressure produces the slow apply and the failed renewal at the same time.
+    fn is_leader(&self) -> bool;
+
     /// Log a failed provisioning apply (warn; the pass retries).
     fn log_provision_failed(&self, error: &ApplyError);
     /// Log a completed provision (info; relay applied, awaiting Ready).
@@ -84,13 +98,48 @@ pub(super) enum Converge {
     Retry,
 }
 
-/// Advance one relay cell's state machine and perform the decided I/O.
+/// Advance one relay cell's state machine, perform the decided I/O, and publish
+/// the resulting state to `coxswain_relay_*`.
 ///
 /// Level-triggered: the record's `next_state`/replica baseline is committed only
 /// **after** the I/O succeeds, so a failed apply/delete leaves the record unchanged
 /// for the next pass. Shared by both relay tiers; the substrate divergences are the
 /// [`RelayCell`] impl.
+///
+/// The metric publish reads the cell back **after** the transition, on every exit
+/// path — including [`Converge::Retry`], where the record is deliberately
+/// unchanged and so still describes reality. A cleared cell removes its series
+/// here, at the moment of deletion, because the relay pass stops iterating a
+/// namespace once its record is gone.
 pub(super) async fn advance(
+    cell: &impl RelayCell,
+    inputs: RelayInputs,
+    tuning: &RelayTuning,
+    now: Instant,
+) -> Converge {
+    let outcome = transition(cell, inputs, tuning, now).await;
+    let (scope, namespace) = cell.metric_labels();
+    if cell.is_leader() {
+        let state = cell.load().map(|r| r.state);
+        crate::metrics::publish_relay(scope, namespace, state, inputs.subscribers);
+        // Re-check AFTER publishing, not only before. A demotion landing between
+        // the first check and the write would run its gauge reset first and have
+        // this publish re-create the series afterwards — freezing them on a
+        // replica whose relay loop will never run again. Re-checking converges
+        // that window to cleared; a demotion after this point is covered by the
+        // reset on the demotion edge itself.
+        if !cell.is_leader() {
+            crate::metrics::clear_relay(scope, namespace);
+        }
+    } else {
+        crate::metrics::clear_relay(scope, namespace);
+    }
+    outcome
+}
+
+/// The state machine proper. Split from [`advance`] so the metric publish covers
+/// every early return without threading it through each arm.
+async fn transition(
     cell: &impl RelayCell,
     inputs: RelayInputs,
     tuning: &RelayTuning,

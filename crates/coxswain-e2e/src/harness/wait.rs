@@ -1144,6 +1144,93 @@ pub fn max_labelled_metric(exposition: &str, metric: &str) -> Option<f64> {
     max
 }
 
+/// Every sample of `metric` whose label block contains all of `labels`, as
+/// `(label block, value)` pairs.
+///
+/// [`parse_metric_value`] matches on the metric NAME only and returns the first
+/// hit, which is wrong for any family with several series per subject — e.g.
+/// `coxswain_relay_state` carries one series per lifecycle state, so a name-only
+/// read reports an arbitrary state's 0 or 1. Selecting by label is what makes
+/// "is this relay `active`?" answerable, and what makes an emptiness assertion
+/// ("no series for MY namespace") safe on a shared fixture.
+#[must_use]
+pub fn labelled_metric_samples<'a>(
+    exposition: &'a str,
+    metric: &str,
+    labels: &[(&str, &str)],
+) -> Vec<(&'a str, f64)> {
+    exposition
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+        .filter_map(|line| {
+            let (name, rest) = line.split_once('{')?;
+            if name != metric {
+                return None;
+            }
+            let (block, after) = rest.rsplit_once('}')?;
+            labels
+                .iter()
+                .all(|(k, v)| label_matches(block, k, v))
+                .then(|| {
+                    after
+                        .split_whitespace()
+                        .next()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .map(|value| (block, value))
+                })
+                .flatten()
+        })
+        .collect()
+}
+
+/// First sample of `metric` matching `labels`. `None` when no series matches —
+/// for a lazily-registered gauge that is indistinguishable from 0, so callers
+/// asserting "absent" must mean it.
+#[must_use]
+pub fn labelled_metric_value(
+    exposition: &str,
+    metric: &str,
+    labels: &[(&str, &str)],
+) -> Option<f64> {
+    labelled_metric_samples(exposition, metric, labels)
+        .first()
+        .map(|(_, v)| *v)
+}
+
+/// The value `block` (a Prometheus label block, without the braces) binds to
+/// `key`, or `None` when the key is absent.
+///
+/// Lives here rather than at the call site so every label read in the crate goes
+/// through one anchored parser — an ad-hoc `split("key=\"")` gets the prefix
+/// anchoring wrong in exactly the way [`label_matches`] documents.
+#[must_use]
+pub fn label_value<'a>(block: &'a str, key: &str) -> Option<&'a str> {
+    block.split(',').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k.trim() == key).then(|| v.trim().trim_matches('"'))
+    })
+}
+
+/// Whether `block` (a Prometheus label block, without the braces) binds `key` to
+/// exactly `value`.
+///
+/// Anchored on the key's left delimiter so `namespace="x"` cannot be satisfied
+/// by a longer key ending in `namespace`, and on the closing quote so
+/// `namespace="ns-1"` cannot be satisfied by `namespace="ns-10"` — both of which
+/// a plain `contains` would accept, and both of which occur here (`scope` /
+/// `namespace`, and sequentially-named e2e namespaces).
+fn label_matches(block: &str, key: &str, value: &str) -> bool {
+    let needle = format!("{key}=\"{value}\"");
+    block.match_indices(&needle).any(|(at, m)| {
+        let left_ok = at == 0 || block[..at].ends_with(',');
+        let right_ok = block[at + m.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| c == ',');
+        left_ok && right_ok
+    })
+}
+
 /// Poll until every controller reflector's watch relist has completed — i.e. no
 /// `coxswain_controller_watch_relists_pending{kind=…}` sample stays above 0.
 ///
@@ -1877,14 +1964,20 @@ async fn backend_tls_policy_state(api: &Api<BackendTlsPolicy>, name: &str) -> St
 
 #[cfg(test)]
 mod exposition_tests {
-    use super::parse_metric_value;
+    use super::{label_value, labelled_metric_samples, labelled_metric_value, parse_metric_value};
 
     #[test]
     fn parse_metric_value_matches_bare_and_labelled() {
-        let body = "# HELP x y
-coxswain_controller_leader 1
-                    coxswain_discovery_streams_total{result=\"not leader\"} 4 1720000000
-";
+        // Not indented to match the surrounding code: these are exposition
+        // lines, and a real scrape has no leading whitespace. Indenting them
+        // made every labelled assertion here read `None` and pass vacuously —
+        // invisible because CI runs `cargo test --workspace --exclude
+        // coxswain-e2e`, so this module is never executed there.
+        let body = concat!(
+            "# HELP x y\n",
+            "coxswain_controller_leader 1\n",
+            "coxswain_discovery_streams_total{result=\"not leader\"} 4 1720000000\n",
+        );
         assert_eq!(
             parse_metric_value(body, "coxswain_controller_leader"),
             Some(1.0)
@@ -1900,5 +1993,115 @@ coxswain_controller_leader 1
         );
         // A prefix must not match a longer metric name.
         assert_eq!(parse_metric_value(body, "coxswain_controller"), None);
+    }
+
+    /// One relay's three state series plus a second namespace, which is what
+    /// makes the label selection load-bearing rather than decorative.
+    const RELAY_EXPOSITION: &str = concat!(
+        "# HELP coxswain_relay_state relay state\n",
+        "coxswain_relay_state{scope=\"namespace\",namespace=\"ns-1\",state=\"provisioning\"} 0\n",
+        "coxswain_relay_state{scope=\"namespace\",namespace=\"ns-1\",state=\"active\"} 1\n",
+        "coxswain_relay_state{scope=\"namespace\",namespace=\"ns-1\",state=\"draining\"} 0\n",
+        "coxswain_relay_state{scope=\"namespace\",namespace=\"ns-10\",state=\"draining\"} 1\n",
+        "coxswain_relay_state{scope=\"shared\",namespace=\"\",state=\"active\"} 1\n",
+        "coxswain_relay_subscribers{scope=\"namespace\",namespace=\"ns-1\"} 2\n",
+    );
+
+    #[test]
+    fn labelled_metric_value_selects_by_label_not_by_first_match() {
+        // The bug this guards: `parse_metric_value` would return the FIRST
+        // `coxswain_relay_state` line — `provisioning` 0 — for every query,
+        // so "is it active?" and "is it draining?" would both read 0.
+        assert_eq!(
+            parse_metric_value(RELAY_EXPOSITION, "coxswain_relay_state"),
+            Some(0.0)
+        );
+        assert_eq!(
+            labelled_metric_value(
+                RELAY_EXPOSITION,
+                "coxswain_relay_state",
+                &[("namespace", "ns-1"), ("state", "active")]
+            ),
+            Some(1.0)
+        );
+        assert_eq!(
+            labelled_metric_value(
+                RELAY_EXPOSITION,
+                "coxswain_relay_state",
+                &[("namespace", "ns-1"), ("state", "draining")]
+            ),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn label_match_is_anchored_against_prefix_collisions() {
+        // `ns-1` must not match `ns-10`: e2e namespaces are sequentially named,
+        // so an unanchored `contains` would silently read a sibling test's relay.
+        assert_eq!(
+            labelled_metric_value(
+                RELAY_EXPOSITION,
+                "coxswain_relay_state",
+                &[("namespace", "ns-1"), ("state", "draining")]
+            ),
+            Some(0.0),
+            "ns-1's draining series is 0; ns-10's is 1"
+        );
+        // `namespace` must not be satisfied by `scope="namespace"`.
+        assert!(
+            labelled_metric_samples(
+                RELAY_EXPOSITION,
+                "coxswain_relay_state",
+                &[("namespace", "namespace")]
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn label_value_reads_the_bound_value_not_a_prefix() {
+        let block = r#"scope="namespace",namespace="ns-1",state="active""#;
+        assert_eq!(label_value(block, "state"), Some("active"));
+        assert_eq!(label_value(block, "namespace"), Some("ns-1"));
+        // `scope="namespace"` must not answer a query for the `namespace` KEY —
+        // the failure mode of an ad-hoc `split("namespace=\"")`.
+        assert_eq!(label_value(block, "scope"), Some("namespace"));
+        assert_eq!(label_value(block, "absent"), None);
+        assert_eq!(
+            label_value(r#"scope="shared",namespace="""#, "namespace"),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn labelled_metric_samples_scopes_emptiness_to_one_namespace() {
+        // The teardown assertion is "no series for MY namespace" — it must stay
+        // true in the presence of another namespace's live relay.
+        assert!(
+            labelled_metric_samples(
+                RELAY_EXPOSITION,
+                "coxswain_relay_state",
+                &[("namespace", "ns-absent")]
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            labelled_metric_samples(
+                RELAY_EXPOSITION,
+                "coxswain_relay_state",
+                &[("namespace", "ns-1")]
+            )
+            .len(),
+            3
+        );
+        // The shared tier's empty namespace is addressable, not a wildcard.
+        assert_eq!(
+            labelled_metric_value(
+                RELAY_EXPOSITION,
+                "coxswain_relay_state",
+                &[("scope", "shared"), ("namespace", "")]
+            ),
+            Some(1.0)
+        );
     }
 }

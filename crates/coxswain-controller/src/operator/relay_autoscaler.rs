@@ -44,7 +44,7 @@ use super::relay_params::EffectiveRelayPolicy;
 /// A namespace with no relay is simply absent from the reconciler's state map;
 /// the three variants here are the states in which a relay Deployment exists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum RelayState {
+pub(crate) enum RelayState {
     /// Relay Deployment applied and authorized to subscribe upstream; awaiting
     /// its own registry entry to report Ready (upstream cache loaded). Leaves are
     /// **not** yet repointed onto it.
@@ -55,6 +55,29 @@ pub(super) enum RelayState {
     /// awaiting the relay's downstream subscriber count to reach 0 before the
     /// Deployment is deleted.
     Draining,
+}
+
+impl RelayState {
+    /// Every variant, in lifecycle order — the set `coxswain_relay_state` zeroes
+    /// out when publishing, and removes when clearing.
+    ///
+    /// A labelled Prometheus series is created and deleted per label-value
+    /// tuple, so both operations have to enumerate the states rather than
+    /// address the family as a whole.
+    pub(crate) const ALL: [Self; 3] = [Self::Provisioning, Self::Active, Self::Draining];
+
+    /// The `state` label value this variant reports as on `coxswain_relay_state`.
+    ///
+    /// Adding a variant breaks this match, which is the prompt to also extend
+    /// [`Self::ALL`] — the array's length is not itself compiler-tied to the
+    /// variant count, so the accompanying unit test is what catches the omission.
+    pub(crate) fn metric_label(self) -> &'static str {
+        match self {
+            Self::Provisioning => "provisioning",
+            Self::Active => "active",
+            Self::Draining => "draining",
+        }
+    }
 }
 
 /// The I/O the reconciler must perform for a namespace this pass, decided purely
@@ -478,6 +501,34 @@ impl Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RelayState::ALL` drives which `coxswain_relay_state` series are written
+    /// and removed, but its length is not compiler-tied to the variant count —
+    /// a new variant compiles fine while silently never being exported, and a
+    /// relay in that state would then read all-zero. The exhaustive match is
+    /// what fails first when a variant is added; this asserts the array kept up.
+    #[test]
+    fn relay_state_all_lists_every_variant_with_a_distinct_label() {
+        for variant in [
+            RelayState::Provisioning,
+            RelayState::Active,
+            RelayState::Draining,
+        ] {
+            assert!(
+                RelayState::ALL.contains(&variant),
+                "{variant:?} is missing from RelayState::ALL, so its series is never published"
+            );
+        }
+        let mut labels: Vec<&str> = RelayState::ALL.iter().map(|s| s.metric_label()).collect();
+        labels.sort_unstable();
+        let before = labels.len();
+        labels.dedup();
+        assert_eq!(
+            labels.len(),
+            before,
+            "two states share a metric_label, so one would overwrite the other's series"
+        );
+    }
 
     fn defaults() -> RelayTuningDefaults {
         RelayTuningDefaults {

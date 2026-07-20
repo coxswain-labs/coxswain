@@ -2334,8 +2334,18 @@ async fn relay_repoint_keeps_serving_during_teardown() -> anyhow::Result<()> {
         wait::POLL,
         || {
             let url = topology_url.clone();
+            let client = h.client.clone();
+            let ns = ns.name.clone();
             async move {
-                format!("relay torn down after cooldown and proxy re-attached directly at '{url}'")
+                let relay_state = coxswain_e2e::harness::leader::relay_diagnostics(
+                    &client,
+                    coxswain_e2e::harness::leader::RelayScope::Namespace(&ns),
+                )
+                .await;
+                format!(
+                    "relay torn down after cooldown and proxy re-attached directly at '{url}'; \
+                     {relay_state}"
+                )
             }
         },
         || {
