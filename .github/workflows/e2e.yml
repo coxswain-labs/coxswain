@@ -105,16 +105,10 @@ jobs:
       - name: Build e2e test archive
         run: cargo nextest archive --archive-file e2e-archive.tar.zst -p coxswain-e2e
 
-      # The archive step above compiles every test target of the package,
-      # including the LIB test binary — but the matrix legs select only
-      # integration binaries (`-E 'binary(<suite>)'`), so the lib tests ran
-      # nowhere: `coxswain-e2e` is also absent from `default-members`, so
-      # ci.yml's bare `cargo test` skips the package entirely. That gap let a
-      # broken fixture in the shared Prometheus exposition parser — which every
-      # e2e metric assertion reads through — sit green in-tree. Running it here
-      # reuses the compilation just done rather than paying for a second one in
-      # ci.yml, and needs no cluster.
-      - name: Run e2e lib tests (no cluster required)
+      # Matrix legs select only `binary(<suite>)` and the package is not a
+      # default-member, so without this the lib tests run nowhere. Reuses the
+      # archive step's compilation; no cluster needed.
+      - name: Run e2e lib tests
         run: cargo test -p coxswain-e2e --lib
 
       - name: Build e2e Docker image

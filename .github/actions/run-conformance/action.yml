@@ -199,9 +199,8 @@ runs:
         echo "usable=${USABLE}" >> "$GITHUB_OUTPUT"
         echo "GatewayStaticAddresses usable=${USABLE} unusable=192.0.2.1"
 
-    # Before the suite, not after it: the dump below runs once the whole 55 min
-    # run has finished, by which point any pod that crashed and was replaced is
-    # unreachable by `kubectl logs`.
+    # Before the suite: the dump runs after the full 55 min, by which point a
+    # crashed-and-replaced pod is unreachable by `kubectl logs`.
     - uses: ./.github/actions/stream-cluster-logs
 
     - name: Run Gateway API conformance suite
@@ -271,19 +270,10 @@ runs:
     - uses: ./.github/actions/dump-cluster-state
       if: failure()
 
-    # Inside the action rather than in each caller, so all three invocations
-    # (e2e.yml, release.yml, conformance-report.yml) collect it.
-    #
-    # Per-leg name: conformance-report.yml runs this across a `fail-fast: false`
-    # matrix of Gateway API versions, and upload-artifact rejects two parallel
-    # jobs writing the same name — so a shared name would lose one failing
-    # leg's logs and redden the step for the wrong reason.
-    #
-    # The env guard is not redundant with `if-no-files-found: ignore`: that
-    # covers a path that matches nothing, not an EMPTY path input, which
-    # upload-artifact rejects outright. Without it, a failure before the
-    # streamer starts (the static-address probe `exit 1` above) stacks a
-    # spurious "Input required and not supplied: path" on the real failure.
+    # In the action so all three callers collect it. Name is per-leg because
+    # upload-artifact rejects duplicate names across parallel matrix jobs. The
+    # env guard covers an EMPTY path (rejected outright), which
+    # `if-no-files-found` does not.
     - name: Upload streamed cluster logs
       if: failure() && env.COXSWAIN_CLUSTER_LOG_FILE != ''
       uses: actions/upload-artifact@v7
