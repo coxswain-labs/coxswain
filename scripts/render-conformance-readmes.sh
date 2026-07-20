@@ -29,7 +29,7 @@ if [ ! -d "$ROOT" ]; then
 fi
 
 python3 - "$ROOT" <<'PY'
-import os, re, sys
+import os, re, subprocess, sys
 
 root = sys.argv[1]
 REPO = "https://github.com/coxswain-labs/coxswain"
@@ -57,14 +57,45 @@ for version_dir in sorted(os.listdir(root)):
         continue
 
     rows = []
+    # The directory is the upstream REPORT dir (e.g. v1.5); the CRD version the
+    # scripts take is the exact tag (e.g. v1.5.1). Using the directory in the
+    # reproduce steps produces a command that errors out, so read the real
+    # version out of the report instead.
+    crd_version = version_dir
     for name in reports:
         text = open(os.path.join(impl_dir, name)).read()
         channel = scalar(text, "gatewayAPIChannel", "standard")
         # `version:` appears under `implementation:`; the first match is it.
         impl_version = scalar(text, "version", "unknown")
         mode = scalar(text, "mode", "default")
+        crd_version = scalar(text, "gatewayAPIVersion", version_dir)
         release = f"[{impl_version}]({REPO}/releases/tag/{impl_version})"
         rows.append(f"| {channel} | {release} | {mode} | [link](./{name}) |")
+
+    # Upstream requires a skipped test in a conformance claim to justify
+    # itself. The reasons live in the manifest so they are reviewed with the
+    # skip that introduced them, rather than written once and forgotten here.
+    skips = subprocess.run(
+        ["scripts/gateway-api-versions.sh", "--skip-reasons", crd_version],
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    skipped_section = ""
+    if skips:
+        skip_rows = "\n".join(
+            f"| `{line.split(chr(9))[0]}` | {line.split(chr(9))[1]} |"
+            for line in skips.splitlines() if chr(9) in line
+        )
+        skipped_section = f"""## Skipped tests
+
+These tests cannot execute against Gateway API {crd_version} for reasons
+outside this implementation, so they are excluded from the run. Every other
+test in each affected feature area passes.
+
+| Test | Why it cannot run |
+|------|-------------------|
+{skip_rows}
+
+"""
 
     readme = f"""# Coxswain
 
@@ -77,19 +108,7 @@ backed by [Pingora](https://github.com/cloudflare/pingora).
 |-------------|------------------------|------|--------|
 {chr(10).join(rows)}
 
-## Overview
-
-Coxswain detects which Gateway API kinds and schema fields the installed CRDs
-actually serve and runs with exactly that feature set, so one build supports
-several Gateway API versions. A report produced against an older version
-therefore claims fewer conformance profiles and advertises fewer
-`supportedFeatures` — by design, not as a partial result. The full matrix is
-documented at
-[`docs/src/reference/capability-matrix.md`]({REPO}/blob/main/docs/src/reference/capability-matrix.md).
-
-This report was produced against Gateway API **{version_dir}**.
-
-## Reproduce
+{skipped_section}## Reproduce
 
 Gateway API CRDs are cluster-scoped singletons, so each version needs its own
 fresh cluster.
@@ -106,13 +125,13 @@ fresh cluster.
 
    ```bash
    kind create cluster --name coxswain-conformance
-   ./scripts/setup-conformance.sh --gateway-api-version {version_dir} --reset ''
+   ./scripts/setup-conformance.sh --gateway-api-version {crd_version} --reset ''
    ```
 
 3. Run the suite:
 
    ```bash
-   ./scripts/run-conformance.sh --gateway-api-version {version_dir}
+   ./scripts/run-conformance.sh --gateway-api-version {crd_version}
    ```
 
    The report is written to

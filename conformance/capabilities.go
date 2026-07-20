@@ -36,7 +36,14 @@ type clusterCapabilities struct {
 }
 
 func (c clusterCapabilities) hasKind(plural string) bool { return c.kinds[plural] }
-func (c clusterCapabilities) hasField(name string) bool  { return c.fields[name] }
+
+// gatewayAPIVersionUnderTest is a human-readable summary for log lines: the
+// exact CRD release is not something the cluster reports directly, so this
+// names the installed kind count instead of guessing a version string.
+func gatewayAPIVersionUnderTest(c clusterCapabilities) string {
+	return fmt.Sprintf("with %d installed kinds", len(c.kinds))
+}
+func (c clusterCapabilities) hasField(name string) bool { return c.fields[name] }
 
 // watchedVersions lists, per plural resource name, the API versions Coxswain
 // watches — mirroring `GatewayApiKind::versions()` on the Rust side. A CRD that

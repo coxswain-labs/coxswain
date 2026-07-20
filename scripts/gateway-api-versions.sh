@@ -13,12 +13,32 @@
 #                      through v1.4.x but unified minor dirs from v1.5.
 #   latest             exactly one entry is true — the version that drives
 #                      codegen, e2e bootstrap and kubeconform.
+#   conformanceModule  "main"     — the suite ships inside sigs.k8s.io/gateway-api
+#                      "separate" — it is its own module, .../gateway-api/conformance
+#                      It only became separate at v1.5.0; requiring
+#                      `.../conformance@v1.4.x` fails with `unknown revision`,
+#                      because no such tag was ever pushed.
+#   skipTests          `[{name, reason}]` — conformance tests that are
+#                      unrunnable for this version through no fault of the
+#                      implementation. The reason is REQUIRED and is published
+#                      verbatim in the report's README, because a skipped test
+#                      in a conformance claim has to justify itself.
+#   buildTags          Go build tags the suite needs for this version, or "".
+#                      `ConformanceOptions.ConformanceProfiles` and
+#                      `.SupportedFeatures` were sets through v1.5 and became
+#                      slices at v1.6; no single assignment compiles against
+#                      both, so a tagged shim selects one.
+#
+# The CRD install URL is deliberately NOT stored: it is a mechanical transform
+# of the version, and four near-identical URLs would be four chances for a typo
+# no gate could catch.
 #
 # Usage:
 #   gateway-api-versions.sh --latest              # v1.6.1
 #   gateway-api-versions.sh --versions            # one version per line
 #   gateway-api-versions.sh --list                # "<version>\t<reportDir>" per line
 #   gateway-api-versions.sh --report-dir v1.5.1   # v1.5
+#   gateway-api-versions.sh --field v1.4.1 buildTags
 #   gateway-api-versions.sh --json                # the raw array (for a matrix)
 #
 # Run from the repo root. Exits non-zero on a malformed manifest.
@@ -48,14 +68,27 @@ if not isinstance(entries, list) or not entries:
     sys.exit(f"error: {path} must be a non-empty array")
 
 seen = set()
+REQUIRED = {
+    "gatewayApiVersion", "reportDir", "latest",
+    "conformanceModule", "buildTags", "skipTests",
+}
 for entry in entries:
-    missing = {"gatewayApiVersion", "reportDir", "latest"} - set(entry)
+    missing = REQUIRED - set(entry)
     if missing:
         sys.exit(f"error: entry {entry!r} is missing {sorted(missing)}")
     version = entry["gatewayApiVersion"]
     if version in seen:
         sys.exit(f"error: {version} is listed more than once")
     seen.add(version)
+    module = entry["conformanceModule"]
+    if module not in ("main", "separate"):
+        sys.exit(f"error: {version} has conformanceModule {module!r}, expected 'main' or 'separate'")
+    for skip in entry["skipTests"]:
+        if not isinstance(skip, dict) or not skip.get("name") or not skip.get("reason"):
+            sys.exit(
+                f"error: {version} skipTests entry {skip!r} needs both a name and a reason — "
+                "an unjustified skip in a conformance claim is not publishable"
+            )
 
 latest = [e["gatewayApiVersion"] for e in entries if e["latest"]]
 if len(latest) != 1:
@@ -74,6 +107,28 @@ elif mode == "--list":
         print(f"{e['gatewayApiVersion']}\t{e['reportDir']}")
 elif mode == "--json":
     print(json.dumps([e["gatewayApiVersion"] for e in entries]))
+elif mode == "--field":
+    key, version = arg.split("=", 1)
+    match = [e for e in entries if e["gatewayApiVersion"] == version]
+    if not match:
+        sys.exit(f"error: {version} is not listed in {path}")
+    if key not in match[0]:
+        sys.exit(f"error: unknown field {key!r}")
+    value = match[0][key]
+    if key == "skipTests":
+        # Names only: this feeds the runner's env var. Reasons come from
+        # `--skip-reasons`, which the README generator uses.
+        print(",".join(s["name"] for s in value))
+    elif isinstance(value, list):
+        print(",".join(value))
+    else:
+        print(value)
+elif mode == "--skip-reasons":
+    match = [e for e in entries if e["gatewayApiVersion"] == arg]
+    if not match:
+        sys.exit(f"error: {arg} is not listed in {path}")
+    for skip in match[0]["skipTests"]:
+        print(f"{skip['name']}\t{skip['reason']}")
 elif mode == "--report-dir":
     match = [e["reportDir"] for e in entries if e["gatewayApiVersion"] == arg]
     if not match:
@@ -100,11 +155,25 @@ case "${1-}" in
     fi
     read_manifest --report-dir "$2"
     ;;
+  --field)
+    if [ -z "${2-}" ] || [ -z "${3-}" ]; then
+      echo "error: --field needs a version and a field name" >&2
+      exit 2
+    fi
+    read_manifest --field "$3=$2"
+    ;;
+  --skip-reasons)
+    if [ -z "${2-}" ]; then
+      echo "error: --skip-reasons needs a version" >&2
+      exit 2
+    fi
+    read_manifest --skip-reasons "$2"
+    ;;
   -h|--help)
     sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
     ;;
   *)
-    echo "error: expected one of --latest --versions --list --json --report-dir --validate" >&2
+    echo "error: expected one of --latest --versions --list --json --report-dir --field --skip-reasons --validate" >&2
     exit 2
     ;;
 esac

@@ -55,6 +55,13 @@ fi
 # (per-patch through v1.4.x, unified minors from v1.5), so it is looked up
 # rather than derived. This also rejects an unsupported version.
 REPORT_DIR=$(scripts/gateway-api-versions.sh --report-dir "$GATEWAY_API_VERSION")
+# Per-version build facts, kept in the manifest so the script and CI cannot
+# disagree about them (see scripts/gateway-api-versions.sh for what they mean).
+CONFORMANCE_MODULE=$(scripts/gateway-api-versions.sh --field "$GATEWAY_API_VERSION" conformanceModule)
+BUILD_TAGS=$(scripts/gateway-api-versions.sh --field "$GATEWAY_API_VERSION" buildTags)
+# Tests the suite itself cannot run at this version (see the manifest for why).
+CONFORMANCE_SKIP_TESTS=$(scripts/gateway-api-versions.sh --field "$GATEWAY_API_VERSION" skipTests)
+export CONFORMANCE_SKIP_TESTS
 
 # On the tagged release commit this yields a clean `v0.5.0` — the tag IS the
 # commit ref, so a hash would be redundant noise, and upstream reports use the
@@ -80,17 +87,28 @@ if [ "$GATEWAY_API_VERSION" != "$LATEST_VERSION" ]; then
   echo ">>> pin conformance suite to Gateway API $GATEWAY_API_VERSION (in $WORKDIR)"
   (
     cd "$WORKDIR"
-    go mod edit -require="sigs.k8s.io/gateway-api@${GATEWAY_API_VERSION}"
+  # Whether the suite is its own module is a per-version fact from the manifest,
+  # not something to re-derive here: it only became separate at v1.5.0, and
+  # requiring `.../conformance@v1.4.x` fails with `unknown revision`.
+  go mod edit -require="sigs.k8s.io/gateway-api@${GATEWAY_API_VERSION}"
+  if [ "$CONFORMANCE_MODULE" = "main" ]; then
+    go mod edit -droprequire="sigs.k8s.io/gateway-api/conformance"
+  else
     go mod edit -require="sigs.k8s.io/gateway-api/conformance@${GATEWAY_API_VERSION}"
-    go mod tidy
+  fi
+  go mod tidy
   )
 fi
 
 echo ">>> run conformance against Gateway API $GATEWAY_API_VERSION"
 echo ">>> report: $REPORT_OUTPUT"
+# The suite writes its report even when tests fail, and a failing report is
+# still worth having — so a non-zero exit must not skip the README generation
+# below. Capture the status and re-raise it at the end.
+set +e
 (
   cd "$WORKDIR"
-  go test -v -timeout 60m -run TestConformance \
+  go test -tags="$BUILD_TAGS" -v -timeout 60m -run TestConformance \
     -args \
     --organization=coxswain-labs \
     --project=coxswain \
@@ -100,8 +118,15 @@ echo ">>> report: $REPORT_OUTPUT"
     --report-output="$REPORT_OUTPUT"
 )
 
+SUITE_STATUS=$?
+set -e
+
 # Upstream requires a README.md beside the reports in each implementation
 # folder; regenerate it so a locally-produced set is submittable as-is.
 scripts/render-conformance-readmes.sh >/dev/null
 
 echo ">>> wrote $REPORT_OUTPUT"
+if [ "$SUITE_STATUS" -ne 0 ]; then
+  echo ">>> conformance FAILED (exit $SUITE_STATUS) — report and README still written"
+fi
+exit "$SUITE_STATUS"

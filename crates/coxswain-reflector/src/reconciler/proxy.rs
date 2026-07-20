@@ -2227,8 +2227,19 @@ impl<S: CapabilitySource> CapabilityProbe<S> {
             if !caps.group_present() {
                 continue;
             }
-            publish_capabilities(&caps);
-            self.capabilities.store(Arc::new(caps.clone()));
+            // Only republish when the set actually moved. This loop runs for
+            // the life of the process on any cluster missing a modelled kind —
+            // exactly the clusters #641 targets — so logging every tick would
+            // emit the same line ~2900 times a day and bury real events.
+            let changed = self
+                .capabilities
+                .guard()
+                .present_kinds()
+                .ne(caps.present_kinds());
+            if changed {
+                publish_capabilities(&caps);
+                self.capabilities.store(Arc::new(caps.clone()));
+            }
 
             let before = spawned.len();
             {

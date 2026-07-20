@@ -89,7 +89,14 @@ if [ -n "$RESET_CMD" ]; then
 fi
 
 echo ">>> build production Docker image (tag coxswain:e2e)"
-docker build -t coxswain:e2e .
+# The docs advertise COXSWAIN_E2E_SKIP_BUILD=1 for iterating against an
+# already-built image; it also matters for a multi-version sweep, where the
+# image is identical across legs and rebuilding it per version is pure waste.
+if [ -n "${COXSWAIN_E2E_SKIP_BUILD-}" ] && docker image inspect coxswain:e2e >/dev/null 2>&1; then
+  echo "    (COXSWAIN_E2E_SKIP_BUILD set and coxswain:e2e present — reusing)"
+else
+  docker build -t coxswain:e2e .
+fi
 
 echo ">>> install Gateway API CRDs $GATEWAY_API_VERSION"
 kubectl apply -f \

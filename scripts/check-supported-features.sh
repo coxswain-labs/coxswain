@@ -32,22 +32,28 @@ rust_features=$(awk '
   in_table && /^\];/ { exit }
   in_table
 ' "$RUST_FILE" \
-  | grep -v '^\s*//' \
-  | grep -oE '"[A-Za-z0-9]+"' \
+  | { grep -v '^\s*//' || true; } \
+  | { grep -oE '"[A-Za-z0-9]+"' || true; } \
   | tr -d '"' \
   | sort -u)
 
-# Go: `{name: features.SupportXxx, ...}` entries in the gatedFeatures table,
-# excluding commented-out lines. The `Support` prefix is stripped to match the
-# Rust names.
+# Go: `{name: "Xxx", ...}` entries in the gatedFeatures table, excluding
+# commented-out lines. Plain strings rather than `features.SupportXxx`
+# constants because 11 of those constants do not exist in the Gateway API v1.4
+# module and naming them would break compilation there — see features.go.
+#
+# `|| true` on the greps: with `set -e`, a grep that matches nothing exits 1 and
+# kills the script before the "extracted zero" guard below can say so, which
+# turns a broken extraction into a silent failure — the exact way a gate stops
+# being a check.
 go_features=$(awk '
   /^var gatedFeatures/ { in_table=1; next }
   in_table && /^\}/ { exit }
   in_table
 ' "$GO_FILE" \
-  | grep -v '^\s*//' \
-  | grep -oE 'features\.Support[A-Za-z0-9]+' \
-  | sed 's/features\.Support//' \
+  | { grep -v '^\s*//' || true; } \
+  | { grep -oE '\{name: "[A-Za-z0-9]+"' || true; } \
+  | sed 's/{name: "//; s/"//' \
   | sort -u)
 
 if [ -z "$rust_features" ]; then

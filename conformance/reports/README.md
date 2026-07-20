@@ -19,8 +19,11 @@ feature set the cluster's CRDs can express. A run against Gateway API v1.4 has
 fewer profiles and fewer `supportedFeatures` by design; see
 `docs/src/reference/capability-matrix.md`.
 
-Loose `*.yaml` directly under this directory is gitignored, so local iteration
-does not dirty the tree.
+**Nothing under this directory is tracked** except this README — `.gitignore`
+ignores `conformance/reports` wholesale. Reports are build outputs: they are
+environment-dependent, regenerated per run, and archived as release assets
+rather than committed. Running the suite locally therefore never dirties the
+tree.
 
 ## Upstream submission requirements
 
@@ -48,10 +51,12 @@ Run the `Conformance reports (all Gateway API versions)` workflow with
 layout, tagged with the same `git describe --long` string the reports carry
 internally, and names the full source commit in the release body.
 
-This directory is therefore a **manual staging area**: populate it (by
-unpacking a release asset, or by running the scripts locally) when preparing a
-publishing PR to `kubernetes-sigs/gateway-api`, which is where reports are
-actually published.
+This directory is therefore a **scratch staging area**: it fills up when you
+run the suite, and you populate it deliberately (from a release asset, or by
+running the scripts) when preparing a publishing PR to
+`kubernetes-sigs/gateway-api` — which is where reports are actually published.
+Since it is gitignored, that PR is prepared against a checkout of *their* repo,
+not this one.
 
 Every report identifies its source tree — `implementation.version` and the
 filename both carry a `git describe --tags --always --long` string, so the

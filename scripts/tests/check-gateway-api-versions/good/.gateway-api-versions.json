@@ -1,4 +1,14 @@
 [
-  { "gatewayApiVersion": "v1.4.1", "reportDir": "v1.4.1", "latest": false },
-  { "gatewayApiVersion": "v1.6.1", "reportDir": "v1.6",   "latest": true  }
+  {
+    "gatewayApiVersion": "v1.4.1",
+    "reportDir": "v1.4.1",
+    "latest": false,
+    "skipTests": []
+  },
+  {
+    "gatewayApiVersion": "v1.6.1",
+    "reportDir": "v1.6",
+    "latest": true,
+    "skipTests": []
+  }
 ]

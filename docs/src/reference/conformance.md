@@ -97,9 +97,10 @@ Or use the wrapper, which resolves the upstream report path for you:
 bash scripts/run-conformance.sh
 ```
 
-A loose `reports/*.yaml` is gitignored. Published reports live under
-`conformance/reports/<report-dir>/coxswain-coxswain/` and are tracked — see
-`conformance/reports/README.md` for the layout.
+`conformance/reports/` is gitignored in full (bar its README): reports are
+build outputs, archived as release assets rather than committed. Running the
+suite locally never dirties the tree. See `conformance/reports/README.md` for
+the layout, which mirrors what `kubernetes-sigs/gateway-api` expects.
 
 A full run takes 8–15 minutes on a clean cluster.
 

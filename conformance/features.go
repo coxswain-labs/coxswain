@@ -59,99 +59,108 @@ func profilesFor(caps clusterCapabilities) []suite.ConformanceProfileName {
 // feature rides on `Gateway`/`HTTPRoute`, which exist at every supported
 // version. This mirrors the Rust `SUPPORTED_FEATURES` table entry for entry —
 // `scripts/check-supported-features.sh` enforces that the two agree.
+//
+// `name` is a plain string, not a `features.SupportXxx` constant. The constants
+// are added as features land, so 11 of the ones below — `SupportTCPRoute`,
+// `SupportListenerSet`, the three redirect-status-code features, the GEP-91
+// pair, and others — simply do not exist in the Gateway API v1.4 Go module,
+// and naming them makes this file fail to COMPILE against the suite version
+// matching a v1.4 cluster. `FeatureName` is a string alias and each constant's
+// value is exactly the feature name, so the string form is the same value by a
+// route that compiles against every supported module version.
 type gatedFeature struct {
-	name          features.FeatureName
+	name          string
 	requiresKind  string
 	requiresField string
 }
 
 var gatedFeatures = []gatedFeature{
 	// Core (required for HTTP profile conformance claim)
-	{name: features.SupportGateway},   // #34
-	{name: features.SupportHTTPRoute}, // #34
+	{name: "Gateway"},   // #34
+	{name: "HTTPRoute"}, // #34
 	// Extended: matching (#7)
-	{name: features.SupportHTTPRouteQueryParamMatching},
-	{name: features.SupportHTTPRouteMethodMatching},
+	{name: "HTTPRouteQueryParamMatching"},
+	{name: "HTTPRouteMethodMatching"},
 	// Extended: header modification (#13, #167)
-	{name: features.SupportHTTPRouteBackendRequestHeaderModification},
-	{name: features.SupportHTTPRouteResponseHeaderModification},
+	{name: "HTTPRouteBackendRequestHeaderModification"},
+	{name: "HTTPRouteResponseHeaderModification"},
 	// Extended: redirect and rewrite (#13)
-	{name: features.SupportHTTPRoutePortRedirect},
-	{name: features.SupportHTTPRouteSchemeRedirect},
-	{name: features.SupportHTTPRoutePathRedirect},
-	{name: features.SupportHTTPRouteHostRewrite},
-	{name: features.SupportHTTPRoutePathRewrite},
+	{name: "HTTPRoutePortRedirect"},
+	{name: "HTTPRouteSchemeRedirect"},
+	{name: "HTTPRoutePathRedirect"},
+	{name: "HTTPRouteHostRewrite"},
+	{name: "HTTPRoutePathRewrite"},
 	// Extended: timeouts (#14)
-	{name: features.SupportHTTPRouteRequestTimeout},
-	{name: features.SupportHTTPRouteBackendTimeout},
+	{name: "HTTPRouteRequestTimeout"},
+	{name: "HTTPRouteBackendTimeout"},
 	// Extended: redirect status codes (#34)
-	{name: features.SupportHTTPRoute303RedirectStatusCode},
-	{name: features.SupportHTTPRoute307RedirectStatusCode},
-	{name: features.SupportHTTPRoute308RedirectStatusCode},
+	{name: "HTTPRoute303RedirectStatusCode"},
+	{name: "HTTPRoute307RedirectStatusCode"},
+	{name: "HTTPRoute308RedirectStatusCode"},
 	// Extended: named route rules (#34)
-	{name: features.SupportHTTPRouteNamedRouteRule},
+	{name: "HTTPRouteNamedRouteRule"},
 	// Extended: HTTP listener isolation (#34)
-	{name: features.SupportGatewayHTTPListenerIsolation},
+	{name: "GatewayHTTPListenerIsolation"},
 	// Extended: CORS filter — GEP-1767 (#41). The `cors` filter is absent from
 	// the HTTPRoute schema below Gateway API v1.5.
-	{name: features.SupportHTTPRouteCORS, requiresField: "HTTPRouteCORS"},
+	{name: "HTTPRouteCORS", requiresField: "HTTPRouteCORS"},
 	// Extended: RequestMirror filter — GEP-3171 (#261)
-	{name: features.SupportHTTPRouteRequestMirror},
-	{name: features.SupportHTTPRouteRequestMultipleMirrors},
-	{name: features.SupportHTTPRouteRequestPercentageMirror},
+	{name: "HTTPRouteRequestMirror"},
+	{name: "HTTPRouteRequestMultipleMirrors"},
+	{name: "HTTPRouteRequestPercentageMirror"},
 	// Extended: HTTPS misdirected-request detection — GEP-3567 (#96)
-	{name: features.SupportGatewayHTTPSListenerDetectMisdirectedRequests},
+	{name: "GatewayHTTPSListenerDetectMisdirectedRequests"},
 	// Extended: port 8080 listener (#34)
-	{name: features.SupportGatewayPort8080},
+	{name: "GatewayPort8080"},
 	// Extended: empty Gateway address value (#34)
-	{name: features.SupportGatewayAddressEmpty},
+	{name: "GatewayAddressEmpty"},
 	// Extended: static Gateway addresses — GatewayStaticAddresses (#260).
 	// Coxswain honors a requested IPAddress by pinning it as the per-Gateway
 	// VIP Service clusterIP (deterministic accept/reject vs the apiserver
 	// service-CIDR). Requires UsableNetworkAddresses/UnusableNetworkAddresses,
 	// injected by scripts/setup-conformance.sh.
-	{name: features.SupportGatewayStaticAddresses},
+	{name: "GatewayStaticAddresses"},
 	// Standard: backend client-certificate (mTLS to upstream) — GEP-3155 (#87)
-	{name: features.SupportGatewayBackendClientCertificate},
+	{name: "GatewayBackendClientCertificate"},
 	// Standard: frontend client-certificate validation — GEP-91 (#86). The
 	// `spec.tls.frontend` subtree is absent from the Gateway schema below
 	// Gateway API v1.5.
-	{name: features.SupportGatewayFrontendClientCertificateValidation, requiresField: "GatewayFrontendTLS"},
-	{name: features.SupportGatewayFrontendClientCertificateValidationInsecureFallback, requiresField: "GatewayFrontendTLS"},
+	{name: "GatewayFrontendClientCertificateValidation", requiresField: "GatewayFrontendTLS"},
+	{name: "GatewayFrontendClientCertificateValidationInsecureFallback", requiresField: "GatewayFrontendTLS"},
 	// Extended: parentRef port mismatch → NoMatchingParent (#34)
-	{name: features.SupportHTTPRouteDestinationPortMatching},
+	{name: "HTTPRouteDestinationPortMatching"},
 	// Extended: per-port listener routing (#82, #98)
-	{name: features.SupportHTTPRouteParentRefPort},
+	{name: "HTTPRouteParentRefPort"},
 	// Extended: backend protocol selection — GEP-1911 (#90, #32)
-	{name: features.SupportHTTPRouteBackendProtocolH2C},
-	{name: features.SupportHTTPRouteBackendProtocolWebSocket},
+	{name: "HTTPRouteBackendProtocolH2C"},
+	{name: "HTTPRouteBackendProtocolWebSocket"},
 	// Core: BackendTLSPolicy — GEP-1897 (#16)
 	// Extended: BackendTLSPolicy subjectAltNames — GEP-1897 (#133)
-	{name: features.SupportBackendTLSPolicy, requiresKind: "backendtlspolicies"},
-	{name: features.SupportBackendTLSPolicySANValidation, requiresKind: "backendtlspolicies"},
+	{name: "BackendTLSPolicy", requiresKind: "backendtlspolicies"},
+	{name: "BackendTLSPolicySANValidation", requiresKind: "backendtlspolicies"},
 	// Standard: ReferenceGrant — GEP-709 (#3, declaration: #166)
-	{name: features.SupportReferenceGrant, requiresKind: "referencegrants"},
+	{name: "ReferenceGrant", requiresKind: "referencegrants"},
 	// Standard: GRPCRoute — GEP-1016 (#33)
-	{name: features.SupportGRPCRoute, requiresKind: pluralGRPCRoutes},
+	{name: "GRPCRoute", requiresKind: pluralGRPCRoutes},
 	// Extended: named route rules — GEP-995 (#504)
-	{name: features.SupportGRPCRouteNamedRouteRule, requiresKind: pluralGRPCRoutes},
+	{name: "GRPCRouteNamedRouteRule", requiresKind: pluralGRPCRoutes},
 	// Standard: TLSRoute passthrough — GEP-2643 (#70)
-	{name: features.SupportTLSRoute, requiresKind: pluralTLSRoutes},
+	{name: "TLSRoute", requiresKind: pluralTLSRoutes},
 	// Extended: TLSRoute terminate mode — #481
-	{name: features.SupportTLSRouteModeTerminate, requiresKind: pluralTLSRoutes},
+	{name: "TLSRouteModeTerminate", requiresKind: pluralTLSRoutes},
 	// Extended: TLSRoute mixed (passthrough+terminate on same port) — #481
-	{name: features.SupportTLSRouteModeMixed, requiresKind: pluralTLSRoutes},
+	{name: "TLSRouteModeMixed", requiresKind: pluralTLSRoutes},
 	// Standard: TCPRoute — GEP-1901 (#505)
-	{name: features.SupportTCPRoute, requiresKind: pluralTCPRoutes},
+	{name: "TCPRoute", requiresKind: pluralTCPRoutes},
 	// Standard: UDPRoute — GEP-2645 (#506)
-	{name: features.SupportUDPRoute, requiresKind: pluralUDPRoutes},
+	{name: "UDPRoute", requiresKind: pluralUDPRoutes},
 	// Standard: ListenerSet — GEP-1713 (#93)
-	{name: features.SupportListenerSet, requiresKind: pluralListenerSets},
+	{name: "ListenerSet", requiresKind: pluralListenerSets},
 	// Extended: Gateway infrastructure metadata propagation — GEP-1867 (#482).
 	// spec.infrastructure.{labels,annotations} propagate onto provisioned
 	// resources; in shared mode the carrier is a per-Gateway identity
 	// ServiceAccount in the Gateway's namespace.
-	{name: features.SupportGatewayInfrastructurePropagation},
+	{name: "GatewayInfrastructurePropagation"},
 }
 
 // supportedFeatures returns the features this cluster's CRDs can express.
@@ -164,7 +173,7 @@ func supportedFeatures(caps clusterCapabilities) []features.FeatureName {
 		if feature.requiresField != "" && !caps.hasField(feature.requiresField) {
 			continue
 		}
-		declared = append(declared, feature.name)
+		declared = append(declared, features.FeatureName(feature.name))
 	}
 	return declared
 }

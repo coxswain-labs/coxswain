@@ -2,6 +2,7 @@ package conformance_test
 
 import (
 	"os"
+	"strings"
 	"testing"
 
 	v1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
@@ -40,13 +41,27 @@ func TestConformance(t *testing.T) {
 	// A profile is claimed only when the CRDs backing it are installed: the
 	// suite runs every test in a claimed profile, and those tests create the
 	// route kind.
-	opts.ConformanceProfiles = profilesFor(caps)
+	applyProfiles(&opts, profilesFor(caps))
 
 	// Declare only features that are currently implemented AND that the
 	// installed CRDs can express. Add entries here as each feature issue closes;
 	// give an entry a `requires` guard when its CRD kind or schema field is
 	// absent below Gateway API v1.6.
-	opts.SupportedFeatures = supportedFeatures(caps)
+	applyFeatures(&opts, supportedFeatures(caps))
+
+	// Tests that are unrunnable for the Gateway API version under test through
+	// no fault of the implementation — supplied by the runner from
+	// `.gateway-api-versions.json`, where each entry carries a justification.
+	// The v1.4.0 suite, for instance, applies a `v1alpha3` BackendTLSPolicy that
+	// the standard channel does not serve; upstream fixed it in v1.4.1.
+	if skips := os.Getenv("CONFORMANCE_SKIP_TESTS"); skips != "" {
+		for _, name := range strings.Split(skips, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				opts.SkipTests = append(opts.SkipTests, name)
+				t.Logf("skipping %s (unrunnable on Gateway API %s)", name, gatewayAPIVersionUnderTest(caps))
+			}
+		}
+	}
 
 	ipType := v1beta1.IPAddressType
 
