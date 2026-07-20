@@ -1,4 +1,4 @@
-name: Conformance reports (all Gateway API versions)
+name: Conformance reports
 
 # Produces a publishable conformance report for every Gateway API version
 # Coxswain claims support for, laid out exactly as the upstream repository
@@ -17,15 +17,11 @@ on:
   workflow_dispatch:
     inputs:
       versions:
-        description: >
-          Space-separated Gateway API versions to run. Empty runs every version
-          listed in .gateway-api-versions.json.
+        description: 'Gateway API versions, comma separated (default: all)'
         required: false
         default: ''
       publish_release:
-        description: >
-          Also attach the bundle to a GitHub release. Release assets never
-          expire, unlike artifacts (capped at 90 days on a public repo).
+        description: 'Publish release'
         type: boolean
         required: false
         default: false
@@ -51,9 +47,16 @@ jobs:
         env:
           REQUESTED_VERSIONS: ${{ github.event.inputs.versions }}
         run: |
-          REQUESTED="$REQUESTED_VERSIONS"
+          # Comma-separated, tolerating what someone actually types into the
+          # dispatch form: surrounding spaces, and a missing "v" prefix. The
+          # manifest stores "v1.4.1", so "1.4.1" would otherwise be rejected
+          # with a list that looks identical to what was typed.
+          REQUESTED=$(echo "$REQUESTED_VERSIONS" \
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^\([0-9]\)/v\1/' \
+            | tr '\n' ' ')
           ALL=$(scripts/gateway-api-versions.sh --versions)
-          if [ -z "$REQUESTED" ]; then
+          if [ -z "${REQUESTED// /}" ]; then
             SELECTED="$ALL"
           else
             SELECTED=""
@@ -78,8 +81,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      # Conformance must validate the artifact that ships, so this is the
-      # production Dockerfile — never Dockerfile.ci.
+      # Production Dockerfile, never Dockerfile.ci. These reports are a public
+      # claim about the shipped artifact, and a debug binary is slower — enough
+      # that a timing-sensitive conformance test could behave differently from
+      # the image users actually run. The extra build minutes buy that fidelity.
       - name: Build coxswain image
         run: docker build -t coxswain:e2e .
 
