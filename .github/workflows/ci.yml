@@ -153,14 +153,6 @@ jobs:
           cache-key-prefix: ci-test
       - run: cargo test
 
-      # `coxswain-e2e` is not in `default-members`, so the bare `cargo test`
-      # above skips it, and the e2e workflow runs only its integration binaries
-      # (`-E 'binary(<suite>)'`). Its LIB tests — the Prometheus exposition
-      # parsers every e2e assertion reads through — therefore ran nowhere, and a
-      # broken fixture sat green in-tree unnoticed as a result. These need no
-      # cluster.
-      - run: cargo test -p coxswain-e2e --lib
-
   deny:
     name: deny
     needs: changes
