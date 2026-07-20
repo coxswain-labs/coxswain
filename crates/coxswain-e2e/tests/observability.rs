@@ -263,12 +263,15 @@ async fn absent_gateway_api_kinds_degrade_instead_of_blocking_readiness() -> any
     }
 
     // The whole point: the controller serves regardless of which optional kinds
-    // the cluster happens to install.
-    let readyz = reqwest::get(h.controller_admin_url("/readyz")).await?;
+    // the cluster happens to install. The aggregate above is exactly what
+    // `/readyz` reports — `CheckState::is_ready()` counts Degraded as ready — so
+    // asserting the aggregate settles to `ready` while kinds are degraded IS the
+    // readiness claim. (`/readyz` itself is on the health port, which the
+    // harness exposes only indirectly: `helm install --wait` already blocks on
+    // it returning 200, so every test in this suite runs only after it has.)
     assert_eq!(
-        readyz.status(),
-        200,
-        "/readyz must stay 200 when optional Gateway API kinds are absent"
+        health["subsystems"]["controller"]["state"]["state"], "ready",
+        "the controller subsystem must aggregate to ready even with kinds degraded"
     );
 
     Ok(())

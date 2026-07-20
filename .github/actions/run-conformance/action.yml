@@ -210,13 +210,15 @@ runs:
         # `v0.5.0-40-g6352459` off-tag, where the hash is what identifies the
         # tree. Needs the full checkout above — shallow loses the tag entirely.
         IMPL_VERSION=$(git describe --tags --always --dirty)
+        VERSION="${{ steps.gw-version.outputs.version }}"
+        REPORT_DIR="${{ steps.gw-version.outputs.report-dir }}"
+
+        # Every lookup below needs $VERSION, so it must be assigned first.
         LATEST=$(scripts/gateway-api-versions.sh --latest)
         CONFORMANCE_MODULE=$(scripts/gateway-api-versions.sh --field "$VERSION" conformanceModule)
         BUILD_TAGS=$(scripts/gateway-api-versions.sh --field "$VERSION" buildTags)
         CONFORMANCE_SKIP_TESTS=$(scripts/gateway-api-versions.sh --field "$VERSION" skipTests)
         export CONFORMANCE_SKIP_TESTS
-        VERSION="${{ steps.gw-version.outputs.version }}"
-        REPORT_DIR="${{ steps.gw-version.outputs.report-dir }}"
         # Upstream's expected layout, so publishing is copy-the-tree.
         REPORT_FILE="conformance/reports/${REPORT_DIR}/coxswain-coxswain/standard-${IMPL_VERSION}-default-report.yaml"
         mkdir -p "$(dirname "$REPORT_FILE")"
