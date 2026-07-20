@@ -59,8 +59,38 @@ runs:
           go install sigs.k8s.io/cloud-provider-kind@latest
           CPK_BIN="$(go env GOPATH)/bin/cloud-provider-kind"
         fi
+        # `--gateway-channel=disabled` is load-bearing, not tidiness.
+        # cloud-provider-kind defaults to `standard`, which makes it INSTALL the
+        # Gateway API CRDs vendored by its own build (v1.5.1 as of v0.11.1)
+        # before anything else touches the cluster. A later
+        # `kubectl apply -f <version>/standard-install.yaml` then only overwrites
+        # the CRDs present in that bundle, so installing an OLDER release leaves
+        # the extras behind at cloud-provider-kind's version — and the
+        # conformance suite aborts with "multiple gateway API CRDs versions
+        # detected". That is exactly how the v1.4.0/v1.4.1 legs failed while
+        # v1.5.1 (same version) and v1.6.1 (a superset) passed.
+        #
+        # Coxswain provisions its own per-Gateway VIP Services, so it needs
+        # cloud-provider-kind only as a LoadBalancer provider. Disabling the
+        # channel leaves the explicit install as the single source of the CRD
+        # version, which is what every caller here already assumes.
+        #
+        # Fail loudly if the binary predates the flag. It is started with `&`,
+        # so an unsupported flag would kill it silently and every later failure
+        # would look like something else.
+        if ! "$CPK_BIN" --help 2>&1 | grep -q -- --gateway-channel; then
+          echo "::error::$CPK_BIN has no --gateway-channel flag; it would install its own Gateway API CRDs"
+          exit 1
+        fi
+
         # Run in background under sudo so it can manipulate Docker networks.
-        sudo "$CPK_BIN" > /tmp/cloud-provider-kind.log 2>&1 &
-        echo "cloud-provider-kind started (PID $!) using $CPK_BIN"
+        sudo "$CPK_BIN" --gateway-channel=disabled > /tmp/cloud-provider-kind.log 2>&1 &
+        CPK_PID=$!
+        echo "cloud-provider-kind started (PID $CPK_PID) using $CPK_BIN"
         # Brief pause to let it register its watch against the cluster.
         sleep 3
+        if ! sudo kill -0 "$CPK_PID" 2>/dev/null; then
+          echo "::error::cloud-provider-kind exited immediately; LoadBalancer Services would never get IPs"
+          cat /tmp/cloud-provider-kind.log || true
+          exit 1
+        fi
