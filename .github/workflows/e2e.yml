@@ -47,7 +47,7 @@ jobs:
               - 'conformance/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
-              - '.gateway-api-version'
+              - '.gateway-api-versions.json'
               - '.config/nextest.toml'
               - '.github/workflows/e2e.yml'
 

@@ -228,7 +228,15 @@ jobs:
       contents: read
       packages: read
     steps:
+      # fetch-depth: 0 is load-bearing, not hygiene. The report version comes
+      # from `git describe --tags`, and the default shallow checkout fetches no
+      # tag history — describe then falls back to a bare short SHA, so the
+      # report would be named `standard-<sha>-default-report.yaml` with no
+      # release version in it. Fetching tags alone is not enough: describe also
+      # needs the commits between HEAD and the tag.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       # The build job pushed each arch to ghcr by digest (untagged until
       # publish-image). Pull the amd64 image — the kind node is amd64 — by its
@@ -434,9 +442,19 @@ jobs:
         id: report
         run: |
           set -euo pipefail
-          REPORT=$(ls ./conformance-report/gateway-api-conformance-*.yaml | head -1)
-          cp "${REPORT}" ./gw-api-conf-report.yaml
-          echo "path=./gw-api-conf-report.yaml" >> "$GITHUB_OUTPUT"
+          # The report is written in the upstream publishing layout —
+          # reports/<report-dir>/coxswain-coxswain/standard-<version>-default-report.yaml
+          # — so it is located by shape rather than by a flat filename.
+          REPORT=$(find ./conformance-report -type f -name 'standard-*-default-report.yaml' | sort | head -1)
+          if [ -z "$REPORT" ]; then
+            echo "::error::no conformance report found under ./conformance-report"
+            find ./conformance-report -type f | sed 's/^/  /'
+            exit 1
+          fi
+          # Released under the upstream filename so the asset is directly
+          # publishable to kubernetes-sigs/gateway-api.
+          cp "${REPORT}" "./$(basename "${REPORT}")"
+          echo "path=./$(basename "${REPORT}")" >> "$GITHUB_OUTPUT"
 
       - name: Create GitHub Release and attach install.yaml + conformance report
         uses: softprops/action-gh-release@v3

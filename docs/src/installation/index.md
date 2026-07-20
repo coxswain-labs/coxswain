@@ -3,7 +3,10 @@
 ## Prerequisites
 
 - **Kubernetes 1.30+**
-- **Gateway API CRDs** (standard channel, v1.5.x or later matching the Coxswain release):
+- **Gateway API CRDs** (standard channel, **v1.4.0 or later**). Coxswain detects
+  which kinds and fields the installed CRDs serve and runs with that feature set,
+  so it can share a cluster with an implementation pinned to an older version —
+  see the [capability matrix](../reference/capability-matrix.md):
 
 ```bash
 kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/download/standard-install.yaml

@@ -3,9 +3,11 @@ module github.com/coxswain-labs/coxswain/conformance
 go 1.26.0
 
 require (
+	k8s.io/apiextensions-apiserver v0.36.1
 	k8s.io/apimachinery v0.36.1
-	sigs.k8s.io/gateway-api v1.6.0
-	sigs.k8s.io/gateway-api/conformance v1.6.0
+	k8s.io/client-go v0.36.1
+	sigs.k8s.io/gateway-api v1.6.1
+	sigs.k8s.io/gateway-api/conformance v1.6.1
 )
 
 require (
@@ -62,8 +64,6 @@ require (
 	gopkg.in/inf.v0 v0.9.1 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	k8s.io/api v0.36.1 // indirect
-	k8s.io/apiextensions-apiserver v0.36.1 // indirect
-	k8s.io/client-go v0.36.1 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260501160325-927ab1f70cd6 // indirect
 	k8s.io/streaming v0.36.1 // indirect

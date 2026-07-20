@@ -335,6 +335,33 @@ fn set_relist_in_flight(kind: &'static str, in_flight: bool) {
         .set(i64::from(in_flight));
 }
 
+/// Publish one 0/1 series per modelled Gateway API kind (#641).
+///
+/// Every kind is emitted, not just the present ones — a missing series is
+/// indistinguishable from a scrape gap, whereas an explicit `0` lets an operator
+/// see at a glance which kinds the installed CRD set withholds.
+pub fn set_gateway_api_capabilities(present: &std::collections::BTreeSet<&'static str>) {
+    for kind in coxswain_core::gateway_api_capability::GatewayApiKind::ALL {
+        gateway_api_capability()
+            .with_label_values(&[kind.as_str()])
+            .set(i64::from(present.contains(kind.as_str())));
+    }
+}
+
+fn gateway_api_capability() -> &'static IntGaugeVec {
+    static GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
+    GAUGE.get_or_init(|| {
+        register_int_gauge_vec!(
+            Opts::new(
+                "coxswain_gateway_api_capability",
+                "1 when the cluster's installed Gateway API CRDs serve this kind, 0 when they do not. A 0 means the kind's reflector is deliberately not spawned and its readiness check is Degraded, not broken."
+            ),
+            &["kind"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
 fn watch_relists_pending() -> &'static IntGaugeVec {
     static GAUGE: OnceLock<IntGaugeVec> = OnceLock::new();
     GAUGE.get_or_init(|| {

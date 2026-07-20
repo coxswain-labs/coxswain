@@ -18,7 +18,10 @@
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, GeneratedCert, Harness, MtlsCerts, NamespaceGuard,
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress},
-    harness::{GATEWAY_TCP_PROXY_PORT, GATEWAY_TLS_PASSTHROUGH_PORT, GATEWAY_UDP_PROXY_PORT, wait},
+    harness::{
+        GATEWAY_TCP_PROXY_PORT, GATEWAY_TLS_PASSTHROUGH_PORT, GATEWAY_UDP_PROXY_PORT, capability,
+        wait,
+    },
 };
 use gateway_api_types::apis::standard::gateways::Gateway;
 use gateway_api_types::apis::standard::grpcroutes::GrpcRoute;
@@ -231,6 +234,78 @@ async fn gatewayclass_supported_features() -> anyhow::Result<()> {
         feats.contains(&"HTTPRoute".to_string()),
         "must advertise core HTTPRoute feature; got: {feats:?}"
     );
+
+    Ok(())
+}
+
+/// Every feature whose availability depends on a Gateway API CRD *kind*, paired
+/// with that kind's plural resource name.
+///
+/// Gateway API CRDs are cluster-scoped singletons, so a co-resident
+/// implementation can pin the cluster to a release that predates some of these.
+/// Coxswain must then advertise exactly what the installed CRDs can express.
+const KIND_GATED_FEATURES: &[(&str, &str)] = &[
+    ("listenersets", "ListenerSet"),
+    ("tlsroutes", "TLSRoute"),
+    ("tlsroutes", "TLSRouteModeMixed"),
+    ("tlsroutes", "TLSRouteModeTerminate"),
+    ("tcproutes", "TCPRoute"),
+    ("udproutes", "UDPRoute"),
+    ("grpcroutes", "GRPCRoute"),
+    ("referencegrants", "ReferenceGrant"),
+    ("backendtlspolicies", "BackendTLSPolicy"),
+];
+
+/// The advertised feature set must match the installed CRDs exactly — in both
+/// directions.
+///
+/// Deliberately capability-*relative* rather than pinned to a version: it is
+/// meaningful on any cluster, and the CI matrix supplies the coverage across
+/// versions. On the default (newest) cluster every kind is installed, so the
+/// "must be advertised" direction is what has teeth here; the "must NOT be
+/// advertised" direction is exercised by the older-version conformance legs.
+///
+/// The failure this guards is silent and expensive: advertising a feature whose
+/// CRD is absent makes a conformance run create that kind and fail, and
+/// under-advertising one whose CRD is present makes callers think Coxswain
+/// cannot do something it can.
+#[tokio::test]
+async fn gatewayclass_advertises_only_features_the_installed_crds_support() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+
+    // Resolved the same way the controller resolves it — by *served version*,
+    // not by CRD presence — so the test and the controller are describing the
+    // same cluster.
+    let installed = capability::served_gateway_api_kinds(&h.client).await?;
+    assert!(
+        installed.contains("gateways"),
+        "the cluster must have Gateway API installed for this test to mean anything"
+    );
+
+    let feats = wait::wait_for_gatewayclass_supported_features(
+        &h.client,
+        "coxswain",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    for (plural, feature) in KIND_GATED_FEATURES {
+        let crd_present = installed.contains(*plural);
+        let advertised = feats.iter().any(|f| f == feature);
+        assert_eq!(
+            advertised,
+            crd_present,
+            "{feature}: CRD {plural} {} but the feature is {} advertised. \
+             supportedFeatures must equal what the installed CRDs can express. \
+             installed={installed:?} advertised={feats:?}",
+            if crd_present {
+                "is installed"
+            } else {
+                "is NOT installed"
+            },
+            if advertised { "" } else { "not" },
+        );
+    }
 
     Ok(())
 }

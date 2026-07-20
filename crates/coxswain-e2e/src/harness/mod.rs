@@ -2,6 +2,7 @@
 //! and provides HTTP/TLS client helpers and wait utilities.
 
 pub mod bootstrap;
+pub mod capability;
 pub mod controller;
 pub mod http;
 pub mod leader;

@@ -52,12 +52,17 @@ jobs:
             crd_manifests:
               - 'deploy/manifests/crds/**'
               - 'charts/coxswain/crds/**'
-              - '.gateway-api-version'
+              - '.gateway-api-versions.json'
               - 'scripts/check-crd-kubeconform.sh'
               - '.github/workflows/ci.yml'
             anti_drift:
               - 'crates/**'
               - 'Cargo.toml'
+              # A PR that only bumps the Gateway API pin must still run
+              # check-gateway-api-versions.sh — that bump IS the drift it guards.
+              - '.gateway-api-versions.json'
+              - 'scripts/check-gateway-api-versions.sh'
+              - 'scripts/gateway-api-versions.sh'
               - 'scripts/check-no-anyhow-libs.sh'
               - 'scripts/check-reflector-health-checks.sh'
               - 'scripts/check-workspace-lints-decl.sh'
@@ -219,6 +224,8 @@ jobs:
       - uses: actions/checkout@v6
       - name: No anyhow in library crates
         run: bash scripts/check-no-anyhow-libs.sh
+      - name: Gateway API version pin is listed in the supported-version manifest
+        run: bash scripts/check-gateway-api-versions.sh
       - name: Reflector readiness checks are registered on the controller subsystem
         run: bash scripts/check-reflector-health-checks.sh
       - name: Every crate Cargo.toml declares [lints] workspace = true

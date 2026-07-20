@@ -1,0 +1,276 @@
+name: Conformance reports (all Gateway API versions)
+
+# Produces a publishable conformance report for every Gateway API version
+# Coxswain claims support for, laid out exactly as the upstream repository
+# expects so publishing is "download one zip, unzip at the repo root, commit".
+#
+# `workflow_dispatch` only. What these reports describe is the *Gateway API
+# version support matrix*, not the product version — so they need refreshing
+# when `.gateway-api-versions` changes or the capability logic does, not on
+# every release. Neither a schedule nor a tag trigger would tell you anything
+# new; each would just re-prove an unchanged claim at four clusters a run.
+#
+# Gateway API CRDs are cluster-scoped singletons, so each version genuinely
+# needs its own cluster; that is why this is a matrix and not one job.
+
+on:
+  workflow_dispatch:
+    inputs:
+      versions:
+        description: >
+          Space-separated Gateway API versions to run. Empty runs every version
+          listed in .gateway-api-versions.json.
+        required: false
+        default: ''
+      publish_release:
+        description: >
+          Also attach the bundle to a GitHub release. Release assets never
+          expire, unlike artifacts (capped at 90 days on a public repo).
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Read the supported-version list from the manifest so the matrix cannot
+  # drift from it.
+  versions:
+    name: Resolve versions
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Resolve version matrix
+        id: resolve
+        # The dispatch input reaches the shell via `env`, never by `${{ }}`
+        # interpolation into the script body — interpolation would splice the
+        # raw string into the command line before bash ever sees it.
+        env:
+          REQUESTED_VERSIONS: ${{ github.event.inputs.versions }}
+        run: |
+          REQUESTED="$REQUESTED_VERSIONS"
+          ALL=$(scripts/gateway-api-versions.sh --versions)
+          if [ -z "$REQUESTED" ]; then
+            SELECTED="$ALL"
+          else
+            SELECTED=""
+            for v in $REQUESTED; do
+              if ! echo "$ALL" | grep -qxF "$v"; then
+                echo "::error::$v is not listed in .gateway-api-versions.json"
+                exit 1
+              fi
+              SELECTED="$SELECTED $v"
+            done
+          fi
+          # shellcheck disable=SC2086  # deliberate word splitting; every
+          # element was validated against the manifest above.
+          MATRIX=$(echo $SELECTED | tr ' ' '\n' | grep -v '^$' \
+            | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+          echo "Running: $MATRIX"
+
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Conformance must validate the artifact that ships, so this is the
+      # production Dockerfile — never Dockerfile.ci.
+      - name: Build coxswain image
+        run: docker build -t coxswain:e2e .
+
+      - name: Export image
+        run: docker save coxswain:e2e | gzip > e2e-image.tar.gz
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: e2e-image
+          path: e2e-image.tar.gz
+          retention-days: 1
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: conformance/go.mod
+          cache-dependency-path: conformance/go.sum
+
+      - name: Build cloud-provider-kind
+        run: |
+          go install sigs.k8s.io/cloud-provider-kind@latest
+          mkdir -p /tmp/cpk
+          cp "$(go env GOPATH)/bin/cloud-provider-kind" /tmp/cpk/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cloud-provider-kind
+          path: /tmp/cpk/cloud-provider-kind
+          retention-days: 1
+
+  conformance:
+    name: Conformance (Gateway API ${{ matrix.gateway-api-version }})
+    needs: [versions, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      # Every version's result is wanted even when one fails — a leg failing is
+      # itself the finding, and cancelling siblings would hide whether the
+      # problem is version-specific.
+      fail-fast: false
+      matrix:
+        gateway-api-version: ${{ fromJSON(needs.versions.outputs.matrix) }}
+    steps:
+      # fetch-depth: 0 is load-bearing, not hygiene. The report version comes
+      # from `git describe --tags`, and the default shallow checkout fetches no
+      # tag history — describe then falls back to a bare short SHA, so the
+      # report would be named `standard-<sha>-default-report.yaml` with no
+      # release version in it. Fetching tags alone is not enough: describe also
+      # needs the commits between HEAD and the tag.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download Docker image
+        uses: actions/download-artifact@v8
+        with:
+          name: e2e-image
+
+      - name: Load Docker image into daemon
+        run: docker load < e2e-image.tar.gz
+
+      - name: Download cloud-provider-kind
+        uses: actions/download-artifact@v8
+        with:
+          name: cloud-provider-kind
+          path: /tmp/cpk
+
+      - name: Install cloud-provider-kind on PATH
+        run: |
+          chmod +x /tmp/cpk/cloud-provider-kind
+          sudo mv /tmp/cpk/cloud-provider-kind /usr/local/bin/cloud-provider-kind
+
+      - uses: ./.github/actions/run-conformance
+        id: conformance
+        with:
+          gateway-api-version: ${{ matrix.gateway-api-version }}
+
+      # One artifact per leg: upload-artifact@v7 rejects two parallel jobs
+      # writing the same name, and a per-leg artifact means a failed version
+      # costs only its own result.
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-report-${{ matrix.gateway-api-version }}
+          path: conformance/reports/
+          if-no-files-found: warn
+          retention-days: 30
+
+  bundle:
+    name: Bundle reports
+    needs: conformance
+    permissions:
+      # Only this job writes; the workflow default stays read-only.
+      contents: write
+    # Runs even when a leg failed, so the versions that did pass are still
+    # publishable.
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # Full history so `git describe` resolves the implementation version the
+      # report filenames already carry.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # `upload-artifact` roots each archive at the least common ancestor of its
+      # search path, so a leg that uploaded `conformance/reports/` produced an
+      # archive whose ROOT is that directory — the `conformance/reports/`
+      # prefix is not in the zip. Restoring it here is what makes the bundle
+      # genuinely repo-tree-shaped.
+      - name: Download every leg's report
+        uses: actions/download-artifact@v8
+        with:
+          pattern: conformance-report-*
+          path: /tmp/legs
+          merge-multiple: true
+
+      - name: Stage into the repo tree layout
+        id: stage
+        run: |
+          if [ ! -d /tmp/legs ] || [ -z "$(ls -A /tmp/legs 2>/dev/null)" ]; then
+            echo "::warning::no reports were produced"
+            echo "staged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p /tmp/bundle/conformance/reports
+          cp -R /tmp/legs/. /tmp/bundle/conformance/reports/
+          # kubernetes-sigs/gateway-api requires a README.md beside the reports
+          # in every implementation folder — a report set without them is not
+          # submittable. Generated from the reports themselves so the table
+          # cannot disagree with what was run.
+          scripts/render-conformance-readmes.sh /tmp/bundle/conformance/reports
+          echo "staged=true" >> "$GITHUB_OUTPUT"
+          echo "Bundle contents:"
+          find /tmp/bundle -type f | sort | sed 's/^/  /'
+
+      # Unzip at the repo root and commit: the paths land exactly on
+      # conformance/reports/<report-dir>/coxswain-coxswain/, which is also the
+      # layout kubernetes-sigs/gateway-api expects for a publishing PR.
+      - name: Upload combined bundle
+        if: steps.stage.outputs.staged == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: conformance-reports-${{ github.sha }}
+          path: /tmp/bundle/
+          if-no-files-found: error
+          # 90 is the maximum this public repo allows, so an artifact can never
+          # be the archive. The committed conformance/reports/ tree is.
+          retention-days: 90
+
+      # Opt-in: a release asset does not expire, so this is the stable download
+      # URL for a given code version. One release per implementation version —
+      # the same granularity the report filenames already use.
+      - name: Package bundle for release
+        if: ${{ steps.stage.outputs.staged == 'true' && inputs.publish_release }}
+        id: package
+        run: |
+          # Same flags and same commit as the conformance legs, so the release
+          # tag matches the version in every report filename and in each
+          # report's implementation.version.
+          VERSION="$(git describe --tags --always --dirty)"
+          cd /tmp/bundle
+          ARCHIVE="/tmp/coxswain-conformance-reports-${VERSION}.tar.gz"
+          tar czf "$ARCHIVE" conformance
+          echo "archive=$ARCHIVE" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        if: ${{ steps.stage.outputs.staged == 'true' && inputs.publish_release }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: conformance-reports-${{ steps.package.outputs.version }}
+          name: Conformance reports ${{ steps.package.outputs.version }}
+          body: |
+            Gateway API conformance reports for coxswain
+            `${{ steps.package.outputs.version }}`, one per supported Gateway
+            API version.
+
+            **Source commit:** `${{ github.sha }}`
+
+            The same ref appears in every report's `implementation.version` and
+            in each report filename, so a report can always be traced back to
+            the exact tree that produced it.
+
+            Unpack at the repo root — the paths land on
+            `conformance/reports/<gateway-api-version>/coxswain-coxswain/`,
+            which is also the layout `kubernetes-sigs/gateway-api` expects for
+            a publishing PR.
+
+            A run against an older Gateway API version claims fewer profiles and
+            advertises fewer features by design; see
+            `docs/src/reference/capability-matrix.md`.
+          files: ${{ steps.package.outputs.archive }}
+          make_latest: false

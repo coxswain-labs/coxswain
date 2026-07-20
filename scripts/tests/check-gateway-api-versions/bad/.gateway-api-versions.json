@@ -1,0 +1,10 @@
+[
+  {
+    "gatewayApiVersion": "v1.6.1",
+    "reportDir": "v1.6",
+    "latest": true,
+    "conformanceModule": "separate",
+    "buildTags": "",
+    "skipTests": []
+  }
+]

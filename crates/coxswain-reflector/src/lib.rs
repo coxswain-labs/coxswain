@@ -29,7 +29,9 @@
 //!   proxy reconciler (shared-pool and dedicated-mode snapshots alike).
 //! - [`port_alloc`] — internal target-port allocator for shared-mode
 //!   per-Gateway addressing (#472).
-//! - [`crds`] — startup probe for Gateway API CRD presence.
+//! - [`capabilities`] — per-kind and per-field Gateway API capability
+//!   detection, so the controller degrades to whatever CRD set is installed
+//!   instead of wedging on an older one.
 //! - `fingerprint` — shared `resourceVersion`-based fingerprint primitives
 //!   used by the partitioned rebuild below.
 //!
@@ -75,8 +77,8 @@
 //! annotation-driven reconcile still fully rebuilds every rebuild; only the
 //! Gateway API (HTTPRoute/GRPCRoute) path is in scope for #511.
 
+pub mod capabilities;
 pub mod cluster;
-pub mod crds;
 pub mod duration;
 pub mod endpoints;
 pub(crate) mod fingerprint;
@@ -100,7 +102,6 @@ mod tests;
 
 pub use cluster::{ClusterSummaryInputs, build_cluster_summary};
 pub use coxswain_core::fleet::SharedFleet;
-pub use crds::gateway_api_crds_present;
 pub use ingress::IngressPorts;
 pub use jwks::JwksCacheHandle;
 pub use k8s_utils::{WatchScope, WatchScopeError};

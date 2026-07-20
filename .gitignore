@@ -1,7 +1,7 @@
 .cargo/config.toml
 .claude/*
-!.claude/skills/
 !.claude/agents/
+!.claude/skills/
 !.claude/CLAUDE.md
 # Shared project hooks (scripts/gates.sh at authoring time). settings.local.json
 # stays ignored — that one is per-developer.
@@ -12,7 +12,8 @@
 .DS_Store
 _staging/
 __pycache__/
-conformance/reports/*.yaml
+conformance/reports
+!conformance/reports/README.md
 conformance/conformance.test
 crates/coxswain-e2e/fixtures/scheme-authz/scheme-authz
 crates/coxswain-e2e/fixtures/malformed-authz/malformed-authz

@@ -9,7 +9,7 @@
 #    is a byte-identical copy — enforced by the
 #    `crd::*::chart_crd_is_byte_identical_to_manifest_crd` snapshot tests in
 #    coxswain-core — so validating one set covers both.
-# 2. The upstream Gateway API CRDs at the `.gateway-api-version` pin, fetched
+# 2. The upstream Gateway API CRDs at the current supported version, fetched
 #    live the same way `scripts/setup-conformance.sh` and DEVELOPMENT.md's
 #    local-controller setup already do. This is the literal regression guard
 #    for kubernetes-sigs/gateway-api#4402 ("Standard CRD manifests contain
@@ -19,7 +19,7 @@
 #    from the release URL, never committed to this repo — see DEVELOPMENT.md),
 #    so there is nothing to "regenerate" on our side; this check is what makes
 #    "kubeconform passes" a durable claim instead of a one-time observation
-#    that would silently go stale on the next `.gateway-api-version` bump.
+#    that would silently go stale on the next Gateway API version bump.
 #
 # kubeconform's bundled `master-standalone(-strict)` schema catalog has no
 # top-level `customresourcedefinition-*.json` file (only its subcomponents —
@@ -105,7 +105,7 @@ if ! run_kubeconform deploy/manifests/crds/*.yaml; then
   status=1
 fi
 
-gateway_api_version="$(tr -d '[:space:]' < .gateway-api-version)"
+gateway_api_version="$(scripts/gateway-api-versions.sh --latest)"
 gateway_install_yaml="$(mktemp -d)/standard-install.yaml"
 gateway_install_url="https://github.com/kubernetes-sigs/gateway-api/releases/download/${gateway_api_version}/standard-install.yaml"
 echo ">>> fetching upstream Gateway API CRDs at ${gateway_api_version}"
@@ -115,7 +115,7 @@ echo ">>> validating upstream Gateway API CRDs (${gateway_api_version}) with kub
 if ! run_kubeconform "$gateway_install_yaml"; then
   echo "FAIL: the upstream Gateway API CRDs at ${gateway_api_version} are structurally" >&2
   echo "invalid (e.g. kubernetes-sigs/gateway-api#4402's null .status fields regressed)." >&2
-  echo "This is not coxswain's manifest — report/track upstream and re-pin .gateway-api-version." >&2
+  echo "This is not coxswain's manifest — report/track upstream and re-pin .gateway-api-versions.json." >&2
   status=1
 fi
 

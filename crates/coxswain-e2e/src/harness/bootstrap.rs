@@ -12,13 +12,42 @@ use tokio::sync::OnceCell;
 /// without touching this cell.
 static CLUSTER_SETUP: OnceCell<()> = OnceCell::const_new();
 
-/// Single source of truth for the Gateway API CRD version installed in tests.
-/// To bump: change `.gateway-api-version` at the repo root, then regenerate
-/// `gateway-api-types` with `cargo run -p xtask -- gateway-api-types`
-/// (#510) — that's the whole loop; there's no second version string to keep
-/// in sync (`gateway-api-types` is an in-workspace crate, not an external
-/// dependency pinned separately in `Cargo.toml`).
-const GATEWAY_API_VERSION: &str = include_str!("../../../../.gateway-api-version").trim_ascii();
+/// The Gateway API CRD version installed in tests: the entry marked
+/// `"latest": true` in `.gateway-api-versions.json` at the repo root.
+///
+/// To bump: edit that manifest, then regenerate `gateway-api-types` with
+/// `cargo run -p xtask -- gateway-api-types` (#510) — that's the whole loop;
+/// there's no second version string to keep in sync (`gateway-api-types` is an
+/// in-workspace crate, not an external dependency pinned in `Cargo.toml`).
+///
+/// Parsed rather than `include_str!`-ed into a `const`: a `const` cannot parse
+/// JSON, and one manifest listing every supported version is worth more than
+/// compile-time evaluation of a string this harness reads once. Fallible rather
+/// than a panicking `LazyLock` because every caller already returns `Result`.
+///
+/// # Errors
+///
+/// Returns an error if the manifest is not valid JSON or does not mark exactly
+/// one entry `"latest": true`.
+fn gateway_api_version() -> anyhow::Result<String> {
+    const MANIFEST: &str = include_str!("../../../../.gateway-api-versions.json");
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(MANIFEST).context("`.gateway-api-versions.json` is not valid JSON")?;
+    let latest: Vec<&serde_json::Value> = entries
+        .iter()
+        .filter(|e| e["latest"] == serde_json::Value::Bool(true))
+        .collect();
+    match latest.as_slice() {
+        [entry] => entry["gatewayApiVersion"]
+            .as_str()
+            .map(str::to_owned)
+            .context("the `latest` entry has no string `gatewayApiVersion`"),
+        found => anyhow::bail!(
+            "`.gateway-api-versions.json` must mark exactly one entry \"latest\": true, found {}",
+            found.len()
+        ),
+    }
+}
 
 /// Local Docker image tag used for all e2e runs.
 pub(crate) const E2E_IMAGE: &str = "coxswain:e2e";
@@ -180,11 +209,12 @@ pub async fn bootstrap_cluster() -> anyhow::Result<()> {
             }
 
             if !gateway_v1_crds_installed().await {
+                let version = gateway_api_version()?;
                 tracing::info!(
-                    "Gateway API CRDs absent or pre-v1, installing {GATEWAY_API_VERSION}"
+                    "Gateway API CRDs absent or pre-v1, installing {version}"
                 );
                 kubectl_apply_url(&format!(
-                    "https://github.com/kubernetes-sigs/gateway-api/releases/download/{GATEWAY_API_VERSION}/standard-install.yaml"
+                    "https://github.com/kubernetes-sigs/gateway-api/releases/download/{version}/standard-install.yaml"
                 ))
                 .await
                 .context("install Gateway API CRDs")?;
@@ -1265,7 +1295,7 @@ async fn install_cloud_provider_kind_if_missing() -> anyhow::Result<()> {
 /// Version source: the `v1.18.0` release tag in the install URL below. This is a
 /// multi-document manifest applied by URL (not a single image), so it is pinned by
 /// release tag rather than `@sha256:` — bump the tag here to upgrade. The
-/// Gateway-API CRDs are likewise tag-pinned via `.gateway-api-version`
+/// Gateway-API CRDs are likewise tag-pinned via `.gateway-api-versions.json`
 /// ([`GATEWAY_API_VERSION`]).
 async fn install_cert_manager_if_missing() -> anyhow::Result<()> {
     if !cert_manager_installed().await {

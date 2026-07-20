@@ -50,6 +50,13 @@ rules:
   - apiGroups: ["authentication.k8s.io"]
     resources: ["tokenreviews"]
     verbs: ["create"]
+  # Read Gateway API CRD definitions to detect which kinds and schema fields the
+  # installed CRD set actually serves, so the controller runs against any
+  # supported Gateway API version instead of wedging on an older one. Read-only,
+  # and cluster-scoped because CRDs are — the namespaced lockdown needs it too.
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources: ["customresourcedefinitions"]
+    verbs: ["get", "list", "watch"]
   # Cluster-scoped IngressClass.
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingressclasses"]

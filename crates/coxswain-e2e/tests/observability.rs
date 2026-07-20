@@ -41,7 +41,7 @@ use anyhow::Context as _;
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, Harness, IngressClassGuard, NamespaceGuard,
     fixtures::{self, backends, gateway_api as gwa, ingress},
-    harness::wait,
+    harness::{capability, wait},
 };
 use gateway_api_types::apis::standard::gateways::Gateway;
 use k8s_openapi::api::events::v1::Event as K8sEvent;
@@ -149,6 +149,130 @@ async fn status_exposes_per_subsystem_checks() -> anyhow::Result<()> {
         .as_object()
         .expect("proxy.checks must be an object");
     assert_eq!(proxy_checks["routing_table_loaded"]["state"], "ready");
+
+    Ok(())
+}
+
+/// Readiness checks whose reflector only runs when the matching Gateway API CRD
+/// is installed, paired with that CRD's plural resource name.
+const KIND_GATED_CHECKS: &[(&str, &str)] = &[
+    ("listenersets", "listener_set"),
+    ("tlsroutes", "tls_route"),
+    ("tcproutes", "tcp_route"),
+    ("udproutes", "udp_route"),
+    ("grpcroutes", "grpcroute"),
+    ("referencegrants", "reference_grant"),
+    ("backendtlspolicies", "backend_tls_policy"),
+];
+
+/// A kind whose CRD is absent must report `degraded`, never `pending`, and must
+/// not hold `/readyz` down.
+///
+/// Both states mean "no reflector is running", but only `degraded` is counted
+/// as ready by the health aggregate. Leaving an absent kind `pending` is
+/// precisely the wedge this behaviour exists to prevent: on a cluster pinned to
+/// an older Gateway API by a co-resident implementation, the controller would
+/// return 503 forever with nothing actually wrong.
+///
+/// Capability-relative, so it is meaningful on any cluster. On the default
+/// (newest) cluster every kind is installed and the assertion is that they are
+/// all `ready`; the `degraded` branch is exercised on the older-version legs.
+#[tokio::test]
+async fn absent_gateway_api_kinds_degrade_instead_of_blocking_readiness() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+
+    // Resolved by *served version*, matching how the controller resolves it.
+    let installed = capability::served_gateway_api_kinds(&h.client).await?;
+
+    let url = h.controller_admin_url("/api/v1/health");
+    let health: serde_json::Value = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        {
+            let url = url.clone();
+            move || {
+                // The regression this test exists to catch — a kind-gated check
+                // left Pending instead of Degraded — blocks the aggregate, so
+                // the poll below never settles and the assertions that name the
+                // offending check are never reached. Render every check's state
+                // here so the timeout itself is the diagnosis.
+                let url = url.clone();
+                async move {
+                    let checks = async {
+                        let body: serde_json::Value =
+                            reqwest::get(&url).await.ok()?.json().await.ok()?;
+                        let checks = body["subsystems"]["controller"]["checks"].as_object()?;
+                        Some(
+                            checks
+                                .iter()
+                                .map(|(name, entry)| {
+                                    format!("{name}={}", entry["state"].as_str().unwrap_or("?"))
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        )
+                    }
+                    .await;
+                    match checks {
+                        Some(checks) => {
+                            format!("controller subsystem to settle; checks were: {checks}")
+                        }
+                        None => "controller subsystem to settle (health endpoint unreadable)"
+                            .to_string(),
+                    }
+                }
+            }
+        },
+        || {
+            let url = url.clone();
+            async move {
+                let h: serde_json::Value = reqwest::get(&url).await.ok()?.json().await.ok()?;
+                let state = h["subsystems"]["controller"]["state"]["state"].as_str()?;
+                (state == "ready").then_some(h)
+            }
+        },
+    )
+    .await?;
+
+    let checks = health["subsystems"]["controller"]["checks"]
+        .as_object()
+        .expect("controller.checks must be an object");
+
+    for (plural, check) in KIND_GATED_CHECKS {
+        let entry = checks
+            .get(*check)
+            .unwrap_or_else(|| panic!("controller.checks must always register '{check}'"));
+        let state = entry["state"].as_str().unwrap_or_default();
+        if installed.contains(*plural) {
+            assert_eq!(
+                state, "ready",
+                "{check}: CRD {plural} is installed so its reflector must sync; got {entry}"
+            );
+        } else {
+            assert_eq!(
+                state, "degraded",
+                "{check}: CRD {plural} is absent, so the check must be degraded (which \
+                 /readyz tolerates) and never pending (which blocks it forever); got {entry}"
+            );
+            assert!(
+                entry["reason"].as_str().is_some_and(|r| !r.is_empty()),
+                "{check}: a degraded check must say why, or an operator cannot tell a \
+                 deliberate downgrade from a broken watch; got {entry}"
+            );
+        }
+    }
+
+    // The whole point: the controller serves regardless of which optional kinds
+    // the cluster happens to install. The aggregate above is exactly what
+    // `/readyz` reports — `CheckState::is_ready()` counts Degraded as ready — so
+    // asserting the aggregate settles to `ready` while kinds are degraded IS the
+    // readiness claim. (`/readyz` itself is on the health port, which the
+    // harness exposes only indirectly: `helm install --wait` already blocks on
+    // it returning 200, so every test in this suite runs only after it has.)
+    assert_eq!(
+        health["subsystems"]["controller"]["state"]["state"], "ready",
+        "the controller subsystem must aggregate to ready even with kinds degraded"
+    );
 
     Ok(())
 }

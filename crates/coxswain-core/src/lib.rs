@@ -13,6 +13,7 @@ pub mod crd;
 pub mod dedicated_registry;
 pub mod endpoints;
 pub mod fleet;
+pub mod gateway_api_capability;
 pub mod health;
 pub mod identity;
 pub mod listener_status;

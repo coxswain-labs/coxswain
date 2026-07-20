@@ -1,5 +1,5 @@
 //! Gateway API condition `type`/`reason` constants, parsed directly from the upstream Go
-//! source (`apis/v1`, `apisx/v1alpha1`) at the tag pinned in `.gateway-api-version` — see
+//! source (`apis/v1`, `apisx/v1alpha1`) at the current tag from `.gateway-api-versions.json` — see
 //! the repo-root `xtask` crate. Regenerate with
 //! `cargo run -p xtask -- gateway-api-types` — do not edit by hand.
 

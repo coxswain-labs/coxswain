@@ -21,6 +21,9 @@ use super::route_builder::{
     build_tcp_routes, build_terminate_routes, build_tls, build_udp_routes, count_attached_routes,
     merge_backend_client_cert_health, resolve_backend_client_certs,
 };
+use crate::capabilities::{
+    ApiServerCapabilities, CapabilitySource, GatewayApiCapabilities, SharedGatewayApiCapabilities,
+};
 use crate::cluster::{ClusterSummaryInputs, build_cluster_summary};
 use crate::gateway_api::{
     BackendPolicyIndex, BackendTlsIndex, GatewayApiReconciler, GrpcRouteReconciler,
@@ -36,13 +39,12 @@ use crate::gw_types::TlsRoute;
 use crate::gw_types::UdpRoute;
 use crate::gw_types::v::gatewayclasses::GatewayClass;
 use crate::gw_types::v::gateways::Gateway;
-use crate::gw_types::v::referencegrants::ReferenceGrant;
 use crate::ingress::IngressPorts;
 use crate::k8s_utils::{WatchScope, scoped_api};
 use crate::merged_store::MergedStore;
 use crate::reference_grants::{
-    GrantSet, flatten_basic_auth_secret_grants, flatten_ca_grants, flatten_grants,
-    flatten_ls_cert_grants, flatten_tcp_backend_grants, flatten_udp_backend_grants,
+    DynamicReferenceGrant, GrantSet, flatten_basic_auth_secret_grants, flatten_ca_grants,
+    flatten_grants, flatten_ls_cert_grants, flatten_tcp_backend_grants, flatten_udp_backend_grants,
 };
 use crate::status::{
     BackendTlsPolicyStatusHandle, ClientTrafficPolicyStatusHandle,
@@ -63,6 +65,7 @@ use coxswain_core::dedicated_registry::{
     DedicatedRegistryData, DedicatedRoutingRegistry, DedicatedRoutingSnapshot,
 };
 use coxswain_core::fleet::{self, SharedFleet};
+use coxswain_core::gateway_api_capability::GatewayApiKind;
 use coxswain_core::health::LivenessGate;
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::ownership::{ObjectKey, OwnedGateways};
@@ -76,6 +79,7 @@ use futures::StreamExt;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::api::networking::v1::{Ingress, IngressClass};
+use kube::core::discovery::ApiResource;
 use kube::{
     Client,
     api::Api,
@@ -359,15 +363,22 @@ fn watch_client(kube_config: &kube::Config, fallback: &Client) -> Client {
 #[derive(Clone, Copy)]
 struct WatchClientSource<'a> {
     /// Inferred config used to build each fresh per-watch client.
-    config: &'a kube::Config,
-    /// Primary client, used only as the fallback if a fresh build fails.
+    ///
+    /// `None` means no dedicated connection can be minted, so every watch
+    /// shares `fallback` — the same outcome [`watch_client`] falls back to when
+    /// a fresh build fails, reached without attempting the build.
+    config: Option<&'a kube::Config>,
+    /// Primary client, used as the fallback when no fresh client can be built.
     fallback: &'a Client,
 }
 
 impl WatchClientSource<'_> {
     /// A dedicated client (own connection) for one watch.
     fn client(&self) -> Client {
-        watch_client(self.config, self.fallback)
+        match self.config {
+            Some(config) => watch_client(config, self.fallback),
+            None => self.fallback.clone(),
+        }
     }
 }
 
@@ -445,6 +456,9 @@ pub struct SharedProxyReconciler {
     /// Per-Gateway publish-sequence stamps for the #531 `Programmed` ack
     /// gate. Stamped at the end of every rebuild, after all cells above.
     publish_index: GatewayPublishIndexHandle,
+    /// Gateway API capabilities detected against the live cluster (#641),
+    /// published for the controller's `GatewayClass` status writer.
+    gateway_api_capabilities: SharedGatewayApiCapabilities,
     fleet: SharedFleet,
     owned_gateways: OwnedGateways,
     leader: Arc<AtomicBool>,
@@ -523,6 +537,12 @@ pub struct ReconcilerOutputs {
 /// store handle). Obtained once from [`SharedProxyReconciler::status_stores`].
 #[derive(Clone)]
 pub struct StatusStores {
+    /// Gateway API capabilities detected against the live cluster (#641).
+    ///
+    /// Carried alongside the stores because the `GatewayClass` status writer
+    /// must advertise only features the installed CRDs can express, and the
+    /// reflector is the only component that talks to discovery.
+    pub gateway_api_capabilities: SharedGatewayApiCapabilities,
     /// `Gateway` store reader.
     pub gateways: MergedStore<Gateway>,
     /// `GatewayClass` store reader.
@@ -709,6 +729,9 @@ impl SharedProxyReconciler {
         controller_name: String,
         opts: ReconcilerOptions,
     ) -> Self {
+        // Bound here rather than in the `Self` literal: `StatusStores` below is
+        // built inside this same constructor and must share the handle.
+        let gateway_api_capabilities = SharedGatewayApiCapabilities::new();
         let ReconcilerOutputs {
             ingress_routes,
             gateway_routes,
@@ -808,6 +831,7 @@ impl SharedProxyReconciler {
                 pods: pods_w,
             };
             let stores = StatusStores {
+                gateway_api_capabilities: gateway_api_capabilities.clone(),
                 gateways: gateways_r,
                 gateway_classes: gateway_classes_r,
                 routes: routes_r,
@@ -871,6 +895,7 @@ impl SharedProxyReconciler {
             cbp_status: CoxswainBackendPolicyStatusHandle::new(),
             external_auth_status: CoxswainExternalAuthStatusHandle::new(),
             publish_index: GatewayPublishIndexHandle::new(),
+            gateway_api_capabilities,
             fleet: SharedFleet::new(),
             owned_gateways,
             leader,
@@ -911,6 +936,14 @@ impl SharedProxyReconciler {
     #[must_use]
     pub fn publish_index(&self) -> GatewayPublishIndexHandle {
         self.publish_index.clone()
+    }
+
+    /// Returns the detected Gateway API capability handle (#641). The
+    /// controller's `GatewayClass` status writer reads it so `supportedFeatures`
+    /// advertises only what the installed CRDs can express.
+    #[must_use]
+    pub fn gateway_api_capabilities(&self) -> SharedGatewayApiCapabilities {
+        self.gateway_api_capabilities.clone()
     }
 
     /// Returns the shared GRPCRoute status handle so the Controller can subscribe to
@@ -1072,7 +1105,7 @@ pub(super) struct ReflectorStores<'a> {
     /// all agree on one Service snapshot. A per-builder re-read could observe a
     /// mid-rebuild Service mutation and disagree (bound on port X, routed under Y).
     pub(super) vip_internal: &'a super::route_builder::VipInternalPorts,
-    pub(super) grants: &'a MergedStore<ReferenceGrant>,
+    pub(super) grants: &'a MergedStore<DynamicReferenceGrant>,
     pub(super) secrets: &'a MergedStore<Secret>,
     /// Label-scoped htpasswd Secrets (`ingress.coxswain-labs.dev/auth-basic=true`) used
     /// by the `auth-basic-secret` Ingress annotation (#24).  Separate from `secrets`
@@ -1301,7 +1334,11 @@ pub(super) fn spawn_reflector<T>(
         + Send
         + Sync
         + 'static,
-    T::DynamicType: Default + Clone + std::hash::Hash + Eq + Send + Sync + 'static,
+    // No `Default` bound: the caller always supplies the writer, so the dynamic
+    // type is already fixed by the time it reaches here. Requiring `Default`
+    // would exclude `ApiResource`, which is how a runtime-negotiated kind such
+    // as `ReferenceGrant` carries its resolved API version.
+    T::DynamicType: Clone + std::hash::Hash + Eq + Send + Sync + 'static,
 {
     let ReflectorEffects {
         trigger,
@@ -1430,6 +1467,7 @@ impl BackgroundService for SharedProxyReconciler {
             cbp_status: self.cbp_status.clone(),
             external_auth_status: self.external_auth_status.clone(),
             publish_index: self.publish_index.clone(),
+            gateway_api_capabilities: self.gateway_api_capabilities.clone(),
             passthrough_routes: self.passthrough_routes.clone(),
             terminate_routes: self.terminate_routes.clone(),
             tcp_routes: self.tcp_routes.clone(),
@@ -1491,6 +1529,8 @@ struct SharedHandles {
     external_auth_status: CoxswainExternalAuthStatusHandle,
     /// Per-Gateway publish-sequence stamps for the #531 ack gate.
     publish_index: GatewayPublishIndexHandle,
+    /// Detected Gateway API capabilities, stored after each successful probe.
+    gateway_api_capabilities: SharedGatewayApiCapabilities,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     passthrough_routes: SharedTlsPassthroughTable,
     /// SNI-keyed TLS terminate routing table for TLSRouteModeTerminate (#481).
@@ -1540,6 +1580,38 @@ where
     });
     // Re-pair each writer's reader handle with the namespace it watches, so the
     // merged store can route `get` by namespace.
+    let readers = writers
+        .iter()
+        .zip(namespaces)
+        .map(|(writer, ns)| (ns.map(str::to_string), writer.as_reader()))
+        .collect();
+    (MergedStore::new(readers), writers)
+}
+
+/// Like [`scoped_reader_writers`], but for a kind whose `DynamicType` carries
+/// runtime data rather than being derivable from the type alone.
+///
+/// [`scoped_reader_writers`] mints stores via `reflector::store::<K>()`, which
+/// needs `K::DynamicType: Default` — and [`kube::core::discovery::ApiResource`]
+/// has no `Default`, because there is no meaningful "default" group/version.
+/// Here the caller supplies the negotiated descriptor and every per-namespace
+/// writer is built from it, so the whole fan watches one agreed API version.
+///
+/// There is no `pre` parameter: no status-relevant type needs this path, so
+/// there are never pre-created writers to adopt.
+fn scoped_reader_writers_dynamic<K>(
+    dt: &K::DynamicType,
+    scope: &WatchScope,
+) -> (MergedStore<K>, Vec<reflector::store::Writer<K>>)
+where
+    K: kube::Resource + Clone + 'static,
+    K::DynamicType: Eq + std::hash::Hash + Clone,
+{
+    let namespaces = scope.api_scopes();
+    let writers: Vec<_> = namespaces
+        .iter()
+        .map(|_| reflector::store::Writer::<K>::new(dt.clone()))
+        .collect();
     let readers = writers
         .iter()
         .zip(namespaces)
@@ -1654,6 +1726,51 @@ impl ScopedSpawn<'_> {
         }
     }
 
+    /// Like [`Self::namespaced`], but for a kind whose API version was
+    /// negotiated at runtime.
+    ///
+    /// A dynamic object's `Scope` is [`kube::core::DynamicResourceScope`], not
+    /// `NamespaceResourceScope`, so it cannot satisfy [`Self::namespaced`]'s
+    /// bound and cannot go through [`scoped_api`]; the `*_with` constructors
+    /// take the descriptor explicitly instead.
+    fn namespaced_dynamic<K>(
+        &mut self,
+        ar: &ApiResource,
+        writers: Vec<reflector::store::Writer<K>>,
+        config: watcher::Config,
+        check: &'static str,
+        label: &'static str,
+    ) where
+        K: kube::Resource<DynamicType = ApiResource, Scope = kube::core::DynamicResourceScope>
+            + serde::de::DeserializeOwned
+            + Clone
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + 'static,
+    {
+        // Copy the `&WatchScope` out first: the spawn below takes `&mut self`,
+        // so the scope must not alias a live borrow of `self`.
+        let scope = self.scope;
+        let readiness = Arc::new(AtomicUsize::new(writers.len().max(1)));
+        for (writer, ns) in writers.into_iter().zip(scope.api_scopes()) {
+            let effects = ReflectorEffects::new(
+                self.trigger,
+                self.health,
+                check,
+                self.metrics,
+                ns.unwrap_or("").to_string(),
+                Arc::clone(&readiness),
+            );
+            let client = self.clients.client();
+            let api: Api<K> = match ns {
+                Some(ns) => Api::namespaced_with(client, ns, ar),
+                None => Api::all_with(client, ar),
+            };
+            spawn_reflector(self.set, writer, api, config.clone(), effects, label);
+        }
+    }
+
     /// Spawn a single cluster-wide reflector for a **cluster-scoped** resource
     /// (or one deliberately watched cluster-wide). The caller supplies the
     /// `Api::all` handle since cluster-scoped types cannot use [`scoped_api`].
@@ -1686,93 +1803,208 @@ impl ScopedSpawn<'_> {
     }
 }
 
-/// Writer bundle for all Gateway API stores, passed as a unit to
-/// [`add_gateway_api_reflectors`]. Gathered here so the callers
-/// don't exceed the 7-argument function threshold.
-struct GatewayApiStoreWriters {
+/// Writer bundle for the stores whose kinds are **always** installed — the core
+/// API types and Coxswain's own CRDs, which ship with our chart.
+///
+/// Separate from [`GatewayApiStoreWriters`] because these are spawned exactly
+/// once and are never capability-gated: routing them through the gate would ask
+/// [`GatewayApiCapabilities::kind`] about a kind it does not model, get `None`,
+/// and silently stop watching ConfigMaps and every policy CR.
+struct CoreStoreWriters {
     // Namespaced types carry one writer per watched namespace (#59); the
-    // cluster-scoped `gateway_classes` and cluster-wide `namespaces` are single.
-    routes: Vec<reflector::store::Writer<HttpRoute>>,
-    grpc_routes: Vec<reflector::store::Writer<GrpcRoute>>,
-    tls_routes: Vec<reflector::store::Writer<TlsRoute>>,
-    tcp_routes: Vec<reflector::store::Writer<TcpRoute>>,
-    udp_routes: Vec<reflector::store::Writer<UdpRoute>>,
-    gateways: Vec<reflector::store::Writer<Gateway>>,
-    gateway_classes: reflector::store::Writer<GatewayClass>,
-    grants: Vec<reflector::store::Writer<ReferenceGrant>>,
-    policies: Vec<reflector::store::Writer<BackendTlsPolicy>>,
+    // cluster-wide `namespaces` is single.
     configmaps: Vec<reflector::store::Writer<ConfigMap>>,
     path_rewrites: Vec<reflector::store::Writer<PathRewriteRegex>>,
     basic_auths: Vec<reflector::store::Writer<BasicAuth>>,
     request_size_limits: Vec<reflector::store::Writer<RequestSizeLimit>>,
-    listener_sets: Vec<reflector::store::Writer<ListenerSet>>,
     namespaces: reflector::store::Writer<Namespace>,
     client_traffic_policies: Vec<reflector::store::Writer<ClientTrafficPolicy>>,
     coxswain_backend_policies: Vec<reflector::store::Writer<CoxswainBackendPolicy>>,
 }
 
-/// Spawn all Gateway API reflectors through `scoped` — one reflector per watched
-/// namespace for namespaced types, a single cluster-wide watch for the
-/// cluster-scoped `GatewayClass` / `Namespace` (#59).
+/// Writer bundle for the `gateway.networking.k8s.io` stores, passed as a unit to
+/// [`add_gateway_api_reflectors`]. Gathered here so the callers
+/// don't exceed the 7-argument function threshold.
 ///
-/// Called either immediately at startup (CRDs present) or from the self-heal
-/// probe task once the CRDs appear. Consumes the writer bundle so each
-/// underlying `reflector::store::Writer` is owned by exactly one task.
-fn add_gateway_api_reflectors(scoped: &mut ScopedSpawn<'_>, writers: GatewayApiStoreWriters) {
-    let GatewayApiStoreWriters {
-        routes,
-        grpc_routes,
-        tls_routes,
-        tcp_routes,
-        udp_routes,
-        gateways,
-        gateway_classes,
-        grants,
-        policies,
+/// Every field is an `Option` so a kind whose CRD is absent **retains** its
+/// writers: the bundle outlives a spawn pass, and a later re-probe (once the CRD
+/// is installed) still has a writer to hand to the reflector. Taking the writer
+/// by value at the gate instead would drop it on the first pass and leave the
+/// kind permanently unactivatable.
+struct GatewayApiStoreWriters {
+    // Namespaced types carry one writer per watched namespace (#59); the
+    // cluster-scoped `gateway_classes` is single.
+    routes: Option<Vec<reflector::store::Writer<HttpRoute>>>,
+    grpc_routes: Option<Vec<reflector::store::Writer<GrpcRoute>>>,
+    tls_routes: Option<Vec<reflector::store::Writer<TlsRoute>>>,
+    tcp_routes: Option<Vec<reflector::store::Writer<TcpRoute>>>,
+    udp_routes: Option<Vec<reflector::store::Writer<UdpRoute>>>,
+    gateways: Option<Vec<reflector::store::Writer<Gateway>>>,
+    gateway_classes: Option<reflector::store::Writer<GatewayClass>>,
+    grants: Option<Vec<reflector::store::Writer<DynamicReferenceGrant>>>,
+    policies: Option<Vec<reflector::store::Writer<BackendTlsPolicy>>>,
+    listener_sets: Option<Vec<reflector::store::Writer<ListenerSet>>>,
+}
+
+/// The single capability gate for every `gateway.networking.k8s.io` reflector.
+///
+/// Wraps a [`ScopedSpawn`] so the "is this kind installed?" question is asked in
+/// exactly one place rather than at each call site — adding a kind stays one
+/// uniform line, and no `if capability X` conditional appears in the spawn list.
+///
+/// `already` records which kinds are live. It is **not** what prevents a
+/// double spawn — taking each kind's writers leaves them `None`, so a second
+/// pass finds nothing to hand over regardless. It exists so the caller can tell
+/// how many kinds became live this tick (whether to trigger a rebuild) and when
+/// every modelled kind is watched (whether to keep probing at all).
+struct CapabilityGatedSpawn<'a, 'b> {
+    scoped: &'a mut ScopedSpawn<'b>,
+    caps: &'a GatewayApiCapabilities,
+    already: &'a mut HashSet<GatewayApiKind>,
+}
+
+impl CapabilityGatedSpawn<'_, '_> {
+    /// Whether this kind should be spawned *now*: its CRD is installed and it
+    /// is not already recorded as live.
+    ///
+    /// A kind whose CRD is absent has its readiness check marked `Degraded`
+    /// rather than left `Pending`. Both mean "no reflector", but only `Pending`
+    /// blocks the subsystem aggregate — and `/readyz` must stay 200 on a cluster
+    /// where every installed kind is working. That is the whole point of #641:
+    /// a Gateway API v1.4 cluster has no ListenerSet/TLSRoute/TCPRoute/UDPRoute
+    /// CRD, and the controller must serve, not wedge.
+    ///
+    /// Degrading here rather than from a separate check table keeps one source
+    /// of truth: this is the only place that knows both the kind and its check
+    /// name, and `scripts/check-reflector-health-checks.sh` already pins those
+    /// names to the call sites below.
+    fn enter(&mut self, kind: GatewayApiKind, check: &'static str) -> bool {
+        if self.caps.kind(kind).is_none() {
+            self.scoped
+                .health
+                .degraded(check, "Gateway API CRD not installed");
+            return false;
+        }
+        self.already.insert(kind)
+    }
+
+    /// Gated [`ScopedSpawn::namespaced`].
+    ///
+    /// `writers` is `&mut Option<_>` so the take happens **after** the gate:
+    /// Rust evaluates arguments before the call, so taking at the call site
+    /// would drop an absent kind's writers and make it permanently
+    /// unactivatable no matter how many times the probe re-runs.
+    fn kind<K>(
+        &mut self,
+        kind: GatewayApiKind,
+        writers: &mut Option<Vec<reflector::store::Writer<K>>>,
+        config: watcher::Config,
+        check: &'static str,
+        label: &'static str,
+    ) where
+        K: kube::Resource<Scope = kube::core::NamespaceResourceScope>
+            + serde::de::DeserializeOwned
+            + Clone
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + 'static,
+        K::DynamicType: Default + Clone + std::hash::Hash + Eq + Send + Sync + 'static,
+    {
+        if !self.enter(kind, check) {
+            return;
+        }
+        let Some(writers) = writers.take() else {
+            return;
+        };
+        self.scoped.namespaced::<K>(writers, config, check, label);
+    }
+
+    /// Gated [`ScopedSpawn::namespaced_dynamic`] — for a kind watched at the
+    /// version discovery reported rather than the one compiled in.
+    ///
+    /// The descriptor comes from the same `caps` lookup that gates the spawn,
+    /// so a kind can never be watched at a version the cluster does not serve.
+    fn kind_dynamic<K>(
+        &mut self,
+        kind: GatewayApiKind,
+        writers: &mut Option<Vec<reflector::store::Writer<K>>>,
+        config: watcher::Config,
+        check: &'static str,
+        label: &'static str,
+    ) where
+        K: kube::Resource<DynamicType = ApiResource, Scope = kube::core::DynamicResourceScope>
+            + serde::de::DeserializeOwned
+            + Clone
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + 'static,
+    {
+        if !self.enter(kind, check) {
+            return;
+        }
+        let Some(ar) = self.caps.kind(kind).cloned() else {
+            return;
+        };
+        let Some(writers) = writers.take() else {
+            return;
+        };
+        self.scoped
+            .namespaced_dynamic::<K>(&ar, writers, config, check, label);
+    }
+
+    /// Gated [`ScopedSpawn::cluster`] — `GatewayClass` is cluster-scoped and so
+    /// cannot go through [`Self::kind`].
+    fn kind_cluster<K>(
+        &mut self,
+        kind: GatewayApiKind,
+        writer: &mut Option<reflector::store::Writer<K>>,
+        api: Api<K>,
+        config: watcher::Config,
+        check: &'static str,
+        label: &'static str,
+    ) where
+        K: kube::Resource
+            + serde::de::DeserializeOwned
+            + Clone
+            + std::fmt::Debug
+            + Send
+            + Sync
+            + 'static,
+        K::DynamicType: Default + Clone + std::hash::Hash + Eq + Send + Sync + 'static,
+    {
+        if !self.enter(kind, check) {
+            return;
+        }
+        let Some(writer) = writer.take() else {
+            return;
+        };
+        self.scoped.cluster::<K>(writer, api, config, check, label);
+    }
+}
+
+/// Spawn the reflectors whose kinds are always installed — core API types and
+/// Coxswain's own CRDs.
+///
+/// Runs **once** at startup and is deliberately outside the capability gate:
+/// these kinds are not part of `gateway.networking.k8s.io`, so gating them would
+/// stop them being watched at all. Consumes the bundle so each underlying
+/// `reflector::store::Writer` is owned by exactly one task.
+fn add_core_reflectors(scoped: &mut ScopedSpawn<'_>, writers: CoreStoreWriters) {
+    let CoreStoreWriters {
         configmaps,
         path_rewrites,
         basic_auths,
         request_size_limits,
-        listener_sets,
         namespaces,
         client_traffic_policies,
         coxswain_backend_policies,
     } = writers;
-    // Cluster-scoped `Api::all` handles built up front (Copy `clients` snapshot),
+    // Cluster-scoped `Api::all` handle built up front (Copy `clients` snapshot),
     // so the `&mut scoped` spawns below don't alias an immutable `scoped` borrow.
     let clients = scoped.clients;
 
-    scoped.namespaced::<HttpRoute>(routes, control_watch_config(), "httproute", "HttpRoute");
-    scoped.namespaced::<GrpcRoute>(
-        grpc_routes,
-        control_watch_config(),
-        "grpcroute",
-        "GrpcRoute",
-    );
-    scoped.namespaced::<TlsRoute>(tls_routes, control_watch_config(), "tls_route", "TlsRoute");
-    scoped.namespaced::<TcpRoute>(tcp_routes, control_watch_config(), "tcp_route", "TcpRoute");
-    scoped.namespaced::<UdpRoute>(udp_routes, control_watch_config(), "udp_route", "UdpRoute");
-    scoped.namespaced::<Gateway>(gateways, control_watch_config(), "gateway", "Gateway");
-    // GatewayClass is cluster-scoped: always one cluster-wide watch.
-    scoped.cluster::<GatewayClass>(
-        gateway_classes,
-        Api::<GatewayClass>::all(clients.client()),
-        control_watch_config(),
-        "gateway_class",
-        "GatewayClass",
-    );
-    scoped.namespaced::<ReferenceGrant>(
-        grants,
-        control_watch_config(),
-        "reference_grant",
-        "ReferenceGrant",
-    );
-    scoped.namespaced::<BackendTlsPolicy>(
-        policies,
-        control_watch_config(),
-        "backend_tls_policy",
-        "BackendTlsPolicy",
-    );
     // ConfigMaps have no type= field selector equivalent; all CMs in scope are
     // watched so BackendTLSPolicy caCertificateRefs can be resolved.
     scoped.namespaced::<ConfigMap>(configmaps, bulk_watch_config(), "config_map", "ConfigMap");
@@ -1793,14 +2025,6 @@ fn add_gateway_api_reflectors(scoped: &mut ScopedSpawn<'_>, writers: GatewayApiS
         control_watch_config(),
         "request_size_limit",
         "RequestSizeLimit",
-    );
-    // GEP-1713: ListenerSets are namespaced and merged into their parent Gateway's
-    // effective listener set during rebuild.
-    scoped.namespaced::<ListenerSet>(
-        listener_sets,
-        control_watch_config(),
-        "listener_set",
-        "ListenerSet",
     );
     // Namespaces are cluster-scoped and watched only so a Gateway's
     // `allowedListeners.namespaces.from: Selector` can be matched against the
@@ -1831,6 +2055,256 @@ fn add_gateway_api_reflectors(scoped: &mut ScopedSpawn<'_>, writers: GatewayApiS
     );
 }
 
+/// Spawn a reflector for every `gateway.networking.k8s.io` kind the cluster
+/// actually serves — one per watched namespace for namespaced types, a single
+/// cluster-wide watch for the cluster-scoped `GatewayClass` (#59).
+///
+/// **Idempotent and re-runnable.** Called at startup and again on every
+/// self-heal probe tick with the same `spawned` set and the same writer bundle,
+/// so a kind installed while the controller runs starts watching without a pod
+/// restart, and kinds already live are not spawned twice.
+fn add_gateway_api_reflectors(
+    scoped: &mut ScopedSpawn<'_>,
+    caps: &GatewayApiCapabilities,
+    writers: &mut GatewayApiStoreWriters,
+    spawned: &mut HashSet<GatewayApiKind>,
+) {
+    // Cluster-scoped `Api::all` handle built up front (Copy `clients` snapshot),
+    // so the `&mut scoped` spawns below don't alias an immutable `scoped` borrow.
+    let clients = scoped.clients;
+    let mut spawn = CapabilityGatedSpawn {
+        scoped,
+        caps,
+        already: spawned,
+    };
+
+    spawn.kind::<HttpRoute>(
+        GatewayApiKind::HttpRoute,
+        &mut writers.routes,
+        control_watch_config(),
+        "httproute",
+        "HttpRoute",
+    );
+    spawn.kind::<GrpcRoute>(
+        GatewayApiKind::GrpcRoute,
+        &mut writers.grpc_routes,
+        control_watch_config(),
+        "grpcroute",
+        "GrpcRoute",
+    );
+    spawn.kind::<TlsRoute>(
+        GatewayApiKind::TlsRoute,
+        &mut writers.tls_routes,
+        control_watch_config(),
+        "tls_route",
+        "TlsRoute",
+    );
+    spawn.kind::<TcpRoute>(
+        GatewayApiKind::TcpRoute,
+        &mut writers.tcp_routes,
+        control_watch_config(),
+        "tcp_route",
+        "TcpRoute",
+    );
+    spawn.kind::<UdpRoute>(
+        GatewayApiKind::UdpRoute,
+        &mut writers.udp_routes,
+        control_watch_config(),
+        "udp_route",
+        "UdpRoute",
+    );
+    spawn.kind::<Gateway>(
+        GatewayApiKind::Gateway,
+        &mut writers.gateways,
+        control_watch_config(),
+        "gateway",
+        "Gateway",
+    );
+    spawn.kind_cluster::<GatewayClass>(
+        GatewayApiKind::GatewayClass,
+        &mut writers.gateway_classes,
+        Api::<GatewayClass>::all(clients.client()),
+        control_watch_config(),
+        "gateway_class",
+        "GatewayClass",
+    );
+    spawn.kind_dynamic::<DynamicReferenceGrant>(
+        GatewayApiKind::ReferenceGrant,
+        &mut writers.grants,
+        control_watch_config(),
+        "reference_grant",
+        "ReferenceGrant",
+    );
+    spawn.kind::<BackendTlsPolicy>(
+        GatewayApiKind::BackendTlsPolicy,
+        &mut writers.policies,
+        control_watch_config(),
+        "backend_tls_policy",
+        "BackendTlsPolicy",
+    );
+    // GEP-1713: ListenerSets are namespaced and merged into their parent Gateway's
+    // effective listener set during rebuild.
+    spawn.kind::<ListenerSet>(
+        GatewayApiKind::ListenerSet,
+        &mut writers.listener_sets,
+        control_watch_config(),
+        "listener_set",
+        "ListenerSet",
+    );
+}
+
+/// Self-heal probe: re-detects Gateway API capabilities on a fixed interval and
+/// re-runs the spawn list, so a CRD installed while the controller is running
+/// starts being watched without a pod restart.
+///
+/// Generic over the capability source so the loop — whose failure modes are
+/// structural (reverting to one-shot; terminating when its supervised set
+/// drains) rather than observable in any single call — can be driven by a
+/// scripted sequence under unit test, with no live API server.
+struct CapabilityProbe<S> {
+    source: S,
+    /// Watch-dedicated client for the reflectors this probe spawns; distinct
+    /// from the client `source` detects with.
+    client: Client,
+    /// `None` shares `client` across the watches this probe spawns instead of
+    /// minting a dedicated connection each — see [`WatchClientSource::config`].
+    kube_config: Option<kube::Config>,
+    trigger: watch::Sender<u64>,
+    health: SubsystemHandle,
+    scope: WatchScope,
+    metrics: crate::ReflectorMetrics,
+    interval: Duration,
+    /// Republished on every successful detection so a kind installed at runtime
+    /// widens the advertised feature set without a restart.
+    capabilities: SharedGatewayApiCapabilities,
+}
+
+impl<S: CapabilitySource> CapabilityProbe<S> {
+    /// Run until the task is dropped.
+    ///
+    /// Takes `writers` and `spawned` by value and threads them across ticks:
+    /// a kind that is absent this tick keeps its writers for the next one, and
+    /// `spawned` makes re-running the list idempotent.
+    async fn run(self, mut writers: GatewayApiStoreWriters, mut spawned: HashSet<GatewayApiKind>) {
+        let mut gw_set = JoinSet::new();
+        // An `interval` rather than a per-iteration `sleep`: the supervise
+        // branch below restarts the loop, which would re-arm a fresh sleep every
+        // time and let a flapping reflector starve the probe forever.
+        let mut tick = tokio::time::interval(self.interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick completes immediately; the caller already detected once.
+        tick.tick().await;
+
+        loop {
+            // Nothing left to discover — every modelled kind is watched, so
+            // further detection could not change any decision. Stop polling
+            // rather than re-reading the CRD schemas forever; supervision of the
+            // already-spawned reflectors continues below.
+            if spawned.len() == GatewayApiKind::ALL.len() {
+                supervise(&mut gw_set).await;
+                return;
+            }
+
+            tokio::select! {
+                _ = tick.tick() => {}
+                // Supervise the reflectors spawned by earlier ticks without
+                // blocking the next tick. `join_next` on an empty set resolves
+                // to `None` immediately, so it must not be a branch that can
+                // starve the timer — hence the guard.
+                joined = gw_set.join_next(), if !gw_set.is_empty() => {
+                    report_reflector_exit(joined);
+                    continue;
+                }
+            }
+
+            let caps = match self.source.detect().await {
+                Ok(caps) => caps,
+                Err(e) => {
+                    tracing::debug!(error = %e, "Gateway API capability re-probe failed");
+                    continue;
+                }
+            };
+            if !caps.group_present() {
+                continue;
+            }
+            // Only republish when the set actually moved. This loop runs for
+            // the life of the process on any cluster missing a modelled kind —
+            // exactly the clusters #641 targets — so logging every tick would
+            // emit the same line ~2900 times a day and bury real events.
+            let changed = self
+                .capabilities
+                .guard()
+                .present_kinds()
+                .ne(caps.present_kinds());
+            if changed {
+                publish_capabilities(&caps);
+                self.capabilities.store(Arc::new(caps.clone()));
+            }
+
+            let before = spawned.len();
+            {
+                let mut scoped = ScopedSpawn {
+                    set: &mut gw_set,
+                    clients: WatchClientSource {
+                        config: self.kube_config.as_ref(),
+                        fallback: &self.client,
+                    },
+                    scope: &self.scope,
+                    trigger: &self.trigger,
+                    health: &self.health,
+                    metrics: self.metrics,
+                };
+                add_gateway_api_reflectors(&mut scoped, &caps, &mut writers, &mut spawned);
+            }
+            if spawned.len() > before {
+                self.health.ready("gateway_api_crds");
+                bump_rebuild(&self.trigger);
+                tracing::info!(
+                    newly_started = spawned.len() - before,
+                    "Gateway API kinds detected; reflectors started"
+                );
+            }
+        }
+    }
+}
+
+/// Emit the capability gauge and one structured line naming what the installed
+/// CRD set does and does not provide, so a downgraded run is visible at startup
+/// rather than inferred from a missing feature later.
+fn publish_capabilities(caps: &GatewayApiCapabilities) {
+    let present: std::collections::BTreeSet<&'static str> =
+        caps.present_kinds().map(GatewayApiKind::as_str).collect();
+    let absent: Vec<&'static str> = GatewayApiKind::ALL
+        .iter()
+        .map(|k| k.as_str())
+        .filter(|k| !present.contains(k))
+        .collect();
+    crate::metrics::set_gateway_api_capabilities(&present);
+    tracing::info!(
+        active = ?present,
+        downgraded = ?absent,
+        "Gateway API capabilities detected"
+    );
+}
+
+/// Log a supervised reflector's exit. `None` means the set drained, which is not
+/// itself an error — the caller decides whether to keep waiting.
+fn report_reflector_exit(joined: Option<Result<(), tokio::task::JoinError>>) {
+    match joined {
+        Some(Ok(())) => tracing::warn!("gateway-api reflector exited unexpectedly"),
+        Some(Err(e)) => tracing::error!(error = %e, "gateway-api reflector panicked"),
+        None => {}
+    }
+}
+
+/// Await the supervised reflectors for the lifetime of the task, reporting each
+/// exit. Returns only once every one has finished.
+async fn supervise(set: &mut JoinSet<()>) {
+    while let Some(joined) = set.join_next().await {
+        report_reflector_exit(Some(joined));
+    }
+}
+
 async fn spawn_tasks(
     client: Client,
     kube_config: kube::Config,
@@ -1858,6 +2332,7 @@ async fn spawn_tasks(
         cbp_status,
         external_auth_status,
         publish_index,
+        gateway_api_capabilities,
         passthrough_routes,
         terminate_routes,
         tcp_routes,
@@ -1884,6 +2359,41 @@ async fn spawn_tasks(
         liveness_gate,
         status_queue,
     } = config;
+
+    // Detect before any store is built: `ReferenceGrant`'s writers must be
+    // minted from the *negotiated* `ApiResource`, and a `reflector::store::Writer`
+    // fixes its dynamic type at construction. Everything downstream reads this
+    // one result rather than re-querying.
+    //
+    // `None` means detection did not succeed (or the surface is off) — distinct
+    // from "detected, and the group is absent", which is `Some(empty)`.
+    let detected: Option<GatewayApiCapabilities> = if enable_gateway_api {
+        match ApiServerCapabilities::new(client.clone()).detect().await {
+            Ok(caps) => Some(caps),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Gateway API capability detection failed; \
+                     readiness will wait until it succeeds"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    // Fall back to the compiled-in descriptor when there is nothing to negotiate
+    // against. The stores are then built but never watched — either the surface
+    // is disabled, or the re-probe will replace nothing because the writers are
+    // only handed out once a capability lookup succeeds.
+    let grant_resource = detected
+        .as_ref()
+        .and_then(|caps| caps.kind(GatewayApiKind::ReferenceGrant))
+        .cloned()
+        .unwrap_or_else(|| {
+            ApiResource::erase::<crate::gw_types::v::referencegrants::ReferenceGrant>(&())
+        });
+
     // Status-relevant stores reuse the writers pre-created in `new` (so the
     // controller's status worker reads the same synced stores the rebuild pass
     // enqueues from); the rest are always fresh non-shared stores.
@@ -1930,7 +2440,8 @@ async fn spawn_tasks(
     let (gateway_class_reader, gateway_class_writer) =
         cluster_reader_writer::<GatewayClass>(pre.gateway_classes);
     let (slice_reader, slice_writers) = scoped_reader_writers::<EndpointSlice>(None, scope);
-    let (grant_reader, grant_writers) = scoped_reader_writers::<ReferenceGrant>(None, scope);
+    let (grant_reader, grant_writers) =
+        scoped_reader_writers_dynamic::<DynamicReferenceGrant>(&grant_resource, scope);
     let (secret_reader, secret_writers) = scoped_reader_writers::<Secret>(None, scope);
     let (auth_secret_reader, auth_secret_writers) = scoped_reader_writers::<Secret>(None, scope);
     let (auth_tls_secret_reader, auth_tls_secret_writers) =
@@ -2008,7 +2519,7 @@ async fn spawn_tasks(
     // JWKS/rebuild tasks (which move `controller_health` and cannot coexist with
     // `scoped`'s immutable borrow of it).
     let clients = WatchClientSource {
-        config: &kube_config,
+        config: Some(&kube_config),
         fallback: &client,
     };
     let mut scoped = ScopedSpawn {
@@ -2168,100 +2679,77 @@ async fn spawn_tasks(
         );
     }
 
-    // --- Gateway API reflectors (gated by --disable-gateway-api + CRD probe) ---
+    // --- Gateway API reflectors (gated by --disable-gateway-api + capability probe) ---
     //
-    // When the surface is enabled (default), probe for Gateway API CRDs. If
-    // present, spawn all reflectors immediately. If absent, readiness fails
-    // under the `gateway_api_crds` check and a background re-probe loop starts
-    // the reflectors once the CRDs appear (self-healing — no pod restart needed).
+    // When the surface is enabled (default), detect which Gateway API kinds the
+    // cluster actually serves and spawn a reflector for each. Kinds absent from
+    // the installed CRD set (e.g. ListenerSet on Gateway API v1.4) are simply
+    // not watched, so an older co-resident CRD version degrades the feature set
+    // instead of wedging readiness. A background re-probe loop picks up kinds
+    // installed later (self-healing — no pod restart needed).
     if enable_gateway_api {
-        let gw_writers = GatewayApiStoreWriters {
-            routes: route_writers,
-            grpc_routes: grpc_route_writers,
-            tls_routes: tls_route_writers,
-            tcp_routes: tcp_route_writers,
-            udp_routes: udp_route_writers,
-            gateways: gateway_writers,
-            gateway_classes: gateway_class_writer,
-            grants: grant_writers,
-            policies: policy_writers,
-            configmaps: configmap_writers,
-            path_rewrites: path_rewrite_writers,
-            basic_auths: basic_auth_writers,
-            request_size_limits: request_size_limit_writers,
-            listener_sets: listener_set_writers,
-            namespaces: namespace_writer,
-            client_traffic_policies: ctp_writers,
-            coxswain_backend_policies: cbp_writers,
+        // The core kinds are unconditional: they are not part of
+        // `gateway.networking.k8s.io`, so no capability can withhold them.
+        add_core_reflectors(
+            &mut scoped,
+            CoreStoreWriters {
+                configmaps: configmap_writers,
+                path_rewrites: path_rewrite_writers,
+                basic_auths: basic_auth_writers,
+                request_size_limits: request_size_limit_writers,
+                namespaces: namespace_writer,
+                client_traffic_policies: ctp_writers,
+                coxswain_backend_policies: cbp_writers,
+            },
+        );
+
+        let mut gw_writers = GatewayApiStoreWriters {
+            routes: Some(route_writers),
+            grpc_routes: Some(grpc_route_writers),
+            tls_routes: Some(tls_route_writers),
+            tcp_routes: Some(tcp_route_writers),
+            udp_routes: Some(udp_route_writers),
+            gateways: Some(gateway_writers),
+            gateway_classes: Some(gateway_class_writer),
+            grants: Some(grant_writers),
+            policies: Some(policy_writers),
+            listener_sets: Some(listener_set_writers),
         };
-        if crate::crds::gateway_api_crds_present(&client).await {
-            add_gateway_api_reflectors(&mut scoped, gw_writers);
-            controller_health.ready("gateway_api_crds");
-        } else {
-            tracing::warn!(
-                "Gateway API CRDs not found; readiness will wait until they appear \
-                 (self-healing re-probe every 30 s — no pod restart required)"
-            );
-            // Self-heal probe task: polls until CRDs appear, then spawns the
-            // Gateway API reflectors and clears the `gateway_api_crds` check.
-            //
-            // The writers slot is consumed exactly once (on first CRD detection)
-            // and then the inner supervise-loop runs forever, so the outer loop
-            // body never reaches the take() a second time.
-            let probe_client = watch_client(&kube_config, &client);
-            let probe_kube_config = kube_config.clone();
-            let probe_trigger = rebuild_tx.clone();
-            let probe_health = controller_health.clone();
-            let probe_watch_scope = watch_scope.clone();
-            let mut writers_slot = Some(gw_writers);
-            scoped.set.spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_secs(30)).await;
-                    if crate::crds::gateway_api_crds_present(&probe_client).await {
-                        let Some(writers) = writers_slot.take() else {
-                            // The inner supervise loop exited — this is a bug
-                            // since join_next() should run forever. Return to
-                            // let the JoinSet clean up.
-                            return;
-                        };
-                        let mut gw_set = JoinSet::new();
-                        let mut probe_scoped = ScopedSpawn {
-                            set: &mut gw_set,
-                            clients: WatchClientSource {
-                                config: &probe_kube_config,
-                                fallback: &probe_client,
-                            },
-                            scope: &probe_watch_scope,
-                            trigger: &probe_trigger,
-                            health: &probe_health,
-                            metrics,
-                        };
-                        add_gateway_api_reflectors(&mut probe_scoped, writers);
-                        probe_health.ready("gateway_api_crds");
-                        bump_rebuild(&probe_trigger);
-                        tracing::info!(
-                            "Gateway API CRDs detected; reflectors started and readiness cleared"
-                        );
-                        // Supervise the dynamically spawned reflectors for the
-                        // lifetime of the probe task.
-                        loop {
-                            match gw_set.join_next().await {
-                                Some(Ok(())) => {
-                                    tracing::warn!("gateway-api reflector exited unexpectedly");
-                                }
-                                Some(Err(e)) => {
-                                    tracing::error!(
-                                        error = %e,
-                                        "gateway-api reflector panicked"
-                                    );
-                                }
-                                None => return,
-                            }
-                        }
-                    }
-                }
-            });
+        let mut spawned: HashSet<GatewayApiKind> = HashSet::new();
+
+        // A detection failure is NOT "no Gateway API": mapping a 403 or an
+        // unreachable API server onto an empty capability set would advertise a
+        // downgraded feature set on a cluster that has every CRD. Distinguish
+        // the two so the operator-facing log names the real cause.
+        match detected {
+            Some(caps) if caps.group_present() => {
+                publish_capabilities(&caps);
+                gateway_api_capabilities.store(Arc::new(caps.clone()));
+                add_gateway_api_reflectors(&mut scoped, &caps, &mut gw_writers, &mut spawned);
+                controller_health.ready("gateway_api_crds");
+            }
+            Some(_) => {
+                tracing::warn!(
+                    "Gateway API CRDs not found; readiness will wait until they appear \
+                     (self-healing re-probe every 30 s — no pod restart required)"
+                );
+            }
+            // Detection already logged the failure above.
+            None => {}
         }
+
+        let probe = CapabilityProbe {
+            source: ApiServerCapabilities::new(client.clone()),
+            client: watch_client(&kube_config, &client),
+            kube_config: Some(kube_config.clone()),
+            trigger: rebuild_tx.clone(),
+            health: controller_health.clone(),
+            scope: watch_scope.clone(),
+            metrics,
+            interval: Duration::from_secs(30),
+            capabilities: gateway_api_capabilities,
+        };
+        scoped.set.spawn(probe.run(gw_writers, spawned));
     }
 
     // --- Fleet / operator pod watch (controller role only) ---
@@ -3172,6 +3660,294 @@ fn record_rebuild_metrics(
     let (exact, wildcard, default) = tls_snapshot.cert_counts();
     let expiries = tls_snapshot.expiries();
     metrics.set_tls(exact, wildcard, default, &expiries);
+}
+
+#[cfg(test)]
+mod capability_probe_tests {
+    use super::*;
+    use crate::capabilities::CapabilityDetectError;
+    use coxswain_core::health::{CheckState, HealthRegistry};
+    use std::sync::atomic::AtomicUsize;
+
+    /// Every readiness check the gateway spawn list touches.
+    ///
+    /// `SubsystemHandle::set` panics on an unregistered name, so this list also
+    /// pins the spawn sites to the registration in `status_writer.rs`: adding a
+    /// gated kind without registering its check fails here rather than at
+    /// runtime on a cluster that happens to lack that CRD.
+    const GATEWAY_CHECKS: &[&str] = &[
+        "gateway_api_crds",
+        "httproute",
+        "grpcroute",
+        "tls_route",
+        "tcp_route",
+        "udp_route",
+        "gateway",
+        "gateway_class",
+        "listener_set",
+        "reference_grant",
+        "backend_tls_policy",
+    ];
+
+    /// A client that fails every request immediately.
+    ///
+    /// Built from a stub service rather than `Client::try_from`: the real
+    /// constructor loads the platform root-CA store, which is irrelevant here
+    /// and unavailable in a sandboxed runner.
+    ///
+    /// Responds rather than parking. A never-resolving service leaves each
+    /// spawned reflector holding an in-flight request that nothing cancels, and
+    /// tearing the runtime down then costs ~13 s per test. The reflectors here
+    /// exist only so the spawn path is exercised for real; none of these tests
+    /// reads anything they produce, so a 503 they back off from is enough.
+    fn stub_client() -> kube::Client {
+        kube::Client::new(
+            tower::service_fn(|_req: http::Request<kube::client::Body>| async {
+                http::Response::builder()
+                    .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                    .body(kube::client::Body::empty())
+            }),
+            "default",
+        )
+    }
+
+    fn caps_with(kinds: &[GatewayApiKind]) -> GatewayApiCapabilities {
+        GatewayApiCapabilities::from_vocabulary(kinds.iter().copied(), [])
+    }
+
+    fn writers_for(scope: &WatchScope) -> GatewayApiStoreWriters {
+        let grant_resource =
+            ApiResource::erase::<crate::gw_types::v::referencegrants::ReferenceGrant>(&());
+        GatewayApiStoreWriters {
+            routes: Some(scoped_reader_writers::<HttpRoute>(None, scope).1),
+            grpc_routes: Some(scoped_reader_writers::<GrpcRoute>(None, scope).1),
+            tls_routes: Some(scoped_reader_writers::<TlsRoute>(None, scope).1),
+            tcp_routes: Some(scoped_reader_writers::<TcpRoute>(None, scope).1),
+            udp_routes: Some(scoped_reader_writers::<UdpRoute>(None, scope).1),
+            gateways: Some(scoped_reader_writers::<Gateway>(None, scope).1),
+            gateway_classes: Some(cluster_reader_writer::<GatewayClass>(None).1),
+            grants: Some(
+                scoped_reader_writers_dynamic::<DynamicReferenceGrant>(&grant_resource, scope).1,
+            ),
+            policies: Some(scoped_reader_writers::<BackendTlsPolicy>(None, scope).1),
+            listener_sets: Some(scoped_reader_writers::<ListenerSet>(None, scope).1),
+        }
+    }
+
+    /// Harness for driving `add_gateway_api_reflectors` tick by tick, holding
+    /// the state the probe loop threads across iterations.
+    struct Ticker {
+        set: JoinSet<()>,
+        client: kube::Client,
+        trigger: watch::Sender<u64>,
+        registry: HealthRegistry,
+        health: SubsystemHandle,
+        scope: WatchScope,
+        writers: GatewayApiStoreWriters,
+        spawned: HashSet<GatewayApiKind>,
+    }
+
+    impl Ticker {
+        fn new() -> Self {
+            let scope = WatchScope::parse(None).expect("cluster-wide scope");
+            let registry = HealthRegistry::new();
+            let health = registry.register("controller", GATEWAY_CHECKS);
+            Self {
+                set: JoinSet::new(),
+                client: stub_client(),
+                trigger: watch::channel(0u64).0,
+                registry,
+                health,
+                writers: writers_for(&scope),
+                scope,
+                spawned: HashSet::new(),
+            }
+        }
+
+        /// Run one spawn pass, returning how many reflector **tasks** it
+        /// started.
+        ///
+        /// Counts tasks rather than entries added to `spawned`: the set is
+        /// idempotent by construction, so a bug that re-spawned an
+        /// already-watched kind every tick would leave it unchanged while
+        /// quietly duplicating watches against the same stores.
+        fn tick(&mut self, caps: &GatewayApiCapabilities) -> usize {
+            let before = self.set.len();
+            let mut scoped = ScopedSpawn {
+                set: &mut self.set,
+                clients: WatchClientSource {
+                    config: None,
+                    fallback: &self.client,
+                },
+                scope: &self.scope,
+                trigger: &self.trigger,
+                health: &self.health,
+                metrics: crate::ReflectorMetrics::new(crate::MetricsPrefix::Controller),
+            };
+            add_gateway_api_reflectors(&mut scoped, caps, &mut self.writers, &mut self.spawned);
+            self.set.len() - before
+        }
+    }
+
+    #[tokio::test]
+    async fn a_kind_absent_this_tick_keeps_its_writers_for_the_next_one() {
+        // The regression: taking the writers at the call site (before the gate)
+        // drops them for an absent kind, so the kind can never activate however
+        // many times the probe re-runs. Acceptance criterion 3, silently dead.
+        let mut t = Ticker::new();
+
+        // Gateway API v1.4 shape — no ListenerSet CRD.
+        assert_eq!(t.tick(&caps_with(&[GatewayApiKind::Gateway])), 1);
+        assert!(
+            t.writers.listener_sets.is_some(),
+            "an absent kind must retain its writers"
+        );
+        assert!(
+            t.writers.gateways.is_none(),
+            "a spawned kind must have consumed its writers"
+        );
+
+        // The cluster is upgraded and the CRD appears.
+        assert_eq!(
+            t.tick(&caps_with(&[
+                GatewayApiKind::Gateway,
+                GatewayApiKind::ListenerSet
+            ])),
+            1,
+            "the newly-installed kind must start on a later tick"
+        );
+        assert!(t.writers.listener_sets.is_none());
+        assert!(t.spawned.contains(&GatewayApiKind::ListenerSet));
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_capability_set_does_not_respawn() {
+        // Re-running the list must not duplicate watches against the same
+        // stores. Two independent things enforce this — the `already` set and
+        // the writers being consumed — and this pins the observable outcome
+        // rather than either mechanism.
+        let mut t = Ticker::new();
+        let caps = caps_with(&[GatewayApiKind::Gateway, GatewayApiKind::HttpRoute]);
+
+        assert_eq!(t.tick(&caps), 2);
+        assert_eq!(t.tick(&caps), 0, "second pass must start nothing");
+        assert_eq!(t.tick(&caps), 0, "and stay idempotent");
+    }
+
+    #[tokio::test]
+    async fn an_absent_kind_degrades_its_check_rather_than_leaving_it_pending() {
+        // `Pending` blocks the subsystem aggregate and so /readyz; `Degraded`
+        // does not. A v1.4 cluster must serve, not wedge — which is the entire
+        // point of #641, and what the pre-change code got wrong.
+        let mut t = Ticker::new();
+        t.tick(&caps_with(&[GatewayApiKind::Gateway]));
+
+        let snapshot = t.registry.snapshot();
+        let checks = &snapshot
+            .subsystems
+            .get("controller")
+            .expect("controller subsystem")
+            .checks;
+        let state = |check: &str| checks.get(check).cloned().expect("registered check");
+        for absent in ["listener_set", "tls_route", "tcp_route", "udp_route"] {
+            assert!(
+                matches!(state(absent), CheckState::Degraded { .. }),
+                "{absent} must be Degraded, was {:?}",
+                state(absent)
+            );
+            assert!(state(absent).is_ready(), "{absent} must not block /readyz");
+        }
+    }
+
+    /// A [`CapabilitySource`] that replays a fixed script, one entry per
+    /// `detect()`, repeating the last entry once exhausted.
+    struct ScriptedSource {
+        script: Vec<Result<GatewayApiCapabilities, ()>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CapabilitySource for ScriptedSource {
+        async fn detect(&self) -> Result<GatewayApiCapabilities, CapabilityDetectError> {
+            let n = self.calls.fetch_add(1, Ordering::AcqRel);
+            let entry = self
+                .script
+                .get(n)
+                .or_else(|| self.script.last())
+                .unwrap_or(&Err(()));
+            match entry {
+                Ok(caps) => Ok(caps.clone()),
+                Err(()) => Err(CapabilityDetectError::CrdRead {
+                    crd: "httproutes.gateway.networking.k8s.io",
+                    source: kube::Error::Api(Box::new(kube::core::Status {
+                        code: 403,
+                        ..kube::core::Status::default()
+                    })),
+                }),
+            }
+        }
+    }
+
+    /// Run the real loop and report how many times it polled its source.
+    async fn probe_calls(
+        script: Vec<Result<GatewayApiCapabilities, ()>>,
+        run_for: Duration,
+    ) -> usize {
+        let scope = WatchScope::parse(None).expect("cluster-wide scope");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = CapabilityProbe {
+            source: ScriptedSource {
+                script,
+                calls: Arc::clone(&calls),
+            },
+            client: stub_client(),
+            kube_config: None,
+            trigger: watch::channel(0u64).0,
+            health: HealthRegistry::new().register("controller", GATEWAY_CHECKS),
+            scope: scope.clone(),
+            metrics: crate::ReflectorMetrics::new(crate::MetricsPrefix::Controller),
+            interval: Duration::from_millis(5),
+            capabilities: SharedGatewayApiCapabilities::new(),
+        };
+
+        let handle = tokio::spawn(probe.run(writers_for(&scope), HashSet::new()));
+        tokio::time::sleep(run_for).await;
+        handle.abort();
+        calls.load(Ordering::Acquire)
+    }
+
+    #[tokio::test]
+    async fn the_loop_keeps_probing_after_a_detection_failure() {
+        // The pre-#641 loop `return`ed once its supervised set drained,
+        // permanently disabling self-heal. A transient 403 must not end it.
+        let calls = probe_calls(vec![Err(()), Err(()), Err(())], Duration::from_millis(500)).await;
+        assert!(
+            calls > 3,
+            "loop must keep probing past the failures, polled only {calls} times"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_loop_keeps_probing_while_the_group_is_absent() {
+        let calls = probe_calls(
+            vec![Ok(GatewayApiCapabilities::empty())],
+            Duration::from_millis(500),
+        )
+        .await;
+        assert!(calls > 3, "polled only {calls} times");
+    }
+
+    #[tokio::test]
+    async fn the_loop_stops_probing_once_every_kind_is_watched() {
+        // Nothing further can be discovered, so re-reading the CRD schemas
+        // every 30 s forever would be pure waste on every healthy cluster.
+        let calls = probe_calls(
+            vec![Ok(caps_with(GatewayApiKind::ALL))],
+            Duration::from_millis(500),
+        )
+        .await;
+        assert_eq!(calls, 1, "expected exactly one poll, got {calls}");
+    }
 }
 
 #[cfg(test)]
