@@ -532,13 +532,58 @@ async fn dedicated_crash_loop_keeps_serving_via_shared() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 3. Restart the controller after the resources are provisioned → assert
-///    the SSA path is idempotent: the Deployment's `metadata.generation` stays
-///    stable across the restart because the operator's same-content SSA produces
-///    no spec write. (`generation`, not `resourceVersion`: the latter bumps on
-///    unrelated status writes — see the in-body comment.)
+/// Label selector for a Gateway's dedicated-proxy pods (GEP-1762): the
+/// gateway-name label plus the `dedicated-proxy` component, as rendered by
+/// `operator::render`.
+fn dedicated_proxy_selector(gateway: &str) -> String {
+    format!(
+        "gateway.networking.k8s.io/gateway-name={gateway},\
+         app.kubernetes.io/component=dedicated-proxy"
+    )
+}
+
+/// The UID of the (single) Ready dedicated-proxy pod for `GATEWAY_NAME` in `ns`.
+///
+/// The UID is the identity a pod ROLL changes — a new pod is a new UID — so it is
+/// the direct signal for "the Deployment was (not) rolled", stronger than
+/// `.metadata.generation` (which only witnesses a spec write, not the pod
+/// lifecycle the operator's SSA idempotency is meant to protect).
+async fn ready_dedicated_proxy_uid(client: &kube::Client, ns: &str) -> anyhow::Result<String> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let selector = dedicated_proxy_selector(GATEWAY_NAME);
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("a Ready dedicated-proxy pod for '{GATEWAY_NAME}' in {ns}") },
+        || {
+            let pods = pods.clone();
+            let selector = selector.clone();
+            async move {
+                let list = pods
+                    .list(&ListParams::default().labels(&selector))
+                    .await
+                    .ok()?;
+                list.iter()
+                    .find(|p| leader::pod_is_ready(p))
+                    .and_then(|p| p.metadata.uid.clone())
+            }
+        },
+    )
+    .await
+}
+
+/// 3. Restart the controller after the dedicated proxy is provisioned → assert the
+///    controller does NOT roll the proxy pod. This is #658 AC#2: the contributing-
+///    factor theory (an empty post-restart `last_hashes` re-SSAs the Deployment and
+///    rolls the pod) is refuted — `last_hashes` only gates logging, the SSA fires
+///    unconditionally and is a server-side no-op on an unchanged spec, and the
+///    render is deterministic and relay-agnostic. Two independent witnesses of "no
+///    roll": the proxy pod keeps its UID (a roll mints a new one), and the
+///    Deployment's `metadata.generation` is unchanged (a roll requires a
+///    pod-template spec write, which bumps it). If a future change makes the render
+///    non-deterministic, both fire.
 #[tokio::test]
-async fn restart_controller_does_not_bump_generation() -> anyhow::Result<()> {
+async fn restart_controller_does_not_roll_dedicated_proxy() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     // Persistent namespace: the bootstrap purge runs on every
     // `Harness::start()`, including the second one below. A regular
@@ -550,43 +595,55 @@ async fn restart_controller_does_not_bump_generation() -> anyhow::Result<()> {
 
     let (_deployments, _services, _sas, deploy, _svc, _sa) = apply_and_wait(&h, &ns).await?;
 
-    // Use `metadata.generation`, not `metadata.resourceVersion`, for the
-    // idempotency check. `resourceVersion` bumps on every write — including
-    // status updates emitted by the K8s Deployment controller while the
-    // proxy pod scales / becomes Ready — so it drifts naturally in the 15 s
-    // observation window and is not a clean signal of "the operator wrote a
-    // new spec". `generation` only bumps on spec changes, which is exactly
-    // the property SSA idempotency is supposed to preserve.
-    //
-    // We check Deployment only: it's the load-bearing resource (rollouts
-    // are triggered by spec changes here), it reliably carries
-    // `.metadata.generation`, and the proxy pod's lifecycle is what would
-    // be most visibly disrupted by a spurious SSA write. Service and
-    // ServiceAccount don't consistently populate `.generation` (Service's
-    // generation isn't set in all K8s versions; ServiceAccount has no
-    // spec), so checking them via `.generation` would itself be flaky.
+    // Capture the proxy pod's identity and the Deployment generation BEFORE the
+    // restart. `generation` (not `resourceVersion`) is the clean spec-write signal:
+    // `resourceVersion` bumps on unrelated status writes (the K8s Deployment
+    // controller updating replica counts as the pod becomes Ready), so it drifts in
+    // the observation window; `generation` only moves on a spec change.
+    let uid_before = ready_dedicated_proxy_uid(&h.client, &ns.name).await?;
     let gen_deploy_before = deploy.metadata.generation.expect("Deployment generation");
 
     // Restart: drop the harness (kills controller) and re-spawn. Bootstrap is
     // idempotent so the second start only re-spawns the binary, and the
-    // 3-second lease TTL means the new pod-name re-claims leadership quickly.
+    // 3-second lease TTL means the new pod-name re-claims leadership quickly. The
+    // new controller process starts with an empty in-memory `last_hashes` — the
+    // exact state #658 blamed for a spurious roll.
     drop(h);
     let h2 = Harness::start().await?;
 
-    // Poll a real post-condition rather than blind-sleeping: wait until the new
-    // pod reports it holds the leader lease (`coxswain_controller_leader=1`) and
-    // has completed at least one successful reconcile on the fresh process. SSA
-    // on identical content is deterministic — it never bumps `.generation` — so
-    // one confirmed post-restart reconcile is sufficient to then assert
-    // generation stability.
-    // Scrape the LEADER specifically, not an arbitrary Service replica: after a
-    // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
-    // races. `wait_for_leader_reconciled` re-resolves the Lease holder each tick.
+    // Wait for a real post-condition: the new leader holds the lease
+    // (`coxswain_controller_leader=1`) and has completed at least one reconcile on
+    // the fresh process, THEN this Gateway is re-Programmed — so the new leader has
+    // demonstrably re-rendered and re-SSA'd it. Only then is "the proxy was not
+    // rolled" a settled fact rather than a race. `wait_for_leader_reconciled`
+    // re-resolves the Lease holder each tick (the HA standby reports leader=0
+    // forever, so a Service-pinned scrape would race).
     leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
+    wait::wait_for_gateway_programmed(&h2.client, GATEWAY_NAME, &ns.name, Duration::from_secs(60))
+        .await?;
 
+    // Witness 1 — the proxy pod kept its identity (was not rolled).
+    let pods: Api<Pod> = Api::namespaced(h2.client.clone(), &ns.name);
+    let current = pods
+        .list(&ListParams::default().labels(&dedicated_proxy_selector(GATEWAY_NAME)))
+        .await?;
+    let still_present = current
+        .iter()
+        .any(|p| p.metadata.uid.as_deref() == Some(uid_before.as_str()));
+    anyhow::ensure!(
+        still_present,
+        "the dedicated proxy pod (uid={uid_before}) was rolled by a controller restart with an \
+         unchanged rendered spec (#658 AC#2); pods now present: {:?}",
+        current
+            .iter()
+            .map(|p| (p.metadata.name.clone(), p.metadata.uid.clone()))
+            .collect::<Vec<_>>()
+    );
+
+    // Witness 2 — no spec write reached the Deployment (would have bumped
+    // generation, the necessary precondition for any roll).
     let deploy_after: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
     let d2 = deploy_after.get(RESOURCE_NAME).await?;
-
     assert_eq!(
         d2.metadata.generation,
         Some(gen_deploy_before),

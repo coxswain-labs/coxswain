@@ -211,6 +211,39 @@ impl UpstreamResolverConfig {
     pub fn controller_target(&self) -> ResolvedUpstream {
         ResolvedUpstream::new(self.controller_endpoint.clone(), self.controller_sa.clone())
     }
+
+    /// A namespace's dedicated-relay endpoint, **ungated** on the repoint set — the
+    /// endpoint the relay's own leaves are streaming from *right now*, regardless of
+    /// whether the relay is still `Active`.
+    ///
+    /// This is the `seed_or_push_upstream` baseline for a
+    /// `Scope::Namespace` relay stream (#652): a stream re-seeding *after* the relay
+    /// left [`Self::active_relays`] must still seed from the relay it is serving, so
+    /// its seed diverges from the now-controller target and a teardown
+    /// `PreferredUpstream(→controller)` is pushed. Seeding from the active-gated
+    /// [`Self::resolve_namespace`] (which already returns the controller once
+    /// deactivated) would make `seed == target` and wedge relay GC.
+    #[must_use]
+    pub fn namespace_relay_endpoint(&self, namespace: &str) -> ResolvedUpstream {
+        let endpoint = format!(
+            "https://{}.{}.svc:{}",
+            self.relay_service_name, namespace, self.relay_port
+        );
+        ResolvedUpstream::new(endpoint, self.relay_sa.clone())
+    }
+
+    /// The shared relay's endpoint, **ungated** on [`Self::shared_relay_active`] — the
+    /// shared-tier counterpart of [`Self::namespace_relay_endpoint`], used as the
+    /// seed baseline for a shared **relay**'s `Scope::SharedPool` stream (#652). A
+    /// direct shared *proxy* still seeds from [`Self::controller_target`]; only the
+    /// shared relay's own stream seeds here (the `is_shared_relay` discriminator).
+    #[must_use]
+    pub fn shared_relay_endpoint(&self) -> ResolvedUpstream {
+        ResolvedUpstream::new(
+            self.shared_relay_endpoint.clone(),
+            self.shared_relay_sa.clone(),
+        )
+    }
 }
 
 // ── RejectHook ────────────────────────────────────────────────────────────────

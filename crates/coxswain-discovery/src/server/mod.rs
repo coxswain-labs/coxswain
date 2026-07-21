@@ -54,7 +54,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -126,12 +126,13 @@ pub struct DiscoveryService {
     /// `rebuild_rx` (routing changes): a relay provision/teardown is not itself a
     /// routing rebuild, so it needs its own signal to trigger a repoint push.
     relay_changed_rx: Option<watch::Receiver<u64>>,
-    /// Relay directive-forwarding fan-out (#601). Set only on a **relay's**
-    /// downstream server: its upstream client fans controller-originated
-    /// `PreferredUpstream` directives here, and each downstream leaf stream
-    /// subscribes and forwards the ones targeting its Gateway. `None` on the
-    /// controller's own server (it originates directives, never forwards them).
-    directive_tx: Option<broadcast::Sender<p::PreferredUpstream>>,
+    /// Relay latest-directive cell (#601/#652). Set only on a **relay's** downstream
+    /// server: its upstream client publishes the most recent controller-originated
+    /// `PreferredUpstream` here, and each downstream leaf stream reads it on open and
+    /// on change, forwarding the ones targeting its Gateway. A `watch` (not a
+    /// `broadcast`) so a leaf subscribing after a directive is published still reads
+    /// it on open. `None` on the controller's own server (it originates directives).
+    directive_tx: Option<watch::Sender<Option<p::PreferredUpstream>>>,
 }
 
 impl DiscoveryService {
@@ -204,16 +205,19 @@ impl DiscoveryService {
         self
     }
 
-    /// Enable relay directive-forwarding on a **relay's** downstream server (#601).
+    /// Enable relay directive-forwarding on a **relay's** downstream server
+    /// (#601/#652).
     ///
-    /// The relay's upstream client fans controller-originated `PreferredUpstream`
-    /// directives into `directive_tx`; each downstream leaf stream subscribes and
-    /// forwards the ones targeting its Gateway. Only a relay installs this — the
-    /// controller originates directives from its resolver instead.
+    /// The relay's upstream client publishes controller-originated `PreferredUpstream`
+    /// directives into `directive_tx` (a `watch` holding the latest); each downstream
+    /// leaf stream reads it on open and on change, forwarding the ones targeting its
+    /// Gateway. Only a relay installs this — the controller originates directives from
+    /// its resolver instead. The `watch` gives late-subscribing leaves the replay a
+    /// `broadcast` cannot, which is what keeps a relay's drain from wedging.
     #[must_use]
     pub fn with_directive_forwarding(
         mut self,
-        directive_tx: broadcast::Sender<p::PreferredUpstream>,
+        directive_tx: watch::Sender<Option<p::PreferredUpstream>>,
     ) -> Self {
         self.directive_tx = Some(directive_tx);
         self
@@ -2128,6 +2132,66 @@ mod tests {
             directive.target_namespace, "team-a",
             "a Namespace-scope directive carries the target namespace for relay forwarding"
         );
+    }
+
+    #[tokio::test]
+    async fn namespace_relay_stream_seeded_while_inactive_pushes_repoint_immediately() {
+        // The #652 wedge: the relay's Namespace stream re-seeds (last=None) AFTER the
+        // namespace already left `active_relays` — the losing controller-restart
+        // interleaving. Seeding from the ungated relay endpoint makes the very first
+        // call diverge from the now-controller target and push the teardown directive,
+        // rather than short-circuiting on `seed == target` and wedging relay GC.
+        let resolver = upstream_resolver(&[]); // namespace NOT active
+        let (tx, mut rx) = mpsc::channel::<Result<ServerMessage, Status>>(4);
+        let scope = Scope::Namespace {
+            namespace: "team-a".to_owned(),
+        };
+        let mut last = None;
+        seed_or_push_upstream(&scope, None, Some(&resolver), &mut last, &tx)
+            .await
+            .expect("seed must not fail");
+        let directive = try_recv_directive(&mut rx).expect(
+            "seeding a Namespace stream while the relay is already inactive must push the \
+             controller repoint on the first call (else relay GC wedges)",
+        );
+        assert_eq!(
+            directive.endpoint,
+            "https://coxswain-controller-discovery.coxswain-system.svc:50051"
+        );
+        assert_eq!(directive.expected_server_sa, "coxswain-controller");
+        assert_eq!(
+            directive.target_namespace, "team-a",
+            "the forward directive carries the target namespace for relay forwarding"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_relay_stream_seeded_while_inactive_pushes_repoint_immediately() {
+        // Shared-tier counterpart of the #652 wedge: the shared relay's own SharedPool
+        // stream re-seeds while `shared_relay_active` is already false. The ungated
+        // shared relay endpoint seed diverges from the controller target → push.
+        let resolver = upstream_resolver(&[]); // shared_relay_active == false
+        let peer = shared_relay_peer();
+        let (tx, mut rx) = mpsc::channel::<Result<ServerMessage, Status>>(4);
+        let mut last = None;
+        seed_or_push_upstream(
+            &Scope::SharedPool,
+            Some(&peer),
+            Some(&resolver),
+            &mut last,
+            &tx,
+        )
+        .await
+        .expect("seed must not fail");
+        let directive = try_recv_directive(&mut rx).expect(
+            "seeding the shared relay's stream while it is already inactive must push the \
+             controller repoint on the first call",
+        );
+        assert_eq!(
+            directive.endpoint,
+            "https://coxswain-controller-discovery.coxswain-system.svc:50051"
+        );
+        assert_eq!(directive.expected_server_sa, "coxswain-controller");
     }
 
     #[tokio::test]
