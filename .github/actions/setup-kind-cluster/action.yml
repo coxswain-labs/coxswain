@@ -14,21 +14,33 @@ runs:
   steps:
     # helm/kind-action downloads the kind + kubectl binaries via curl with no
     # retry, so a transient "curl: (35) Recv failure: Connection reset by peer"
-    # fails the whole job before any test runs. Wrap it in Wandalen/wretry.action
-    # (purpose-built to retry a `uses:` step) so a flaky download is retried
-    # instead of aborting the run.
+    # fails the whole job before any test runs. It was previously wrapped in
+    # Wandalen/wretry.action (purpose-built to retry a `uses:` step), but that
+    # action is stuck on the Node 20 runtime with no newer release (#656). Its
+    # replacement, nick-fields/retry (node24), can only retry a shell command,
+    # not a `uses:` step — so this retries the actual flaky operation
+    # directly: the binary download, with `kind create cluster` folded into
+    # the same command so a half-created cluster from a failed attempt is torn
+    # down before the next try. kubectl ships preinstalled on GitHub-hosted
+    # runners, so nothing else helm/kind-action provided is needed.
     - name: Create kind cluster
-      uses: Wandalen/wretry.action@v3.8.0
+      uses: nick-fields/retry@v4
       with:
-        action: helm/kind-action@v1
-        with: |
-          cluster_name: ${{ inputs.cluster-name }}
-        attempt_limit: 3
-        attempt_delay: 15000
+        max_attempts: 3
+        retry_wait_seconds: 15
+        timeout_minutes: 10
         # Tear down any half-created cluster before retrying so the retry doesn't
         # fail on "cluster already exists"; harmless (|| true) if the failure was
         # the binary download, before any cluster existed.
-        pre_retry_command: kind delete cluster --name ${{ inputs.cluster-name }} || true
+        on_retry_command: kind delete cluster --name ${{ inputs.cluster-name }} || true
+        command: |
+          set -euo pipefail
+          if ! command -v kind >/dev/null 2>&1; then
+            curl -fsSLo /tmp/kind https://kind.sigs.k8s.io/dl/v0.32.0/kind-linux-amd64
+            echo "50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54  /tmp/kind" | sha256sum -c
+            sudo install -m 0755 /tmp/kind /usr/local/bin/kind
+          fi
+          kind create cluster --name ${{ inputs.cluster-name }} --wait=60s
 
     - name: Route pod CIDR to kind node
       shell: bash
