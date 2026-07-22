@@ -1,6 +1,6 @@
 # ListenerSet guide
 
-A `ListenerSet` (GEP-1713) lets an application team attach listeners to a `Gateway`
+A `ListenerSet` lets an application team attach listeners to a `Gateway`
 they do not own — without editing the Gateway object itself. The Gateway is usually
 infrastructure-owned and a point of contention; a `ListenerSet` moves listener
 ownership to the team that needs the port and hostname, while the Gateway operator
