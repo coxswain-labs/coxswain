@@ -111,5 +111,4 @@ nav:
     - Overview: architecture/index.md
     - Proxy topology: architecture/proxy-topology.md
     - Discovery protocol: architecture/discovery-protocol.md
-  - FAQ: faq.md
 

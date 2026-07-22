@@ -1,3 +1,8 @@
+/* Mermaid: drop the default white box behind edge labels (transparent bg). */
+.md-typeset .mermaid {
+  --md-mermaid-label-bg-color: transparent;
+}
+
 /* Widen the content row so the right-hand "On this page" TOC doesn't squeeze the
    prose. mkdocs-material caps .md-grid at 61rem by default; on wider viewports we
    give the content column much more room while the nav/TOC stay their fixed width. */

@@ -8,7 +8,7 @@ flowchart LR
     K8s[Kubernetes\nAPI Server]
 
     subgraph cs[coxswain-system]
-        C[Controller\nreflector · discovery server\nidentity server]
+        C[Controller]
         SP["Proxy pool (shared)"]
     end
 
