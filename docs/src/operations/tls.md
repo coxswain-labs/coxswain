@@ -174,9 +174,9 @@ curl --resolve example.com:443:127.0.0.1 -k https://example.com/
 openssl s_client -connect 127.0.0.1:443 -servername example.com -brief
 ```
 
-## Gateway frontend client certificate validation (GEP-91)
+## Gateway frontend client certificate validation
 
-Coxswain implements **GEP-91** (Standard channel, Gateway API v1.5): gateway-wide TLS client certificate validation configured via `spec.tls.frontend.default.validation` on an HTTPS listener.
+Coxswain implements gateway-wide TLS client-certificate validation (Standard channel, Gateway API v1.5+), configured via `spec.tls.frontend.default.validation` on an HTTPS listener.
 
 ### CA bundle
 
@@ -237,7 +237,7 @@ Programmed:   False
 | `AllowInsecureFallback` | Client cert is requested and validated if present, but the handshake is never aborted. Missing or invalid cert → request passes through; authorization is delegated to the backend. |
 
 ```yaml
-# AllowInsecureFallback (GEP-91)
+# AllowInsecureFallback
 frontend:
   default:
     validation:
@@ -264,20 +264,16 @@ This condition is **absent** when the mode is `AllowValidOnly`. Operators can us
 kubectl get gateway <name> -o jsonpath='{.status.conditions[?(@.type=="InsecureFrontendValidationMode")]}'
 ```
 
-### Out of scope
+### Additional CA-ref behaviour
 
-| Feature | Status |
-|---------|--------|
-| `perPort` validation overrides | **Supported** — `spec.tls.frontend.perPort[].tls.validation` overrides the gateway `default` for listeners on that port; the resolved config is keyed by the listener's bind port + hostname, so two Gateways sharing a hostname keep independent validation policies |
-| Cross-namespace CA refs | **Supported** — a CA `ConfigMap` in another namespace requires a `Gateway → ConfigMap` `ReferenceGrant`; without one the listener surfaces `ResolvedRefs=False/RefNotPermitted` |
-| Secret-backed CA refs | Not yet — only `ConfigMap`/`ca.crt` is Core-certified |
-| Multiple `caCertificateRefs` | Planned (Extended support); currently only the first ref is used |
+- **Per-port overrides** — `spec.tls.frontend.perPort[].tls.validation` overrides the gateway `default` for listeners on that port; the resolved config is keyed by bind port + hostname, so two Gateways sharing a hostname keep independent validation policies.
+- **Cross-namespace CA refs** — a CA `ConfigMap` in another namespace requires a `Gateway → ConfigMap` `ReferenceGrant`; without one the listener surfaces `ResolvedRefs=False/RefNotPermitted`. Only `ConfigMap`/`ca.crt` CA refs are supported (not Secret-backed), and only the first `caCertificateRef` is used.
 
-A listener whose effective CA ref cannot be resolved fails closed and surfaces the GEP-91 reason on its `ResolvedRefs` condition: `InvalidCACertificateRef` (missing ConfigMap / no `ca.crt` / not PEM), `InvalidCACertificateKind` (ref kind is not `ConfigMap`), or `RefNotPermitted` (cross-namespace without a `ReferenceGrant`).
+A listener whose effective CA ref cannot be resolved fails closed and surfaces the reason on its `ResolvedRefs` condition: `InvalidCACertificateRef` (missing ConfigMap / no `ca.crt` / not PEM), `InvalidCACertificateKind` (ref kind is not `ConfigMap`), or `RefNotPermitted` (cross-namespace without a `ReferenceGrant`).
 
-## Gateway backend client certificate (GEP-3155)
+## Gateway backend client certificate
 
-Coxswain implements **GEP-3155**: when a Gateway carries `spec.tls.backend.clientCertificateRef`, the proxy presents that certificate as its client identity when opening TLS connections to upstream pods. This enables backend mutual TLS — the upstream can verify the proxy's identity in addition to the proxy verifying the upstream's certificate.
+When a Gateway carries `spec.tls.backend.clientCertificateRef`, the proxy presents that certificate as its client identity when opening TLS connections to upstream pods. This enables backend mutual TLS — the upstream can verify the proxy's identity in addition to the proxy verifying the upstream's certificate.
 
 !!! important
     The backend client cert is **only applied on connections driven by a `BackendTLSPolicy`**. `BackendTLSPolicy` is the sole Gateway API mechanism for originating upstream TLS; without it the connection to the backend is cleartext, and `clientCertificateRef` has no effect.
@@ -355,18 +351,11 @@ The controller resolves the Secret and pushes the cert bytes to the proxy via th
 
 Connections already in flight use the cert that was in effect when the connection was opened. New connections after the rotation use the new cert.
 
-### Out of scope
-
-| Feature | Status |
-|---------|--------|
-| Cross-namespace `clientCertificateRef` | Planned — requires a `ReferenceGrant`; without one the Gateway surfaces `ResolvedRefs=False/RefNotPermitted` |
-
-## BackendTLSPolicy subjectAltNames (GEP-1897 Extended)
+## BackendTLSPolicy subjectAltNames
 
 `BackendTLSPolicy.spec.validation.subjectAltNames` pins the identity the upstream's leaf
 certificate must present, independent of the `hostname` used for SNI and certificate
-selection.  This satisfies the GEP-1897 Extended-conformance feature
-`BackendTLSPolicySANValidation`.
+selection.
 
 ### How it works
 

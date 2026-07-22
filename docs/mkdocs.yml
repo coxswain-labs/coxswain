@@ -38,9 +38,11 @@ theme:
     - navigation.instant.progress
     - navigation.sections
     - navigation.top
-    - toc.integrate
     - content.code.copy
     - content.tabs.link
+
+extra_css:
+  - stylesheets/extra.css
 
 plugins:
   - search
@@ -77,32 +79,36 @@ nav:
     - Overview: installation/index.md
     - Helm: installation/helm.md
     - Kustomize: installation/kustomize.md
-    - Raw manifests: installation/manifests.md
-  - Guides:
-    - Ingress:
-      - Overview: guides/ingress.md
-      - Annotations: guides/ingress-annotations.md
-    - Gateway API:
-      - Overview: guides/gateway-api.md
-      - ListenerSets: guides/listener-sets.md
-      - Dedicated proxy pools: guides/dedicated-mode.md
-    - Operations:
-      - Running in production: guides/running-in-production.md
-      - Control-plane security: guides/control-plane-security.md
-      - TLS: guides/tls.md
-      - Rate limiting: guides/rate-limiting.md
-      - Retries: guides/retries.md
-      - Verifying releases: guides/verifying-releases.md
-      - Troubleshooting: guides/troubleshooting.md
+    - Manifests: installation/manifests.md
+  - Gateway API:
+    - Overview: gateway-api/index.md
+    - Gateway: gateway-api/gateway.md
+    - ListenerSets: gateway-api/listenerset.md
+    - HTTPRoute: gateway-api/httproute.md
+    - GRPCRoute: gateway-api/grpcroute.md
+    - TLSRoute: gateway-api/tlsroute.md
+    - TCP / UDP routes: gateway-api/tcp-udp-routes.md
+    - Route extensions: gateway-api/route-extensions.md
+    - Backend policy: gateway-api/backend-policy.md
+    - Conformance: gateway-api/capability-matrix.md
+  - Ingress:
+    - Overview: ingress/index.md
+    - Annotations: ingress/annotations.md
+  - Operations:
+    - Traffic:
+      - TLS: operations/tls.md
+      - Rate limiting: operations/rate-limiting.md
+      - Retries: operations/retries.md
+    - Production: operations/running-in-production.md
+    - Control plane: operations/control-plane-security.md
+    - Relay tier: operations/relay-policy.md
+    - Releases: operations/verifying-releases.md
+    - Troubleshooting: operations/troubleshooting.md
   - Reference:
     - Configuration: reference/configuration.md
-    - Relay policy: reference/relay-policy.md
     - Observability: reference/observability.md
-    - Conformance: reference/conformance.md
-    - Gateway API capability matrix: reference/capability-matrix.md
   - Architecture:
-    - Overview: architecture.md
-    - Deployment models: architecture/deployment-models.md
+    - Overview: architecture/index.md
+    - Proxy topology: architecture/proxy-topology.md
     - Discovery protocol: architecture/discovery-protocol.md
-  - FAQ: faq.md
 

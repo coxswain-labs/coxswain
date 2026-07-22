@@ -8,6 +8,8 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 
 ## Quick reference
 
+<div class="nowrap-col1" markdown>
+
 | Annotation | Type | Default | Example |
 |------------|------|---------|---------|
 | `ingress.coxswain-labs.dev/read-timeout` | duration | _none_ | `"60s"` |
@@ -44,6 +46,8 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/path-normalize` | `base`, `merge-slashes`, `decode-and-merge-slashes` | `base` | `"merge-slashes"` |
 
+</div>
+
 ```yaml
 metadata:
   annotations:
@@ -52,9 +56,15 @@ metadata:
     ingress.coxswain-labs.dev/rewrite-target: "/v2"
 ```
 
+## CR-backed annotations
+
+Eight annotations — `retry`, `rate-limit`, `ext-auth`, `auth-basic-secret`, `auth-jwt`, `auth-tls-secret`, `ip-access-control`, and `compression` — take a `namespace/name` value pointing at a Kubernetes resource: a Coxswain CRD, or a `Secret` for the auth ones. You set the annotation on the Ingress `metadata.annotations` (as in the example above), so the sections below show only the referenced resource. The same resource backs the equivalent Gateway API `ExtensionRef` filter, so one CR serves an Ingress and an HTTPRoute/GRPCRoute identically.
+
+**Missing-reference behaviour** — a missing, unlabeled, or unparseable reference fails **open** (the feature is skipped, traffic flows) for every CR-backed annotation **except** the auth checks (`ext-auth`, `auth-basic-secret`, `auth-jwt`) and client-cert mTLS (`auth-tls-secret`), which fail **closed** (`503`, or an aborted handshake for mTLS) — a stale or typo'd auth reference must not silently disable enforcement.
+
 ## Backend connection settings are not annotations
 
-If you're looking for `connect-timeout`, `upstream-keepalive-timeout`, `load-balance`, `circuit-breaker-*`, or `session-affinity` and don't see them in the table above: these five settings moved out of the annotation namespace entirely. They now live on a separate Kubernetes resource, [`CoxswainBackendPolicy`](gateway-api.md#coxswainbackendpolicy), which you attach to the **backend `Service`** rather than the Ingress.
+If you're looking for `connect-timeout`, `upstream-keepalive-timeout`, `load-balance`, `circuit-breaker-*`, or `session-affinity` and don't see them in the table above: these five settings moved out of the annotation namespace entirely. They now live on a separate Kubernetes resource, [`CoxswainBackendPolicy`](../gateway-api/backend-policy.md), which you attach to the **backend `Service`** rather than the Ingress.
 
 Why the different shape? These five settings all describe the *connection to the upstream pod* — not anything about routing or the request itself — so they belong to the Service the Ingress points at, not to the Ingress. That also means:
 
@@ -62,13 +72,13 @@ Why the different shape? These five settings all describe the *connection to the
 - The same policy applies identically whether the Service is reached via an Ingress, an `HTTPRoute`, or a `GRPCRoute` — one place to configure it, no matter how traffic gets there.
 - If two Ingresses (or an Ingress and an HTTPRoute) point at the same Service, they share the same connection policy. That's intentional — connection pooling, load-balancing, and circuit-breaking happen per-Service, not per-route.
 
-See the [Gateway API guide's `CoxswainBackendPolicy` section](gateway-api.md#coxswainbackendpolicy) for the full field list, a copy-pasteable example, and how each setting behaves.
+See the [Gateway API guide's `CoxswainBackendPolicy` section](../gateway-api/backend-policy.md) for the full field list, a copy-pasteable example, and how each setting behaves.
 
 ## Timeouts
 
 **Duration format** — All timeout annotations accept Go `time.ParseDuration` strings: one or more `<number><unit>` pairs without spaces. Supported units: `ns`, `us` (`µs`), `ms`, `s`, `m`, `h`. Examples: `"5s"`, `"500ms"`, `"1m30s"`. Zero values (`"0"`, `"0s"`) are treated as absent.
 
-These are per-*request* timeouts. Upstream connect timeout is per-backend connection policy — see [`CoxswainBackendPolicy`](gateway-api.md#coxswainbackendpolicy).
+These are per-*request* timeouts. Upstream connect timeout is per-backend connection policy — see [`CoxswainBackendPolicy`](../gateway-api/backend-policy.md).
 
 ### `read-timeout`
 
@@ -80,7 +90,7 @@ Maximum time to write the full request to the upstream. Corresponds to Pingora's
 
 ## `retry`
 
-The Ingress surface for the [`RetryPolicy` CRD](retries.md), same idiom as `ext-auth`/`auth-jwt`/`compression`. Value is `namespace/name` of a `RetryPolicy` resource; both surfaces resolve the same CR to the same runtime policy, so one `RetryPolicy` can back an Ingress and an HTTPRoute/GRPCRoute `ExtensionRef` filter identically. The field shape follows the Gateway API [GEP-1731](https://gateway-api.sigs.k8s.io/geps/gep-1731/) (`attempts` / `codes` / `backoff`). See the [Retries guide](retries.md) for the full model, including gRPC. Ingress is HTTP-only, so a referenced CR's `grpcCodes` field is ignored.
+The Ingress surface for the [`RetryPolicy` CRD](../operations/retries.md). The field shape follows the Gateway API retry model (`attempts` / `codes` / `backoff`). See the [Retries guide](../operations/retries.md) for the full model, including gRPC. Ingress is HTTP-only, so a referenced CR's `grpcCodes` field is ignored.
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -92,27 +102,6 @@ spec:
   attempts: 2
   codes: [502, 503, 504]
   backoff: 100ms
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: my-ingress
-  namespace: my-app
-  annotations:
-    ingress.coxswain-labs.dev/retry: "my-app/default-retry"
-spec:
-  ingressClassName: coxswain
-  rules:
-    - host: api.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: my-api
-                port:
-                  number: 8080
 ```
 
 `attempts` is the gate: absent or `0` disables retrying entirely, regardless of `codes`/`backoff`. With `attempts: 2`, Coxswain makes up to 3 total attempts, tried against randomly selected endpoints in the same backend group (no per-endpoint pinning). When `attempts >= 1`, **connection failures and connect-timeouts are always retried** (they are safe — no request bytes were sent); `codes` additionally selects which upstream _responses_ trigger a retry — omitted defaults to `[502, 503, 504]` (`500` is excluded: the application ran, and a retry risks double execution), an explicit empty list opts out of response-code retries. `backoff` is a minimum delay before each retried attempt; absent means immediate retry.
@@ -121,11 +110,6 @@ Each retry attempt (not counting the final failing attempt) increments `coxswain
 
 !!! note
     Response-code retries require the full request body to be buffered. Requests whose bodies are too large or were only partially received cannot be retried and pass through to the client as-is.
-
-A missing `RetryPolicy` CR fails **open** (no retries) — unlike the auth annotations (`ext-auth`/`auth-basic-secret`/`auth-jwt`), which fail closed with **503**. A broken or stale `retry` reference degrades the route to no retries rather than blocking traffic.
-
-!!! note "Migration from the inline retry-attempts/retry-codes/retry-backoff annotations (breaking)"
-    Earlier releases exposed three inline annotations — `retry-attempts`, `retry-codes`, `retry-backoff` — duplicating the `RetryPolicy` CRD schema. These are removed; move each Ingress's values into a `RetryPolicy` CR and point `retry` at it.
 
 ## `rewrite-target`
 
@@ -199,13 +183,11 @@ spec:
                   number: 80
 ```
 
-**Per-path, not per-host.** `use-regex` is an Ingress-wide *enable*; the per-path lever is the standard `pathType` field. Only `ImplementationSpecific` rules become regex — `Prefix` and `Exact` rules in the same Ingress are unaffected. This differs from nginx-ingress, where `use-regex` (or `rewrite-target`) on any path forces regex matching across **all** paths of the host; Coxswain never does this.
+**Per-path, not per-host.** `use-regex` is an Ingress-wide *enable*; the per-path lever is the standard `pathType` field. Only `ImplementationSpecific` rules become regex — `Prefix` and `Exact` rules in the same Ingress are unaffected. Enabling `use-regex` never forces regex matching onto paths that did not opt in via `pathType`.
 
 **Matching semantics.** The pattern is matched unanchored and is evaluated **after** exact and prefix routes on the same host — a literal `Prefix`/`Exact` rule that also matches wins over a regex rule. The Kubernetes API server requires every Ingress path to start with `/`, so a regex path is always rooted there (`/svc/(.*)`, not `^/svc/(.*)`); use `$` to anchor the end.
 
 **Invalid patterns.** A path whose value is not a valid regular expression is skipped with a controller `WARN`; the rest of the Ingress (and the routing table) is unaffected.
-
-**Migrating from nginx-ingress.** The canonical nginx pairing — `nginx.ingress.kubernetes.io/use-regex` + `nginx.ingress.kubernetes.io/rewrite-target: /$2` with `pathType: ImplementationSpecific` — maps directly onto the Coxswain annotations of the same names. See [capture-group substitution](#capture-group-substitution).
 
 ## `path-normalize`
 
@@ -319,6 +301,8 @@ ingress.coxswain-labs.dev/response-header-remove: "Server, X-Powered-By"
 
 Six annotations configure an HTTP redirect response. Any combination of the fields below may be omitted; omitted fields are inherited from the original request (hostname is preserved, path is preserved, etc.). The redirect fires at the proxy layer — the upstream backend is never reached.
 
+<div class="nowrap-col1" markdown>
+
 | Annotation | Value | Notes |
 |------------|-------|-------|
 | `redirect-scheme` | `http` or `https` | |
@@ -326,6 +310,8 @@ Six annotations configure an HTTP redirect response. Any combination of the fiel
 | `redirect-port` | port integer | explicit port in the Location |
 | `redirect-path` | absolute path | full path replacement |
 | `redirect-status-code` | `301`, `302`, `307`, `308` | defaults to `302` |
+
+</div>
 
 ```yaml
 ingress.coxswain-labs.dev/redirect-scheme: "https"
@@ -361,9 +347,8 @@ ingress.coxswain-labs.dev/ssl-redirect-code: "301"
 ## Backend wire protocol (`appProtocol`)
 
 Coxswain has no `backend-protocol` annotation. The upstream wire protocol is taken
-from the backend **Service port `appProtocol`** field — the Gateway API mechanism
-([GEP-1911](https://gateway-api.sigs.k8s.io/geps/gep-1911/)), which applies to both
-Ingress and Gateway API backends:
+from the backend **Service port `appProtocol`** field — the Gateway API mechanism,
+which applies to both Ingress and Gateway API backends:
 
 | `appProtocol` | Behaviour |
 |---------------|-----------|
@@ -382,7 +367,7 @@ spec:
 ```
 
 !!! note
-    **Upstream TLS** is configured with a `BackendTLSPolicy` ([GEP-1897](gateway-api.md)), the sole Gateway API mechanism for originating TLS to a backend. There is no protocol-hint shortcut for upstream TLS.
+    **Upstream TLS** is configured with a `BackendTLSPolicy`, the sole Gateway API mechanism for originating TLS to a backend. There is no protocol-hint shortcut for upstream TLS.
 
 ## `max-body-size`
 
@@ -403,7 +388,7 @@ The value is a byte count, optionally suffixed with a binary unit (case-insensit
 | `"8m"` | 8 × 1024² |
 | `"1g"` | 1 × 1024³ |
 
-Units are **binary** (`k` = 1024, `m` = 1024², `g` = 1024³), matching nginx-ingress's `proxy-body-size`.
+Units are **binary** (`k` = 1024, `m` = 1024², `g` = 1024³).
 
 Enforcement is two-layered and never buffers the whole body:
 
@@ -460,7 +445,7 @@ A mirror timeout of 5 s is applied per sub-request; the primary never waits for 
 
 ## `ip-access-control`
 
-The Ingress surface for the [`IpAccessControl` CRD](gateway-api.md#ip-access-control), same idiom as `ext-auth`/`auth-jwt`/`compression`/`retry`/`rate-limit`. Value is `namespace/name` of an `IpAccessControl` resource; both surfaces resolve the same CR to the same runtime config, so one `IpAccessControl` can back an Ingress and an HTTPRoute/GRPCRoute `ExtensionRef` filter identically. A request whose client IP falls inside `deny`, or outside every `allow` range when `allow` is non-empty, is rejected with **403 Forbidden** before any upstream connection is opened.
+The Ingress surface for the [`IpAccessControl` CRD](../gateway-api/route-extensions.md#ip-access-control), same idiom as `ext-auth`/`auth-jwt`/`compression`/`retry`/`rate-limit`. Value is `namespace/name` of an `IpAccessControl` resource; both surfaces resolve the same CR to the same runtime config, so one `IpAccessControl` can back an Ingress and an HTTPRoute/GRPCRoute `ExtensionRef` filter identically. A request whose client IP falls inside `deny`, or outside every `allow` range when `allow` is non-empty, is rejected with **403 Forbidden** before any upstream connection is opened.
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -473,12 +458,6 @@ spec:
   allow:                      # then the allow-list
     - 203.0.113.0/24
     - 2001:db8::/32
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  annotations:
-    ingress.coxswain-labs.dev/ip-access-control: "my-app/office-only"
 ```
 
 The `allow` / `deny` values are lists of IPv4/IPv6 CIDR blocks. A bare address without a prefix (`10.0.0.1`, `2001:db8::1`) is accepted as a host route (`/32` / `/128`).
@@ -491,10 +470,7 @@ The `allow` / `deny` values are lists of IPv4/IPv6 CIDR blocks. A bare address w
 
 **Unattributable client IP.** A client whose IP cannot be determined is **denied** against a non-empty `allow` list (**fail-closed** — an un-attributable client must not pass a security control), but is **not** blocked by `deny` alone (a block list only acts on IPs it can positively attribute to a listed range).
 
-A missing `IpAccessControl` CR fails **open** (no IP filtering) — unlike the auth annotations (`ext-auth`/`auth-basic-secret`/`auth-jwt`), which fail closed with **503**. A broken or stale `ip-access-control` reference degrades the route to unfiltered rather than blocking traffic. Invalid CIDR tokens are logged and skipped rather than rejecting the whole policy.
-
-!!! note "Migration from the inline allow-source-range/deny-source-range annotations (breaking)"
-    Earlier releases exposed two inline annotations — `allow-source-range`, `deny-source-range` — duplicating the `IpAccessControl` CRD schema. These are removed; move each Ingress's values into an `IpAccessControl` CR and point `ip-access-control` at it.
+Invalid CIDR tokens are logged and skipped rather than rejecting the whole policy.
 
 ## `trust-forwarded-for`
 
@@ -560,13 +536,13 @@ The value is a comma-separated list of IPv4/IPv6 CIDR blocks (same format as `fo
 
 ## Session affinity, circuit breaker, and load balancing
 
-Session affinity (sticky sessions), the per-upstream-endpoint circuit breaker, and the load-balancing algorithm are **not** Ingress annotations — they are configured by attaching a [`CoxswainBackendPolicy`](gateway-api.md#coxswainbackendpolicy) to the backend `Service`, identically for Ingress and Gateway API routes. See the [Gateway API guide](gateway-api.md#coxswainbackendpolicy) for the full field set, the circuit breaker's state machine and Prometheus series, and worked examples.
+Session affinity (sticky sessions), the per-upstream-endpoint circuit breaker, and the load-balancing algorithm are **not** Ingress annotations — they are configured by attaching a [`CoxswainBackendPolicy`](../gateway-api/backend-policy.md) to the backend `Service`, identically for Ingress and Gateway API routes. See the [Gateway API guide](../gateway-api/backend-policy.md) for the full field set, the circuit breaker's state machine and Prometheus series, and worked examples.
 
 ---
 
 ## Rate limiting
 
-The Ingress surface for the [`RateLimit` CRD](rate-limiting.md#ratelimit-spec-fields), same idiom as `ext-auth`/`auth-jwt`/`compression`/`retry`. Value is `namespace/name` of a `RateLimit` resource; both surfaces resolve the same CR to the same runtime config, so one `RateLimit` can back an Ingress and an HTTPRoute/GRPCRoute `ExtensionRef` filter identically. Over-limit requests are rejected with **429 Too Many Requests** and a `Retry-After` header (in whole seconds) telling the client when to retry. See the [Rate limiting guide](rate-limiting.md) for the full model, including the GCRA algorithm and Gateway API usage.
+The Ingress surface for the [`RateLimit` CRD](../operations/rate-limiting.md#ratelimit-spec-fields), same idiom as `ext-auth`/`auth-jwt`/`compression`/`retry`. Value is `namespace/name` of a `RateLimit` resource; both surfaces resolve the same CR to the same runtime config, so one `RateLimit` can back an Ingress and an HTTPRoute/GRPCRoute `ExtensionRef` filter identically. Over-limit requests are rejected with **429 Too Many Requests** and a `Retry-After` header (in whole seconds) telling the client when to retry. See the [Rate limiting guide](../operations/rate-limiting.md) for the full model, including the GCRA algorithm and Gateway API usage.
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -578,32 +554,9 @@ spec:
   requestsPerSecond: 100
   burst: 50              # optional, default 0
   byHeader: "X-Api-Key"  # optional; absent = limit by client IP
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: my-ingress
-  namespace: my-app
-  annotations:
-    ingress.coxswain-labs.dev/rate-limit: "my-app/default-limit"
-spec:
-  ingressClassName: coxswain
-  rules:
-    - host: api.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: my-api
-                port:
-                  number: 8080
 ```
 
 `requestsPerSecond` is the sustained rate per client; `burst` (default `0`) is extra headroom above the sustained rate a client that has been idle may spend in a short spike — total burst capacity is `requestsPerSecond + burst`. `byHeader` selects the per-client key: absent (the default) keys by real client IP (or L4 peer when not behind a PROXY-protocol LB); a header name keys by that header's value instead. When the keying dimension is not available for a request (undeterminable IP, or an absent header on a header-keyed route) the request is **admitted without counting** (**fail-open**) — a missing key never blocks traffic.
-
-A missing `RateLimit` CR fails **open** (no rate limiting) — unlike the auth annotations (`ext-auth`/`auth-basic-secret`/`auth-jwt`), which fail closed with **503**. A broken or stale `rate-limit` reference degrades the route to unthrottled rather than blocking traffic.
 
 !!! warning "Header keying allows rate-limit bypass"
     `byHeader` allocates one bucket per **unique value** of the named header. A client that rotates the header value (e.g. sends a different `X-Api-Key` on each request) starts with a full bucket every time, bypassing the per-key limit entirely.
@@ -615,16 +568,13 @@ A missing `RateLimit` CR fails **open** (no rate limiting) — unlike the auth a
 
     The controller emits a `Warning` Event on the Ingress when `byHeader` keying is configured without an auth annotation, so operators are notified at reconcile time.
 
-!!! note "Migration from the inline rate-limit-rps/rate-limit-burst/rate-limit-by annotations (breaking)"
-    Earlier releases exposed three inline annotations — `rate-limit-rps`, `rate-limit-burst`, `rate-limit-by` — duplicating the `RateLimit` CRD schema. These are removed; move each Ingress's values into a `RateLimit` CR and point `rate-limit` at it.
-
 ## Authentication
 
 Coxswain supports three independently additive authentication checks on Ingresses: **external authorization** (`ext_authz`, delegated to an auth service, `ext-auth`), **basic auth** (htpasswd Secret, `auth-basic-secret`), and **JWT** (JWKS bearer-token, `auth-jwt`). All are enforced at the proxy before any upstream connection; a failure never reaches the backend. A route can combine any subset of the three — every configured check must pass.
 
 ### `ext-auth`
 
-Enables **external authorization** (`ext_authz`) — the Ingress surface for the [`CoxswainExternalAuth` CRD](gateway-api.md#external-authorization-ext_authz), same idiom as `auth-jwt`. Value is `namespace/name` of a `CoxswainExternalAuth` resource; both surfaces resolve the same CR to the same runtime config, so one `CoxswainExternalAuth` can back an Ingress and an HTTPRoute `ExtensionRef` filter identically.
+Enables **external authorization** (`ext_authz`) — the Ingress surface for the [`CoxswainExternalAuth` CRD](../gateway-api/route-extensions.md#external-authorization-ext_authz), same idiom as `auth-jwt`. Value is `namespace/name` of a `CoxswainExternalAuth` resource; both surfaces resolve the same CR to the same runtime config, so one `CoxswainExternalAuth` can back an Ingress and an HTTPRoute `ExtensionRef` filter identically.
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -641,30 +591,9 @@ spec:
   failClosed: true        # deny (503) on auth-service error/timeout (default)
   allowedResponseHeaders: # copied onto the upstream request on allow
     - x-auth-user
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: my-ingress
-  namespace: my-app
-  annotations:
-    ingress.coxswain-labs.dev/ext-auth: "my-app/oauth2"
-spec:
-  ingressClassName: coxswain
-  rules:
-    - host: api.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: my-api
-                port:
-                  number: 8080
 ```
 
-A **2xx** (HTTP transport) or `OK` (gRPC transport) response from the auth service allows the request; any other status is returned to the client verbatim and the upstream is never hit. A missing `CoxswainExternalAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`auth-jwt`: an operator who set `ext-auth` intends the route to require the check, so a stale or typo'd reference must not silently disable it. A present CR whose `backendRef` has no ready endpoints, whose cross-namespace `backendRef` lacks a `ReferenceGrant`, or whose protocol is unsupported also fails **closed**. See the [`CoxswainExternalAuth` CRD reference](gateway-api.md#external-authorization-ext_authz) for the full spec (transport, timeout, fail-closed posture, response-header forwarding).
+A **2xx** (HTTP transport) or `OK` (gRPC transport) response from the auth service allows the request; any other status is returned to the client verbatim and the upstream is never hit. A missing `CoxswainExternalAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`auth-jwt`: an operator who set `ext-auth` intends the route to require the check, so a stale or typo'd reference must not silently disable it. A present CR whose `backendRef` has no ready endpoints, whose cross-namespace `backendRef` lacks a `ReferenceGrant`, or whose protocol is unsupported also fails **closed**. See the [`CoxswainExternalAuth` CRD reference](../gateway-api/route-extensions.md#external-authorization-ext_authz) for the full spec (transport, timeout, fail-closed posture, response-header forwarding).
 
 ### `auth-basic-secret`
 
@@ -690,27 +619,6 @@ data:
   # alice:secret (bcrypt)  bob:secret (SHA1)
   auth: |
     YWxpY2U6JDJ5JDA0JHdyUkZRU0NCZXpZTFR5V1hKS1dldXVPaHRGdWtyQWo3UHpQWXRRc09ORWg4ck9PampJTGFLCmJvYjp7U0hBfTVlbjZHNk1lelJyb1QzWEtxa2RQT21ZL0JmUT0K
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: my-ingress
-  namespace: my-app
-  annotations:
-    ingress.coxswain-labs.dev/auth-basic-secret: "my-app/my-htpasswd"
-spec:
-  ingressClassName: coxswain
-  rules:
-    - host: api.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: my-api
-                port:
-                  number: 8080
 ```
 
 Requests without credentials receive **401** with a `WWW-Authenticate: Basic realm="coxswain"` header. Invalid credentials also receive **401**.
@@ -722,7 +630,7 @@ Requests without credentials receive **401** with a `WWW-Authenticate: Basic rea
 
 ### `auth-jwt`
 
-Enables **JWT (JWKS bearer-token) validation** — the Ingress surface for the [`JwtAuth` CRD](gateway-api.md#jwt-authentication), same idiom as `auth-basic-secret`. Value is `namespace/name` of a `JwtAuth` resource; both surfaces resolve the same CR to the same runtime config, so one `JwtAuth` can back an Ingress and an HTTPRoute identically.
+Enables **JWT (JWKS bearer-token) validation** — the Ingress surface for the [`JwtAuth` CRD](../gateway-api/route-extensions.md#jwt-authentication), same idiom as `auth-basic-secret`. Value is `namespace/name` of a `JwtAuth` resource; both surfaces resolve the same CR to the same runtime config, so one `JwtAuth` can back an Ingress and an HTTPRoute identically.
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -740,30 +648,9 @@ spec:
   claimToHeaders:
     - claim: sub
       header: x-user-id
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: my-ingress
-  namespace: my-app
-  annotations:
-    ingress.coxswain-labs.dev/auth-jwt: "my-app/my-jwt"
-spec:
-  ingressClassName: coxswain
-  rules:
-    - host: api.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: my-api
-                port:
-                  number: 8080
 ```
 
-A valid, signed, unexpired, correct-issuer bearer token is admitted; the verified `sub` claim is forwarded as `x-user-id`. A missing/invalid/expired/wrong-issuer/wrong-audience token receives **401** with `WWW-Authenticate: Bearer`. A missing `JwtAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`ext-auth`: an operator who set `auth-jwt` intends the route to require a bearer token, so a stale or typo'd reference must not silently disable authentication. An unresolved JWKS also fails **closed** (**503**). See the [`JwtAuth` CRD reference](gateway-api.md#jwt-authentication) for the full spec (remote vs. inline JWKS, `fromHeaders`, `forwardPayloadHeader`, `forward`).
+A valid, signed, unexpired, correct-issuer bearer token is admitted; the verified `sub` claim is forwarded as `x-user-id`. A missing/invalid/expired/wrong-issuer/wrong-audience token receives **401** with `WWW-Authenticate: Bearer`. A missing `JwtAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`ext-auth`: an operator who set `auth-jwt` intends the route to require a bearer token, so a stale or typo'd reference must not silently disable authentication. An unresolved JWKS also fails **closed** (**503**). See the [`JwtAuth` CRD reference](../gateway-api/route-extensions.md#jwt-authentication) for the full spec (remote vs. inline JWKS, `fromHeaders`, `forwardPayloadHeader`, `forward`).
 
 ## Client certificate mTLS
 
@@ -794,32 +681,9 @@ metadata:
 type: Opaque
 data:
   ca.crt: <base64-encoded PEM CA cert(s)>
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: my-ingress
-  namespace: my-app
-  annotations:
-    ingress.coxswain-labs.dev/auth-tls-secret: "my-app/my-client-ca"
-spec:
-  ingressClassName: coxswain
-  tls:
-    - hosts:
-        - api.example.com
-      secretName: api-server-cert
-  rules:
-    - host: api.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: my-api
-                port:
-                  number: 8080
 ```
+
+The Ingress carries the annotation and must also declare a `spec.tls` server certificate for the host — client-cert verification happens during that TLS handshake, so an mTLS host needs its own server cert.
 
 ### `auth-tls-verify-depth`
 
@@ -844,7 +708,7 @@ The header value is the raw PEM of the client leaf certificate, percent-encoded 
 
 ## Upstream keepalive idle timeout
 
-How long Pingora keeps an idle upstream connection in its keepalive pool before evicting it is **not** an Ingress annotation — it is `timeouts.idle` on a [`CoxswainBackendPolicy`](gateway-api.md#coxswainbackendpolicy) attached to the backend `Service`. Absent or invalid values warn and fall back to Pingora's default (connections are evicted by LRU capacity pressure, not by age).
+How long Pingora keeps an idle upstream connection in its keepalive pool before evicting it is **not** an Ingress annotation — it is `timeouts.idle` on a [`CoxswainBackendPolicy`](../gateway-api/backend-policy.md) attached to the backend `Service`. Absent or invalid values warn and fall back to Pingora's default (connections are evicted by LRU capacity pressure, not by age).
 
 **Observability**: the `coxswain_proxy_upstream_connections_total{state="reused"}` counter increments every time a request reuses a pooled connection. Compare it with `{state="new"}` to gauge keepalive efficiency for a route.
 
@@ -853,7 +717,7 @@ How long Pingora keeps an idle upstream connection in its keepalive pool before 
 ## `compression`
 
 Opt-in, per-Ingress on-the-fly response compression — the Ingress surface for the
-[`Compression` CRD](gateway-api.md#response-compression), same idiom as `ext-auth`/`auth-jwt`. Value
+[`Compression` CRD](../gateway-api/route-extensions.md#response-compression), same idiom as `ext-auth`/`auth-jwt`. Value
 is `namespace/name` of a `Compression` resource; both surfaces resolve the same CR to the same
 runtime config, so one `Compression` can back an Ingress and an HTTPRoute `ExtensionRef` filter
 identically.
@@ -875,44 +739,13 @@ spec:
     - text/css
     - application/json
     - application/javascript
----
-apiVersion: networking.k8s.io/v1
-kind: Ingress
-metadata:
-  name: my-ingress
-  namespace: my-app
-  annotations:
-    ingress.coxswain-labs.dev/compression: "my-app/default-compression"
-spec:
-  ingressClassName: coxswain
-  rules:
-    - host: api.example.com
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: my-api
-                port:
-                  number: 8080
 ```
 
 At least one of `gzip` / `brotli` must be `true` for the CR to have any effect; when both are `false`
 (the default) it is a no-op. Brotli is preferred over gzip when both are enabled and the client
 advertises `br` in `Accept-Encoding`. `level` (1–9, default `6`), `minSize` (bytes, default `1024`),
 and `types` (default: `text/html`, `text/plain`, `text/css`, `application/json`,
-`application/javascript`) are documented on the [`Compression` CRD reference](gateway-api.md#response-compression).
-
-A missing `Compression` CR fails **open** (no compression) — unlike the auth annotations
-(`ext-auth`/`auth-basic-secret`/`auth-jwt`), which fail closed with **503**. A broken or stale
-`compression` reference degrades the route to uncompressed responses rather than blocking traffic.
-
-!!! note "Migration from the inline `compression-*` annotations (breaking)"
-    Earlier releases exposed five inline annotations — `compression-gzip`, `compression-brotli`,
-    `compression-level`, `compression-types`, `compression-min-size` — duplicating the `Compression`
-    CRD schema. These are removed; move each Ingress's values into a `Compression` CR and point
-    `compression` at it.
+`application/javascript`) are documented on the [`Compression` CRD reference](../gateway-api/route-extensions.md#response-compression).
 
 ### Behaviour
 
@@ -940,7 +773,7 @@ When compression fires, the proxy:
 
 ## Load-balancing algorithm
 
-The algorithm used to pick an upstream endpoint for each request is **not** an Ingress annotation — it is `loadBalancer.algorithm` on a [`CoxswainBackendPolicy`](gateway-api.md#coxswainbackendpolicy) attached to the backend `Service`. See the Gateway API guide for the full value table (`round_robin`, `least_conn`, `ewma`, the `hash:*` consistent-hash forms), the Istio/Envoy equivalence mapping, and performance notes.
+The algorithm used to pick an upstream endpoint for each request is **not** an Ingress annotation — it is `loadBalancer.algorithm` on a [`CoxswainBackendPolicy`](../gateway-api/backend-policy.md) attached to the backend `Service`. See the Gateway API guide for the full value table (`round_robin`, `least_conn`, `ewma`, the `hash:*` consistent-hash forms), the Istio/Envoy equivalence mapping, and performance notes.
 
 `hash:source-ip` (and its alias `ip_hash`) interacts with [`trust-forwarded-for`](#trust-forwarded-for): when enabled, it hashes the resolved client IP (the first non-private address from the forwarded header, gated by [`forwarded-for-trusted-cidrs`](#forwarded-for-trusted-cidrs) if set) rather than the TCP peer address.
 

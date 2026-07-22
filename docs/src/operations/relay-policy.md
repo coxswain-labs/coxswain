@@ -1,7 +1,7 @@
 # CoxswainRelayPolicy
 
 `CoxswainRelayPolicy` is a **namespaced** CRD that tunes the controller-provisioned
-**namespace relays** of the [discovery relay tier](../architecture/deployment-models.md#discovery-relay-tier).
+**namespace relays** of the [discovery relay tier](../architecture/proxy-topology.md#discovery-relay-tier).
 The policy in a namespace governs that namespace's relay, overlaying structured control —
 enablement, HA, resources, scheduling, and autoscaling — on top of the install-wide
 `--relay-*` controller flags.
@@ -14,7 +14,7 @@ enablement, HA, resources, scheduling, and autoscaling — on top of the install
 ## Model: override, not activation
 
 Turning the tier on (`--relay-enabled`) already provisions relays automatically wherever they
-reduce leader fan-out (the [control loop](../architecture/deployment-models.md#discovery-relay-tier):
+reduce leader fan-out (the [control loop](../architecture/proxy-topology.md#discovery-relay-tier):
 activation at break-even, cooldown deactivation). You do **not** need a policy to get the
 optimization. `CoxswainRelayPolicy` is for **overrides and tuning** — force a namespace on or
 off, resize it, pin its scheduling, or tune/opt it into autoscaling.
@@ -23,7 +23,7 @@ off, resize it, pin its scheduling, or tune/opt it into autoscaling.
 
 The effective policy for a namespace is simply the `CoxswainRelayPolicy` that lives **in**
 that namespace — keyed by the object's own namespace, the same model as the
-`CoxswainGatewayParameters` used for [dedicated proxies](../guides/dedicated-mode.md). Every
+`CoxswainGatewayParameters` used for [dedicated proxies](../gateway-api/index.md#dedicated-proxy-pools). Every
 field is optional; unset fields fall through to the global `--relay-*` controller-flag
 defaults. `podTemplate` strategic-merges onto the controller-rendered relay pod.
 
@@ -47,7 +47,7 @@ controller picks the lexically-first by name and warn-logs the ambiguity.
 Namespace-relay autoscaling is **controller-driven — there is no `HorizontalPodAutoscaler`**.
 The relay is I/O/fan-out-bound (CPU mistracks its load) and each replica opens its own upstream
 stream to the leader, so the controller re-implements the standard autoscaler loop internally,
-sizing the relay from the namespace's **live dedicated-proxy subscriber count**:
+sizing the relay from the namespace's **live dedicated proxy subscriber count**:
 
 ```
 replicas = clamp(ceil(liveSubscribers / targetProxiesPerReplica), minReplicas, maxReplicas)
@@ -61,7 +61,7 @@ window (scale up promptly, scale down only on the trailing-window peak).
 | `enabled` | `bool` | `false` | Opt into controller-driven sizing. |
 | `minReplicas` | `int` | effective `replicas` | HA floor. Keep ≥ 2. |
 | `maxReplicas` | `int` | — (**required**) | Cap on relay replicas — bounds the upstream fan-out regrowth. **If unset, autoscaling is ignored** (the relay stays at static `replicas`) and the controller warn-logs; an uncapped relay never runs. |
-| `targetProxiesPerReplica` | `int` | `--relay-target-proxies-per-replica` (250) | **Capacity ratio** — downstream proxies each replica should front. Decoupled from the break-even threshold (a relay is a fan-out cache, so real per-replica capacity is O(100s), not the break-even number). Measured (#603): under one CPU core and p99 fan-out latency under 20ms at 250 subscribers even under sustained 10 changes/sec churn. |
+| `targetProxiesPerReplica` | `int` | `--relay-target-proxies-per-replica` (250) | **Capacity ratio** — downstream proxies each replica should front. Decoupled from the break-even threshold (a relay is a fan-out cache, so real per-replica capacity is O(100s), not the break-even number). Measured: under one CPU core and p99 fan-out latency under 20ms at 250 subscribers even under sustained 10 changes/sec churn. |
 | `scaleDownStabilizationSeconds` | `int` | `--relay-scale-down-stabilization` (300) | Scale-**down** sizes on the max subscriber count over this trailing window; scale-up is prompt. Damps flapping. |
 | `cooldownSeconds` | `int` | `--relay-cooldown` (300) | The relay is torn down only after the subscriber count holds **below** break-even for this long. A genuinely drained namespace (no dedicated Gateways) tears down at once; a transient 0 (relay restart/reconnect) waits the cooldown. |
 | `tolerance` | `float` | `--relay-tolerance` (0.10) | Relative sizing deadband: the replica count changes only when load deviates from target by more than this fraction. |

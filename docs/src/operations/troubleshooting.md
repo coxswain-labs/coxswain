@@ -153,7 +153,7 @@ kubectl -n coxswain-system get events --field-selector reason=BootstrapRejected
 Common causes:
 
 - **Bootstrap endpoint unreachable** — the dedicated proxy's `COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT` (its sole anchor) is rendered by the controller; verify the controller's bootstrap `Service` exists and the proxy pod can reach it. The routing upstream — the controller, or this namespace's relay if provisioned — is delivered by the bootstrap response, so a proxy that never bootstraps also never learns where to stream from.
-- **SVID scope mismatch** — the stream server logs `PERMISSION_DENIED` if the proxy's SVID does not match the expected ServiceAccount for the Gateway. Check that the SA name follows the GEP-1762 pattern (`{gateway-name}-{gatewayclass-name}`) and that the controller's registry entry is current. Reconciling the Gateway again (e.g. by adding/removing an annotation) forces a registry refresh.
+- **SVID scope mismatch** — the stream server logs `PERMISSION_DENIED` if the proxy's SVID does not match the expected ServiceAccount for the Gateway. Check that the SA name follows the pattern (`{gateway-name}-{gatewayclass-name}`) and that the controller's registry entry is current. Reconciling the Gateway again (e.g. by adding/removing an annotation) forces a registry refresh.
 - **Wire-version mismatch** — proxy logs `FAILED_PRECONDITION`; see [Wire-version skew](control-plane-security.md#wire-version-skew).
 
 ## Provisioned resources not garbage-collected after Gateway deletion
@@ -190,7 +190,7 @@ kubectl -n coxswain-system rollout restart deployment/coxswain-controller
 
 ## Ingress route is shadowed by a conflict
 
-When two `Ingress` objects claim the same host and path combination, only one wins (see [Multi-Ingress merging and conflict precedence](ingress.md#multiple-ingresses-on-the-same-host)). The losing Ingress's route is silently dropped from the routing table. The controller emits a `Warning` Event on the shadowed Ingress to make the conflict visible:
+When two `Ingress` objects claim the same host and path combination, only one wins (see [Multi-Ingress merging and conflict precedence](../ingress/index.md#multiple-ingresses-on-the-same-host)). The losing Ingress's route is silently dropped from the routing table. The controller emits a `Warning` Event on the shadowed Ingress to make the conflict visible:
 
 ```bash
 kubectl describe ingress <shadowed-ingress>

@@ -1,27 +1,14 @@
 # Gateway API Conformance
 
-Coxswain is tested against the official [Gateway API conformance suite](https://gateway-api.sigs.k8s.io/concepts/conformance/) on every release. This page explains what is claimed, how to run the suite locally, and how to interpret the report.
+Coxswain is tested against the official [Gateway API conformance suite](https://gateway-api.sigs.k8s.io/concepts/conformance/) on every release. This is the maintainer guide to running the suite, interpreting the report, and publishing results. For the operator-facing view of which profiles and features a given CRD set yields, see the [capability matrix](docs/src/gateway-api/capability-matrix.md#conformance).
 
 ## Claimed profiles and features
 
-Coxswain claims up to five conformance profiles. Which ones are claimed depends
-on the **installed Gateway API CRDs**, not on a compiled-in list — a profile
-whose route kind is absent cannot be claimed, because the suite would create
-that kind and fail:
+Coxswain claims up to five conformance profiles (`GATEWAY-HTTP`, `GATEWAY-GRPC`, `GATEWAY-TLS`, `GATEWAY-TCP`, `GATEWAY-UDP`), derived from the **installed Gateway API CRDs** rather than a compiled-in list — a profile whose route kind is absent cannot be claimed, because the suite would create that kind and fail. See the [capability matrix](docs/src/gateway-api/capability-matrix.md#conformance) for which Gateway API version yields which profiles.
 
-| Profile | Requires | Description |
-|---------|----------|-------------|
-| `GATEWAY-HTTP` | always | HTTPRoute routing, header/path manipulation, redirects, mirroring, timeouts |
-| `GATEWAY-GRPC` | `GRPCRoute` | GRPCRoute routing |
-| `GATEWAY-TLS` | `TLSRoute` (v1.5+) | TLSRoute passthrough, terminate, and mixed-mode listeners |
-| `GATEWAY-TCP` | `TCPRoute` (v1.6+) | TCPRoute routing |
-| `GATEWAY-UDP` | `UDPRoute` (v1.6+) | UDPRoute routing |
+Extended features are listed in `conformance/features.go` (`gatedFeatures`) and kept in sync with the Rust `SUPPORTED_FEATURES` table in `crates/coxswain-controller/src/controller/gateway_class_status.rs`. `scripts/check-supported-features.sh` enforces this parity in CI — a mismatch is a build error. Each entry carries what the cluster must install for the declaration to be true, so both sides shrink identically on an older CRD set.
 
-So a run against Gateway API v1.4 claims two profiles (HTTP and GRPC — it has
-no TLSRoute, TCPRoute or UDPRoute CRD) and a run against v1.6 claims all five.
-See the [capability matrix](capability-matrix.md).
-
-Extended features are listed in `conformance/features.go` (`gatedFeatures`) and kept in sync with the Rust `SUPPORTED_FEATURES` table in `crates/coxswain-controller/src/controller/gateway_class_status.rs`. The `scripts/check-supported-features.sh` script enforces this parity in CI — a mismatch is a build error. Each entry carries what the cluster must install for the declaration to be true, so both sides shrink identically on an older CRD set.
+`main_test.go` is the entrypoint. Claimed profiles/features are derived from the cluster's installed CRDs: `capabilities.go` reads the Gateway API CRD definitions (kind presence plus two schema-field probes) and `features.go` holds the `gatedFeatures` table naming what each declaration requires. Profiles are built from strings rather than `suite.Gateway*ConformanceProfileName` constants because the TCP/UDP constants do not exist in the Gateway API v1.4 Go module, and this file must compile against it.
 
 ## Prerequisites
 
@@ -67,8 +54,7 @@ VIP_SERVICE_TYPE=ClusterIP bash scripts/setup-conformance.sh --reset 'orb delete
 bash scripts/setup-conformance.sh --reset 'kind delete cluster --name kind && kind create cluster --name kind'
 ```
 
-!!! warning
-    Forgetting `VIP_SERVICE_TYPE=ClusterIP` on OrbStack causes all per-test Gateway Services to stay `<pending>`, leaving Gateways without IP addresses. Every conformance test that opens a connection then times out waiting for the address — the suite takes hours instead of minutes and all traffic tests fail.
+> **Warning** — Forgetting `VIP_SERVICE_TYPE=ClusterIP` on OrbStack causes all per-test Gateway Services to stay `<pending>`, leaving Gateways without IP addresses. Every conformance test that opens a connection then times out waiting for the address — the suite takes hours instead of minutes and all traffic tests fail.
 
 ### Skip reset (iterate on a running cluster)
 
@@ -97,19 +83,13 @@ Or use the wrapper, which resolves the upstream report path for you:
 bash scripts/run-conformance.sh
 ```
 
-`conformance/reports/` is gitignored in full (bar its README): reports are
-build outputs, archived as release assets rather than committed. Running the
-suite locally never dirties the tree. See `conformance/reports/README.md` for
-the layout, which mirrors what `kubernetes-sigs/gateway-api` expects.
+`conformance/reports/` is gitignored in full (bar its README): reports are build outputs, archived as release assets rather than committed. Running the suite locally never dirties the tree. See `conformance/reports/README.md` for the layout, which mirrors what `kubernetes-sigs/gateway-api` expects.
 
 A full run takes 8–15 minutes on a clean cluster.
 
 ## Running against an older Gateway API version
 
-Coxswain supports several Gateway API versions (see the
-[capability matrix](capability-matrix.md)), and publishes a report for each.
-Because Gateway API CRDs are cluster-scoped singletons, **every version needs
-its own fresh cluster**:
+Coxswain supports several Gateway API versions (see the [capability matrix](docs/src/gateway-api/capability-matrix.md)), and publishes a report for each. Because Gateway API CRDs are cluster-scoped singletons, **every version needs its own fresh cluster**:
 
 ```bash
 for v in $(scripts/gateway-api-versions.sh --versions); do
@@ -120,20 +100,11 @@ for v in $(scripts/gateway-api-versions.sh --versions); do
 done
 ```
 
-`run-conformance.sh` pins the Go suite module to the matching version in a
-temporary copy of `conformance/`, so no tracked file is modified — a pinned
-`go.mod` left behind would look like an intentional downgrade of the project's
-own dependency.
+`run-conformance.sh` pins the Go suite module to the matching version in a temporary copy of `conformance/`, so no tracked file is modified — a pinned `go.mod` left behind would look like an intentional downgrade of the project's own dependency.
 
-Expect fewer profiles and a shorter `supportedFeatures` list on older versions.
-That is the mechanism working. The versions come from
-`.gateway-api-versions.json`, whose `"latest": true` entry is also what drives
-codegen, e2e and kubeconform; `scripts/check-gateway-api-versions.sh` validates
-the manifest.
+Expect fewer profiles and a shorter `supportedFeatures` list on older versions. That is the mechanism working. The versions come from `.gateway-api-versions.json`, whose `"latest": true` entry is also what drives codegen, e2e and kubeconform; `scripts/check-gateway-api-versions.sh` validates the manifest.
 
-The same matrix runs in CI via the `Conformance reports (all Gateway API versions)`
-workflow, which is `workflow_dispatch` only and emits one combined,
-repo-tree-shaped artifact.
+The same matrix runs in CI via the `Conformance reports (all Gateway API versions)` workflow, which is `workflow_dispatch` only and emits one combined, repo-tree-shaped artifact.
 
 ### Running a subset of tests
 
@@ -184,7 +155,7 @@ A test is **skipped** (not failed) when the implementation explicitly claims the
 3. Run `scripts/check-supported-features.sh` — it must report the feature count in sync.
 4. Add or update e2e tests for the new behaviour (`crates/coxswain-e2e/tests/`).
 
-## CI
+## CI and publishing
 
 The conformance suite runs in CI against a kind cluster with cloud-provider-kind on every PR, at the pinned latest Gateway API version. The CI job uses `Dockerfile.ci` (Linux-only fast path) and `VIP_SERVICE_TYPE=LoadBalancer` (the default).
 

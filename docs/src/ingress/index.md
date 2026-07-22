@@ -19,9 +19,13 @@ spec:
 
 ### Annotations
 
+<div class="nowrap-col1" markdown>
+
 | Annotation | Description |
 |------------|-------------|
 | `ingressclass.kubernetes.io/is-default-class` | Makes Coxswain the cluster default — handles `Ingress` objects with no class specified |
+
+</div>
 
 ### Making Coxswain the cluster default
 
@@ -60,11 +64,15 @@ spec:
 
 ### Annotations
 
+<div class="nowrap-col1" markdown>
+
 | Annotation | Description |
 |------------|-------------|
 | `kubernetes.io/ingress.class` | Legacy class selection; takes effect when `spec.ingressClassName` is absent. Use `spec.ingressClassName` on Kubernetes 1.18+ |
 
-Coxswain also supports the `ingress.coxswain-labs.dev/*` annotation namespace for per-Ingress configuration (timeouts, retries, path rewrites, backend protocol). See [Ingress annotations](ingress-annotations.md) for the full reference.
+</div>
+
+Coxswain also supports the `ingress.coxswain-labs.dev/*` annotation namespace for per-Ingress configuration (timeouts, retries, path rewrites, backend protocol). See [Ingress annotations](annotations.md) for the full reference.
 
 ### Supported fields
 
@@ -113,7 +121,7 @@ Only Service backends are supported; Resource backends are ignored.
 |------------|-----------|
 | `Prefix` | Matches any request path with the given prefix. `/foo` matches `/foo`, `/foo/`, `/foo/bar`. |
 | `Exact` | Matches only the exact path. `/foo` does not match `/foo/`. |
-| `ImplementationSpecific` | Treated as `Prefix` by default; becomes regex matching when [`use-regex: "true"`](ingress-annotations.md#use-regex) is set on the Ingress. |
+| `ImplementationSpecific` | Treated as `Prefix` by default; becomes regex matching when [`use-regex: "true"`](annotations.md#use-regex) is set on the Ingress. |
 
 ```yaml
 rules:
@@ -155,7 +163,7 @@ rules:
 ```
 
 !!! note
-    Gateway API wildcards differ: `*.example.com` in a `Gateway` listener or `HTTPRoute` matches any number of labels, including `foo.bar.example.com`. See the [Gateway API guide](gateway-api.md#wildcard-hostnames) if you also use `HTTPRoute` objects in the cluster.
+    Gateway API wildcards differ: `*.example.com` in a `Gateway` listener or `HTTPRoute` matches any number of labels, including `foo.bar.example.com`. See the [Gateway API guide](../gateway-api/httproute.md#wildcard-hostnames) if you also use `HTTPRoute` objects in the cluster.
 
 ### Catch-all rule
 
@@ -216,43 +224,15 @@ Both `Ingress` objects are active simultaneously — `/api/*` goes to `api-servi
 
 **Collision precedence**
 
-When two `Ingress` objects define the same `(host, path, pathType)`, exactly one wins. Since Ingress routes carry no method, header, or query predicates, Coxswain falls through to the timestamp tie-break: the `Ingress` with the **oldest `creationTimestamp`** serves the path; the newer one is shadowed. This matches ingress-nginx's default behaviour.
+When two `Ingress` objects define the same `(host, path, pathType)`, exactly one wins. Since Ingress routes carry no method, header, or query predicates, Coxswain falls through to the timestamp tie-break: the `Ingress` with the **oldest `creationTimestamp`** serves the path; the newer one is shadowed.
 
 ```yaml
-# Ingress "old-app" — created first
-spec:
-  ingressClassName: coxswain
-  rules:
-    - host: app.example.com
-      http:
-        paths:
-          - path: /foo
-            pathType: Prefix
-            backend:
-              service:
-                name: old-svc         # wins — created first
-                port:
-                  number: 80
+# Two Ingresses both define host app.example.com, path /foo, pathType Prefix:
+#   old-app (created first)  → old-svc   — wins
+#   new-app (created later)  → new-svc   — shadowed, never serves /foo
 ```
 
-```yaml
-# Ingress "new-app" — created later
-spec:
-  ingressClassName: coxswain
-  rules:
-    - host: app.example.com
-      http:
-        paths:
-          - path: /foo
-            pathType: Prefix
-            backend:
-              service:
-                name: new-svc         # shadowed — created later
-                port:
-                  number: 80
-```
-
-`old-svc` wins; `new-svc` is shadowed and never receives traffic for `Prefix /foo`. Delete or rename the conflicting path in one of the `Ingress` objects to restore it. Conflicts are reported via `GET /api/v1/problems` (`routing.conflicts`) on the controller admin port.
+Delete or rename the conflicting path in one of the `Ingress` objects to restore it. Conflicts are reported via `GET /api/v1/problems` (`routing.conflicts`) on the controller admin port.
 
 Routes with the same `(host, path)` but **different predicate conditions** — for example, an `HTTPRoute` rule with a method or header constraint on the same host and path — are not a conflict: they coexist and each serves its matching traffic.
 
@@ -261,7 +241,7 @@ Routes with the same `(host, path)` but **different predicate conditions** — f
 
 ### TLS
 
-Add a `spec.tls` block and reference a `kubernetes.io/tls` Secret in the same namespace. Coxswain reloads the cert automatically when the Secret changes. See the [TLS guide](tls.md) for cert-manager integration.
+Add a `spec.tls` block and reference a `kubernetes.io/tls` Secret in the same namespace. Coxswain reloads the cert automatically when the Secret changes. See the [TLS guide](../operations/tls.md) for cert-manager integration.
 
 ```yaml
 spec:
@@ -298,15 +278,3 @@ New requests are routed to the remaining healthy endpoints.
 
 The effective drain window is bounded by the pod's `terminationGracePeriodSeconds`. Design your
 `preStop` hooks to complete within this budget.
-
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: app-tls
-  namespace: default
-type: kubernetes.io/tls
-data:
-  tls.crt: <base64-encoded certificate>
-  tls.key: <base64-encoded private key>
-```

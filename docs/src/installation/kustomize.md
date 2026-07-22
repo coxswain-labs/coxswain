@@ -1,6 +1,6 @@
 # Kustomize install
 
-Coxswain's deployment manifests are structured as a Kustomize base under `deploy/manifests/`. Use this method when you need to apply overlays — custom resource limits, additional labels, namespace changes, or image overrides. The base includes the `CoxswainGatewayParameters` and `RateLimit` CRDs and a `ValidatingAdmissionPolicy` for Ingress annotation validation (silently skipped on Kubernetes < 1.30).
+Coxswain's deployment manifests are structured as a Kustomize base under `deploy/manifests/`. Use this method when you need to apply overlays — custom resource limits, additional labels, namespace changes, or image overrides. The base's core resource, `coxswain.yaml`, is **rendered from the Helm chart**, so a Kustomize install produces the same result as `helm install`; it plus all of Coxswain's CRDs and a `ValidatingAdmissionPolicy` for Ingress annotation validation (silently skipped on Kubernetes < 1.30) make up the base.
 
 ## Install from main
 
@@ -51,7 +51,7 @@ CA and works out of the box. To consume an external CA instead, apply
 `deploy/manifests/cert-manager-example.yaml` (a standalone recipe, not part of
 the base), set `COXSWAIN_DISCOVERY_CA_MODE=external` on the controller, and delete
 the `coxswain-controller-discovery-ca` Role/RoleBinding. See
-[Control-plane security](../guides/control-plane-security.md).
+[Control-plane security](../operations/control-plane-security.md).
 
 ## Uninstall
 

@@ -7,11 +7,26 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash scripts/gates.sh",
+            "command": "bash \"$CLAUDE_PROJECT_DIR/scripts/gates.sh\"",
             "timeout": 30
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "codegraph prompt-hook"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "mcp__codegraph__*"
     ]
   }
 }

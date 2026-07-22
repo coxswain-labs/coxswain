@@ -50,7 +50,7 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL` | `--controller-lease-renew-interval` | `5s` | How often the leader renews its lease; must be ≤ 1/3 of the TTL |
 | `COXSWAIN_CONTROLLER_LEASE_TTL` | `--controller-lease-ttl` | `15s` | How long a lease stays valid without renewal; must be ≥ 3× the renew interval |
 | `COXSWAIN_CONTROLLER_NAME` | `--controller-name` | `coxswain-labs.dev/gateway-controller` | GatewayClass `spec.controllerName` to claim |
-| `COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT` | `--discovery-bootstrap-endpoint` | _(none; **required** for proxy/relay)_ | _(proxy/relay)_ `https://` URI of the controller bootstrap listener — the **sole endpoint anchor**. The proxy exchanges its SA token + CSR for an SVID here, and the response carries its routing-stream upstream (the controller, or its namespace's relay if provisioned), repointed live thereafter. See [Control-plane security](../guides/control-plane-security.md) |
+| `COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT` | `--discovery-bootstrap-endpoint` | _(none; **required** for proxy/relay)_ | _(proxy/relay)_ `https://` URI of the controller bootstrap listener — the **sole endpoint anchor**. The proxy exchanges its SA token + CSR for an SVID here, and the response carries its routing-stream upstream (the controller, or its namespace's relay if provisioned), repointed live thereafter. See [Control-plane security](../operations/control-plane-security.md) |
 | `COXSWAIN_DISCOVERY_BOOTSTRAP_PORT` | `--discovery-bootstrap-port` | `50052` | _(controller)_ Port for the server-auth-only bootstrap gRPC listener |
 | `COXSWAIN_DISCOVERY_CA_BUNDLE_PATH` | `--discovery-ca-bundle-path` | `/var/run/secrets/coxswain/trust-bundle/ca.crt` | _(proxy)_ Path to the mounted trust-bundle ConfigMap used to verify the controller |
 | `COXSWAIN_DISCOVERY_CA_MODE` | `--discovery-ca-mode` | `auto` | _(controller)_ `auto` self-generates the CA Secret if absent; `external` requires a pre-existing Secret (fail closed) |
@@ -75,18 +75,18 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_PROXY_LISTENER_DRAIN_TIMEOUT` | `--proxy-listener-drain-timeout` | `30s` | Drain window for in-flight requests when a Gateway listener is removed at runtime |
 | `COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD` | `--proxy-shutdown-grace-period` | `30s` | Drain window after shutdown signal |
 | `COXSWAIN_PROXY_SHUTDOWN_TIMEOUT` | `--proxy-shutdown-timeout` | `5s` | Hard deadline after the grace period; remaining connections are forcibly closed |
-| `COXSWAIN_PROXY_THREADS` | `--proxy-threads` | `2` | Worker threads per proxy service; set to CPU core count for maximum throughput |
+| `COXSWAIN_PROXY_THREADS` | `--proxy-threads` | `0` | Worker threads per proxy service; `0` = auto (effective CPU parallelism, floored at 2). Tune to the pod's CPU **limit**, not the host core count |
 | `COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE` | `--proxy-upstream-keepalive-pool-size` | `128` | Maximum idle upstream connections in Pingora's keepalive pool; connections beyond the limit are evicted LRU |
 | `COXSWAIN_INGRESS_PROXY_TRUSTED_SOURCES` | `--ingress-proxy-trusted-sources` | _(none)_ | Comma-separated CIDRs allowed to send PROXY-protocol headers on Ingress listeners; only meaningful with `--ingress-accept-proxy-protocol` |
 | `COXSWAIN_RECONCILE_DEBOUNCE_MIN` | `--reconcile-debounce-min` | `20ms` | _(controller)_ Trailing quiet window for the rebuild debounce; a watch event resets it, and it firing with no further events rebuilds the routing table. Must be ≤ the max |
 | `COXSWAIN_RECONCILE_DEBOUNCE_MAX` | `--reconcile-debounce-max` | `500ms` | _(controller)_ Hard ceiling on the same debounce, measured from the first event of a cycle; bounds convergence under sustained churn (e.g. a rolling deploy). Must be ≥ the min |
 | `COXSWAIN_STATUS_ADDRESS` | `--status-address` | _(none)_ | IP or hostname written to `Ingress.status` and `Gateway.status.addresses`; required for cert-manager HTTP-01 and external-dns |
-| `COXSWAIN_WATCH_NAMESPACE` | `--watch-namespace` | _(cluster-wide)_ | Restrict the controller's namespaced watches to a comma-separated namespace list (e.g. `ns1,ns2,ns3`); a single value scopes to one namespace, omitted watches cluster-wide. Enables a namespaced-`Role`-per-namespace RBAC lockdown (see [Running in production](../guides/running-in-production.md#rbac)). Only the controller watches Kubernetes; the proxy is unaffected |
+| `COXSWAIN_WATCH_NAMESPACE` | `--watch-namespace` | _(cluster-wide)_ | Restrict the controller's namespaced watches to a comma-separated namespace list (e.g. `ns1,ns2,ns3`); a single value scopes to one namespace, omitted watches cluster-wide. Enables a namespaced-`Role`-per-namespace RBAC lockdown (see [Running in production](../operations/running-in-production.md#rbac)). Only the controller watches Kubernetes; the proxy is unaffected |
 | `POD_NAME` | `--pod-name` | `coxswain-local` | Pod name used as the leader-election holder identity |
 | `POD_NAMESPACE` | `--pod-namespace` | `coxswain-system` | Pod namespace used to scope the leader-election Lease |
 
 !!! note
-    The dedicated proxy scope flags (`--dedicated`, `--gateway-name`, `--gateway-namespace`) are set by the controller on the proxy Deployments it provisions, or passed by hand when running a dedicated proxy manually. The discovery anchor (`--discovery-bootstrap-endpoint`) is likewise set by the controller on provisioned Deployments; there is no `--discovery-endpoint` — the routing-stream upstream is delivered by the bootstrap response and repointed live, so a relay rebalance never re-renders (nor rolls) a proxy Deployment. See [Dedicated proxy pools](../guides/dedicated-mode.md).
+    The dedicated proxy scope flags (`--dedicated`, `--gateway-name`, `--gateway-namespace`) are set by the controller on the proxy Deployments it provisions, or passed by hand when running a dedicated proxy manually. The discovery anchor (`--discovery-bootstrap-endpoint`) is likewise set by the controller on provisioned Deployments; there is no `--discovery-endpoint` — the routing-stream upstream is delivered by the bootstrap response and repointed live, so a relay rebalance never re-renders (nor rolls) a proxy Deployment. See [Dedicated proxy pools](../gateway-api/index.md#dedicated-proxy-pools).
 
 ## Ports summary
 
@@ -103,13 +103,7 @@ Both API surfaces are enabled by default. Use `controller.gatewayApi.enabled=fal
 
 ### Self-healing Gateway API CRD detection
 
-When the Gateway API surface is enabled (`--disable-gateway-api` absent) but the Gateway API CRDs are not installed yet, Coxswain does not crash. Instead:
-
-1. A `gateway_api_crds` health check is registered but stays `Pending`, blocking `/readyz` until resolved.
-2. A background re-probe task polls every 30 seconds.
-3. Once the CRDs appear, the Gateway API reflectors are started in-process and `gateway_api_crds` becomes `Ready` — no pod restart required.
-
-The active API surfaces are visible in every pod's `/api/v1/health` response under `api_surfaces.gateway_api` and `api_surfaces.ingress`.
+When the Gateway API surface is enabled but the CRDs aren't installed yet, Coxswain doesn't crash: a `gateway_api_crds` health check stays `Pending` (blocking `/readyz`), a background task re-probes every 30 s, and the Gateway API reflectors start in-process once the CRDs appear — no pod restart. The active surfaces show in every pod's `/api/v1/health` under `api_surfaces.gateway_api` / `api_surfaces.ingress`. See the [capability matrix](../gateway-api/capability-matrix.md) for how detection degrades across Gateway API versions.
 
 ## HTTP/2 support
 
@@ -117,7 +111,7 @@ Coxswain supports HTTP/2 on both the downstream (client → proxy) and upstream 
 
 - **h2 over TLS (HTTPS)** — automatic. The TLS acceptor advertises `h2` and `http/1.1` via ALPN; clients that don't offer `h2` fall back to HTTP/1.1 transparently.
 - **h2c (cleartext HTTP/2, prior-knowledge)** — automatic on plain-TCP listeners. The h2c preface is detected non-destructively; HTTP/1.1 clients on the same port are unaffected.
-- **Upstream h2c** — enabled per-route via `appProtocol: kubernetes.io/h2c` on the backend `Service` port (Gateway API GEP-1911 `HTTPRouteBackendProtocolH2C`).
+- **Upstream h2c** — enabled per-route via `appProtocol: kubernetes.io/h2c` on the backend `Service` port (the Gateway API `HTTPRouteBackendProtocolH2C` mechanism).
 
 **PROXY-protocol restriction:** when `--ingress-accept-proxy-protocol` is set, Ingress inbound connections are h1-only. h2c prior-knowledge and h2 ALPN are disabled on PROXY-wrapped connections.
 
@@ -149,7 +143,7 @@ spec:
     - 192.168.0.0/16
 ```
 
-**Precedence (GEP-713):** a section-scoped policy (with `sectionName`) beats a gateway-scoped one for the targeted listener. When two policies at the same scope target the same listener, the older `creationTimestamp` wins; the loser receives `Accepted=False / Conflicted=True` in `status.ancestors[]`.
+**Precedence:** a section-scoped policy (with `sectionName`) beats a gateway-scoped one for the targeted listener. When two policies at the same scope target the same listener, the older `creationTimestamp` wins; the loser receives `Accepted=False / Conflicted=True` in `status.ancestors[]`.
 
 **TLS passthrough:** PROXY headers are stripped before SNI detection, so passthrough routes work correctly whether or not PROXY headers are present. Without a `ClientTrafficPolicy`, PROXY headers on passthrough listeners are treated as raw connection bytes and cause the SNI lookup to fail.
 
@@ -169,7 +163,7 @@ These flags do not affect Gateway listeners. Gateway listeners are always govern
 The controller and proxy communicate over a secured gRPC discovery channel:
 the controller acts as a CA, proxies bootstrap an SVID with their ServiceAccount
 token, and routing snapshots flow over mandatory mTLS. The `COXSWAIN_DISCOVERY_*`
-settings above configure it; see [Control-plane security](../guides/control-plane-security.md)
+settings above configure it; see [Control-plane security](../operations/control-plane-security.md)
 for the model, CA provisioning modes (`auto` / `external` + cert-manager / BYO),
 SVID rotation, and troubleshooting.
 

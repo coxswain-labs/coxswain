@@ -794,9 +794,11 @@ pub(crate) struct ControllerArgs {
 
     /// Port the discovery gRPC server binds to.
     ///
-    /// The proxy's `--source=discovery` mode connects here to receive pushed
-    /// routing snapshots. Every controller replica serves discovery independently;
-    /// no leader election gate applies to this listener.
+    /// Serves the `Discovery.Stream` RPC that pushes routing snapshots to proxies
+    /// and relays. The listener binds on every replica, but the stream is
+    /// leader-only: a standby replica rejects a subscribe with `FAILED_PRECONDITION`,
+    /// and the leader-selecting `coxswain-controller-discovery` Service routes
+    /// stream traffic only to the current leader.
     ///
     /// The bind address is controlled by `--management-bind-address`.
     #[arg(long, env = "COXSWAIN_DISCOVERY_PORT", default_value_t = RELAY_DISCOVERY_PORT)]

@@ -94,7 +94,7 @@ struct ViewInputs<'a> {
 
 /// Materialize the routing world for `scope` into a [`MaterializedView`].
 ///
-/// - [`Scope::SharedPool`] reads the six shared L7/status cells plus the four L4
+/// - [`Scope::SharedPool`] reads the five shared L7/status cells plus the four L4
 ///   cells (these deliberately exclude cut-over Gateways).
 /// - [`Scope::Gateway`] reads only the Gateway's dedicated-registry slice (empty
 ///   Ingress, empty L4). An absent entry yields an empty world at **seq 0**, so an

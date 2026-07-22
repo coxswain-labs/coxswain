@@ -51,7 +51,7 @@ helm show values oci://ghcr.io/coxswain-labs/charts/coxswain
 | `proxy.shared.autoscaling.maxReplicas` | `10` | HPA upper bound |
 | `proxy.shared.autoscaling.targetCPUUtilizationPercentage` | `80` | HPA CPU utilization target |
 | `proxy.shared.podDisruptionBudget.enabled` | `true` | Provision a PDB for the shared proxy (effective when floor `≥ 2`) |
-| `proxy.shared.threads` | `2` | Worker threads per shared proxy service |
+| `proxy.shared.threads` | `0` | Worker threads per shared proxy pod (`0` = one per available CPU core) |
 | `proxy.shared.resources.requests.cpu` | `100m` | Shared proxy CPU request |
 | `proxy.shared.resources.requests.memory` | `128Mi` | Shared proxy memory request |
 | `proxy.shared.resources.limits.cpu` | `500m` | Shared proxy CPU limit |
@@ -61,21 +61,21 @@ See the [Helm chart README](https://github.com/coxswain-labs/coxswain/blob/main/
 
 ## Discovery relay tier
 
-The [relay tier](../architecture/deployment-models.md#discovery-relay-tier) scales leader fan-out by inserting zero-RBAC cache pods between the controller and the proxies. It is **on by default (opt-out)**, but the break-even gate keeps it inert until a scope's demand earns a relay — so a small install provisions no relays and is byte-identical to a relay-free one. The **controller** owns the whole tier (both the shared-pool relay and the per-namespace dedicated relays); these `relay.*` values map onto its `--relay-*` flags — there are no relay templates to render:
+The [relay tier](../architecture/proxy-topology.md#discovery-relay-tier) scales leader fan-out by inserting zero-RBAC cache pods between the controller and the proxies. It is **on by default (opt-out)**, but the break-even gate keeps it inert until a scope's demand earns a relay — so a small install provisions no relays and is byte-identical to a relay-free one. The **controller** owns the whole tier (both the shared-pool relay and the per-namespace dedicated relays); these `relay.*` values map onto its `--relay-*` flags — there are no relay templates to render:
 
 | Value | Default | Description |
 |-------|---------|-------------|
 | `relay.enabled` | `true` | Master switch (→ `--relay-enabled`). Set `false` to disable the whole tier — any already-provisioned relay (shared or per-namespace) is torn down, not orphaned |
 | `relay.replicas` | `2` | HA replica count / autoscaling floor for a provisioned relay |
 | `relay.maxReplicas` | `10` | Shared-relay autoscaling ceiling (→ `--relay-max-replicas`) — the mandatory cap on the upstream streams the shared relay opens against the leader. Dedicated relays cap via `CoxswainRelayPolicy` |
-| `relay.minProxyReplicas` | `8` | Break-even **activation** threshold: a scope gets a relay only once its demand (a namespace's live dedicated-proxy count, or the shared pool's replica count) reaches this (below it, direct-to-controller) |
-| `relay.targetProxiesPerReplica` | `50` | Capacity ratio — proxies per relay replica the sizing loop targets. Decoupled from the break-even threshold |
+| `relay.minProxyReplicas` | `8` | Break-even **activation** threshold: a scope gets a relay only once its demand (a namespace's live dedicated proxy count, or the shared pool's replica count) reaches this (below it, direct-to-controller) |
+| `relay.targetProxiesPerReplica` | `250` | Capacity ratio — proxies per relay replica the sizing loop targets. Decoupled from the break-even threshold |
 | `relay.cooldown` | `300s` | Deactivation cooldown: an active relay is torn down after demand holds below break-even for this long (a genuinely-drained scope tears down at once) |
 | `relay.scaleDownStabilization` | `300s` | Scale-down stabilization window for an autoscaled relay (scale up promptly, down only on the trailing-window peak) |
 | `relay.tolerance` | `0.10` | Relative sizing deadband — the replica count changes only when load deviates from target by more than this fraction |
 | `relay.resources.{cpuRequest,memoryRequest,memoryLimit}` | `50m` / `64Mi` / `256Mi` | Resources for each provisioned relay (CPU request only — a limit would throttle fan-out) |
 
-Per-namespace overrides for the **dedicated** relays (force-on/off, replicas, resources, `podTemplate` scheduling, autoscaling) come from the namespaced [`CoxswainRelayPolicy`](../reference/relay-policy.md) CRD; the shared relay is global and reads the `relay.*` flag values directly.
+Per-namespace overrides for the **dedicated** relays (force-on/off, replicas, resources, `podTemplate` scheduling, autoscaling) come from the namespaced [`CoxswainRelayPolicy`](../operations/relay-policy.md) CRD; the shared relay is global and reads the `relay.*` flag values directly.
 
 ```bash
 # Disable the relay tier entirely
@@ -115,7 +115,7 @@ The controller secures the controller↔proxy discovery channel with mandatory
 mTLS. By default (`discovery.ca.mode=auto`) it self-generates the CA and works
 out of the box — nothing to provision. To consume a cert-manager-managed or
 bring-your-own CA instead, set `discovery.ca.mode=external` and supply the
-Secret. See [Control-plane security](../guides/control-plane-security.md).
+Secret. See [Control-plane security](../operations/control-plane-security.md).
 
 ## Uninstall
 

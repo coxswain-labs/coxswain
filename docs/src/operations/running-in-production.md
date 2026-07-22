@@ -6,7 +6,7 @@ Review each section below before directing production traffic to Coxswain.
 
 **Controller.** The chart defaults to `controller.replicas: 2` — two replicas with leader election. The `PodDisruptionBudget` (`maxUnavailable: 1`) is provisioned automatically when `replicas >= 2`, so a node drain never removes the last controller pod. The controller does not use an HPA (extra replicas are failover standby, not throughput).
 
-On a leader failover (pod death, node drain, rolling upgrade) the warm standby takes the lease within one Lease TTL (15 s default) and immediately re-drives every reconciler — status writes, dedicated-proxy provisioning, and per-Gateway VIP provisioning all resume without waiting for their periodic backstops. The discovery stream is leader-only: proxies reconnect to the new leader (sub-second once the lease moves, via the leader-labelled `coxswain-controller-discovery` Service) and keep serving their last-good routing throughout — a failover stalls routing *updates* briefly, never live traffic. A single failed lease renewal (an API-server blip) does not demote a healthy leader; demotion requires either a positive takeover by another replica or elapsed time since the last successful renew approaching the TTL.
+On a leader failover (pod death, node drain, rolling upgrade) the warm standby takes the lease within one Lease TTL (15 s default) and immediately re-drives every reconciler — status writes, dedicated proxy provisioning, and per-Gateway VIP provisioning all resume without waiting for their periodic backstops. The discovery stream is leader-only: proxies reconnect to the new leader (sub-second once the lease moves, via the leader-labelled `coxswain-controller-discovery` Service) and keep serving their last-good routing throughout — a failover stalls routing *updates* briefly, never live traffic. A single failed lease renewal (an API-server blip) does not demote a healthy leader; demotion requires either a positive takeover by another replica or elapsed time since the last successful renew approaching the TTL.
 
 **Shared proxy.** The chart defaults to `proxy.shared.replicas: 1`, which is fine for evaluation but inadequate for production. Run at least two replicas — the PDB is only provisioned when the effective replica floor is ≥ 2:
 
@@ -137,7 +137,7 @@ Set `--status-address` to the external IP or hostname of your load balancer. Wit
 
 ## TLS
 
-TLS Secrets must be in the correct namespace — for `Ingress`, the same namespace as the `Ingress` object; for `Gateway`, the same namespace as the `Gateway` unless a `ReferenceGrant` permits cross-namespace access. See the [TLS guide](../guides/tls.md) for cert-manager setup.
+TLS Secrets must be in the correct namespace — for `Ingress`, the same namespace as the `Ingress` object; for `Gateway`, the same namespace as the `Gateway` unless a `ReferenceGrant` permits cross-namespace access. See the [TLS guide](tls.md) for cert-manager setup.
 
 ## Observability
 
@@ -184,18 +184,10 @@ A separate namespaced `Role` (in `coxswain-system`) grants `get`, `create`, `pat
 
 To restrict Coxswain to a fixed set of namespaces, set `watchNamespace` to a comma-separated list (`ns1,ns2,ns3`); a single value scopes to one namespace, omitted watches cluster-wide. This restricts the controller's reflectors — one namespaced watch per listed namespace, per resource type — so the ServiceAccount needs **no cluster-wide read** on the high-value tenant resources: `services`, `endpointslices`, **`secrets`**, `configmaps`, `ingresses`, the Gateway API routes/`gateways`/`backendtlspolicies`/`listenersets`, and the route-scoped coxswain CRDs. The proxy's discovery client is unaffected (it receives routing from the controller, not from Kubernetes directly).
 
-This is the least-privilege lockdown for soft multi-tenancy: replace the cluster-wide `ClusterRole` read rules with a namespaced `Role` + `RoleBinding` in **each** listed namespace, granting the same read (and status-write) verbs there. Namespaced resources whose objects can also live in the controller's own namespace — `services` (besides tenant backend Services, the per-Gateway shared-VIP Services are provisioned in `coxswain-system`), `pods` (the shared-proxy fleet pods live in `coxswain-system`, dedicated-proxy pods in the Gateway namespaces), and `coxswaingatewayparameters` / `coxswainingressclassparameters` (a `parametersRef` default commonly lives in `coxswain-system`) — are watched in the listed namespaces **plus `coxswain-system`**, so they need a `Role` there too, not a cluster-wide grant. The only reads that stay cluster-wide are genuinely cluster-scoped Kubernetes resources (no namespace to scope by): `gatewayclasses`, `namespaces`, `nodes`, `ingressclasses`, and `tokenreviews`. Every coxswain-owned CRD is namespaced. The leader-election `Role` in `coxswain-system` is unchanged. See `deploy/manifests/controller-rbac-namespaced.yaml` for a worked example to replicate per listed namespace. Verify the lockdown with `kubectl auth can-i list secrets -A --as=system:serviceaccount:coxswain-system:coxswain-controller` (expect `no` outside the listed namespaces).
+This is the least-privilege lockdown for soft multi-tenancy: replace the cluster-wide `ClusterRole` read rules with a namespaced `Role` + `RoleBinding` in **each** listed namespace, granting the same read (and status-write) verbs there. Namespaced resources whose objects can also live in the controller's own namespace — `services` (besides tenant backend Services, the per-Gateway shared-VIP Services are provisioned in `coxswain-system`), `pods` (the shared proxy fleet pods live in `coxswain-system`, dedicated proxy pods in the Gateway namespaces), and `coxswaingatewayparameters` / `coxswainingressclassparameters` (a `parametersRef` default commonly lives in `coxswain-system`) — are watched in the listed namespaces **plus `coxswain-system`**, so they need a `Role` there too, not a cluster-wide grant. The only reads that stay cluster-wide are genuinely cluster-scoped Kubernetes resources (no namespace to scope by): `gatewayclasses`, `namespaces`, `nodes`, `ingressclasses`, and `tokenreviews`. Every coxswain-owned CRD is namespaced. The leader-election `Role` in `coxswain-system` is unchanged. See `deploy/manifests/controller-rbac-namespaced.yaml` for a worked example to replicate per listed namespace. Verify the lockdown with `kubectl auth can-i list secrets -A --as=system:serviceaccount:coxswain-system:coxswain-controller` (expect `no` outside the listed namespaces).
 
 ## Signed image verification
 
-Every release image is signed with cosign. Verify the signature before deploying to a production cluster:
+Every release image and chart is signed with cosign. Verify the signature before deploying to a production cluster — see [Verifying releases](verifying-releases.md).
 
-```bash
-cosign verify \
-  --certificate-identity-regexp \
-    "https://github.com/coxswain-labs/coxswain/.github/workflows/release.yml" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  ghcr.io/coxswain-labs/coxswain:vX.Y.Z
-```
-
-See [Verifying releases](../guides/verifying-releases.md) for the cosign verification flow for both the image and the Helm chart.
+See [Verifying releases](verifying-releases.md) for the cosign verification flow for both the image and the Helm chart.

@@ -194,6 +194,18 @@ jobs:
         run: bash scripts/check-supported-features.sh
 
 
+  manifests-synced:
+    name: manifests-synced
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: azure/setup-helm@v4
+        with:
+          version: v4.2.3
+      - name: deploy/manifests base is rendered from (in sync with) the Helm chart
+        run: bash scripts/check-manifests-synced.sh
+
+
   # Deliberately unfiltered: a gate that stops firing is invisible on the real
   # tree (it just reports OK), so these run on every change rather than only
   # when scripts/ is touched.

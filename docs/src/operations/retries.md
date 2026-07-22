@@ -9,12 +9,12 @@ Both bindings reference the same `RetryPolicy` custom resource, resolved through
 | [Ingress annotation](#ingress-annotation) | Per-Ingress (HTTP only): `ingress.coxswain-labs.dev/retry: "namespace/name"` |
 | [Gateway API `ExtensionRef`](#gateway-api-extensionref) | Per-`HTTPRoute` / `GRPCRoute` rule, via the same `RetryPolicy` custom resource |
 
-The configuration model mirrors Gateway API [GEP-1731](https://gateway-api.sigs.k8s.io/geps/gep-1731/) (`attempts` / `backoff` / `codes`) so that, once GEP-1731 graduates to the Standard channel, the HTTP surface can be moved to the native `HTTPRoute.spec.rules[].retry` field with no behavioural change. gRPC retry has no GEP-1731 equivalent and stays on the `RetryPolicy` CR permanently.
+The configuration model mirrors the Gateway API retry model (`attempts` / `backoff` / `codes`); gRPC retry has no Gateway API standard equivalent and stays on the `RetryPolicy` CR.
 
 ## Model
 
 - **`attempts`** — the number of _additional_ attempts after the first, and the **gate**: when `attempts` is `0` (or absent on an Ingress), retrying is disabled entirely. With `attempts: 2`, Coxswain makes up to 3 total attempts.
-- **Connection failures and connect-timeouts are always retried** when `attempts >= 1`. They are safe to replay — no request bytes reached the upstream. There is no separate opt-in (this matches GEP-1731, where connection-error retries are implicit).
+- **Connection failures and connect-timeouts are always retried** when `attempts >= 1`. They are safe to replay — no request bytes reached the upstream. There is no separate opt-in — connection-error retries are always implicit.
 - **`codes`** selects which upstream _responses_ retry. See [HTTP](#http-codes) and [gRPC](#grpc-codes) below.
 - **`backoff`** — a minimum delay before each retried attempt. Applied as a fixed minimum; exponential backoff and jitter are not yet applied.
 
@@ -57,10 +57,7 @@ metadata:
 
 **Fail-open**: if the referenced `RetryPolicy` CR is missing, the route serves with retrying disabled (a WARN is logged) rather than failing the route — the same posture as the Gateway API binding below.
 
-!!! note "Migration from the inline retry-attempts/retry-codes/retry-backoff annotations (breaking)"
-    Earlier releases exposed three inline annotations — `retry-attempts`, `retry-codes`, `retry-backoff` — duplicating the `RetryPolicy` CRD schema. These are removed; move each Ingress's values into a `RetryPolicy` CR and point `retry` at it.
-
-See the [Ingress annotations reference](ingress-annotations.md#retry) for the full annotation semantics.
+See the [Ingress annotations reference](../ingress/annotations.md#retry) for the full annotation semantics.
 
 ## Gateway API `ExtensionRef`
 
