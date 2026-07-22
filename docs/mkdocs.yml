@@ -37,7 +37,6 @@ theme:
     - navigation.instant
     - navigation.instant.progress
     - navigation.sections
-    - navigation.indexes
     - navigation.top
     - content.code.copy
     - content.tabs.link
@@ -77,12 +76,12 @@ nav:
   - Home: index.md
   - Getting started: getting-started.md
   - Installation:
-    - installation/index.md
+    - Overview: installation/index.md
     - Helm: installation/helm.md
     - Kustomize: installation/kustomize.md
     - Manifests: installation/manifests.md
   - Gateway API:
-    - gateway-api/index.md
+    - Overview: gateway-api/index.md
     - Gateway: gateway-api/gateway.md
     - ListenerSets: gateway-api/listenerset.md
     - HTTPRoute: gateway-api/httproute.md
@@ -93,7 +92,7 @@ nav:
     - Backend policy: gateway-api/backend-policy.md
     - Conformance: gateway-api/capability-matrix.md
   - Ingress:
-    - ingress/index.md
+    - Overview: ingress/index.md
     - Annotations: ingress/annotations.md
   - Operations:
     - Traffic:
@@ -109,7 +108,7 @@ nav:
     - Configuration: reference/configuration.md
     - Observability: reference/observability.md
   - Architecture:
-    - architecture/index.md
+    - Overview: architecture/index.md
     - Proxy topology: architecture/proxy-topology.md
     - Discovery protocol: architecture/discovery-protocol.md
   - FAQ: faq.md
