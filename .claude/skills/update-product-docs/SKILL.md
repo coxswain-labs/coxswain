@@ -1,6 +1,6 @@
 ---
 name: update-product-docs
-description: Audit and update the product documentation under `docs/src/` (the mkdocs site that ships to coxswain-labs.github.io/coxswain) against the canonical conventions embedded in this skill (two macro deployment models — Shared and Dedicated — and the supporting naming and diagram rules). Audits first, presents the proposed diff, applies on user approval. Covers naming-convention violations in prose and mermaid diagrams (e.g. "Per-Gateway proxy pod" → "Proxy pool (dedicated)"), broken internal links, pages referenced in `docs/mkdocs.yml` nav but missing on disk (or vice versa), and `mkdocs build --strict` warnings. Sibling to `audit-guardrails` but action-oriented — the verb is `update`, not `audit`. Triggers on phrases like "update the product docs", "fix the docs", "the docs are drifting", "refresh the architecture page", "the diagrams are out of sync".
+description: Audit and update the product documentation under `docs/src/` (the mkdocs site that ships to coxswain-labs.github.io/coxswain) against the canonical conventions embedded in this skill (proxy topology — one data plane, shared by default and dedicated per Gateway on opt-in — and the supporting naming and diagram rules). Audits first, presents the proposed diff, applies on user approval. Covers naming-convention violations in prose and mermaid diagrams (e.g. "Per-Gateway proxy pod" → "Proxy pool (dedicated)"), broken internal links, pages referenced in `docs/mkdocs.yml` nav but missing on disk (or vice versa), and `mkdocs build --strict` warnings. Sibling to `audit-guardrails` but action-oriented — the verb is `update`, not `audit`. Triggers on phrases like "update the product docs", "fix the docs", "the docs are drifting", "refresh the architecture page", "the diagrams are out of sync".
 ---
 
 Maintain `docs/src/` (the mkdocs site published to `coxswain-labs.github.io/coxswain`) against the project's naming conventions, link integrity, and build cleanliness. The skill runs in three phases — audit, apply, verify — and pauses for user approval before any edit lands.
@@ -16,7 +16,7 @@ Maintain `docs/src/` (the mkdocs site published to `coxswain-labs.github.io/coxs
 | `docs/src/installation/*.md` | Helm / Kustomize / raw manifest install paths |
 | `docs/src/guides/*.md` | Topic guides (Ingress, Gateway API, dedicated-mode, TLS, production deployment, troubleshooting, verifying releases) |
 | `docs/src/reference/*.md` | Configuration and observability reference |
-| `docs/src/architecture.md` | The architecture page with the deployment-model diagram |
+| `docs/src/architecture.md` | The architecture page with the proxy-topology diagram |
 | `docs/src/faq.md` | FAQ |
 | `docs/mkdocs.yml` | mkdocs nav + theme + plugins (validated, not rewritten by this skill) |
 
@@ -26,22 +26,27 @@ Maintain `docs/src/` (the mkdocs site published to `coxswain-labs.github.io/coxs
 
 These rules ARE the source of truth — don't go looking for them elsewhere. If the framework changes, edit this file; it's what every audit run grades against.
 
-### Deployment-model framework
+### Proxy-topology framework
 
-**Two macro deployment models**:
+Coxswain runs **one controller-managed data plane**. "Shared" and "dedicated" are two *topologies* of that one data plane — not two "deployment models" the operator picks up front. Do **not** frame them as "deployment models"; that older phrasing over-elevated an implementation detail into a top-level taxonomy and is retired. The canonical page is `docs/src/architecture/proxy-topology.md` ("Proxy topology"); the canonical noun for the axis is **proxy topology**.
 
-- **Shared** — one cluster-wide proxy pool serves Ingress and all non-dedicated Gateways. *Ingress-only* is a runtime variant of Shared when Gateway-API CRDs are absent at startup (the controller probes and drops the Gateway pipelines).
-- **Dedicated** — per-Gateway proxy, provisioned on the controller when a `Gateway` carries `spec.infrastructure.parametersRef` → `CoxswainGatewayParameters`. Each dedicated Gateway gets its own Deployment + Service + ServiceAccount + RBAC.
+**Two topologies, composing:**
 
-**Per-namespace is intentionally NOT a deployment model.** The Gateway API spec has only per-Gateway data-plane customization (`Gateway.spec.infrastructure.parametersRef`, GEP-1762) and per-class (`GatewayClass.spec.parametersRef`); no namespace-scoped axis exists. Per-Gateway and per-namespace are nested, not orthogonal — per-Gateway is strictly more granular. Don't introduce a per-namespace pool framing in docs.
+- **Shared** (the default) — one cluster-wide proxy pool serves Ingress and all Gateways that haven't opted into dedicated. *Ingress-only* is a runtime variant of Shared when Gateway-API CRDs are absent at startup (the controller probes and drops the Gateway pipelines).
+- **Dedicated** — a per-Gateway proxy, provisioned on the controller when a `Gateway` requests its own infrastructure via `spec.infrastructure.parametersRef` → `CoxswainGatewayParameters` (GEP-1762). Each dedicated Gateway gets its own Deployment + Service + ServiceAccount + RBAC.
 
-**CLI subcommands are a separate axis from deployment models.** The binary's `serve dev` / `serve controller` / `serve proxy --shared` / `serve proxy --dedicated` are pod-role choices; the **two** deployment models are data-plane shape. Document them on separate axes; do not conflate counting.
+Frame dedicated as a **per-Gateway opt-in on top of the default shared pool** — this is just how Coxswain implements the Gateway API's per-Gateway infrastructure model, not a parallel install mode. Classic `Ingress` has no `parametersRef` equivalent and is always shared.
+
+**Per-namespace is intentionally NOT a topology.** The Gateway API spec has only per-Gateway data-plane customization (`Gateway.spec.infrastructure.parametersRef`, GEP-1762) and per-class (`GatewayClass.spec.parametersRef`); no namespace-scoped axis exists. Per-Gateway and per-namespace are nested, not orthogonal — per-Gateway is strictly more granular. Don't introduce a per-namespace pool framing in docs.
+
+**CLI subcommands are a separate axis from proxy topology.** The binary's `serve dev` / `serve controller` / `serve proxy --shared` / `serve proxy --dedicated` are pod-role choices; shared/dedicated are data-plane shape. Document them on separate axes; do not conflate counting.
 
 ### Prose naming rules
 
 - **Introduce "dedicated proxy (per Gateway)" once per page or section, then shorten to "dedicated" plain.** No "dedicated per-Gateway proxy" mouthful in body text.
 - **"shared proxy" / "dedicated proxy"** (space-separated) in prose. The hyphenated form (`shared-proxy`, `dedicated-proxy`) is only valid inside literal identifiers — `coxswain-shared-proxy`, CLI flags, code symbols, K8s resource names.
-- Never write "all four modes" / "four deployment models" — there are two.
+- Never write "all four modes" / "four deployment models" / "four topologies" — shared and dedicated are two topologies of one data plane; the CLI-subcommand and runtime-variant axes are separate.
+- Never write "deployment model(s)" for the shared/dedicated axis — the canonical noun is "proxy topology". (Retired framing.)
 - Never write `proxy --gateway` — the CLI flag is `proxy --dedicated`.
 - Never write `coxswain.io` — the project domain is always `coxswain-labs.dev`. Applies to CRD groups, condition types, finalizers, label/annotation keys, and any DNS-form identifier in prose.
 
@@ -65,8 +70,9 @@ Enumerate findings without editing anything. Categorize each finding by type, se
    - `Per-Gateway` (replace with the per-page convention: introduce once as "dedicated proxy (per Gateway)" then "dedicated" plain)
    - `shared-proxy ` followed by a space and a non-identifier word (hyphenated form in prose; should be "shared proxy" space-separated). Allowed only inside literal identifiers (`coxswain-shared-proxy`, `proxy.shared.enabled`, CLI flags, code symbols)
    - `dedicated per-Gateway proxy` repeated more than once per page (the parenthetical goes on first mention only)
-   - `per-namespace proxy` / `per-namespace pool` (not a deployment model; flag any reference)
-   - `all four modes` / `four deployment models` / `four models` (category error; two macro models is the correct framing)
+   - `per-namespace proxy` / `per-namespace pool` (not a topology; flag any reference)
+   - `deployment model` / `deployment models` (retired framing for the shared/dedicated axis; the canonical noun is "proxy topology")
+   - `all four modes` / `four deployment models` / `four models` / `four topologies` (category error; shared + dedicated are two topologies)
    - `coxswain.io` anywhere (always `coxswain-labs.dev`)
    - `proxy --gateway` (the CLI flag is `proxy --dedicated`; `--gateway` is the legacy name)
 
@@ -107,7 +113,7 @@ After applying changes:
 
 1. `cd docs && mkdocs build --strict 2>&1` — exits zero.
 2. `cd docs && PACKAGE_VERSION=0.1.2 mkdocs build --strict 2>&1` — exits zero (substitution path).
-3. `grep -rE "Per-Gateway|shared-proxy [a-z]|all four modes|coxswain\.io|proxy --gateway" docs/src/` — returns no matches in prose (matches inside code blocks for literal K8s identifiers like `coxswain-shared-proxy` are fine).
+3. `grep -riE "Per-Gateway|shared-proxy [a-z]|all four modes|deployment model|coxswain\.io|proxy --gateway" docs/src/` — returns no matches in prose (matches inside code blocks for literal K8s identifiers like `coxswain-shared-proxy` are fine).
 4. Optional spot-check: `cd docs && mkdocs serve` and visit the rebuilt pages in a browser (especially the architecture diagram and any page where naming was changed). The skill prints the URL and pauses so the user can confirm visually.
 
 If any verification step fails, the skill reports which step + the failure mode and asks the user whether to revert the in-this-session edits.
