@@ -76,7 +76,7 @@ Like the shared proxy, the dedicated proxy holds **zero Kubernetes API credentia
 
 A zero-RBAC discovery **cache**: a recursive node that subscribes to an upstream discovery stream (the controller) and re-publishes snapshots to downstream proxies, so the leader's snapshot fan-out scales O(relays) instead of O(nodes). A relay holds the same zero-Kubernetes-credentials invariant as a proxy. `relay --shared` fronts the shared pool; `relay --namespace <NS>` fronts one namespace's dedicated Gateways (controller-provisioned; provenance-authorized). Leaves speak the unchanged protocol and are unaware of the tier. See [Discovery protocol → The relay tier](discovery-protocol.md#the-relay-tier).
 
-## Request path
+## Request lifecycle
 
 ```mermaid
 flowchart LR
