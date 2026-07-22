@@ -68,7 +68,7 @@ The shared proxy holds **zero Kubernetes API credentials**. Its ServiceAccount e
 
 Read-only proxy scoped to a single Gateway (identified by `--dedicated --gateway-name=NAME --gateway-namespace=NS`). Provisioned by the controller in the Gateway's own namespace. Has its own rollout, failure domain, and `/metrics`.
 
-The dedicated proxy subscribes with `Scope::Gateway { name, namespace }` and receives only its Gateway's routing snapshot. The controller stamps the expected proxy ServiceAccount name (`{gateway-name}-{gatewayclass-name}`, per GEP-1762) into the Gateway's registry entry at reconcile time. When the subscription arrives, the discovery server verifies that the peer's mTLS SVID matches that expected SA before sending any snapshot — a mismatch yields `PERMISSION_DENIED`.
+The dedicated proxy subscribes with `Scope::Gateway { name, namespace }` and receives only its Gateway's routing snapshot. The controller stamps the expected proxy ServiceAccount name (`{gateway-name}-{gatewayclass-name}`) into the Gateway's registry entry at reconcile time. When the subscription arrives, the discovery server verifies that the peer's mTLS SVID matches that expected SA before sending any snapshot — a mismatch yields `PERMISSION_DENIED`.
 
 Like the shared proxy, the dedicated proxy holds **zero Kubernetes API credentials**. Cross-namespace route attachment (`allowedRoutes.namespaces.from: All`/`Selector`) is resolved by the controller at reconcile time — the controller's cluster-wide reflector compiles all cross-namespace routes into the dedicated snapshot before it is pushed. No proxy-side cluster-wide reflector and no proxy-side RBAC are required.
 

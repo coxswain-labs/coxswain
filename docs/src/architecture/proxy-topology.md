@@ -1,6 +1,6 @@
 # Proxy topology
 
-Coxswain runs a single controller-managed data plane. **By default every `Ingress` and every `Gateway` is served by one shared proxy pool**; a `Gateway` that requests its own infrastructure (`spec.infrastructure.parametersRef` → `CoxswainGatewayParameters`, GEP-1762) instead gets a **dedicated** proxy of its own. This is just how Coxswain implements the Gateway API's per-Gateway infrastructure model — classic `Ingress`, which has no `parametersRef` equivalent, is always shared.
+Coxswain runs a single controller-managed data plane. **By default every `Ingress` and every `Gateway` is served by one shared proxy pool**; a `Gateway` that requests its own infrastructure (`spec.infrastructure.parametersRef` → `CoxswainGatewayParameters`) instead gets a **dedicated** proxy of its own. This is just how Coxswain implements the Gateway API's per-Gateway infrastructure model — classic `Ingress`, which has no `parametersRef` equivalent, is always shared.
 
 Shared and dedicated are therefore two topologies of the same data plane, not separate install modes: they compose. A production cluster typically runs the shared pool alongside a few dedicated proxies for Gateways that need isolation.
 
@@ -26,10 +26,10 @@ One cluster-wide proxy pool serves every `Ingress` and every `Gateway` that has 
 - Each Gateway still reports its own VIP in `status.addresses`, same as if it had its own dedicated proxy.
 - This only relies on standard Kubernetes `Service` `port → targetPort` mapping — no `SO_ORIGINAL_DST`, no conntrack tricks — so it works the same on iptables, IPVS, eBPF, and cloud load balancers alike.
 
-**Per-Gateway infrastructure identity (GEP-1867).** The shared pool's actual compute lives in `coxswain-system`, but each Gateway still needs its own "infrastructure identity" per the Gateway API spec — so the controller also provisions a `ServiceAccount` for each owned Gateway, in that Gateway's *own* namespace. This SA is deliberately inert:
+**Per-Gateway infrastructure identity.** The shared pool's actual compute lives in `coxswain-system`, but each Gateway still needs its own "infrastructure identity" per the Gateway API spec — so the controller also provisions a `ServiceAccount` for each owned Gateway, in that Gateway's *own* namespace. This SA is deliberately inert:
 
 - It carries **zero RBAC** — the proxy pod itself runs under a different ServiceAccount entirely. This one exists purely as an identity object.
-- Its job is to be the carrier for `spec.infrastructure.{labels,annotations}` (the GEP-1867 metadata a Gateway can request be applied to its infrastructure) — since in the shared model there's no per-Gateway proxy pod in that namespace for those labels/annotations to land on otherwise.
+- Its job is to be the carrier for `spec.infrastructure.{labels,annotations}` (the infrastructure metadata a Gateway can request be applied to its infrastructure) — since in the shared model there's no per-Gateway proxy pod in that namespace for those labels/annotations to land on otherwise.
 - It's owner-referenced to the Gateway, so deleting the Gateway garbage-collects it automatically; moving a Gateway into dedicated mode prunes it explicitly instead.
 - Infrastructure annotations from this object also propagate onto the Gateway's VIP `Service` — this is how, for example, a cloud load-balancer annotation set on the Gateway reaches the actual `LoadBalancer` Service.
 

@@ -105,7 +105,7 @@ spec:
 
 ## JWT authentication
 
-`JwtAuth` validates a bearer token's signature against a JSON Web Key Set (JWKS) — the Coxswain implementation of Envoy's `envoy.filters.http.jwt_authn` `JwtProvider` / Istio's `RequestAuthentication.jwtRules`, and the Gateway API surface for the [Ingress `auth-jwt` annotation](../ingress/annotations.md). No Gateway API standard exists for in-proxy JWT validation (GEP-1494 covers *delegated* ext_authz, a different model). Unlike `BasicAuth` (an HTTP/browser idiom), bearer/JWT auth is a common gRPC pattern, so `JwtAuth` is supported on both `HTTPRoute` and `GRPCRoute`.
+`JwtAuth` validates a bearer token's signature against a JSON Web Key Set (JWKS) — the Coxswain implementation of Envoy's `envoy.filters.http.jwt_authn` `JwtProvider` / Istio's `RequestAuthentication.jwtRules`, and the Gateway API surface for the [Ingress `auth-jwt` annotation](../ingress/annotations.md). No Gateway API standard exists for in-proxy JWT validation (the ext_authz standard covers *delegated* auth, a different model). Unlike `BasicAuth` (an HTTP/browser idiom), bearer/JWT auth is a common gRPC pattern, so `JwtAuth` is supported on both `HTTPRoute` and `GRPCRoute`.
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -140,7 +140,7 @@ Semantics:
 
 ## External authorization (ext_authz)
 
-`CoxswainExternalAuth` delegates an allow/deny decision to an external authorization service before a request reaches its upstream — the Coxswain implementation of [GEP-1494] and the Envoy / Istio / kgateway `ext_authz` model. The auth service is named by a **`backendRef`** (a `Service` + port), resolved to pod endpoints and load-balanced like any other backend; there is no URL form.
+`CoxswainExternalAuth` delegates an allow/deny decision to an external authorization service before a request reaches its upstream — the Coxswain implementation of the Envoy / Istio / kgateway `ext_authz` model. The auth service is named by a **`backendRef`** (a `Service` + port), resolved to pod endpoints and load-balanced like any other backend; there is no URL form.
 
 It is **dual-surface**:
 
@@ -194,8 +194,6 @@ Fail-closed and cross-namespace rules:
 
 - `failClosed: true` (the default) denies with **503** when the auth service is unreachable, errors, or times out; `failClosed: false` fails **open** (request proceeds unauthorized). A `backendRef` that resolves to no ready endpoints — or an unsupported protocol — always fails **closed**, regardless of `failClosed`.
 - A `backendRef` whose `namespace` differs from the policy's namespace requires a matching `ReferenceGrant` — `from` a `CoxswainExternalAuth` (`gateway.coxswain-labs.dev`) `to` a core `Service`. Without it the reference fails **closed** (503). Same-namespace refs need no grant.
-
-[GEP-1494]: https://gateway-api.sigs.k8s.io/geps/gep-1494/
 
 ## Request size limit
 
