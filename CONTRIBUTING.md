@@ -12,12 +12,24 @@ Thanks for your interest in coxswain — a pure-Rust Kubernetes Ingress & Gatewa
 
 Labels: discover the live taxonomy with `gh label list --repo coxswain-labs/coxswain`. Every issue carries at least one `type:` and one `area:` or `api:`. Use `status: backlog` for triaged-but-uncommitted issues; promotion to a `v0.N` milestone happens when scope solidifies.
 
+## AI-assisted development
+
+Coxswain is developed with heavy AI assistance — most of the code is written by
+AI under human direction, review, and testing. This is a deliberate, stated choice,
+and it shapes how contributions are handled:
+
+- **AI-assisted contributions are welcome**, held to the same bar as any other: the
+  change must pass the fmt / clippy / test gates, ship tests for new behavior, carry
+  a clear rationale, and have a human author who can explain and stand behind it.
+- **Please don't open unreviewed, untested output** — AI-generated or not. A PR that
+  "looks right" but was never run costs more review time than it saves.
+
 ## Pull requests
 
 - Branch off `main`: `git checkout -b issue-N` (replace `N` with the issue number you're working on).
 - Reference the issue in every commit footer: `Refs #N` (intermediate) or `Fixes #N` (final). `Fixes #N` auto-closes the issue and flips the Project's `Status` to `Done` on merge.
-- Run `cargo fmt`, `cargo clippy -- -D warnings`, and `cargo test --workspace --exclude coxswain-e2e` before pushing.
-- Squash-merge from the GitHub UI or `gh pr merge --squash --delete-branch`.
+- Run `cargo fmt`, `cargo clippy --workspace --all-targets --exclude coxswain-e2e -- -D warnings`, and `cargo test --workspace --exclude coxswain-e2e` before pushing.
+- Squash-merge from the GitHub UI or `gh pr merge --squash`; the repo auto-deletes the head branch on merge.
 
 The CI pipeline runs the full e2e suite + conformance against every PR; the same procedures you ran locally are exercised again on Linux runners.
 

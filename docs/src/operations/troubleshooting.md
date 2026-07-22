@@ -190,7 +190,7 @@ kubectl -n coxswain-system rollout restart deployment/coxswain-controller
 
 ## Ingress route is shadowed by a conflict
 
-When two `Ingress` objects claim the same host and path combination, only one wins (see [Multi-Ingress merging and conflict precedence](ingress.md#multiple-ingresses-on-the-same-host)). The losing Ingress's route is silently dropped from the routing table. The controller emits a `Warning` Event on the shadowed Ingress to make the conflict visible:
+When two `Ingress` objects claim the same host and path combination, only one wins (see [Multi-Ingress merging and conflict precedence](../ingress/index.md#multiple-ingresses-on-the-same-host)). The losing Ingress's route is silently dropped from the routing table. The controller emits a `Warning` Event on the shadowed Ingress to make the conflict visible:
 
 ```bash
 kubectl describe ingress <shadowed-ingress>

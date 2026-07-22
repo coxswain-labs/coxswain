@@ -2,19 +2,18 @@
 
 [![E2E & Conformance](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml/badge.svg)](https://github.com/coxswain-labs/coxswain/actions/workflows/e2e.yml)
 
-> **Pre-1.0 — early adopter release.** Coxswain passes the full Gateway API standard conformance suite. Production use is at your own risk; feedback and contributions are welcome.
+> **Pre-1.0 — ready to try.** Ingress and Gateway API support is feature-complete, and Coxswain passes the full Gateway API standard conformance suite. We're hardening toward 1.0, and broad real-world testing is what gets us there — run it against your workloads and open an issue for anything you hit. It hasn't been battle-tested at scale yet, so validate before you rely on it in production — early adopters and contributors welcome.
 
 A Kubernetes Ingress and Gateway API controller written in Rust, backed by [Pingora](https://github.com/cloudflare/pingora) — Cloudflare's battle-tested proxy library.
 
-- `Ingress`, `HTTPRoute`, `GRPCRoute`, `TLSRoute`, and `ListenerSet` in a single proxy fleet
+- `Ingress`, `HTTPRoute`, `GRPCRoute`, `TLSRoute`, `TCPRoute`, `UDPRoute`, and `ListenerSet` in a single proxy fleet
 - Routing changes and TLS certificate rotations take effect without restarting the proxy
 - Proxies receive compiled routing snapshots over a mandatory-mTLS gRPC stream — zero Kubernetes API credentials on the data plane
-- Shared proxy pool for multi-tenant clusters; dedicated per-Gateway proxy for isolation and independent rollout
+- Shared proxy pool for multi-tenant clusters; a dedicated proxy per Gateway for isolation and independent rollout
 - Rich Ingress annotation surface: rate limiting, auth (basic + ext_authz), session affinity, circuit breaker, mTLS, mirroring, compression, and more
+- Runs against Gateway API **v1.4 through v1.6** (standard channel), detecting each release's available kinds and features at runtime — no version pin
 
-See [Architecture](https://docs.coxswain-labs.dev/coxswain/latest/architecture/) for the deployment models and RBAC boundary.
-
-**Documentation**: [docs.coxswain-labs.dev/coxswain](https://docs.coxswain-labs.dev/coxswain/) — installation guides, configuration reference, architecture overview, and FAQ.
+Want the full picture? The [documentation](https://docs.coxswain-labs.dev/coxswain/) covers installation, configuration, and the [architecture](https://docs.coxswain-labs.dev/coxswain/latest/architecture/) — proxy topology, the RBAC boundary, and more — plus an FAQ to get you unstuck.
 
 
 ## Getting started
@@ -206,6 +205,8 @@ For the complete walkthrough — including TLS, dedicated mode, and Ingress anno
 ## Authors
 
 Created and maintained by Matteo Giaccone.
+
+Coxswain is developed with heavy AI assistance — most of the code is written by AI under human direction, review, and testing. That's a deliberate choice, and it extends to contributions: AI-assisted pull requests are welcome, held to the same bar as any other — tests pass, the intent is clear, and a human stands behind the change.
 
 ## License
 

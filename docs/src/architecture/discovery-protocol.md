@@ -3,7 +3,7 @@
 The controller compiles K8s routing state and pushes it to each subscribed proxy over a mandatory-mTLS gRPC stream. The wire is **resource-oriented** (`WIRE_VERSION = 2`): the first message of a session is a full snapshot, and every change after it is a per-resource delta — only what moved. Proxies apply each message to their in-process routing tables via atomic pointer swaps, recompiling only the partitions that changed — no locks, no channels, no restart. All routing data (routes, upstream addresses, TLS certificates) arrives via the discovery stream; the proxy never reads the Kubernetes API.
 
 !!! note "Securing the channel"
-    This page covers the protocol's data-flow and status-gating logic. For how the channel is authenticated (mTLS, SPIFFE SVIDs, CA provisioning modes), reconnect behaviour, and wire-version compatibility, see [Control-plane security](../guides/control-plane-security.md).
+    This page covers the protocol's data-flow and status-gating logic. For how the channel is authenticated (mTLS, SPIFFE SVIDs, CA provisioning modes), reconnect behaviour, and wire-version compatibility, see [Control-plane security](../operations/control-plane-security.md).
 
 ## The wire protocol
 
@@ -108,7 +108,7 @@ The `Programmed` gate then evaluates the folded **leaf** entries, never the rela
 ### Failure and rollout
 
 - **Controller outage** &mdash; the relay serves its last-good world (the same last-good / self-healing invariants above), degrades its health, and reconverges on reconnect. Leaves never disconnect.
-- **Relay outage** &mdash; leaves serve last-good and reconverge when the relay returns (a reconnecting leaf gets a fresh full via the `expect_full` gate). Relay HA is &ge;2 replicas behind the relay's Service, so a single-replica bounce is transparent. If a relay is genuinely unreachable (e.g. torn down in a rebalance race), the leaf **re-bootstraps** to the controller &mdash; the always-up anchor &mdash; and is re-pointed at whatever upstream is current (#601). This is a bounded, last-resort SVID handshake per affected leaf, not a routing-snapshot stampede; the data plane keeps serving its last-good snapshot throughout the control-stream reconnect.
+- **Relay outage** &mdash; leaves serve last-good and reconverge when the relay returns (a reconnecting leaf gets a fresh full via the `expect_full` gate). Relay HA is &ge;2 replicas behind the relay's Service, so a single-replica bounce is transparent. If a relay is genuinely unreachable (e.g. torn down in a rebalance race), the leaf **re-bootstraps** to the controller &mdash; the always-up anchor &mdash; and is re-pointed at whatever upstream is current. This is a bounded, last-resort SVID handshake per affected leaf, not a routing-snapshot stampede; the data plane keeps serving its last-good snapshot throughout the control-stream reconnect.
 - **Rollout order** is controller &rarr; relay &rarr; leaf, the same skew direction the wire already tolerates: a newer controller serves an older relay/leaf, and the additive `Namespace` / `GatewayMeta` resources are inert on any leaf that never subscribes them.
 
 ## How `Programmed` status is gated

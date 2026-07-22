@@ -90,9 +90,9 @@ metadata:
 ```
 
 !!! warning
-    Header keying can be bypassed by rotating the header value. Pair it with `ext-auth` or `auth-basic-secret` to ensure the header is authenticated before being trusted. The controller emits a `Warning` Event on the Ingress when `byHeader` keying is configured without an auth annotation, so operators are notified at reconcile time. See the [rate-limit annotation reference](ingress-annotations.md#rate-limiting) for details.
+    Header keying can be bypassed by rotating the header value. Pair it with `ext-auth` or `auth-basic-secret` to ensure the header is authenticated before being trusted. The controller emits a `Warning` Event on the Ingress when `byHeader` keying is configured without an auth annotation, so operators are notified at reconcile time. See the [rate-limit annotation reference](../ingress/annotations.md#rate-limiting) for details.
 
-See the [Ingress annotations reference](ingress-annotations.md#rate-limiting) for the full annotation semantics.
+See the [Ingress annotations reference](../ingress/annotations.md#rate-limiting) for the full annotation semantics.
 
 ## Gateway API ExtensionRef
 

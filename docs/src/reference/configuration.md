@@ -50,7 +50,7 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL` | `--controller-lease-renew-interval` | `5s` | How often the leader renews its lease; must be ≤ 1/3 of the TTL |
 | `COXSWAIN_CONTROLLER_LEASE_TTL` | `--controller-lease-ttl` | `15s` | How long a lease stays valid without renewal; must be ≥ 3× the renew interval |
 | `COXSWAIN_CONTROLLER_NAME` | `--controller-name` | `coxswain-labs.dev/gateway-controller` | GatewayClass `spec.controllerName` to claim |
-| `COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT` | `--discovery-bootstrap-endpoint` | _(none; **required** for proxy/relay)_ | _(proxy/relay)_ `https://` URI of the controller bootstrap listener — the **sole endpoint anchor**. The proxy exchanges its SA token + CSR for an SVID here, and the response carries its routing-stream upstream (the controller, or its namespace's relay if provisioned), repointed live thereafter. See [Control-plane security](../guides/control-plane-security.md) |
+| `COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT` | `--discovery-bootstrap-endpoint` | _(none; **required** for proxy/relay)_ | _(proxy/relay)_ `https://` URI of the controller bootstrap listener — the **sole endpoint anchor**. The proxy exchanges its SA token + CSR for an SVID here, and the response carries its routing-stream upstream (the controller, or its namespace's relay if provisioned), repointed live thereafter. See [Control-plane security](../operations/control-plane-security.md) |
 | `COXSWAIN_DISCOVERY_BOOTSTRAP_PORT` | `--discovery-bootstrap-port` | `50052` | _(controller)_ Port for the server-auth-only bootstrap gRPC listener |
 | `COXSWAIN_DISCOVERY_CA_BUNDLE_PATH` | `--discovery-ca-bundle-path` | `/var/run/secrets/coxswain/trust-bundle/ca.crt` | _(proxy)_ Path to the mounted trust-bundle ConfigMap used to verify the controller |
 | `COXSWAIN_DISCOVERY_CA_MODE` | `--discovery-ca-mode` | `auto` | _(controller)_ `auto` self-generates the CA Secret if absent; `external` requires a pre-existing Secret (fail closed) |
@@ -81,12 +81,12 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_RECONCILE_DEBOUNCE_MIN` | `--reconcile-debounce-min` | `20ms` | _(controller)_ Trailing quiet window for the rebuild debounce; a watch event resets it, and it firing with no further events rebuilds the routing table. Must be ≤ the max |
 | `COXSWAIN_RECONCILE_DEBOUNCE_MAX` | `--reconcile-debounce-max` | `500ms` | _(controller)_ Hard ceiling on the same debounce, measured from the first event of a cycle; bounds convergence under sustained churn (e.g. a rolling deploy). Must be ≥ the min |
 | `COXSWAIN_STATUS_ADDRESS` | `--status-address` | _(none)_ | IP or hostname written to `Ingress.status` and `Gateway.status.addresses`; required for cert-manager HTTP-01 and external-dns |
-| `COXSWAIN_WATCH_NAMESPACE` | `--watch-namespace` | _(cluster-wide)_ | Restrict the controller's namespaced watches to a comma-separated namespace list (e.g. `ns1,ns2,ns3`); a single value scopes to one namespace, omitted watches cluster-wide. Enables a namespaced-`Role`-per-namespace RBAC lockdown (see [Running in production](../guides/running-in-production.md#rbac)). Only the controller watches Kubernetes; the proxy is unaffected |
+| `COXSWAIN_WATCH_NAMESPACE` | `--watch-namespace` | _(cluster-wide)_ | Restrict the controller's namespaced watches to a comma-separated namespace list (e.g. `ns1,ns2,ns3`); a single value scopes to one namespace, omitted watches cluster-wide. Enables a namespaced-`Role`-per-namespace RBAC lockdown (see [Running in production](../operations/running-in-production.md#rbac)). Only the controller watches Kubernetes; the proxy is unaffected |
 | `POD_NAME` | `--pod-name` | `coxswain-local` | Pod name used as the leader-election holder identity |
 | `POD_NAMESPACE` | `--pod-namespace` | `coxswain-system` | Pod namespace used to scope the leader-election Lease |
 
 !!! note
-    The dedicated proxy scope flags (`--dedicated`, `--gateway-name`, `--gateway-namespace`) are set by the controller on the proxy Deployments it provisions, or passed by hand when running a dedicated proxy manually. The discovery anchor (`--discovery-bootstrap-endpoint`) is likewise set by the controller on provisioned Deployments; there is no `--discovery-endpoint` — the routing-stream upstream is delivered by the bootstrap response and repointed live, so a relay rebalance never re-renders (nor rolls) a proxy Deployment. See [Dedicated proxy pools](../guides/dedicated-mode.md).
+    The dedicated proxy scope flags (`--dedicated`, `--gateway-name`, `--gateway-namespace`) are set by the controller on the proxy Deployments it provisions, or passed by hand when running a dedicated proxy manually. The discovery anchor (`--discovery-bootstrap-endpoint`) is likewise set by the controller on provisioned Deployments; there is no `--discovery-endpoint` — the routing-stream upstream is delivered by the bootstrap response and repointed live, so a relay rebalance never re-renders (nor rolls) a proxy Deployment. See [Dedicated proxy pools](../gateway-api/index.md#dedicated-proxy-pools).
 
 ## Ports summary
 
@@ -169,7 +169,7 @@ These flags do not affect Gateway listeners. Gateway listeners are always govern
 The controller and proxy communicate over a secured gRPC discovery channel:
 the controller acts as a CA, proxies bootstrap an SVID with their ServiceAccount
 token, and routing snapshots flow over mandatory mTLS. The `COXSWAIN_DISCOVERY_*`
-settings above configure it; see [Control-plane security](../guides/control-plane-security.md)
+settings above configure it; see [Control-plane security](../operations/control-plane-security.md)
 for the model, CA provisioning modes (`auto` / `external` + cert-manager / BYO),
 SVID rotation, and troubleshooting.
 

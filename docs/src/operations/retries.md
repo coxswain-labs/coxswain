@@ -60,7 +60,7 @@ metadata:
 !!! note "Migration from the inline retry-attempts/retry-codes/retry-backoff annotations (breaking)"
     Earlier releases exposed three inline annotations — `retry-attempts`, `retry-codes`, `retry-backoff` — duplicating the `RetryPolicy` CRD schema. These are removed; move each Ingress's values into a `RetryPolicy` CR and point `retry` at it.
 
-See the [Ingress annotations reference](ingress-annotations.md#retry) for the full annotation semantics.
+See the [Ingress annotations reference](../ingress/annotations.md#retry) for the full annotation semantics.
 
 ## Gateway API `ExtensionRef`
 

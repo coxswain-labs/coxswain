@@ -143,7 +143,7 @@ controller pod restarts.
 
 Every proxy's SVID is derived from its Kubernetes ServiceAccount — the identity
 that the `TokenReview` check validates at bootstrap. The table below shows the
-canonical form for each deployment model:
+canonical form for each proxy role:
 
 | Proxy role | ServiceAccount | SVID |
 |---|---|---|
@@ -205,8 +205,8 @@ discovery **client** (upstream, to the controller) and a discovery **server**
 
 A leaf placed behind a relay verifies the relay's identity instead of the
 controller's — but it is not configured with a static endpoint or expected SA.
-Since the routing upstream is **bootstrap-delivered and runtime-directed**
-(#601), the controller hands the leaf its upstream `(endpoint, expected_server_sa)`
+Since the routing upstream is **bootstrap-delivered and runtime-directed**,
+the controller hands the leaf its upstream `(endpoint, expected_server_sa)`
 in the bootstrap response — the relay's Service and the relay's SA when the
 namespace is relay-fronted — and the leaf verifies that identity on its stream.
 Bootstrap itself always targets the controller (never tiered).

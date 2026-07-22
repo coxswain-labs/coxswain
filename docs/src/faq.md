@@ -22,11 +22,11 @@ Yes. Both `Ingress` and `HTTPRoute` objects contribute to the same routing table
 
 Embedding status writes in the proxy would force leader election into the data plane: only one replica could write at a time, and horizontal scaling would require electing more leaders. Making the controller the sole Kubernetes reader and writer keeps proxy pods stateless, eliminates inter-replica coordination, and gives the proxy **zero Kubernetes API access** — a compromised proxy pod cannot read from or write to the API server at all. The invariant is enforced by shipping no RBAC for the proxy SA, not by convention.
 
-See [Deployment models](architecture/deployment-models.md) for the two macro deployment models (Shared and Dedicated).
+See [Proxy topology](architecture/proxy-topology.md) for how the shared pool and dedicated proxies serve Ingress and Gateways.
 
 ### How does Ingress fit?
 
-Classic `Ingress` resources are always served by the shared proxy pool — `Ingress` has no equivalent of `parametersRef`. Gateway API users can opt a `Gateway` into a dedicated proxy (per Gateway) via `spec.infrastructure.parametersRef` on the `Gateway` or via `spec.parametersRef` on its `GatewayClass` (cluster-wide default); the controller provisions and manages that dedicated proxy automatically. See [Dedicated proxy pools](guides/dedicated-mode.md) for the full walkthrough.
+Classic `Ingress` resources are always served by the shared proxy pool — `Ingress` has no equivalent of `parametersRef`. Gateway API users can opt a `Gateway` into a dedicated proxy (per Gateway) via `spec.infrastructure.parametersRef` on the `Gateway` or via `spec.parametersRef` on its `GatewayClass` (cluster-wide default); the controller provisions and manages that dedicated proxy automatically. See [Dedicated proxy pools](gateway-api/index.md#dedicated-proxy-pools) for the full walkthrough.
 
 ## Comparison
 
@@ -61,9 +61,9 @@ Architectural differences only — not performance or quality. All projects belo
 
 ## Troubleshooting
 
-See [Troubleshooting](guides/troubleshooting.md) for step-by-step diagnostic commands. Common dedicated-mode questions:
+See [Troubleshooting](operations/troubleshooting.md) for step-by-step diagnostic commands. Common dedicated-mode questions:
 
-- **Dedicated proxy pod not starting** — see [Dedicated proxy pod never becomes Ready](guides/troubleshooting.md#dedicated-proxy-pod-never-becomes-ready).
-- **Dedicated proxy stuck `NotReady` or `Degraded`** — see [Dedicated proxy stuck `NotReady` or `Degraded`](guides/troubleshooting.md#dedicated-proxy-stuck-notready-or-degraded).
-- **Provisioned resources left behind after Gateway deletion** — see [Provisioned resources not garbage-collected after Gateway deletion](guides/troubleshooting.md#provisioned-resources-not-garbage-collected-after-gateway-deletion).
-- **Controller not reconciling Gateway API resources** — see [Controller stuck in Ingress-only mode](guides/troubleshooting.md#controller-stuck-in-ingress-only-mode).
+- **Dedicated proxy pod not starting** — see [Dedicated proxy pod never becomes Ready](operations/troubleshooting.md#dedicated-proxy-pod-never-becomes-ready).
+- **Dedicated proxy stuck `NotReady` or `Degraded`** — see [Dedicated proxy stuck `NotReady` or `Degraded`](operations/troubleshooting.md#dedicated-proxy-stuck-notready-or-degraded).
+- **Provisioned resources left behind after Gateway deletion** — see [Provisioned resources not garbage-collected after Gateway deletion](operations/troubleshooting.md#provisioned-resources-not-garbage-collected-after-gateway-deletion).
+- **Controller not reconciling Gateway API resources** — see [Controller stuck in Ingress-only mode](operations/troubleshooting.md#controller-stuck-in-ingress-only-mode).

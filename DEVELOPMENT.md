@@ -5,14 +5,14 @@
 ```bash
 cargo build                                    # build
 cargo test --workspace --exclude coxswain-e2e  # unit tests (no cluster)
-cargo clippy -- -D warnings                    # lint
+cargo clippy --workspace --all-targets --exclude coxswain-e2e -- -D warnings  # lint (CI gate)
 cargo fmt                                      # format
 cargo run --bin coxswain -- serve controller --log-format console  # terminal 1
 cargo run --bin coxswain -- serve proxy --shared --log-format console \
   --ingress-http-port 80 --ingress-https-port 443              # terminal 2
 ```
 
-Coxswain ships as two cooperating pods: `serve controller` (writer + operator UI) and `serve proxy --shared` (read-only data plane). Run them in separate terminals against the same cluster.
+Coxswain ships as three pod roles: `serve controller` (writer + operator UI), `serve proxy` (read-only data plane), and `serve relay` (discovery fan-out cache). Local development normally needs just the first two — run `serve controller` and `serve proxy --shared` in separate terminals against the same cluster.
 
 For the release procedure, see `RELEASE.md`. For contributing conventions (docs site, etc.), see `CONTRIBUTING.md`.
 
@@ -61,35 +61,33 @@ This replaced a `.gateway-api-version` pin plus a separate plural manifest. A `"
    ```bash
    cargo run -p xtask -- gateway-api-types
    ```
-   (Pass an explicit tag as a trailing argument, e.g. `-- gateway-api-types v1.6.0`, to test an unreleased tag without touching `.gateway-api-version`.)
+   (Pass an explicit tag as a trailing argument, e.g. `-- gateway-api-types v1.6.0`, to test an unreleased tag without touching `.gateway-api-versions.json`.)
 4. Review the regenerated diff under `crates/gateway-api-types/src/` like any other committed-generated artifact (same trust model as `charts/coxswain/crds/*.yaml`), then `cargo test --workspace --exclude coxswain-e2e` to catch any CRD schema changes existing fixtures need to account for (new required fields show up as `E0063` compile errors at every affected struct literal).
 
 ### 2. Apply the cluster manifests
 
-Apply everything except the Deployments — the binary runs on your machine:
+Apply the base (CRDs, RBAC, GatewayClass, IngressClass, admission policy, Services), then scale the in-cluster controller to zero so your local binary is the only controller:
 
 ```bash
-kubectl apply -f deploy/manifests/namespace.yaml
-kubectl apply -f deploy/manifests/controller-rbac.yaml
-kubectl apply -f deploy/manifests/shared-proxy-rbac.yaml
-kubectl apply -f deploy/manifests/gateway-class.yaml
+kubectl apply -k deploy/manifests
+kubectl -n coxswain-system scale deployment/coxswain-controller --replicas=0
 ```
 
-Or use the Helm chart and scale the in-cluster pods to zero so the local binary is the only instance:
+Or use the Helm chart, but keep the in-cluster data plane out of the way so your local binary is the only instance. The shared proxy pool is controller-owned (provisioned off `proxy.shared.*`, not Helm-rendered), so disable it via values rather than scaling its Deployment — a running controller would otherwise reconcile the replica count back:
 
 ```bash
-helm install coxswain charts/coxswain --namespace coxswain-system --create-namespace
+helm install coxswain charts/coxswain --namespace coxswain-system --create-namespace \
+  --set proxy.shared.enabled=false
 kubectl -n coxswain-system scale deployment/coxswain-controller --replicas=0
-kubectl -n coxswain-system scale deployment/coxswain-shared-proxy --replicas=0
 ```
 
 `deploy/` is split into three subdirectories:
 
-- `deploy/manifests/` — production Kubernetes manifests (namespace, RBAC, GatewayClass, IngressClass, PodDisruptionBudget, Deployment).
+- `deploy/manifests/` — production Kubernetes manifests. `coxswain.yaml` is **generated from the Helm chart** by `scripts/render-manifests.sh` (the chart is the single source of truth; `scripts/check-manifests-synced.sh` gates drift), and the CRDs live in `crds/`. Never hand-edit `coxswain.yaml`.
 - `deploy/dev/` — local dev fixtures (echo backends, sample HTTPRoute and Ingress objects, cross-namespace scenarios).
 - `deploy/examples/` — user-facing example configurations shipped as documentation (e.g. cert-manager TLS setup).
 
-> **Namespace-scoped install.** Pass `--watch-namespace=<ns>` (or `COXSWAIN_WATCH_NAMESPACE=<ns>`) to restrict the controller's reflectors to a single namespace. Replace the cluster-scoped `ClusterRole`/`ClusterRoleBinding` in `controller-rbac.yaml` with a namespaced `Role`/`RoleBinding` when running scoped. The shared-proxy SA has no RBAC to adjust.
+> **Namespace-scoped install.** Pass `--watch-namespace=<ns>` (or `COXSWAIN_WATCH_NAMESPACE=<ns>`) to restrict the controller's reflectors to a single namespace. Replace the cluster-scoped `ClusterRole`/`ClusterRoleBinding` with a namespaced `Role`/`RoleBinding` when running scoped — `deploy/manifests/controller-rbac-namespaced.yaml` is a worked example. The shared-proxy SA has no RBAC to adjust.
 
 ### 3. Run the binary
 
@@ -115,7 +113,7 @@ To run a dedicated-mode proxy (per-Gateway data plane) locally, see [docs/src/gu
 | `80`   | HTTP proxy (data plane)                          |
 | `443`  | HTTPS proxy (data plane, SNI TLS)                |
 | `8081` | Health endpoints (`/healthz`, `/readyz`)         |
-| `8082` | Admin endpoints (`/metrics`, `/api/v1/routes`, `/api/v1/health`, operator UI + `/api/v1/*`) |
+| `8082` | Admin endpoints (`/metrics`, `/api/v1/health`; operator UI + the `/api/v1/*` routing/fleet API on the controller) |
 
 The bind address for all listeners defaults to `0.0.0.0`. Pass `--proxy-bind-address 127.0.0.1` to restrict to localhost.
 
@@ -127,9 +125,9 @@ curl -s http://localhost:8081/healthz      # ok
 curl -s http://localhost:8081/readyz       # ok (after every subsystem check is Ready)
 
 # Admin diagnostics
-curl -s http://localhost:8082/api/v1/health  # {"version":"...","kubernetes_version":"...","leader":...,"subsystems":{...}}
-curl -s http://localhost:8082/api/v1/routes  # {"ingress":{"hosts":[]},"gateway":{"hosts":[]}} (proxy role only)
-curl -s http://localhost:8082/metrics        # Prometheus text
+curl -s http://localhost:8082/api/v1/health          # {"version":"...","kubernetes_version":"...","leader":...,"subsystems":{...}}
+curl -s http://localhost:8082/api/v1/routing/summary # per-category route + problem counts (controller role)
+curl -s http://localhost:8082/metrics                # Prometheus text
 
 # Kubernetes
 kubectl get gatewayclass                   # should show "coxswain" accepted
@@ -192,8 +190,12 @@ curl -H "Host: cross-ns.local" http://localhost:8000/    # 503 Service Unavailab
 
 ### Observe the routing table
 
+The proxy no longer exposes a route-dump endpoint — observe the live table through the controller's aggregated admin API (or the operator UI at `http://localhost:8082/`):
+
 ```bash
-curl -s http://localhost:8082/api/v1/routes | jq .    # lists all active hostnames
+curl -s http://localhost:8082/api/v1/routing/summary    | jq .   # per-category counts
+curl -s http://localhost:8082/api/v1/routing/httproutes | jq .   # active HTTPRoutes
+curl -s http://localhost:8082/api/v1/routing/ingresses  | jq .   # active Ingresses
 ```
 
 ---

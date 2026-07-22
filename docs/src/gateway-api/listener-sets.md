@@ -183,7 +183,7 @@ spec:
 ```
 
 This mirrors the cross-namespace cert plumbing used by `Gateway` HTTPS listeners
-(which use `from: kind: Gateway`) — see the [TLS guide](tls.md).
+(which use `from: kind: Gateway`) — see the [TLS guide](../operations/tls.md).
 
 ## Status conditions
 

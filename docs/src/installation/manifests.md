@@ -1,9 +1,9 @@
 # Raw manifests install
 
-Every Coxswain release publishes a pre-rendered `install.yaml` as a GitHub Release asset. It includes the `Namespace`, `RBAC`, `GatewayClass`, `IngressClass`, `CoxswainGatewayParameters` and `RateLimit` CRDs, a `ValidatingAdmissionPolicy` for Ingress annotation validation, and `Deployments` (controller and shared proxy), with the image pinned to the exact release tag.
+Every Coxswain release publishes a pre-rendered `install.yaml` as a GitHub Release asset — `kustomize build` of the chart-rendered base, with the image pinned to the exact release tag. It includes the `Namespace`, `RBAC`, `GatewayClass`, `IngressClass`, all of Coxswain's CRDs, a `ValidatingAdmissionPolicy` for Ingress annotation validation, the controller `Deployment` and its Services, and the shared-proxy data-plane `Service`. (The shared proxy pool's Deployment and the rest of its resources are provisioned by the controller at runtime, in every install method.)
 
 !!! note
-    The `ValidatingAdmissionPolicy` is silently skipped on clusters that do not advertise `admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy` (Kubernetes < 1.30). Service and PodDisruptionBudget resources are Helm-only; use the [Helm install](helm.md) for production deployments.
+    `install.yaml` is rendered from the Helm chart, so it installs the **same resources** as `helm install` — Services and the `PodDisruptionBudget` included. The `ValidatingAdmissionPolicy` is silently skipped on clusters that do not advertise `admissionregistration.k8s.io/v1/ValidatingAdmissionPolicy` (Kubernetes < 1.30). Helm is still recommended for production, for values-driven configuration and upgrades.
 
 ## Install the latest release
 
@@ -38,7 +38,7 @@ The rolling update strategy on each Deployment ensures zero-downtime upgrades wh
 discovery CA, so the controller↔proxy mTLS works with no extra steps. To consume
 an external CA, switch the controller to `COXSWAIN_DISCOVERY_CA_MODE=external` and
 supply the `coxswain-discovery-ca` Secret. See
-[Control-plane security](../guides/control-plane-security.md).
+[Control-plane security](../operations/control-plane-security.md).
 
 ## Uninstall
 

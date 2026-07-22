@@ -20,18 +20,15 @@ kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/latest/
 
 ## Step 2 — Install Coxswain
 
-=== "Helm (recommended)"
+Install with Helm — the recommended path, with values-driven configuration and easy upgrades. See [Installation](installation/index.md) for the Kustomize and raw-manifest alternatives.
 
-    ```bash
-    helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
-      --namespace coxswain-system --create-namespace
-    ```
+```bash
+helm install coxswain oci://ghcr.io/coxswain-labs/charts/coxswain \
+  --namespace coxswain-system --create-namespace
+```
 
-=== "Raw manifests"
-
-    ```bash
-    kubectl apply -f https://github.com/coxswain-labs/coxswain/releases/latest/download/install.yaml
-    ```
+!!! note "Local clusters (kind, k3s, OrbStack)"
+    These have no cloud load balancer, so each Gateway's per-Gateway VIP `Service` can't be assigned an external address and the `Gateway` stays `Programmed=False`. Add `--set proxy.shared.vipServiceType=ClusterIP` to the install so VIPs get in-cluster addresses instead; reach them (and the shared-proxy Ingress endpoint) with `kubectl port-forward` — see Step 5.
 
 Wait for the controller to become ready:
 
@@ -179,16 +176,35 @@ kubectl apply -f echo-backend.yaml
 
 ## Step 5 — Verify traffic
 
-The proxy port depends on your cluster and install method. For a local cluster with a `NodePort` or port-forwarded service:
+Reach the backend by the address of whichever entry point you configured in Step 4.
 
-```bash
-# Find the proxy service address
-kubectl -n coxswain-system get svc coxswain-shared-proxy
+=== "Gateway API"
 
-# Test via Host header
-curl -H "Host: echo.example.com" http://<proxy-address>/
-# {"host":"echo.example.com","method":"GET","path":"/", ...}
-```
+    Each `Gateway` gets its own address (Coxswain provisions a per-Gateway VIP `Service` in `coxswain-system`). Read the address from the Gateway's status:
+
+    ```bash
+    kubectl get gateway example-gateway
+    # NAME              CLASS      ADDRESS        PROGRAMMED   AGE
+    # example-gateway   coxswain   203.0.113.10   True         30s
+
+    curl -H "Host: echo.example.com" http://203.0.113.10/
+    # {"host":"echo.example.com","method":"GET","path":"/", ...}
+    ```
+
+    On a local cluster without an external load balancer, port-forward the Gateway's VIP `Service` instead (find it with `kubectl -n coxswain-system get svc`), then `curl` `localhost` with the same `Host` header.
+
+=== "Ingress"
+
+    Ingress traffic is served on the shared proxy's fixed `80`/`443` listeners, exposed by the `coxswain-shared-proxy` `Service` (`LoadBalancer` by default):
+
+    ```bash
+    kubectl -n coxswain-system get svc coxswain-shared-proxy
+
+    curl -H "Host: echo.example.com" http://<proxy-address>/
+    # {"host":"echo.example.com","method":"GET","path":"/", ...}
+    ```
+
+    On a local cluster without an external load balancer, `kubectl -n coxswain-system port-forward svc/coxswain-shared-proxy 8080:80` and `curl` `http://localhost:8080/` with the same `Host` header.
 
 ## Step 6 — Open the operator console
 
@@ -202,8 +218,8 @@ Then open `http://localhost:8082` in your browser. The console shows cluster hea
 
 ## What's next?
 
-- **Gateway API** — see the [Gateway API guide](guides/gateway-api.md) for the full `HTTPRoute` feature surface, TLS listeners, and cross-namespace routing.
-- **Ingress** — see the [Ingress guide](guides/ingress.md) to use classic `Ingress` resources.
-- **TLS** — see the [TLS guide](guides/tls.md) to add HTTPS with cert-manager or a manual Secret.
-- **Production** — see [Running in production](guides/running-in-production.md) before going live.
-- **Troubleshooting** — if something isn't working, see the [Troubleshooting guide](guides/troubleshooting.md).
+- **Gateway API** — see the [Gateway API guide](gateway-api/index.md) for the full `HTTPRoute` feature surface, TLS listeners, and cross-namespace routing.
+- **Ingress** — see the [Ingress guide](ingress/index.md) to use classic `Ingress` resources.
+- **TLS** — see the [TLS guide](operations/tls.md) to add HTTPS with cert-manager or a manual Secret.
+- **Production** — see [Running in production](operations/running-in-production.md) before going live.
+- **Troubleshooting** — if something isn't working, see the [Troubleshooting guide](operations/troubleshooting.md).
