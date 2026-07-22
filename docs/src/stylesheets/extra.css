@@ -1,3 +1,10 @@
+/* Widen the content row so the right-hand "On this page" TOC doesn't squeeze the
+   prose. mkdocs-material caps .md-grid at 61rem by default; on wider viewports we
+   give the content column much more room while the nav/TOC stay their fixed width. */
+.md-grid {
+  max-width: 1600px;
+}
+
 /* Keep long identifiers on a single line in a specific table column. Scoped to a
    wrapping .nowrap-colN div so no other table is affected. */
 .nowrap-col1 td:nth-child(1),

@@ -37,8 +37,8 @@ theme:
     - navigation.instant
     - navigation.instant.progress
     - navigation.sections
+    - navigation.indexes
     - navigation.top
-    - toc.integrate
     - content.code.copy
     - content.tabs.link
 
@@ -77,39 +77,39 @@ nav:
   - Home: index.md
   - Getting started: getting-started.md
   - Installation:
-    - Overview: installation/index.md
+    - installation/index.md
     - Helm: installation/helm.md
     - Kustomize: installation/kustomize.md
-    - Raw manifests: installation/manifests.md
+    - Manifests: installation/manifests.md
   - Gateway API:
-    - Overview: gateway-api/index.md
+    - gateway-api/index.md
     - Gateway: gateway-api/gateway.md
     - ListenerSets: gateway-api/listenerset.md
     - HTTPRoute: gateway-api/httproute.md
     - GRPCRoute: gateway-api/grpcroute.md
     - TLSRoute: gateway-api/tlsroute.md
-    - TCP & UDP routes: gateway-api/tcp-udp-routes.md
+    - TCP / UDP routes: gateway-api/tcp-udp-routes.md
     - Route extensions: gateway-api/route-extensions.md
-    - CoxswainBackendPolicy: gateway-api/backend-policy.md
-    - Capability & conformance: gateway-api/capability-matrix.md
+    - Backend policy: gateway-api/backend-policy.md
+    - Conformance: gateway-api/capability-matrix.md
   - Ingress:
-    - Overview: ingress/index.md
+    - ingress/index.md
     - Annotations: ingress/annotations.md
   - Operations:
-    - Traffic management:
+    - Traffic:
       - TLS: operations/tls.md
       - Rate limiting: operations/rate-limiting.md
       - Retries: operations/retries.md
-    - Running in production: operations/running-in-production.md
-    - Control-plane security: operations/control-plane-security.md
+    - Production: operations/running-in-production.md
+    - Control plane: operations/control-plane-security.md
     - Relay tier: operations/relay-policy.md
-    - Verifying releases: operations/verifying-releases.md
+    - Releases: operations/verifying-releases.md
     - Troubleshooting: operations/troubleshooting.md
   - Reference:
     - Configuration: reference/configuration.md
     - Observability: reference/observability.md
   - Architecture:
-    - Overview: architecture/index.md
+    - architecture/index.md
     - Proxy topology: architecture/proxy-topology.md
     - Discovery protocol: architecture/discovery-protocol.md
   - FAQ: faq.md
