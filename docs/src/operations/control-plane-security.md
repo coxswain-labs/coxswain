@@ -151,7 +151,7 @@ canonical form for each proxy role:
 | Dedicated proxy (per Gateway) | `<gateway-name>-<gatewayclass-name>` | `spiffe://<trust-domain>/ns/<gateway-ns>/sa/<gateway-name>-<gatewayclass-name>` |
 | Relay (discovery cache) | `coxswain-relay` (chart) / provisioned per namespace | `spiffe://<trust-domain>/ns/<relay-ns>/sa/<relay-sa>` |
 
-The dedicated proxy SA name follows [GEP-1762](https://gateway-api.sigs.k8s.io/geps/gep-1762/):
+The dedicated proxy SA name follows a fixed pattern:
 it is the same name the controller uses for the provisioned Deployment, Service,
 and ServiceAccount. For example, a Gateway `prod/my-gw` of class `coxswain` runs
 as SA `my-gw-coxswain` with SVID
@@ -159,64 +159,15 @@ as SA `my-gw-coxswain` with SVID
 
 ### Scope binding enforcement
 
-A dedicated proxy subscribes with `Scope::Gateway { name, namespace }` to
-receive only its own Gateway's routing snapshot. The stream handler enforces that
-the claimed Gateway matches the peer's authenticated SVID:
+A dedicated proxy subscribes for only its own Gateway's routing snapshot, and the discovery server enforces that the claimed Gateway matches the proxy's authenticated SVID. The controller stamps the expected proxy SA (`{gateway}-{class}`) into the Gateway's registry entry at reconcile time; a `Subscribe` whose peer SVID does not match `…/ns/<namespace>/sa/<expected-sa>` is closed with **`PERMISSION_DENIED`** before any snapshot is delivered. A valid certificate from the *wrong* Gateway is still rejected.
 
-1. The controller stamps the expected proxy SA (`{gw}-{class}`) into the
-   Gateway's dedicated registry entry at reconcile time.
-2. When the proxy's `Subscribe` message arrives, the server extracts the URI SANs
-   from the peer's TLS client certificate (injected as request metadata by
-   `PeerSvidStream`).
-3. If the peer's SVID does not match
-   `…/ns/<claimed-namespace>/sa/<expected-sa>` the stream is closed immediately
-   with `PERMISSION_DENIED` — before any snapshot is delivered.
-
-The trust-domain prefix is validated at the TLS handshake by
-`SpiffeClientCertVerifier`, so the binding check only needs to compare the
-namespace and ServiceAccount name. A valid cert from the wrong Gateway is still
-rejected.
-
-If mTLS is not established (no peer certificate — test or degraded-mode paths
-only), the binding check is skipped and the stream is fail-open. In production
-there is no plaintext discovery server; `SpiffeClientCertVerifier` mandates
-client auth, so every accepted stream carries a peer cert.
+The binding check is skipped only when no peer certificate is present — a path that exists solely for tests and degraded modes. Production discovery mandates client auth, so every accepted stream carries a peer cert.
 
 ### Relay tier
 
-A [relay](../architecture/discovery-protocol.md#the-relay-tier) is both a
-discovery **client** (upstream, to the controller) and a discovery **server**
-(downstream, to proxies), so it sits on both sides of the trust model:
+A [relay](../architecture/discovery-protocol.md#the-relay-tier) is both a discovery **client** (upstream, to the controller) and a discovery **server** (downstream, to proxies). Its ServiceAccount holds **zero Kubernetes verbs** — the same read-only invariant as a proxy — so it never touches the CA Secret, trust bundle, or the controller's `TokenReview`. Downstream it presents its own rotating SVID as its serving certificate and enforces the identical trust-domain and Gateway-scope-binding checks the controller does; it **rejects `Namespace` subscribes** (only the controller serves that scope).
 
-- **Upstream**, the relay is an ordinary client: it bootstraps its own SVID from
-  the controller (bootstrap is never tiered) and opens the mandatory-mTLS stream
-  exactly like a proxy. Its SA holds **zero Kubernetes verbs** — the same
-  read-only invariant as a proxy, so the relay never touches the CA Secret,
-  trust-bundle ConfigMap, or `TokenReview` the controller's discovery server
-  needs.
-- **Downstream**, the relay presents that *same rotating bootstrapped SVID* as
-  its serving certificate (issued SVIDs already carry the `serverAuth` EKU) and
-  uses the mounted trust bundle as its client-CA. It enforces the identical
-  `SpiffeClientCertVerifier` trust-domain check and, for `Scope::Gateway`
-  subscribes, the identical SVID&harr;Gateway binding above — it reconstructs each
-  Gateway's expected proxy SA from the `GatewayMeta` resource on its upstream
-  stream. A relay's downstream server **rejects `Namespace` subscribes** (only
-  the controller serves that scope).
-
-A leaf placed behind a relay verifies the relay's identity instead of the
-controller's — but it is not configured with a static endpoint or expected SA.
-Since the routing upstream is **bootstrap-delivered and runtime-directed**,
-the controller hands the leaf its upstream `(endpoint, expected_server_sa)`
-in the bootstrap response — the relay's Service and the relay's SA when the
-namespace is relay-fronted — and the leaf verifies that identity on its stream.
-Bootstrap itself always targets the controller (never tiered).
-
-Relay availability is delivered by running ≥2 relay replicas behind the relay
-Service. If a relay is nonetheless unreachable (e.g. torn down in a rebalance
-race), the leaf **re-bootstraps** to the controller — the always-up anchor — and
-is re-pointed at whatever upstream is current. This fallback repoints the
-control stream only; the data plane keeps serving its last-good routing snapshot
-throughout, so a relay rebalance never disrupts live traffic.
+A proxy behind a relay is handed its upstream `(endpoint, expected server SA)` in the bootstrap response and verifies that identity on its stream — bootstrap always targets the controller directly, never a relay. Run **≥2 relay replicas** for availability; if a relay becomes unreachable, the proxy **re-bootstraps** to the controller (the always-up anchor) and is re-pointed at the current upstream. This repoints the control stream only — the data plane keeps serving its last-good snapshot throughout, so a relay rebalance never disrupts live traffic.
 
 ## Configuration
 

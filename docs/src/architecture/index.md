@@ -42,13 +42,13 @@ Watches Ingress, GatewayClass, Gateway, HTTPRoute, and related resources cluster
 
 The controller also runs two gRPC listeners that proxies connect to:
 
-- **Discovery (Stream) listener** (port 50051, mTLS mandatory, **leader-only**) — compiles routing snapshots from K8s resources and pushes them to subscribed proxies. Each snapshot is scoped to the subscriber's declared `Scope` — see [Scope-aware dispatch](architecture/proxy-topology.md#scope-aware-dispatch).
+- **Discovery (Stream) listener** (port 50051, mTLS mandatory, **leader-only**) — compiles routing snapshots from K8s resources and pushes them to subscribed proxies. Each snapshot is scoped to the subscriber's declared `Scope` — see [Scope-aware dispatch](proxy-topology.md#scope-aware-dispatch).
 
     Only the lease holder serves streams. Mechanically: the leader labels its own pod (`discovery.coxswain-labs.dev/leader: "true"`), so the `coxswain-controller-discovery` Service routes dials to it; a standby replica that gets dialled anyway (during a leader transition) rejects the stream with `FAILED_PRECONDITION`, and the proxy fast-retries until it lands on the real leader.
 
     Why single-replica: it gives every proxy one consistent watch position (no two replicas can disagree about routing state), and it puts each proxy's bound-listener readiness report in the same process that writes `Gateway` status — so `Programmed=True` is a genuine claim that the data plane is actually bound and serving, not just that the controller compiled a snapshot.
 
-- **Bootstrap (Identity) listener** (port 50052, server-auth-only TLS, **every replica**, via the separate `coxswain-controller-discovery-bootstrap` Service) — acts as a certificate authority for new proxies. A fresh proxy presents its ServiceAccount token and a CSR; the controller validates the token via `TokenReview`, signs a short-lived SPIFFE SVID, and returns it. Unlike the Stream listener, every replica can do this (not just the leader) because issuance needs no shared state beyond the one CA Secret all replicas already read — so it keeps working through leader churn. See [Control-plane security](operations/control-plane-security.md).
+- **Bootstrap (Identity) listener** (port 50052, server-auth-only TLS, **every replica**, via the separate `coxswain-controller-discovery-bootstrap` Service) — acts as a certificate authority for new proxies. A fresh proxy presents its ServiceAccount token and a CSR; the controller validates the token via `TokenReview`, signs a short-lived SPIFFE SVID, and returns it. Unlike the Stream listener, every replica can do this (not just the leader) because issuance needs no shared state beyond the one CA Secret all replicas already read — so it keeps working through leader churn. See [Control-plane security](../operations/control-plane-security.md).
 
 On a leader change, routing *updates* stall for the brief reconnect window (bounded by the Lease TTL) while every proxy keeps serving its last-good snapshot — no data-plane outage. Status writes race nothing: a demoted leader re-checks its leadership immediately before every status patch, narrowing the residual last-write-wins window to a single request round-trip (accepted; both replicas compute identical status from warm caches).
 
@@ -74,7 +74,7 @@ Like the shared proxy, the dedicated proxy holds **zero Kubernetes API credentia
 
 ### `serve relay`
 
-A zero-RBAC discovery **cache**: a recursive node that subscribes to an upstream discovery stream (the controller) and re-publishes snapshots to downstream proxies, so the leader's snapshot fan-out scales O(relays) instead of O(nodes). A relay holds the same zero-Kubernetes-credentials invariant as a proxy. `relay --shared` fronts the shared pool; `relay --namespace <NS>` fronts one namespace's dedicated Gateways (controller-provisioned; provenance-authorized). Leaves speak the unchanged protocol and are unaware of the tier. See [Discovery protocol → The relay tier](architecture/discovery-protocol.md#the-relay-tier).
+A zero-RBAC discovery **cache**: a recursive node that subscribes to an upstream discovery stream (the controller) and re-publishes snapshots to downstream proxies, so the leader's snapshot fan-out scales O(relays) instead of O(nodes). A relay holds the same zero-Kubernetes-credentials invariant as a proxy. `relay --shared` fronts the shared pool; `relay --namespace <NS>` fronts one namespace's dedicated Gateways (controller-provisioned; provenance-authorized). Leaves speak the unchanged protocol and are unaware of the tier. See [Discovery protocol → The relay tier](discovery-protocol.md#the-relay-tier).
 
 ## Request path
 
@@ -89,12 +89,12 @@ flowchart LR
     F --> G([Forward])
 ```
 
-The routing table is an immutable snapshot behind an atomic pointer; each request reads it with a single atomic load — no locks, no channels. The discovery supervisor applies each pushed change — a per-resource delta, not a whole-table blob (see [Discovery protocol → wire protocol](architecture/discovery-protocol.md#the-wire-protocol)) — by recompiling only the routing partitions that changed and splicing every unchanged partition's already-compiled router straight into a fresh table, then swaps the pointer atomically; in-flight requests complete against the old snapshot, the next request sees the new routing.
+The routing table is an immutable snapshot behind an atomic pointer; each request reads it with a single atomic load — no locks, no channels. The discovery supervisor applies each pushed change — a per-resource delta, not a whole-table blob (see [Discovery protocol → wire protocol](discovery-protocol.md#the-wire-protocol)) — by recompiling only the routing partitions that changed and splicing every unchanged partition's already-compiled router straight into a fresh table, then swaps the pointer atomically; in-flight requests complete against the old snapshot, the next request sees the new routing.
 
 TLS works the same way: the TLS store is an atomic snapshot rebuilt on every push. New connections use the new certificate; connections in progress complete with the old one.
 
 ## Where to go next
 
-- **[Proxy topology](architecture/proxy-topology.md)** — the shared and dedicated topologies, how per-Gateway addressing works when compute is shared, and the scope-aware snapshot dispatch that keeps them isolated.
-- **[Discovery protocol](architecture/discovery-protocol.md)** — how `Programmed` status is gated on real bind + ack signals, RBAC by role, and which admin endpoints each role exposes.
-- **[Control-plane security](operations/control-plane-security.md)** — how the discovery channel is secured (mTLS, SPIFFE SVIDs, CA provisioning), reconnect behaviour, and wire-version compatibility.
+- **[Proxy topology](proxy-topology.md)** — the shared and dedicated topologies, how per-Gateway addressing works when compute is shared, and the scope-aware snapshot dispatch that keeps them isolated.
+- **[Discovery protocol](discovery-protocol.md)** — how `Programmed` status is gated on real bind + ack signals, RBAC by role, and which admin endpoints each role exposes.
+- **[Control-plane security](../operations/control-plane-security.md)** — how the discovery channel is secured (mTLS, SPIFFE SVIDs, CA provisioning), reconnect behaviour, and wire-version compatibility.

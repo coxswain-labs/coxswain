@@ -45,7 +45,7 @@ kubectl apply -f "https://github.com/kubernetes-sigs/gateway-api/releases/downlo
 ]
 ```
 
-The `latest` entry is what `coxswain-e2e`'s bootstrap installs, what `kubeconform` validates against, and what `gateway-api-types` is generated from. The rest are versions conformance reports are published for; the controller detects at runtime which kinds and schema fields the installed CRDs actually serve — see `docs/src/reference/capability-matrix.md`.
+The `latest` entry is what `coxswain-e2e`'s bootstrap installs, what `kubeconform` validates against, and what `gateway-api-types` is generated from. The rest are versions conformance reports are published for; the controller detects at runtime which kinds and schema fields the installed CRDs actually serve — see `docs/src/gateway-api/capability-matrix.md`.
 
 Read it via `scripts/gateway-api-versions.sh` (`--latest`, `--versions`, `--list`, `--report-dir vX.Y.Z`). That script is the only JSON parser in the shell/CI surface, so no consumer needs `jq` and none can disagree about the schema. `scripts/check-gateway-api-versions.sh` validates it.
 
@@ -104,7 +104,7 @@ cargo run --bin coxswain -- serve proxy --shared --log-format console \
 
 `--log-format console` produces human-readable output instead of JSON. `--ingress-http-port` and `--ingress-https-port` are required on the proxy to bind listeners; omitting both starts no listeners.
 
-To run a dedicated-mode proxy (per-Gateway data plane) locally, see [docs/src/guides/dedicated-mode.md](docs/src/guides/dedicated-mode.md).
+To run a dedicated-mode proxy (per-Gateway data plane) locally, see [docs/src/gateway-api/index.md#dedicated-proxy-pools](docs/src/gateway-api/index.md#dedicated-proxy-pools).
 
 ### Ports
 
@@ -270,24 +270,14 @@ cargo nextest run --profile e2e-serial -p coxswain-e2e -E 'binary(routing)' --no
 
 ### Conformance
 
-The Gateway API conformance suite needs the production image and a Helm install with Ingress entry points disabled (so every conformance Gateway listener binds cleanly). The setup is wrapped in a script that takes a `--reset` flag for cluster-agnostic operation:
+Quick local run on OrbStack:
 
 ```bash
-bash scripts/setup-conformance.sh --reset 'orb delete -f k8s && orb start k8s'
-
-cd conformance && go test -v -timeout 60m -run TestConformance -args \
-  --organization=coxswain-labs --project=coxswain \
-  --url=https://github.com/coxswain-labs/coxswain \
-  --version="$(git describe --tags --always)" \
-  --contact=https://github.com/coxswain-labs/coxswain/issues \
-  --report-output=reports/local-report.yaml
+VIP_SERVICE_TYPE=ClusterIP bash scripts/setup-conformance.sh --reset 'orb delete -f k8s && orb start k8s'
+bash scripts/run-conformance.sh
 ```
 
-Examples for other clusters:
-- kind: `--reset 'kind delete cluster --name kind && kind create cluster --name kind'`
-- minikube: `--reset 'minikube delete && minikube start'`
-
-`main_test.go` is the entrypoint. The claimed profiles and features are derived from the cluster's installed CRDs rather than hard-coded: `capabilities.go` reads the Gateway API CRD definitions (kind presence plus two schema-field probes) and `features.go` holds the `gatedFeatures` table naming what each declaration requires. Profiles are built from strings rather than `suite.Gateway*ConformanceProfileName` constants because the TCP/UDP constants do not exist in the Gateway API v1.4 Go module, and this file must compile against it. Reports are written to `reports/` (`local-report.yaml` is gitignored). Verify compilation without a cluster via `cd conformance && go vet ./...`.
+See **[CONFORMANCE.md](CONFORMANCE.md)** for the full guide — cluster-specific reset/VIP settings, running against older Gateway API versions, subset runs, reading the report, adding a claimed feature, and publishing reports upstream.
 
 ### Tips
 

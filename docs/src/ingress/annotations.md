@@ -8,6 +8,8 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 
 ## Quick reference
 
+<div class="nowrap-col1" markdown>
+
 | Annotation | Type | Default | Example |
 |------------|------|---------|---------|
 | `ingress.coxswain-labs.dev/read-timeout` | duration | _none_ | `"60s"` |
@@ -43,6 +45,8 @@ Coxswain supports the `ingress.coxswain-labs.dev/*` annotation namespace for per
 | `ingress.coxswain-labs.dev/auth-tls-verify-depth` | integer | `1` | `"2"` |
 | `ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream` | boolean | `false` | `"true"` |
 | `ingress.coxswain-labs.dev/path-normalize` | `base`, `merge-slashes`, `decode-and-merge-slashes` | `base` | `"merge-slashes"` |
+
+</div>
 
 ```yaml
 metadata:
@@ -297,6 +301,8 @@ ingress.coxswain-labs.dev/response-header-remove: "Server, X-Powered-By"
 
 Six annotations configure an HTTP redirect response. Any combination of the fields below may be omitted; omitted fields are inherited from the original request (hostname is preserved, path is preserved, etc.). The redirect fires at the proxy layer — the upstream backend is never reached.
 
+<div class="nowrap-col1" markdown>
+
 | Annotation | Value | Notes |
 |------------|-------|-------|
 | `redirect-scheme` | `http` or `https` | |
@@ -304,6 +310,8 @@ Six annotations configure an HTTP redirect response. Any combination of the fiel
 | `redirect-port` | port integer | explicit port in the Location |
 | `redirect-path` | absolute path | full path replacement |
 | `redirect-status-code` | `301`, `302`, `307`, `308` | defaults to `302` |
+
+</div>
 
 ```yaml
 ingress.coxswain-labs.dev/redirect-scheme: "https"

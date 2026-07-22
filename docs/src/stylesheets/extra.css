@@ -1,5 +1,9 @@
-/* Keep API-version identifiers (e.g. gateway.networking.k8s.io/v1) on a single
-   line. Scoped to tables wrapped in .nowrap-col2 so no other table is affected. */
+/* Keep long identifiers on a single line in a specific table column. Scoped to a
+   wrapping .nowrap-colN div so no other table is affected. */
+.nowrap-col1 td:nth-child(1),
+.nowrap-col1 th:nth-child(1) {
+  white-space: nowrap;
+}
 .nowrap-col2 td:nth-child(2),
 .nowrap-col2 th:nth-child(2) {
   white-space: nowrap;

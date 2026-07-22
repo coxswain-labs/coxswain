@@ -12,7 +12,7 @@ The `route` Prometheus label is a **stable rule identifier**, not a request path
 
 Route id formats:
 
-- HTTPRoute / GRPCRoute: `httproute/<namespace>/<name>:<rule-id>` / `grpcroute/<namespace>/<name>:<rule-id>` — `rule-id` is the rule's `.name` (`HTTPRouteNamedRouteRule` / `GRPCRouteNamedRouteRule`, GEP-995) when the operator sets one; otherwise the position in `spec.rules[]`. A rule's id is stable across reorders only when named — an unnamed rule's index-based id shifts if a preceding rule is added or removed.
+- HTTPRoute / GRPCRoute: `httproute/<namespace>/<name>:<rule-id>` / `grpcroute/<namespace>/<name>:<rule-id>` — `rule-id` is the rule's `.name` (`HTTPRouteNamedRouteRule` / `GRPCRouteNamedRouteRule`) when the operator sets one; otherwise the position in `spec.rules[]`. A rule's id is stable across reorders only when named — an unnamed rule's index-based id shifts if a preceding rule is added or removed.
 - Ingress per-rule: `ingress/<namespace>/<name>:<r>.<p>` — nested `(rules, paths)` index, mirroring the YAML structure.
 - Ingress `spec.defaultBackend`: `ingress/<namespace>/<name>:default`.
 - The controller-wide `--ingress-default-backend` fallback: `ingress-default-backend/<service-namespace>/<service-name>`.
@@ -23,7 +23,7 @@ Route id formats:
 |--------|------|--------|
 | `coxswain_proxy_requests_total` | Counter | `listener`, `route`, `method`, `status_code` |
 | `coxswain_proxy_request_duration_seconds` | Histogram | `listener`, `route` |
-| `coxswain_proxy_upstream_errors_total` | Counter | `listener`, `route`, `upstream`, `error_type` (`connect`/`timeout`/`refused`/`tls`/`5xx`/`other`) |
+| `coxswain_proxy_upstream_errors_total` | Counter | `listener`, `route`, `upstream`, `error_type` (`connect`/`timeout`/`5xx`/`other`) |
 | `coxswain_proxy_upstream_retries_total` | Counter | `listener`, `route`, `upstream`, `condition` (`connect-failure`/`timeout`/`5xx`) |
 | `coxswain_proxy_upstream_connections_total` | Counter | `state` (`new`/`reused`) — incremented once per request; `reused` climbs when upstream keepalive is effective |
 | `coxswain_proxy_mirror_requests_total` | Counter | `route`, `upstream` — incremented once per mirror dispatch (fire-and-forget shadow requests from `RequestMirror` filters); counts attempts, not successes |
@@ -33,7 +33,7 @@ Route id formats:
 | `coxswain_proxy_routing_table_rebuilds_total` | Counter | `result` (`ok`/`error`) |
 | `coxswain_proxy_routing_table_rebuild_duration_seconds` | Histogram | — |
 | `coxswain_proxy_tls_certs_loaded` | Gauge | `bucket` (`exact`/`wildcard`/`default`) |
-| `coxswain_proxy_tls_cert_expiry_seconds` | Gauge | `sni` |
+| `coxswain_proxy_tls_cert_expiry_seconds` | Gauge | `sni`, `source` |
 | `coxswain_proxy_tls_handshakes_total` | Counter | `result` (`ok`/`fail`), `version` |
 | `coxswain_proxy_connections_active` | Gauge | `listener` |
 | `coxswain_proxy_connections_total` | Counter | `listener` |
@@ -97,7 +97,7 @@ The `listener` label is the **local port the proxy accepted the connection on**.
 
 `coxswain_controller_reconcile_errors_total`'s `reason` label is a bounded classification of the underlying Kubernetes API error: `namespace_terminating` (SSA into a namespace mid-deletion — a self-resolving race), `conflict` (409), `forbidden` (RBAC), `not_found`, `invalid` (422 validation/webhook rejection), `api_other`, `transport`, `internal`. Errors classified `forbidden`/`invalid` are persistent — the operator polls them at a flat 15 s because retrying faster cannot fix RBAC or a rejected spec; every other class retries with a per-Gateway exponential backoff (0.5 s doubling to a 15 s cap, reset on the first success). A sustained non-zero rate on a persistent reason is an operator-action signal, not a transient blip.
 
-`coxswain_controller_watch_relists_pending{kind}` is the **watch-relist wedge** signal. A reflector relist increments it on `Event::Init` (relist started) and decrements it on `Event::InitDone` (relist completed); in steady state every kind sits at 0, briefly ticking to 1 while a relist is in flight. A kind pinned **above 0** for minutes is the wedge signature: the watch relist began but its `InitDone` never arrived, so that store is serving a stale (often empty) snapshot while the pod otherwise looks healthy — the lease renews and reconcile counters climb. Alert on any `kind` staying non-zero beyond a minute. The controller's liveness backstop restarts the pod automatically if this persists past ~2.5 min (see [Health endpoints](#health-endpoints)); the alert exists so operators see the wedge (and the restart) rather than silent staleness. The original root cause — kube's back-pressuring shared-store dispatcher — was removed by the **single watch fabric**: the controller runs one `watcher() → authoritative store → derive(status/routing/provisioning)` pipeline (no cross-fabric fan-out, no per-kind work-queues), the store advances unconditionally, and the rebuild loop is woken by a **lossless `watch`-channel trigger** — a delivered watch event can never be dropped before the loop observes it (unlike an edge-triggered `Notify` in a `select!`), so convergence is event-driven and does not depend on any timer to recover a missed wake. Three backstops then cover only the residual gaps the trigger itself cannot: a periodic **resync tick** on the rebuild loop (re-derives even when a watch goes *silent* without delivering an event), a bounded per-watcher **idle timeout** (a silently-stalled watch is reconnected within the window rather than serving stale data for minutes), and this relist-liveness gate (pod restart as the last resort). A sustained non-zero here indicates a new, unrelated watch fault worth investigating.
+`coxswain_controller_watch_relists_pending{kind}` is the **watch-relist wedge** signal. It increments when a reflector relist starts and decrements when it completes; in steady state every kind sits at 0, briefly ticking to 1 while a relist is in flight. A kind pinned **above 0** for minutes is the wedge signature — the relist began but never completed, so that store serves a stale (often empty) snapshot while the pod otherwise looks healthy (the lease renews, reconcile counters climb). **Alert on any `kind` staying non-zero beyond a minute.** The controller's liveness backstop restarts the pod automatically if this persists past ~2.5 min (see [Health endpoints](#health-endpoints)); the alert exists so operators see the wedge rather than silent staleness.
 
 `coxswain_controller_gateways_held_pending` counts shared-mode Gateways whose top-level `Programmed` is currently deferred (`False/Pending` with `observedGeneration` one below the current generation) awaiting VIP resolution, proxy bind, or snapshot ack. Legitimate holds clear within seconds of a spec change; alert on this gauge staying non-zero — before it existed, a Gateway stuck here was indistinguishable from healthy reconcile traffic. Terminally-invalid configurations (every listener unserviceable, unsupported `parametersRef`) never enter the hold: they settle `Programmed=False/Invalid` at the current generation immediately.
 
@@ -130,7 +130,7 @@ The control-plane gRPC channel between controller (server) and proxies (clients)
 | Metric | Side | Type | Labels |
 |--------|------|------|--------|
 | `coxswain_discovery_connected_proxies` | Server | Gauge | — (proxy streams live now; a drop to `0` means the fleet lost its control-plane link) |
-| `coxswain_discovery_streams_total` | Server | Counter | `result` (`accepted`/`rejected`) — `rejected` covers wire-version mismatch, malformed scope, and SVID/scope-binding denial |
+| `coxswain_discovery_streams_total` | Server | Counter | `result` (`accepted`/`rejected`/`rejected_not_leader`) — `rejected` covers wire-version mismatch, malformed scope, and SVID/scope-binding denial; `rejected_not_leader` is a standby replica declining the stream |
 | `coxswain_discovery_acks_total` | Server | Counter | — (snapshot Acks received; tracks fleet convergence throughput) |
 | `coxswain_discovery_snapshot_messages_total` | Server | Counter | `kind` (`full`/`delta`) — messages pushed; healthy steady state is a climbing `delta` against a near-static `full`. A rising `full` rate means control-plane link churn or repeated self-healing resyncs |
 | `coxswain_discovery_snapshot_resources_sent_total` | Server | Counter | — (resource upserts placed in pushed snapshots; ÷ `snapshot_messages_total` is the average payload width — collapses toward 1 under endpoint-only deltas) |
@@ -154,7 +154,7 @@ When you run a [dedicated proxy pool](../gateway-api/index.md#dedicated-proxy-po
 
 Instead the identity rides in as a **scrape-time target label**. Each proxy pod the controller provisions carries the Gateway it serves as two pod labels:
 
-- `gateway.networking.k8s.io/gateway-name` — the Gateway name (the GEP-1762 well-known label).
+- `gateway.networking.k8s.io/gateway-name` — the Gateway name (the well-known label).
 - `gateway.coxswain-labs.dev/gateway-namespace` — the Gateway namespace (a Coxswain label; the upstream group defines no namespace label).
 
 The chart's PodMonitor then copies those pod labels onto every scraped sample via `relabelings`, so they appear on the metrics without ever touching the series the proxy emits:
@@ -243,6 +243,7 @@ Coxswain emits one structured log event per proxied request at `INFO` level on t
 | `method` | string | HTTP method |
 | `path` | string | Request path — see `--access-log-path-mode` below |
 | `status` | integer | Response HTTP status code |
+| `client_ip` | string | Resolved client IP (PROXY-protocol peer or a trusted forwarded-for header, else the L4 peer) |
 | `route_id` | string | Canonical rule identifier; same value as the `route` Prometheus label. Empty for requests that bypass routing (e.g. 404 with no matching host) |
 | `upstream` | string | Name of the matched upstream service |
 | `upstream_addr` | string | Selected endpoint `ip:port` |
@@ -353,7 +354,7 @@ Type     Reason                Age   From                 Message
 Warning  InternalPortRemapped  3s    coxswain-controller  listener 443 internal port moved 30001 -> 30004 while the Gateway is live
 ```
 
-### InternalPortRangeExhausted (shared-mode Gateway)
+### NoInternalPortAvailable (shared-mode Gateway)
 
 Emitted on a shared-mode `Gateway` when the `30000–32767` internal-port band is exhausted;
 the un-allocated listeners get no VIP port and are not addressed until capacity frees up.
@@ -430,6 +431,3 @@ Use `RUST_LOG` directive syntax for per-crate control:
         metrics_path: /metrics
     ```
 
-## Grafana dashboard
-
-A community Grafana dashboard for Coxswain is planned for a future release. In the meantime, the metrics above are compatible with standard Kubernetes proxy dashboards (e.g. `kubernetes-nginx-ingress` panels adapted for `coxswain_` prefix).

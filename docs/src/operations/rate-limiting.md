@@ -66,9 +66,6 @@ spec:
 
 **Fail-open**: if the referenced `RateLimit` CR is missing, the route serves with rate limiting disabled (a WARN is logged) rather than failing the route — the same posture as the Gateway API binding below. See the [`RateLimit` spec fields](#ratelimit-spec-fields) below for `requestsPerSecond`/`burst`/`byHeader`.
 
-!!! note "Migration from the inline rate-limit-rps/rate-limit-burst/rate-limit-by annotations (breaking)"
-    Earlier releases exposed three inline annotations — `rate-limit-rps`, `rate-limit-burst`, `rate-limit-by` — duplicating the `RateLimit` CRD schema. These are removed; move each Ingress's values into a `RateLimit` CR and point `rate-limit` at it.
-
 ### Example: 5 req/s per API key header
 
 ```yaml

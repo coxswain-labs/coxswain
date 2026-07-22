@@ -75,7 +75,7 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_PROXY_LISTENER_DRAIN_TIMEOUT` | `--proxy-listener-drain-timeout` | `30s` | Drain window for in-flight requests when a Gateway listener is removed at runtime |
 | `COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD` | `--proxy-shutdown-grace-period` | `30s` | Drain window after shutdown signal |
 | `COXSWAIN_PROXY_SHUTDOWN_TIMEOUT` | `--proxy-shutdown-timeout` | `5s` | Hard deadline after the grace period; remaining connections are forcibly closed |
-| `COXSWAIN_PROXY_THREADS` | `--proxy-threads` | `2` | Worker threads per proxy service; set to CPU core count for maximum throughput |
+| `COXSWAIN_PROXY_THREADS` | `--proxy-threads` | `0` | Worker threads per proxy service; `0` = auto (effective CPU parallelism, floored at 2). Tune to the pod's CPU **limit**, not the host core count |
 | `COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE` | `--proxy-upstream-keepalive-pool-size` | `128` | Maximum idle upstream connections in Pingora's keepalive pool; connections beyond the limit are evicted LRU |
 | `COXSWAIN_INGRESS_PROXY_TRUSTED_SOURCES` | `--ingress-proxy-trusted-sources` | _(none)_ | Comma-separated CIDRs allowed to send PROXY-protocol headers on Ingress listeners; only meaningful with `--ingress-accept-proxy-protocol` |
 | `COXSWAIN_RECONCILE_DEBOUNCE_MIN` | `--reconcile-debounce-min` | `20ms` | _(controller)_ Trailing quiet window for the rebuild debounce; a watch event resets it, and it firing with no further events rebuilds the routing table. Must be ≤ the max |
@@ -103,13 +103,7 @@ Both API surfaces are enabled by default. Use `controller.gatewayApi.enabled=fal
 
 ### Self-healing Gateway API CRD detection
 
-When the Gateway API surface is enabled (`--disable-gateway-api` absent) but the Gateway API CRDs are not installed yet, Coxswain does not crash. Instead:
-
-1. A `gateway_api_crds` health check is registered but stays `Pending`, blocking `/readyz` until resolved.
-2. A background re-probe task polls every 30 seconds.
-3. Once the CRDs appear, the Gateway API reflectors are started in-process and `gateway_api_crds` becomes `Ready` — no pod restart required.
-
-The active API surfaces are visible in every pod's `/api/v1/health` response under `api_surfaces.gateway_api` and `api_surfaces.ingress`.
+When the Gateway API surface is enabled but the CRDs aren't installed yet, Coxswain doesn't crash: a `gateway_api_crds` health check stays `Pending` (blocking `/readyz`), a background task re-probes every 30 s, and the Gateway API reflectors start in-process once the CRDs appear — no pod restart. The active surfaces show in every pod's `/api/v1/health` under `api_surfaces.gateway_api` / `api_surfaces.ingress`. See the [capability matrix](../gateway-api/capability-matrix.md) for how detection degrades across Gateway API versions.
 
 ## HTTP/2 support
 
@@ -117,7 +111,7 @@ Coxswain supports HTTP/2 on both the downstream (client → proxy) and upstream 
 
 - **h2 over TLS (HTTPS)** — automatic. The TLS acceptor advertises `h2` and `http/1.1` via ALPN; clients that don't offer `h2` fall back to HTTP/1.1 transparently.
 - **h2c (cleartext HTTP/2, prior-knowledge)** — automatic on plain-TCP listeners. The h2c preface is detected non-destructively; HTTP/1.1 clients on the same port are unaffected.
-- **Upstream h2c** — enabled per-route via `appProtocol: kubernetes.io/h2c` on the backend `Service` port (Gateway API GEP-1911 `HTTPRouteBackendProtocolH2C`).
+- **Upstream h2c** — enabled per-route via `appProtocol: kubernetes.io/h2c` on the backend `Service` port (the Gateway API `HTTPRouteBackendProtocolH2C` mechanism).
 
 **PROXY-protocol restriction:** when `--ingress-accept-proxy-protocol` is set, Ingress inbound connections are h1-only. h2c prior-knowledge and h2 ALPN are disabled on PROXY-wrapped connections.
 
@@ -149,7 +143,7 @@ spec:
     - 192.168.0.0/16
 ```
 
-**Precedence (GEP-713):** a section-scoped policy (with `sectionName`) beats a gateway-scoped one for the targeted listener. When two policies at the same scope target the same listener, the older `creationTimestamp` wins; the loser receives `Accepted=False / Conflicted=True` in `status.ancestors[]`.
+**Precedence:** a section-scoped policy (with `sectionName`) beats a gateway-scoped one for the targeted listener. When two policies at the same scope target the same listener, the older `creationTimestamp` wins; the loser receives `Accepted=False / Conflicted=True` in `status.ancestors[]`.
 
 **TLS passthrough:** PROXY headers are stripped before SNI detection, so passthrough routes work correctly whether or not PROXY headers are present. Without a `ClientTrafficPolicy`, PROXY headers on passthrough listeners are treated as raw connection bytes and cause the SNI lookup to fail.
 

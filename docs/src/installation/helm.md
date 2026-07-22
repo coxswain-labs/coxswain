@@ -75,7 +75,7 @@ The [relay tier](../architecture/proxy-topology.md#discovery-relay-tier) scales 
 | `relay.tolerance` | `0.10` | Relative sizing deadband — the replica count changes only when load deviates from target by more than this fraction |
 | `relay.resources.{cpuRequest,memoryRequest,memoryLimit}` | `50m` / `64Mi` / `256Mi` | Resources for each provisioned relay (CPU request only — a limit would throttle fan-out) |
 
-Per-namespace overrides for the **dedicated** relays (force-on/off, replicas, resources, `podTemplate` scheduling, autoscaling) come from the namespaced [`CoxswainRelayPolicy`](../reference/relay-policy.md) CRD; the shared relay is global and reads the `relay.*` flag values directly.
+Per-namespace overrides for the **dedicated** relays (force-on/off, replicas, resources, `podTemplate` scheduling, autoscaling) come from the namespaced [`CoxswainRelayPolicy`](../operations/relay-policy.md) CRD; the shared relay is global and reads the `relay.*` flag values directly.
 
 ```bash
 # Disable the relay tier entirely

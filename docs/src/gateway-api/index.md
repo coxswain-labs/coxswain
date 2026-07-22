@@ -12,7 +12,7 @@ This section documents each resource on its own page. Start here for the resourc
 |----------|-------------|---------|
 | `GatewayClass` | `gateway.networking.k8s.io/v1` | Full |
 | `Gateway` | `gateway.networking.k8s.io/v1` | HTTP, HTTPS, TLS passthrough/terminate, TCP, and UDP listeners — see [Gateway](gateway.md) |
-| `ListenerSet` | `gateway.networking.k8s.io/v1` | Attach listeners to a Gateway across namespaces — see the [ListenerSet guide](listener-sets.md) |
+| `ListenerSet` | `gateway.networking.k8s.io/v1` | Attach listeners to a Gateway across namespaces — see the [ListenerSet guide](listenerset.md) |
 | `HTTPRoute` | `gateway.networking.k8s.io/v1` | Path, header, method, and query matching; weighted traffic split — see [HTTPRoute](httproute.md) |
 | `GRPCRoute` | `gateway.networking.k8s.io/v1` | Service and method matching; cleartext h2c backends — see [GRPCRoute](grpcroute.md) |
 | `TLSRoute` | `gateway.networking.k8s.io/v1` | SNI-keyed L4 passthrough and/or terminate — see [TLSRoute](tlsroute.md) |

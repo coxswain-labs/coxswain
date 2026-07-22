@@ -24,8 +24,8 @@ kind exists at every supported version but the field does not:
 
 | Feature | Requires | Absent below |
 |---|---|---|
-| `HTTPRouteCORS` (GEP-1767) | `HTTPRoute` `spec.rules[].filters[].cors` | v1.5 |
-| `GatewayFrontendClientCertificateValidation` and its `…InsecureFallback` sibling (GEP-91) | `Gateway` `spec.tls.frontend` | v1.5 |
+| `HTTPRouteCORS` | `HTTPRoute` `spec.rules[].filters[].cors` | v1.5 |
+| `GatewayFrontendClientCertificateValidation` and its `…InsecureFallback` sibling | `Gateway` `spec.tls.frontend` | v1.5 |
 
 ## What a downgrade actually disables
 
@@ -97,7 +97,16 @@ cluster.
 
 ## Conformance
 
-Conformance reports are published for every supported version, under
-`conformance/reports/<report-dir>/`. A report from a v1.4 cluster claims fewer
-profiles and fewer features than one from v1.6 — that is the mechanism working,
-not a regression. See [Conformance](conformance.md) for how to reproduce a run.
+Coxswain is tested against the official [Gateway API conformance suite](https://gateway-api.sigs.k8s.io/concepts/conformance/) on every release. It claims up to five profiles, determined by the **installed CRDs** — a profile whose route kind is absent cannot be claimed, because the suite would create that kind and fail:
+
+| Profile | Requires | Covers |
+|---------|----------|--------|
+| `GATEWAY-HTTP` | always | HTTPRoute routing, header/path manipulation, redirects, mirroring, timeouts |
+| `GATEWAY-GRPC` | `GRPCRoute` | GRPCRoute routing |
+| `GATEWAY-TLS` | `TLSRoute` (v1.5+) | TLSRoute passthrough, terminate, and mixed-mode listeners |
+| `GATEWAY-TCP` | `TCPRoute` (v1.6+) | TCPRoute routing |
+| `GATEWAY-UDP` | `UDPRoute` (v1.6+) | UDPRoute routing |
+
+So a run against Gateway API v1.4 claims two profiles (HTTP and GRPC — it has no TLSRoute/TCPRoute/UDPRoute CRD) and a run against v1.6 claims all five. Reports are published for every supported version under `conformance/reports/<report-dir>/`; a v1.4 report claims fewer profiles and features than a v1.6 one — the mechanism working, not a regression.
+
+Running the suite is a maintainer task — see [CONFORMANCE.md](https://github.com/coxswain-labs/coxswain/blob/main/CONFORMANCE.md) in the repository.

@@ -84,13 +84,14 @@ nav:
   - Gateway API:
     - Overview: gateway-api/index.md
     - Gateway: gateway-api/gateway.md
-    - ListenerSets: gateway-api/listener-sets.md
+    - ListenerSets: gateway-api/listenerset.md
     - HTTPRoute: gateway-api/httproute.md
     - GRPCRoute: gateway-api/grpcroute.md
     - TLSRoute: gateway-api/tlsroute.md
     - TCP & UDP routes: gateway-api/tcp-udp-routes.md
     - Route extensions: gateway-api/route-extensions.md
     - CoxswainBackendPolicy: gateway-api/backend-policy.md
+    - Capability & conformance: gateway-api/capability-matrix.md
   - Ingress:
     - Overview: ingress/index.md
     - Annotations: ingress/annotations.md
@@ -101,16 +102,14 @@ nav:
       - Retries: operations/retries.md
     - Running in production: operations/running-in-production.md
     - Control-plane security: operations/control-plane-security.md
+    - Relay tier: operations/relay-policy.md
     - Verifying releases: operations/verifying-releases.md
     - Troubleshooting: operations/troubleshooting.md
   - Reference:
     - Configuration: reference/configuration.md
-    - Relay policy: reference/relay-policy.md
     - Observability: reference/observability.md
-    - Conformance: reference/conformance.md
-    - Gateway API capability matrix: reference/capability-matrix.md
   - Architecture:
-    - Overview: architecture.md
+    - Overview: architecture/index.md
     - Proxy topology: architecture/proxy-topology.md
     - Discovery protocol: architecture/discovery-protocol.md
   - FAQ: faq.md

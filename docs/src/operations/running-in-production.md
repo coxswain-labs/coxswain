@@ -188,14 +188,6 @@ This is the least-privilege lockdown for soft multi-tenancy: replace the cluster
 
 ## Signed image verification
 
-Every release image is signed with cosign. Verify the signature before deploying to a production cluster:
-
-```bash
-cosign verify \
-  --certificate-identity-regexp \
-    "https://github.com/coxswain-labs/coxswain/.github/workflows/release.yml" \
-  --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  ghcr.io/coxswain-labs/coxswain:vX.Y.Z
-```
+Every release image and chart is signed with cosign. Verify the signature before deploying to a production cluster — see [Verifying releases](verifying-releases.md).
 
 See [Verifying releases](verifying-releases.md) for the cosign verification flow for both the image and the Helm chart.

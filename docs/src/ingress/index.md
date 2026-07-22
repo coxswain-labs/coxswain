@@ -19,9 +19,13 @@ spec:
 
 ### Annotations
 
+<div class="nowrap-col1" markdown>
+
 | Annotation | Description |
 |------------|-------------|
 | `ingressclass.kubernetes.io/is-default-class` | Makes Coxswain the cluster default — handles `Ingress` objects with no class specified |
+
+</div>
 
 ### Making Coxswain the cluster default
 
@@ -60,9 +64,13 @@ spec:
 
 ### Annotations
 
+<div class="nowrap-col1" markdown>
+
 | Annotation | Description |
 |------------|-------------|
 | `kubernetes.io/ingress.class` | Legacy class selection; takes effect when `spec.ingressClassName` is absent. Use `spec.ingressClassName` on Kubernetes 1.18+ |
+
+</div>
 
 Coxswain also supports the `ingress.coxswain-labs.dev/*` annotation namespace for per-Ingress configuration (timeouts, retries, path rewrites, backend protocol). See [Ingress annotations](annotations.md) for the full reference.
 
