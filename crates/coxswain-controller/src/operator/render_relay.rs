@@ -40,6 +40,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::BTreeMap;
 
+use super::harden::HardeningReport;
 use super::render::{
     container_hardening_security_context, discovery_volume_mounts, discovery_volumes,
     http_get_probe, merge_pod_template, pod_hardening_security_context,
@@ -184,6 +185,11 @@ pub(crate) struct RenderedRelay {
     /// `Some` only when [`RelayRenderInputs::pdb_replica_ceiling`] ≥ 2. Applied-or-deleted by
     /// [`super::apply::apply_relay`].
     pub pdb: Option<PodDisruptionBudget>,
+    /// Controller-owned pod fields the namespace's `CoxswainRelayPolicy.podTemplate`
+    /// tried to set and did not get (see `super::harden`). Empty unless the policy
+    /// reached for the security envelope; the relay reconciler turns a non-empty
+    /// report into a `Warning` Event on the policy object.
+    pub(super) sanitized: HardeningReport,
 }
 
 /// Label selector matching every **dedicated** (per-namespace) relay resource
@@ -262,8 +268,9 @@ fn render_relay_service(variant: RelayVariant<'_>) -> Service {
 }
 
 /// Render the relay `Deployment` (`serve relay {--namespace=<ns>|--shared}`, ≥2
-/// replicas).
-fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
+/// replicas), returning it alongside the fields the security envelope took back
+/// from the namespace's `podTemplate` overlay (see `super::harden`).
+fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> (Deployment, HardeningReport) {
     let variant = inputs.variant;
     let component = variant.component();
     let args = vec![
@@ -345,14 +352,14 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
     // coxswain container survives, scheduling fields (nodeSelector/tolerations/affinity/
     // topologySpreadConstraints/priorityClassName) layer on. The shared relay carries
     // no per-object podTemplate (no namespaced policy), so this is inert there.
-    let pod_template = match inputs.pod_template {
+    let (pod_template, sanitized) = match inputs.pod_template {
         Some(overlay) => {
             merge_pod_template(&base_pod_template, overlay, variant.deploy_namespace())
         }
-        None => base_pod_template,
+        None => (base_pod_template, HardeningReport::default()),
     };
 
-    Deployment {
+    let deployment = Deployment {
         metadata: relay_metadata(variant),
         spec: Some(DeploymentSpec {
             replicas: Some(inputs.replicas.max(1)),
@@ -364,7 +371,8 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
             ..Default::default()
         }),
         status: None,
-    }
+    };
+    (deployment, sanitized)
 }
 
 /// Build the relay container's [`ResourceRequirements`] from the controller's
@@ -424,11 +432,13 @@ fn render_relay_pdb(inputs: &RelayRenderInputs<'_>) -> Option<PodDisruptionBudge
 
 /// Render all relay objects for `inputs.variant`.
 pub(crate) fn render_relay(inputs: &RelayRenderInputs<'_>) -> RenderedRelay {
+    let (deployment, sanitized) = render_relay_deployment(inputs);
     RenderedRelay {
         service_account: render_relay_service_account(inputs.variant),
         service: render_relay_service(inputs.variant),
-        deployment: render_relay_deployment(inputs),
+        deployment,
         pdb: render_relay_pdb(inputs),
+        sanitized,
     }
 }
 
@@ -463,6 +473,12 @@ mod tests {
         }
     }
 
+    /// The rendered Deployment alone, for the tests that don't assert on what the
+    /// security envelope took back from the overlay.
+    fn relay_deployment(inputs: &RelayRenderInputs<'_>) -> Deployment {
+        render_relay_deployment(inputs).0
+    }
+
     #[test]
     fn relay_resources_omits_empty_and_keeps_cpu_request_only() {
         let r = relay_resources("50m", "64Mi", "256Mi").expect("some");
@@ -483,7 +499,7 @@ mod tests {
 
     #[test]
     fn deployment_carries_resource_requests() {
-        let d = render_relay_deployment(&inputs());
+        let d = relay_deployment(&inputs());
         let container = &d.spec.unwrap().template.spec.unwrap().containers[0];
         let req = container
             .resources
@@ -580,7 +596,7 @@ mod tests {
 
     #[test]
     fn deployment_runs_serve_relay_for_the_namespace() {
-        let d = render_relay_deployment(&inputs());
+        let d = relay_deployment(&inputs());
         let spec = d.spec.expect("deployment spec");
         assert_eq!(spec.replicas, Some(2), "a relay is HA (≥2 replicas)");
         let container = &spec.template.spec.expect("pod spec").containers[0];
@@ -612,7 +628,7 @@ mod tests {
     fn replicas_clamp_to_at_least_one() {
         let mut i = inputs();
         i.replicas = 0;
-        let d = render_relay_deployment(&i);
+        let d = relay_deployment(&i);
         assert_eq!(
             d.spec.unwrap().replicas,
             Some(1),
@@ -622,7 +638,7 @@ mod tests {
 
     #[test]
     fn relay_pod_is_hardened_without_net_bind_service() {
-        let d = render_relay_deployment(&inputs());
+        let d = relay_deployment(&inputs());
         let pod = d.spec.unwrap().template.spec.unwrap();
         assert_eq!(
             pod.security_context.and_then(|s| s.run_as_non_root),
@@ -646,7 +662,7 @@ mod tests {
 
     #[test]
     fn deployment_gates_readiness_on_relay_health() {
-        let d = render_relay_deployment(&inputs());
+        let d = relay_deployment(&inputs());
         let container = &d.spec.unwrap().template.spec.unwrap().containers[0];
         let probe = container.readiness_probe.as_ref().expect("readiness probe");
         let get = probe.http_get.as_ref().expect("http get");
@@ -665,7 +681,7 @@ mod tests {
         });
         let mut i = inputs();
         i.pod_template = Some(&overlay);
-        let d = render_relay_deployment(&i);
+        let d = relay_deployment(&i);
         let spec = d.spec.expect("spec").template.spec.expect("pod spec");
         assert_eq!(
             spec.node_selector
@@ -686,6 +702,73 @@ mod tests {
         );
     }
 
+    /// A namespace tenant owns `CoxswainRelayPolicy` in their own namespace, so
+    /// its `podTemplate` is a tenant-supplied input to a pod the *controller*
+    /// creates. It must not be able to hand itself the node.
+    #[test]
+    fn hostile_pod_template_overlay_cannot_weaken_the_relay_pod() {
+        let overlay = serde_json::json!({
+            "spec": {
+                "hostNetwork": true,
+                "serviceAccountName": "cluster-admin",
+                "securityContext": {"runAsNonRoot": false, "runAsUser": 0},
+                "containers": [{
+                    "name": "coxswain",
+                    "securityContext": {"privileged": true}
+                }],
+                "volumes": [{"name": "host-root", "hostPath": {"path": "/"}}],
+                "nodeSelector": {"zone": "eu-1"}
+            }
+        });
+        let mut i = inputs();
+        i.pod_template = Some(&overlay);
+        let (d, report) = render_relay_deployment(&i);
+        let spec = d.spec.expect("spec").template.spec.expect("pod spec");
+
+        assert_eq!(
+            spec.host_network, None,
+            "a relay never joins the host network namespace"
+        );
+        assert_eq!(
+            spec.service_account_name.as_deref(),
+            Some(RELAY_NAME),
+            "the relay pod keeps its zero-verb identity"
+        );
+        assert_eq!(
+            spec.security_context.and_then(|s| s.run_as_non_root),
+            Some(true),
+            "runAsNonRoot survives an overlay that turns it off"
+        );
+        assert_eq!(
+            spec.containers[0]
+                .security_context
+                .as_ref()
+                .and_then(|sc| sc.privileged),
+            None,
+            "the coxswain container's rendered securityContext is restored wholesale"
+        );
+        assert!(
+            spec.volumes
+                .as_ref()
+                .expect("volumes")
+                .iter()
+                .all(|v| v.host_path.is_none()),
+            "hostPath volumes are stripped"
+        );
+        assert_eq!(
+            spec.node_selector
+                .as_ref()
+                .and_then(|n| n.get("zone"))
+                .map(String::as_str),
+            Some("eu-1"),
+            "the benign part of the same overlay still applies — this filters, it does not reject"
+        );
+        assert!(
+            !report.is_empty(),
+            "the overwritten fields must be reported so the tenant can be told"
+        );
+    }
+
     #[test]
     fn malformed_pod_template_overlay_degrades_to_base_without_panic() {
         // `containers` patched into a non-array can't deserialize back into a
@@ -694,7 +777,7 @@ mod tests {
         let overlay = serde_json::json!({"spec": {"containers": "not-an-array"}});
         let mut i = inputs();
         i.pod_template = Some(&overlay);
-        let d = render_relay_deployment(&i);
+        let d = relay_deployment(&i);
         let spec = d.spec.expect("spec").template.spec.expect("pod spec");
         assert!(
             spec.containers.iter().any(|c| c.name == "coxswain"),

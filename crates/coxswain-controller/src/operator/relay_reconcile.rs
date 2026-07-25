@@ -29,13 +29,13 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{ObjectReference, Service, ServiceAccount};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::{Api, Client, Resource as _, api::DeleteParams};
 use pingora_core::server::ShutdownWatch;
 use tokio::sync::watch;
 
-use coxswain_core::crd::CoxswainGatewayParameters;
+use coxswain_core::crd::{CoxswainGatewayParameters, CoxswainRelayPolicy};
 use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClass;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
 
@@ -44,7 +44,7 @@ use super::relay_autoscaler::{RelayInputs, RelayRecord, RelayTuning};
 use super::relay_converge::{self, RelayCell};
 use super::relay_params::EffectiveRelayPolicy;
 use super::render_relay::{self, RelayRenderInputs, RelayVariant};
-use super::{apply, params};
+use super::{apply, harden, params};
 
 /// Resync backstop cadence. The registry watch is the prompt driver (a leaf
 /// connect/disconnect shifts the signal); this bounds staleness and, crucially,
@@ -371,7 +371,40 @@ async fn apply_relay_at(
         pod_template: policy.pod_template.as_ref(),
         pdb_replica_ceiling: clamp_u32_to_i32(pdb_ceiling),
     });
+
+    // The policy's `podTemplate` reached for fields the controller owns; the
+    // rendered hardening won. Report it on the policy object itself — that is what
+    // the tenant edits, and unlike a Gateway it has no status to carry the signal.
+    if !rendered.sanitized.is_empty()
+        && let Some(name) = policy.source_name.as_deref()
+    {
+        harden::emit_sanitized_event(
+            &ctx.event_recorder,
+            &relay_policy_object_reference(namespace, name),
+            &rendered.sanitized,
+        )
+        .await;
+    }
+
     apply::apply_relay(&ctx.client, namespace, &rendered).await
+}
+
+/// The `involvedObject` reference for a Kubernetes Event about one namespace's
+/// `CoxswainRelayPolicy`. No `uid`: the policy is read from a reflector store
+/// snapshot, and an Event addressed by group/kind/namespace/name still resolves
+/// under `kubectl describe coxswainrelaypolicy`.
+fn relay_policy_object_reference(namespace: &str, name: &str) -> ObjectReference {
+    ObjectReference {
+        api_version: Some(format!(
+            "{}/{}",
+            CoxswainRelayPolicy::group(&()),
+            CoxswainRelayPolicy::version(&())
+        )),
+        kind: Some(CoxswainRelayPolicy::kind(&()).to_string()),
+        name: Some(name.to_string()),
+        namespace: Some(namespace.to_string()),
+        ..Default::default()
+    }
 }
 
 /// Idempotently delete a relay's `Deployment` / `Service` / `ServiceAccount` /

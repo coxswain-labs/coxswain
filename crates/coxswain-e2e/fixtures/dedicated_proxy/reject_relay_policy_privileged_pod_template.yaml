@@ -1,0 +1,17 @@
+# CoxswainRelayPolicy whose podTemplate repoints the relay pod at another
+# ServiceAccount. The relay policy is namespaced and governs the relay the
+# controller provisions into that namespace, so it is the second tenant-writable
+# path into a controller-created pod and the same policy covers it.
+#
+# Violates exactly one policy rule so the rejection message is deterministic. See
+# reject_gateway_params_privileged_pod_template.yaml.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainRelayPolicy
+metadata:
+  name: e2e-relay-privileged
+  namespace: ${TESTNS}
+spec:
+  podTemplate:
+    spec:
+      serviceAccountName: cluster-admin

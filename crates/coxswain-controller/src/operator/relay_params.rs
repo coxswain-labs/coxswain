@@ -30,6 +30,12 @@ pub(super) struct EffectiveRelayPolicy {
     pub(super) resources: Option<ResourceRequirements>,
     pub(super) pod_template: Option<serde_json::Value>,
     pub(super) autoscaling: Option<RelayAutoscaling>,
+    /// Name of the `CoxswainRelayPolicy` object these fields came from, `None`
+    /// when the namespace has no policy and the values are pure flag defaults.
+    /// Carried so a diagnostic about the policy's own content — the `podTemplate`
+    /// sanitization Event — can be published on the object the tenant would edit,
+    /// which `resolve`'s flattening would otherwise discard.
+    pub(super) source_name: Option<String>,
 }
 
 /// Resolve the effective relay policy for `namespace` from the full policy set (the reflector
@@ -50,6 +56,7 @@ pub(super) fn resolve(
         resources: spec.resources.clone(),
         pod_template: spec.pod_template.clone(),
         autoscaling: spec.autoscaling.clone(),
+        source_name: Some(policy_name(policy).to_string()),
     }
 }
 

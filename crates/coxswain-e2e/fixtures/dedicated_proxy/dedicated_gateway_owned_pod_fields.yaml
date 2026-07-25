@@ -1,0 +1,70 @@
+# Dedicated-mode Gateway whose podTemplate overlay mixes a controller-owned field
+# with a benign one, to prove the controller FILTERS the overlay rather than
+# rejecting it:
+#   app.kubernetes.io/name label → controller-owned (the Deployment's selector
+#     joins on it; an overlay rewrite would leave the Deployment unable to match
+#     its own pods), so it is restored and reported as a PodTemplateSanitized
+#     Warning Event on the Gateway.
+#   nodeSelector + tier label     → benign, and must still land.
+#   a securityContext-free sidecar → hardened by the envelope (privilege
+#     escalation blocked, writable root kept) and NOT reported, since it never
+#     asked for a securityContext to overrule.
+#
+# The overlay deliberately touches nothing the install's ValidatingAdmissionPolicy
+# rejects: this fixture must reach the controller so the envelope itself is what
+# is under test. The escalation fields the VAP does reject are covered by
+# reject_gateway_params_privileged_pod_template.yaml.
+#
+# The image is a deliberately non-pullable `registry.invalid/` literal: the test
+# reads the rendered Deployment spec and never waits on Pod readiness, so
+# ImagePullBackOff is irrelevant (and the image-pinning gate allowlists the
+# prefix). TESTNS is substituted at runtime.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: owned-fields-params
+spec:
+  image: registry.invalid/custom-proxy:v9
+  serviceType: ClusterIP
+  podTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/name: not-coxswain
+        tier: edge
+    spec:
+      nodeSelector:
+        coxswain-labs.dev/pool: edge
+      # A plain sidecar — the most common legitimate use of the escape hatch. It
+      # asks for no securityContext of its own, so the controller must harden it
+      # (privilege escalation blocked) without reporting anything as ignored, and
+      # must leave its root filesystem writable. The emptyDir is the documented
+      # way for such a sidecar to get a writable path.
+      containers:
+        - name: log-shipper
+          image: registry.invalid/log-shipper:v1
+          volumeMounts:
+            - name: scratch
+              mountPath: /var/scratch
+      volumes:
+        - name: scratch
+          emptyDir: {}
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: owned-fields-gw
+spec:
+  gatewayClassName: coxswain
+  infrastructure:
+    parametersRef:
+      group: gateway.coxswain-labs.dev
+      kind: CoxswainGatewayParameters
+      name: owned-fields-params
+  listeners:
+    - name: http
+      port: 8101
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same

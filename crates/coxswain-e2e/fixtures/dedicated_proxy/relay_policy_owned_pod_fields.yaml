@@ -1,0 +1,31 @@
+# CoxswainRelayPolicy that force-enables the namespace relay and whose podTemplate
+# mixes a controller-owned field with a benign one:
+#   app.kubernetes.io/name label → controller-owned (the relay Deployment's
+#     selector joins on it), restored and reported as a PodTemplateSanitized
+#     Warning Event on this policy object.
+#   tolerations                  → benign, and must still land.
+#
+# The overlay deliberately touches nothing the install's ValidatingAdmissionPolicy
+# rejects, so it reaches the controller and exercises the envelope itself. The
+# escalation fields the VAP does reject are covered by
+# reject_relay_policy_privileged_pod_template.yaml.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainRelayPolicy
+metadata:
+  name: e2e-relay-owned-fields
+  namespace: ${TESTNS}
+spec:
+  enabled: true
+  replicas: 1
+  podTemplate:
+    metadata:
+      labels:
+        app.kubernetes.io/name: not-coxswain
+        tier: edge
+    spec:
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: relay
+          effect: NoSchedule

@@ -769,6 +769,25 @@ async fn params_pod_template_merges_onto_template() -> anyhow::Result<()> {
         Some("edge"),
         "podTemplate nodeSelector should merge onto the rendered pod template"
     );
+
+    // The negative: this overlay asks for nothing the controller owns, so the
+    // security envelope must stay silent. A Warning Event here would train
+    // operators to ignore the one that matters. The Deployment above proves the
+    // reconcile already ran, so an Event would exist by now if one were coming.
+    let events: Api<k8s_openapi::api::events::v1::Event> =
+        Api::namespaced(h.client.clone(), &ns.name);
+    let sanitized: Vec<String> = events
+        .list(&ListParams::default())
+        .await?
+        .items
+        .into_iter()
+        .filter(|e| e.reason.as_deref() == Some("PodTemplateSanitized"))
+        .filter_map(|e| e.note)
+        .collect();
+    anyhow::ensure!(
+        sanitized.is_empty(),
+        "a scheduling-only podTemplate overlay must not report anything as ignored; got {sanitized:?}"
+    );
     Ok(())
 }
 
@@ -782,6 +801,213 @@ async fn params_service_type_sets_service_type() -> anyhow::Result<()> {
         svc.spec.as_ref().and_then(|s| s.type_.as_deref()),
         Some("NodePort"),
         "serviceType should render to Service.spec.type"
+    );
+    Ok(())
+}
+
+/// The rendered dedicated-proxy pod is hardened, and stays hardened with a
+/// `podTemplate` overlay applied. The overlay object is tenant-writable while the
+/// pod is created by the cluster-privileged controller, so this is the security
+/// floor every dedicated proxy runs on regardless of what the tenant asked for.
+#[tokio::test]
+async fn dedicated_pod_is_hardened_under_a_pod_template_overlay() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-hardened").await?;
+    let (deploy, _) = provision_field_gateway(&h, &ns).await?;
+
+    let pod = deploy
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .context("rendered pod spec")?;
+
+    anyhow::ensure!(
+        pod.security_context
+            .as_ref()
+            .and_then(|sc| sc.run_as_non_root)
+            == Some(true),
+        "dedicated proxy pod must run as non-root, got {:?}",
+        pod.security_context
+    );
+    anyhow::ensure!(
+        pod.host_network.is_none() && pod.host_pid.is_none() && pod.host_ipc.is_none(),
+        "dedicated proxy pod must not join any host namespace"
+    );
+    anyhow::ensure!(
+        pod.automount_service_account_token == Some(false),
+        "dedicated proxy pod must decline the ambient SA token; it presents only the \
+         projected discovery token"
+    );
+    anyhow::ensure!(
+        pod.volumes
+            .as_ref()
+            .is_none_or(|vs| vs.iter().all(|v| v.host_path.is_none())),
+        "no hostPath volume may ever reach a controller-created pod"
+    );
+
+    let sc = coxswain_container(&deploy)
+        .security_context
+        .as_ref()
+        .context("coxswain container securityContext")?;
+    anyhow::ensure!(
+        sc.allow_privilege_escalation == Some(false)
+            && sc.read_only_root_filesystem == Some(true)
+            && sc.privileged != Some(true),
+        "coxswain container must keep its rendered hardening, got {sc:?}"
+    );
+    anyhow::ensure!(
+        sc.capabilities
+            .as_ref()
+            .and_then(|c| c.drop.as_ref())
+            .is_some_and(|d| d.iter().any(|c| c == "ALL")),
+        "coxswain container must drop ALL capabilities, got {:?}",
+        sc.capabilities
+    );
+    Ok(())
+}
+
+/// A `podTemplate` overlay that sets a controller-owned field is *filtered*, not
+/// rejected: the owned field is restored, the benign fields in the same overlay
+/// still apply, and the tenant is told which field was ignored via a
+/// `PodTemplateSanitized` Warning Event on their Gateway.
+///
+/// The overlay rewrites the reserved `app.kubernetes.io/name` pod label — owned
+/// because the Deployment's selector joins on it, so an overlay rewrite would
+/// leave the Deployment unable to match its own pods.
+#[tokio::test]
+async fn pod_template_overlay_owned_field_is_restored_and_reported() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-sanitized").await?;
+    fixtures::apply_fixture(
+        dedicated::DEDICATED_GATEWAY_OWNED_POD_FIELDS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let deploy = wait::wait_for_resource(
+        &deployments,
+        "owned-fields-gw-coxswain",
+        Duration::from_secs(30),
+    )
+    .await?;
+    let template = &deploy.spec.as_ref().context("Deployment spec")?.template;
+    let labels = template
+        .metadata
+        .as_ref()
+        .and_then(|m| m.labels.as_ref())
+        .context("pod template labels")?;
+
+    anyhow::ensure!(
+        labels.get("app.kubernetes.io/name").map(String::as_str) == Some("coxswain"),
+        "the overlay's app.kubernetes.io/name rewrite must be undone — the Deployment \
+         selector joins on it; got {:?}",
+        labels.get("app.kubernetes.io/name")
+    );
+    anyhow::ensure!(
+        labels.get("tier").map(String::as_str) == Some("edge"),
+        "a non-reserved label from the same overlay must still apply — the envelope \
+         filters the overlay, it does not reject it; got {:?}",
+        labels.get("tier")
+    );
+    anyhow::ensure!(
+        template
+            .spec
+            .as_ref()
+            .and_then(|s| s.node_selector.as_ref())
+            .and_then(|n| n.get("coxswain-labs.dev/pool"))
+            .map(String::as_str)
+            == Some("edge"),
+        "the overlay's nodeSelector must still apply"
+    );
+
+    let event = wait::wait_for_warning_event(
+        &h.client,
+        &ns.name,
+        "Gateway",
+        "owned-fields-gw",
+        "PodTemplateSanitized",
+        Duration::from_secs(60),
+    )
+    .await?;
+    let note = event.note.unwrap_or_default();
+    anyhow::ensure!(
+        note.contains("app.kubernetes.io/name"),
+        "the Event must name the ignored field so the tenant can fix their YAML; got {note:?}"
+    );
+    anyhow::ensure!(
+        !note.contains("log-shipper"),
+        "the sidecar in the same overlay asked for no securityContext, so nothing of \
+         its was overruled — reporting it would tell the tenant to remove a field they \
+         never wrote; got {note:?}"
+    );
+    Ok(())
+}
+
+/// A container the controller did not render still runs inside the envelope: it
+/// keeps its image, mounts, and writable root filesystem, but cannot be the
+/// escape hatch the coxswain container no longer is. Without this the tenant
+/// simply moves the escalation one container to the right.
+#[tokio::test]
+async fn overlay_added_sidecar_runs_without_privilege_escalation() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-dedgw-sidecar").await?;
+    fixtures::apply_fixture(
+        dedicated::DEDICATED_GATEWAY_OWNED_POD_FIELDS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let deploy = wait::wait_for_resource(
+        &deployments,
+        "owned-fields-gw-coxswain",
+        Duration::from_secs(30),
+    )
+    .await?;
+    let pod = deploy
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .context("rendered pod spec")?;
+    let sidecar = pod
+        .containers
+        .iter()
+        .find(|c| c.name == "log-shipper")
+        .context("the overlay's sidecar must survive — the envelope filters, it does not reject")?;
+    let sc = sidecar
+        .security_context
+        .as_ref()
+        .context("a container the controller did not render still gets the envelope")?;
+
+    anyhow::ensure!(
+        sc.privileged == Some(false) && sc.allow_privilege_escalation == Some(false),
+        "sidecar must not be able to escalate, got {sc:?}"
+    );
+    anyhow::ensure!(
+        sc.run_as_non_root == Some(true),
+        "sidecar must run as non-root, got {sc:?}"
+    );
+    anyhow::ensure!(
+        sc.capabilities
+            .as_ref()
+            .and_then(|c| c.drop.as_ref())
+            .is_some_and(|d| d.iter().any(|c| c == "ALL")),
+        "sidecar must drop ALL capabilities, got {:?}",
+        sc.capabilities
+    );
+    anyhow::ensure!(
+        sc.read_only_root_filesystem.is_none(),
+        "a writable root filesystem is not an escalation control — forcing it would break \
+         ordinary sidecars for no security gain; got {sc:?}"
+    );
+    anyhow::ensure!(
+        sidecar
+            .volume_mounts
+            .as_ref()
+            .is_some_and(|m| m.iter().any(|m| m.name == "scratch")),
+        "the sidecar keeps its own emptyDir mount — that is the documented way to get a \
+         writable path"
     );
     Ok(())
 }
@@ -1877,6 +2103,71 @@ mod serial {
             cpu.map(|q| q.0.as_str()),
             Some("25m"),
             "policy resources override must land on the relay container"
+        );
+        Ok(())
+    }
+
+    /// A relay policy's `podTemplate` is the second tenant-writable path into a
+    /// pod the cluster-privileged controller creates, so the same security
+    /// envelope applies: the controller-owned field is restored, the benign one in
+    /// the same overlay still lands, and the tenant is told on the policy object —
+    /// which, unlike a Gateway, has no status to carry the signal.
+    #[tokio::test]
+    async fn relay_pod_template_owned_field_is_restored_and_reported() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            relay_enabled: true,
+            relay_min_proxy_replicas: Some(100),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "relay-pol-sanitized").await?;
+        apply_relay_policy(dedicated::RELAY_POLICY_OWNED_POD_FIELDS, &ns.name).await?;
+
+        apply_and_wait(&h, &ns).await?;
+
+        let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+        wait_for_relay_replicas(&deployments, 1).await?;
+        let template = deployments
+            .get(RELAY_NAME)
+            .await?
+            .spec
+            .context("relay Deployment spec")?
+            .template;
+        let labels = template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.labels.as_ref())
+            .context("relay pod template labels")?;
+
+        anyhow::ensure!(
+            labels.get("app.kubernetes.io/name").map(String::as_str) == Some("coxswain"),
+            "the overlay's app.kubernetes.io/name rewrite must be undone — the relay \
+             Deployment selector joins on it; got {:?}",
+            labels.get("app.kubernetes.io/name")
+        );
+        anyhow::ensure!(
+            template
+                .spec
+                .as_ref()
+                .and_then(|s| s.tolerations.as_ref())
+                .is_some_and(|t| t.iter().any(|t| t.key.as_deref() == Some("dedicated"))),
+            "the benign tolerations from the same overlay must still apply"
+        );
+
+        let event = wait::wait_for_warning_event(
+            &h.client,
+            &ns.name,
+            "CoxswainRelayPolicy",
+            "e2e-relay-owned-fields",
+            "PodTemplateSanitized",
+            Duration::from_secs(60),
+        )
+        .await?;
+        let note = event.note.unwrap_or_default();
+        anyhow::ensure!(
+            note.contains("app.kubernetes.io/name"),
+            "the Event must name the ignored field so the tenant can fix their YAML; \
+             got {note:?}"
         );
         Ok(())
     }

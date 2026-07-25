@@ -59,6 +59,7 @@
 //! Protocol is always `TCP` (HTTP/HTTPS/TLS all ride TCP at the Service layer;
 //! the proxy distinguishes them at L7 by listener config).
 
+use super::harden::{self, HardeningReport};
 use super::merge::strategic_merge_pod_template;
 use super::params::EffectiveParams;
 use super::reconciler::GatewayIdentity;
@@ -106,7 +107,7 @@ use super::render_shared::{
 /// `app.kubernetes.io/instance`; a user override on either silently detaches
 /// the Service from its pods, which is the exact class of bug this list
 /// prevents.
-const RESERVED_LABEL_KEYS: &[&str] = &[
+pub(super) const RESERVED_LABEL_KEYS: &[&str] = &[
     "gateway.networking.k8s.io/gateway-name",
     "app.kubernetes.io/name",
     "app.kubernetes.io/instance",
@@ -196,6 +197,12 @@ pub(super) struct RenderedSpecs {
     /// disruptions. `Some` only when the effective replica floor (minReplicas
     /// if autoscaling, else replicas) is ≥ 2.
     pub(super) pdb: Option<PodDisruptionBudget>,
+    /// Controller-owned pod fields the tenant's `podTemplate` overlay tried to set
+    /// and did not get (see [`super::harden`]). Empty unless the overlay reached
+    /// for the security envelope; the reconciler turns a non-empty report into a
+    /// `Warning` Event on the Gateway so the override is visible to the tenant
+    /// rather than silently dropped.
+    pub(super) sanitized: HardeningReport,
 }
 
 /// Built-in default for [`EffectiveParams::replicas`].
@@ -228,6 +235,7 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
         owner_ref: &owner_ref,
     };
 
+    let (deployment, sanitized) = render_deployment(&common, inputs);
     RenderedSpecs {
         service_account: render_service_account(&common),
         service: render_service(
@@ -236,9 +244,10 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
             inputs.params,
             inputs.effective_ports,
         ),
-        deployment: render_deployment(&common, inputs),
+        deployment,
         hpa: render_hpa(&common, inputs.params),
         pdb: render_pdb(&common, inputs.params),
+        sanitized,
     }
 }
 
@@ -387,9 +396,15 @@ fn metadata_for(common: &Common<'_>) -> ObjectMeta {
     }
 }
 
+/// The dedicated proxy's pod identity. Holds zero verbs (no RoleBinding is ever
+/// rendered for it) and, like the shared proxy's and the relay's, disables the
+/// default token automount: the pod presents only the explicit, audience-scoped
+/// projected token from [`discovery_volumes`], so the ambient
+/// `/var/run/secrets/kubernetes.io/serviceaccount` mount is pure surface.
 fn render_service_account(common: &Common<'_>) -> ServiceAccount {
     ServiceAccount {
         metadata: metadata_for(common),
+        automount_service_account_token: Some(false),
         ..Default::default()
     }
 }
@@ -519,7 +534,13 @@ fn service_ports(gateway: &Gateway, effective_ports: &[EffectiveListenerPort]) -
 /// Single source of truth in the reflector (also read by `build_tls`).
 pub(super) use coxswain_reflector::port_alloc::SHARED_GATEWAY_VIP_COMPONENT;
 
-fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployment {
+/// Render the dedicated proxy `Deployment`, returning it alongside the fields the
+/// security envelope took back from the tenant's `podTemplate` overlay (see
+/// [`super::harden`]) so the reconciler can report them.
+fn render_deployment(
+    common: &Common<'_>,
+    inputs: &RenderInputs<'_>,
+) -> (Deployment, HardeningReport) {
     let gw_name = inputs.gateway.metadata.name.as_deref().unwrap_or("");
     let image = inputs
         .params
@@ -612,6 +633,7 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         }),
         spec: Some(PodSpec {
             service_account_name: Some(common.name.to_string()),
+            automount_service_account_token: Some(false),
             security_context: Some(pod_hardening_security_context()),
             containers: vec![coxswain_container],
             volumes: Some(discovery_volumes()),
@@ -619,9 +641,9 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         }),
     };
 
-    let pod_template = match inputs.params.pod_template.as_ref() {
+    let (pod_template, sanitized) = match inputs.params.pod_template.as_ref() {
         Some(overlay) => merge_pod_template(&base_pod_template, overlay, gw_name),
-        None => base_pod_template,
+        None => (base_pod_template, HardeningReport::default()),
     };
 
     let mut selector_labels = BTreeMap::new();
@@ -633,7 +655,7 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
         );
     }
 
-    Deployment {
+    let deployment = Deployment {
         metadata: metadata_for(common),
         spec: Some(DeploymentSpec {
             replicas,
@@ -645,7 +667,8 @@ fn render_deployment(common: &Common<'_>, inputs: &RenderInputs<'_>) -> Deployme
             ..Default::default()
         }),
         status: None,
-    }
+    };
+    (deployment, sanitized)
 }
 
 /// The two read-only volumes every dedicated proxy needs to bootstrap an SVID:
@@ -824,11 +847,19 @@ pub(super) fn effective_ports_need_net_bind(effective_ports: &[EffectiveListener
 }
 
 /// Apply a partial `PodTemplateSpec` overlay to a base via the strategic
-/// merge from [`super::merge`]. Round-trips through JSON because the
-/// strategic-merge primitive operates on [`serde_json::Value`].
+/// merge from [`super::merge`], then filter the result back into the base's
+/// security envelope via [`super::harden::enforce`]. Round-trips through JSON
+/// because the strategic-merge primitive operates on [`serde_json::Value`].
 ///
-/// Shared with [`super::render_relay`] so the namespace relay's `podTemplate`
-/// escape hatch (#589) merges with identical semantics to the dedicated proxy's.
+/// Shared by all three renderers — dedicated proxy, shared pool, namespace relay —
+/// so a `podTemplate` overlay merges *and* is bounded with identical semantics
+/// wherever it comes from. Because this is the only way to obtain a merged pod
+/// template and the enforcement is unconditional, "hardening survives the overlay"
+/// needs no lint or check script to stay true.
+///
+/// Returns the merged template alongside the fields the envelope took back; an
+/// empty report is the common case (a scheduling-only overlay asks for nothing
+/// the controller owns). Callers surface a non-empty one to the tenant.
 ///
 /// **Never panics.** The overlay is operator-supplied and opaque to the CRD
 /// validator (`x-kubernetes-preserve-unknown-fields`), so a malformed overlay
@@ -841,7 +872,7 @@ pub(super) fn merge_pod_template(
     base: &PodTemplateSpec,
     overlay: &serde_json::Value,
     context: &str,
-) -> PodTemplateSpec {
+) -> (PodTemplateSpec, HardeningReport) {
     let base_json = match serde_json::to_value(base) {
         Ok(v) => v,
         Err(e) => {
@@ -852,12 +883,23 @@ pub(super) fn merge_pod_template(
                 error = %e,
                 "podTemplate base failed to serialize; rendering without the overlay"
             );
-            return base.clone();
+            return (base.clone(), HardeningReport::default());
         }
     };
     let merged = strategic_merge_pod_template(&base_json, overlay);
     match serde_json::from_value::<PodTemplateSpec>(merged) {
-        Ok(pt) => pt,
+        Ok(mut pt) => {
+            let report = harden::enforce(base, &mut pt);
+            if !report.is_empty() {
+                tracing::warn!(
+                    context = %context,
+                    fields = %report.summary(),
+                    "podTemplate overlay set controller-owned pod fields; the rendered \
+                     hardening wins and those fields are ignored"
+                );
+            }
+            (pt, report)
+        }
         Err(e) => {
             tracing::warn!(
                 context = %context,
@@ -865,7 +907,7 @@ pub(super) fn merge_pod_template(
                 "operator podTemplate overlay produced an invalid PodTemplateSpec; \
                  ignoring the overlay and rendering the base pod spec"
             );
-            base.clone()
+            (base.clone(), HardeningReport::default())
         }
     }
 }
@@ -1442,7 +1484,11 @@ mod tests {
         }))
         .expect("valid base");
         let overlay = json!({"spec": {"containers": "not-an-array"}});
-        let merged = merge_pod_template(&base, &overlay, "test-gw");
+        let (merged, report) = merge_pod_template(&base, &overlay, "test-gw");
+        assert!(
+            report.is_empty(),
+            "the degrade path renders the base itself; nothing was taken back"
+        );
         let names: Vec<String> = merged
             .spec
             .expect("pod spec")
@@ -1465,7 +1511,11 @@ mod tests {
         }))
         .expect("valid base");
         let overlay = json!({"spec": {"nodeSelector": {"zone": "eu"}}});
-        let merged = merge_pod_template(&base, &overlay, "test-gw");
+        let (merged, report) = merge_pod_template(&base, &overlay, "test-gw");
+        assert!(
+            report.is_empty(),
+            "a scheduling-only overlay stays inside the envelope"
+        );
         assert_eq!(
             merged
                 .spec
@@ -1547,6 +1597,125 @@ mod tests {
         assert_eq!(
             result.service_account.metadata.name.as_deref(),
             Some("my-gw-coxswain")
+        );
+        assert_eq!(
+            result.service_account.automount_service_account_token,
+            Some(false),
+            "the dedicated SA holds zero verbs and the pod uses the explicit projected \
+             token — the ambient mount is pure surface, as on the shared proxy and relay"
+        );
+        assert_eq!(
+            pod_spec.automount_service_account_token,
+            Some(false),
+            "and the pod declines it too, so an SA-level default can't reintroduce it"
+        );
+    }
+
+    /// A `CoxswainGatewayParameters` lives in the Gateway's own namespace, so its
+    /// `podTemplate` is tenant input to a pod the cluster-privileged controller
+    /// creates. The rendered hardening must win over every field of it.
+    #[test]
+    fn hostile_pod_template_overlay_cannot_weaken_the_dedicated_pod() {
+        let gw = make_gateway("default", "my-gw", vec![("http", 80, "HTTP")]);
+        let params = EffectiveParams {
+            pod_template: Some(json!({
+                "spec": {
+                    "hostNetwork": true,
+                    "hostPID": true,
+                    "serviceAccountName": "cluster-admin",
+                    "automountServiceAccountToken": true,
+                    "securityContext": {"runAsNonRoot": false, "runAsUser": 0},
+                    "containers": [
+                        {"name": "coxswain", "securityContext": {"privileged": true}},
+                        {"name": "evil", "securityContext": {"privileged": true}}
+                    ],
+                    "volumes": [{"name": "host-root", "hostPath": {"path": "/"}}],
+                    "nodeSelector": {"pool": "edge"}
+                }
+            })),
+            ..Default::default()
+        };
+        let result = render(&RenderInputs {
+            gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
+            params: &params,
+            controller_image: "coxswain:v0.2",
+            gateway_class_name: "coxswain",
+            discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
+            discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
+            discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
+            discovery_trust_domain: "cluster.local",
+            admin_port: 8082,
+            effective_ports: &[],
+        });
+        let pod = result
+            .deployment
+            .spec
+            .expect("deployment spec")
+            .template
+            .spec
+            .expect("pod spec");
+
+        assert_eq!(pod.host_network, None, "hostNetwork is controller-owned");
+        assert_eq!(pod.host_pid, None, "hostPID is controller-owned");
+        assert_eq!(
+            pod.service_account_name.as_deref(),
+            Some("my-gw-coxswain"),
+            "the pod keeps the provisioned zero-verb identity"
+        );
+        assert_eq!(pod.automount_service_account_token, Some(false));
+        assert_eq!(
+            pod.security_context.and_then(|s| s.run_as_non_root),
+            Some(true),
+            "runAsNonRoot survives an overlay that turns it off"
+        );
+        let coxswain = pod
+            .containers
+            .iter()
+            .find(|c| c.name == "coxswain")
+            .expect("coxswain container");
+        assert_eq!(
+            coxswain
+                .security_context
+                .as_ref()
+                .and_then(|sc| sc.privileged),
+            None,
+            "the coxswain container's rendered securityContext is restored wholesale"
+        );
+        let sidecar = pod
+            .containers
+            .iter()
+            .find(|c| c.name == "evil")
+            .expect("overlay-added container survives, hardened");
+        let sc = sidecar
+            .security_context
+            .as_ref()
+            .expect("sidecar security context");
+        assert_eq!(
+            sc.privileged,
+            Some(false),
+            "a sidecar cannot be the escape hatch the coxswain container no longer is"
+        );
+        assert_eq!(sc.allow_privilege_escalation, Some(false));
+        assert!(
+            pod.volumes
+                .as_ref()
+                .expect("volumes")
+                .iter()
+                .all(|v| v.host_path.is_none()),
+            "hostPath volumes never survive"
+        );
+        assert_eq!(
+            pod.node_selector
+                .as_ref()
+                .and_then(|n| n.get("pool"))
+                .map(String::as_str),
+            Some("edge"),
+            "the benign part of the same overlay still applies — this filters, it does not reject"
+        );
+        assert!(
+            !result.sanitized.is_empty(),
+            "the overwritten fields must be reported so the Gateway's owner can be told"
         );
     }
 

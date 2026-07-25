@@ -281,6 +281,9 @@ fn shared_relay_tuning(ctx: &ReconcileContext) -> RelayTuning {
             ctx.relay.max_replicas.max(floor),
             ctx.relay.target_proxies_per_replica.max(1),
         )),
+        // Synthesized from flags, not read from a policy object — there is no
+        // `CoxswainRelayPolicy` for the shared tier to address a diagnostic at.
+        source_name: None,
     };
     RelayTuning::resolve(&policy, ctx.relay_tuning_defaults())
 }

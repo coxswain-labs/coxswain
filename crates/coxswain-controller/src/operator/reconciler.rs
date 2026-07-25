@@ -41,7 +41,9 @@
 
 use super::relay_params::{self, EffectiveRelayPolicy};
 use super::render_shared_proxy::ProxyPoolConfig;
-use super::{apply, params, relay_autoscaler, render, render_relay, render_shared, status, vip};
+use super::{
+    apply, harden, params, relay_autoscaler, render, render_relay, render_shared, status, vip,
+};
 use crate::controller::StatusOutcome;
 use coxswain_core::Shared;
 use coxswain_core::crd::{CoxswainGatewayParameters, CoxswainRelayPolicy, ServiceType};
@@ -54,11 +56,14 @@ use coxswain_reflector::ingress::IngressPorts;
 use coxswain_reflector::status::{GatewayListenerStatus, GatewayListenerStatusHandle};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Node, Pod, Service, ServiceAccount};
+use k8s_openapi::api::core::v1::{
+    ConfigMap, Namespace, Node, ObjectReference, Pod, Service, ServiceAccount,
+};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::{
     Api, Client, Resource as _,
     api::{DeleteParams, ListParams, ObjectMeta, Patch, PatchParams},
+    runtime::events::{Recorder, Reporter},
 };
 use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -325,6 +330,11 @@ pub(crate) struct ReconcileContext {
     pub(super) controller_image: String,
     pub(super) leader: Arc<AtomicBool>,
     pub(super) client: Client,
+    /// Shared Kubernetes Event publisher for every operator diagnostic. Held on
+    /// the context rather than constructed per call because the deduplication
+    /// that collapses a repeating diagnostic into one Event object lives in the
+    /// `Recorder`'s cache — a fresh `Recorder` per emission defeats it.
+    pub(super) event_recorder: Recorder,
     pub(super) class_store: MergedStore<GatewayClass>,
     pub(super) params_store: MergedStore<CoxswainGatewayParameters>,
     /// `CoxswainRelayPolicy` snapshot (#589): per-namespace relay tuning overlaid onto the
@@ -464,11 +474,24 @@ impl ReconcileContext {
         stores: coxswain_reflector::OperatorStores,
         client: Client,
     ) -> Self {
+        // One long-lived Recorder for the whole operator: its dedup cache is what
+        // turns a diagnostic that recurs on every reconcile pass into a single
+        // Event object with a rising series count. A per-call `Recorder::new`
+        // starts with an empty cache and creates a fresh Event each time, which on
+        // a 2 s bind-gate requeue is thousands of objects an hour.
+        let event_recorder = Recorder::new(
+            client.clone(),
+            Reporter {
+                controller: config.controller_name.clone(),
+                instance: None,
+            },
+        );
         Self {
             controller_name: config.controller_name,
             controller_image: config.controller_image,
             leader: config.leader,
             client,
+            event_recorder,
             class_store: stores.gateway_classes,
             params_store: stores.params,
             relay_policies_store: stores.relay_policies,
@@ -1073,6 +1096,19 @@ async fn reconcile_inner(
         effective_ports: dedicated_ports,
     });
 
+    // The tenant's `podTemplate` reached for fields the controller owns (pod or
+    // container securityContext, the pinned SA, a host namespace, a hostPath
+    // volume). The rendered hardening won — tell them so, on the object they'd
+    // edit to fix it, rather than letting the override vanish silently.
+    if !rendered.sanitized.is_empty() {
+        harden::emit_sanitized_event(
+            &ctx.event_recorder,
+            &gateway_object_reference(&gw),
+            &rendered.sanitized,
+        )
+        .await;
+    }
+
     // Stage 1a — make the controller's CA trust bundle reachable from the
     // dedicated proxy's namespace so its `trust-bundle` volume has content and
     // it can verify the controller during SVID bootstrap (#423). No-op when the
@@ -1642,6 +1678,22 @@ pub(super) fn gateway_id(gw: &Gateway) -> String {
         gw.metadata.namespace.as_deref().unwrap_or(""),
         gw.metadata.name.as_deref().unwrap_or("")
     )
+}
+
+/// The `involvedObject` reference used when the operator publishes a Kubernetes
+/// Event about a Gateway. Single source of truth so every emitter addresses the
+/// same object identity — a reference that drifts (missing `uid`, wrong
+/// `apiVersion`) still publishes, but the Event stops showing up under
+/// `kubectl describe gateway`, which is the only reason to emit it.
+pub(super) fn gateway_object_reference(gw: &Gateway) -> ObjectReference {
+    ObjectReference {
+        api_version: Some("gateway.networking.k8s.io/v1".into()),
+        kind: Some("Gateway".into()),
+        name: gw.metadata.name.clone(),
+        namespace: gw.metadata.namespace.clone(),
+        uid: gw.metadata.uid.clone(),
+        ..Default::default()
+    }
 }
 
 fn hash_rendered(rendered: &render::RenderedSpecs) -> u64 {
