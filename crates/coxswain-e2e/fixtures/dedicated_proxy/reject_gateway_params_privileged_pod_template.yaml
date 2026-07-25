@@ -1,0 +1,22 @@
+# CoxswainGatewayParameters whose podTemplate hands the coxswain container a
+# privileged securityContext.
+#
+# This object is tenant-writable (namespaced, in the Gateway's own namespace) but
+# the pod it shapes is created by the cluster-privileged controller, so the
+# install's ValidatingAdmissionPolicy rejects it at apply time.
+#
+# Exactly ONE policy rule is violated, deliberately: the apiserver reports only
+# the first failing validation, so a fixture that tripped several would let the
+# test pass while the rule it names had been deleted.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: privileged-params
+spec:
+  podTemplate:
+    spec:
+      containers:
+        - name: coxswain
+          securityContext:
+            privileged: true

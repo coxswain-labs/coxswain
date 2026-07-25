@@ -95,7 +95,14 @@ pub struct CoxswainRelayPolicySpec {
     /// Raw partial `PodTemplateSpec` strategic-merged onto the controller-rendered relay
     /// pod — the scheduling escape hatch (`nodeSelector`, `tolerations`, `affinity`,
     /// `topologySpreadConstraints`, `priorityClassName`, …). Opaque to the CRD validator
-    /// (`x-kubernetes-preserve-unknown-fields`); the controller merges and validates it.
+    /// (`x-kubernetes-preserve-unknown-fields`); the controller merges it and then
+    /// re-asserts its own hardening over the result. It cannot weaken pod security:
+    /// the pod- and container-level `securityContext`, `serviceAccountName`,
+    /// `automountServiceAccountToken` and the host namespace flags are
+    /// controller-owned and any overlay value for them is ignored; an added volume
+    /// must use a source the `restricted` Pod Security Standard allows, and
+    /// `hostPort`s are stripped. Overwritten fields are reported as a
+    /// `PodTemplateSanitized` Warning Event on this policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "preserve_unknown_fields_schema")]
     pub pod_template: Option<serde_json::Value>,

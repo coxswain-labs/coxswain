@@ -1,0 +1,14 @@
+# CoxswainGatewayParameters whose podTemplate puts the controller-created pod on
+# the node's network namespace.
+#
+# Violates exactly one policy rule — the host-namespace flags — so the rejection
+# message is deterministic. See reject_gateway_params_privileged_pod_template.yaml.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: host-namespace-params
+spec:
+  podTemplate:
+    spec:
+      hostNetwork: true

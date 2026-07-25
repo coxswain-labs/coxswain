@@ -52,6 +52,7 @@ use std::collections::BTreeMap;
 
 use coxswain_core::fleet::ADMIN_PORT_ANNOTATION;
 
+use super::harden::HardeningReport;
 use super::render::{
     container_hardening_security_context, discovery_volume_mounts, discovery_volumes,
     http_get_probe, merge_pod_template, pod_hardening_security_context, pod_identity_env,
@@ -435,12 +436,18 @@ fn render_shared_proxy_deployment(inputs: &SharedProxyRenderInputs<'_>) -> Deplo
 
     // Strategic-merge the operator's `proxy.shared.podTemplate` overlay (scheduling
     // + pod metadata + pull secrets) onto the base, same semantics as the dedicated
-    // proxy's `CoxswainGatewayParameters.spec.podTemplate`. The controller-managed
-    // fields (SA name, security context, discovery volumes, the coxswain container)
-    // survive; `merge_pod_template` degrades to the base on a malformed overlay.
-    let pod_template = match config.pod_template.as_ref() {
+    // proxy's `CoxswainGatewayParameters.spec.podTemplate`. The controller-owned
+    // fields (SA name, pod + container security context, host namespaces) are
+    // re-asserted afterwards by `harden::enforce`, and `merge_pod_template` degrades
+    // to the base on a malformed overlay.
+    //
+    // The sanitization report is dropped rather than surfaced: this overlay is an
+    // install-time Helm value owned by the cluster admin, not a tenant CR, so there
+    // is no tenant-owned object to hang a Warning Event on. `merge_pod_template`
+    // has already WARN-logged the overwritten fields.
+    let (pod_template, _sanitized) = match config.pod_template.as_ref() {
         Some(overlay) => merge_pod_template(&base_pod_template, overlay, &config.name),
-        None => base_pod_template,
+        None => (base_pod_template, HardeningReport::default()),
     };
 
     // Under autoscaling the HPA is the sole authority on replica count; omitting

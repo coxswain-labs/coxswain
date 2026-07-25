@@ -846,6 +846,114 @@ spec:
         '" — must be a comma-separated list of CIDR blocks or IPs (e.g. "10.0.0.0/8,192.168.0.0/16")'
 ---
 # Source: coxswain/templates/vap.yaml
+# ValidatingAdmissionPolicy + Binding for the podTemplate escape hatch on the two
+# params CRDs.
+#
+# The controller already refuses to weaken its rendered pod hardening: it merges
+# the overlay, then re-asserts the controller-owned fields over the result. That
+# filter is the authoritative guarantee and holds with or without this policy.
+# This policy exists purely for feedback speed — without it the tenant's apply
+# succeeds and they learn their securityContext was ignored from a Warning Event
+# afterwards; with it, `kubectl apply` fails immediately naming the field.
+#
+# It denies a subset of what the controller filters — the escalation-relevant
+# fields. The controller also restores things this policy says nothing about (the
+# reserved pod labels, its own volumes), because those are availability concerns
+# rather than reasons to fail a tenant's apply. Keep the two in sync in the other
+# direction: a field added here that the controller still honours would reject a
+# working config.
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: coxswain-pod-template-hardening
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/instance: coxswain
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: ["gateway.coxswain-labs.dev"]
+        apiVersions: ["v1alpha1"]
+        operations: ["CREATE", "UPDATE"]
+        resources: ["coxswaingatewayparameters", "coxswainrelaypolicies"]
+  matchConditions:
+    - name: has-pod-template-spec
+      expression: >-
+        has(object.spec) && has(object.spec.podTemplate) &&
+        'spec' in object.spec.podTemplate
+  variables:
+    # podTemplate is x-kubernetes-preserve-unknown-fields, so its contents are an
+    # untyped map — key presence is tested with `in`, not field selection.
+    - name: pod
+      expression: object.spec.podTemplate.spec
+    - name: allContainers
+      expression: >-
+        (('containers' in variables.pod) ? variables.pod.containers : []) +
+        (('initContainers' in variables.pod) ? variables.pod.initContainers : [])
+    - name: volumes
+      expression: "('volumes' in variables.pod) ? variables.pod.volumes : []"
+  validations:
+    - expression: "!('securityContext' in variables.pod)"
+      message: >-
+        podTemplate.spec.securityContext is controller-owned — the rendered pod runs
+        runAsNonRoot with the RuntimeDefault seccomp profile and an overlay cannot
+        change it. Remove the field.
+
+    - expression: "!('serviceAccountName' in variables.pod)"
+      message: >-
+        podTemplate.spec.serviceAccountName is controller-owned — the pod runs as the
+        provisioned zero-verb ServiceAccount. Remove the field.
+
+    - expression: "!('automountServiceAccountToken' in variables.pod)"
+      message: >-
+        podTemplate.spec.automountServiceAccountToken is controller-owned — the pod
+        mounts only the explicit audience-scoped discovery token. Remove the field.
+
+    - expression: >-
+        !('hostNetwork' in variables.pod) && !('hostPID' in variables.pod) &&
+        !('hostIPC' in variables.pod)
+      message: >-
+        podTemplate.spec.hostNetwork / hostPID / hostIPC are controller-owned — a
+        controller-provisioned pod never joins a host namespace. Remove the field.
+
+    # `size(v) == 2` is the exactly-one-source check: a volume is `name` plus one
+    # source field, so two keys total. Without it `{emptyDir: {}, hostPath: {…}}`
+    # would satisfy the allowlist while carrying the hostPath through, and the
+    # apiserver would then reject the rendered Deployment outright.
+    - expression: >-
+        variables.volumes.all(v, size(v) == 2 &&
+          ['configMap', 'csi', 'downwardAPI', 'emptyDir', 'ephemeral',
+           'persistentVolumeClaim', 'projected', 'secret'].exists(src, src in v))
+      message: >-
+        podTemplate.spec.volumes[] must declare exactly one volume source, and it must be
+        one the restricted Pod Security Standard allows (configMap, csi, downwardAPI,
+        emptyDir, ephemeral, persistentVolumeClaim, projected, secret). hostPath mounts
+        the node's filesystem, gitRepo has the kubelet clone a repository as root on the
+        node, and nfs/iscsi/cephfs/flexVolume attach storage nobody vetted — into a pod
+        the controller creates on your behalf.
+
+    - expression: "!('ephemeralContainers' in variables.pod)"
+      message: >-
+        podTemplate.spec.ephemeralContainers is rejected — a pod template may not carry
+        ephemeral containers at all, so the rendered Deployment would be refused by the
+        apiserver. Attach an ephemeral container to the running pod with
+        `kubectl debug` instead.
+
+    - expression: "variables.allContainers.all(c, !('securityContext' in c))"
+      message: >-
+        podTemplate container securityContext is controller-owned — the coxswain
+        container keeps its rendered hardening and any container you add runs with
+        privilege escalation blocked. Remove the field.
+
+    - expression: >-
+        variables.allContainers.all(c,
+          !('ports' in c) || c.ports.all(p, !('hostPort' in p)))
+      message: >-
+        podTemplate container ports[].hostPort is rejected — it binds the node's
+        network namespace. Expose the port through the Gateway listener instead.
+---
+# Source: coxswain/templates/vap.yaml
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingAdmissionPolicyBinding
 metadata:
@@ -855,4 +963,16 @@ metadata:
     app.kubernetes.io/instance: coxswain
 spec:
   policyName: coxswain-ingress-annotations
+  validationActions: [Deny]
+---
+# Source: coxswain/templates/vap.yaml
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: coxswain-pod-template-hardening
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/instance: coxswain
+spec:
+  policyName: coxswain-pod-template-hardening
   validationActions: [Deny]

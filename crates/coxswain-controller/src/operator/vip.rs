@@ -16,8 +16,8 @@
 //! Services whose owning Gateway is gone or has left shared mode.
 
 use super::reconciler::{
-    GatewayIdentity, ReconcileContext, gateway_id, gateway_key, ignore_not_found,
-    is_owned_shared_mode,
+    GatewayIdentity, ReconcileContext, gateway_id, gateway_key, gateway_object_reference,
+    ignore_not_found, is_owned_shared_mode,
 };
 use super::{apply, render_shared};
 use coxswain_core::crd::ServiceType;
@@ -27,7 +27,7 @@ use coxswain_reflector::port_alloc::{
     DEFAULT_INTERNAL_PORT_RANGE, ListenerKey, SHARED_GATEWAY_VIP_COMPONENT,
     allocate_internal_ports, read_vip_internal_ports,
 };
-use k8s_openapi::api::core::v1::{ObjectReference, Service};
+use k8s_openapi::api::core::v1::Service;
 use kube::{Api, Client, Resource as _, api::DeleteParams, api::ListParams};
 use pingora_core::server::ShutdownWatch;
 use std::collections::{BTreeMap, HashMap};
@@ -686,14 +686,7 @@ async fn emit_remap_violation_event(
     else {
         return;
     };
-    let reference = ObjectReference {
-        api_version: Some("gateway.networking.k8s.io/v1".into()),
-        kind: Some("Gateway".into()),
-        name: gw.metadata.name.clone(),
-        namespace: gw.metadata.namespace.clone(),
-        uid: gw.metadata.uid.clone(),
-        ..Default::default()
-    };
+    let reference = gateway_object_reference(gw);
     let reporter = Reporter {
         controller: ctx.controller_name.to_string(),
         instance: None,
@@ -731,14 +724,7 @@ async fn emit_port_exhaustion_event(client: &Client, gw: &Gateway, controller_na
         "operator: internal target-port range (30000-32767) exhausted; \
          some shared-mode listeners have no VIP port and will not be addressed"
     );
-    let reference = ObjectReference {
-        api_version: Some("gateway.networking.k8s.io/v1".into()),
-        kind: Some("Gateway".into()),
-        name: gw.metadata.name.clone(),
-        namespace: gw.metadata.namespace.clone(),
-        uid: gw.metadata.uid.clone(),
-        ..Default::default()
-    };
+    let reference = gateway_object_reference(gw);
     let reporter = Reporter {
         controller: controller_name.to_string(),
         instance: None,

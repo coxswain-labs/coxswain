@@ -1877,6 +1877,94 @@ async fn coxswain_gateway_parameters_invalid_service_type_rejected() -> anyhow::
     Ok(())
 }
 
+// ── podTemplate security envelope, admission half (#662) ─────────────────────
+//
+// The params CRDs are tenant-writable but shape a pod the cluster-privileged
+// controller creates, so a `podTemplate` reaching for the node is a
+// privilege-escalation path. The controller's own security envelope is the
+// authoritative backstop — it filters the overlay even on objects that predate
+// this policy — while the VAP makes the failure immediate and names the field,
+// instead of leaving the tenant to discover from a Warning Event that their
+// config was ignored.
+//
+// One test per policy rule, each asserting the message that rule emits: the
+// apiserver reports only the FIRST failing validation, so an `OR` over several
+// substrings would stay green after the rule under test had been deleted.
+
+/// A privileged container `securityContext` in a `podTemplate` is rejected.
+#[tokio::test]
+async fn gateway_params_privileged_container_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-cgp-privileged").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        dedicated::REJECT_GATEWAY_PARAMS_PRIVILEGED_POD_TEMPLATE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("container securityContext"),
+        "rejection must come from the container-securityContext rule, got: {msg}"
+    );
+    Ok(())
+}
+
+/// A `hostPath` volume in a `podTemplate` is rejected by the volume-source
+/// allowlist — the rule that keeps the node's filesystem out of a pod the
+/// controller creates on the tenant's behalf.
+#[tokio::test]
+async fn gateway_params_host_path_volume_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-cgp-hostpath").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        dedicated::REJECT_GATEWAY_PARAMS_HOST_PATH_VOLUME,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("volumes[]"),
+        "rejection must come from the volume-source allowlist rule, got: {msg}"
+    );
+    Ok(())
+}
+
+/// `hostNetwork` in a `podTemplate` is rejected by the host-namespace rule.
+#[tokio::test]
+async fn gateway_params_host_namespace_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-cgp-hostns").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        dedicated::REJECT_GATEWAY_PARAMS_HOST_NAMESPACE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("hostNetwork"),
+        "rejection must come from the host-namespace rule, got: {msg}"
+    );
+    Ok(())
+}
+
+/// The relay-side counterpart: a `CoxswainRelayPolicy` whose `podTemplate`
+/// repoints the relay's ServiceAccount is rejected. `CoxswainRelayPolicy` is the
+/// second tenant-writable path into a controller-created pod, and carries no
+/// status subresource, so admission is the only place a tenant gets a synchronous
+/// answer.
+#[tokio::test]
+async fn relay_policy_service_account_override_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "vap-crp-podtmpl").await?;
+    let msg = fixtures::apply_fixture_expect_rejected(
+        dedicated::REJECT_RELAY_POLICY_PRIVILEGED_POD_TEMPLATE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    anyhow::ensure!(
+        msg.contains("serviceAccountName"),
+        "rejection must come from the serviceAccountName rule, got: {msg}"
+    );
+    Ok(())
+}
+
 /// A valid GRPCRoute with a resolvable backend reaches `Accepted=True`,
 /// `Programmed=True`, and `ResolvedRefs=True`.
 ///

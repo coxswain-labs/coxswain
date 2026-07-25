@@ -1772,54 +1772,90 @@ pub async fn wait_for_backend_tls_policy_condition_with_reason(
     .await
 }
 
-/// Poll `events.k8s.io/v1` Events until a `Warning` Event matching `reason` and
-/// `ingress_name` appears in `namespace`, or `timeout` elapses.
+/// Poll `events.k8s.io/v1` Events until a `Warning` Event matching `reason`
+/// appears on the `kind`/`name` object in `namespace`, or `timeout` elapses.
 ///
 /// The kube `Recorder` deduplicates Events in-process, so the first reconcile
 /// after an issue appears will emit the Event; subsequent resyncs update the
 /// count rather than creating a new object. This helper therefore only needs to
 /// find **one** matching Event.
 ///
+/// Matching on `kind` as well as `name` matters: a namespace under test can hold
+/// several objects with the same name (a Gateway and its provisioned Deployment,
+/// say), and asserting on the wrong one would pass for the wrong reason.
+///
 /// Returns the matching Event.
 ///
 /// # Errors
 ///
 /// Returns an error if no matching Event is found before `timeout` elapses.
-pub async fn wait_for_ingress_warning_event(
+pub async fn wait_for_warning_event(
     client: &kube::Client,
     namespace: &str,
-    ingress_name: &str,
+    kind: &str,
+    name: &str,
     reason: &str,
     timeout: Duration,
 ) -> anyhow::Result<k8s_openapi::api::events::v1::Event> {
     use k8s_openapi::api::events::v1::Event;
     let api: Api<Event> = Api::namespaced(client.clone(), namespace);
-    let ingress_name = ingress_name.to_owned();
+    let kind = kind.to_owned();
+    let name = name.to_owned();
     let reason = reason.to_owned();
     poll_until(
         timeout,
         POLL,
         || {
-            let ingress_name = ingress_name.clone();
+            let api = api.clone();
+            let kind = kind.clone();
+            let name = name.clone();
             let reason = reason.clone();
+            // Render every Event actually present, not just the one expected: the
+            // three ways this times out — nothing emitted at all, emitted as
+            // `Normal`, or emitted against the wrong `regarding.kind` — are
+            // indistinguishable from a message that only echoes the query.
             async move {
+                let observed = match api.list(&kube::api::ListParams::default()).await {
+                    Ok(list) => list
+                        .items
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "{}/{} on {}/{}",
+                                e.type_.as_deref().unwrap_or("?"),
+                                e.reason.as_deref().unwrap_or("?"),
+                                e.regarding
+                                    .as_ref()
+                                    .and_then(|r| r.kind.as_deref())
+                                    .unwrap_or("?"),
+                                e.regarding
+                                    .as_ref()
+                                    .and_then(|r| r.name.as_deref())
+                                    .unwrap_or("?"),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                    Err(e) => format!("<Event list failed: {e}>"),
+                };
                 format!(
-                    "Warning Event reason={reason} on Ingress {ingress_name}/{namespace} to appear"
+                    "Warning Event reason={reason} on {kind} {name}/{namespace} to appear; \
+                     Events in {namespace}: [{observed}]"
                 )
             }
         },
         || {
             let api = api.clone();
-            let ingress_name = ingress_name.clone();
+            let kind = kind.clone();
+            let name = name.clone();
             let reason = reason.clone();
             async move {
                 let list = api.list(&kube::api::ListParams::default()).await.ok()?;
                 list.items.into_iter().find(|e| {
                     e.type_.as_deref() == Some("Warning")
                         && e.reason.as_deref() == Some(&reason)
-                        && e.regarding.as_ref().and_then(|r| r.name.as_deref())
-                            == Some(&ingress_name)
-                        && e.regarding.as_ref().and_then(|r| r.kind.as_deref()) == Some("Ingress")
+                        && e.regarding.as_ref().and_then(|r| r.name.as_deref()) == Some(&name)
+                        && e.regarding.as_ref().and_then(|r| r.kind.as_deref()) == Some(&kind)
                 })
             }
         },

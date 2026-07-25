@@ -74,6 +74,44 @@ pub const DEDICATED_GATEWAY_INVALID_TLS: &str = fixture!("dedicated_gateway_inva
 /// lands on the rendered Deployment/Service.
 pub const DEDICATED_GATEWAY_FIELDS: &str = fixture!("dedicated_gateway_fields.yaml");
 
+/// Dedicated-mode `Gateway` whose `podTemplate` overlay mixes a controller-owned
+/// field (a reserved pod label the Deployment selector joins on) with a benign
+/// one (`nodeSelector`). Used to verify the security envelope restores the owned
+/// field, reports it as a `PodTemplateSanitized` Event, and still applies the rest.
+pub const DEDICATED_GATEWAY_OWNED_POD_FIELDS: &str =
+    fixture!("dedicated_gateway_owned_pod_fields.yaml");
+
+/// `CoxswainRelayPolicy` force-enabling the relay, whose `podTemplate` mixes a
+/// controller-owned field (a reserved pod label) with benign `tolerations`. The
+/// relay-side counterpart of [`DEDICATED_GATEWAY_OWNED_POD_FIELDS`].
+pub const RELAY_POLICY_OWNED_POD_FIELDS: &str = fixture!("relay_policy_owned_pod_fields.yaml");
+
+// ── podTemplate security envelope, admission half (#662) ─────────────────────
+//
+// One fixture per `ValidatingAdmissionPolicy` rule, each violating exactly that
+// rule: the apiserver reports only the first failing validation, so a fixture
+// tripping several would keep its test green after the rule it names was deleted.
+
+/// `CoxswainGatewayParameters` whose `podTemplate` hands the coxswain container a
+/// privileged `securityContext` — rejected at admission.
+pub const REJECT_GATEWAY_PARAMS_PRIVILEGED_POD_TEMPLATE: &str =
+    fixture!("reject_gateway_params_privileged_pod_template.yaml");
+
+/// `CoxswainGatewayParameters` whose `podTemplate` mounts the node root through a
+/// `hostPath` volume — rejected by the volume-source allowlist.
+pub const REJECT_GATEWAY_PARAMS_HOST_PATH_VOLUME: &str =
+    fixture!("reject_gateway_params_host_path_volume.yaml");
+
+/// `CoxswainGatewayParameters` whose `podTemplate` sets `hostNetwork` — rejected
+/// by the host-namespace rule.
+pub const REJECT_GATEWAY_PARAMS_HOST_NAMESPACE: &str =
+    fixture!("reject_gateway_params_host_namespace.yaml");
+
+/// `CoxswainRelayPolicy` whose `podTemplate` repoints the relay's ServiceAccount —
+/// the relay-side counterpart of [`REJECT_GATEWAY_PARAMS_PRIVILEGED_POD_TEMPLATE`].
+pub const REJECT_RELAY_POLICY_PRIVILEGED_POD_TEMPLATE: &str =
+    fixture!("reject_relay_policy_privileged_pod_template.yaml");
+
 /// Dedicated-mode `Gateway` with `allowedRoutes.namespaces.from: All` on its
 /// listener (#229). Used to verify that the controller auto-provisions a
 /// `ClusterRoleBinding` for the proxy SA and renders

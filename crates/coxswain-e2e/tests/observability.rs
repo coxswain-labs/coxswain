@@ -1205,9 +1205,10 @@ async fn conflict_emits_warning_event_on_loser() -> anyhow::Result<()> {
     };
 
     // Assert Warning RouteConflict Event on the loser.
-    let event = wait::wait_for_ingress_warning_event(
+    let event = wait::wait_for_warning_event(
         &h.client,
         &ns.name,
+        "Ingress",
         &loser_name,
         "RouteConflict",
         Duration::from_secs(60),
@@ -1284,9 +1285,10 @@ async fn invalid_annotation_emits_warning_event() -> anyhow::Result<()> {
     wait::wait_for_route_status(&h.http, &valid_host, "/a", 200, Duration::from_secs(60)).await?;
 
     // Assert Warning InvalidAnnotation Event on the misconfigured Ingress.
-    let event = wait::wait_for_ingress_warning_event(
+    let event = wait::wait_for_warning_event(
         &h.client,
         &ns.name,
+        "Ingress",
         "pn-none",
         "InvalidAnnotation",
         Duration::from_secs(60),
@@ -1346,9 +1348,10 @@ async fn rate_limit_by_header_without_auth_emits_warning_event() -> anyhow::Resu
     let rl_host = format!("ratelimitheader.{}.local", ns.name);
     wait::wait_for_route_status(&h.http, &rl_host, "/", 200, Duration::from_secs(60)).await?;
 
-    let event = wait::wait_for_ingress_warning_event(
+    let event = wait::wait_for_warning_event(
         &h.client,
         &ns.name,
+        "Ingress",
         "rate-limit-by-header-ingress",
         "InvalidAnnotation",
         Duration::from_secs(60),
@@ -1420,9 +1423,10 @@ async fn sha1_htpasswd_credential_emits_warning_event() -> anyhow::Result<()> {
     let sha1_host = format!("authbasic.{}.local", ns.name);
     wait::wait_for_route_status(&h.http, &sha1_host, "/", 401, Duration::from_secs(60)).await?;
 
-    let event = wait::wait_for_ingress_warning_event(
+    let event = wait::wait_for_warning_event(
         &h.client,
         &ns.name,
+        "Ingress",
         "auth-basic-ingress",
         "InvalidAnnotation",
         Duration::from_secs(60),

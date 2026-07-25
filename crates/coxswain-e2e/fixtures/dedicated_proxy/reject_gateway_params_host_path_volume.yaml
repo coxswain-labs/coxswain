@@ -1,0 +1,18 @@
+# CoxswainGatewayParameters whose podTemplate mounts the node's root filesystem
+# into a pod the cluster-privileged controller creates.
+#
+# Violates exactly one policy rule — the volume-source allowlist — so the
+# rejection message is deterministic and the test fails if that specific rule is
+# removed. See reject_gateway_params_privileged_pod_template.yaml.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainGatewayParameters
+metadata:
+  name: host-path-params
+spec:
+  podTemplate:
+    spec:
+      volumes:
+        - name: host-root
+          hostPath:
+            path: /

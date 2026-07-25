@@ -49,6 +49,7 @@
 //!   leadership lease applies — non-leaders re-queue.
 
 pub(crate) mod apply;
+pub(crate) mod harden;
 pub(crate) mod merge;
 pub(crate) mod params;
 pub(crate) mod reconciler;

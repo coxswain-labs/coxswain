@@ -25,7 +25,13 @@ The effective policy for a namespace is simply the `CoxswainRelayPolicy` that li
 that namespace — keyed by the object's own namespace, the same model as the
 `CoxswainGatewayParameters` used for [dedicated proxies](../gateway-api/index.md#dedicated-proxy-pools). Every
 field is optional; unset fields fall through to the global `--relay-*` controller-flag
-defaults. `podTemplate` strategic-merges onto the controller-rendered relay pod.
+defaults. `podTemplate` strategic-merges onto the controller-rendered relay pod, then the
+controller re-asserts its own hardening over the result — the pod- and container-level
+`securityContext`, the pinned ServiceAccount, its own volumes, and the host namespace flags are
+controller-owned, and an added volume must use a source the `restricted` Pod Security Standard
+allows. See the
+[pod security envelope](../gateway-api/index.md#the-pod-security-envelope) for the full list;
+ignored fields are reported as a `PodTemplateSanitized` Warning Event on this policy.
 
 There is no cluster-wide "default policy" and no label selector: the only install-wide default
 is the flat `--relay-*` flags; structured overrides (autoscaling, `podTemplate`, `resources`)
@@ -39,7 +45,7 @@ controller picks the lexically-first by name and warn-logs the ambiguity.
 | `enabled` | `bool` | unset (auto) | Tri-state override: unset = controller decides (activation threshold); `true` = force on (bypass threshold; still torn down at zero subscribers); `false` = force off (unconditional, overrides the cooldown). |
 | `replicas` | `int` | `--relay-replicas` (2) | Static relay replica count when autoscaling is off. |
 | `resources` | `ResourceRequirements` | `--relay-*-request` / `--relay-memory-limit` | Relay container requests/limits. |
-| `podTemplate` | partial `PodTemplateSpec` | none | Scheduling escape hatch strategic-merged onto the relay pod (nodeSelector, tolerations, affinity, topologySpreadConstraints, priorityClassName, …). |
+| `podTemplate` | partial `PodTemplateSpec` | none | Scheduling escape hatch strategic-merged onto the relay pod (nodeSelector, tolerations, affinity, topologySpreadConstraints, priorityClassName, …), bounded by the [pod security envelope](../gateway-api/index.md#the-pod-security-envelope). |
 | `autoscaling` | object | off | Controller-driven autoscaling (see below). |
 
 ### `autoscaling`

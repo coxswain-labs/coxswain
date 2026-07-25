@@ -113,7 +113,7 @@ Tunable fields on `CoxswainGatewayParameters`:
 | `resources` | Resource requests/limits on the proxy container | controller default |
 | `image` | Override the proxy image | controller's own image |
 | `serviceType` | `LoadBalancer`, `NodePort`, or `ClusterIP` for the proxy Service | `LoadBalancer` |
-| `podTemplate` | Partial `PodTemplateSpec` merged over the rendered template (nodeSelector, tolerations, env, sidecars, …) | — |
+| `podTemplate` | Partial `PodTemplateSpec` merged over the rendered template (nodeSelector, tolerations, env, sidecars, …), bounded by the [pod security envelope](#the-pod-security-envelope) | — |
 | `autoscaling.enabled` | Provision an HPA for the dedicated proxy Deployment | `false` |
 | `autoscaling.minReplicas` | HPA lower bound; must be `≥ 2` for the PDB to be provisioned | — |
 | `autoscaling.maxReplicas` | HPA upper bound | — |
@@ -129,6 +129,60 @@ spec:
     maxReplicas: 10
     targetCPUUtilizationPercentage: 80
 ```
+
+### The pod security envelope
+
+`podTemplate` is an escape hatch on an object a namespace tenant can write, applied to a pod the
+cluster-privileged controller creates on their behalf. It therefore cannot weaken the rendered pod's
+security: the controller merges the overlay and then re-asserts its own hardening over the result.
+
+Controller-owned — an overlay value for any of these is ignored:
+
+| Field | What the controller renders |
+|---|---|
+| `spec.securityContext` | `runAsNonRoot: true` with the `RuntimeDefault` seccomp profile |
+| `spec.serviceAccountName` | the provisioned zero-verb ServiceAccount |
+| `spec.automountServiceAccountToken` | `false` — only the explicit audience-scoped discovery token is mounted |
+| `spec.hostNetwork` / `hostPID` / `hostIPC` | unset; a provisioned pod never joins a host namespace |
+| `spec.containers[coxswain].securityContext` | no privilege escalation, all capabilities dropped, read-only root filesystem |
+| the controller's own volumes (`discovery-token`, `trust-bundle`) | restored verbatim; an overlay entry reusing one of these names is reverted, not merged |
+| the reserved `app.kubernetes.io/*` pod labels | the Deployment selector depends on them |
+| `spec.ephemeralContainers` | cleared — a pod template may not carry one, so the apiserver would refuse the Deployment |
+
+A volume the overlay adds must use a source the `restricted` Pod Security Standard allows —
+`configMap`, `csi`, `downwardAPI`, `emptyDir`, `ephemeral`, `persistentVolumeClaim`, `projected`, or
+`secret`. Anything else is dropped along with any `volumeMount` referencing it: `hostPath` mounts the
+node's filesystem, `gitRepo` has the kubelet clone a repository as root on the node, and
+`nfs`/`iscsi`/`cephfs`/`flexVolume` attach storage the controller never vetted. `hostPort` is
+stripped from every container port.
+
+A container the controller did not render — a sidecar or init container you add through the overlay —
+keeps its own image, command, mounts, and writable root filesystem, but runs with privilege escalation
+blocked: `privileged: false`, `allowPrivilegeEscalation: false`, all capabilities dropped, and
+`runAsNonRoot: true`. A sidecar that needs a writable path should mount an `emptyDir`.
+
+Everything else in the overlay applies normally — `nodeSelector`, `tolerations`, `affinity`,
+`topologySpreadConstraints`, `priorityClassName`, additional volumes, container `env`, and added
+containers are all merged as written. The controller filters the overlay rather than rejecting it, so
+one disallowed field never discards the rest.
+
+When an overlay does set a controller-owned field, the controller emits a `PodTemplateSanitized`
+`Warning` Event naming each ignored field:
+
+```bash
+kubectl describe gateway tenant-a-gw -n tenant-a
+```
+
+The same rules apply to the namespace relay's [`CoxswainRelayPolicy.podTemplate`](../operations/relay-policy.md),
+which reports on the policy object instead.
+
+If the install's [`ValidatingAdmissionPolicy`](../installation/helm.md) is active (Kubernetes 1.30+,
+`vap.enabled`), the escalation-relevant subset — the two `securityContext` fields, the ServiceAccount
+fields, the host namespace flags, `ephemeralContainers`, disallowed volume sources, and `hostPort` —
+is rejected at `kubectl apply` time instead, with a message naming the field. The rest (the reserved
+pod labels, the controller's own volumes) is filtered by the controller and reported by Event, since
+an availability guardrail is no reason to fail a tenant's apply. The controller-side filter stays
+authoritative either way: it also covers objects created before the policy was installed.
 
 ### Automatic provisioning
 
