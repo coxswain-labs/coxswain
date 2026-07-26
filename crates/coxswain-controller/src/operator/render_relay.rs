@@ -33,6 +33,7 @@ use k8s_openapi::api::core::v1::{
     Container, ContainerPort, PodSpec, PodTemplateSpec, ResourceRequirements, Service,
     ServiceAccount, ServicePort, ServiceSpec,
 };
+use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
@@ -40,6 +41,7 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::BTreeMap;
 
+use super::admin_fence::{AdminFenceConfig, render_admin_fence};
 use super::harden::HardeningReport;
 use super::render::{
     container_hardening_security_context, discovery_volume_mounts, discovery_volumes,
@@ -163,6 +165,11 @@ pub(crate) struct RelayRenderInputs<'a> {
     /// the `CoxswainRelayPolicy.spec.podTemplate` scheduling escape hatch (#589). `None`
     /// leaves the controller-rendered pod untouched.
     pub pod_template: Option<&'a serde_json::Value>,
+    /// Admin server port the relay binds — the install-wide `--admin-port`, the
+    /// same value every other role's management surface uses.
+    pub admin_port: u16,
+    /// Admin-port fencing policy (#670), install-wide.
+    pub admin_fence: &'a AdminFenceConfig,
     /// The replica *ceiling* used for the PDB decision (#589): a relay gets a
     /// `PodDisruptionBudget` (maxUnavailable: 1) when the most replicas it may run is ≥2.
     /// It equals the autoscaling `maxReplicas` when autoscaling is on, otherwise the static
@@ -185,6 +192,9 @@ pub(crate) struct RenderedRelay {
     /// `Some` only when [`RelayRenderInputs::pdb_replica_ceiling`] ≥ 2. Applied-or-deleted by
     /// [`super::apply::apply_relay`].
     pub pdb: Option<PodDisruptionBudget>,
+    /// Admin-port fence (#670) — `Some` unless fencing is disabled install-wide.
+    /// Applied-or-deleted by [`super::apply::apply_relay`].
+    pub network_policy: Option<NetworkPolicy>,
     /// Controller-owned pod fields the namespace's `CoxswainRelayPolicy.podTemplate`
     /// tried to set and did not get (see `super::harden`). Empty unless the policy
     /// reached for the security envelope; the relay reconciler turns a non-empty
@@ -430,6 +440,25 @@ fn render_relay_pdb(inputs: &RelayRenderInputs<'_>) -> Option<PodDisruptionBudge
     })
 }
 
+/// Render the relay's admin-port fence (#670), or `None` when fencing is off.
+///
+/// The relay binds the admin surface from the same `wire_management_servers`
+/// path every other role uses, so it needs the same fence — its `/metrics`
+/// carries the fan-out topology of every leaf behind it.
+fn render_relay_network_policy(inputs: &RelayRenderInputs<'_>) -> Option<NetworkPolicy> {
+    let variant = inputs.variant;
+    inputs.admin_fence.enabled.then(|| {
+        render_admin_fence(
+            variant.name(),
+            variant.deploy_namespace(),
+            relay_labels(variant.component()),
+            relay_selector_labels(variant.component()),
+            inputs.admin_port,
+            inputs.admin_fence,
+        )
+    })
+}
+
 /// Render all relay objects for `inputs.variant`.
 pub(crate) fn render_relay(inputs: &RelayRenderInputs<'_>) -> RenderedRelay {
     let (deployment, sanitized) = render_relay_deployment(inputs);
@@ -438,6 +467,7 @@ pub(crate) fn render_relay(inputs: &RelayRenderInputs<'_>) -> RenderedRelay {
         service: render_relay_service(inputs.variant),
         deployment,
         pdb: render_relay_pdb(inputs),
+        network_policy: render_relay_network_policy(inputs),
         sanitized,
     }
 }
@@ -445,6 +475,10 @@ pub(crate) fn render_relay(inputs: &RelayRenderInputs<'_>) -> RenderedRelay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
+
+    /// Default (fencing-on) policy every relay render test borrows.
+    static TEST_ADMIN_FENCE: LazyLock<AdminFenceConfig> = LazyLock::new(AdminFenceConfig::default);
 
     fn inputs() -> RelayRenderInputs<'static> {
         inputs_for(RelayVariant::Namespace {
@@ -469,6 +503,8 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             resources: relay_resources("50m", "64Mi", "256Mi"),
             pod_template: None,
+            admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             pdb_replica_ceiling: 2,
         }
     }

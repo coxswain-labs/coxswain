@@ -59,6 +59,7 @@
 //! Protocol is always `TCP` (HTTP/HTTPS/TLS all ride TCP at the Service layer;
 //! the proxy distinguishes them at L7 by listener config).
 
+use super::admin_fence::{AdminFenceConfig, render_admin_fence};
 use super::harden::{self, HardeningReport};
 use super::merge::strategic_merge_pod_template;
 use super::params::EffectiveParams;
@@ -78,6 +79,7 @@ use k8s_openapi::api::core::v1::{
     ProjectedVolumeSource, SeccompProfile, SecurityContext, Service, ServiceAccount,
     ServiceAccountTokenProjection, ServicePort, ServiceSpec, Volume, VolumeMount, VolumeProjection,
 };
+use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
@@ -156,6 +158,8 @@ pub(super) struct RenderInputs<'a> {
     /// Admin server port rendered as the `gateway.coxswain-labs.dev/admin-port`
     /// annotation on the pod template so fleet discovery can reach this pod.
     pub(super) admin_port: u16,
+    /// Admin-port fencing policy (#670), install-wide.
+    pub(super) admin_fence: &'a AdminFenceConfig,
     /// Effective listener ports (Gateway's own + attached ListenerSets', GEP-1713)
     /// the dedicated proxy's Service and container expose. Empty falls back to
     /// `gateway.spec.listeners` — so a ListenerSet listener on a new port is
@@ -197,6 +201,11 @@ pub(super) struct RenderedSpecs {
     /// disruptions. `Some` only when the effective replica floor (minReplicas
     /// if autoscaling, else replicas) is ≥ 2.
     pub(super) pdb: Option<PodDisruptionBudget>,
+    /// Admin-port fence (#670) — `Some` unless fencing is disabled install-wide.
+    /// Carries the Gateway owner reference like the rest of the trio, so
+    /// deleting the Gateway garbage-collects it; the applier apply-or-deletes on
+    /// the `None` case so turning fencing off mid-life reclaims it too.
+    pub(super) network_policy: Option<NetworkPolicy>,
     /// Controller-owned pod fields the tenant's `podTemplate` overlay tried to set
     /// and did not get (see [`super::harden`]). Empty unless the overlay reached
     /// for the security envelope; the reconciler turns a non-empty report into a
@@ -247,8 +256,33 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
         deployment,
         hpa: render_hpa(&common, inputs.params),
         pdb: render_pdb(&common, inputs.params),
+        network_policy: render_network_policy(&common, inputs.admin_port, inputs.admin_fence),
         sanitized,
     }
+}
+
+/// Render this Gateway's admin-port fence (#670), or `None` when fencing is off.
+///
+/// Shares the trio's name, labels, and owner reference, so it is reclaimed by
+/// the same garbage collection that reclaims the Deployment when the Gateway is
+/// deleted.
+fn render_network_policy(
+    common: &Common<'_>,
+    admin_port: u16,
+    config: &AdminFenceConfig,
+) -> Option<NetworkPolicy> {
+    config.enabled.then(|| {
+        let mut policy = render_admin_fence(
+            common.name,
+            common.namespace,
+            common.labels.clone(),
+            pod_selector_labels(common.labels),
+            admin_port,
+            config,
+        );
+        policy.metadata.owner_references = Some(vec![common.owner_ref.clone()]);
+        policy
+    })
 }
 
 /// GEP-1762 names the generated resources `<NAME>-<GATEWAY CLASS>`.
@@ -285,6 +319,26 @@ fn standard_labels(gateway: &Gateway, component: &str) -> BTreeMap<String, Strin
         component.to_string(),
     );
     labels
+}
+
+/// The label subset the dedicated trio's `Deployment`, `PodDisruptionBudget`,
+/// and admin fence all select this Gateway's pods on.
+///
+/// `app.kubernetes.io/instance` carries the Gateway name (see
+/// [`standard_labels`]), so this is unique per Gateway within its namespace —
+/// which is what keeps two dedicated Gateways in one namespace from selecting
+/// each other's pods. Single source for all three selectors so they can never
+/// drift apart.
+fn pod_selector_labels(labels: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let mut selector = BTreeMap::new();
+    selector.insert("app.kubernetes.io/name".to_string(), "coxswain".to_string());
+    if let Some(instance) = labels.get("app.kubernetes.io/instance") {
+        selector.insert(
+            "app.kubernetes.io/instance".to_string(),
+            instance.to_string(),
+        );
+    }
+    selector
 }
 
 /// Reserved annotations placed on every rendered resource. Unlike labels, there
@@ -646,14 +700,7 @@ fn render_deployment(
         None => (base_pod_template, HardeningReport::default()),
     };
 
-    let mut selector_labels = BTreeMap::new();
-    selector_labels.insert("app.kubernetes.io/name".to_string(), "coxswain".to_string());
-    if let Some(instance) = common.labels.get("app.kubernetes.io/instance") {
-        selector_labels.insert(
-            "app.kubernetes.io/instance".to_string(),
-            instance.to_string(),
-        );
-    }
+    let selector_labels = pod_selector_labels(common.labels);
 
     let deployment = Deployment {
         metadata: metadata_for(common),
@@ -984,14 +1031,7 @@ fn render_pdb(common: &Common<'_>, params: &EffectiveParams) -> Option<PodDisrup
         return None;
     }
 
-    let mut selector_labels = BTreeMap::new();
-    selector_labels.insert("app.kubernetes.io/name".to_string(), "coxswain".to_string());
-    if let Some(instance) = common.labels.get("app.kubernetes.io/instance") {
-        selector_labels.insert(
-            "app.kubernetes.io/instance".to_string(),
-            instance.to_string(),
-        );
-    }
+    let selector_labels = pod_selector_labels(common.labels);
 
     Some(PodDisruptionBudget {
         metadata: metadata_for(common),
@@ -1014,6 +1054,11 @@ mod tests {
         GatewayInfrastructure, GatewayListeners, GatewaySpec,
     };
     use serde_json::json;
+    use std::sync::LazyLock;
+
+    /// Default (fencing-on) policy every render test borrows, so adding the
+    /// fence didn't have to thread a binding through ~15 call sites.
+    static TEST_ADMIN_FENCE: LazyLock<AdminFenceConfig> = LazyLock::new(AdminFenceConfig::default);
 
     fn make_gateway(namespace: &str, name: &str, listeners: Vec<(&str, u16, &str)>) -> Gateway {
         Gateway {
@@ -1136,6 +1181,7 @@ mod tests {
             discovery_ca_bundle_path: "/ca",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         let spec = result.service.spec.expect("service spec");
@@ -1160,6 +1206,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
 
@@ -1214,6 +1261,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         assert_eq!(result.deployment.spec.unwrap().replicas, Some(5));
@@ -1240,6 +1288,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
@@ -1303,6 +1352,7 @@ mod tests {
                 discovery_ca_bundle_path: "/c",
                 discovery_trust_domain: "cluster.local",
                 admin_port: 8082,
+                admin_fence: &TEST_ADMIN_FENCE,
                 effective_ports: ports,
             })
             .deployment
@@ -1375,6 +1425,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
@@ -1410,6 +1461,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
@@ -1443,6 +1495,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
@@ -1544,6 +1597,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         for labels in [
@@ -1587,6 +1641,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
@@ -1646,6 +1701,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         let pod = result
@@ -1737,6 +1793,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         for meta in [
@@ -1783,6 +1840,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         for meta in [
@@ -1828,6 +1886,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         let labels = result.deployment.metadata.labels.as_ref().expect("labels");
@@ -1869,6 +1928,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         for meta in [

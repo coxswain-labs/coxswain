@@ -1,0 +1,61 @@
+{{- if and .Values.controller.enabled .Values.networkPolicy.enabled -}}
+# Admin-port fence for the controller pod (#670).
+#
+# The controller's admin port relays verbatim Kubernetes manifests (including Pod
+# `spec.containers[].env`, frequently credentials) and coxswain pod logs, with no
+# authentication of its own. The pod network is flat, so without this policy any
+# pod in any namespace can read all of it.
+#
+# Unlike the proxy and relay policies — which the controller renders itself, and
+# which must leave a dynamic, unknowable set of data-plane ports open — the
+# controller binds a fixed four ports, so this policy can enumerate them. That
+# makes it strictly closed: any port added here in future without a matching rule
+# is denied rather than silently exposed.
+#
+# Left open to all sources, deliberately:
+#   health    — kubelet probes are node-sourced, not pod-sourced, and
+#               /healthz + /readyz carry no cluster data.
+#   discovery — already mutually authenticated by SVID mTLS, and its callers are
+#               dedicated proxies and relays in arbitrary tenant namespaces,
+#               which no static selector can enumerate.
+#   bootstrap — same, authenticated by ServiceAccount TokenReview.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "coxswain.controller.fullname" . }}-admin
+  namespace: {{ include "coxswain.namespace" . }}
+  labels:
+    {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "coxswain.controller.selectorLabels" . | nindent 6 }}
+  # Ingress only: this is about who may reach the controller. Naming Egress would
+  # additionally deny everything it dials — the apiserver above all.
+  policyTypes:
+    - Ingress
+  ingress:
+    # Unauthenticated but non-sensitive, plus the two authenticated control-plane
+    # ports. Omitting `from` (rather than giving it an empty list, which would
+    # match no source at all) is what leaves these source-unrestricted.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.health.port }}
+        - protocol: TCP
+          port: {{ .Values.discovery.port }}
+        - protocol: TCP
+          port: {{ .Values.discovery.bootstrapPort }}
+    # The admin surface: same-namespace pods, plus any operator-configured peers.
+    # The controller is itself in the install namespace, so `podSelector: {}`
+    # already covers its peer-replica fan-out and a co-located Prometheus. A
+    # scraper elsewhere needs an extraIngress entry. `kubectl port-forward` is
+    # unaffected either way — it is node-sourced, not subject to pod selectors.
+    - from:
+        - podSelector: {}
+        {{- with .Values.networkPolicy.admin.extraIngress }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.admin.port }}
+{{- end }}

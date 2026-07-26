@@ -93,6 +93,18 @@ spec:
               value: {{ .Values.discovery.port | quote }}
             - name: COXSWAIN_MANAGEMENT_BIND_ADDRESS
               value: {{ .Values.management.bindAddress | quote }}
+            # Admin-port fencing. The value is a Secret NAME, never a credential:
+            # the controller reads the Secret itself so rotation needs no restart.
+            - name: COXSWAIN_ADMIN_FENCE_ENABLED
+              value: {{ .Values.networkPolicy.enabled | quote }}
+            {{- with .Values.networkPolicy.admin.extraIngress }}
+            - name: COXSWAIN_ADMIN_FENCE_EXTRA_INGRESS
+              value: {{ toJson . | quote }}
+            {{- end }}
+            {{- with .Values.adminAuth.secretName }}
+            - name: COXSWAIN_ADMIN_BASIC_AUTH_SECRET
+              value: {{ . | quote }}
+            {{- end }}
             - name: COXSWAIN_CONTROLLER_NAME
               value: {{ .Values.controllerName | quote }}
             {{- if .Values.watchNamespace }}

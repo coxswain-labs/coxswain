@@ -67,6 +67,7 @@ jobs:
               - 'scripts/check-reflector-health-checks.sh'
               - 'scripts/check-workspace-lints-decl.sh'
               - 'scripts/check-no-per-site-allow.sh'
+              - 'scripts/check-no-issue-refs-in-help.sh'
               - 'scripts/check-bounded-regex.sh'
               - 'scripts/check-no-peek-readable.sh'
               - 'scripts/check-no-wildcard-panic.sh'
@@ -244,6 +245,8 @@ jobs:
         run: bash scripts/check-workspace-lints-decl.sh
       - name: No per-site #[allow] / #[expect] in non-test source
         run: bash scripts/check-no-per-site-allow.sh
+      - name: No internal issue references in CLI --help text
+        run: bash scripts/check-no-issue-refs-in-help.sh
       - name: Tenant-supplied regexes compile via compile_bounded (bounded size)
         run: bash scripts/check-bounded-regex.sh
       - name: MSG_PEEK retry loops wait via PeekBackoff, never readable()

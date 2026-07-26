@@ -113,6 +113,65 @@ health:
 admin:
   port: 8082
 
+# -- Admin-port fencing. The management surface binds 0.0.0.0 so kubelet probes
+# and Prometheus scraping work out of the box, and the pod network is flat — so
+# without a NetworkPolicy any pod in any namespace can reach every coxswain
+# pod's admin port. On the controller that port relays verbatim Kubernetes
+# manifests (including Pod env) and pod logs; on a proxy or relay it serves
+# /metrics, whose gateway_name/gateway_namespace labels map the whole routing
+# topology.
+#
+# One policy is rendered per pod set: the controller's here in the chart, and
+# one each for the shared pool / dedicated proxies / relays by the controller
+# itself (it owns those Deployments). Each admits the admin port only from pods
+# in the policy's own namespace; every other port stays open to all sources, so
+# the data plane, kubelet probes, and the discovery stream are untouched.
+networkPolicy:
+  # Set false on clusters whose CNI does not enforce NetworkPolicy (the object
+  # would be inert anyway), or when you fence the surface with your own policy.
+  # Disabling reclaims any policy previously applied. (The controller keeps its
+  # networkpolicies RBAC either way — it needs the delete verb precisely in order
+  # to reclaim them.)
+  enabled: true
+  admin:
+    # Additional NetworkPolicyPeers admitted to the admin port, beyond pods in
+    # the target pod's own namespace and pods in the install namespace (which is
+    # what lets the controller aggregate a dedicated proxy in a tenant
+    # namespace). The case the default gets wrong is Prometheus scraping from a
+    # third namespace: the PodMonitor below targets pod IPs directly, so those
+    # scrapes are denied unless its namespace is named here.
+    #
+    # Entries are verbatim NetworkPolicyPeer objects, e.g.:
+    #   extraIngress:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: monitoring
+    extraIngress: []
+
+# -- Optional HTTP Basic authentication on the controller's admin port, as a
+# second factor alongside the NetworkPolicy above. Off by default.
+#
+# Create the Secret yourself, holding ONE htpasswd line (bcrypt only) under the
+# key `auth`, in the release namespace:
+#
+#   htpasswd -nbB admin 's3cret' > auth
+#   kubectl create secret generic coxswain-admin-auth \
+#     --namespace coxswain-system --from-file=auth
+#
+# Then set `secretName: coxswain-admin-auth`. The controller reads the Secret
+# with the RBAC it already has and re-reads it every 30s, so rotating the
+# credential does not need a restart. If the Secret is missing or unusable the
+# admin surface returns 503 rather than falling back to unauthenticated.
+#
+# This covers the CONTROLLER's admin port only — the port that serves manifests
+# and logs. Proxy and relay admin ports serve only /metrics and /api/v1/health
+# and are fenced by NetworkPolicy alone.
+#
+# NOTE: enabling this also requires credentials on anything scraping the
+# controller's /metrics, including the PodMonitor below.
+adminAuth:
+  secretName: ""
+
 # -- Discovery gRPC server port (COXSWAIN_DISCOVERY_PORT).
 # The controller binds this port; shared and dedicated proxies connect to it.
 discovery:

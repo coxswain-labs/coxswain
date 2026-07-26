@@ -758,6 +758,8 @@ name = "coxswain-admin"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.0",
+ "bcrypt",
  "bytes",
  "coxswain-core",
  "form_urlencoded",
@@ -774,8 +776,10 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]
@@ -896,6 +900,7 @@ version = "0.5.0"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
+ "bcrypt",
  "bytes",
  "coxswain-core",
  "flate2",

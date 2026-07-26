@@ -89,6 +89,9 @@ for raw in "${paths[@]}"; do
     crates/*/src/*.rs) add scripts/check-no-anyhow-libs.sh ;;
   esac
   case "$p" in
+    crates/*/src/*.rs) add scripts/check-no-issue-refs-in-help.sh ;;
+  esac
+  case "$p" in
     crates/coxswain-reflector/src/*) add scripts/check-reflector-health-checks.sh ;;
   esac
   case "$p" in

@@ -73,6 +73,20 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses", "ingressclasses"]
     verbs: ["get", "list", "watch"]
+  # Admin-port fencing (#670): the provisioning operator server-side-applies one
+  # NetworkPolicy per controller-provisioned pod set — the shared pool, each
+  # dedicated proxy, and each relay — restricting their admin port to callers in
+  # the pod's own namespace and the install namespace.
+  #
+  # Deliberately NOT gated on `networkPolicy.enabled`. Disabling the fence is
+  # exactly when the controller must be able to DELETE the policies it applied,
+  # so gating the grant on the toggle deadlocks: the same `helm upgrade` that
+  # flips the flag would revoke the verb needed to act on it, every reconcile
+  # would fail 403, and — because the delete is sequenced first — the shared
+  # pool could no longer be reclaimed either.
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "create", "update", "patch", "delete"]
   - apiGroups: ["networking.k8s.io"]
     resources: ["ingresses/status"]
     verbs: ["patch", "update"]

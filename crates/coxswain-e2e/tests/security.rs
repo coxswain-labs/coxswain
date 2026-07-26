@@ -3237,4 +3237,189 @@ mod serial {
         .await?;
         Ok(())
     }
+
+    // ── Admin-port Basic authentication (#670) ────────────────────────────────
+
+    /// Username the admin-auth tests provision.
+    const ADMIN_AUTH_USER: &str = "e2e-admin";
+    /// Password the admin-auth tests provision. Test-only; never a real secret.
+    const ADMIN_AUTH_PASSWORD: &str = "e2e-s3cret";
+    /// Secret the admin-auth tests create in the install namespace.
+    const ADMIN_AUTH_SECRET: &str = "coxswain-e2e-admin-auth";
+
+    /// Create (or replace) the admin-credential Secret holding one bcrypt
+    /// htpasswd line, returning a guard that deletes it when the test ends.
+    ///
+    /// The hash is computed here rather than hard-coded so the test cannot drift
+    /// from the password it asserts with. Cost 4 keeps it fast; the production
+    /// default from `htpasswd -B` is higher.
+    async fn create_admin_auth_secret(
+        client: &kube::Client,
+    ) -> anyhow::Result<AdminAuthSecretGuard> {
+        use k8s_openapi::api::core::v1::Secret;
+        use kube::api::{Api, DeleteParams, Patch, PatchParams};
+
+        let hash = bcrypt::hash(ADMIN_AUTH_PASSWORD, 4)?;
+        let secret: Secret = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": ADMIN_AUTH_SECRET, "namespace": "coxswain-system" },
+            "stringData": { "auth": format!("{ADMIN_AUTH_USER}:{hash}\n") },
+        }))?;
+
+        let api: Api<Secret> = Api::namespaced(client.clone(), "coxswain-system");
+        // Delete first: a previous run's Secret carries a different bcrypt salt,
+        // and an apply that merged with it would verify against the wrong hash.
+        let _ = api
+            .delete(ADMIN_AUTH_SECRET, &DeleteParams::default())
+            .await;
+        api.patch(
+            ADMIN_AUTH_SECRET,
+            &PatchParams::apply("coxswain-e2e").force(),
+            &Patch::Apply(&secret),
+        )
+        .await?;
+        Ok(AdminAuthSecretGuard)
+    }
+
+    /// RAII cleanup for the admin-credential Secret.
+    ///
+    /// It lives in the shared install namespace, not a `NamespaceGuard`'s
+    /// throwaway namespace, so nothing else reclaims it. Deletes on an
+    /// independent runtime — `Drop` is synchronous and the test's own runtime is
+    /// already shutting down by the time it runs.
+    struct AdminAuthSecretGuard;
+
+    impl Drop for AdminAuthSecretGuard {
+        fn drop(&mut self) {
+            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            rt.block_on(async {
+                if let Ok(client) = kube::Client::try_default().await {
+                    let api: kube::api::Api<k8s_openapi::api::core::v1::Secret> =
+                        kube::api::Api::namespaced(client, "coxswain-system");
+                    let _ = api
+                        .delete(ADMIN_AUTH_SECRET, &kube::api::DeleteParams::default())
+                        .await;
+                }
+            });
+        }
+    }
+
+    /// `GET` the controller's admin `/api/v1/health`, optionally with Basic
+    /// credentials, returning the HTTP status.
+    async fn admin_health_status(
+        url: &str,
+        credentials: Option<(&str, &str)>,
+    ) -> anyhow::Result<u16> {
+        let req = reqwest::Client::new().get(url);
+        let req = match credentials {
+            Some((user, password)) => req.basic_auth(user, Some(password)),
+            None => req,
+        };
+        Ok(req.send().await?.status().as_u16())
+    }
+
+    /// Happy path: with `adminAuth.secretName` set, the controller's admin
+    /// surface serves normally to a caller presenting the configured
+    /// credentials (#670).
+    #[tokio::test]
+    async fn admin_port_serves_normally_with_valid_basic_auth_credentials() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let _secret = create_admin_auth_secret(&client).await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            admin_auth_secret_name: Some(ADMIN_AUTH_SECRET.to_string()),
+            ..Default::default()
+        })
+        .await?;
+        let url = format!("http://{}/api/v1/health", controller.controller_admin_addr);
+
+        // Poll rather than asserting once: the credential is loaded by a
+        // background task the moment the admin service starts, so the very first
+        // request after a rollout can still see the fail-closed 503.
+        let status = wait::poll_until(
+            Duration::from_secs(60),
+            Duration::from_millis(500),
+            || async {
+                format!("admin /api/v1/health never returned 200 for valid credentials at {url}")
+            },
+            || async {
+                admin_health_status(&url, Some((ADMIN_AUTH_USER, ADMIN_AUTH_PASSWORD)))
+                    .await
+                    .ok()
+                    .filter(|s| *s == 200)
+            },
+        )
+        .await?;
+        assert_eq!(status, 200);
+        Ok(())
+    }
+
+    /// Sad path: the same admin surface refuses a caller with no credentials
+    /// and a caller with the wrong password, and the health port stays open
+    /// either way so kubelet probes keep working (#670).
+    #[tokio::test]
+    async fn admin_port_rejects_missing_and_wrong_basic_auth_credentials() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let _secret = create_admin_auth_secret(&client).await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            admin_auth_secret_name: Some(ADMIN_AUTH_SECRET.to_string()),
+            ..Default::default()
+        })
+        .await?;
+        let url = format!("http://{}/api/v1/health", controller.controller_admin_addr);
+
+        // Settle on the enforcing state first: before the credential loads the
+        // surface answers 503 (fail-closed), which is also "not 200" and would
+        // make an immediate 401 assertion pass for the wrong reason.
+        wait::poll_until(
+            Duration::from_secs(60),
+            Duration::from_millis(500),
+            || async {
+                format!("admin /api/v1/health never reached the enforcing 401 state at {url}")
+            },
+            || async {
+                admin_health_status(&url, None)
+                    .await
+                    .ok()
+                    .filter(|s| *s == 401)
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            admin_health_status(&url, None).await?,
+            401,
+            "a request with no Authorization header must be challenged, not served"
+        );
+        assert_eq!(
+            admin_health_status(&url, Some((ADMIN_AUTH_USER, "wrong-password"))).await?,
+            401,
+            "the configured username with a wrong password must be challenged"
+        );
+        assert_eq!(
+            admin_health_status(&url, Some(("someone-else", ADMIN_AUTH_PASSWORD))).await?,
+            401,
+            "the correct password under a different username must be challenged"
+        );
+        // The credential is genuinely enforced, not the endpoint being broken.
+        assert_eq!(
+            admin_health_status(&url, Some((ADMIN_AUTH_USER, ADMIN_AUTH_PASSWORD))).await?,
+            200,
+            "valid credentials must still be served — otherwise the 401s above prove nothing"
+        );
+
+        // The health port is a separate listener and must never be authenticated,
+        // or kubelet probes would fail and the pod would be killed.
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+        Ok(())
+    }
 }

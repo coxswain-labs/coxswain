@@ -46,6 +46,9 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 |---------|------|---------|-------------|
 | `COXSWAIN_ACCESS_LOG` | `--access-log` | `true` | Emit one structured access-log event per proxied request on the `coxswain_proxy::access` target; set `false` to silence. See [Observability](observability.md#access-logs) |
 | `COXSWAIN_ACCESS_LOG_PATH_MODE` | `--access-log-path-mode` | `full` | What the access-log `path` field records: `full`, `pattern`, or `none` |
+| `COXSWAIN_ADMIN_BASIC_AUTH_SECRET` | `--admin-basic-auth-secret` | _(none)_ | _(controller)_ Name of a Secret in the install namespace holding one bcrypt htpasswd line under key `auth`. Requires HTTP Basic auth on the whole admin listener, `/metrics` included. Re-read every 30s, so rotation needs no restart; a missing or unusable Secret closes the surface with `503` rather than serving it unauthenticated. See [Running in production](../operations/running-in-production.md#the-admin-and-management-ports) |
+| `COXSWAIN_ADMIN_FENCE_ENABLED` | `--admin-fence-enabled` | `true` | _(controller)_ Restrict the admin port of every provisioned pod (shared pool, dedicated proxies, relays) to callers in the pod's own namespace, via a `NetworkPolicy`. All other ports stay reachable from anywhere. `false` removes any policy already applied |
+| `COXSWAIN_ADMIN_FENCE_EXTRA_INGRESS` | `--admin-fence-extra-ingress` | `[]` | _(controller)_ JSON array of Kubernetes `NetworkPolicyPeer` objects allowed through the admin-port restriction, e.g. to let a Prometheus in another namespace scrape `/metrics` |
 | `COXSWAIN_ADMIN_PORT` | `--admin-port` | `8082` | Port for admin, metrics, and diagnostics endpoints |
 | `COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL` | `--controller-lease-renew-interval` | `5s` | How often the leader renews its lease; must be ≤ 1/3 of the TTL |
 | `COXSWAIN_CONTROLLER_LEASE_TTL` | `--controller-lease-ttl` | `15s` | How long a lease stays valid without renewal; must be ≥ 3× the renew interval |
@@ -170,6 +173,9 @@ SVID rotation, and troubleshooting.
 
 !!! note
     The data plane and the management surface bind independently: `COXSWAIN_PROXY_BIND_ADDRESS` for the HTTP/HTTPS proxy listeners, and `COXSWAIN_MANAGEMENT_BIND_ADDRESS` for the health and admin servers. Both default to `0.0.0.0`; set the management address to a management-network IP to keep `/metrics`, `/api/v1/health`, and the health endpoints off the data-plane interface.
+
+!!! warning "Fence the admin port"
+    On the controller, the admin port serves verbatim Kubernetes manifests (including Pod environment variables) and pod logs. It is fenced by a `NetworkPolicy` by default, and `COXSWAIN_ADMIN_BASIC_AUTH_SECRET` adds authentication. See [the admin and management ports](../operations/running-in-production.md#the-admin-and-management-ports) before changing either.
 
 ## Leader election
 

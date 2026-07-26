@@ -74,6 +74,7 @@ covers. TIER 2 runs all of them regardless.
 | Tenant-controlled input | any code parsing CR fields, annotations, headers, or peer bytes — mostly `core`, `reflector`, `proxy` |
 | Error typing | any `crates/**/*.rs` adding an error type or a fallible fn |
 | Doc quality | any `crates/**/*.rs` adding or changing a `pub` / `pub(crate)` item |
+| CLI help text | any `///` inside a type deriving clap `Parser`/`Args`/`Subcommand` — mostly `coxswain-bin/src/args.rs` |
 | Architectural vs work-saving | any `crates/**/*.rs` |
 | Test coverage | any user-visible behaviour change |
 | E2E test construction | `crates/coxswain-e2e/**` |
@@ -119,6 +120,16 @@ that restate the code ("Build the config" on `fn build_config`), and flag a new
 non-obvious invariant with no comment at all. Presence of a doc is not the
 standard; information content is. Never suggest adding a doc that would only
 restate a name.
+
+**CLI help text.** A `///` inside a clap-deriving type is not a code comment —
+clap renders it verbatim into `--help`, so it is product copy read by operators
+who cannot see this repo. It carries only: what the flag does, accepted
+values/format, the default, and when to change it. Flag design rationale,
+history ("supersedes…", "replaced the former…"), benchmark narrative,
+`[`RustItem`]` intra-doc links (they render as literal noise), and anything
+addressed to a future maintainer rather than an operator. The *why* belongs in
+the module `//!` header instead. Issue numbers are already gated by
+`check-no-issue-refs-in-help.sh` — do not re-report those.
 
 **Architectural vs work-saving.** Did the change fix the cause or add a special
 case around it? Is a new wildcard `_` arm hiding a case the compiler could have

@@ -48,6 +48,7 @@
 //! - The reconcile is leader-gated: only the controller pod holding the
 //!   leadership lease applies — non-leaders re-queue.
 
+pub(crate) mod admin_fence;
 pub(crate) mod apply;
 pub(crate) mod harden;
 pub(crate) mod merge;
@@ -66,6 +67,7 @@ pub(crate) mod shared_install;
 pub(crate) mod status;
 pub(crate) mod vip;
 
+pub use admin_fence::AdminFenceConfig;
 pub use reconciler::{OperatorConfig, RelayConfig};
 pub use render_shared_proxy::ProxyPoolConfig;
 // #574 fold: the operator no longer runs as its own `BackgroundService`. The

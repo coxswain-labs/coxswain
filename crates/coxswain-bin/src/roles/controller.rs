@@ -257,6 +257,9 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         health_port: args.common.health_port,
         enable_ingress: !args.common.disable_ingress,
         enable_gateway_api: !args.common.disable_gateway_api,
+        admin_fence: args
+            .controller
+            .admin_fence_config(&args.common.pod_namespace),
         vip_failures: vip_failures.clone(),
         node_registry: Some(node_registry_for_operator),
         publish_index: Some(publish_index.clone()),
@@ -322,17 +325,38 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     // The controller has no local routing tables of its own to wire — its
     // routing surface is the aggregate `/api/v1/{fleet,routing}/*` above, and
     // the proxy admin query surface (`/api/v1/routes`) was retired in #537.
-    server.add_service(
-        AdminServer::new(health, status_writer.leader)
-            .with_aggregator(aggregator)
-            .with_events(events)
-            .with_ui()
-            .with_api_surfaces(
-                !args.common.disable_gateway_api,
-                !args.common.disable_ingress,
-            )
-            .into_service(admin_addr),
-    );
+    let mut admin = AdminServer::new(health, status_writer.leader)
+        .with_aggregator(aggregator)
+        .with_events(events)
+        .with_ui()
+        .with_api_surfaces(
+            !args.common.disable_gateway_api,
+            !args.common.disable_ingress,
+        );
+
+    // Optional Basic auth on the admin surface (#670). Only the controller wires
+    // it: it is the role whose admin port serves manifests and logs, and the only
+    // one holding the `secrets` read the credential lookup needs — proxy and relay
+    // ServiceAccounts hold zero Kubernetes verbs by design.
+    //
+    // The watcher and the listener both start at `run_forever`, so the first
+    // credential read races the first request. What makes that safe is the cell's
+    // initial value: it starts empty, and empty means 503, so the surface is
+    // closed until a credential loads rather than briefly open.
+    if let Some(secret) = args.controller.admin_basic_auth_secret.as_deref() {
+        let watcher = coxswain_admin::AdminCredentialWatcher::new(
+            secret.to_string(),
+            args.common.pod_namespace.clone(),
+        );
+        admin = admin.with_basic_auth(coxswain_admin::AdminAuth::new(
+            watcher.credential(),
+            "coxswain admin",
+        ));
+        server.add_service(background_service("admin-credential", watcher));
+        tracing::info!(secret, "admin: Basic authentication enabled");
+    }
+
+    server.add_service(admin.into_service(admin_addr));
 
     tracing::info!(
         management_bind_address = %args.common.management_bind_address,

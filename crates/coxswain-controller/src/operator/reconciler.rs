@@ -39,6 +39,7 @@
 //! health drifts, so a cert-ref or route-resolution change reaches the patch
 //! path within watch latency without a dedicated retrigger channel.
 
+use super::admin_fence::AdminFenceConfig;
 use super::relay_params::{self, EffectiveRelayPolicy};
 use super::render_shared_proxy::ProxyPoolConfig;
 use super::{
@@ -59,6 +60,7 @@ use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{
     ConfigMap, Namespace, Node, ObjectReference, Pod, Service, ServiceAccount,
 };
+use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::{
     Api, Client, Resource as _,
@@ -273,6 +275,10 @@ pub struct OperatorConfig {
     /// Whether the Gateway API surface is enabled install-wide (mirrors the
     /// controller's `--disable-gateway-api`).
     pub enable_gateway_api: bool,
+    /// Admin-port fencing policy (#670), install-wide: applied identically to
+    /// the shared pool, every dedicated proxy, and every relay, since all three
+    /// bind the same admin surface.
+    pub admin_fence: AdminFenceConfig,
     /// Shared handle for publishing definitively-failed static-address VIP
     /// provisioning to the status writer (#531/#533). Constructed in
     /// `coxswain-bin` and cloned into the `Controller` too, so the single
@@ -401,6 +407,9 @@ pub(crate) struct ReconcileContext {
     pub(super) health_port: u16,
     pub(super) enable_ingress: bool,
     pub(super) enable_gateway_api: bool,
+    /// Admin-port fencing policy (#670), applied to every provisioned pod —
+    /// shared pool, dedicated proxy, and relay alike.
+    pub(super) admin_fence: AdminFenceConfig,
     /// Signals the serialized [`run_vip_reconciler`] task to run a whole-VIP
     /// pass (#472). Per-Gateway reconciles only *signal* here — they never
     /// provision VIP Services themselves, so the allocation stays single-writer.
@@ -515,6 +524,7 @@ impl ReconcileContext {
             health_port: config.health_port,
             enable_ingress: config.enable_ingress,
             enable_gateway_api: config.enable_gateway_api,
+            admin_fence: config.admin_fence,
             vip_trigger: Arc::new(tokio::sync::Notify::new()),
             shared_install_trigger: Arc::new(tokio::sync::Notify::new()),
             vip_failures: config.vip_failures,
@@ -1093,6 +1103,7 @@ async fn reconcile_inner(
         discovery_ca_bundle_path: &ctx.discovery_ca_bundle_path,
         discovery_trust_domain: &ctx.discovery_trust_domain,
         admin_port: ctx.admin_port,
+        admin_fence: &ctx.admin_fence,
         effective_ports: dedicated_ports,
     });
 
@@ -1506,17 +1517,21 @@ async fn delete_dedicated_resources(
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
     let services: Api<Service> = Api::namespaced(client.clone(), namespace);
     let service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
-    // HPA and PDB carry the same GEP-1762 name as the Deployment/Service/SA.
-    // They survive a plain Gateway delete (owner-ref GC handles that), but the
-    // dedicated→shared migration path deletes the Gateway resources explicitly
-    // because the Gateway itself survives and owner-ref GC doesn't run.
+    // HPA, PDB, and the admin-fence NetworkPolicy carry the same GEP-1762 name
+    // as the Deployment/Service/SA. They survive a plain Gateway delete
+    // (owner-ref GC handles that), but the dedicated→shared migration path
+    // deletes the Gateway resources explicitly because the Gateway itself
+    // survives and owner-ref GC doesn't run — a fence left behind would then
+    // select pods that no longer exist until the Gateway is finally deleted.
     let hpas: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
     let pdbs: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
+    let network_policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
     ignore_not_found(deployments.delete(name, &dp).await)?;
     ignore_not_found(services.delete(name, &dp).await)?;
     ignore_not_found(service_accounts.delete(name, &dp).await)?;
     ignore_not_found(hpas.delete(name, &dp).await)?;
     ignore_not_found(pdbs.delete(name, &dp).await)?;
+    ignore_not_found(network_policies.delete(name, &dp).await)?;
     Ok(())
 }
 
@@ -1730,6 +1745,10 @@ fn log_rendered_change(gw: &Gateway, rendered: &render::RenderedSpecs) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::LazyLock;
+
+    /// Default (fencing-on) policy the render tests below borrow.
+    static TEST_ADMIN_FENCE: LazyLock<AdminFenceConfig> = LazyLock::new(AdminFenceConfig::default);
 
     #[test]
     fn gateway_key_uses_namespace_and_name() {
@@ -1999,6 +2018,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         let r_b = render::render(&render::RenderInputs {
@@ -2012,6 +2032,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         });
         assert_ne!(
@@ -2053,6 +2074,7 @@ mod tests {
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
             admin_port: 8082,
+            admin_fence: &TEST_ADMIN_FENCE,
             effective_ports: &[],
         };
         let r1 = render::render(&inputs);

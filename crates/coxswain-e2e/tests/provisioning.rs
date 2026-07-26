@@ -31,7 +31,7 @@ use gateway_api_types::apis::standard::gateways::Gateway;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
-use k8s_openapi::api::networking::v1::Ingress;
+use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::{Api, DeleteParams, ListParams, Patch, PatchParams};
@@ -1598,6 +1598,161 @@ async fn shared_proxy_pool_provisioned_at_install_without_gateways() -> anyhow::
 // Tests that mutate the shared Helm release (non-default ControllerOptions /
 // start_with_options) or that need flake-isolation timing must run serially
 // against the whole e2e job -- see `.config/nextest.toml` `test(/serial::/)`.
+// ── Admin-port fence (#670) ──────────────────────────────────────────────────
+
+/// Name of the install's shared-pool admin fence.
+const SHARED_POOL_FENCE: &str = "coxswain-shared-proxy-admin";
+/// Name of the controller's admin fence (chart-rendered).
+const CONTROLLER_FENCE: &str = "coxswain-controller-admin";
+
+/// Whether `policy` admits `port` on TCP from any source — i.e. whether the
+/// fence leaves that port reachable.
+///
+/// This is the assertion that matters for the data plane: the fence works by
+/// allowing the *complement* of the admin port, so a bug in that inversion shows
+/// up as a legitimate listener port silently falling outside every open range.
+fn tcp_port_is_open_to_all(policy: &NetworkPolicy, port: i32) -> bool {
+    policy
+        .spec
+        .as_ref()
+        .and_then(|s| s.ingress.as_ref())
+        .is_some_and(|rules| {
+            rules.iter().any(|rule| {
+                // `from: None` means "any source"; a rule with peers is scoped.
+                rule.from.is_none()
+                    && rule.ports.as_ref().is_some_and(|ports| {
+                        ports.iter().any(|p| {
+                            let Some(IntOrString::Int(start)) = p.port else {
+                                return false;
+                            };
+                            p.protocol.as_deref() == Some("TCP")
+                                && port >= start
+                                && port <= p.end_port.unwrap_or(start)
+                        })
+                    })
+            })
+        })
+}
+
+/// Whether `policy` restricts `port` on TCP to a scoped set of peers.
+fn tcp_port_is_fenced(policy: &NetworkPolicy, port: i32) -> bool {
+    policy
+        .spec
+        .as_ref()
+        .and_then(|s| s.ingress.as_ref())
+        .is_some_and(|rules| {
+            rules.iter().any(|rule| {
+                rule.from.as_ref().is_some_and(|peers| !peers.is_empty())
+                    && rule.ports.as_ref().is_some_and(|ports| {
+                        ports.iter().any(|p| {
+                            p.protocol.as_deref() == Some("TCP")
+                                && p.port == Some(IntOrString::Int(port))
+                        })
+                    })
+            })
+        })
+}
+
+/// Happy path: the install fences the admin port on the controller, the shared
+/// pool, and every dedicated proxy — while leaving the data-plane and health
+/// ports open to all sources (#670).
+///
+/// Object shape only. Neither OrbStack's nor kind's default CNI enforces
+/// `NetworkPolicy`, so no local test can assert that traffic is actually
+/// blocked; what *is* asserted here is the property a wrong policy would break
+/// on a cluster that does enforce it — that the fence covers 8082 and nothing
+/// else.
+#[tokio::test]
+async fn admin_fence_restricts_admin_port_and_leaves_data_plane_open() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "prov-fence").await?;
+
+    let install: Api<NetworkPolicy> = Api::namespaced(h.client.clone(), "coxswain-system");
+
+    for name in [CONTROLLER_FENCE, SHARED_POOL_FENCE] {
+        let policy = wait::wait_for_resource(&install, name, Duration::from_secs(30))
+            .await
+            .with_context(|| format!("admin fence {name} should be provisioned by default"))?;
+
+        assert!(
+            tcp_port_is_fenced(&policy, 8082),
+            "{name} must restrict the admin port 8082 to a scoped peer set"
+        );
+        assert!(
+            !tcp_port_is_open_to_all(&policy, 8082),
+            "{name} must not also admit 8082 from every source — that would void the fence"
+        );
+        assert!(
+            tcp_port_is_open_to_all(&policy, 8081),
+            "{name} must leave the health port open: kubelet probes are node-sourced"
+        );
+        assert_eq!(
+            policy.spec.as_ref().and_then(|s| s.policy_types.clone()),
+            Some(vec!["Ingress".to_string()]),
+            "{name} must not restrict egress — the controller must keep reaching the apiserver"
+        );
+    }
+
+    // A dedicated Gateway gets its own fence, owner-referenced like the rest of
+    // its trio so deleting the Gateway garbage-collects it.
+    let (_, _, _, _, _, _) = apply_and_wait(&h, &ns).await?;
+    let dedicated_policies: Api<NetworkPolicy> = Api::namespaced(h.client.clone(), &ns.name);
+    let policy =
+        wait::wait_for_resource(&dedicated_policies, RESOURCE_NAME, Duration::from_secs(30))
+            .await
+            .context("a dedicated proxy should be fenced like every other role")?;
+
+    assert!(
+        tcp_port_is_fenced(&policy, 8082),
+        "the dedicated proxy's admin port must be restricted"
+    );
+    // A dedicated proxy runs in its Gateway's namespace, the controller in the
+    // install namespace — so a same-namespace-only rule would silently drop the
+    // controller's own `/api/v1/health` fan-out and strand the fleet view.
+    let admits_install_ns = policy
+        .spec
+        .as_ref()
+        .and_then(|s| s.ingress.as_ref())
+        .is_some_and(|rules| {
+            rules
+                .iter()
+                .filter_map(|r| r.from.as_ref())
+                .flatten()
+                .any(|p| {
+                    p.namespace_selector.as_ref().is_some_and(|s| {
+                        s.match_labels.as_ref().is_some_and(|l| {
+                            l.get("kubernetes.io/metadata.name").map(String::as_str)
+                                == Some("coxswain-system")
+                        })
+                    })
+                })
+        });
+    assert!(
+        admits_install_ns,
+        "the fence must admit the install namespace, or the controller cannot reach \
+         a dedicated proxy's admin port to aggregate it"
+    );
+    // The listener ports a dedicated proxy actually binds must stay reachable —
+    // this is the regression that would black-hole a Gateway's traffic.
+    for port in [80, 443, 8080, 8443] {
+        assert!(
+            tcp_port_is_open_to_all(&policy, port),
+            "port {port} must stay open to all sources; the fence may only close 8082"
+        );
+    }
+    assert_eq!(
+        policy
+            .metadata
+            .owner_references
+            .as_ref()
+            .map(std::vec::Vec::len),
+        Some(1),
+        "the fence must carry the Gateway owner reference so it is GC'd with the trio"
+    );
+
+    Ok(())
+}
+
 mod serial {
     use super::*;
 
@@ -2884,6 +3039,57 @@ mod serial {
                 let deploy_gone = deploys.get(SHARED_PROXY_NAME).await.is_err();
                 let lb_gone = svcs.get(SHARED_PROXY_NAME).await.is_err();
                 (deploy_gone && lb_gone).then_some(())
+            },
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    /// Sad path: turning the admin fence off removes the chart-rendered
+    /// controller policy *and* reclaims the controller-provisioned pool policy
+    /// (#670).
+    ///
+    /// The second half is the one worth testing: the pool's policy is applied by
+    /// the controller, not Helm, so `helm upgrade` alone cannot delete it — only
+    /// the operator's apply-or-delete pass does. Without that pass a disabled
+    /// fence would leave the pool fenced by an object nothing owns any more,
+    /// which no amount of re-running `helm upgrade` would clear.
+    #[tokio::test]
+    async fn admin_fence_policies_are_reclaimed_when_fencing_is_disabled() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            network_policy_enabled: Some(false),
+            ..Default::default()
+        })
+        .await?;
+
+        let policies: Api<NetworkPolicy> = Api::namespaced(h.client.clone(), "coxswain-system");
+        wait::poll_until(
+            Duration::from_secs(90),
+            wait::POLL,
+            || {
+                let policies = policies.clone();
+                async move {
+                    let present: Vec<String> = policies
+                        .list(&ListParams::default())
+                        .await
+                        .map(|l| {
+                            l.items
+                                .into_iter()
+                                .filter_map(|p| p.metadata.name)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    format!(
+                        "admin fences to be reclaimed when networkPolicy.enabled=false; \
+                         still present in coxswain-system: {present:?}"
+                    )
+                }
+            },
+            || async {
+                let controller_gone = policies.get(CONTROLLER_FENCE).await.is_err();
+                let pool_gone = policies.get(SHARED_POOL_FENCE).await.is_err();
+                (controller_gone && pool_gone).then_some(())
             },
         )
         .await?;
