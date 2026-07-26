@@ -583,10 +583,14 @@ mod tests {
     // ── ext_authz transport (#23) ─────────────────────────────────────────────
 
     /// A route whose auth chain carries a gRPC-transport ext_authz check must
-    /// survive the wire round-trip. Regression for the old encode `unreachable!`
-    /// on the transport wildcard and the decode `MissingRequiredField("http")`:
-    /// a Grpc entry now encodes the `grpc` field and decodes cleanly (a decode
-    /// error would fail `rt_ingress`'s `expect`).
+    /// survive the wire round-trip with `allowed_headers` and `response_headers`
+    /// intact and NOT swapped. Regression for the old encode `unreachable!` on
+    /// the transport wildcard and the decode `MissingRequiredField("http")`
+    /// (a Grpc entry now encodes the `grpc` field and decodes cleanly), and —
+    /// since both fields share the exact same `Arc<[Box<str>]>` type (#663) — for
+    /// a constructor-argument-order swap in `auth_from_wire`, which would
+    /// compile clean and round-trip a route successfully while forwarding the
+    /// wrong names to the auth service.
     #[test]
     fn ext_auth_grpc_transport_round_trips() {
         use coxswain_core::routing::{
@@ -597,9 +601,10 @@ mod tests {
             Duration::from_millis(750),
             Arc::from([addr("10.1.2.3:9000"), addr("10.1.2.4:9000")]),
             true,
-            ExtAuthTransport::Grpc(GrpcExtAuthConfig::new(Arc::from([Box::from(
-                "x-auth-user",
-            )]))),
+            ExtAuthTransport::Grpc(GrpcExtAuthConfig::new(
+                Arc::from([Box::from("x-request-headers-marker")]),
+                Arc::from([Box::from("x-response-headers-marker")]),
+            )),
         )));
         let bg = simple_bg("ns/svc", &[addr("10.0.0.1:8080")]);
         let entry = Arc::new(simple_entry(bg).with_auth_chain(Arc::from([auth])));
@@ -610,10 +615,87 @@ mod tests {
             .add_exact_route("/", entry);
 
         let rt = rt_ingress(b);
-        assert!(
-            rt.route(80, "grpc.example.com", "/", &ctx()).is_some(),
-            "gRPC ext_authz route must survive the wire round-trip"
+        let RouteOutcome::Found(m) = rt.find(80, "grpc.example.com", "/", &ctx()) else {
+            panic!("gRPC ext_authz route must survive the wire round-trip");
+        };
+        assert_eq!(m.auth.len(), 1, "auth chain must carry exactly one entry");
+        let IngressAuthConfig::External(ext) = m.auth[0].as_ref() else {
+            panic!("expected IngressAuthConfig::External, got {:?}", m.auth[0]);
+        };
+        let ExtAuthTransport::Grpc(grpc) = &ext.transport else {
+            panic!("expected ExtAuthTransport::Grpc, got {:?}", ext.transport);
+        };
+        assert_eq!(
+            grpc.allowed_headers
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            ["x-request-headers-marker"]
         );
+        assert_eq!(
+            grpc.response_headers
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            ["x-response-headers-marker"]
+        );
+    }
+
+    /// HTTP-transport counterpart of [`ext_auth_grpc_transport_round_trips`] —
+    /// no round-trip test existed for this transport at all before #663.
+    /// Asserts `allowed_headers`/`response_headers`/`always_set_cookie` all
+    /// survive, and are not swapped with each other.
+    #[test]
+    fn ext_auth_http_transport_round_trips() {
+        use coxswain_core::routing::{
+            ExtAuthConfig, ExtAuthTransport, HttpExtAuthConfig, IngressAuthConfig,
+        };
+
+        let auth = Arc::new(IngressAuthConfig::External(ExtAuthConfig::new(
+            Duration::from_millis(250),
+            Arc::from([addr("10.1.2.3:4180")]),
+            false,
+            ExtAuthTransport::Http(HttpExtAuthConfig::new(
+                Arc::from([Box::from("x-request-headers-marker")]),
+                Arc::from([Box::from("x-response-headers-marker")]),
+                true,
+            )),
+        )));
+        let bg = simple_bg("ns/svc", &[addr("10.0.0.1:8080")]);
+        let entry = Arc::new(simple_entry(bg).with_auth_chain(Arc::from([auth])));
+
+        let mut b = IngressRoutingTableBuilder::new();
+        b.for_port(80)
+            .exact_host("http-authz.example.com")
+            .add_exact_route("/", entry);
+
+        let rt = rt_ingress(b);
+        let RouteOutcome::Found(m) = rt.find(80, "http-authz.example.com", "/", &ctx()) else {
+            panic!("HTTP ext_authz route must survive the wire round-trip");
+        };
+        assert_eq!(m.auth.len(), 1, "auth chain must carry exactly one entry");
+        let IngressAuthConfig::External(ext) = m.auth[0].as_ref() else {
+            panic!("expected IngressAuthConfig::External, got {:?}", m.auth[0]);
+        };
+        assert!(!ext.fail_closed, "fail_closed must round-trip as false");
+        let ExtAuthTransport::Http(http) = &ext.transport else {
+            panic!("expected ExtAuthTransport::Http, got {:?}", ext.transport);
+        };
+        assert_eq!(
+            http.allowed_headers
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            ["x-request-headers-marker"]
+        );
+        assert_eq!(
+            http.response_headers
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            ["x-response-headers-marker"]
+        );
+        assert!(http.always_set_cookie);
     }
 
     // ── JWT auth (#441) ────────────────────────────────────────────────────────

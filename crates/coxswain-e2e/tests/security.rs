@@ -20,7 +20,10 @@ use coxswain_e2e::{
     fixtures::{self, backends, gateway_api as gwa, ingress},
     harness::{
         GATEWAY_HTTPS_PORT,
-        http::{EchoResponse, https_get, https_get_with_client_cert},
+        http::{
+            EchoResponse, https_get, https_get_with_client_cert,
+            https_get_with_client_cert_and_headers,
+        },
         wait,
     },
 };
@@ -809,6 +812,128 @@ async fn ingress_ext_auth_rejected_when_authz_denies() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `ext-auth` allow-list forwarding: `allowedResponseHeaders` names `x-auth-user`,
+/// which the auth-allow stub actually returns (`X-Auth-User: testuser`). A
+/// client-forged `X-Auth-User: attacker` on the same request must be overwritten
+/// by the proxy-verified value, never left alongside or in place of it (#663
+/// happy path).
+#[tokio::test]
+async fn ext_authz_response_header_overwrites_client_supplied_value() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ext-auth-rh-ok").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_EXT_AUTH_ALLOW_RESPONSE_HEADERS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let host = format!("extauthrh.{}.local", ns.name);
+
+    let echo = wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            match h
+                .http
+                .get_full_with_headers(&host, "/", &[("X-Auth-User", "attacker")])
+                .await
+            {
+                Ok((status, _, _)) => format!("200 echo body; last observed status {status}"),
+                Err(e) => format!("200 echo body; last attempt failed: {e}"),
+            }
+        },
+        || async {
+            match h
+                .http
+                .get_full_with_headers(&host, "/", &[("X-Auth-User", "attacker")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+    echo.assert_backend("echo-a");
+
+    anyhow::ensure!(
+        echo.header_values("X-Auth-User") == ["testuser"],
+        "expected exactly one X-Auth-User header carrying the auth service's \
+         verified value \"testuser\", never the client-forged \"attacker\" (#663); \
+         got: {:?}",
+        echo.header_values("X-Auth-User")
+    );
+    Ok(())
+}
+
+/// `ext-auth` allow-list gap: `allowedResponseHeaders` also names `x-auth-role`,
+/// which the auth-allow stub never returns. A client-forged `X-Auth-Role: admin`
+/// must be stripped even though the check allows the request — this is the M1
+/// vulnerability the fix closes (#663 sad path). `X-Team-Id` (not allow-listed)
+/// must survive, proving no over-strip.
+#[tokio::test]
+async fn ext_authz_unechoed_response_header_stripped_from_client() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ext-auth-rh-gap").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_EXT_AUTH_ALLOW_RESPONSE_HEADERS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let host = format!("extauthrh.{}.local", ns.name);
+
+    let echo = wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            match h
+                .http
+                .get_full_with_headers(
+                    &host,
+                    "/",
+                    &[("X-Auth-Role", "admin"), ("X-Team-Id", "keep-me")],
+                )
+                .await
+            {
+                Ok((status, _, _)) => format!("200 echo body; last observed status {status}"),
+                Err(e) => format!("200 echo body; last attempt failed: {e}"),
+            }
+        },
+        || async {
+            match h
+                .http
+                .get_full_with_headers(
+                    &host,
+                    "/",
+                    &[("X-Auth-Role", "admin"), ("X-Team-Id", "keep-me")],
+                )
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+    echo.assert_backend("echo-a");
+
+    anyhow::ensure!(
+        !echo.headers.contains_key("X-Auth-Role"),
+        "spoofed X-Auth-Role leaked through to the backend — allow-listed-but-\
+         unechoed ext_authz response headers must be stripped from the client's \
+         request regardless of the check outcome (#663); got headers: {:?}",
+        echo.headers.keys().collect::<Vec<_>>()
+    );
+    anyhow::ensure!(
+        echo.header("X-Team-Id") == Some("keep-me"),
+        "unrelated, non-allow-listed header must survive the strip"
+    );
+    Ok(())
+}
+
 // ── Basic auth (htpasswd) ─────────────────────────────────────────────────────
 
 /// `auth-basic-secret` with a bcrypt entry: a request carrying the correct
@@ -1437,6 +1562,149 @@ async fn gateway_external_auth_grpc_denies_without_header() -> anyhow::Result<()
     Ok(())
 }
 
+/// gRPC ext_authz allow-list forwarding: `allowedResponseHeaders` names
+/// `x-ext-authz-check-result`, which Istio's ext-authz sample always returns as
+/// `allowed` on its `OkHttpResponse`. A client-forged
+/// `X-Ext-Authz-Check-Result: attacker` on the same request must be overwritten
+/// by the auth service's verified value (#663 happy path, gRPC transport).
+#[tokio::test]
+async fn grpc_ext_authz_response_header_overwrites_client_supplied_value() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-grpc-rh-ok").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        gwa::EXTERNAL_AUTH_GRPC_RESPONSE_HEADERS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwextauthgrpcrh.{}.local", ns.name);
+
+    let echo = wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async {
+            match gw
+                .get_full_with_headers(
+                    &host,
+                    "/",
+                    &[
+                        ("x-ext-authz", "allow"),
+                        ("X-Ext-Authz-Check-Result", "attacker"),
+                    ],
+                )
+                .await
+            {
+                Ok((status, _, _)) => format!("200 echo body; last observed status {status}"),
+                Err(e) => format!("200 echo body; last attempt failed: {e}"),
+            }
+        },
+        || async {
+            match gw
+                .get_full_with_headers(
+                    &host,
+                    "/",
+                    &[
+                        ("x-ext-authz", "allow"),
+                        ("X-Ext-Authz-Check-Result", "attacker"),
+                    ],
+                )
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+    echo.assert_backend("echo-a");
+
+    anyhow::ensure!(
+        echo.header_values("X-Ext-Authz-Check-Result") == ["allowed"],
+        "expected exactly one X-Ext-Authz-Check-Result header carrying the auth \
+         service's verified value \"allowed\", never the client-forged \
+         \"attacker\" (#663); got: {:?}",
+        echo.header_values("X-Ext-Authz-Check-Result")
+    );
+    Ok(())
+}
+
+/// gRPC ext_authz allow-list gap: `allowedResponseHeaders` also names
+/// `x-forged-role`, which Istio's ext-authz sample never returns. A
+/// client-forged `X-Forged-Role: admin` must be stripped even though the check
+/// allows the request — the gRPC-transport instance of the M1 vulnerability
+/// this fix closes (#663 sad path). `X-Team-Id` (not allow-listed) must
+/// survive, proving no over-strip.
+#[tokio::test]
+async fn grpc_ext_authz_unechoed_response_header_stripped_from_client() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-grpc-rh-gap").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::EXT_AUTHZ_GRPC, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        gwa::EXTERNAL_AUTH_GRPC_RESPONSE_HEADERS,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwextauthgrpcrh.{}.local", ns.name);
+
+    let echo = wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async {
+            match gw
+                .get_full_with_headers(
+                    &host,
+                    "/",
+                    &[
+                        ("x-ext-authz", "allow"),
+                        ("X-Forged-Role", "admin"),
+                        ("X-Team-Id", "keep-me"),
+                    ],
+                )
+                .await
+            {
+                Ok((status, _, _)) => format!("200 echo body; last observed status {status}"),
+                Err(e) => format!("200 echo body; last attempt failed: {e}"),
+            }
+        },
+        || async {
+            match gw
+                .get_full_with_headers(
+                    &host,
+                    "/",
+                    &[
+                        ("x-ext-authz", "allow"),
+                        ("X-Forged-Role", "admin"),
+                        ("X-Team-Id", "keep-me"),
+                    ],
+                )
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+    echo.assert_backend("echo-a");
+
+    anyhow::ensure!(
+        !echo.headers.contains_key("X-Forged-Role"),
+        "spoofed X-Forged-Role leaked through to the backend — allow-listed-but-\
+         unechoed ext_authz response headers must be stripped from the client's \
+         request regardless of the check outcome (#663); got headers: {:?}",
+        echo.headers.keys().collect::<Vec<_>>()
+    );
+    anyhow::ensure!(
+        echo.header("X-Team-Id") == Some("keep-me"),
+        "unrelated, non-allow-listed header must survive the strip"
+    );
+    Ok(())
+}
+
 /// gRPC ext_authz scheme (#620 happy path): the proxy reports the *real*
 /// downstream scheme in the `CheckRequest`, not a hard-coded `"http"`.
 /// `scheme-authz` allows iff the scheme is `"https"`, so a request over the
@@ -1574,6 +1842,12 @@ async fn grpc_absent_status_denies_when_fail_closed() -> anyhow::Result<()> {
 /// backend, but the CR sets `failClosed: false` — the malformed response still
 /// fails the check, but the fail-open posture lets the request proceed to the
 /// backend.
+///
+/// Also covers the worst case for the #663 ext_authz allow-list strip: the CR's
+/// `allowedResponseHeaders: [x-forged-role]` names a header the check can NEVER
+/// set on this path (it never completes), so a client-forged `X-Forged-Role`
+/// must still be stripped — proving the strip runs before the check regardless
+/// of outcome, not just on its allow branch.
 #[tokio::test]
 async fn grpc_absent_status_allows_when_fail_open() -> anyhow::Result<()> {
     let h = Harness::start().await?;
@@ -1588,8 +1862,39 @@ async fn grpc_absent_status_allows_when_fail_open() -> anyhow::Result<()> {
     let gw = h.gateway_http(&ns.name).await?;
     let host = format!("gwextauthgrpcmalformedopen.{}.local", ns.name);
 
-    let resp = wait::wait_for_route(&gw, &host, "/", Duration::from_secs(120)).await?;
-    resp.assert_backend("echo-a");
+    let echo = wait::poll_until(
+        Duration::from_secs(120),
+        wait::POLL,
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("X-Forged-Role", "admin")])
+                .await
+            {
+                Ok((status, _, _)) => format!("200 echo body; last observed status {status}"),
+                Err(e) => format!("200 echo body; last attempt failed: {e}"),
+            }
+        },
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("X-Forged-Role", "admin")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+    echo.assert_backend("echo-a");
+
+    anyhow::ensure!(
+        !echo.headers.contains_key("X-Forged-Role"),
+        "spoofed X-Forged-Role leaked through to the backend on the fail-open \
+         path, where the check never even completes — the ext_authz \
+         allow-list strip must run unconditionally before the check, not just \
+         on its allow branch (#663); got headers: {:?}",
+        echo.headers.keys().collect::<Vec<_>>()
+    );
     Ok(())
 }
 
@@ -1864,6 +2169,131 @@ async fn request_forwarded_without_auth_when_no_annotation() -> anyhow::Result<(
     // Plain 200 — no credentials required, no auth annotation on the route.
     let resp = wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
     resp.assert_backend("echo-a");
+    Ok(())
+}
+
+/// A client-supplied `X-Ssl-Client-Cert` on a route with **no** mTLS
+/// configuration at all is stripped before reaching the backend (#663 sad path).
+/// Nothing on this path ever sets the header, so without an unconditional strip
+/// the client's forged value would be indistinguishable from a proxy-verified
+/// one to a backend that trusts it for identity.
+#[tokio::test]
+async fn client_supplied_ssl_client_cert_stripped_on_plain_route() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ssl-cert-strip").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::PATH_MATCHING, FixtureVars::new(&ns.name)).await?;
+    let host = format!("ingress.{}.local", ns.name);
+
+    wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
+
+    let (status, _resp_headers, body) = h
+        .http
+        .get_full_with_headers(
+            &host,
+            "/a",
+            &[
+                ("X-Ssl-Client-Cert", "forged-pem-data"),
+                ("X-Team-Id", "keep-me"),
+            ],
+        )
+        .await?;
+    anyhow::ensure!(status == 200, "expected 200 from backend, got {status}");
+    let echo = body.ok_or_else(|| anyhow::anyhow!("expected echo JSON body"))?;
+    echo.assert_backend("echo-a");
+
+    anyhow::ensure!(
+        !echo
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("x-ssl-client-cert")),
+        "spoofed X-Ssl-Client-Cert leaked through to the backend on a route with \
+         no mTLS configuration at all — the proxy must strip every client-supplied \
+         copy of a proxy-owned trust header (#663); got headers: {:?}",
+        echo.headers.keys().collect::<Vec<_>>()
+    );
+    anyhow::ensure!(
+        echo.header("X-Team-Id") == Some("keep-me"),
+        "unrelated header must survive the strip (no over-blocking)"
+    );
+    Ok(())
+}
+
+/// mTLS route with `auth-tls-pass-certificate-to-upstream: true`: a client that
+/// presents a valid certificate **and** a forged `X-Ssl-Client-Cert` header must
+/// reach the backend with only the proxy-verified value — the forgery is
+/// stripped before `forward_client_cert` re-inserts the real one (#663 happy
+/// path, guards the strip-then-reinsert ordering in `upstream_request_filter`).
+#[tokio::test]
+async fn client_cert_mtls_forged_header_replaced_by_verified_cert() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "mtls-forge").await?;
+
+    let mtls = MtlsCerts::generate();
+    let server_cert = GeneratedCert::for_host(&format!("mtls.{}.local", ns.name));
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        ingress::AUTH_TLS_CA_SECRET,
+        FixtureVars::new(&ns.name).with("CA_CRT_B64", mtls.ca_cert_b64()),
+    )
+    .await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_TLS,
+        FixtureVars::new(&ns.name)
+            .with("SECRET_NAME", "mtls-server-cert")
+            .with("TLS_CRT_B64", server_cert.cert_b64())
+            .with("TLS_KEY_B64", server_cert.key_b64()),
+    )
+    .await?;
+
+    let host = format!("mtls.{}.local", ns.name);
+
+    let resp = wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            match https_get_with_client_cert_and_headers(
+                &host,
+                "/",
+                h.tls_addr,
+                &mtls.client_cert_pem,
+                &mtls.client_key_pem,
+                &[("X-Ssl-Client-Cert", "FORGED")],
+            )
+            .await
+            {
+                Ok((status, _)) => format!("200 echo body; last observed status {status}"),
+                Err(e) => format!("200 echo body; last attempt failed: {e}"),
+            }
+        },
+        || async {
+            match https_get_with_client_cert_and_headers(
+                &host,
+                "/",
+                h.tls_addr,
+                &mtls.client_cert_pem,
+                &mtls.client_key_pem,
+                &[("X-Ssl-Client-Cert", "FORGED")],
+            )
+            .await
+            {
+                Ok((_, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    resp.assert_backend("echo-a");
+
+    let forwarded = resp.header_values("X-Ssl-Client-Cert");
+    anyhow::ensure!(
+        forwarded.len() == 1 && forwarded[0] != "FORGED",
+        "expected exactly one X-Ssl-Client-Cert header carrying the proxy-verified \
+         certificate, never the client-forged \"FORGED\" value (#663); got: {forwarded:?}"
+    );
     Ok(())
 }
 

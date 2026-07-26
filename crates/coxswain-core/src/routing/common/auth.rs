@@ -13,6 +13,50 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroize::ZeroizeOnDrop;
 
+/// GEP-1494 default `allowedHeaders` for the `HTTP` transport, applied by
+/// [`resolve_allowed_headers`] when the configured list is empty: only
+/// `authorization` is forwarded beyond the mandatory `Host`/method/path
+/// pseudo-headers the proxy always sends (#663).
+pub const DEFAULT_ALLOWED_HEADERS_HTTP: &[&str] = &["authorization"];
+
+/// GEP-1494 default `allowedHeaders` for the `GRPC` transport, applied by
+/// [`resolve_allowed_headers`] when the configured list is empty (#663). Wider
+/// than the HTTP default because gRPC has no separate pseudo-header carve-out
+/// for these — the spec names them explicitly so a default-configured check
+/// still sees them.
+pub const DEFAULT_ALLOWED_HEADERS_GRPC: &[&str] = &[
+    "authorization",
+    "location",
+    "proxy-authenticate",
+    "set-cookie",
+    "www-authenticate",
+];
+
+/// Resolve a raw `allowedHeaders` list (GEP-1494) to a lower-cased, **always
+/// non-empty** list: `raw` verbatim (lower-cased) when non-empty, else
+/// `default` (see [`DEFAULT_ALLOWED_HEADERS_HTTP`] / [`DEFAULT_ALLOWED_HEADERS_GRPC`]).
+///
+/// The single, shared construction point for this invariant (#663) — used both
+/// by the reflector resolving a `CoxswainExternalAuthSpec` (`raw` is the CRD's
+/// operator-cased strings) and by the discovery wire decoder (`raw` is the
+/// decoded proto field, which is empty when an older sender doesn't populate it
+/// yet, e.g. a relay one version behind a controller during a rolling upgrade).
+/// Applying the same default at *both* construction sites means a version-skew
+/// window degrades to the same safe default an unconfigured CRD gets, never to
+/// "forward nothing" (which would deny every check, indistinguishable from a
+/// real auth failure) nor "forward everything" (the #663 vulnerability this
+/// type exists to close).
+#[must_use]
+pub fn resolve_allowed_headers(raw: &[String], default: &[&str]) -> Arc<[Box<str>]> {
+    if raw.is_empty() {
+        default.iter().map(|h| Box::from(*h)).collect()
+    } else {
+        raw.iter()
+            .map(|h| h.to_ascii_lowercase().into_boxed_str())
+            .collect()
+    }
+}
+
 /// Top-level authentication configuration for an Ingress route, resolved at
 /// reconcile time from the `ingress.coxswain-labs.dev/auth-*` annotations.
 ///
@@ -92,8 +136,9 @@ pub enum ExtAuthTransport {
     /// HTTP forward-auth — Envoy `ext_authz`-HTTP semantics.
     ///
     /// Request replays the original method and path to a resolved auth endpoint,
-    /// forwards client headers (Authorization, Cookie, …), sends no body.
-    /// Three-bucket response contract mirrors Envoy / Istio `envoyExtAuthzHttp`:
+    /// forwards the client headers named in `allowed_headers` (GEP-1494
+    /// `allowedHeaders`), sends no body. Three-bucket response contract mirrors
+    /// Envoy / Istio `envoyExtAuthzHttp`:
     /// - 2xx → allow; copy `response_headers` allow-list onto upstream request.
     /// - non-2xx → deny; return auth status+body to client; `always_set_cookie`
     ///   adds `Set-Cookie` to the downstream response (enables `302 → IdP`).
@@ -102,8 +147,8 @@ pub enum ExtAuthTransport {
     /// gRPC — the Envoy `envoy.service.auth.v3.Authorization/Check` proto (#23).
     ///
     /// The proxy sends a `CheckRequest` carrying the downstream request's method,
-    /// path, host, and headers to a resolved auth endpoint and maps the
-    /// `CheckResponse`:
+    /// path, host, and the headers named in `allowed_headers` (GEP-1494
+    /// `allowedHeaders`) to a resolved auth endpoint and maps the `CheckResponse`:
     /// - `status.code == OK` → allow; copy `response_headers` from the
     ///   `OkHttpResponse` headers onto the upstream request.
     /// - `status.code != OK` → deny; return the `DeniedHttpResponse` HTTP status
@@ -113,10 +158,18 @@ pub enum ExtAuthTransport {
     Grpc(GrpcExtAuthConfig),
 }
 
-/// HTTP forward-auth wiring: the response-header allow-list knobs. The check
-/// target endpoints live on the parent [`ExtAuthConfig`].
+/// HTTP forward-auth wiring: the request- and response-header allow-list
+/// knobs. The check target endpoints live on the parent [`ExtAuthConfig`].
 #[derive(Debug)]
 pub struct HttpExtAuthConfig {
+    /// Header names forwarded from the client's request onto the auth-service
+    /// check request (GEP-1494 `allowedHeaders`), lower-cased at reconcile time.
+    /// **Always resolved to a non-empty list** — the reflector bakes in the
+    /// GEP-1494 HTTP default (`authorization` alone) when the CRD field is
+    /// absent or empty, so this is never treated as "forward nothing" (#663).
+    /// `Host`, the request method, and path are forwarded unconditionally by
+    /// the proxy regardless of this list — see [`ExtAuthTransport::Http`].
+    pub allowed_headers: Arc<[Box<str>]>,
     /// Header names to copy from the auth *response* onto the upstream *request*
     /// when the auth service allows (Envoy `allowed_upstream_headers` / Istio
     /// `headersToUpstreamOnAllow`; GEP-1494 `allowedResponseHeaders`).
@@ -129,23 +182,35 @@ pub struct HttpExtAuthConfig {
 }
 
 impl HttpExtAuthConfig {
-    /// Construct an [`HttpExtAuthConfig`] with the given allowed response
+    /// Construct an [`HttpExtAuthConfig`] with the given allowed request/response
     /// headers and Set-Cookie forwarding flag.
     #[must_use]
-    pub fn new(response_headers: Arc<[Box<str>]>, always_set_cookie: bool) -> Self {
+    pub fn new(
+        allowed_headers: Arc<[Box<str>]>,
+        response_headers: Arc<[Box<str>]>,
+        always_set_cookie: bool,
+    ) -> Self {
         Self {
+            allowed_headers,
             response_headers,
             always_set_cookie,
         }
     }
 }
 
-/// gRPC ext_authz wiring: the response-header allow-list. The check-target
-/// endpoints live on the parent [`ExtAuthConfig`]. The Envoy proto forwards the
-/// full downstream request context to the auth service, so — unlike the HTTP
-/// transport — there is no request-header allow-list knob here.
+/// gRPC ext_authz wiring: the request- and response-header allow-lists. The
+/// check-target endpoints live on the parent [`ExtAuthConfig`].
 #[derive(Debug)]
 pub struct GrpcExtAuthConfig {
+    /// Header names copied into the `CheckRequest`'s header map (GEP-1494
+    /// `allowedHeaders`), lower-cased at reconcile time. **Always resolved to a
+    /// non-empty list** — the reflector bakes in the GEP-1494 gRPC default
+    /// (`authorization`, `location`, `proxy-authenticate`, `set-cookie`,
+    /// `www-authenticate`) when the CRD field is absent or empty (#663). Unlike
+    /// `Host`/method/path on the HTTP transport, gRPC has no separate
+    /// pseudo-header carve-out — everything the check needs beyond this list is
+    /// carried by dedicated `CheckRequest` fields, not the header map.
+    pub allowed_headers: Arc<[Box<str>]>,
     /// Header names to copy from the auth service's `OkHttpResponse.headers` onto
     /// the upstream *request* when the check allows (Envoy
     /// `allowed_upstream_headers`; GEP-1494 `allowedResponseHeaders`). Lower-cased
@@ -154,10 +219,14 @@ pub struct GrpcExtAuthConfig {
 }
 
 impl GrpcExtAuthConfig {
-    /// Construct a [`GrpcExtAuthConfig`] with the given allowed response headers.
+    /// Construct a [`GrpcExtAuthConfig`] with the given allowed request/response
+    /// headers.
     #[must_use]
-    pub fn new(response_headers: Arc<[Box<str>]>) -> Self {
-        Self { response_headers }
+    pub fn new(allowed_headers: Arc<[Box<str>]>, response_headers: Arc<[Box<str>]>) -> Self {
+        Self {
+            allowed_headers,
+            response_headers,
+        }
     }
 }
 
@@ -303,5 +372,57 @@ impl std::fmt::Debug for PasswordHash {
             PasswordHash::Bcrypt(_) => f.write_str("Bcrypt(<redacted>)"),
             PasswordHash::Sha1(_) => f.write_str("Sha1(<redacted>)"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| (*n).to_string()).collect()
+    }
+
+    #[test]
+    fn resolve_allowed_headers_lower_cases_and_prefers_configured_names() {
+        let raw = strings(&["Cookie", "X-Request-Id"]);
+        let resolved = resolve_allowed_headers(&raw, DEFAULT_ALLOWED_HEADERS_HTTP);
+        assert_eq!(
+            resolved.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+            ["cookie", "x-request-id"],
+            "configured names win over the default, and are lower-cased"
+        );
+    }
+
+    #[test]
+    fn resolve_allowed_headers_falls_back_to_default_when_raw_is_empty() {
+        // Covers both CRD-absent (`Option::None` unwrapped to `&[]` by the
+        // caller) and CRD-explicit-empty (`allowedHeaders: []`) — neither may be
+        // taken as "forward nothing", which would silently break every check.
+        let resolved = resolve_allowed_headers(&[], DEFAULT_ALLOWED_HEADERS_HTTP);
+        assert_eq!(
+            resolved.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+            DEFAULT_ALLOWED_HEADERS_HTTP
+        );
+    }
+
+    #[test]
+    fn resolve_allowed_headers_uses_the_grpc_default_when_given_it() {
+        let resolved = resolve_allowed_headers(&[], DEFAULT_ALLOWED_HEADERS_GRPC);
+        assert_eq!(
+            resolved.iter().map(AsRef::as_ref).collect::<Vec<&str>>(),
+            DEFAULT_ALLOWED_HEADERS_GRPC
+        );
+    }
+
+    #[test]
+    fn resolve_allowed_headers_result_is_never_empty() {
+        // The invariant every caller (reflector resolve, wire decode) depends
+        // on: this function alone is the one place it must hold.
+        assert!(!resolve_allowed_headers(&[], DEFAULT_ALLOWED_HEADERS_HTTP).is_empty());
+        assert!(!resolve_allowed_headers(&[], DEFAULT_ALLOWED_HEADERS_GRPC).is_empty());
+        assert!(
+            !resolve_allowed_headers(&strings(&["x"]), DEFAULT_ALLOWED_HEADERS_HTTP).is_empty()
+        );
     }
 }

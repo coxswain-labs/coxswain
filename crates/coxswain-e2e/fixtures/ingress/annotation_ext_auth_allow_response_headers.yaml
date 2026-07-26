@@ -1,0 +1,44 @@
+# ext-auth allow-list fixture (#663): same auth-allow stub as
+# annotation_ext_auth_allow.yaml, but `allowedResponseHeaders` names TWO
+# headers:
+#   - x-auth-user — the stub actually returns this (X-Auth-User: testuser),
+#     so it proves the legitimately-returned value is forwarded and
+#     overwrites a client-forged copy of the same name (#663 happy path).
+#   - x-auth-role — the stub never returns this, so it proves a client-forged
+#     copy is stripped even though the check allows the request (#663 sad
+#     path: the ext_authz allow-list gap the CVE is about).
+#
+# Host: extauthrh.TESTNS.local / -> echo-a:3000 (reached on allow).
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
+metadata:
+  name: extauth-allow-response-headers
+spec:
+  protocol: HTTP
+  backendRef:
+    name: auth-allow
+    port: 4000
+  allowedResponseHeaders:
+    - x-auth-user
+    - x-auth-role
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ext-auth-allow-response-headers-ingress
+  annotations:
+    ingress.coxswain-labs.dev/ext-auth: "${TESTNS}/extauth-allow-response-headers"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: extauthrh.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

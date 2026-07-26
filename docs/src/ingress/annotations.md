@@ -589,11 +589,15 @@ spec:
     port: 4180
   timeout: 250ms
   failClosed: true        # deny (503) on auth-service error/timeout (default)
+  allowedHeaders:         # forwarded to the auth service on the check request
+    - authorization
   allowedResponseHeaders: # copied onto the upstream request on allow
     - x-auth-user
 ```
 
-A **2xx** (HTTP transport) or `OK` (gRPC transport) response from the auth service allows the request; any other status is returned to the client verbatim and the upstream is never hit. A missing `CoxswainExternalAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`auth-jwt`: an operator who set `ext-auth` intends the route to require the check, so a stale or typo'd reference must not silently disable it. A present CR whose `backendRef` has no ready endpoints, whose cross-namespace `backendRef` lacks a `ReferenceGrant`, or whose protocol is unsupported also fails **closed**. See the [`CoxswainExternalAuth` CRD reference](../gateway-api/route-extensions.md#external-authorization-ext_authz) for the full spec (transport, timeout, fail-closed posture, response-header forwarding).
+A **2xx** (HTTP transport) or `OK` (gRPC transport) response from the auth service allows the request; any other status is returned to the client verbatim and the upstream is never hit. A missing `CoxswainExternalAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`auth-jwt`: an operator who set `ext-auth` intends the route to require the check, so a stale or typo'd reference must not silently disable it. A present CR whose `backendRef` has no ready endpoints, whose cross-namespace `backendRef` lacks a `ReferenceGrant`, or whose protocol is unsupported also fails **closed**. See the [`CoxswainExternalAuth` CRD reference](../gateway-api/route-extensions.md#external-authorization-ext_authz) for the full spec (transport, timeout, fail-closed posture, request/response-header forwarding).
+
+Only the client request headers named in `allowedHeaders` reach the auth service — everything else (`Cookie`, a custom header, anything unnamed) is withheld, so a client can't smuggle a credential or forge a header your authz policy trusts just because it wasn't allow-listed. When absent or empty, GEP-1494's per-protocol default applies (`Authorization` alone for `HTTP`; a wider GEP-1494-defined set for `GRPC`). Symmetrically, every name in `allowedResponseHeaders` is stripped from the client's request before the check runs, whether or not the auth service echoes it back on a given allow response — a client cannot forge a header your backend trusts as the auth service's word just because the service didn't set it on this particular request.
 
 ### `auth-basic-secret`
 
@@ -702,6 +706,8 @@ ingress.coxswain-labs.dev/auth-tls-pass-certificate-to-upstream: "true"
 ```
 
 The header value is the raw PEM of the client leaf certificate, percent-encoded (all non-alphanumeric characters encoded). Backends decode it with a standard URL-decode.
+
+`X-SSL-Client-Cert` is unconditionally stripped from every client request before this (or any) route filter runs — on a route without this annotation, without an mTLS `auth-tls-secret`, or where the client presented no certificate under GEP-91 insecure fallback, nothing re-inserts it, so a client cannot forge the header your backend trusts as a proxy-verified identity.
 
 !!! note "v1 limitation"
     `auth-tls-*` annotations are read directly off `Ingress.metadata.annotations`. They do not inherit class-level defaults from a `CoxswainIngressClassParameters` resource. Per-class mTLS defaults are tracked for a future release.

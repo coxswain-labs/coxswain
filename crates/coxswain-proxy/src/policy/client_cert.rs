@@ -72,8 +72,18 @@ pub(crate) fn enforce_client_cert(
 
 /// Forward the verified client certificate upstream as `X-SSL-Client-Cert` when
 /// [`enforce_client_cert`] stashed one on `ctx` (`pass_to_upstream`).
-pub(crate) fn forward_client_cert(upstream_request: &mut RequestHeader, ctx: &mut ProxyCtx) {
-    if let Some(hv) = ctx.client_cert_header.take() {
-        let _ = upstream_request.insert_header("x-ssl-client-cert", hv);
+///
+/// Reads `ctx.client_cert_header`, never `.take()`s it (#663): Pingora retries a
+/// failed upstream attempt against a *fresh* clone of the downstream request
+/// while reusing the same `ctx`, re-running `upstream_request_filter` — and
+/// therefore this function — once per attempt. A one-shot `.take()` would
+/// forward the verified certificate on attempt 1 only; a retried attempt would
+/// then present neither the client's forged copy (correctly stripped) nor the
+/// proxy's verified one, silently downgrading an authenticated request to
+/// unauthenticated. `HeaderValue`'s `Bytes`-backed clone is cheap (see
+/// `ProxyCtx::client_cert_header`'s doc).
+pub(crate) fn forward_client_cert(upstream_request: &mut RequestHeader, ctx: &ProxyCtx) {
+    if let Some(hv) = ctx.client_cert_header.as_ref() {
+        let _ = upstream_request.insert_header("x-ssl-client-cert", hv.clone());
     }
 }

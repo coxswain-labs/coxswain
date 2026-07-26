@@ -7,6 +7,11 @@
 #   * a request with `x-ext-authz: allow` is allowed → echo-a,
 #   * a request without it is denied (PermissionDenied) → 403.
 #
+# `allowedHeaders: [x-ext-authz]` (#663) is required: GEP-1494's GRPC default
+# (Authorization, Location, Proxy-Authenticate, Set-Cookie, WWW-Authenticate)
+# does not include x-ext-authz, so without this the proxy would withhold the
+# very header this fixture's allow/deny decision depends on.
+#
 # Gateway: coxswain-extauth-grpc on GATEWAY_HTTP_PORT.
 # Route host: gwextauthgrpc.TESTNS.local, path / -> echo-a:3000.
 ---
@@ -33,6 +38,8 @@ spec:
   backendRef:
     name: ext-authz-grpc
     port: 9000
+  allowedHeaders:
+    - x-ext-authz
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute

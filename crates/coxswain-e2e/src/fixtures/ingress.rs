@@ -202,6 +202,15 @@ pub const ANNOTATION_EXT_AUTH_ALLOW: &str = fixture!("annotation_ext_auth_allow.
 /// proxy returns 403 and never reaches echo-a. Depends on `backends::AUTH_STUB`
 /// being applied first.
 pub const ANNOTATION_EXT_AUTH_DENY: &str = fixture!("annotation_ext_auth_deny.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/ext-auth` naming a `CoxswainExternalAuth`
+/// CR (HTTP transport, `backendRef: auth-allow:4000`) whose `allowedResponseHeaders`
+/// names `x-auth-user` (which the stub returns) **and** `x-auth-role` (which it
+/// does not) (#663). Used to verify a legitimately-returned header overwrites a
+/// client-forged copy, and an allow-listed-but-unechoed header is stripped from
+/// the client's request rather than reaching the backend. Depends on
+/// `backends::AUTH_STUB` being applied first.
+pub const ANNOTATION_EXT_AUTH_ALLOW_RESPONSE_HEADERS: &str =
+    fixture!("annotation_ext_auth_allow_response_headers.yaml");
 /// Labeled htpasswd Secret for basic-auth e2e tests (#24).
 /// Carries `ingress.coxswain-labs.dev/auth-basic: "true"` so the reflector picks it up.
 /// Contains: `alice` (bcrypt, password `secret`) + `bob` (SHA1, password `secret`).

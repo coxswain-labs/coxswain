@@ -17,8 +17,9 @@ pub mod udp;
 mod tests;
 
 pub use common::auth::{
-    BasicCredential, ExtAuthConfig, ExtAuthTransport, GrpcExtAuthConfig, HttpExtAuthConfig,
-    IngressAuthConfig, JwtConfig, JwtHeaderLoc, PasswordHash,
+    BasicCredential, DEFAULT_ALLOWED_HEADERS_GRPC, DEFAULT_ALLOWED_HEADERS_HTTP, ExtAuthConfig,
+    ExtAuthTransport, GrpcExtAuthConfig, HttpExtAuthConfig, IngressAuthConfig, JwtConfig,
+    JwtHeaderLoc, PasswordHash, resolve_allowed_headers,
 };
 pub use common::backend::{
     BackendGroup, BackendGroupSpec, HashSource, LoadBalance, LoadBalanceParseError, Selected,

@@ -3,10 +3,13 @@
 //! Called from [`crate::hooks::request_filter`] after rate-limiting and
 //! before redirect/body handling.  Implements two modes:
 //!
-//! - **External (`ext_authz`)**: forwards a sub-request to a configurable HTTP
-//!   auth endpoint using Envoy `ext_authz`-HTTP semantics — original method and
-//!   Host are preserved; client headers (Authorization, Cookie …) are forwarded;
-//!   no body.  2xx → allow; non-2xx → deny (status+body returned to client);
+//! - **External (`ext_authz`)**: forwards a sub-request to a configurable auth
+//!   endpoint (HTTP forward-auth or the Envoy gRPC `Authorization/Check` proto)
+//!   — original method, Host, and path are preserved; client headers are
+//!   forwarded only when named in `allowedHeaders` (GEP-1494, #663; resolved to
+//!   a per-protocol default when unset — see
+//!   [`coxswain_core::routing::HttpExtAuthConfig::allowed_headers`]); no body.
+//!   2xx/`OK` → allow; otherwise → deny (status+body returned to client);
 //!   timeout/connect error → 503.
 //!
 //! - **Basic auth** (`Authorization: Basic`): decodes the header and verifies
@@ -32,6 +35,13 @@
 //! bcrypt and SHA1 hashes are scrubbed when the `BasicCredential` list is
 //! dropped at reconcile time (via `ZeroizeOnDrop` on `BasicCredential` /
 //! `PasswordHash`).
+//!
+//! `ext_authz`'s `allowedResponseHeaders` names are stripped from the client's
+//! request unconditionally, before the check even runs (#663, `enforce`'s
+//! `External` arm) — the proxy only ever *sets* a name the auth service's allow
+//! response actually echoes, so a configured-but-unechoed name would otherwise
+//! let a client's forged copy reach the backend indistinguishable from a
+//! proxy-verified one. Same pattern as the JWT path's [`strip_header_names`].
 
 use coxswain_core::routing::{ExtAuthTransport, IngressAuthConfig, JwtConfig, PasswordHash};
 use pingora_core::Result;
@@ -72,6 +82,55 @@ pub(crate) const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
+/// Whether `name` — an already-lower-cased header name, from
+/// [`http::HeaderName::as_str`] — is in `allowed_headers` and therefore
+/// forwarded to the ext_authz auth service on the check request (GEP-1494
+/// `allowedHeaders`, #663).
+///
+/// `allowed_headers` is always non-empty by construction (the reflector bakes
+/// in the GEP-1494 per-protocol default when the CRD field is absent or
+/// empty), so this never degenerates into "forward everything". `Host`, the
+/// request method, and the request path bypass this check entirely on both
+/// transports — they identify the request being authorized, not
+/// client-supplied trust material, and are threaded through dedicated fields
+/// rather than the generic header set this gates.
+pub(crate) fn is_allowed_request_header(name: &str, allowed_headers: &[Box<str>]) -> bool {
+    allowed_headers.iter().any(|h| h.as_ref() == name)
+}
+
+/// Whether `name` — an already-lower-cased header name — should be forwarded
+/// onto the ext_authz check request: not `host` (forwarded separately as a
+/// dedicated pseudo-header on both transports, never through this generic
+/// set), not hop-by-hop, and named in `allowed_headers`
+/// ([`is_allowed_request_header`], GEP-1494 `allowedHeaders`, #663).
+///
+/// The single decision point [`select_forwarded_headers`] (HTTP) and
+/// [`grpc::select_check_headers`] both filter through, so the two transports
+/// can never drift on which names are pseudo-headers vs. hop-by-hop vs.
+/// allow-listed.
+fn should_forward_to_authz(name: &str, allowed_headers: &[Box<str>]) -> bool {
+    name != "host"
+        && !HOP_BY_HOP.contains(&name)
+        && is_allowed_request_header(name, allowed_headers)
+}
+
+/// The `(name, value)` pairs to forward from `req_hdr` onto the HTTP
+/// forward-auth check request, per [`should_forward_to_authz`]. `Session`-free
+/// (takes a [`RequestHeader`] directly) so this is unit-testable without
+/// constructing a Pingora `Session` — the same testing boundary
+/// [`stage_ext_authz_strips`] established for the response-header side.
+fn select_forwarded_headers<'a>(
+    req_hdr: &'a pingora_http::RequestHeader,
+    allowed_headers: &[Box<str>],
+) -> Vec<(&'a str, &'a str)> {
+    req_hdr
+        .headers
+        .iter()
+        .filter(|(name, _)| should_forward_to_authz(name.as_str(), allowed_headers))
+        .filter_map(|(name, value)| value.to_str().ok().map(|v| (name.as_str(), v)))
+        .collect()
+}
+
 // ── Public entry point ────────────────────────────────────────────────────────
 
 /// Enforce the authentication policy on `session`.
@@ -88,8 +147,9 @@ pub(crate) const HOP_BY_HOP: &[&str] = &[
 /// and the route's `auth-response-headers` list is non-empty; the caller
 /// stores it on `ctx` for [`crate::hooks::upstream_request_filter`] to apply.
 /// `strip_upstream_headers` is populated by a successful JWT check when the
-/// CRD's `forward` is `false` — applied by the same caller, before
-/// `auth_response_headers`.
+/// CRD's `forward` is `false`, and unconditionally by an `ext_authz` check's
+/// configured `allowedResponseHeaders` (#663, mirroring [`strip_header_names`])
+/// — applied by the same caller, before `auth_response_headers`.
 ///
 /// # Errors
 ///
@@ -105,6 +165,13 @@ pub(crate) async fn enforce(
 ) -> Result<bool> {
     match auth {
         IngressAuthConfig::External(cfg) => {
+            // Unconditionally stage every name this check's allow-list could
+            // populate, *before* the check runs — not just on its allow branch.
+            // That also covers the fail-open paths (unreachable/timed-out
+            // service, `failClosed: false`): the check never ran, so nothing
+            // legitimate could have set the header, making a client-forged copy
+            // indistinguishable from a proxy-verified one without this strip.
+            stage_ext_authz_strips(&cfg.transport, strip_upstream_headers);
             enforce_ext_authz(client, grpc_channels, cfg, session, auth_response_headers).await
         }
         IngressAuthConfig::Basic(creds) => enforce_basic(creds, session).await,
@@ -124,6 +191,40 @@ pub(crate) async fn enforce(
             write_simple(session, 503).await?;
             Ok(true)
         }
+    }
+}
+
+/// The `allowedResponseHeaders` names an `ext_authz` check owns on the upstream
+/// request, for either transport.
+///
+/// The proxy only ever *sets* these names when the auth service's allow
+/// response actually echoes them (see [`enforce_ext_authz_http`] and
+/// `grpc::map_check_response`) — so unlike a `set`-then-`insert` header, a
+/// configured-but-unechoed name has nothing proxy-side to overwrite a client's
+/// forged copy with. [`enforce`] strips every name here unconditionally,
+/// before the check even runs.
+fn ext_authz_strip_names(transport: &ExtAuthTransport) -> &Arc<[Box<str>]> {
+    match transport {
+        ExtAuthTransport::Http(cfg) => &cfg.response_headers,
+        ExtAuthTransport::Grpc(cfg) => &cfg.response_headers,
+    }
+}
+
+/// Stage `transport`'s [`ext_authz_strip_names`] onto `strip_upstream_headers_out`
+/// (#663), appending to whatever an earlier check in the additive auth chain
+/// already staged (e.g. a `JwtAuth` token-strip name) rather than clobbering it.
+/// A `Session`-free, directly unit-testable extraction of [`enforce`]'s
+/// `External` arm — `enforce` itself needs a live `Session` to reach the check
+/// that follows, which is out of scope for a staging-order test.
+fn stage_ext_authz_strips(
+    transport: &ExtAuthTransport,
+    strip_upstream_headers_out: &mut Option<Vec<Box<str>>>,
+) {
+    let names = ext_authz_strip_names(transport);
+    if !names.is_empty() {
+        strip_upstream_headers_out
+            .get_or_insert_with(Vec::new)
+            .extend(names.iter().cloned());
     }
 }
 
@@ -181,7 +282,10 @@ async fn enforce_ext_authz_http(
 
     let mut builder = client.request(method, &url);
 
-    // Forward client headers, preserving Host.  Strip hop-by-hop.
+    // Forward Host unconditionally (a pseudo-header identifying the request, not
+    // client-supplied trust material) plus every client header named in
+    // `allowed_headers` (GEP-1494 `allowedHeaders`, #663) — hop-by-hop headers
+    // are stripped regardless of the allow-list.
     let host_hdr = req_hdr
         .headers
         .get(http::header::HOST)
@@ -191,15 +295,8 @@ async fn enforce_ext_authz_http(
     if !host_hdr.is_empty() {
         builder = builder.header(reqwest::header::HOST, &host_hdr);
     }
-    for (name, value) in &req_hdr.headers {
-        // `HeaderName::as_str()` is already lowercase — compare in place.
-        let name_str = name.as_str();
-        if name_str == "host" || HOP_BY_HOP.contains(&name_str) {
-            continue;
-        }
-        if let Ok(v) = value.to_str() {
-            builder = builder.header(name_str, v);
-        }
+    for (name, value) in select_forwarded_headers(req_hdr, &http_cfg.allowed_headers) {
+        builder = builder.header(name, value);
     }
 
     let auth_response = match tokio::time::timeout(cfg.timeout, builder.send()).await {
@@ -312,6 +409,200 @@ async fn enforce_ext_authz_http(
             });
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod ext_authz_strip_tests {
+    use super::*;
+    use coxswain_core::routing::{GrpcExtAuthConfig, HttpExtAuthConfig};
+
+    fn http_transport(response_header_names: &[&str]) -> ExtAuthTransport {
+        ExtAuthTransport::Http(HttpExtAuthConfig::new(
+            Arc::from([]),
+            response_header_names
+                .iter()
+                .map(|n| Box::from(*n))
+                .collect(),
+            false,
+        ))
+    }
+
+    fn grpc_transport(response_header_names: &[&str]) -> ExtAuthTransport {
+        ExtAuthTransport::Grpc(GrpcExtAuthConfig::new(
+            Arc::from([]),
+            response_header_names
+                .iter()
+                .map(|n| Box::from(*n))
+                .collect(),
+        ))
+    }
+
+    #[test]
+    fn ext_authz_strip_names_covers_both_transports() {
+        assert_eq!(
+            ext_authz_strip_names(&http_transport(&["x-auth-user", "x-auth-role"]))
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            ["x-auth-user", "x-auth-role"]
+        );
+        assert_eq!(
+            ext_authz_strip_names(&grpc_transport(&["x-auth-user"]))
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            ["x-auth-user"]
+        );
+        assert!(ext_authz_strip_names(&http_transport(&[])).is_empty());
+        assert!(ext_authz_strip_names(&grpc_transport(&[])).is_empty());
+    }
+
+    #[test]
+    fn stage_ext_authz_strips_populates_output_with_configured_names() {
+        let transport = http_transport(&["x-auth-user", "x-auth-role"]);
+        let mut out = None;
+        stage_ext_authz_strips(&transport, &mut out);
+        assert_eq!(
+            out.as_deref(),
+            Some(
+                [
+                    Box::<str>::from("x-auth-user"),
+                    Box::<str>::from("x-auth-role")
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn stage_ext_authz_strips_appends_to_names_an_earlier_check_already_staged() {
+        // The additive auth chain (e.g. a route-level JwtAuth `forward: false`
+        // strip ahead of a Gateway-mandated ext_authz check) shares one
+        // `strip_upstream_headers` slot across every `enforce()` call — staging
+        // must APPEND, never clobber a name an earlier check already staged.
+        let transport = http_transport(&["x-auth-user"]);
+        let mut out = Some(vec![Box::<str>::from("x-jwt-token")]);
+        stage_ext_authz_strips(&transport, &mut out);
+        assert_eq!(
+            out.as_deref(),
+            Some(
+                [
+                    Box::<str>::from("x-jwt-token"),
+                    Box::<str>::from("x-auth-user")
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn stage_ext_authz_strips_leaves_output_unset_when_unconfigured() {
+        let mut out = None;
+        stage_ext_authz_strips(&http_transport(&[]), &mut out);
+        assert!(
+            out.is_none(),
+            "an ext_authz check with no allowedResponseHeaders must not force-allocate the strip list"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ext_authz_allowed_headers_tests {
+    use super::{is_allowed_request_header, select_forwarded_headers, should_forward_to_authz};
+    use pingora_http::RequestHeader;
+
+    fn allowed(names: &[&str]) -> Vec<Box<str>> {
+        names.iter().map(|n| Box::from(*n)).collect()
+    }
+
+    #[test]
+    fn forwards_a_configured_name() {
+        assert!(is_allowed_request_header(
+            "authorization",
+            &allowed(&["authorization", "x-request-id"])
+        ));
+    }
+
+    #[test]
+    fn withholds_an_unconfigured_name() {
+        // The concrete #663 gap this closes: a client-controlled header not
+        // named in `allowedHeaders` must never reach the auth service, even
+        // when it looks like a credential (Cookie) or a header the operator's
+        // backend later trusts as an authz-service verdict.
+        assert!(!is_allowed_request_header(
+            "cookie",
+            &allowed(&["authorization"])
+        ));
+        assert!(!is_allowed_request_header(
+            "x-auth-user",
+            &allowed(&["authorization"])
+        ));
+    }
+
+    #[test]
+    fn withholds_everything_when_the_allow_list_is_empty() {
+        // Reachable only if a caller ever passes an empty list directly (the
+        // reflector never resolves one — see `resolve_allowed_headers`), but the
+        // predicate itself must fail closed rather than default-allow.
+        assert!(!is_allowed_request_header("authorization", &[]));
+    }
+
+    #[test]
+    fn comparison_is_exact_not_substring() {
+        // `contains`/`starts_with`-style matching would let `x-authorization-evil`
+        // sneak through an `authorization` allow-list.
+        assert!(!is_allowed_request_header(
+            "x-authorization-evil",
+            &allowed(&["authorization"])
+        ));
+    }
+
+    #[test]
+    fn should_forward_to_authz_excludes_host_even_when_listed() {
+        // `host` is forwarded separately as a dedicated pseudo-header; listing it
+        // in `allowedHeaders` must not cause a second, generic-path copy.
+        assert!(!should_forward_to_authz("host", &allowed(&["host"])));
+    }
+
+    #[test]
+    fn should_forward_to_authz_excludes_hop_by_hop_even_when_listed() {
+        // A hop-by-hop name can never be forwarded, regardless of the allow-list
+        // — listing `connection` must not punch a hole in that invariant.
+        assert!(!should_forward_to_authz(
+            "connection",
+            &allowed(&["connection"])
+        ));
+    }
+
+    #[test]
+    fn select_forwarded_headers_only_returns_allow_listed_survivors() {
+        // Regression for the exact wiring bug the review flagged: dropping the
+        // `!` on the allow-list check, or reordering the host/hop-by-hop
+        // carve-out, compiles clean but forwards everything. This test fails
+        // immediately if either happens.
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("host", "example.com").unwrap();
+        req.insert_header("authorization", "Bearer t").unwrap();
+        req.insert_header("cookie", "session=evil").unwrap();
+        req.insert_header("connection", "keep-alive").unwrap();
+
+        let mut forwarded =
+            select_forwarded_headers(&req, &allowed(&["authorization", "connection"]));
+        forwarded.sort_unstable();
+
+        assert_eq!(
+            forwarded,
+            vec![("authorization", "Bearer t")],
+            "only the allow-listed, non-pseudo, non-hop-by-hop header survives"
+        );
+    }
+
+    #[test]
+    fn select_forwarded_headers_empty_when_nothing_matches() {
+        let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+        req.insert_header("cookie", "session=evil").unwrap();
+        assert!(select_forwarded_headers(&req, &allowed(&["authorization"])).is_empty());
+    }
 }
 
 // ── Basic auth ────────────────────────────────────────────────────────────────
@@ -1202,7 +1493,7 @@ mod jwt_tests {
 /// the HTTP forward-auth path; both share [`pick_endpoint`], [`write_simple`],
 /// and [`HOP_BY_HOP`].
 mod grpc {
-    use super::{HOP_BY_HOP, pick_endpoint, write_simple};
+    use super::{HOP_BY_HOP, pick_endpoint, should_forward_to_authz, write_simple};
     use envoy_types::pb::envoy::service::auth::v3 as auth_pb;
     use envoy_types::pb::envoy::service::auth::v3::authorization_client::AuthorizationClient;
     use envoy_types::pb::envoy::service::auth::v3::check_response::HttpResponse;
@@ -1233,7 +1524,7 @@ mod grpc {
 
         // Build the CheckRequest from the (immutably-borrowed) request header
         // before any mutable use of `session` below.
-        let check = build_check_request(session);
+        let check = build_check_request(session, &grpc_cfg.allowed_headers);
 
         // Reuse (or lazily build) a pooled channel to the auth pod, cleartext
         // (h2c, #544 — see `crate::policy::grpc_channel`). The channel's own
@@ -1276,10 +1567,42 @@ mod grpc {
         }
     }
 
+    /// The header map to carry in the `CheckRequest`'s `HttpRequest.headers`,
+    /// per [`should_forward_to_authz`] (hop-by-hop stripped, `Host` excluded —
+    /// it is a dedicated `HttpRequest` field, not part of this map — and only
+    /// names in `allowed_headers` survive). `Session`-free (takes a
+    /// [`pingora_http::RequestHeader`] directly) so this is unit-testable
+    /// without constructing a Pingora `Session`, mirroring
+    /// [`super::select_forwarded_headers`] on the HTTP transport.
+    ///
+    /// Sized to `allowed_headers.len()`, not `req.headers.len()`: at most that
+    /// many entries can ever survive the filter, and `allowed_headers` is
+    /// always small (operator-authored, GEP-1494-default-sized) while
+    /// `req.headers` is client-controlled and potentially much larger.
+    fn select_check_headers(
+        req: &pingora_http::RequestHeader,
+        allowed_headers: &[Box<str>],
+    ) -> HashMap<String, String> {
+        let mut headers = HashMap::with_capacity(allowed_headers.len());
+        for (name, value) in &req.headers {
+            let name_str = name.as_str();
+            if !should_forward_to_authz(name_str, allowed_headers) {
+                continue;
+            }
+            if let Ok(v) = value.to_str() {
+                headers.insert(name_str.to_owned(), v.to_owned());
+            }
+        }
+        headers
+    }
+
     /// Build the Envoy `CheckRequest` from the downstream request: method, path,
     /// host, scheme, and headers (hop-by-hop stripped, names lower-cased). No body
     /// is forwarded (GEP-1494 `forwardBody` buffering is a follow-up).
-    fn build_check_request(session: &Session) -> auth_pb::CheckRequest {
+    fn build_check_request(
+        session: &Session,
+        allowed_headers: &[Box<str>],
+    ) -> auth_pb::CheckRequest {
         let req = session.req_header();
         let method = req.method.as_str().to_owned();
         let path = req
@@ -1293,18 +1616,10 @@ mod grpc {
             .and_then(|v| v.to_str().ok())
             .unwrap_or_default()
             .to_owned();
-        let mut headers: HashMap<String, String> = HashMap::with_capacity(req.headers.len());
-        for (name, value) in &req.headers {
-            // `HeaderName::as_str()` is already lowercase — used directly for the
-            // hop-by-hop check and as the (owned) map key.
-            let name_str = name.as_str();
-            if HOP_BY_HOP.contains(&name_str) {
-                continue;
-            }
-            if let Ok(v) = value.to_str() {
-                headers.insert(name_str.to_owned(), v.to_owned());
-            }
-        }
+        // `host`/`method`/`path` above are dedicated `HttpRequest` fields, not
+        // part of this map, so they bypass `allowed_headers` unconditionally —
+        // same pseudo-header carve-out as the HTTP transport.
+        let headers = select_check_headers(req, allowed_headers);
         let http_req = auth_pb::attribute_context::HttpRequest {
             method,
             path,
@@ -1427,7 +1742,52 @@ mod grpc {
         use coxswain_core::routing::GrpcExtAuthConfig;
         use envoy_types::pb::envoy::config::core::v3::{HeaderValue, HeaderValueOption};
         use envoy_types::pb::envoy::r#type::v3::HttpStatus;
+        use pingora_http::RequestHeader;
         use std::sync::Arc;
+
+        fn allowed(names: &[&str]) -> Vec<Box<str>> {
+            names.iter().map(|n| Box::from(*n)).collect()
+        }
+
+        /// Regression for the wiring bug the review flagged on the gRPC
+        /// transport: dropping the allow-list filter, or reordering the
+        /// host/hop-by-hop carve-out, compiles clean but ships every client
+        /// header in the `CheckRequest`. `Session`-free — exercises the same
+        /// filtering `build_check_request` delegates to.
+        #[test]
+        fn select_check_headers_only_returns_allow_listed_survivors() {
+            let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+            req.insert_header("host", "example.com").unwrap();
+            req.insert_header("authorization", "Bearer t").unwrap();
+            req.insert_header("cookie", "session=evil").unwrap();
+            req.insert_header("connection", "keep-alive").unwrap();
+
+            let headers = select_check_headers(&req, &allowed(&["authorization", "connection"]));
+
+            assert_eq!(
+                headers.len(),
+                1,
+                "only the allow-listed, non-pseudo, non-hop-by-hop header survives: {headers:?}"
+            );
+            assert_eq!(
+                headers.get("authorization").map(String::as_str),
+                Some("Bearer t")
+            );
+        }
+
+        #[test]
+        fn select_check_headers_sized_to_allow_list_not_request() {
+            let mut req = RequestHeader::build("GET", b"/", None).unwrap();
+            for i in 0..40 {
+                req.insert_header(format!("x-noise-{i}"), "v").unwrap();
+            }
+            let headers = select_check_headers(&req, &allowed(&["authorization"]));
+            assert!(
+                headers.capacity() < 40,
+                "capacity must track the allow-list size, not the client's header count: {}",
+                headers.capacity()
+            );
+        }
 
         fn ok_response(headers: Vec<(&str, &str)>) -> auth_pb::CheckResponse {
             auth_pb::CheckResponse {
@@ -1457,7 +1817,10 @@ mod grpc {
         /// header (case-insensitively) into the upstream forward set.
         #[tokio::test]
         async fn ok_response_forwards_allowlisted_headers() {
-            let cfg = GrpcExtAuthConfig::new(Arc::from([Box::from("x-auth-user")]));
+            let cfg = GrpcExtAuthConfig::new(
+                Arc::from([Box::from("authorization")]),
+                Arc::from([Box::from("x-auth-user")]),
+            );
             let resp = ok_response(vec![("X-Auth-User", "alice"), ("X-Other", "nope")]);
             // map_check_response needs a Session for the deny path only; the allow
             // path writes nothing, so exercise the header-selection logic directly.

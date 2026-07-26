@@ -156,6 +156,10 @@ Two transports, selected by `spec.protocol`:
 
 `CoxswainExternalAuth` is **HTTPRoute-only** (a Gateway-attached policy covers the HTTPRoutes on the Gateway); `GRPCRoute` is not yet supported.
 
+Every name in `allowedResponseHeaders` is stripped from the client's request before the check runs, whether or not the auth service actually echoes it back on a given allow response. A route that trusts an allow-listed header as proxy-attested identity must never see a client's own copy of it — only the value the auth service supplied, when it supplied one.
+
+`allowedHeaders` is the inbound counterpart: only the named client request headers are forwarded to the auth service on the check request — every other header (`Cookie`, a custom header, anything not named) is withheld, so a client can't smuggle a credential or a same-named-as-trusted header to the auth service just because it isn't in the list. `Host`, the request method, and path are always forwarded regardless of this list — they identify the request being authorized, not client-supplied trust material. When absent or empty, GEP-1494's per-protocol default applies: `HTTP` forwards only `Authorization`; `GRPC` forwards `Authorization`, `Location`, `Proxy-Authenticate`, `Set-Cookie`, `WWW-Authenticate`.
+
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
 kind: CoxswainExternalAuth
@@ -168,6 +172,9 @@ spec:
     port: 4180
   timeout: 250ms
   failClosed: true        # deny (503) on auth-service error/timeout (default)
+  allowedHeaders:         # forwarded to the auth service on the check request
+    - authorization
+    - cookie
   allowedResponseHeaders: # copied onto the upstream request on allow
     - x-auth-user
 ```

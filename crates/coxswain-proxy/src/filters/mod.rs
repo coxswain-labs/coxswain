@@ -5,7 +5,7 @@
 //! URL rewrites, and CORS response headers, plus the proxy-owned `Forwarded` /
 //! `X-Proxy-Engine` infrastructure headers. The per-variant mechanics live in
 //! submodules so that adding a GEP filter touches a single file:
-//! [`header`] (header modifiers + the proxy-owned forwarding deny-list),
+//! [`header`] (header modifiers + the proxy-owned trust-header deny-list),
 //! [`rewrite`] (`UrlRewrite` path rewriting), [`redirect`] (`RequestRedirect`
 //! short-circuit), [`cors`] (CORS preflight, GEP-1767), and [`mirror`]
 //! (`RequestMirror` fire-and-forget dispatch, GEP-3171).
@@ -33,17 +33,18 @@ static X_PROXY_ENGINE: LazyLock<HeaderValue> =
 pub struct TrafficFilter;
 
 impl TrafficFilter {
-    /// Strip client-supplied forwarding headers from the upstream request.
+    /// Strip client-supplied proxy-owned trust headers from the upstream request.
     ///
     /// Called unconditionally in [`crate::hooks::upstream_request_filter`]
-    /// **before** any operator filter or proxy-generated header insertion runs.
-    /// This ensures client-injected values for `Forwarded`, `X-Forwarded-For`,
-    /// `X-Forwarded-Proto`, and `X-Real-IP` never reach the backend regardless
-    /// of whether PROXY protocol is enabled.
+    /// **before** any operator filter, proxy-generated header insertion, or
+    /// verified-client-cert forwarding runs. This ensures client-injected values
+    /// for `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Real-IP`, and
+    /// `X-SSL-Client-Cert` never reach the backend regardless of whether PROXY
+    /// protocol is enabled or this host requires mTLS (#663).
     ///
     /// Zero allocations — `remove_header` is an in-place map removal.
-    pub(crate) fn strip_client_forwarding_headers(upstream_request: &mut RequestHeader) {
-        for name in header::CLIENT_FORWARDING_HEADERS.iter() {
+    pub(crate) fn strip_proxy_owned_headers(upstream_request: &mut RequestHeader) {
+        for name in header::PROXY_OWNED_HEADERS.iter() {
             upstream_request.remove_header(name);
         }
     }
@@ -68,11 +69,7 @@ impl TrafficFilter {
         for filter in filters {
             match filter {
                 FilterAction::RequestHeaderModifier(m) => {
-                    header::apply_header_mod(
-                        upstream_request,
-                        m,
-                        header::is_owned_forwarding_header,
-                    );
+                    header::apply_header_mod(upstream_request, m, header::is_proxy_owned_header);
                 }
                 FilterAction::UrlRewrite { hostname, path } => {
                     if let Some(h) = hostname {
@@ -187,16 +184,17 @@ mod tests {
     }
 
     #[test]
-    fn strip_removes_all_client_forwarding_headers() {
+    fn strip_removes_all_proxy_owned_headers() {
         let mut r = RequestHeader::build("GET", b"/", None).unwrap();
         r.insert_header("forwarded", "for=1.2.3.4;by=evil").unwrap();
         r.insert_header("x-forwarded-for", "1.2.3.4").unwrap();
         r.insert_header("x-forwarded-proto", "https").unwrap();
         r.insert_header("x-real-ip", "1.2.3.4").unwrap();
+        r.insert_header("x-ssl-client-cert", "forged-pem").unwrap();
         // Unrelated header must survive the strip.
         r.insert_header("x-custom-app", "keep-me").unwrap();
 
-        TrafficFilter::strip_client_forwarding_headers(&mut r);
+        TrafficFilter::strip_proxy_owned_headers(&mut r);
 
         assert!(
             r.headers.get("forwarded").is_none(),
@@ -213,6 +211,10 @@ mod tests {
         assert!(
             r.headers.get("x-real-ip").is_none(),
             "x-real-ip must be stripped"
+        );
+        assert!(
+            r.headers.get("x-ssl-client-cert").is_none(),
+            "x-ssl-client-cert must be stripped (#663)"
         );
         assert_eq!(
             r.headers.get("x-custom-app").map(|v| v.as_bytes()),
