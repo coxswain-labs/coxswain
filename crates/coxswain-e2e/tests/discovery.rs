@@ -2072,6 +2072,145 @@ async fn dedicated_proxy_repoints_to_relay_without_dropping_traffic() -> anyhow:
     Ok(())
 }
 
+/// Render a proxy's `coxswain_discovery_client_directives_total` samples, for a
+/// timeout message that says which of the failure modes actually happened.
+///
+/// An absent series reads as `0` — the counter is lazily registered, so "no
+/// directive reached this proxy" and "the family was never touched" look the
+/// same from outside; that is why the caller also reports the scrape error
+/// separately rather than folding it into a zero.
+async fn directive_counters(pod: &str, ns: &str) -> anyhow::Result<String> {
+    let pf = coxswain_e2e::harness::leader::pod_admin_forward_in(pod, ns).await?;
+    let body = pf.metrics_text(Duration::from_secs(5)).await?;
+    let read = |outcome: &str| {
+        wait::labelled_metric_value(
+            &body,
+            "coxswain_discovery_client_directives_total",
+            &[("outcome", outcome)],
+        )
+        .unwrap_or(0.0)
+    };
+    Ok(format!(
+        "applied={} noop={} rejected={}",
+        read("applied"),
+        read("noop"),
+        read("rejected")
+    ))
+}
+
+/// The dedicated proxy resolves its repoint through its own upstream policy: a
+/// legitimate controller-issued directive is **applied**, and nothing is ever
+/// **rejected**.
+///
+/// A leaf derives the SPIFFE identity it will trust for a new upstream from its
+/// own launch config rather than from the directive's fields, so the directive
+/// may only select one of three known upstreams. That resolution is a pure
+/// function covered exhaustively by unit tests; what only a live cluster can
+/// show is that it is actually **on the path** — that a real controller-issued
+/// repoint against the real rendered Service DNS satisfies the policy instead of
+/// being refused. A regression that mis-derived the legal host set would leave
+/// `applied` at zero and `rejected` climbing.
+///
+/// The rejection branch itself is deliberately not covered here: a leaf only
+/// receives directives from its current upstream, so provoking one requires
+/// first making a hostile server that upstream — the very repoint this policy
+/// blocks. See the control-plane security docs.
+///
+/// Serial: `relay.dedicated.enabled` Helm mutator, in the always-serial
+/// `discovery` binary.
+#[tokio::test]
+async fn repoint_directive_resolves_through_local_upstream_policy() -> anyhow::Result<()> {
+    let h = Harness::start_with_options(relay_tiering_threshold_1()).await?;
+    let ns = NamespaceGuard::create(&h.client, "relay-policy").await?;
+
+    let (http, host, _uid) = converge_dedicated_proxy(&h, &ns.name).await?;
+
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    wait_for_relay_ready(&deployments).await?;
+
+    // The repoint landed — the proxy now streams through the relay.
+    let topology_url = h.controller_admin_url("/api/v1/topology");
+    wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
+
+    // Scrape the LEAF's own counters: the policy runs on the proxy, not the
+    // controller, so only the proxy's exposition proves it was consulted.
+    let pod = dedicated_proxy_pod(&h.client, &ns.name).await?;
+    let pod_name = pod
+        .metadata
+        .name
+        .clone()
+        .context("dedicated-proxy pod has no name")?;
+
+    let applied = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || {
+            let pod_name = pod_name.clone();
+            let ns = ns.name.clone();
+            async move {
+                // Render what the counters actually say: the three failure modes
+                // here (a real host-set regression climbing `rejected`, the
+                // directive never reaching the proxy at all, and the forward
+                // itself failing) are indistinguishable from the expectation alone.
+                let observed = match directive_counters(&pod_name, &ns).await {
+                    Ok(c) => c,
+                    Err(e) => format!("could not scrape the proxy's /metrics: {e:#}"),
+                };
+                format!(
+                    "dedicated-proxy pod '{pod_name}' in '{ns}' to report an applied \
+                     upstream directive; observed {observed}"
+                )
+            }
+        },
+        || {
+            let pod_name = pod_name.clone();
+            let ns = ns.name.clone();
+            async move {
+                let pf = coxswain_e2e::harness::leader::pod_admin_forward_in(&pod_name, &ns)
+                    .await
+                    .ok()?;
+                let body = pf.metrics_text(Duration::from_secs(5)).await.ok()?;
+                let applied = wait::labelled_metric_value(
+                    &body,
+                    "coxswain_discovery_client_directives_total",
+                    &[("outcome", "applied")],
+                )
+                .unwrap_or(0.0);
+                (applied >= 1.0).then_some(body)
+            }
+        },
+    )
+    .await
+    .context(
+        "the dedicated proxy never recorded an applied upstream directive — the repoint \
+         reached it (it is folded under the relay) but the local upstream policy did not \
+         resolve the controller's directive",
+    )?;
+
+    // The legitimate directive must resolve, never be refused. A non-zero
+    // `rejected` here means the policy's legal host set disagrees with the
+    // Service DNS the controller actually renders.
+    let rejected = wait::labelled_metric_value(
+        &applied,
+        "coxswain_discovery_client_directives_total",
+        &[("outcome", "rejected")],
+    )
+    .unwrap_or(0.0);
+    assert_eq!(
+        rejected, 0.0,
+        "the dedicated proxy refused {rejected} legitimate upstream directive(s); its \
+         upstream policy disagrees with the endpoints the controller renders"
+    );
+
+    // The policy is on the control path only — traffic is untouched.
+    wait::wait_for_route(&http, &host, "/", Duration::from_secs(30))
+        .await
+        .context("dedicated proxy stopped serving traffic after the policy-resolved repoint")?
+        .assert_backend("echo-a");
+
+    Ok(())
+}
+
 /// Sad path — controller outage: with the dedicated proxy converged **through**
 /// the relay, scaling the controller to zero must leave both the relay and the
 /// proxy serving their last-good world (neither drops Ready), and the proxy must

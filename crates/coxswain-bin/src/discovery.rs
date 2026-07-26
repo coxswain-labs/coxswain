@@ -10,14 +10,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use coxswain_controller::{
-    BootstrapRejectHook, CaMode, KubeTokenAuthenticator, load_or_generate, spawn_trust_publisher,
+    BootstrapRejectHook, CONTROLLER_DISCOVERY_SERVICE, CaMode, KubeTokenAuthenticator,
+    RELAY_SERVICE_ACCOUNT, SHARED_RELAY_SERVICE_ACCOUNT, load_or_generate, spawn_trust_publisher,
 };
 use coxswain_core::health::SubsystemHandle;
 use coxswain_core::identity::{SpiffeId, SvidIssuer};
 use coxswain_discovery::{
     BootstrapClient, BootstrapClientConfig, BootstrapRunner, BootstrapService,
     DiscoveryBootstrapServerTls, DiscoveryClient, DiscoveryClientConfig, DiscoveryServerTls, Scope,
-    SharedSvid, SpiffeMatcher, Supervisor, UpstreamResolverConfig, serve_discovery_with_tls,
+    SharedSvid, SpiffeMatcher, Supervisor, UpstreamNames, UpstreamPolicy, UpstreamResolverConfig,
+    serve_discovery_with_tls,
 };
 use pingora_core::server::{Server, ShutdownWatch};
 use pingora_core::services::background::background_service;
@@ -216,36 +218,32 @@ impl pingora_core::services::background::BackgroundService for DiscoveryIdentity
 
 // ── Proxy discovery client wiring ─────────────────────────────────────────────
 
-/// Build the proxy-side discovery client and (when a bootstrap endpoint is
-/// configured) the SVID bootstrap loop, wiring the shared SVID cell + rotation
-/// signal into the discovery client config.
+/// Build the closed set of routing upstreams this node will accept (#665).
 ///
-/// Returns the client (routing-cell read handles, consumed by the proxy
-/// acceptors), the not-yet-running reconnect supervisor, and an optional
-/// not-yet-running bootstrap loop. Both runnables are driven by Pingora
-/// background services via [`register_discovery_background_services`] so they run
-/// on a Pingora runtime (the caller is still on the synchronous startup path).
-/// Extract the controller's namespace from an in-cluster discovery endpoint.
+/// `install_namespace` is the namespace label of the node's own
+/// `--discovery-bootstrap-endpoint`: the controller and the shared relay both
+/// live there, so it plus the node's own namespace is enough to name all three
+/// legal upstreams — no additional flag, and nothing derived from the wire.
 ///
-/// Kubernetes service DNS is `<service>.<namespace>.svc[.cluster.local]`, so the
-/// controller's namespace is the second label of the host. Returns `None` for
-/// anything that isn't a recognizable `…svc…` service DNS (IP literals, test
-/// loopback addresses), letting the caller fall back to the proxy's own
-/// namespace. This keeps the controller-identity check correct for proxies that
-/// do not share the controller's namespace (dedicated proxies; any non-default
-/// install namespace) instead of assuming co-location.
-pub(crate) fn controller_namespace_from_endpoint(endpoint: &str) -> Option<String> {
-    let after_scheme = endpoint
-        .split_once("://")
-        .map_or(endpoint, |(_, rest)| rest);
-    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
-    let host = host_port.rsplit_once(':').map_or(host_port, |(h, _)| h);
-    let mut labels = host.split('.');
-    let _service = labels.next()?;
-    let namespace = labels.next().filter(|ns| !ns.is_empty())?;
-    // Only trust the parse when the third label is `svc` — i.e. it really is
-    // cluster service DNS, not an arbitrary host like `localhost:50051`.
-    (labels.next() == Some("svc")).then(|| namespace.to_owned())
+/// The three names come from the controller's own constants rather than literals
+/// so the endpoint a leaf is *pointed at* and the host it will *accept* cannot
+/// drift apart.
+fn build_upstream_policy(
+    disco: &DiscoveryClientArgs,
+    common: &CommonArgs,
+    install_namespace: &str,
+) -> UpstreamPolicy {
+    UpstreamPolicy::new(
+        disco.discovery_trust_domain.clone(),
+        install_namespace,
+        &common.pod_namespace,
+        &UpstreamNames {
+            controller_service: CONTROLLER_DISCOVERY_SERVICE.to_owned(),
+            controller_sa: CONTROLLER_SPIFFE_SA.to_owned(),
+            relay: RELAY_SERVICE_ACCOUNT.to_owned(),
+            shared_relay: SHARED_RELAY_SERVICE_ACCOUNT.to_owned(),
+        },
+    )
 }
 
 /// Build a [`DiscoveryClientConfig`] (endpoints, scope, bootstrap/SVID wiring)
@@ -258,6 +256,9 @@ pub(crate) fn controller_namespace_from_endpoint(endpoint: &str) -> Option<Strin
 /// relay SA). Bootstrap itself is **not** tiered — its server namespace is always
 /// derived from the bootstrap endpoint (the controller), independent of the
 /// routing upstream.
+///
+/// Both of those writers resolve through the [`UpstreamPolicy`] built here, so
+/// neither can hand this node an identity to trust.
 pub(crate) fn build_discovery_client_config(
     disco: &DiscoveryClientArgs,
     common: &CommonArgs,
@@ -278,10 +279,18 @@ pub(crate) fn build_discovery_client_config(
     // Bootstrap always targets the controller (never tiered), so its server
     // namespace comes from the BOOTSTRAP endpoint's service DNS. Fall back to the
     // node's own namespace for a non-cluster endpoint (test loopback).
+    //
+    // The canonical parser, not a local copy: it is what the upstream policy
+    // below validates hosts with, so a hardening there (a form the dialer
+    // resolves differently than a naive parse) must reach this derivation too.
     let bootstrap_namespace =
-        controller_namespace_from_endpoint(&disco.discovery_bootstrap_endpoint)
+        coxswain_discovery::namespace_from_service_dns(&disco.discovery_bootstrap_endpoint)
             .unwrap_or_else(|| common.pod_namespace.clone());
-    let boot_config = BootstrapClientConfig::new(
+    // Both writers to the upstream cell get the policy (#665), so neither the
+    // bootstrap response nor a live directive can hand this node an identity.
+    let upstream_policy = build_upstream_policy(disco, common, &bootstrap_namespace);
+    config.upstream_policy = Some(upstream_policy.clone());
+    let mut boot_config = BootstrapClientConfig::new(
         disco.discovery_bootstrap_endpoint.clone(),
         disco.discovery_sa_token_path.clone(),
         disco.discovery_ca_bundle_path.clone(),
@@ -290,6 +299,7 @@ pub(crate) fn build_discovery_client_config(
         scope,
         common.pod_namespace.clone(),
     );
+    boot_config.upstream_policy = Some(upstream_policy);
     let (handle, runner) = BootstrapClient::build(boot_config);
     // `--discovery-bootstrap-endpoint` is `required = true` at the clap layer, so a
     // bootstrap client — and thus a serving SVID cell — always exists here. Hand it
@@ -308,6 +318,19 @@ pub(crate) fn build_discovery_client_config(
     (config, runner, svid)
 }
 
+/// Build the proxy-side discovery client and the SVID bootstrap loop, wiring the
+/// shared SVID cell + rotation signal into the discovery client config.
+///
+/// Returns the client (routing-cell read handles, consumed by the proxy
+/// acceptors), the not-yet-running reconnect supervisor, and the not-yet-running
+/// bootstrap loop. Both runnables are driven by Pingora background services via
+/// [`register_discovery_background_services`] so they run on a Pingora runtime
+/// (the caller is still on the synchronous startup path).
+///
+/// # Errors
+///
+/// Propagates [`DiscoveryClient::new`](coxswain_discovery::DiscoveryClient::new)
+/// when a configured endpoint is not a valid URI.
 pub(crate) fn build_discovery_client(
     disco: &DiscoveryClientArgs,
     common: &CommonArgs,
@@ -346,37 +369,133 @@ pub(crate) fn register_discovery_background_services(
 mod tests {
     use super::*;
 
+    // ── upstream policy wiring (#665) ─────────────────────────────────────────
+
+    /// Parse a real `serve proxy --shared` invocation and return the two arg
+    /// groups `build_discovery_client_config` consumes, so the policy under test
+    /// is parameterised exactly as production parameterises it.
+    fn proxy_args(bootstrap_endpoint: &str) -> (crate::args::CommonArgs, DiscoveryClientArgs) {
+        use crate::args::{Cli, Commands, Role};
+        use clap::Parser;
+
+        let cli = Cli::try_parse_from([
+            "coxswain",
+            "serve",
+            "proxy",
+            "--shared",
+            &format!("--discovery-bootstrap-endpoint={bootstrap_endpoint}"),
+            "--pod-namespace=team-a",
+        ])
+        .expect("serve proxy --shared must parse");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Proxy(args)) = serve.role else {
+            panic!("expected Role::Proxy");
+        };
+        (args.common, args.discovery)
+    }
+
+    /// A proxy's policy accepts exactly the three upstreams the controller can
+    /// legitimately point it at, each with a locally-derived identity.
     #[test]
-    fn controller_namespace_parsed_from_service_dns() {
-        assert_eq!(
-            controller_namespace_from_endpoint(
-                "https://coxswain-controller-discovery.coxswain-system.svc:50052"
+    fn policy_accepts_the_three_legal_upstreams() {
+        let (common, disco) =
+            proxy_args("https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052");
+        let policy = build_upstream_policy(&disco, &common, "coxswain-system");
+
+        for (endpoint, sa) in [
+            (
+                "https://coxswain-controller-discovery.coxswain-system.svc:50051",
+                "coxswain-controller",
             ),
-            Some("coxswain-system".to_owned())
+            ("https://coxswain-relay.team-a.svc:50051", "coxswain-relay"),
+            (
+                "https://coxswain-relay-shared.coxswain-system.svc:50051",
+                "coxswain-relay-shared",
+            ),
+        ] {
+            assert!(
+                policy.resolve(endpoint, sa).is_ok(),
+                "{endpoint} is a legitimate upstream the controller renders; the policy must accept it"
+            );
+        }
+    }
+
+    /// The policy is built from the controller's own naming constants, so a
+    /// relay outside this proxy's namespace — and any host the controller never
+    /// renders — is refused.
+    #[test]
+    fn policy_refuses_upstreams_outside_this_nodes_own_set() {
+        let (common, disco) =
+            proxy_args("https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052");
+        let policy = build_upstream_policy(&disco, &common, "coxswain-system");
+
+        for endpoint in [
+            "https://coxswain-relay.team-b.svc:50051",
+            "https://attacker.team-a.svc:50051",
+        ] {
+            assert!(
+                policy.resolve(endpoint, "coxswain-relay").is_err(),
+                "{endpoint} is not an upstream this node may be pointed at"
+            );
+        }
+    }
+
+    /// Production never runs without the policy: `build_discovery_client_config`
+    /// must populate it on every client it builds. `None` is the test-only
+    /// fail-open default, so this is the assertion that keeps it out of a
+    /// shipped binary.
+    #[test]
+    fn built_client_config_always_carries_an_upstream_policy() {
+        let (common, disco) =
+            proxy_args("https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052");
+        let (config, _runner, _svid) =
+            build_discovery_client_config(&disco, &common, Scope::SharedPool, None);
+        let policy = config
+            .upstream_policy
+            .as_ref()
+            .expect("a built discovery client config must always carry an upstream policy");
+        assert!(
+            policy
+                .resolve("https://coxswain-relay.team-a.svc:50051", "coxswain-relay")
+                .is_ok(),
+            "the wired policy must be parameterised with this node's own namespace"
         );
-        assert_eq!(
-            controller_namespace_from_endpoint(
-                "https://coxswain-controller-discovery.tenant-a.svc.cluster.local:50051"
-            ),
-            Some("tenant-a".to_owned())
+        assert!(
+            policy
+                .resolve("https://coxswain-relay.team-b.svc:50051", "coxswain-relay")
+                .is_err(),
+            "the wired policy must refuse a peer tenant's relay"
         );
     }
 
+    /// A loopback bootstrap endpoint yields no install namespace, so the policy
+    /// falls back to the node's own — the plaintext/test path. Asserted here
+    /// rather than on the parser (covered in `coxswain-discovery`) because what
+    /// matters at this seam is that the fallback keeps the node's OWN relay
+    /// legal and everything else refused.
     #[test]
-    fn controller_namespace_none_for_non_service_dns() {
-        // Loopback / IP / bare host: not cluster service DNS → caller falls back
-        // to the proxy's own namespace.
+    fn loopback_bootstrap_endpoint_falls_back_to_the_nodes_own_namespace() {
+        let (common, disco) = proxy_args("https://127.0.0.1:50052");
+        let install_ns =
+            coxswain_discovery::namespace_from_service_dns(&disco.discovery_bootstrap_endpoint)
+                .unwrap_or_else(|| common.pod_namespace.clone());
         assert_eq!(
-            controller_namespace_from_endpoint("http://127.0.0.1:50051"),
-            None
+            install_ns, "team-a",
+            "a non-service-DNS bootstrap endpoint must fall back to the pod's own namespace"
         );
-        assert_eq!(
-            controller_namespace_from_endpoint("https://localhost:50052"),
-            None
+
+        let policy = build_upstream_policy(&disco, &common, &install_ns);
+        assert!(
+            policy
+                .resolve("https://coxswain-relay.team-a.svc:50051", "coxswain-relay")
+                .is_ok(),
+            "the node's own namespace relay stays legal under the fallback"
         );
-        assert_eq!(
-            controller_namespace_from_endpoint("https://example.com:443"),
-            None
+        assert!(
+            policy
+                .resolve("https://coxswain-relay.team-b.svc:50051", "coxswain-relay")
+                .is_err(),
+            "the fallback must not widen the legal set to other namespaces"
         );
     }
 }

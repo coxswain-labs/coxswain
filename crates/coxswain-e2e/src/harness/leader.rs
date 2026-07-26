@@ -455,7 +455,8 @@ impl<'a> RelayScope<'a> {
     }
 }
 
-/// Open a port-forward to `pod`'s admin port (serving `/metrics`).
+/// Open a port-forward to a control-plane `pod`'s admin port (serving
+/// `/metrics`) in the install namespace.
 ///
 /// # Errors
 ///
@@ -463,15 +464,30 @@ impl<'a> RelayScope<'a> {
 /// within the helper's internal deadline.
 #[must_use = "dropping the forward closes the tunnel"]
 pub async fn pod_admin_forward(pod: &str) -> anyhow::Result<PodAdminForward> {
+    pod_admin_forward_in(pod, SYSTEM_NAMESPACE).await
+}
+
+/// Open a port-forward to `pod`'s admin port in `namespace`.
+///
+/// Every role binds admin on the same port, so only the namespace varies — a
+/// dedicated proxy or a namespace relay lives in its tenant namespace rather
+/// than the install namespace [`pod_admin_forward`] assumes.
+///
+/// # Errors
+///
+/// Fails when no free local port is available or the forward cannot bind
+/// within the helper's internal deadline.
+#[must_use = "dropping the forward closes the tunnel"]
+pub async fn pod_admin_forward_in(pod: &str, namespace: &str) -> anyhow::Result<PodAdminForward> {
     let local = free_port()?;
     let child = start_port_forward(
         &format!("pod/{pod}"),
         local,
         CONTROLLER_ADMIN_PORT,
-        SYSTEM_NAMESPACE,
+        namespace,
     )
     .await
-    .with_context(|| format!("port-forward to pod/{pod}"))?;
+    .with_context(|| format!("port-forward to pod/{pod} in '{namespace}'"))?;
     let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), local);
     Ok(PodAdminForward {
         child,

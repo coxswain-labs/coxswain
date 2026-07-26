@@ -34,7 +34,9 @@ use crate::proto::v1::{
 };
 use crate::subscription::Scope;
 use crate::svid::SharedSvid;
-use crate::upstream::{SharedUpstream, UpstreamTarget, expected_server_matcher};
+use crate::upstream::{
+    SharedUpstream, UpstreamPolicy, UpstreamRejection, UpstreamTarget, expected_server_matcher,
+};
 use crate::version::WIRE_VERSION;
 
 /// Configuration for the discovery gRPC client supervisor.
@@ -137,10 +139,29 @@ pub struct DiscoveryClientConfig {
     pub re_bootstrap: Option<Arc<Notify>>,
     /// SPIFFE trust domain, used to rebuild the expected-server matcher when a
     /// live `PreferredUpstream` directive names a new `(endpoint, sa)` (#601).
+    ///
+    /// Only consulted when `upstream_policy` is `None`; a wired policy carries
+    /// its own trust domain.
     pub trust_domain: String,
     /// Namespace to attribute an upstream whose endpoint is not cluster service
     /// DNS (test loopback) when rebuilding a matcher from a directive (#601).
+    ///
+    /// Only consulted when `upstream_policy` is `None` — a wired policy refuses
+    /// non-service-DNS endpoints outright rather than attributing them.
     pub fallback_namespace: String,
+    /// The closed set of upstreams a `PreferredUpstream` directive may name
+    /// (#665).
+    ///
+    /// When `Some`, a directive may only *select* one of the upstreams this node
+    /// can name from its own launch config; the expected SVID is derived locally
+    /// and the directive's `expected_server_sa` is cross-checked, never trusted.
+    /// Without it the identity to trust comes off the wire, so whoever sends the
+    /// directive picks both the server and the identity it must present.
+    ///
+    /// `None` (default) keeps the pre-#665 wire-derived behaviour and is
+    /// **test-only**, the same idiom as `tls: None` above: `coxswain-bin`
+    /// populates it on every client it builds, pinned by a unit test there.
+    pub upstream_policy: Option<UpstreamPolicy>,
     /// How this client handles a `PreferredUpstream` directive (#601): a leaf
     /// repoints its own upstream; a relay forwards it downstream. Defaults to
     /// [`UpstreamDirectiveHandler::RepointSelf`].
@@ -188,6 +209,7 @@ impl DiscoveryClientConfig {
             re_bootstrap: None,
             trust_domain: "cluster.local".to_owned(),
             fallback_namespace: String::new(),
+            upstream_policy: None,
             upstream_directive_handler: UpstreamDirectiveHandler::RepointSelf,
         }
     }
@@ -974,13 +996,27 @@ impl Supervisor {
             warn!("discovery client: received PreferredUpstream with empty endpoint; ignoring");
             return false;
         }
-        let matcher = expected_server_matcher(
-            &self.config.trust_domain,
-            &directive.endpoint,
-            &directive.expected_server_sa,
-            &self.config.fallback_namespace,
-        );
-        let target = UpstreamTarget::new(directive.endpoint.clone(), matcher);
+        let target = match self.resolve_directive(directive) {
+            Ok(target) => target,
+            Err(e) => {
+                // The sender named an upstream this node's policy does not
+                // recognise (#665). Refuse and keep the current upstream: the
+                // node stays on a peer it has already verified, and the data
+                // plane keeps serving throughout. Following the directive is
+                // precisely the outcome the policy exists to prevent, so a
+                // refusal is never escalated beyond a warning.
+                warn!(
+                    endpoint = %directive.endpoint,
+                    expected_server_sa = %directive.expected_server_sa,
+                    error = %e,
+                    "discovery client: refusing PreferredUpstream outside this node's upstream policy"
+                );
+                crate::metrics::client_directives_total()
+                    .with_label_values(&["rejected"])
+                    .inc();
+                return false;
+            }
+        };
         // No-op when the directive names the upstream we are already on. A repoint
         // to the current endpoint must NOT tear down a healthy stream: doing so
         // reconnects to the same place, and if the peer re-sends the same directive
@@ -993,6 +1029,9 @@ impl Supervisor {
                 endpoint = %directive.endpoint,
                 "discovery client: PreferredUpstream names the current upstream; not repointing"
             );
+            crate::metrics::client_directives_total()
+                .with_label_values(&["noop"])
+                .inc();
             return false;
         }
         debug!(
@@ -1001,7 +1040,40 @@ impl Supervisor {
             "discovery client: applying PreferredUpstream directive; repointing routing upstream"
         );
         cell.store(Arc::new(Some(target)));
+        crate::metrics::client_directives_total()
+            .with_label_values(&["applied"])
+            .inc();
         true
+    }
+
+    /// Resolve a directive's `(endpoint, expected_server_sa)` into a target
+    /// whose expected identity this node derived itself (#665).
+    ///
+    /// With a policy wired (always, in production — `coxswain-bin` populates it
+    /// on every client it builds) the pair is resolved against the three
+    /// upstreams the node can name locally. Without one — the plaintext test
+    /// path, mirroring `tls: None` on the same config — the pre-#665 derivation
+    /// stands, so unit tests and harnesses on loopback endpoints keep working.
+    ///
+    /// # Errors
+    ///
+    /// [`UpstreamRejection`] when a wired policy refuses the named upstream.
+    fn resolve_directive(
+        &self,
+        directive: &p::PreferredUpstream,
+    ) -> Result<UpstreamTarget, UpstreamRejection> {
+        match self.config.upstream_policy.as_ref() {
+            Some(policy) => policy.resolve(&directive.endpoint, &directive.expected_server_sa),
+            None => Ok(UpstreamTarget::new(
+                directive.endpoint.clone(),
+                expected_server_matcher(
+                    &self.config.trust_domain,
+                    &directive.endpoint,
+                    &directive.expected_server_sa,
+                    &self.config.fallback_namespace,
+                ),
+            )),
+        }
     }
 }
 
@@ -1642,6 +1714,7 @@ mod tests {
             re_bootstrap: None,
             trust_domain: "cluster.local".to_owned(),
             fallback_namespace: String::new(),
+            upstream_policy: None,
             upstream_directive_handler: UpstreamDirectiveHandler::RepointSelf,
         }
     }
