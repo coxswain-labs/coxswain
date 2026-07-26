@@ -80,6 +80,7 @@
 pub mod capabilities;
 pub mod cluster;
 pub mod duration;
+pub(crate) mod egress;
 pub mod endpoints;
 pub(crate) mod fingerprint;
 pub mod gateway_api;

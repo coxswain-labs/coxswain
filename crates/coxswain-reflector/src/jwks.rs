@@ -3,15 +3,24 @@
 //! Remote JWKS resolution happens **here** — never in `coxswain-proxy` — so the
 //! read-only data plane never egresses to an identity provider (the Istio
 //! model, not Envoy's default proxy-side fetch). [`JwksCacheHandle`] is a
-//! cloneable, lock-free-read handle: [`run`] is the sole writer (spawned once,
+//! cloneable, lock-free-read handle: `run` is the sole writer (spawned once,
 //! controller role only — see [`crate::reconciler::ReconcilerOptions::fetch_remote_jwks`]),
 //! and the reconcile rebuild reads it synchronously via [`JwksCacheHandle::get`]
 //! when resolving a `JwtAuth` CR that names a [`coxswain_core::crd::RemoteJwks`].
 //!
 //! Inline JWKS ([`coxswain_core::crd::InlineJwks`]) never touches this cache — the reflector reads
 //! `spec.jwks.inline.jwks` directly at resolve time.
+//!
+//! `remote.uri` is a tenant-authored URL fetched by the privileged controller
+//! (#664) — `fetch_one` enforces the `crate::egress` guard on it: `https`
+//! is required unless the destination is operator-allowlisted, a literal-IP
+//! host is checked against the same policy the caller's `reqwest::Client` was
+//! built with (see `crate::egress::GuardedResolver`, wired in at
+//! [`crate::reconciler`]'s client construction — DNS-resolved hosts are
+//! covered there, not here), and the response body is capped.
 
 use crate::MergedStore;
+use crate::egress::EgressPolicy;
 use arc_swap::ArcSwap;
 use coxswain_core::crd::JwtAuth;
 #[cfg(test)]
@@ -36,6 +45,11 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How often the background task rescans the `JwtAuth` store for due URIs.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Cap on a JWKS response body (#664): a legitimate key set is a handful of
+/// keys, at most a few KiB. 1 MiB is generous headroom while still bounding
+/// what a compromised or malicious endpoint can make the controller buffer.
+const MAX_JWKS_BODY_BYTES: usize = 1 << 20;
 
 /// Outcome of the most recent fetch attempt for one JWKS URI.
 #[derive(Clone, Debug)]
@@ -136,12 +150,17 @@ impl JwksCacheHandle {
 /// [`crate::reconciler::ReconcilerOptions::fetch_remote_jwks`]) — the proxy
 /// never runs this task, so the read-only data plane never egresses to an
 /// identity provider.
-pub async fn run(cache: JwksCacheHandle, jwt_auths: MergedStore<JwtAuth>, client: reqwest::Client) {
+pub(crate) async fn run(
+    cache: JwksCacheHandle,
+    jwt_auths: MergedStore<JwtAuth>,
+    client: reqwest::Client,
+    policy: EgressPolicy,
+) {
     let mut local: HashMap<Box<str>, CacheEntry> = HashMap::new();
     let mut ticker = tokio::time::interval(POLL_INTERVAL);
     loop {
         ticker.tick().await;
-        tick(&cache, &jwt_auths, &client, &mut local).await;
+        tick(&cache, &jwt_auths, &client, &policy, &mut local).await;
     }
 }
 
@@ -152,6 +171,7 @@ async fn tick(
     cache: &JwksCacheHandle,
     jwt_auths: &MergedStore<JwtAuth>,
     client: &reqwest::Client,
+    policy: &EgressPolicy,
     local: &mut HashMap<Box<str>, CacheEntry>,
 ) {
     let now = Instant::now();
@@ -188,7 +208,7 @@ async fn tick(
         return;
     }
 
-    let fetches = due.iter().map(|uri| fetch_one(client, uri));
+    let fetches = due.iter().map(|uri| fetch_one(client, uri, policy));
     let results = futures::future::join_all(fetches).await;
 
     for (uri, result) in due.into_iter().zip(results) {
@@ -220,21 +240,121 @@ async fn tick(
     cache.publish(snapshot);
 }
 
-/// Fetch one JWKS URI, bounded by [`FETCH_TIMEOUT`].
+/// Why a JWKS fetch failed. Every variant leaves the URI's cache entry
+/// [`CacheState::Failed`] (fail-closed) — this only exists to give the
+/// `tracing::warn!` in [`tick`] a precise, `Display`-able cause.
+#[derive(Debug, thiserror::Error)]
+enum JwksFetchError {
+    /// `uri` isn't a valid absolute URL at all.
+    #[error("not a valid URL")]
+    InvalidUri,
+    /// Plaintext (`http`) to anything other than a literal IP the operator
+    /// allowlisted via `--egress-allow-cidr`. `https` is always permitted;
+    /// `http` never is otherwise — a hostname target can't be checked here at
+    /// all (no DNS lookup happens before the connector itself resolves it,
+    /// see [`check_url`]), so `http` to a hostname is refused unconditionally,
+    /// not just when unlisted — see [`EgressPolicy::permits_plaintext`].
+    #[error(
+        "http:// is only permitted to a literal IP address listed in --egress-allow-cidr \
+         (a hostname target must use https://)"
+    )]
+    PlaintextNotAllowed,
+    /// The host is a literal IP outside the controller's egress policy (#664)
+    /// — see [`crate::egress`].
+    #[error("blocked by the controller's egress policy; see --egress-allow-cidr")]
+    Blocked,
+    /// A non-`2xx` response. Redirects are disabled on the client (#664), so
+    /// a `3xx` lands here rather than being silently followed.
+    #[error("server responded {0}")]
+    Status(reqwest::StatusCode),
+    /// The response body exceeded [`MAX_JWKS_BODY_BYTES`].
+    #[error("response body exceeded the {MAX_JWKS_BODY_BYTES}-byte cap")]
+    BodyTooLarge,
+    /// The body isn't valid UTF-8.
+    #[error("response body is not valid UTF-8")]
+    NotUtf8,
+    /// Network error, TLS error, resolver-rejected (see
+    /// [`crate::egress::GuardedResolver`]), or timeout.
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+}
+
+/// Reject a request before it's ever sent, for anything decidable from the
+/// URL alone: scheme, and a literal-IP host (hyper-util skips DNS resolution
+/// entirely for those — `SocketAddrs::try_parse` — so
+/// [`crate::egress::GuardedResolver`], wired into the client's DNS resolver,
+/// never sees them; this is the only place they're checked).
+///
+/// `Url::host_str` brackets an IPv6 literal (`"[::1]"`), so it is stripped
+/// before parsing — mirroring `hyper_util`'s own
+/// `trim_start_matches('[').trim_end_matches(']')` in `HttpConnector::call_async`,
+/// the exact bracket-stripping that feeds its `SocketAddrs::try_parse` fast
+/// path. Without this, `https://[::ffff:169.254.169.254]/` (or any bracketed
+/// IPv6/IPv4-mapped literal) would parse as a non-IP "hostname" here, skip
+/// this check entirely, and still hit the DNS fast path downstream — bypassing
+/// the guard through the one case it exists to cover.
+fn check_url(uri: &str, policy: &EgressPolicy) -> Result<(), JwksFetchError> {
+    let parsed = reqwest::Url::parse(uri).map_err(|_| JwksFetchError::InvalidUri)?;
+    let Some(host) = parsed.host_str() else {
+        return Err(JwksFetchError::InvalidUri);
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let literal_ip = host.parse::<std::net::IpAddr>().ok();
+
+    match parsed.scheme() {
+        "https" => {}
+        "http" => {
+            let permitted = literal_ip.is_some_and(|ip| policy.permits_plaintext(ip));
+            if !permitted {
+                return Err(JwksFetchError::PlaintextNotAllowed);
+            }
+        }
+        _ => return Err(JwksFetchError::InvalidUri),
+    }
+
+    if let Some(ip) = literal_ip
+        && !policy.permits(ip)
+    {
+        return Err(JwksFetchError::Blocked);
+    }
+    Ok(())
+}
+
+/// Fetch one JWKS URI, bounded by [`FETCH_TIMEOUT`] and guarded against SSRF
+/// (#664, [`crate::egress`]).
 ///
 /// Returns the verbatim response body text on a `2xx`; any other outcome
-/// (network error, non-2xx status, timeout, non-UTF-8 body) is an `Err`. Body
-/// *content* validation (is this actually a parseable JWK Set?) happens in
-/// `coxswain-proxy`, which is the sole JWKS-parsing/crypto boundary in the
-/// codebase (see [`coxswain_core::routing::JwtConfig`]'s module doc).
-async fn fetch_one(client: &reqwest::Client, uri: &str) -> Result<Arc<str>, reqwest::Error> {
-    let resp = client
-        .get(uri)
-        .timeout(FETCH_TIMEOUT)
-        .send()
-        .await?
-        .error_for_status()?;
-    let text = resp.text().await?;
+/// (blocked destination, network error, non-2xx status, timeout, oversized or
+/// non-UTF-8 body) is an `Err`. Body *content* validation (is this actually a
+/// parseable JWK Set?) happens in `coxswain-proxy`, which is the sole
+/// JWKS-parsing/crypto boundary in the codebase (see
+/// [`coxswain_core::routing::JwtConfig`]'s module doc).
+async fn fetch_one(
+    client: &reqwest::Client,
+    uri: &str,
+    policy: &EgressPolicy,
+) -> Result<Arc<str>, JwksFetchError> {
+    check_url(uri, policy)?;
+
+    let mut resp = client.get(uri).timeout(FETCH_TIMEOUT).send().await?;
+    if !resp.status().is_success() {
+        return Err(JwksFetchError::Status(resp.status()));
+    }
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_JWKS_BODY_BYTES as u64)
+    {
+        return Err(JwksFetchError::BodyTooLarge);
+    }
+
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if body.len() + chunk.len() > MAX_JWKS_BODY_BYTES {
+            return Err(JwksFetchError::BodyTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let text = String::from_utf8(body).map_err(|_| JwksFetchError::NotUtf8)?;
     Ok(Arc::from(text))
 }
 
@@ -310,7 +430,8 @@ mod tests {
                 next_due: Instant::now() + Duration::from_secs(3600),
             },
         );
-        tick(&cache, &jwt_auths, &client, &mut local).await;
+        let policy = EgressPolicy::default();
+        tick(&cache, &jwt_auths, &client, &policy, &mut local).await;
         assert!(local.is_empty(), "stale entry must be pruned");
     }
 
@@ -318,5 +439,73 @@ mod tests {
         let (reader, mut writer) = reflector::store();
         writer.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
         MergedStore::single(reader)
+    }
+
+    #[test]
+    fn https_to_any_host_passes_the_url_check() {
+        let policy = EgressPolicy::default();
+        check_url("https://issuer.example.com/jwks.json", &policy).expect("https is allowed");
+    }
+
+    #[test]
+    fn http_to_a_hostname_is_rejected_without_dns() {
+        // No allowlist can vouch for a hostname without resolving it, and
+        // `check_url` never performs DNS — see its doc comment.
+        let policy = EgressPolicy::new(vec!["10.0.0.0/8".parse().expect("cidr")]);
+        let err = check_url("http://issuer.example.com/jwks.json", &policy)
+            .expect_err("http to a hostname must be rejected");
+        assert!(matches!(err, JwksFetchError::PlaintextNotAllowed));
+    }
+
+    #[test]
+    fn http_to_an_allowlisted_literal_ip_is_permitted() {
+        let policy = EgressPolicy::new(vec!["10.0.0.0/8".parse().expect("cidr")]);
+        check_url("http://10.1.2.3/jwks.json", &policy)
+            .expect("http to an allowlisted literal IP is permitted");
+    }
+
+    #[test]
+    fn https_to_a_reserved_literal_ip_is_blocked_without_dns() {
+        let policy = EgressPolicy::default();
+        let err = check_url("https://169.254.169.254/latest/meta-data/", &policy)
+            .expect_err("metadata IP must be blocked");
+        assert!(matches!(err, JwksFetchError::Blocked));
+    }
+
+    #[test]
+    fn bracketed_ipv6_literal_host_is_blocked() {
+        // `Url::host_str()` brackets an IPv6 literal; a naive `.parse::<IpAddr>()`
+        // on the unmodified `host_str()` would treat this as an opaque hostname
+        // and skip the reserved-range check entirely (#664 regression).
+        let policy = EgressPolicy::default();
+        let err = check_url("https://[fd00::1]/jwks.json", &policy)
+            .expect_err("ULA IPv6 literal must be blocked");
+        assert!(matches!(err, JwksFetchError::Blocked));
+    }
+
+    #[test]
+    fn bracketed_ipv4_mapped_ipv6_literal_host_is_blocked() {
+        let policy = EgressPolicy::default();
+        let err = check_url(
+            "https://[::ffff:169.254.169.254]/latest/meta-data/",
+            &policy,
+        )
+        .expect_err("IPv4-mapped IPv6 metadata literal must be blocked");
+        assert!(matches!(err, JwksFetchError::Blocked));
+    }
+
+    #[test]
+    fn non_http_scheme_is_rejected() {
+        let policy = EgressPolicy::default();
+        let err =
+            check_url("file:///etc/passwd", &policy).expect_err("non-http scheme must be rejected");
+        assert!(matches!(err, JwksFetchError::InvalidUri));
+    }
+
+    #[test]
+    fn unparseable_uri_is_rejected() {
+        let policy = EgressPolicy::default();
+        let err = check_url("not a url", &policy).expect_err("unparseable URI must be rejected");
+        assert!(matches!(err, JwksFetchError::InvalidUri));
     }
 }

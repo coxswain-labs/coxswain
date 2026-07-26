@@ -320,6 +320,12 @@ pub(crate) struct HelmOverrides {
     /// A comma-separated list (`ns1,ns2`) scopes the controller to those
     /// namespaces. `None` leaves the chart default (cluster-wide).
     pub watch_namespace: Option<String>,
+    /// Passed as `controller.egressAllowCidrs` (#664): CIDRs the controller may
+    /// fetch a tenant-authored `JwtAuth.spec.jwks.remote.uri` from, beyond the
+    /// public internet. Empty (the chart default) refuses every reserved/
+    /// special-purpose destination, including the in-cluster Service CIDR a
+    /// test's own ClusterIP fixture lives in.
+    pub egress_allow_cidrs: Vec<String>,
 }
 
 /// Install or upgrade the coxswain Helm release with e2e-specific overrides.
@@ -450,6 +456,13 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
         // Escape commas so Helm passes the whole namespace list as one string
         // value instead of splitting it into a list (#59 multi-namespace watch).
         args.push(format!("watchNamespace={}", ns.replace(',', "\\,")));
+    }
+    if !overrides.egress_allow_cidrs.is_empty() {
+        args.push("--set".into());
+        args.push(format!(
+            "controller.egressAllowCidrs={{{}}}",
+            overrides.egress_allow_cidrs.join("\\,")
+        ));
     }
     if let Some(enabled) = overrides.gateway_api_enabled {
         args.push("--set".into());
@@ -711,6 +724,7 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
         relay_scale_down_stabilization: _,
         relay_target_proxies_per_replica: _,
         watch_namespace: _,
+        egress_allow_cidrs: _,
     } = HelmOverrides::default();
     let mut dirty = Vec::new();
     let mut check = |path: &[&str], is_dirty: bool| {
@@ -800,6 +814,12 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
         get(&["relay", "targetProxiesPerReplica"]).is_some(),
     );
     check(&["watchNamespace"], get(&["watchNamespace"]).is_some());
+    check(
+        &["controller", "egressAllowCidrs"],
+        get(&["controller", "egressAllowCidrs"])
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|a| !a.is_empty()),
+    );
     dirty
 }
 

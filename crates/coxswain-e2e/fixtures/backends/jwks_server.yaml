@@ -1,0 +1,52 @@
+# JWKS server backend for the remote-JWKS SSRF-guard e2e tests (#664).
+#
+# A busybox `nc` loop (same idiom as auth_stub.yaml) serving one fixed HTTP/1.1
+# response over PLAIN HTTP on port 8080: the SAME public ES256 key
+# (kid=e2e-test-key) as jwt_auth_extensionref.yaml's inline JWKS, so
+# coxswain_e2e::jwt::valid_token() verifies against it. Plain HTTP is
+# deliberate — it exercises the operator's `--egress-allow-cidr` allowlist,
+# which is also the only class of destination a plaintext `remote.uri` is ever
+# accepted for (crates/coxswain-reflector/src/egress.rs).
+#
+# The Service's ClusterIP is discovered at test time (`svc.spec.clusterIP`)
+# and substituted into the JwtAuth CR's `remote.uri` as a literal IP — a
+# hostname target is never eligible for plaintext, only a literal IP the
+# operator's CIDR allowlist covers.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jwks-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jwks-server
+  template:
+    metadata:
+      labels:
+        app: jwks-server
+    spec:
+      containers:
+        - name: jwks-server
+          image: ${BUSYBOX_IMAGE}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              while true; do
+                printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 172\r\nConnection: close\r\n\r\n{"keys":[{"kty":"EC","crv":"P-256","kid":"e2e-test-key","alg":"ES256","x":"ScOuAzhxBbDIGzXwHlAcn0nHt8tE9OvqRHm3RIGQjk8","y":"JiMe4KXWaBgWIBD1TTkwQdJNbLkO5AEiRQSdv8dbQyg"}]}' | nc -l -p 8080
+              done
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jwks-server
+spec:
+  selector:
+    app: jwks-server
+  ports:
+    - port: 8080
+      targetPort: 8080

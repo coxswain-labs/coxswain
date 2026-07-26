@@ -292,6 +292,11 @@ pub const BASIC_AUTH_EXTENSIONREF: &str = fixture!("basic_auth_extensionref.yaml
 /// missing/invalid/expired/wrong-issuer tokens get 401. Sign matching tokens
 /// via [`crate::jwt`].
 pub const JWT_AUTH_EXTENSIONREF: &str = fixture!("jwt_auth_extensionref.yaml");
+/// Gateway + `JwtAuth` (**remote** JWKS, `${JWKS_URI}` placeholder) + HTTPRoute
+/// with an `ExtensionRef` filter (#664 — controller-side SSRF guard on
+/// `remote.uri`). Apply `backends::ECHO` and `backends::JWKS_SERVER` first;
+/// substitute `JWKS_URI` from the JWKS server Service's discovered ClusterIP.
+pub const JWT_AUTH_REMOTE_EXTENSIONREF: &str = fixture!("jwt_auth_remote_extensionref.yaml");
 /// Gateway + `CoxswainExternalAuth` (HTTP, auth-allow:4000) + HTTPRoute with an
 /// `ExtensionRef` filter (#23 happy path). The ext_authz check allows → echo-a.
 pub const EXTERNAL_AUTH_ROUTE_ALLOW: &str = fixture!("external_auth_route_allow.yaml");

@@ -1,0 +1,66 @@
+# JwtAuth ExtensionRef with a REMOTE JWKS fixture (#664 — controller-side SSRF
+# guard on JwtAuth.spec.jwks.remote.uri). Apply backends::ECHO and
+# backends::JWKS_SERVER first; JWKS_URI is a runtime-discovered literal
+# (`http://<jwks-server ClusterIP>:8080/jwks.json`) substituted per test.
+#
+# The proxy behaviour under a valid token is identical to
+# jwt_auth_extensionref.yaml (same key material) — this fixture exists to
+# exercise the CONTROLLER'S fetch of remote.uri, not proxy-side verification.
+#
+# Gateway: coxswain-jwtauth-remote on GATEWAY_HTTP_PORT.
+# Route host: gwjwtauth-remote.TESTNS.local, path / -> echo-a:3000.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-jwtauth-remote
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: JwtAuth
+metadata:
+  name: jwtauth-remote
+spec:
+  issuer: https://issuer.e2e.coxswain-labs.dev
+  jwks:
+    remote:
+      uri: ${JWKS_URI}
+      # Floored at MIN_REFRESH (30s) so a first-fetch miss (e.g. jwks-server
+      # not yet Ready when the controller's next tick lands) retries inside
+      # the test's poll window instead of the 5m DEFAULT_REFRESH.
+      refreshInterval: 30s
+  claimToHeaders:
+    - claim: sub
+      header: x-user-id
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: jwtauth-remote-route
+spec:
+  parentRefs:
+    - name: coxswain-jwtauth-remote
+  hostnames:
+    - "gwjwtauth-remote.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: JwtAuth
+            name: jwtauth-remote
+      backendRefs:
+        - name: echo-a
+          port: 3000

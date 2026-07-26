@@ -87,6 +87,11 @@ pub struct ControllerOptions {
     /// namespaces; resources elsewhere are ignored. `None` leaves the chart
     /// default (cluster-wide).
     pub watch_namespace: Option<String>,
+    /// Sets `controller.egressAllowCidrs` (#664) — CIDRs the controller may
+    /// fetch a tenant-authored `JwtAuth.spec.jwks.remote.uri` from, beyond the
+    /// public internet. Empty (the chart default) refuses every reserved/
+    /// special-purpose destination, including any in-cluster ClusterIP.
+    pub egress_allow_cidrs: Vec<String>,
 }
 
 /// Handle to the in-cluster coxswain installation for one test.
@@ -164,6 +169,7 @@ impl ControllerProcess {
             relay_scale_down_stabilization: opts.relay_scale_down_stabilization,
             relay_target_proxies_per_replica: opts.relay_target_proxies_per_replica,
             watch_namespace: opts.watch_namespace,
+            egress_allow_cidrs: opts.egress_allow_cidrs,
         };
         if overrides != HelmOverrides::default() {
             let root = workspace_root().context("workspace root")?;

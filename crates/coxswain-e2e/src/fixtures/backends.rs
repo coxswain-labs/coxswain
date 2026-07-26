@@ -56,6 +56,17 @@ pub const AUTH_STUB: &str = concat!(
     "/fixtures/backends/auth_stub.yaml"
 );
 
+/// JWKS server for the remote-JWKS SSRF-guard e2e tests (#664).
+///
+/// Creates one `jwks-server` Service (port 8080, plain HTTP, busybox nc loop)
+/// serving the same public ES256 key (`kid=e2e-test-key`) as
+/// `gateway_api::JWT_AUTH_EXTENSIONREF`'s inline JWKS. Callers discover the
+/// Service's ClusterIP at test time and build `remote.uri` from it.
+pub const JWKS_SERVER: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/fixtures/backends/jwks_server.yaml"
+);
+
 /// Istio's `ext-authz` sample server for gRPC ext_authz e2e (#23).
 ///
 /// Creates one `ext-authz-grpc` Service exposing an HTTP check server on `:8000`

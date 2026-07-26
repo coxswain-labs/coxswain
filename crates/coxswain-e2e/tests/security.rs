@@ -3040,4 +3040,201 @@ mod serial {
 
         Ok(())
     }
+
+    // ── JwtAuth remote JWKS SSRF guard (#664) ─────────────────────────────
+
+    /// Reads the `jwks-server` fixture's discovered ClusterIP. Callers build
+    /// the full `remote.uri` themselves — the two tests below deliberately use
+    /// different schemes to exercise different halves of the guard: `https://`
+    /// hits the reserved-range denylist (`EgressPolicy::permits`,
+    /// `crate::egress::RESERVED_NETS`) directly, while `http://` additionally
+    /// exercises the plaintext-requires-explicit-allowlisting rule
+    /// (`EgressPolicy::permits_plaintext`) — the only destination class a
+    /// plaintext `remote.uri` is ever accepted for.
+    async fn jwks_server_cluster_ip(
+        client: &kube::Client,
+        namespace: &str,
+    ) -> anyhow::Result<String> {
+        use anyhow::Context as _;
+        let services: kube::Api<k8s_openapi::api::core::v1::Service> =
+            kube::Api::namespaced(client.clone(), namespace);
+        let svc = wait::wait_for_resource(&services, "jwks-server", Duration::from_secs(30))
+            .await
+            .context("jwks-server Service")?;
+        svc.spec
+            .as_ref()
+            .and_then(|s| s.cluster_ip.clone())
+            .ok_or_else(|| anyhow::anyhow!("jwks-server Service has no clusterIP"))
+    }
+
+    /// `JwtAuth.spec.jwks.remote.uri` naming a destination inside
+    /// `--egress-allow-cidr`: the controller fetches it, and a valid bearer
+    /// token is admitted exactly as with an inline JWKS (#664 happy path —
+    /// the operator allowlist is what makes an in-cluster identity provider
+    /// reachable at all).
+    #[tokio::test]
+    async fn remote_jwks_from_allowlisted_cidr_admits_valid_token() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            // Covers the actual Service CIDR of both cluster distributions this
+            // suite runs against, verified live rather than assumed: kind's
+            // default is 10.96.0.0/12 (⊂ 10.0.0.0/8); OrbStack's k3s node runs
+            // `--service-cidr 192.168.194.128/25` (⊂ 192.168.0.0/16, confirmed
+            // via `kubectl get svc kubernetes -o jsonpath='{.spec.clusterIP}'`
+            // → 192.168.194.129). 172.16.0.0/12 covers a differently-configured
+            // cluster.
+            egress_allow_cidrs: vec![
+                "10.0.0.0/8".to_string(),
+                "172.16.0.0/12".to_string(),
+                "192.168.0.0/16".to_string(),
+            ],
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "jwks-remote-ok").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        fixtures::apply_fixture(backends::JWKS_SERVER, FixtureVars::new(&ns.name)).await?;
+        // Both backends must actually be serving before the controller's first
+        // fetch attempt: a miss costs DEFAULT_REFRESH (5m, floored at 30s by
+        // this fixture's own `refreshInterval`) to retry, not the 5s tick
+        // interval, which would otherwise blow the poll budget below.
+        wait::wait_for_deployments(&ns.name, &["echo-a", "jwks-server"]).await?;
+        let cluster_ip = jwks_server_cluster_ip(&h.client, &ns.name).await?;
+        // Plaintext, deliberately: this proves permits_plaintext specifically
+        // — the reserved-range denylist alone is exercised by the companion
+        // sad-path test's https:// target instead.
+        let jwks_uri = format!("http://{cluster_ip}:8080/jwks.json");
+        fixtures::apply_fixture(
+            gwa::JWT_AUTH_REMOTE_EXTENSIONREF,
+            FixtureVars::new(&ns.name).with("JWKS_URI", jwks_uri),
+        )
+        .await?;
+
+        let gw = h.gateway_http(&ns.name).await?;
+        let host = format!("gwjwtauth-remote.{}.local", ns.name);
+        let token = coxswain_e2e::jwt::valid_token();
+        let bearer = format!("Bearer {token}");
+
+        // Poll for the fully-reconciled state (claim actually forwarded), not
+        // just a 200 — the controller's JWKS fetch, the route reconcile, and
+        // the CR sync are all independent of each other (see
+        // gateway_jwt_auth_valid_token_admitted). 90s covers a missed first
+        // fetch's 30s retry floor plus route convergence.
+        let last_status: std::cell::Cell<Option<u16>> = std::cell::Cell::new(None);
+        let resp = wait::poll_until(
+            Duration::from_secs(90),
+            wait::POLL,
+            || async {
+                format!(
+                    "remote-JWKS route to admit a valid token at {host} (last status: {:?})",
+                    last_status.get()
+                )
+            },
+            || async {
+                let result = gw
+                    .get_full_with_headers(&host, "/", &[("authorization", &bearer)])
+                    .await;
+                match result {
+                    Ok((status, _, body)) => {
+                        last_status.set(Some(status));
+                        match body {
+                            Some(body)
+                                if status == 200
+                                    && body.header("X-User-Id") == Some("e2e-test-user") =>
+                            {
+                                Some(body)
+                            }
+                            _ => None,
+                        }
+                    }
+                    Err(_) => None,
+                }
+            },
+        )
+        .await?;
+        resp.assert_backend("echo-a");
+        Ok(())
+    }
+
+    /// `JwtAuth.spec.jwks.remote.uri` naming a private-range destination the
+    /// operator has NOT allowlisted: the controller's reserved-range denylist
+    /// (`EgressPolicy::permits`, `crate::egress::RESERVED_NETS`) refuses to
+    /// fetch it (`--egress-allow-cidr` unset, the default), so the JWKS never
+    /// resolves and the route fails closed with 503 — even for an otherwise-
+    /// valid bearer token (#664 sad path). Uses `https://` specifically so the
+    /// refusal is attributable to the denylist, not merely the separate
+    /// plaintext-requires-allowlisting rule the companion happy-path test's
+    /// `http://` target exercises; the block happens in `check_url` before
+    /// any dial, so the fixture's plain-HTTP server never needing to speak
+    /// TLS is irrelevant. Proves the flag, not mere reachability, gates the
+    /// fetch: the same destination (over `http://`, its native scheme)
+    /// succeeds once allowlisted, in the companion test above.
+    #[tokio::test]
+    async fn remote_jwks_to_private_address_is_refused_without_allowlist() -> anyhow::Result<()> {
+        let h = Harness::start().await?;
+        let ns = NamespaceGuard::create(&h.client, "jwks-remote-blocked").await?;
+
+        fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+        fixtures::apply_fixture(backends::JWKS_SERVER, FixtureVars::new(&ns.name)).await?;
+        wait::wait_for_deployments(&ns.name, &["echo-a", "jwks-server"]).await?;
+        let cluster_ip = jwks_server_cluster_ip(&h.client, &ns.name).await?;
+        let jwks_uri = format!("https://{cluster_ip}:8080/jwks.json");
+        fixtures::apply_fixture(
+            gwa::JWT_AUTH_REMOTE_EXTENSIONREF,
+            FixtureVars::new(&ns.name).with("JWKS_URI", jwks_uri),
+        )
+        .await?;
+
+        let gw = h.gateway_http(&ns.name).await?;
+        let host = format!("gwjwtauth-remote.{}.local", ns.name);
+        let token = coxswain_e2e::jwt::valid_token();
+        let bearer = format!("Bearer {token}");
+
+        // 404 while not yet programmed; 503 while `echo-a`'s endpoints haven't
+        // propagated into the routing snapshot is ALSO 503 — indistinguishable
+        // from the SSRF-guard block we're asserting on a single hit (see
+        // grpc_absent_status_denies_when_fail_closed). A regression that
+        // silently drops the guard (JWKS resolves, route programs, backend
+        // reachable) only shows up once resolution has definitely settled, so
+        // require 5 *consecutive*, spaced (500ms apart) 503s against a VALID
+        // bearer token rather than a single occurrence: any flip to 200 breaks
+        // the streak and this fails. `last_status` makes a timeout diagnosable
+        // from the CI log alone instead of just the dead streak counter.
+        let streak = std::cell::Cell::new(0u32);
+        let last_status: std::cell::Cell<Option<u16>> = std::cell::Cell::new(None);
+        wait::poll_until(
+            Duration::from_secs(90),
+            wait::POLL,
+            || async {
+                format!(
+                    "5 consecutive sustained 503s at {host} with a valid token \
+                     (streak={}, last status={:?})",
+                    streak.get(),
+                    last_status.get()
+                )
+            },
+            || async {
+                match gw
+                    .get_full_with_headers(&host, "/", &[("authorization", &bearer)])
+                    .await
+                {
+                    Ok((status, _, _)) => {
+                        last_status.set(Some(status));
+                        if status == 503 {
+                            streak.set(streak.get() + 1);
+                        } else {
+                            streak.set(0);
+                        }
+                        (streak.get() >= 5).then_some(())
+                    }
+                    Err(_) => {
+                        streak.set(0);
+                        None
+                    }
+                }
+            },
+        )
+        .await?;
+        Ok(())
+    }
 }

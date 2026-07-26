@@ -121,6 +121,13 @@ spec:
               value: {{ .Values.controller.reconcileDebounceMin | quote }}
             - name: COXSWAIN_RECONCILE_DEBOUNCE_MAX
               value: {{ .Values.controller.reconcileDebounceMax | quote }}
+            {{- with .Values.controller.egressAllowCidrs }}
+            # Controller-side JWKS SSRF guard (#664): destinations, beyond the
+            # public internet, the controller may fetch a tenant-authored
+            # JwtAuth.spec.jwks.remote.uri from.
+            - name: COXSWAIN_EGRESS_ALLOW_CIDR
+              value: {{ join "," . | quote }}
+            {{- end }}
             # Relay tier (#584/#605): the controller demand-drives one tier with two
             # scopes — a shared-pool relay in front of the shared proxy pool, and a
             # per-namespace relay in front of each namespace's dedicated proxies —

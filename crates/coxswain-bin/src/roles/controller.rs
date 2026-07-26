@@ -65,6 +65,7 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             ),
             enable_gateway_api: !args.common.disable_gateway_api,
             enable_ingress: !args.common.disable_ingress,
+            egress_allow_cidrs: args.controller.egress_allow_cidr.clone(),
             debounce,
             liveness_gate: Some(liveness_gate.clone()),
         },

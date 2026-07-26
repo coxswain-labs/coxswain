@@ -62,6 +62,11 @@ pub struct StatusWriterConfig {
     /// Enable the Ingress surface. When `false`, Ingress reflectors and health
     /// checks are not registered.
     pub enable_ingress: bool,
+    /// Destinations, beyond the public internet, the controller may connect to
+    /// when fetching a tenant-authored `JwtAuth.spec.jwks.remote.uri`
+    /// (`--egress-allow-cidr`, #664). Empty (the default) refuses every
+    /// reserved/special-purpose range.
+    pub egress_allow_cidrs: Vec<ipnet::IpNet>,
     /// Bounds for the reconciler's adaptive rebuild debounce (#512).
     pub debounce: coxswain_reflector::DebounceSettings,
     /// Relist liveness backstop gate (#573). Trips `/healthz` if a reflector's
@@ -119,6 +124,7 @@ pub fn spawn_status_writer(
         ingress_ports,
         enable_gateway_api,
         enable_ingress,
+        egress_allow_cidrs,
         debounce,
         liveness_gate,
     } = config;
@@ -281,6 +287,7 @@ pub fn spawn_status_writer(
             // Controller role only (#441) — the read-only proxy must never
             // egress to a JWKS identity provider; see `coxswain_reflector::jwks`.
             fetch_remote_jwks: true,
+            egress_allow_cidrs,
             debounce,
             // Relist wedge backstop (#573): the reconciler spawns the monitor
             // that trips this gate on a stuck relist.

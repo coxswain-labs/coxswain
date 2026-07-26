@@ -56,6 +56,7 @@ All values can be overridden with `--set key=value` or a custom `values.yaml`.
 | `controller.ingress.enabled` | `true` | Enable Ingress API surface and listener ports |
 | `controller.leaseTtl` | `15s` | Leader lease validity duration |
 | `controller.leaseRenewInterval` | `5s` | Leader lease renewal interval |
+| `controller.egressAllowCidrs` | `[]` | CIDRs the controller may fetch a tenant-authored `JwtAuth.spec.jwks.remote.uri` from, beyond the public internet (SSRF guard); list an in-cluster identity provider's Service CIDR to permit it |
 
 ### Shared proxy settings
 
