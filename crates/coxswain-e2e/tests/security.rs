@@ -3285,28 +3285,38 @@ mod serial {
     /// RAII cleanup for the admin-credential Secret.
     ///
     /// It lives in the shared install namespace, not a `NamespaceGuard`'s
-    /// throwaway namespace, so nothing else reclaims it. Deletes on an
-    /// independent runtime — `Drop` is synchronous and the test's own runtime is
-    /// already shutting down by the time it runs.
+    /// throwaway namespace, so nothing else reclaims it.
+    ///
+    /// The delete runs on a dedicated **thread** owning a fresh runtime and a
+    /// fresh client — the same shape as `harness::namespace::delete_resource`,
+    /// and for the same two reasons. `Drop` runs while the test's own
+    /// `#[tokio::test]` runtime is still on this thread, so calling `block_on`
+    /// here panics with "Cannot start a runtime from within a runtime"; and a
+    /// kube `Client`'s connection pool is bound to the runtime that built it, so
+    /// the client has to be constructed inside the new one. The thread is joined
+    /// so the DELETE completes before the test process exits.
     struct AdminAuthSecretGuard;
 
     impl Drop for AdminAuthSecretGuard {
         fn drop(&mut self) {
-            let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            else {
-                return;
-            };
-            rt.block_on(async {
-                if let Ok(client) = kube::Client::try_default().await {
-                    let api: kube::api::Api<k8s_openapi::api::core::v1::Secret> =
-                        kube::api::Api::namespaced(client, "coxswain-system");
-                    let _ = api
-                        .delete(ADMIN_AUTH_SECRET, &kube::api::DeleteParams::default())
-                        .await;
-                }
+            let handle = std::thread::spawn(|| {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(async {
+                    if let Ok(client) = kube::Client::try_default().await {
+                        let api: kube::api::Api<k8s_openapi::api::core::v1::Secret> =
+                            kube::api::Api::namespaced(client, "coxswain-system");
+                        let _ = api
+                            .delete(ADMIN_AUTH_SECRET, &kube::api::DeleteParams::default())
+                            .await;
+                    }
+                });
             });
+            let _ = handle.join();
         }
     }
 
