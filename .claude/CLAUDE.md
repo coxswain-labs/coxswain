@@ -8,13 +8,6 @@ Source-of-truth guidance for Claude Code in this repository.
 
 Roadmap: [Coxswain Roadmap Project](https://github.com/orgs/coxswain-labs/projects/2). `gh project view 2 --owner coxswain-labs` and `gh issue list --milestone v0.X --state all` enumerate scope.
 
-## Agent rules
-
-- **Always be concise and to the point**
-- **Do not over-explain, keep the prose short unless asked to explain**
-- **Do not over-emphasize**
-- **Do not be sycophantic**
-
 ## Project Overview
 
 **Coxswain** is a pure-Rust Kubernetes Ingress & Gateway API controller backed by [Pingora](https://github.com/cloudflare/pingora). It watches `Ingress` and `Gateway API` resources and dynamically routes traffic without a full reload.
@@ -140,10 +133,19 @@ When adding a new upstream TLS feature (e.g. a new peer option driven by a `Back
 ## GitHub issue workflow
 
 1. Invoke `/rust-skills` to load Rust coding guidelines.
-2. `git checkout main && git pull --ff-only origin main`. Stop if it fails.
+2. `git checkout main && git pull --ff-only origin main`. Stop if it fails. Then `cargo sweep --installed && cargo sweep --time 7` (non-blocking) — cargo never garbage-collects, so this once-per-issue sweep is what keeps `target/` from growing without bound; it reached 660 GB before the cadence existed.
 3. Enter plan mode. Read `gh issue view N`, cross-check code references, grill the user on anything unclear, design the implementation.
 4. After plan approval: `git checkout -b issue-N`, implement per acceptance criteria. For Gateway API features with a **Feature flags** line in the issue body: add the SupportedFeatures entries in both the Rust and Go lists (gate: `check-supported-features.sh` — it names both files). For routing, status-condition, or proxy-behaviour changes: add/update scenarios in the by-plane suite `crates/coxswain-e2e/tests/{routing,tls,security,traffic_policy,status_conditions,provisioning,resilience,observability,discovery}.rs` (a test belongs to the plane of its *primary assertion target* — see each file's header).
-5. Iterate per chunk with a **scoped, cheap** check — `cargo fmt && cargo check -p <changed-crate>` (`--workspace` only for cross-crate edits). Run the full gate **once, at the end** (not per chunk): `cargo clippy --workspace --all-targets --exclude coxswain-e2e -- -D warnings` then `cargo test --workspace --exclude coxswain-e2e`. `clippy` subsumes `check`, and the subcommands don't share build artifacts, so a standalone `check` before `clippy` — or running the full clippy/test per chunk — is a wasted multi-minute rebuild each time.
+5. Use **one** cargo invocation form for the whole issue — iteration and final gate alike:
+
+   ```bash
+   cargo fmt
+   cargo clippy --workspace --all-targets --exclude coxswain-e2e -- -D warnings
+   ```
+
+   Never substitute `cargo check`, never swap `-p <crate>` for `--workspace`, never drop `--all-targets`. Each of those is a *different* invocation form, and cargo gives each its own artifact family — `check` and `clippy` use different rustc drivers, and `-p` and `--workspace` resolve dependency features differently, so neither pair shares a single compiled dependency. Alternating between forms doesn't save a build, it adds a cold one *and* leaves its artifacts in `target/` forever. Sticking to one form keeps a single warm cache: the first run of the issue pays, every run after it rebuilds only the changed crate and its dependents.
+
+   Run `cargo test --workspace --exclude coxswain-e2e` **once, at the end** — it is a separate artifact family (`--cfg test`) and there is no way to fold it into the clippy one.
 6. **Before every `git push`**, run the doc gate: `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude coxswain-e2e --no-deps`. The CI `doc` job is `-D warnings` and fails the PR otherwise; it is *not* caught by fmt/clippy/test. The recurring failure is `rustdoc::private_intra_doc_links` — a `///`/`//!` doc on a **`pub`** item using `[`X`]` to link a `pub(crate)`/private item. **Authoring rule:** an `[`X`]` intra-doc link may only target a **`pub`** item (in this crate or a dependency); for a `pub(crate)`/private/local-fn target, use a plain code span `` `X` `` instead.
 
 Always include the issue reference in commit footers: `Refs #N` (intermediate work) or `Fixes #N` (final commit). Closing via `Fixes #N` auto-flips the Project's `Status` to `Done`; never manually close + flip.
@@ -162,7 +164,6 @@ Milestones are plain version numbers (`v0.1`, `v0.2`, …); use `gh issue edit N
 
 Labels: discover the live taxonomy with `gh label list --repo coxswain-labs/coxswain`. Every issue carries at least one `type:` and one `area:` or `api:`. `status: backlog` only on issues with no milestone; `priority:` is per-milestone; `type:` and `area:`/`api:` are required everywhere.
 
-<!-- CODEGRAPH_START -->
 ## CodeGraph
 
 In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the repo root), reach for it BEFORE grep/find or reading files when you need to understand or locate code:
@@ -171,4 +172,3 @@ In repositories indexed by CodeGraph (a `.codegraph/` directory exists at the re
 - **Shell** (always works): `codegraph explore "<symbol names or question>"` prints the same output.
 
 If there is no `.codegraph/` directory, skip CodeGraph entirely — indexing is the user's decision.
-<!-- CODEGRAPH_END -->

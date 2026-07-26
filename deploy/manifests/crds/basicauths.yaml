@@ -5,15 +5,12 @@ metadata:
 spec:
   group: gateway.coxswain-labs.dev
   names:
-    categories: []
     kind: BasicAuth
     plural: basicauths
-    shortNames: []
     singular: basicauth
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for BasicAuthSpec via `CustomResource`
@@ -54,4 +51,3 @@ spec:
         type: object
     served: true
     storage: true
-    subresources: {}

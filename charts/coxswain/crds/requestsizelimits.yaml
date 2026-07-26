@@ -5,15 +5,12 @@ metadata:
 spec:
   group: gateway.coxswain-labs.dev
   names:
-    categories: []
     kind: RequestSizeLimit
     plural: requestsizelimits
-    shortNames: []
     singular: requestsizelimit
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for RequestSizeLimitSpec via `CustomResource`
@@ -43,4 +40,3 @@ spec:
         type: object
     served: true
     storage: true
-    subresources: {}
