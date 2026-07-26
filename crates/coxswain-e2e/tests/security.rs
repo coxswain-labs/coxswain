@@ -3320,12 +3320,19 @@ mod serial {
         }
     }
 
-    /// `GET` the controller's admin `/api/v1/health`, optionally with Basic
-    /// credentials, returning the HTTP status.
-    async fn admin_health_status(
-        url: &str,
-        credentials: Option<(&str, &str)>,
-    ) -> anyhow::Result<u16> {
+    /// A controller admin path that Basic auth actually gates.
+    ///
+    /// NOT `/api/v1/health`: that is one of three infrastructure endpoints
+    /// deliberately exempt from auth (with `/metrics` and
+    /// `/api/v1/topology/local`), because the controller probes peers on them
+    /// while holding only the bcrypt *hash* and so cannot authenticate to
+    /// itself. Asserting a challenge against an exempt path can never pass, and
+    /// asserting a 200 against one passes without proving anything.
+    const GATED_ADMIN_PATH: &str = "/api/v1/routing/gateways";
+
+    /// `GET` an admin path, optionally with Basic credentials, returning the
+    /// HTTP status.
+    async fn admin_status(url: &str, credentials: Option<(&str, &str)>) -> anyhow::Result<u16> {
         let req = reqwest::Client::new().get(url);
         let req = match credentials {
             Some((user, password)) => req.basic_auth(user, Some(password)),
@@ -3348,7 +3355,10 @@ mod serial {
             ..Default::default()
         })
         .await?;
-        let url = format!("http://{}/api/v1/health", controller.controller_admin_addr);
+        let url = format!(
+            "http://{}{GATED_ADMIN_PATH}",
+            controller.controller_admin_addr
+        );
 
         // Poll rather than asserting once: the credential is loaded by a
         // background task the moment the admin service starts, so the very first
@@ -3357,10 +3367,12 @@ mod serial {
             Duration::from_secs(60),
             Duration::from_millis(500),
             || async {
-                format!("admin /api/v1/health never returned 200 for valid credentials at {url}")
+                format!(
+                    "admin {GATED_ADMIN_PATH} never returned 200 for valid credentials at {url}"
+                )
             },
             || async {
-                admin_health_status(&url, Some((ADMIN_AUTH_USER, ADMIN_AUTH_PASSWORD)))
+                admin_status(&url, Some((ADMIN_AUTH_USER, ADMIN_AUTH_PASSWORD)))
                     .await
                     .ok()
                     .filter(|s| *s == 200)
@@ -3385,7 +3397,10 @@ mod serial {
             ..Default::default()
         })
         .await?;
-        let url = format!("http://{}/api/v1/health", controller.controller_admin_addr);
+        let url = format!(
+            "http://{}{GATED_ADMIN_PATH}",
+            controller.controller_admin_addr
+        );
 
         // Settle on the enforcing state first: before the credential loads the
         // surface answers 503 (fail-closed), which is also "not 200" and would
@@ -3394,35 +3409,30 @@ mod serial {
             Duration::from_secs(60),
             Duration::from_millis(500),
             || async {
-                format!("admin /api/v1/health never reached the enforcing 401 state at {url}")
+                format!("admin {GATED_ADMIN_PATH} never reached the enforcing 401 state at {url}")
             },
-            || async {
-                admin_health_status(&url, None)
-                    .await
-                    .ok()
-                    .filter(|s| *s == 401)
-            },
+            || async { admin_status(&url, None).await.ok().filter(|s| *s == 401) },
         )
         .await?;
 
         assert_eq!(
-            admin_health_status(&url, None).await?,
+            admin_status(&url, None).await?,
             401,
             "a request with no Authorization header must be challenged, not served"
         );
         assert_eq!(
-            admin_health_status(&url, Some((ADMIN_AUTH_USER, "wrong-password"))).await?,
+            admin_status(&url, Some((ADMIN_AUTH_USER, "wrong-password"))).await?,
             401,
             "the configured username with a wrong password must be challenged"
         );
         assert_eq!(
-            admin_health_status(&url, Some(("someone-else", ADMIN_AUTH_PASSWORD))).await?,
+            admin_status(&url, Some(("someone-else", ADMIN_AUTH_PASSWORD))).await?,
             401,
             "the correct password under a different username must be challenged"
         );
         // The credential is genuinely enforced, not the endpoint being broken.
         assert_eq!(
-            admin_health_status(&url, Some((ADMIN_AUTH_USER, ADMIN_AUTH_PASSWORD))).await?,
+            admin_status(&url, Some((ADMIN_AUTH_USER, ADMIN_AUTH_PASSWORD))).await?,
             200,
             "valid credentials must still be served — otherwise the 401s above prove nothing"
         );
@@ -3430,6 +3440,24 @@ mod serial {
         // The health port is a separate listener and must never be authenticated,
         // or kubelet probes would fail and the pod would be killed.
         wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        // The three infrastructure endpoints stay reachable WITHOUT credentials
+        // even while the gated path above is challenging. This is load-bearing,
+        // not incidental: the controller probes peers on `/api/v1/health` and
+        // `/api/v1/topology/local` holding only the bcrypt hash (so it cannot
+        // authenticate to itself, and gating them would make every pod report
+        // `reachable: false`), and the chart's PodMonitor scrapes `/metrics` by
+        // pod IP with no credential field. An earlier revision of this test
+        // asserted a challenge against `/api/v1/health` and could never pass.
+        for exempt in ["/metrics", "/api/v1/health", "/api/v1/topology/local"] {
+            let exempt_url = format!("http://{}{exempt}", controller.controller_admin_addr);
+            assert_eq!(
+                admin_status(&exempt_url, None).await?,
+                200,
+                "{exempt} must stay reachable without credentials — gating it breaks \
+                 the controller's own fan-out or Prometheus scraping"
+            );
+        }
         Ok(())
     }
 }
