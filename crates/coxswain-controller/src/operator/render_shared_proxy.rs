@@ -43,6 +43,7 @@ use k8s_openapi::api::core::v1::{
     Container, ContainerPort, PodSpec, PodTemplateSpec, ResourceRequirements, Service,
     ServiceAccount, ServicePort, ServiceSpec,
 };
+use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::policy::v1::{PodDisruptionBudget, PodDisruptionBudgetSpec};
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelector;
@@ -52,6 +53,7 @@ use std::collections::BTreeMap;
 
 use coxswain_core::fleet::ADMIN_PORT_ANNOTATION;
 
+use super::admin_fence::{AdminFenceConfig, render_admin_fence};
 use super::harden::HardeningReport;
 use super::render::{
     container_hardening_security_context, discovery_volume_mounts, discovery_volumes,
@@ -173,6 +175,8 @@ pub(crate) struct SharedProxyRenderInputs<'a> {
     /// Whether the Gateway API surface is enabled install-wide (mirrors the
     /// controller's `--disable-gateway-api`).
     pub enable_gateway_api: bool,
+    /// Admin-port fencing policy (#670), install-wide.
+    pub admin_fence: &'a AdminFenceConfig,
 }
 
 /// The rendered shared-pool objects. Applied-or-deleted by
@@ -190,6 +194,10 @@ pub(crate) struct RenderedSharedProxy {
     pub pdb: Option<PodDisruptionBudget>,
     /// Internal ClusterIP Service exposing the health + admin ports.
     pub internal_service: Service,
+    /// Admin-port fence (#670) — `Some` unless fencing is disabled install-wide.
+    /// Applied-or-deleted by [`super::apply::apply_shared_proxy`], so turning
+    /// `networkPolicy.enabled` off reclaims a previously applied policy.
+    pub network_policy: Option<NetworkPolicy>,
 }
 
 /// Metadata labels for shared-pool resources: the install's selector set plus a
@@ -588,6 +596,29 @@ fn render_shared_proxy_pdb(inputs: &SharedProxyRenderInputs<'_>) -> Option<PodDi
     })
 }
 
+/// The admin-fence `NetworkPolicy` name: `<name>-admin`, alongside the internal
+/// Service's `<name>-internal`. Shared with the apply-or-delete and reclaim
+/// paths so a rename can never orphan the policy.
+pub(super) fn network_policy_name(pool_name: &str) -> String {
+    format!("{pool_name}-admin")
+}
+
+/// Render the pool's admin-port fence (#670), or `None` when fencing is off.
+fn render_shared_proxy_network_policy(
+    inputs: &SharedProxyRenderInputs<'_>,
+) -> Option<NetworkPolicy> {
+    inputs.admin_fence.enabled.then(|| {
+        render_admin_fence(
+            &network_policy_name(&inputs.config.name),
+            inputs.namespace,
+            shared_proxy_labels(inputs.selector),
+            inputs.selector.clone(),
+            inputs.admin_port,
+            inputs.admin_fence,
+        )
+    })
+}
+
 /// Render every controller-owned shared-pool object.
 pub(crate) fn render_shared_proxy(inputs: &SharedProxyRenderInputs<'_>) -> RenderedSharedProxy {
     RenderedSharedProxy {
@@ -596,6 +627,7 @@ pub(crate) fn render_shared_proxy(inputs: &SharedProxyRenderInputs<'_>) -> Rende
         hpa: render_shared_proxy_hpa(inputs),
         pdb: render_shared_proxy_pdb(inputs),
         internal_service: render_shared_proxy_internal_service(inputs),
+        network_policy: render_shared_proxy_network_policy(inputs),
     }
 }
 
@@ -669,6 +701,7 @@ mod tests {
             admin_port: 8082,
             enable_ingress: true,
             enable_gateway_api: true,
+            admin_fence: Box::leak(Box::new(AdminFenceConfig::default())),
         }
     }
 

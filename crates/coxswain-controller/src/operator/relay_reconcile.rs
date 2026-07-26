@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{ObjectReference, Service, ServiceAccount};
+use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::{Api, Client, Resource as _, api::DeleteParams};
 use pingora_core::server::ShutdownWatch;
@@ -369,6 +370,8 @@ async fn apply_relay_at(
         discovery_trust_domain: &ctx.discovery_trust_domain,
         resources,
         pod_template: policy.pod_template.as_ref(),
+        admin_port: ctx.admin_port,
+        admin_fence: &ctx.admin_fence,
         pdb_replica_ceiling: clamp_u32_to_i32(pdb_ceiling),
     });
 
@@ -408,7 +411,8 @@ fn relay_policy_object_reference(namespace: &str, name: &str) -> ObjectReference
 }
 
 /// Idempotently delete a relay's `Deployment` / `Service` / `ServiceAccount` /
-/// `PodDisruptionBudget` (all share `name` — [`render_relay::RELAY_NAME`] for the
+/// `PodDisruptionBudget` / admin-fence `NetworkPolicy` (all share `name` —
+/// [`render_relay::RELAY_NAME`] for the
 /// dedicated tier, [`render_relay::SHARED_RELAY_NAME`] for the shared pool). A relay
 /// has no owner reference, so GC is this explicit delete; a `NotFound` is success.
 /// `pub(super)` so the shared-relay convergence in [`super::shared_install`] reuses
@@ -430,11 +434,17 @@ pub(super) async fn delete_relay_resources(
     // The PDB is optional (rendered only at ceiling ≥2); delete it unconditionally so GC is
     // complete whether or not one was ever provisioned (NotFound is success).
     let pdbs: Api<PodDisruptionBudget> = Api::namespaced(client.clone(), namespace);
+    // Likewise optional (rendered only when admin fencing is on, #670) — deleted
+    // unconditionally so a torn-down relay never leaves a policy selecting
+    // labels nothing carries any more.
+    let network_policies: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
     ignore_not_found(deployments.delete(name, &dp).await).map_err(apply::ApplyError::Deployment)?;
     ignore_not_found(services.delete(name, &dp).await).map_err(apply::ApplyError::Service)?;
     ignore_not_found(service_accounts.delete(name, &dp).await)
         .map_err(apply::ApplyError::ServiceAccount)?;
     ignore_not_found(pdbs.delete(name, &dp).await).map_err(apply::ApplyError::Pdb)?;
+    ignore_not_found(network_policies.delete(name, &dp).await)
+        .map_err(apply::ApplyError::NetworkPolicy)?;
     Ok(())
 }
 

@@ -3237,4 +3237,227 @@ mod serial {
         .await?;
         Ok(())
     }
+
+    // ── Admin-port Basic authentication (#670) ────────────────────────────────
+
+    /// Username the admin-auth tests provision.
+    const ADMIN_AUTH_USER: &str = "e2e-admin";
+    /// Password the admin-auth tests provision. Test-only; never a real secret.
+    const ADMIN_AUTH_PASSWORD: &str = "e2e-s3cret";
+    /// Secret the admin-auth tests create in the install namespace.
+    const ADMIN_AUTH_SECRET: &str = "coxswain-e2e-admin-auth";
+
+    /// Create (or replace) the admin-credential Secret holding one bcrypt
+    /// htpasswd line, returning a guard that deletes it when the test ends.
+    ///
+    /// The hash is computed here rather than hard-coded so the test cannot drift
+    /// from the password it asserts with. Cost 4 keeps it fast; the production
+    /// default from `htpasswd -B` is higher.
+    async fn create_admin_auth_secret(
+        client: &kube::Client,
+    ) -> anyhow::Result<AdminAuthSecretGuard> {
+        use k8s_openapi::api::core::v1::Secret;
+        use kube::api::{Api, DeleteParams, Patch, PatchParams};
+
+        let hash = bcrypt::hash(ADMIN_AUTH_PASSWORD, 4)?;
+        let secret: Secret = serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Secret",
+            "metadata": { "name": ADMIN_AUTH_SECRET, "namespace": "coxswain-system" },
+            "stringData": { "auth": format!("{ADMIN_AUTH_USER}:{hash}\n") },
+        }))?;
+
+        let api: Api<Secret> = Api::namespaced(client.clone(), "coxswain-system");
+        // Delete first: a previous run's Secret carries a different bcrypt salt,
+        // and an apply that merged with it would verify against the wrong hash.
+        let _ = api
+            .delete(ADMIN_AUTH_SECRET, &DeleteParams::default())
+            .await;
+        api.patch(
+            ADMIN_AUTH_SECRET,
+            &PatchParams::apply("coxswain-e2e").force(),
+            &Patch::Apply(&secret),
+        )
+        .await?;
+        Ok(AdminAuthSecretGuard)
+    }
+
+    /// RAII cleanup for the admin-credential Secret.
+    ///
+    /// It lives in the shared install namespace, not a `NamespaceGuard`'s
+    /// throwaway namespace, so nothing else reclaims it.
+    ///
+    /// The delete runs on a dedicated **thread** owning a fresh runtime and a
+    /// fresh client — the same shape as `harness::namespace::delete_resource`,
+    /// and for the same two reasons. `Drop` runs while the test's own
+    /// `#[tokio::test]` runtime is still on this thread, so calling `block_on`
+    /// here panics with "Cannot start a runtime from within a runtime"; and a
+    /// kube `Client`'s connection pool is bound to the runtime that built it, so
+    /// the client has to be constructed inside the new one. The thread is joined
+    /// so the DELETE completes before the test process exits.
+    struct AdminAuthSecretGuard;
+
+    impl Drop for AdminAuthSecretGuard {
+        fn drop(&mut self) {
+            let handle = std::thread::spawn(|| {
+                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                else {
+                    return;
+                };
+                rt.block_on(async {
+                    if let Ok(client) = kube::Client::try_default().await {
+                        let api: kube::api::Api<k8s_openapi::api::core::v1::Secret> =
+                            kube::api::Api::namespaced(client, "coxswain-system");
+                        let _ = api
+                            .delete(ADMIN_AUTH_SECRET, &kube::api::DeleteParams::default())
+                            .await;
+                    }
+                });
+            });
+            let _ = handle.join();
+        }
+    }
+
+    /// A controller admin path that Basic auth actually gates.
+    ///
+    /// NOT `/api/v1/health`: that is one of three infrastructure endpoints
+    /// deliberately exempt from auth (with `/metrics` and
+    /// `/api/v1/topology/local`), because the controller probes peers on them
+    /// while holding only the bcrypt *hash* and so cannot authenticate to
+    /// itself. Asserting a challenge against an exempt path can never pass, and
+    /// asserting a 200 against one passes without proving anything.
+    const GATED_ADMIN_PATH: &str = "/api/v1/routing/gateways";
+
+    /// `GET` an admin path, optionally with Basic credentials, returning the
+    /// HTTP status.
+    async fn admin_status(url: &str, credentials: Option<(&str, &str)>) -> anyhow::Result<u16> {
+        let req = reqwest::Client::new().get(url);
+        let req = match credentials {
+            Some((user, password)) => req.basic_auth(user, Some(password)),
+            None => req,
+        };
+        Ok(req.send().await?.status().as_u16())
+    }
+
+    /// Happy path: with `adminAuth.secretName` set, the controller's admin
+    /// surface serves normally to a caller presenting the configured
+    /// credentials (#670).
+    #[tokio::test]
+    async fn admin_port_serves_normally_with_valid_basic_auth_credentials() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let _secret = create_admin_auth_secret(&client).await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            admin_auth_secret_name: Some(ADMIN_AUTH_SECRET.to_string()),
+            ..Default::default()
+        })
+        .await?;
+        let url = format!(
+            "http://{}{GATED_ADMIN_PATH}",
+            controller.controller_admin_addr
+        );
+
+        // Poll rather than asserting once: the credential is loaded by a
+        // background task the moment the admin service starts, so the very first
+        // request after a rollout can still see the fail-closed 503.
+        let status = wait::poll_until(
+            Duration::from_secs(60),
+            Duration::from_millis(500),
+            || async {
+                format!(
+                    "admin {GATED_ADMIN_PATH} never returned 200 for valid credentials at {url}"
+                )
+            },
+            || async {
+                admin_status(&url, Some((ADMIN_AUTH_USER, ADMIN_AUTH_PASSWORD)))
+                    .await
+                    .ok()
+                    .filter(|s| *s == 200)
+            },
+        )
+        .await?;
+        assert_eq!(status, 200);
+        Ok(())
+    }
+
+    /// Sad path: the same admin surface refuses a caller with no credentials
+    /// and a caller with the wrong password, and the health port stays open
+    /// either way so kubelet probes keep working (#670).
+    #[tokio::test]
+    async fn admin_port_rejects_missing_and_wrong_basic_auth_credentials() -> anyhow::Result<()> {
+        bootstrap().await?;
+        let client = kube::Client::try_default().await?;
+        let _secret = create_admin_auth_secret(&client).await?;
+
+        let controller = ControllerProcess::start_with_options(ControllerOptions {
+            admin_auth_secret_name: Some(ADMIN_AUTH_SECRET.to_string()),
+            ..Default::default()
+        })
+        .await?;
+        let url = format!(
+            "http://{}{GATED_ADMIN_PATH}",
+            controller.controller_admin_addr
+        );
+
+        // Settle on the enforcing state first: before the credential loads the
+        // surface answers 503 (fail-closed), which is also "not 200" and would
+        // make an immediate 401 assertion pass for the wrong reason.
+        wait::poll_until(
+            Duration::from_secs(60),
+            Duration::from_millis(500),
+            || async {
+                format!("admin {GATED_ADMIN_PATH} never reached the enforcing 401 state at {url}")
+            },
+            || async { admin_status(&url, None).await.ok().filter(|s| *s == 401) },
+        )
+        .await?;
+
+        assert_eq!(
+            admin_status(&url, None).await?,
+            401,
+            "a request with no Authorization header must be challenged, not served"
+        );
+        assert_eq!(
+            admin_status(&url, Some((ADMIN_AUTH_USER, "wrong-password"))).await?,
+            401,
+            "the configured username with a wrong password must be challenged"
+        );
+        assert_eq!(
+            admin_status(&url, Some(("someone-else", ADMIN_AUTH_PASSWORD))).await?,
+            401,
+            "the correct password under a different username must be challenged"
+        );
+        // The credential is genuinely enforced, not the endpoint being broken.
+        assert_eq!(
+            admin_status(&url, Some((ADMIN_AUTH_USER, ADMIN_AUTH_PASSWORD))).await?,
+            200,
+            "valid credentials must still be served — otherwise the 401s above prove nothing"
+        );
+
+        // The health port is a separate listener and must never be authenticated,
+        // or kubelet probes would fail and the pod would be killed.
+        wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
+
+        // The three infrastructure endpoints stay reachable WITHOUT credentials
+        // even while the gated path above is challenging. This is load-bearing,
+        // not incidental: the controller probes peers on `/api/v1/health` and
+        // `/api/v1/topology/local` holding only the bcrypt hash (so it cannot
+        // authenticate to itself, and gating them would make every pod report
+        // `reachable: false`), and the chart's PodMonitor scrapes `/metrics` by
+        // pod IP with no credential field. An earlier revision of this test
+        // asserted a challenge against `/api/v1/health` and could never pass.
+        for exempt in ["/metrics", "/api/v1/health", "/api/v1/topology/local"] {
+            let exempt_url = format!("http://{}{exempt}", controller.controller_admin_addr);
+            assert_eq!(
+                admin_status(&exempt_url, None).await?,
+                200,
+                "{exempt} must stay reachable without credentials — gating it breaks \
+                 the controller's own fan-out or Prometheus scraping"
+            );
+        }
+        Ok(())
+    }
 }

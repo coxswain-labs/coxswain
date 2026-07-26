@@ -27,7 +27,8 @@ use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use coxswain_controller::{
-    IngressDefaultBackend, ProxyPoolConfig, RELAY_DISCOVERY_PORT, RelayConfig,
+    AdminFenceConfig, IngressDefaultBackend, NetworkPolicyPeer, ProxyPoolConfig,
+    RELAY_DISCOVERY_PORT, RelayConfig,
 };
 use ipnet::IpNet;
 
@@ -98,18 +99,18 @@ pub(crate) struct ServeArgs {
 /// Pod role — selects which subsystems run and which flags are accepted.
 #[derive(Subcommand, Debug)]
 pub(crate) enum Role {
-    /// Reconciler + status writer pod. Boxed: `ControllerRoleArgs` grew past
-    /// `Proxy`/`Relay`'s size once `--egress-allow-cidr` (#664) was added,
-    /// which otherwise leaves every `Role` value as large as the biggest
-    /// variant regardless of which role was actually selected.
+    // Boxed: `ControllerRoleArgs` grew past `Proxy`/`Relay`'s size once
+    // `--egress-allow-cidr` (#664) was added, which otherwise leaves every
+    // `Role` value as large as the biggest variant regardless of which role was
+    // actually selected.
+    /// Reconciler and status writer pod: reads Kubernetes, writes resource status.
     Controller(Box<ControllerRoleArgs>),
     /// Read-only data plane pod. Use `--shared` for the shared pool or
     /// `--dedicated` for a per-Gateway pod.
     Proxy(ProxyRoleArgs),
-    /// Zero-RBAC discovery cache pod: subscribes upstream to the controller and
-    /// re-serves the snapshot stream downstream to proxies. Use `--shared` to
-    /// front the shared pool or `--namespace <NS>` to front one namespace's
-    /// dedicated Gateways.
+    /// Zero-RBAC discovery cache pod that relays routing snapshots from the
+    /// controller to proxies. Use `--shared` to front the shared pool or
+    /// `--namespace <NS>` to front one namespace's dedicated Gateways.
     Relay(RelayRoleArgs),
 }
 
@@ -156,17 +157,13 @@ pub(crate) struct CommonArgs {
 
     /// IP address shared by the health and admin HTTP servers.
     ///
-    /// Both `/healthz`/`/readyz` (health) and `/metrics`/`/api/v1/routes`/`/api/v1/health`
-    /// (admin) bind to this address. Set it to a management-network IP to
-    /// restrict access; leave at `0.0.0.0` so kubelet probes and Prometheus
-    /// scraping work out of the box. Independent from the data-plane
-    /// `--proxy-bind-address`.
+    /// Set a management-network IP to restrict access; the default `0.0.0.0`
+    /// lets kubelet probes and Prometheus scraping work out of the box.
+    /// Independent of the data-plane `--proxy-bind-address`.
     ///
-    /// SECURITY: on the controller role the admin API relays cluster data —
-    /// pod logs (`/api/v1/pods/{name}/logs`) and verbatim Kubernetes manifests
-    /// (`/api/v1/manifests/...`) — and is currently unauthenticated. When bound to
-    /// `0.0.0.0` it MUST be fenced by a NetworkPolicy that admits only trusted
-    /// scrapers/probes; admin-port authentication is tracked in #251.
+    /// SECURITY: on the controller role the admin API serves pod logs and
+    /// verbatim Kubernetes manifests, including Pod environment variables. Also
+    /// restrict it with `--admin-fence-enabled` and `--admin-basic-auth-secret`.
     #[arg(
         long,
         env = "COXSWAIN_MANAGEMENT_BIND_ADDRESS",
@@ -188,51 +185,46 @@ pub(crate) struct CommonArgs {
 
     /// Kubernetes namespace(s) to watch. Omit for cluster-wide scope.
     ///
-    /// Accepts a comma-separated list (`ns1,ns2,ns3`, #59): each entry spawns
-    /// one namespaced watch per resource type, letting the controller run with a
-    /// namespaced `Role` per namespace instead of cluster-wide read. A single
-    /// entry is the exact equivalent of the pre-list single-namespace scope; an
-    /// empty entry (e.g. a trailing comma) is rejected at startup.
+    /// Comma-separated list (`ns1,ns2,ns3`); each entry is watched separately,
+    /// so the controller can run with a namespaced `Role` per namespace instead
+    /// of cluster-wide read. An empty entry (e.g. a trailing comma) is rejected
+    /// at startup.
     #[arg(long, env = "COXSWAIN_WATCH_NAMESPACE")]
     pub watch_namespace: Option<String>,
 
-    /// Port on which Ingress traffic is served cluster-wide.
+    /// Port on which Ingress HTTP traffic is served cluster-wide.
     ///
-    /// The proxy pod binds this port; the controller pod compares Gateway
-    /// listener ports against it for the `PortUnavailable` listener
-    /// condition. When omitted, no static Ingress HTTP listener is bound and
-    /// Coxswain serves only the ports declared by `Gateway.spec.listeners`.
+    /// The proxy binds it; the controller compares Gateway listener ports
+    /// against it for the `PortUnavailable` listener condition. When omitted, no
+    /// static Ingress HTTP listener is bound and only the ports declared by
+    /// `Gateway.spec.listeners` are served.
     #[arg(long, env = "COXSWAIN_INGRESS_HTTP_PORT")]
     pub ingress_http_port: Option<u16>,
 
     /// Port on which TLS-terminated Ingress traffic is served cluster-wide.
     ///
-    /// The proxy pod binds this port; the controller pod compares Gateway
-    /// listener ports against it for the `PortUnavailable` listener
-    /// condition. SNI selects the certificate from each `Ingress.spec.tls`
-    /// block. When omitted, no static Ingress HTTPS listener is bound.
+    /// SNI selects the certificate from each `Ingress.spec.tls` block. The
+    /// proxy binds it; the controller compares Gateway listener ports against it
+    /// for the `PortUnavailable` listener condition. When omitted, no static
+    /// Ingress HTTPS listener is bound.
     #[arg(long, env = "COXSWAIN_INGRESS_HTTPS_PORT")]
     pub ingress_https_port: Option<u16>,
 
-    /// Disable the Gateway API surface entirely.
+    /// Disable the Gateway API surface entirely, for Ingress-only installs.
     ///
-    /// When set, no Gateway API reflectors (`Gateway`, `GatewayClass`,
+    /// When set, no Gateway API resources (`Gateway`, `GatewayClass`,
     /// `HTTPRoute`, `GRPCRoute`, `TLSRoute`, `ListenerSet`, `ReferenceGrant`,
-    /// `BackendTLSPolicy`) are started, no CRD-presence probe runs, and the
-    /// `gateway_api_crds` readiness check is not registered. Useful for
-    /// Ingress-only installs. Default (unset): the surface is enabled and, if
-    /// the CRDs are absent at startup, readiness fails until they appear
-    /// (self-healing re-probe — no restart required).
+    /// `BackendTLSPolicy`) are watched and the `gateway_api_crds` readiness
+    /// check is not registered. Default (unset): enabled, and readiness fails
+    /// until the CRDs appear — no restart needed once they do.
     #[arg(long, env = "COXSWAIN_DISABLE_GATEWAY_API")]
     pub disable_gateway_api: bool,
 
-    /// Disable the Ingress surface entirely.
+    /// Disable the Ingress surface entirely, for Gateway-API-only installs.
     ///
-    /// When set, no Ingress reflectors (`Ingress`, `IngressClass`,
-    /// `CoxswainIngressClassParameters`) are started and the proxy binds no
-    /// static Ingress listeners. Useful for Gateway-API-only installs, or
-    /// clusters where Ingress is handled by a separate controller. Default
-    /// (unset): the surface is enabled.
+    /// When set, no `Ingress`, `IngressClass`, or
+    /// `CoxswainIngressClassParameters` resources are watched and the proxy
+    /// binds no static Ingress listeners. Default (unset): enabled.
     #[arg(long, env = "COXSWAIN_DISABLE_INGRESS")]
     pub disable_ingress: bool,
 }
@@ -240,25 +232,20 @@ pub(crate) struct CommonArgs {
 /// Flags specific to roles that bind Pingora proxy listeners (`proxy`, `dev`).
 #[derive(Args, Debug)]
 pub(crate) struct ProxyArgs {
-    /// Worker threads per proxy service.
+    /// Worker threads per proxy service; `0` (default) auto-sizes from the CPU limit.
     ///
-    /// Threads are not shared across services. `0` (the default) means **auto**:
-    /// resolve to the effective CPU parallelism at startup via
-    /// [`std::thread::available_parallelism`], which is cgroup-quota-aware on
-    /// Linux (it reads `cpu.max` / `cfs_quota`), so the count tracks the pod's
-    /// `resources.limits.cpu` with no manual tuning — floored at 2. Set an
-    /// explicit non-zero value to override. Tune to the pod's CPU *limit*, not
-    /// the host core count: over-provisioning threads under a CFS quota only
-    /// adds context-switching.
+    /// Threads are not shared across services. Auto resolves the effective CPU
+    /// parallelism at startup, which is cgroup-quota-aware on Linux, so the
+    /// count tracks the pod's `resources.limits.cpu`, floored at 2. Set a
+    /// non-zero value to override; tune it to the pod's CPU *limit*, not the
+    /// host core count.
     #[arg(long, env = "COXSWAIN_PROXY_THREADS", default_value_t = 0)]
     pub proxy_threads: usize,
 
-    /// Drain window before the final shutdown step.
+    /// Drain window given to existing connections after a shutdown signal.
     ///
-    /// After a shutdown signal, existing connections are given this long to complete
-    /// before the final runtime-shutdown step begins.
-    /// Accepts human-readable durations: `30s`, `1m`, `1m30s`. Set to `0s` to disable.
-    /// Maps to Pingora's `grace_period_seconds`.
+    /// Accepts human-readable durations: `30s`, `1m`, `1m30s`. Default `30s`;
+    /// `0s` disables.
     #[arg(
         long,
         env = "COXSWAIN_PROXY_SHUTDOWN_GRACE_PERIOD",
@@ -267,10 +254,9 @@ pub(crate) struct ProxyArgs {
     )]
     pub proxy_shutdown_grace_period: Duration,
 
-    /// Hard deadline for the final runtime-shutdown step after the grace period expires.
+    /// Hard deadline for the final shutdown step after the grace period expires.
     ///
-    /// Accepts human-readable durations: `5s`, `10s`. Set to `0s` to disable.
-    /// Maps to Pingora's `graceful_shutdown_timeout_seconds`.
+    /// Accepts human-readable durations: `5s`, `10s`. Default `5s`; `0s` disables.
     #[arg(
         long,
         env = "COXSWAIN_PROXY_SHUTDOWN_TIMEOUT",
@@ -279,22 +265,15 @@ pub(crate) struct ProxyArgs {
     )]
     pub proxy_shutdown_timeout: Duration,
 
-    /// Time budget for draining in-flight connections when a listener is
-    /// added or removed at runtime.
+    /// Time budget for draining in-flight connections when a listener is added
+    /// or removed at runtime.
     ///
-    /// When a Gateway listener is removed, the acceptor stops accepting new
-    /// connections on that port and waits up to this long for all in-flight
-    /// requests to complete.  If any connections remain after the timeout,
-    /// they are force-closed (TCP abort), the
-    /// `coxswain_proxy_requests_force_closed_total` counter is incremented,
-    /// and a `WARN` log is emitted.
-    ///
-    /// Distinct from `--proxy-shutdown-grace-period`, which controls the
-    /// whole-process shutdown window on SIGTERM/SIGQUIT.
-    ///
-    /// Accepts human-readable durations: `30s`, `1m`. Set to `0s` to
-    /// force-close immediately on listener removal (not recommended for
-    /// production).
+    /// Connections still open after the timeout are force-closed (TCP abort),
+    /// counted in `coxswain_proxy_requests_force_closed_total`, and logged at
+    /// `WARN`. Distinct from `--proxy-shutdown-grace-period`, which covers
+    /// whole-process shutdown on SIGTERM/SIGQUIT. Accepts human-readable
+    /// durations: `30s`, `1m`. `0s` force-closes immediately on listener removal
+    /// (not recommended for production).
     #[arg(
         long,
         env = "COXSWAIN_PROXY_LISTENER_DRAIN_TIMEOUT",
@@ -303,12 +282,12 @@ pub(crate) struct ProxyArgs {
     )]
     pub proxy_listener_drain_timeout: Duration,
 
-    /// Maximum number of idle upstream connections held in Pingora's keepalive pool.
+    /// Maximum idle upstream connections held in the keepalive pool (LRU-evicted).
     ///
-    /// Connections beyond this limit are evicted on an LRU basis. Raise when upstream
-    /// services have many distinct hosts or ports and you observe high connection
-    /// establishment rates in `coxswain_proxy_upstream_connections_total{state="new"}`.
-    /// Lowering saves file descriptors at the cost of more reconnects.
+    /// Raise when upstreams span many distinct hosts or ports and
+    /// `coxswain_proxy_upstream_connections_total{state="new"}` shows a high
+    /// connection-establishment rate. Lowering saves file descriptors at the
+    /// cost of more reconnects.
     #[arg(
         long,
         env = "COXSWAIN_PROXY_UPSTREAM_KEEPALIVE_POOL_SIZE",
@@ -318,20 +297,17 @@ pub(crate) struct ProxyArgs {
 
     /// IP address to bind all proxy listeners to.
     ///
-    /// Shared by both HTTP and HTTPS listeners; combine with
-    /// `--ingress-http-port` and/or `--ingress-https-port` (on `CommonArgs`)
-    /// to form the full bind address for each listener. The health and admin
-    /// servers bind separately via `--management-bind-address`.
+    /// Shared by the HTTP and HTTPS listeners; combine with
+    /// `--ingress-http-port` and/or `--ingress-https-port` to form each
+    /// listener's full bind address. The health and admin servers bind
+    /// separately via `--management-bind-address`.
     #[arg(long, env = "COXSWAIN_PROXY_BIND_ADDRESS", default_value = "0.0.0.0")]
     pub proxy_bind_address: IpAddr,
 
     /// Timeout for dialling a TLS passthrough backend.
     ///
-    /// When a TLS-passthrough connection matches a TLSRoute, the proxy opens a
-    /// TCP connection to the selected backend within this window.  If the
-    /// backend does not accept within the timeout the client connection is closed.
-    ///
-    /// Accepts human-readable durations: `5s`, `30s`.
+    /// If the backend does not accept the connection within this window, the
+    /// client connection is closed. Accepts human-readable durations: `5s`, `30s`.
     #[arg(
         long,
         env = "COXSWAIN_PROXY_TLS_PASSTHROUGH_DIAL_TIMEOUT",
@@ -340,23 +316,12 @@ pub(crate) struct ProxyArgs {
     )]
     pub proxy_tls_passthrough_dial_timeout: Duration,
 
-    /// Idle timeout for a UDPRoute session (#506).
+    /// Idle timeout for a UDPRoute session (a client 5-tuple pinned to a backend).
     ///
-    /// Not a connect timeout — UDP `connect()` is a local operation with no
-    /// handshake. A UDPRoute session is a client 5-tuple pinned to a backend;
-    /// this bounds how long that pin and its reply-forwarding task stay alive
-    /// between datagrams before the proxy evicts it (the next datagram from
-    /// that client re-selects a backend as a fresh session).
-    ///
-    /// Kept short by default: a session's server-side lifetime is decoupled
-    /// from how fast its exchange actually completes (UDP has no protocol-level
-    /// "done" signal), so it always lingers for the full timeout even after a
-    /// one-shot request/response (DNS-shaped) has already finished. A long
-    /// default compounds badly under bursty short-lived traffic — thousands of
-    /// completed-but-still-lingering sessions can exhaust the per-listener
-    /// session table in seconds.
-    ///
-    /// Accepts human-readable durations: `5s`, `30s`.
+    /// Bounds how long that pin stays alive between datagrams; the next datagram
+    /// starts a fresh session and re-selects a backend. Default `10s` — a
+    /// session always lingers for the full timeout, so a long value can exhaust
+    /// the per-listener session table under bursty traffic. Accepts `5s`, `30s`.
     #[arg(
         long,
         env = "COXSWAIN_PROXY_UDP_SESSION_TIMEOUT",
@@ -365,20 +330,14 @@ pub(crate) struct ProxyArgs {
     )]
     pub proxy_udp_session_timeout: Duration,
 
-    /// Enable HAProxy PROXY protocol v1/v2 on **Ingress** listeners.
+    /// Require the HAProxy PROXY protocol v1/v2 on **Ingress** listeners.
     ///
-    /// When set, every connection accepted on the Ingress HTTP/HTTPS ports
-    /// (from `--ingress-http-port` / `--ingress-https-port`) MUST carry a valid
-    /// PROXY v1 or v2 header. Connections from sources not listed in
-    /// `--ingress-proxy-trusted-sources` are dropped immediately. Connections
-    /// that omit or malform the header are also dropped (strict mode).
-    ///
-    /// This flag applies **only** to Ingress-origin listeners. For Gateway API
-    /// listeners, use a `ClientTrafficPolicy` CRD targeting the desired
-    /// listener (or Gateway) instead.
-    ///
-    /// The real client address extracted from the PROXY header is propagated
-    /// upstream via the RFC 7239 `Forwarded` header.
+    /// Every connection on the Ingress HTTP/HTTPS ports must then carry a valid
+    /// PROXY v1 or v2 header; connections that omit or malform it, or come from
+    /// a source not in `--ingress-proxy-trusted-sources`, are dropped. The
+    /// client address it carries is propagated upstream in the RFC 7239
+    /// `Forwarded` header. Gateway API listeners are unaffected — they use a
+    /// `ClientTrafficPolicy` CRD instead.
     #[arg(
         long,
         env = "COXSWAIN_INGRESS_ACCEPT_PROXY_PROTOCOL",
@@ -388,9 +347,8 @@ pub(crate) struct ProxyArgs {
 
     /// Comma-separated CIDR ranges permitted to send PROXY headers on Ingress listeners.
     ///
-    /// Only meaningful when `--ingress-accept-proxy-protocol` is set. Connections
-    /// from addresses outside this list are rejected at the TCP level.
-    ///
+    /// Only meaningful with `--ingress-accept-proxy-protocol`. Connections from
+    /// addresses outside this list are rejected at the TCP level.
     /// Example: `10.0.0.0/8,172.16.0.0/12,127.0.0.1/32`
     #[arg(
         long,
@@ -401,9 +359,9 @@ pub(crate) struct ProxyArgs {
 
     /// Global default for the total request timeout (client → proxy → upstream → client).
     ///
-    /// Applied to routes that do not set `HTTPRouteRule.timeouts.request`. A route-level
-    /// setting always overrides this value.
-    /// Accepts human-readable durations: `30s`, `1m`, `1m30s`. Omit to disable.
+    /// Applies to routes that do not set `HTTPRouteRule.timeouts.request`, which
+    /// always overrides it. Accepts human-readable durations: `30s`, `1m`,
+    /// `1m30s`. Omit to disable.
     #[arg(
         long,
         env = "COXSWAIN_PROXY_DEFAULT_REQUEST_TIMEOUT",
@@ -413,8 +371,8 @@ pub(crate) struct ProxyArgs {
 
     /// Global default for the upstream-only (backend) request timeout.
     ///
-    /// Applied to routes that do not set `HTTPRouteRule.timeouts.backendRequest`. A
-    /// route-level setting always overrides this value.
+    /// Applies to routes that do not set
+    /// `HTTPRouteRule.timeouts.backendRequest`, which always overrides it.
     /// Accepts human-readable durations: `10s`, `500ms`. Omit to disable.
     #[arg(
         long,
@@ -423,27 +381,21 @@ pub(crate) struct ProxyArgs {
     )]
     pub proxy_default_backend_request_timeout: Option<Duration>,
 
-    /// Controller-wide default backend for Ingress traffic that does not match any rule.
+    /// Controller-wide default backend for Ingress traffic that matches no rule.
     ///
     /// Format: `<namespace>/<service>:<port>` — e.g. `default/my-404-page:80`.
-    ///
-    /// When set, requests to hosts with no matching path (and requests to entirely
-    /// unknown hosts) are forwarded to this service. A per-Ingress `spec.defaultBackend`
-    /// always overrides this setting within that Ingress's rule hosts.
-    ///
-    /// The backing service is re-resolved on every routing-table rebuild; the default
-    /// disappears automatically if its endpoints become unavailable and reappears when
+    /// Unmatched paths and entirely unknown hosts go here; a per-Ingress
+    /// `spec.defaultBackend` overrides it within that Ingress's rule hosts. The
+    /// default drops out while the service has no endpoints and returns when
     /// they recover.
     #[arg(long, env = "COXSWAIN_INGRESS_DEFAULT_BACKEND")]
     pub ingress_default_backend: Option<IngressDefaultBackend>,
 
-    /// Enable per-request access logging.
+    /// Enable per-request access logging (default `true`).
     ///
-    /// When `true` (default), one structured log event is emitted per request at
-    /// `INFO` level on the `coxswain_proxy::access` target. Set to `false` to
-    /// silence access logs entirely (useful for high-traffic benchmarking).
-    ///
-    /// Individual fields can be suppressed or transformed with `--access-log-path-mode`.
+    /// Emits one structured `INFO` event per request on the
+    /// `coxswain_proxy::access` target. Set `false` to silence access logs
+    /// entirely; use `--access-log-path-mode` to trim the `path` field instead.
     #[arg(
         long,
         env = "COXSWAIN_ACCESS_LOG",
@@ -452,14 +404,12 @@ pub(crate) struct ProxyArgs {
     )]
     pub access_log: bool,
 
-    /// Controls what the access log records in the `path` field.
+    /// What the access log records in the `path` field: `full`, `pattern`, or `none`.
     ///
-    /// `full` (default): the concrete request path. `pattern`: the matched
+    /// `full` (default) is the concrete request path; `pattern` is the matched
     /// rule's registered path pattern — e.g. `/users/` instead of
-    /// `/users/42/orders/7`. `none`: the field is omitted entirely.
-    ///
-    /// Prefer pipeline-side redaction when your log collector supports it.
-    /// Use `pattern` or `none` only when the pipeline cannot filter.
+    /// `/users/42/orders/7`; `none` omits the field. Prefer pipeline-side
+    /// redaction when your log collector supports it.
     #[arg(long, env = "COXSWAIN_ACCESS_LOG_PATH_MODE", default_value = "full")]
     pub access_log_path_mode: AccessLogPathMode,
 }
@@ -500,6 +450,30 @@ fn parse_label_selector(s: &str) -> Result<BTreeMap<String, String>, String> {
 /// Returns the `serde_json` parse error message for malformed JSON.
 fn parse_json(s: &str) -> Result<serde_json::Value, String> {
     serde_json::from_str(s).map_err(|e| format!("invalid pod-template JSON: {e}"))
+}
+
+/// The `--admin-fence-extra-ingress` peer list (#670).
+///
+/// A newtype rather than a bare `Vec<NetworkPolicyPeer>` because clap infers a
+/// `Vec<T>` field as a *multi-value* argument and downcasts each occurrence to
+/// `T`. This flag takes one JSON array as a single value, so the parser returns
+/// `T = NetworkPolicyPeers`. Declaring the bare `Vec` compiles and renders
+/// correct `--help`, then panics on every parse — a runtime-only failure the
+/// `args` tests caught.
+#[derive(Clone, Debug)]
+pub(crate) struct NetworkPolicyPeers(pub Vec<NetworkPolicyPeer>);
+
+/// Parse the `--admin-fence-extra-ingress` value into [`NetworkPolicyPeers`] (#670).
+///
+/// Parsed into the typed Kubernetes objects here, at startup, rather than
+/// carried as opaque JSON to the render path: a malformed peer would otherwise
+/// surface as a policy that quietly fails to admit the scraper it names, which
+/// looks identical to a CNI problem. Failing the pod's startup instead makes the
+/// misconfiguration unmissable.
+fn parse_network_policy_peers(s: &str) -> Result<NetworkPolicyPeers, String> {
+    serde_json::from_str(s)
+        .map(NetworkPolicyPeers)
+        .map_err(|e| format!("invalid admin-fence extra-ingress JSON: {e}"))
 }
 
 /// Parse the `--shared-vip-service-type` value into a [`ServiceType`] (#472).
@@ -551,29 +525,61 @@ pub(crate) struct ControllerArgs {
     )]
     pub controller_lease_renew_interval: Duration,
 
-    /// External address written to every owned `Ingress.status.loadBalancer.ingress[0]`
-    /// and `Gateway.status.addresses[0]`.
+    /// External address written to every owned
+    /// `Ingress.status.loadBalancer.ingress[0]` and `Gateway.status.addresses[0]`.
     ///
-    /// Accepts either a bare IP (`203.0.113.1`) or a DNS hostname
-    /// (`coxswain.example.com`). IP values are written to `.ip`;
-    /// hostname values are written to `.hostname`.
-    ///
-    /// Required for cert-manager HTTP-01 challenge resolution and
-    /// external-dns DNS record creation. When omitted, status is
-    /// not patched (backward-compatible default).
+    /// Accepts a bare IP (`203.0.113.1`), written to `.ip`, or a DNS hostname
+    /// (`coxswain.example.com`), written to `.hostname`. Required for
+    /// cert-manager HTTP-01 challenge resolution and external-dns record
+    /// creation. When omitted, the address is not patched.
     #[arg(long, env = "COXSWAIN_STATUS_ADDRESS")]
     pub status_address: Option<String>,
 
-    /// Label selector targeting the shared proxy pod, used as the `selector` of
-    /// every per-Gateway shared-mode VIP Service (#472).
+    /// Restrict the admin port of every provisioned pod (shared pool, dedicated
+    /// proxies, relays) to callers in the pod's own namespace, via a `NetworkPolicy`.
     ///
-    /// Comma-separated `key=value` pairs. The Helm chart supplies the install's
-    /// selector — typically
-    /// `app.kubernetes.io/name=coxswain,app.kubernetes.io/instance=<release>,app.kubernetes.io/component=shared-proxy`
-    /// — because the controller cannot derive the release name
-    /// (`app.kubernetes.io/instance`) itself. Empty (the default) disables
-    /// shared-mode per-Gateway addressing, leaving Gateways on the fixed shared
-    /// listeners (Ingress-style); set it to enable cross-Gateway isolation.
+    /// On by default; all other ports stay reachable from anywhere. Set `false`
+    /// to leave the admin port open and remove any policy already applied.
+    #[arg(
+        long,
+        env = "COXSWAIN_ADMIN_FENCE_ENABLED",
+        default_value_t = true,
+        action = clap::ArgAction::Set,
+    )]
+    pub admin_fence_enabled: bool,
+
+    /// Additional callers to allow through the admin-port restriction, as a JSON
+    /// array of Kubernetes `NetworkPolicyPeer` objects.
+    ///
+    /// Needed to let a Prometheus in another namespace scrape `/metrics`, e.g.
+    /// `[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}}]`.
+    #[arg(
+        long,
+        env = "COXSWAIN_ADMIN_FENCE_EXTRA_INGRESS",
+        default_value = "[]",
+        value_parser = parse_network_policy_peers,
+    )]
+    pub admin_fence_extra_ingress: NetworkPolicyPeers,
+
+    /// Require HTTP Basic auth on the admin port, from a `Secret` of this name
+    /// in the pod's namespace.
+    ///
+    /// The Secret holds one bcrypt htpasswd line (`htpasswd -nbB <user> <pass>`)
+    /// under the key `auth`. It is re-read every 30s, so rotating the credential
+    /// needs no restart. Covers the whole admin listener including `/metrics`;
+    /// the health port is unaffected. A missing or unusable Secret returns 503
+    /// rather than serving the surface unauthenticated. Unset = no auth.
+    #[arg(long, env = "COXSWAIN_ADMIN_BASIC_AUTH_SECRET")]
+    pub admin_basic_auth_secret: Option<String>,
+
+    /// Label selector targeting the shared proxy pod, used as the `selector` of
+    /// every per-Gateway shared-mode VIP Service.
+    ///
+    /// Comma-separated `key=value` pairs, normally supplied by the Helm chart, e.g.
+    /// `app.kubernetes.io/name=coxswain,app.kubernetes.io/instance=<release>,app.kubernetes.io/component=shared-proxy`.
+    /// Empty (the default) disables shared-mode per-Gateway addressing, leaving
+    /// Gateways on the fixed shared listeners; set it to enable cross-Gateway
+    /// isolation.
     #[arg(
         long,
         env = "COXSWAIN_SHARED_PROXY_SELECTOR",
@@ -582,11 +588,11 @@ pub(crate) struct ControllerArgs {
     )]
     pub shared_proxy_selector: BTreeMap<String, String>,
 
-    /// Service type for the per-Gateway shared-mode VIP Services (#472).
+    /// Service type for the per-Gateway shared-mode VIP Services.
     ///
     /// `LoadBalancer` (default) gives each Gateway its own external address;
     /// `ClusterIP` gives a stable in-cluster address for on-prem or test
-    /// clusters. `NodePort` is rejected — see [`parse_service_type`].
+    /// clusters. `NodePort` is rejected.
     #[arg(
         long,
         env = "COXSWAIN_SHARED_VIP_SERVICE_TYPE",
@@ -601,11 +607,10 @@ pub(crate) struct ControllerArgs {
     // values; the controller renders them onto the pool's pod. Ports, ingress /
     // gateway-api enablement, and the discovery bootstrap material come from the
     // controller's own `CommonArgs` (shared install-wide), not from here.
-    /// Provision the controller-owned shared proxy pool (#604).
+    /// Provision the controller-owned shared proxy pool (default `true`).
     ///
-    /// `true` (default) provisions the base data plane at install. `false` leaves
-    /// it unprovisioned (as does an empty `--shared-proxy-selector`, an
-    /// Ingress-only / test install).
+    /// `false` leaves it unprovisioned, as does an empty
+    /// `--shared-proxy-selector`.
     #[arg(
         long,
         env = "COXSWAIN_SHARED_PROXY_ENABLED",
@@ -614,9 +619,8 @@ pub(crate) struct ControllerArgs {
     )]
     pub shared_proxy_enabled: bool,
 
-    /// Name of the shared proxy Deployment / ServiceAccount / HPA / PDB (and the
-    /// stem of the internal Service, `<name>-internal`). Chart-supplied, release
-    /// prefixed.
+    /// Name of the shared proxy Deployment / ServiceAccount / HPA / PDB, and the
+    /// stem of its internal Service (`<name>-internal`).
     #[arg(
         long,
         env = "COXSWAIN_SHARED_PROXY_NAME",
@@ -783,11 +787,12 @@ pub(crate) struct ControllerArgs {
     )]
     pub shared_proxy_access_log_path_mode: AccessLogPathMode,
 
-    /// Partial `PodTemplateSpec` (JSON) strategic-merged onto the shared pool pod:
-    /// scheduling (nodeSelector/tolerations/affinity/topologySpreadConstraints/
-    /// priorityClassName), pod labels/annotations, and image pull secrets. The
-    /// chart builds it from `proxy.shared.*`. Controller-managed fields (SA,
-    /// security context, discovery volumes, coxswain container) survive the merge.
+    /// Partial `PodTemplateSpec` (JSON) strategic-merged onto the shared pool pod.
+    ///
+    /// Carries scheduling (nodeSelector, tolerations, affinity,
+    /// topologySpreadConstraints, priorityClassName), pod labels/annotations, and
+    /// image pull secrets. Controller-managed fields (ServiceAccount, security
+    /// context, discovery volumes, coxswain container) survive the merge.
     #[arg(
         long,
         env = "COXSWAIN_SHARED_PROXY_POD_TEMPLATE",
@@ -795,25 +800,21 @@ pub(crate) struct ControllerArgs {
     )]
     pub shared_proxy_pod_template: Option<serde_json::Value>,
 
-    /// Port the discovery gRPC server binds to.
+    /// Port the discovery gRPC server binds to, pushing routing snapshots to
+    /// proxies and relays.
     ///
-    /// Serves the `Discovery.Stream` RPC that pushes routing snapshots to proxies
-    /// and relays. The listener binds on every replica, but the stream is
-    /// leader-only: a standby replica rejects a subscribe with `FAILED_PRECONDITION`,
-    /// and the leader-selecting `coxswain-controller-discovery` Service routes
-    /// stream traffic only to the current leader.
-    ///
-    /// The bind address is controlled by `--management-bind-address`.
+    /// The listener binds on every replica but only the leader serves the
+    /// stream; a standby rejects a subscribe with `FAILED_PRECONDITION`. The
+    /// bind address is controlled by `--management-bind-address`.
     #[arg(long, env = "COXSWAIN_DISCOVERY_PORT", default_value_t = RELAY_DISCOVERY_PORT)]
     pub discovery_port: u16,
 
     /// Port the bootstrap gRPC server binds to.
     ///
-    /// Fresh proxies with no SVID connect here to exchange a Kubernetes
-    /// ServiceAccount token + CSR for a short-lived SVID.  Uses server-auth-only
-    /// TLS (no client cert required on this port).
-    ///
-    /// The bind address is controlled by `--management-bind-address`.
+    /// Proxies and relays with no SVID connect here to exchange a Kubernetes
+    /// ServiceAccount token plus a CSR for a short-lived SVID. Server-auth-only
+    /// TLS — no client cert required on this port. The bind address is
+    /// controlled by `--management-bind-address`.
     #[arg(
         long,
         env = "COXSWAIN_DISCOVERY_BOOTSTRAP_PORT",
@@ -866,66 +867,40 @@ pub(crate) struct ControllerArgs {
     )]
     pub discovery_trust_domain: String,
 
-    /// Enable the discovery relay tier (#584, #605).
+    /// Enable the discovery relay tier (on by default).
     ///
-    /// **On by default (opt-out).** When enabled, the controller demand-drives the
-    /// whole relay tier: a single shared-pool relay in front of the shared proxy
-    /// pool, and a per-namespace relay in front of each namespace's dedicated
-    /// proxies — each provisioned only once its scope crosses the break-even
-    /// threshold (`--relay-min-proxy-replicas`), so an on-by-default install below
-    /// threshold provisions nothing and is byte-identical to a relay-free one.
-    /// Downstream proxies then subscribe for routing snapshots through the relay
-    /// instead of directly to the controller, so the leader fans out one stream per
-    /// relay rather than one per proxy replica. Set `--relay-enabled=false` to opt
-    /// out entirely. The controller authorizes a dedicated relay's `Namespace`
-    /// subscribe only for the SA it provisioned (provenance, deny-by-default); a
-    /// shared relay's `SharedPool` subscribe carries the shared world, which is not
-    /// tenant-scoped.
+    /// A relay subscribes to the controller once and fans routing snapshots out
+    /// to the proxies behind it, so the leader serves one stream per relay
+    /// instead of one per proxy replica. Relays are provisioned only once their
+    /// scope crosses `--relay-min-proxy-replicas`, so an install below that
+    /// threshold provisions none. Set `false` to opt out entirely.
     #[arg(long, env = "COXSWAIN_RELAY_ENABLED", default_value_t = true)]
     pub relay_enabled: bool,
 
-    /// Replica count for each provisioned namespace relay (#584).
+    /// Replica count for each provisioned namespace relay. Default 2 (HA).
     ///
-    /// Only meaningful with `--relay-enabled`. Default 2 (HA): at replica 1 a
-    /// relay restart drops the streams of every leaf behind it until it returns,
-    /// so production keeps ≥2; a small cluster that enables tiering but wants a
-    /// single pod sets `--relay-replicas=1`. Values below 1 are clamped to 1 —
-    /// per-namespace scale-to-0 is governed by `--relay-min-proxy-replicas`,
-    /// not this flag.
+    /// At 1 replica, a relay restart drops the streams of every proxy behind it
+    /// until it returns, so production should keep ≥2. Values below 1 are
+    /// clamped to 1; scale-to-zero is governed by `--relay-min-proxy-replicas`,
+    /// not this flag. Only meaningful with `--relay-enabled`.
     #[arg(long, env = "COXSWAIN_RELAY_REPLICAS", default_value_t = 2)]
     pub relay_replicas: u32,
 
-    /// Minimum downstream demand before a namespace gets its own relay (#584).
+    /// Minimum downstream demand before a namespace gets its own relay. Default 8.
     ///
-    /// A relay is provisioned for a namespace only once its *desired* dedicated-
-    /// proxy replica count (summed across that namespace's dedicated Gateways)
-    /// reaches this value; below it, the namespace's proxies subscribe directly to
-    /// the controller (a relay is scaled to zero). This is a break-even control:
-    /// each relay replica opens its own upstream stream to the leader, so a relay
-    /// only *reduces* leader load when it fronts more downstream streams than it
-    /// costs (`--relay-replicas`). The default (8) keeps relays off small and
-    /// medium namespaces — the tier earns its extra hop and pods only at fan-out
-    /// scale. Only meaningful with `--relay-enabled`.
+    /// A namespace gets a relay only once its desired dedicated-proxy replica
+    /// count (summed across that namespace's dedicated Gateways) reaches this
+    /// value; below it, those proxies subscribe directly to the controller.
+    /// Raise it to keep relays off namespaces too small to pay for the extra
+    /// hop, lower it to tier sooner. Only meaningful with `--relay-enabled`.
     #[arg(long, env = "COXSWAIN_RELAY_MIN_PROXY_REPLICAS", default_value_t = 8)]
     pub relay_min_proxy_replicas: u32,
 
-    /// Capacity ratio: downstream dedicated proxies per relay replica the sizing
-    /// loop targets (#602).
+    /// Downstream dedicated proxies each relay replica should front. Default 250.
     ///
-    /// **Decoupled from** the break-even `--relay-min-proxy-replicas`: that gate
-    /// answers "is a relay worth existing?", this answers "how many subscribers can
-    /// one replica front?". A relay is a fan-out cache (one upstream stream in,
-    /// broadcast to N subscribers), so real per-replica capacity is O(100s), bounded
-    /// by egress/serialization and failover blast radius — not the break-even
-    /// number. An autoscaled relay (`CoxswainRelayPolicy` with a capped
-    /// `RelayAutoscaling`) runs `clamp(ceil(live_subscribers / this), min, max)`.
-    /// Default 250 — measured (#603: `cargo bench -p coxswain-discovery --bench
-    /// relay_fanout`), superseding #602's provisional 50. At 250 subscribers a
-    /// relay replica holds under one CPU core and p99 fan-out latency stays under
-    /// 20ms even at a sustained 10 changes/sec; both climb roughly linearly past
-    /// that point (500 crosses one core, 1000 needs ~two) rather than at a sharp
-    /// knee, so 250 is picked with headroom below the observed range rather than
-    /// at its edge — conservative relative to failover blast radius. Per-namespace
+    /// An autoscaled relay (`CoxswainRelayPolicy` with `RelayAutoscaling`) runs
+    /// `clamp(ceil(live_subscribers / this), min, max)`. Lower it to shrink a
+    /// failover's blast radius, raise it to run fewer relay pods. Per-namespace
     /// override: `RelayAutoscaling.targetProxiesPerReplica`.
     #[arg(
         long,
@@ -934,32 +909,23 @@ pub(crate) struct ControllerArgs {
     )]
     pub relay_target_proxies_per_replica: u32,
 
-    /// Autoscaling ceiling for the **shared-pool** relay (#605).
+    /// Autoscaling ceiling for the **shared-pool** relay. Default 10.
     ///
-    /// The shared relay fronts the whole (traffic-HPA'd) shared proxy pool and,
-    /// unlike a namespace relay, has no `CoxswainRelayPolicy`, so it autoscales
-    /// directly off the flags:
+    /// The shared relay autoscales straight off the flags:
     /// `clamp(ceil(pool-replicas / --relay-target-proxies-per-replica),
-    /// --relay-replicas, this)`. This is the mandatory cap on the upstream streams
-    /// the shared relay opens against the leader — keep it well below the pool's
-    /// replica count divided by the capacity ratio, or the relay's own streams
-    /// approach the count it is meant to collapse. Does not affect the dedicated
-    /// tier (which caps via `RelayAutoscaling.maxReplicas`). Only meaningful with
-    /// `--relay-enabled`.
+    /// --relay-replicas, this)`. Keep it well below the pool replica count
+    /// divided by the capacity ratio. The dedicated tier caps via
+    /// `RelayAutoscaling.maxReplicas` instead. Only with `--relay-enabled`.
     #[arg(long, env = "COXSWAIN_RELAY_MAX_REPLICAS", default_value_t = 10)]
     pub relay_max_replicas: u32,
 
-    /// Deactivation cooldown for a namespace relay (#602).
+    /// Deactivation cooldown for a namespace relay. Default `300s`.
     ///
-    /// Once the namespace's live dedicated-proxy subscriber count falls below the
-    /// break-even threshold (`--relay-min-proxy-replicas`), the relay is torn down
-    /// only after the signal has stayed below it continuously for this long — the
-    /// KEDA-style hysteresis that replaces the old keep-until-fully-drained rule. A
-    /// namespace that genuinely drains (no dedicated Gateways left) tears down at
-    /// once; a transient 0 while Gateways remain (relay restart / control-stream
-    /// reconnect) waits the cooldown, so a blip never deletes a live relay.
-    /// Per-namespace override: `RelayAutoscaling.cooldownSeconds`. Only meaningful
-    /// with `--relay-enabled`.
+    /// Once the namespace's live subscriber count falls below
+    /// `--relay-min-proxy-replicas`, the relay is torn down only after it has
+    /// stayed below continuously for this long, so a restart blip never deletes
+    /// a live relay. A namespace with no dedicated Gateways left tears down at
+    /// once. Per-namespace override: `RelayAutoscaling.cooldownSeconds`.
     #[arg(
         long,
         env = "COXSWAIN_RELAY_COOLDOWN",
@@ -968,12 +934,12 @@ pub(crate) struct ControllerArgs {
     )]
     pub relay_cooldown: Duration,
 
-    /// Scale-down stabilization window for an autoscaled namespace relay (#602).
+    /// Scale-down stabilization window for an autoscaled namespace relay. Default `300s`.
     ///
     /// When scaling **down**, the loop sizes on the **maximum** subscriber count
-    /// observed over this trailing window, so a brief dip does not immediately shed a
-    /// replica (scale-**up** is not damped — a relay grows promptly under load).
-    /// Per-namespace override: `RelayAutoscaling.scaleDownStabilizationSeconds`.
+    /// observed over this trailing window, so a brief dip does not shed a
+    /// replica. Scale-**up** is not damped. Per-namespace override:
+    /// `RelayAutoscaling.scaleDownStabilizationSeconds`.
     #[arg(
         long,
         env = "COXSWAIN_RELAY_SCALE_DOWN_STABILIZATION",
@@ -982,43 +948,40 @@ pub(crate) struct ControllerArgs {
     )]
     pub relay_scale_down_stabilization: Duration,
 
-    /// Relative sizing deadband for an autoscaled namespace relay (#602).
+    /// Relative sizing deadband for an autoscaled namespace relay. Default `0.10`.
     ///
-    /// The loop changes the replica count only when the usage ratio
-    /// (`live_subscribers / (current_replicas × target)`) deviates from 1.0 by more
-    /// than this fraction — a `0.10` tolerance ignores load within ±10% of target, so
-    /// small jitter does not churn the Deployment. Per-namespace override:
-    /// `RelayAutoscaling.tolerance`.
+    /// The replica count changes only when the usage ratio
+    /// (`live_subscribers / (current_replicas × target)`) deviates from 1.0 by
+    /// more than this fraction, so `0.10` ignores load within ±10% of target.
+    /// Per-namespace override: `RelayAutoscaling.tolerance`.
     #[arg(long, env = "COXSWAIN_RELAY_TOLERANCE", default_value_t = 0.10)]
     pub relay_tolerance: f64,
 
-    /// CPU **request** for each provisioned namespace relay container (#584).
+    /// CPU **request** for each provisioned namespace relay container.
     ///
-    /// A relay is otherwise BestEffort (no requests) — unschedulable-priority and
-    /// first to be evicted. A request only, no CPU limit, is deliberate: a CPU
-    /// limit would throttle the delta-fan-out path. Empty omits the request.
-    /// Per-namespace overrides land with `CoxswainRelayPolicy` (v0.6).
+    /// Empty omits the request, leaving the relay BestEffort and first to be
+    /// evicted. No CPU limit is set either way — throttling the fan-out path
+    /// would stall routing convergence.
     #[arg(long, env = "COXSWAIN_RELAY_CPU_REQUEST", default_value = "50m")]
     pub relay_cpu_request: String,
 
-    /// Memory **request** for each provisioned namespace relay container (#584).
-    /// Empty omits it. See [`Self::relay_cpu_request`].
+    /// Memory **request** for each provisioned namespace relay container.
+    /// Empty omits it.
     #[arg(long, env = "COXSWAIN_RELAY_MEMORY_REQUEST", default_value = "64Mi")]
     pub relay_memory_request: String,
 
-    /// Memory **limit** for each provisioned namespace relay container (#584).
+    /// Memory **limit** for each provisioned namespace relay container.
     ///
-    /// Memory is the OOM risk (the relay caches the namespace's routing world +
-    /// per-leaf delta baselines), so it carries a limit to protect the node.
-    /// Empty omits it. See [`Self::relay_cpu_request`].
+    /// A relay caches the namespace's routing world plus per-proxy delta
+    /// baselines, so raise this for namespaces with many Gateways or proxies.
+    /// Empty omits the limit.
     #[arg(long, env = "COXSWAIN_RELAY_MEMORY_LIMIT", default_value = "256Mi")]
     pub relay_memory_limit: String,
 
-    /// Minimum trailing-edge quiet window for the reconciler's rebuild
-    /// debounce (#512).
+    /// Minimum trailing-edge quiet window for the reconciler's rebuild debounce.
     ///
-    /// A watch event resets this timer; when it elapses with no further
-    /// events, the routing table rebuilds. Governs how fast an isolated
+    /// A watch event resets this timer; the routing table rebuilds when it
+    /// elapses with no further events, so it governs how fast an isolated
     /// resource change converges. Must be at most `--reconcile-debounce-max`.
     #[arg(
         long,
@@ -1028,11 +991,11 @@ pub(crate) struct ControllerArgs {
     )]
     pub reconcile_debounce_min: Duration,
 
-    /// Maximum debounce wait for the reconciler's rebuild loop (#512).
+    /// Maximum debounce wait for the reconciler's rebuild loop.
     ///
-    /// A hard ceiling measured from the first event of a debounce cycle: even
-    /// under continuous churn (e.g. a rolling deploy) that keeps resetting
-    /// `--reconcile-debounce-min`, the routing table rebuilds within this
+    /// A hard ceiling measured from the first event of a debounce cycle: under
+    /// continuous churn (e.g. a rolling deploy) that keeps resetting
+    /// `--reconcile-debounce-min`, the routing table still rebuilds within this
     /// bound. Must be at least `--reconcile-debounce-min`.
     #[arg(
         long,
@@ -1042,24 +1005,16 @@ pub(crate) struct ControllerArgs {
     )]
     pub reconcile_debounce_max: Duration,
 
-    /// Comma-separated CIDR ranges the controller may connect to, beyond the
-    /// public internet, when fetching a tenant-authored
-    /// `JwtAuth.spec.jwks.remote.uri` (#664).
+    /// Comma-separated CIDR ranges the controller may fetch a
+    /// `JwtAuth.spec.jwks.remote.uri` from, beyond the public internet.
     ///
-    /// A tenant with create-rights in their own namespace controls this URL;
-    /// without this flag the controller refuses every reserved/special-purpose
-    /// destination (RFC 1918 private space, loopback, link-local — including
-    /// cloud metadata at `169.254.169.254` — CGNAT, documentation ranges,
-    /// multicast) so a tenant can't turn the privileged controller into an SSRF
-    /// proxy against the cluster network. List a CIDR here to let `remote.uri`
-    /// name an in-cluster identity provider (e.g. its Service ClusterIP range).
-    ///
-    /// A listed CIDR is also the **only** class of destination where a
-    /// plaintext `http://` `remote.uri` is ever accepted (an in-cluster
-    /// provider without TLS) — every other destination, listed or not, must
-    /// use `https://`.
-    ///
-    /// Example: `10.96.0.0/12` (a typical Service CIDR).
+    /// By default every reserved destination is refused (RFC 1918 private space,
+    /// loopback, link-local — including cloud metadata at `169.254.169.254` —
+    /// CGNAT, documentation ranges, multicast). List a CIDR to let `remote.uri`
+    /// name an in-cluster identity provider, e.g. the Service CIDR
+    /// `10.96.0.0/12`. A listed CIDR is also the **only** place a plaintext
+    /// `http://` `remote.uri` is accepted; every other destination must use
+    /// `https://`.
     #[arg(long, env = "COXSWAIN_EGRESS_ALLOW_CIDR", value_delimiter = ',')]
     pub egress_allow_cidr: Vec<IpNet>,
 }
@@ -1119,6 +1074,18 @@ impl ControllerArgs {
                 .as_flag_value()
                 .to_string(),
             pod_template: self.shared_proxy_pod_template.clone(),
+        }
+    }
+
+    /// Build the [`AdminFenceConfig`] the operator carries (#670) from the
+    /// `--admin-fence-*` flags. The peers are already typed
+    /// `NetworkPolicyPeer`s — [`parse_network_policy_peers`] rejects a malformed
+    /// one at startup — so the renderer emits them verbatim.
+    pub(crate) fn admin_fence_config(&self, install_namespace: &str) -> AdminFenceConfig {
+        AdminFenceConfig {
+            enabled: self.admin_fence_enabled,
+            extra_ingress: self.admin_fence_extra_ingress.0.clone(),
+            install_namespace: install_namespace.to_string(),
         }
     }
 
@@ -1227,18 +1194,12 @@ pub(crate) struct ProxyRoleArgs {
 /// env vars, and defaults stay identical across roles.
 #[derive(Args, Debug)]
 pub(crate) struct DiscoveryClientArgs {
-    /// Bootstrap endpoint — the sole endpoint anchor and fallback (#601).
+    /// Bootstrap endpoint this pod fetches its SVID and routing upstream from.
     ///
-    /// Must be an `https://` URI pointing to the controller's bootstrap listener
-    /// (port 50052 by default). Bootstrap is **not** tiered — even a leaf behind a
-    /// relay bootstraps its SVID directly from the controller. The bootstrap
-    /// response also carries this client's current best **routing** upstream
-    /// (`(endpoint, expected_server_sa)`): the relay fronting its scope if one is
-    /// provisioned, else the controller. The client then dials that upstream for
-    /// its mTLS `Stream` — there is no separate stream-endpoint flag. A live
-    /// `PreferredUpstream` directive on the stream repoints it at runtime without
-    /// a pod restart; if the upstream becomes unreachable the client re-bootstraps
-    /// here to re-resolve it (this endpoint is the always-up anchor).
+    /// Must be an `https://` URI pointing at the controller's bootstrap listener
+    /// (port 50052 by default) — even a proxy behind a relay bootstraps from the
+    /// controller. The response also names the upstream for the mTLS routing
+    /// stream, so there is no separate stream-endpoint flag.
     ///
     /// Example: `https://coxswain-controller-discovery.coxswain-system.svc:50052`
     #[arg(long, env = "COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT", required = true)]
@@ -1247,8 +1208,7 @@ pub(crate) struct DiscoveryClientArgs {
     /// Path to the projected ServiceAccount token file.
     ///
     /// The token is sent to the bootstrap listener so the controller can validate
-    /// the node's identity via the Kubernetes TokenReview API.
-    ///
+    /// this pod's identity via the Kubernetes TokenReview API.
     /// Default: `/var/run/secrets/coxswain/discovery-token/token`
     #[arg(
         long,
@@ -1259,10 +1219,9 @@ pub(crate) struct DiscoveryClientArgs {
 
     /// Path to the CA bundle from the trust-bundle ConfigMap mount.
     ///
-    /// Used to verify the upstream server's TLS certificate during bootstrap and
-    /// to build the mTLS channel for `Stream`. A relay reuses the same bundle as
-    /// the client-CA for the downstream proxies it serves.
-    ///
+    /// Verifies the upstream server's TLS certificate during bootstrap and
+    /// builds the mTLS routing-stream channel. A relay reuses the same bundle as
+    /// the client CA for the proxies it serves.
     /// Default: `/var/run/secrets/coxswain/trust-bundle/ca.crt`
     #[arg(
         long,
@@ -1273,9 +1232,8 @@ pub(crate) struct DiscoveryClientArgs {
 
     /// SPIFFE trust domain; must match the controller's `--discovery-trust-domain`.
     ///
-    /// Used to verify the controller's SPIFFE URI SAN during bootstrap and to
-    /// construct the mTLS `Stream` channel's expected server identity from the
-    /// bootstrap-delivered upstream `(endpoint, expected_server_sa)` pointer.
+    /// Verifies the upstream server's SPIFFE URI SAN during bootstrap and on the
+    /// mTLS routing stream.
     #[arg(
         long,
         env = "COXSWAIN_DISCOVERY_TRUST_DOMAIN",
@@ -1335,23 +1293,21 @@ impl ProxyRoleArgs {
     }
 }
 
-/// Arguments accepted by the `relay` role (#583).
+/// Arguments accepted by the `relay` role.
 ///
 /// A relay is a zero-RBAC discovery cache: an upstream discovery **client** and
 /// a downstream discovery **server** in one pod. Exactly one of `--shared`
 /// (front the shared pool) or `--namespace <NS>` (front one namespace's
-/// dedicated Gateways) selects the upstream subscription scope; clap's `scope`
-/// group enforces the choice at parse time.
+/// dedicated Gateways) selects the upstream subscription scope.
 #[derive(Args, Debug)]
 #[command(group(ArgGroup::new("scope").required(true).multiple(false)))]
 pub(crate) struct RelayRoleArgs {
     /// Flags shared by every role.
     #[command(flatten)]
     pub common: CommonArgs,
-    /// Discovery-client flags for the **upstream** subscription (to the
-    /// controller). `--discovery-bootstrap-endpoint` is the sole anchor (#601):
-    /// the relay bootstraps its SVID there and learns its own routing upstream
-    /// (always the controller — relays never tier) from the bootstrap response.
+    /// Discovery-client flags for the **upstream** subscription to the
+    /// controller. A relay always bootstraps and subscribes to the controller
+    /// directly; relays never chain to another relay.
     #[command(flatten)]
     pub discovery: DiscoveryClientArgs,
 
@@ -1360,13 +1316,13 @@ pub(crate) struct RelayRoleArgs {
     pub shared: bool,
 
     /// Front one namespace's dedicated Gateways: subscribe `Namespace{NS}`
-    /// upstream and re-serve each Gateway's world downstream. (Requires the
-    /// controller's provenance authorizer — provisioned relays land in #584.)
+    /// upstream and re-serve each Gateway's world downstream. The controller
+    /// admits only relays it provisioned itself.
     #[arg(long, value_name = "NS", group = "scope")]
     pub namespace: Option<String>,
 
-    /// Port the relay's **downstream** discovery server binds, for leaf proxies
-    /// to subscribe. Mirrors the controller's `--discovery-port`.
+    /// Port the relay's **downstream** discovery server binds, for the proxies
+    /// behind it to subscribe on. Mirrors the controller's `--discovery-port`.
     #[arg(long, env = "COXSWAIN_DISCOVERY_PORT", default_value_t = RELAY_DISCOVERY_PORT)]
     pub discovery_port: u16,
 }
@@ -1877,6 +1833,99 @@ mod tests {
         assert!(
             args.common.disable_ingress,
             "--disable-ingress must be true when flag is set"
+        );
+    }
+
+    /// Parse a controller-role command line and hand back its args.
+    fn controller_args(extra: &[&str]) -> Box<ControllerRoleArgs> {
+        let mut argv = vec!["coxswain", "serve", "controller"];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).expect("controller args parse");
+        let Commands::Serve(serve) = cli.command;
+        let Some(Role::Controller(args)) = serve.role else {
+            panic!("expected controller role");
+        };
+        args
+    }
+
+    #[test]
+    fn admin_fence_defaults_to_enabled_with_no_extra_peers() {
+        // Fencing is opt-out: an install that says nothing must still get the
+        // policy, or the default deployment stays exposed.
+        let fence = controller_args(&[])
+            .controller
+            .admin_fence_config("coxswain-system");
+        assert!(fence.enabled, "the admin fence must default to on");
+        assert!(fence.extra_ingress.is_empty());
+    }
+
+    #[test]
+    fn admin_fence_can_be_disabled() {
+        let fence = controller_args(&["--admin-fence-enabled=false"])
+            .controller
+            .admin_fence_config("coxswain-system");
+        assert!(!fence.enabled);
+    }
+
+    #[test]
+    fn admin_fence_extra_ingress_parses_a_json_peer_array() {
+        // Regression: declaring this field as a bare `Vec<NetworkPolicyPeer>`
+        // compiled, rendered correct `--help`, and then panicked on every parse
+        // — clap infers a `Vec<T>` field as multi-value and downcasts to `T`.
+        // Only an actual parse catches it, so this test is the guard.
+        let fence = controller_args(&[
+            "--admin-fence-extra-ingress",
+            r#"[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}}]"#,
+        ])
+        .controller
+        .admin_fence_config("coxswain-system");
+        assert_eq!(fence.extra_ingress.len(), 1);
+        let selector = fence.extra_ingress[0]
+            .namespace_selector
+            .as_ref()
+            .expect("the peer's namespaceSelector must survive parsing");
+        assert_eq!(
+            selector
+                .match_labels
+                .as_ref()
+                .and_then(|l| l.get("kubernetes.io/metadata.name"))
+                .map(String::as_str),
+            Some("monitoring")
+        );
+    }
+
+    #[test]
+    fn admin_fence_extra_ingress_rejects_malformed_json() {
+        // Fails the pod's startup rather than rendering a policy that silently
+        // omits the scraper it was meant to admit.
+        assert!(
+            Cli::try_parse_from([
+                "coxswain",
+                "serve",
+                "controller",
+                "--admin-fence-extra-ingress",
+                "{not json",
+            ])
+            .is_err(),
+            "a malformed peer list must be rejected at startup"
+        );
+    }
+
+    #[test]
+    fn admin_basic_auth_secret_is_unset_by_default_and_takes_a_name() {
+        assert!(
+            controller_args(&[])
+                .controller
+                .admin_basic_auth_secret
+                .is_none(),
+            "Basic auth is opt-in"
+        );
+        assert_eq!(
+            controller_args(&["--admin-basic-auth-secret", "coxswain-admin-auth"])
+                .controller
+                .admin_basic_auth_secret
+                .as_deref(),
+            Some("coxswain-admin-auth")
         );
     }
 }

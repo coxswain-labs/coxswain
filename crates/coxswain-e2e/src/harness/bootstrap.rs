@@ -326,6 +326,12 @@ pub(crate) struct HelmOverrides {
     /// special-purpose destination, including the in-cluster Service CIDR a
     /// test's own ClusterIP fixture lives in.
     pub egress_allow_cidrs: Vec<String>,
+    /// Passed as `networkPolicy.enabled` (#670): the admin-port fence. `None`
+    /// leaves the chart default (`true`).
+    pub network_policy_enabled: Option<bool>,
+    /// Passed as `adminAuth.secretName` (#670): requires HTTP Basic auth on the
+    /// controller's admin port. `None` leaves the chart default (no auth).
+    pub admin_auth_secret_name: Option<String>,
 }
 
 /// Install or upgrade the coxswain Helm release with e2e-specific overrides.
@@ -463,6 +469,14 @@ pub(crate) async fn helm_install(root: &Path, overrides: &HelmOverrides) -> anyh
             "controller.egressAllowCidrs={{{}}}",
             overrides.egress_allow_cidrs.join("\\,")
         ));
+    }
+    if let Some(enabled) = overrides.network_policy_enabled {
+        args.push("--set".into());
+        args.push(format!("networkPolicy.enabled={enabled}"));
+    }
+    if let Some(secret) = &overrides.admin_auth_secret_name {
+        args.push("--set".into());
+        args.push(format!("adminAuth.secretName={secret}"));
     }
     if let Some(enabled) = overrides.gateway_api_enabled {
         args.push("--set".into());
@@ -725,6 +739,8 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
         relay_target_proxies_per_replica: _,
         watch_namespace: _,
         egress_allow_cidrs: _,
+        network_policy_enabled: _,
+        admin_auth_secret_name: _,
     } = HelmOverrides::default();
     let mut dirty = Vec::new();
     let mut check = |path: &[&str], is_dirty: bool| {
@@ -819,6 +835,14 @@ fn dirty_override_paths(values: &serde_json::Value) -> Vec<String> {
         get(&["controller", "egressAllowCidrs"])
             .and_then(serde_json::Value::as_array)
             .is_some_and(|a| !a.is_empty()),
+    );
+    check(
+        &["networkPolicy", "enabled"],
+        get(&["networkPolicy", "enabled"]).is_some(),
+    );
+    check(
+        &["adminAuth", "secretName"],
+        get(&["adminAuth", "secretName"]).is_some(),
     );
     dirty
 }

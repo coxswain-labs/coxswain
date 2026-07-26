@@ -34,6 +34,34 @@ Rootless mode is enabled: the shared-proxy container binds 8080/8443 and the
 gateway Service maps 80/443 → 8080/8443. CAP_NET_BIND_SERVICE is not required.
 {{- end }}
 
+{{- if .Values.networkPolicy.enabled }}
+
+The admin port ({{ .Values.admin.port }}) is fenced by a NetworkPolicy on every
+coxswain pod: only pods in the same namespace may reach it. On the controller
+that port serves Kubernetes manifests and pod logs, so this keeps it away from
+other tenants. Everything else — the data plane, probes, discovery — is
+unaffected, and `kubectl port-forward` still works.
+
+To let Prometheus scrape from another namespace, add its namespace to
+`networkPolicy.admin.extraIngress`. If your CNI does not enforce NetworkPolicy
+the object is inert; set `networkPolicy.enabled: false` to omit it.
+{{- else }}
+
+WARNING: networkPolicy.enabled is false, so the admin port ({{ .Values.admin.port }})
+is reachable from every pod in the cluster. On the controller that port serves
+verbatim Kubernetes manifests (including Pod environment variables) and pod
+logs. Fence it with your own NetworkPolicy, or set `adminAuth.secretName`.
+{{- end }}
+{{- if .Values.adminAuth.secretName }}
+
+The controller's admin port requires HTTP Basic auth from Secret
+"{{ .Values.adminAuth.secretName }}" (key `auth`, one bcrypt htpasswd line).
+This covers /metrics too, so scrapers need the credential. If the Secret is
+missing or unusable the admin surface returns 503:
+
+  kubectl -n {{ include "coxswain.namespace" . }} get secret {{ .Values.adminAuth.secretName }}
+{{- end }}
+
 The shared-proxy ServiceAccount holds no Kubernetes API access — it exists
 only as a pod identity for mTLS bootstrap. Verify no coxswain RBAC is bound:
 

@@ -171,6 +171,62 @@ Coxswain unconditionally strips `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Pro
 
 The same rule applies to `ext-auth`'s `allowedResponseHeaders`: every configured name is stripped from the client's request before the check runs, regardless of whether the auth service actually echoes it back. A route that allow-lists a header the auth service doesn't always return would otherwise let a client's forged value through untouched on the requests where it isn't returned.
 
+### The admin and management ports
+
+Every Coxswain pod binds two management ports, both on `management.bindAddress` (`0.0.0.0` by default, so kubelet probes and Prometheus scraping work without configuration):
+
+- **Health, `8081`** — `/healthz` and `/readyz`. Carries no cluster data.
+- **Admin, `8082`** — `/metrics` on every role, plus, on the **controller**, the operator UI and the `/api/v1/*` surface: verbatim Kubernetes manifests (`/api/v1/manifests/{kind}/{ns}/{name}`, including Pod `spec.containers[].env`, which frequently holds credentials), Coxswain pod logs, and the full routing topology.
+
+The Kubernetes pod network is flat, so an unfenced admin port is readable by any pod in any namespace. That is a strong reconnaissance and credential-pivot primitive in a multi-tenant cluster, where a tenant in namespace A could otherwise read namespace B's Pod environment. Two controls address it.
+
+**NetworkPolicy (on by default).** Coxswain ships one `NetworkPolicy` per pod set — the controller's from the chart, and one each for the shared pool, every dedicated proxy, and every relay, applied by the controller that owns those Deployments. Each admits the admin port from two places only: pods in the policy's own namespace, and pods in the install namespace. The second is what lets the controller aggregate a dedicated proxy, which runs in its Gateway's namespace rather than alongside the controller. Everything else stays reachable from anywhere: the data plane, kubelet probes, and the mTLS-authenticated discovery ports.
+
+A proxy binds ports that are not knowable when the policy is written — the shared pool allocates one internal port per Gateway listener, and a dedicated proxy binds whatever its Gateway declares. Because a `NetworkPolicy` denies every port it does not name, those policies allow the full port range *except* the admin port, rather than enumerating the data plane. Adding or removing a listener therefore never requires the policy to be rewritten and can never be blocked by a stale one.
+
+To let Prometheus scrape from another namespace, name it explicitly:
+
+```yaml
+networkPolicy:
+  admin:
+    extraIngress:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: monitoring
+```
+
+Set `networkPolicy.enabled: false` on clusters whose CNI does not enforce `NetworkPolicy` (where the object is inert anyway), or if you fence the surface with your own policy. Disabling removes any policy the controller previously applied; it keeps the `networkpolicies` RBAC either way, since the delete verb is exactly what reclaiming them needs.
+
+**Basic auth (opt-in).** A second factor for the controller's admin port, worth enabling whenever the port is reachable beyond the install namespace. Create a Secret holding one bcrypt htpasswd line under the key `auth`:
+
+```bash
+htpasswd -nbB admin 's3cret' > auth
+kubectl create secret generic coxswain-admin-auth \
+  --namespace coxswain-system --from-file=auth
+rm auth
+```
+
+```yaml
+adminAuth:
+  secretName: coxswain-admin-auth
+```
+
+Only the Secret's *name* reaches the controller; it reads the Secret with the RBAC it already holds and re-reads it every 30 seconds, so rotating the credential needs no restart. Only bcrypt is accepted — a plaintext or SHA-1 entry is rejected at load. If the Secret is deleted or becomes unreadable the admin surface returns `503`; it never falls back to unauthenticated, so a typo in the name cannot silently reopen it. A transient apiserver error does *not* clear the credential — the last known-good one is kept until the apiserver gives a definitive answer.
+
+Authentication covers everything that exposes cluster data: `/api/v1/{manifests,fleet,routing,problems,events,topology}`, `/api/v1/pods/*/logs`, and the operator UI at `/`. Three endpoints stay open because gating them would break the product rather than protect it:
+
+| Endpoint | Why it stays open |
+|---|---|
+| `/metrics` | The chart's `PodMonitor` scrapes it by pod IP and has no credential field. |
+| `/api/v1/health` | The controller probes **peer** pods here to build the fleet view; it holds only the bcrypt hash, so it cannot authenticate to itself. |
+| `/api/v1/topology/local` | The same fan-out, for the merged HA topology view. |
+
+None of the three returns manifests, environment variables, pod logs, or routing tables, and all three remain behind the `NetworkPolicy` fence. The health port is a separate listener and is never authenticated — kubelet probes keep working untouched.
+
+Basic auth is deliberately not offered on proxy and relay admin ports: those serve only `/metrics` and `/api/v1/health`, and those pods hold zero Kubernetes RBAC by design, so they cannot read a credential Secret. `NetworkPolicy` is the control there.
+
+### Controller egress
+
 `JwtAuth.spec.jwks.remote.uri` is tenant-authored (any namespace with create-rights on `JwtAuth` controls it), and the controller — a privileged, cluster-network-reachable pod — fetches it every 30 s–5 min. The controller refuses `remote.uri` unless it is `https://` and resolves to a public IP: every reserved/special-purpose range (RFC 1918 private space, loopback, link-local — including cloud metadata at `169.254.169.254` — CGNAT, documentation ranges, multicast) is denied by default, closing off SSRF against the cluster network or cloud metadata service. Set `controller.egressAllowCidrs` (`--egress-allow-cidr`) to permit specific additional destinations — typically an in-cluster identity provider's Service CIDR. A CIDR listed there is also the only destination class where a plaintext `http://` `remote.uri` is accepted; every other destination requires `https://`. See [JwtAuth](../gateway-api/route-extensions.md#jwt-authentication) and the [configuration reference](../reference/configuration.md).
 
 ## RBAC

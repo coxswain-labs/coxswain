@@ -30,10 +30,13 @@
 use super::reconciler::ignore_not_found;
 use super::render::RenderedSpecs;
 use super::render_relay::RenderedRelay;
-use super::render_shared_proxy::RenderedSharedProxy;
+use super::render_shared_proxy::{
+    RenderedSharedProxy, network_policy_name as shared_proxy_np_name,
+};
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
 use k8s_openapi::api::core::v1::{Service, ServiceAccount};
+use k8s_openapi::api::networking::v1::NetworkPolicy;
 use k8s_openapi::api::policy::v1::PodDisruptionBudget;
 use kube::api::{DeleteParams, Patch, PatchParams};
 use kube::{Api, Client};
@@ -67,6 +70,9 @@ pub(super) enum ApplyError {
     /// SSA or deletion of the `PodDisruptionBudget` failed.
     #[error("apply/delete PodDisruptionBudget: {0}")]
     Pdb(#[source] kube::Error),
+    /// SSA or deletion of the admin-port fence `NetworkPolicy` failed (#670).
+    #[error("apply/delete NetworkPolicy: {0}")]
+    NetworkPolicy(#[source] kube::Error),
 }
 
 impl ApplyError {
@@ -78,7 +84,8 @@ impl ApplyError {
             | Self::Service(e)
             | Self::Deployment(e)
             | Self::Hpa(e)
-            | Self::Pdb(e) => e,
+            | Self::Pdb(e)
+            | Self::NetworkPolicy(e) => e,
         }
     }
 }
@@ -193,6 +200,28 @@ pub(super) async fn apply_rendered(
         }
     }
 
+    // Admin-port fence (#670): same apply-or-delete pattern. The policy shares
+    // the trio's GEP-1762 name, so the disabled branch derives it from the
+    // Deployment name like HPA and PDB do.
+    let np_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
+    match rendered.network_policy.as_ref() {
+        Some(np) => {
+            let np_name = np
+                .metadata
+                .name
+                .as_deref()
+                .unwrap_or_else(|| panic!("invariant: rendered NetworkPolicy has no name"));
+            np_api
+                .patch(np_name, &params, &Patch::Apply(np))
+                .await
+                .map_err(ApplyError::NetworkPolicy)?;
+        }
+        None => {
+            ignore_not_found(np_api.delete(deploy_name, &DeleteParams::default()).await)
+                .map_err(ApplyError::NetworkPolicy)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -275,6 +304,26 @@ pub(super) async fn apply_relay(
         None => {
             ignore_not_found(pdb_api.delete(deploy_name, &DeleteParams::default()).await)
                 .map_err(ApplyError::Pdb)?;
+        }
+    }
+
+    // Admin-port fence (#670): same apply-or-delete pattern. The relay's name is
+    // fixed, so the disabled branch derives the delete target from `deploy_name`.
+    let np_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
+    match rendered.network_policy.as_ref() {
+        Some(np) => {
+            let np_name =
+                np.metadata.name.as_deref().unwrap_or_else(|| {
+                    panic!("invariant: rendered relay NetworkPolicy has no name")
+                });
+            np_api
+                .patch(np_name, &params, &Patch::Apply(np))
+                .await
+                .map_err(ApplyError::NetworkPolicy)?;
+        }
+        None => {
+            ignore_not_found(np_api.delete(deploy_name, &DeleteParams::default()).await)
+                .map_err(ApplyError::NetworkPolicy)?;
         }
     }
 
@@ -386,6 +435,30 @@ pub(super) async fn apply_shared_proxy(
         }
     }
 
+    // Admin-port fence (#670): same apply-or-delete pattern, so flipping
+    // `networkPolicy.enabled` off reclaims a previously applied policy rather
+    // than leaving the pool fenced by an object nothing owns any more.
+    let np_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
+    match rendered.network_policy.as_ref() {
+        Some(np) => {
+            let np_name = np.metadata.name.as_deref().unwrap_or_else(|| {
+                panic!("invariant: rendered shared-proxy NetworkPolicy has no name")
+            });
+            np_api
+                .patch(np_name, &params, &Patch::Apply(np))
+                .await
+                .map_err(ApplyError::NetworkPolicy)?;
+        }
+        None => {
+            ignore_not_found(
+                np_api
+                    .delete(&shared_proxy_np_name(deploy_name), &DeleteParams::default())
+                    .await,
+            )
+            .map_err(ApplyError::NetworkPolicy)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -406,6 +479,10 @@ pub(super) async fn delete_shared_proxy(
 ) -> Result<(), ApplyError> {
     let dp = DeleteParams::default();
     let internal = format!("{name}-internal");
+
+    let np_api: Api<NetworkPolicy> = Api::namespaced(client.clone(), namespace);
+    ignore_not_found(np_api.delete(&shared_proxy_np_name(name), &dp).await)
+        .map_err(ApplyError::NetworkPolicy)?;
 
     let hpa_api: Api<HorizontalPodAutoscaler> = Api::namespaced(client.clone(), namespace);
     ignore_not_found(hpa_api.delete(name, &dp).await).map_err(ApplyError::Hpa)?;

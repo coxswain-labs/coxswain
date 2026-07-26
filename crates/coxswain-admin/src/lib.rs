@@ -22,6 +22,7 @@
 //! below and the `aggregator` handlers.
 
 mod aggregator;
+mod auth;
 mod events;
 mod gw_types;
 mod logs;
@@ -29,7 +30,13 @@ mod page;
 mod routes_dto;
 
 pub use aggregator::OperatorAggregator;
+pub use auth::{
+    AUTH_SECRET_KEY, AdminAuth, AdminAuthError, AdminCredentialCell, AdminCredentialWatcher,
+    parse_admin_credential,
+};
 pub use events::EventSources;
+
+use auth::AuthOutcome;
 
 use aggregator::json_response;
 use async_trait::async_trait;
@@ -109,6 +116,11 @@ pub struct AdminServer {
     /// the controller role — proxy roles leave this `false` so `GET /`
     /// returns 404 structurally, the same gate as the aggregator surface.
     serve_ui: bool,
+    /// Optional HTTP Basic authentication. `None` (the default) serves the
+    /// surface unauthenticated, as before — the `NetworkPolicy` fence is the
+    /// primary control and this is the opt-in second factor. When `Some`, it
+    /// gates every endpoint except those in `is_infrastructure_endpoint`.
+    basic_auth: Option<AdminAuth>,
     /// HTTP module pipeline (response compression) applied to every buffered
     /// endpoint. The SSE stream deliberately bypasses it — compression buffers,
     /// which would defeat streaming.
@@ -132,9 +144,23 @@ impl AdminServer {
             aggregator: None,
             events: None,
             serve_ui: false,
+            basic_auth: None,
             modules,
             api_surfaces: ApiSurfaces::default(),
         }
+    }
+
+    /// Require HTTP Basic authentication on this server's sensitive endpoints.
+    ///
+    /// Everything that exposes cluster data is gated. Three infrastructure
+    /// endpoints are not — see `is_infrastructure_endpoint` for the list and
+    /// why each one has to stay reachable. The health *server* is a separate
+    /// listener on its own port and is unaffected either way, so kubelet probes
+    /// never need credentials.
+    #[must_use]
+    pub fn with_basic_auth(mut self, auth: AdminAuth) -> Self {
+        self.basic_auth = Some(auth);
+        self
     }
 
     /// Override the active API surfaces reported in `/api/v1/health`.
@@ -210,6 +236,36 @@ impl HttpServerApp for AdminServer {
             Ok(false) => return None,
             Err(e) => {
                 tracing::error!(error = %e, "admin: failed to read request header");
+                return None;
+            }
+        }
+
+        // Basic auth runs before the two streaming branches below as well as the
+        // buffered pipeline — the log relay and the SSE stream are exactly the
+        // endpoints worth protecting, and both return before `build_response` is
+        // ever reached.
+        if let Some(auth) = self.basic_auth.as_ref()
+            && !is_infrastructure_endpoint(session.req_header().uri.path())
+        {
+            let header = session
+                .req_header()
+                .headers
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
+            let denial = match auth.check(header.as_deref()).await {
+                AuthOutcome::Allow => None,
+                AuthOutcome::Challenge => Some(auth.challenge()),
+                AuthOutcome::Unavailable => {
+                    tracing::warn!(
+                        "admin: Basic auth is configured but no credential is loaded — \
+                         refusing every request (503) until the Secret is readable"
+                    );
+                    Some(AdminAuth::unavailable())
+                }
+            };
+            if let Some(response) = denial {
+                write_denial(&mut session, response).await;
                 return None;
             }
         }
@@ -366,6 +422,52 @@ impl AdminServer {
 
             _ => aggregator::not_found(),
         }
+    }
+}
+
+/// Whether `path` is an infrastructure endpoint that stays reachable even when
+/// Basic auth is configured.
+///
+/// Three paths are exempt, and the list is deliberately closed:
+///
+/// - `/metrics` — the chart's own `PodMonitor` scrapes it by pod IP. Gating it
+///   would break monitoring on every install that enables auth, with no
+///   credential knob on the `PodMonitor` to fix it.
+/// - `/api/v1/health` — the controller's aggregator probes **peer** pods on this
+///   path to build the fleet view. It cannot present the credential: the pod
+///   only ever holds the bcrypt *hash*, never the password. Gating it would make
+///   every controller and proxy report `reachable: false` the moment auth was
+///   turned on.
+/// - `/api/v1/topology/local` — same fan-out, for the merged HA topology view.
+///
+/// None of the three exposes what this feature exists to protect: no manifests,
+/// no `spec.containers[].env`, no pod logs, no routing tables. They report this
+/// pod's own liveness, its metric counters, and the proxies connected to it —
+/// and they remain behind the `NetworkPolicy` fence, which is the primary
+/// control. Everything genuinely sensitive (`/api/v1/{manifests,fleet,routing,
+/// problems,events,topology}`, `/api/v1/pods/*/logs`, and the UI at `/`) stays
+/// authenticated.
+fn is_infrastructure_endpoint(path: &str) -> bool {
+    matches!(
+        path,
+        "/metrics" | "/api/v1/health" | "/api/v1/topology/local"
+    )
+}
+
+/// Write an auth denial (401 or 503) straight onto the session and close.
+///
+/// Bypasses the buffered module pipeline deliberately: the denial short-circuits
+/// before the dispatch that pipeline exists to serve, and both responses are
+/// header-only, so there is nothing for the compression module to do. The
+/// connection is not reused — a denied caller gets no keep-alive to retry on.
+async fn write_denial(session: &mut ServerSession, response: Response<Vec<u8>>) {
+    let (parts, _) = response.into_parts();
+    let header: ResponseHeader = parts.into();
+    if let Err(e) = session
+        .response_duplex_vec(vec![HttpTask::Header(Box::new(header), true)])
+        .await
+    {
+        tracing::error!(error = %e, "admin: failed to write auth denial");
     }
 }
 
@@ -541,6 +643,41 @@ mod tests {
             logs_pod_name("/api/v1/pods/coxswain-abc/logs"),
             Some("coxswain-abc")
         );
+    }
+
+    #[test]
+    fn only_the_three_fan_out_and_scrape_paths_bypass_basic_auth() {
+        // These three must stay open: the controller's aggregator probes peers
+        // on the health/topology paths and can only ever hold the bcrypt hash,
+        // and the chart's PodMonitor scrapes /metrics by pod IP.
+        for path in ["/metrics", "/api/v1/health", "/api/v1/topology/local"] {
+            assert!(
+                is_infrastructure_endpoint(path),
+                "{path} must stay reachable"
+            );
+        }
+    }
+
+    #[test]
+    fn every_sensitive_path_is_subject_to_basic_auth() {
+        // The exemption is a closed list, not a prefix match: `/api/v1/topology`
+        // (the aggregate view) must NOT inherit `/api/v1/topology/local`'s pass.
+        for path in [
+            "/",
+            "/api/v1/topology",
+            "/api/v1/manifests/pod/kube-system/etcd-0",
+            "/api/v1/pods/coxswain-abc/logs",
+            "/api/v1/fleet/proxies",
+            "/api/v1/routing/gateways",
+            "/api/v1/problems",
+            "/api/v1/events",
+            "/metrics/../api/v1/manifests",
+        ] {
+            assert!(
+                !is_infrastructure_endpoint(path),
+                "{path} exposes cluster data and must require credentials"
+            );
+        }
     }
 
     #[test]

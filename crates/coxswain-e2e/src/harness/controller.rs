@@ -92,6 +92,14 @@ pub struct ControllerOptions {
     /// public internet. Empty (the chart default) refuses every reserved/
     /// special-purpose destination, including any in-cluster ClusterIP.
     pub egress_allow_cidrs: Vec<String>,
+    /// Sets `networkPolicy.enabled` (#670) — the admin-port fence. `None` leaves
+    /// the chart default (`true`). `Some(false)` asserts the controller reclaims
+    /// the policies it previously applied.
+    pub network_policy_enabled: Option<bool>,
+    /// Sets `adminAuth.secretName` (#670) — requires HTTP Basic auth on the
+    /// controller's admin port, from a Secret the test creates first. `None`
+    /// leaves the chart default (no auth).
+    pub admin_auth_secret_name: Option<String>,
 }
 
 /// Handle to the in-cluster coxswain installation for one test.
@@ -170,6 +178,8 @@ impl ControllerProcess {
             relay_target_proxies_per_replica: opts.relay_target_proxies_per_replica,
             watch_namespace: opts.watch_namespace,
             egress_allow_cidrs: opts.egress_allow_cidrs,
+            network_policy_enabled: opts.network_policy_enabled,
+            admin_auth_secret_name: opts.admin_auth_secret_name,
         };
         if overrides != HelmOverrides::default() {
             let root = workspace_root().context("workspace root")?;

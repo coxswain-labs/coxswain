@@ -20,7 +20,12 @@ pub use controller::{
     Controller, ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress,
     StatusChannels,
 };
-pub use operator::{OperatorConfig, ProxyPoolConfig, RelayConfig};
+/// Re-exported so callers can populate [`AdminFenceConfig::extra_ingress`]
+/// without taking a direct `k8s-openapi` dependency — and, more importantly, so
+/// they cannot accidentally build one against a *different* `k8s-openapi`
+/// version than this crate compiles against.
+pub use k8s_openapi::api::networking::v1::NetworkPolicyPeer;
+pub use operator::{AdminFenceConfig, OperatorConfig, ProxyPoolConfig, RelayConfig};
 pub use status_writer::{StatusWriterConfig, StatusWriterError, spawn_status_writer};
 
 /// Fixed `ServiceAccount` (and `Deployment`/`Service`) name of every
