@@ -5,15 +5,12 @@ metadata:
 spec:
   group: gateway.coxswain-labs.dev
   names:
-    categories: []
     kind: RateLimit
     plural: ratelimits
-    shortNames: []
     singular: ratelimit
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for RateLimitSpec via `CustomResource`
@@ -73,4 +70,3 @@ spec:
         type: object
     served: true
     storage: true
-    subresources: {}

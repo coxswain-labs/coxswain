@@ -184,7 +184,7 @@ mod tests {
         assert_eq!(
             on_disk, generated,
             "deploy/manifests/crds/coxswaingatewayparameters.yaml drifted from the Rust type. \
-             Regenerate: cargo run -p coxswain-core --example crdgen \
+             Regenerate: cargo run -p coxswain-core --example crdgen -- GatewayParameters \
              > deploy/manifests/crds/coxswaingatewayparameters.yaml \
              && cp deploy/manifests/crds/coxswaingatewayparameters.yaml \
              charts/coxswain/crds/coxswaingatewayparameters.yaml",

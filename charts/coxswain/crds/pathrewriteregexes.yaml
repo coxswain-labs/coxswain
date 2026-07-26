@@ -5,15 +5,12 @@ metadata:
 spec:
   group: gateway.coxswain-labs.dev
   names:
-    categories: []
     kind: PathRewriteRegex
     plural: pathrewriteregexes
-    shortNames: []
     singular: pathrewriteregex
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for PathRewriteRegexSpec via `CustomResource`
@@ -45,4 +42,3 @@ spec:
         type: object
     served: true
     storage: true
-    subresources: {}

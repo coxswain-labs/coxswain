@@ -5,15 +5,12 @@ metadata:
 spec:
   group: gateway.coxswain-labs.dev
   names:
-    categories: []
     kind: Compression
     plural: compressions
-    shortNames: []
     singular: compression
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for CompressionSpec via `CustomResource`
@@ -74,4 +71,3 @@ spec:
         type: object
     served: true
     storage: true
-    subresources: {}

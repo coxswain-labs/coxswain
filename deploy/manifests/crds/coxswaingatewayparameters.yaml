@@ -5,15 +5,12 @@ metadata:
 spec:
   group: gateway.coxswain-labs.dev
   names:
-    categories: []
     kind: CoxswainGatewayParameters
     plural: coxswaingatewayparameters
-    shortNames: []
     singular: coxswaingatewayparameters
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for CoxswainGatewayParametersSpec via `CustomResource`
@@ -165,4 +162,3 @@ spec:
         type: object
     served: true
     storage: true
-    subresources: {}

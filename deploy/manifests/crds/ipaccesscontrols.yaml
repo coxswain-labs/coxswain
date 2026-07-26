@@ -5,15 +5,12 @@ metadata:
 spec:
   group: gateway.coxswain-labs.dev
   names:
-    categories: []
     kind: IpAccessControl
     plural: ipaccesscontrols
-    shortNames: []
     singular: ipaccesscontrol
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for IpAccessControlSpec via `CustomResource`
@@ -71,4 +68,3 @@ spec:
         type: object
     served: true
     storage: true
-    subresources: {}

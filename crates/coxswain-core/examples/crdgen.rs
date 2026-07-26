@@ -1,7 +1,10 @@
 //! Prints a Coxswain CRD YAML to stdout.
 //!
-//! Pass the CRD kind as the first argument. With no argument, defaults to
-//! `GatewayParameters` for backward compatibility.
+//! Pass the CRD kind as the first argument. An unrecognised or missing kind
+//! exits 2 with the list of valid kinds — it never falls back to a default,
+//! because the caller is redirecting stdout into a specific manifest and a
+//! wrong-but-valid CRD written there is silent until an unrelated snapshot test
+//! fails.
 //!
 //! ## Regenerate manifests after touching a CRD type
 //!
@@ -25,7 +28,7 @@
 //!     charts/coxswain/crds/coxswainexternalauths.yaml
 //!
 //! # CoxswainGatewayParameters
-//! cargo run -p coxswain-core --example crdgen \
+//! cargo run -p coxswain-core --example crdgen -- GatewayParameters \
 //!     > deploy/manifests/crds/coxswaingatewayparameters.yaml
 //! cp deploy/manifests/crds/coxswaingatewayparameters.yaml \
 //!     charts/coxswain/crds/coxswaingatewayparameters.yaml
@@ -96,7 +99,9 @@ use coxswain_core::crd::{
 use kube::CustomResourceExt;
 
 fn main() -> Result<(), serde_yaml::Error> {
-    let kind = std::env::args().nth(1).unwrap_or_default();
+    let Some(kind) = std::env::args().nth(1) else {
+        usage("missing CRD kind");
+    };
     match kind.as_str() {
         "ClientTrafficPolicy" => {
             serde_yaml::to_writer(std::io::stdout(), &ClientTrafficPolicy::crd())
@@ -121,7 +126,44 @@ fn main() -> Result<(), serde_yaml::Error> {
         "Compression" => serde_yaml::to_writer(std::io::stdout(), &Compression::crd()),
         "RetryPolicy" => serde_yaml::to_writer(std::io::stdout(), &RetryPolicy::crd()),
         "JwtAuth" => serde_yaml::to_writer(std::io::stdout(), &JwtAuth::crd()),
-        // No arg or "GatewayParameters" → gateway (backward-compatible default).
-        _ => serde_yaml::to_writer(std::io::stdout(), &CoxswainGatewayParameters::crd()),
+        "GatewayParameters" => {
+            serde_yaml::to_writer(std::io::stdout(), &CoxswainGatewayParameters::crd())
+        }
+        other => usage(&format!("unknown CRD kind {other:?}")),
     }
+}
+
+/// Every kind this generator accepts, in the order the `//!` header documents
+/// them. Listed here so a rejected kind can show the caller what is valid.
+const KINDS: &[&str] = &[
+    "BasicAuth",
+    "ClientTrafficPolicy",
+    "Compression",
+    "CoxswainBackendPolicy",
+    "CoxswainExternalAuth",
+    "CoxswainRelayPolicy",
+    "GatewayParameters",
+    "IngressClassParameters",
+    "IpAccessControl",
+    "JwtAuth",
+    "PathRewriteRegex",
+    "RateLimit",
+    "RequestSizeLimit",
+    "RetryPolicy",
+];
+
+/// Rejects an unusable invocation instead of emitting a CRD the caller did not
+/// ask for.
+///
+/// This used to be a `_ =>` arm that fell through to `CoxswainGatewayParameters`,
+/// which meant a typo'd kind — or a shell loop that silently passed the wrong
+/// string — wrote a valid-looking gateway CRD into whatever file the caller had
+/// redirected to. That failure is invisible: the output parses, `kubeconform`
+/// accepts it, and only the snapshot test for the *overwritten* CRD notices.
+/// Exiting non-zero turns it into a build failure at the point of the mistake.
+fn usage(problem: &str) -> ! {
+    eprintln!("crdgen: {problem}");
+    eprintln!("usage: cargo run -p coxswain-core --example crdgen -- <Kind>");
+    eprintln!("kinds: {}", KINDS.join(", "));
+    std::process::exit(2)
 }

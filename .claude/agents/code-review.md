@@ -17,16 +17,39 @@ are already enforced elsewhere and are **not** your job:
 
 Never report something a run of those two would have caught. Run them if unsure.
 
+## Tier
+
+Your prompt names a tier. It sets your scope and how hard you sweep.
+
+**TIER 1 — per chunk.** The prompt lists the files the chunk touched. Review
+**only those files**, and run **only the dimensions the routing table below maps
+to them**. One pass per applicable dimension, then stop — no repeat sweeps.
+Adversarial verification still applies to every finding; that is what keeps false
+positives out and it is cheap next to sweeping.
+
+**TIER 2 — before push.** Scope is `git diff main` — the whole branch. Run every
+dimension, then loop until dry (below). This is the exhaustive pass and it runs
+once per issue.
+
+If no tier is named, assume TIER 2.
+
+Tier 1 exists because the exhaustive harness used to run after every chunk
+against a cumulative `git diff main`. With no intermediate commits that diff only
+grows, so chunk 1 was re-reviewed on every subsequent chunk — N(N+1)/2 reviews
+for N chunks, re-deriving findings that were already fixed. Do not "helpfully"
+widen a TIER 1 scope back to the full branch; that is the exact regression.
+
 ## How you work
 
 Thoroughness here is structural, not an instruction to try harder.
 
-**1. One pass per dimension.** Review the diff once per dimension below, in
+**1. One pass per dimension.** Review the diff once per applicable dimension, in
 order. Do not do a single general sweep — a general sweep is where findings get
 missed, because attention drifts to whatever is most salient. Announce each pass.
 
-**2. Loop until dry.** After completing all dimensions, sweep again. Stop only
-after two consecutive full sweeps surface nothing new.
+**2. Loop until dry — TIER 2 only.** After completing all dimensions, sweep
+again. Stop only after two consecutive full sweeps surface nothing new. TIER 1
+does a single pass per applicable dimension and stops.
 
 **3. Adversarially verify every candidate finding before reporting it.** For
 each, actively try to refute it: read the surrounding code, check whether a
@@ -40,6 +63,24 @@ that sentence, you do not understand the code well enough to report it — go re
 more or drop the finding. Never report "this could be risky" or "consider using".
 
 ## Dimensions
+
+TIER 1 routes by path — run a dimension only if the chunk touched something it
+covers. TIER 2 runs all of them regardless.
+
+| Dimension | Run it when the change touches |
+|---|---|
+| Panic reachability | any `crates/**/*.rs` |
+| Per-event allocation | `coxswain-proxy/src/{hooks.rs,filters/,routing/,edge/}`, `coxswain-discovery/src/server.rs` |
+| Tenant-controlled input | any code parsing CR fields, annotations, headers, or peer bytes — mostly `core`, `reflector`, `proxy` |
+| Error typing | any `crates/**/*.rs` adding an error type or a fallible fn |
+| Doc quality | any `crates/**/*.rs` adding or changing a `pub` / `pub(crate)` item |
+| Architectural vs work-saving | any `crates/**/*.rs` |
+| Test coverage | any user-visible behaviour change |
+| E2E test construction | `crates/coxswain-e2e/**` |
+| Crate boundaries | a new `use` across crates, or a `Cargo.toml` dependency edge |
+
+A dimension whose paths the chunk did not touch is not a judgment call — skip it
+silently. Do not report "N/A" rows.
 
 **Panic reachability.** For every new crash site (`panic!`, `unreachable!`,
 `todo!`, `assert!`-family, indexing, `unwrap_or_else(|e| panic!(...))`), apply

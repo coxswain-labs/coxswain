@@ -17,9 +17,12 @@ Invoke `/rust-skills` before anything else.
 
 ```bash
 git checkout main && git pull --ff-only origin main
+cargo sweep --installed && cargo sweep --time 7
 ```
 
-Stop and report if this fails.
+Stop and report if the git step fails; a `cargo sweep` failure is non-blocking.
+
+The sweep is cargo's missing garbage collector, run once per issue. `--installed` drops artifacts built by toolchains no longer installed (a rustc upgrade orphans an entire generation); `--time 7` drops anything untouched for a week — typically the previous issue branches' artifacts. Without it `target/` only grows: it reached 660 GB before this cadence existed.
 
 ## 3 — Read the issue
 
@@ -98,23 +101,28 @@ Implement per the approved plan.
 
 Gates run automatically on every Edit/Write via the `PostToolUse` hook in `.claude/settings.json`, which dispatches through `scripts/gates.sh`. If one fires, fix the cause before continuing — do not proceed with a failing gate. To run them manually for a path: `bash scripts/gates.sh <path>`.
 
-After each meaningful chunk, dispatch the `code-review` agent (`.claude/agents/code-review.md`) over the chunk's diff. It covers what no gate can decide: panic reachability, per-event allocation on the four data planes, tenant-controlled input, doc quality, architectural-vs-work-saving.
+After each meaningful chunk, dispatch the `code-review` agent (`.claude/agents/code-review.md`) as **TIER 1**, with `model: "sonnet"`. Pass it the explicit list of files that chunk touched — you just edited them, so name them; there are no intermediate commits to diff against. The agent reviews only those files and only the dimensions its routing table maps to them.
 
-Iterate per chunk with a **scoped, cheap** check — do not run the full clippy+test suite after every chunk:
+Never widen a TIER 1 dispatch to `git diff main`. That diff grows monotonically across the issue, so a per-chunk exhaustive review re-reviews every earlier chunk — the cost that made this two-tier split necessary.
+
+The exhaustive TIER 2 review runs once, in step 7. Between them they cover what no gate can decide: panic reachability, per-event allocation on the four data planes, tenant-controlled input, doc quality, architectural-vs-work-saving.
+
+Use **one** cargo invocation form for the whole issue — per chunk and as the final gate alike:
 
 ```bash
 cargo fmt
-cargo check -p <changed-crate>        # --workspace only for cross-crate edits
+cargo clippy --workspace --all-targets --exclude coxswain-e2e -- -D warnings
 ```
 
-Run the full gate **once, at the end** (before the commit checkpoint), each command a single time:
+Never substitute `cargo check`, never swap `-p <crate>` for `--workspace`, never drop `--all-targets`. Cargo gives each invocation form its own artifact family — `check` and `clippy` use different rustc drivers, and `-p` and `--workspace` resolve dependency features differently, so neither pair shares a single compiled dependency. Alternating forms doesn't save a build, it adds a cold one and leaves those artifacts in `target/` forever (cargo never garbage-collects). One form means one warm cache: the issue's first run pays, each run after it rebuilds only the changed crate and its dependents.
+
+Run the test suite **once, at the end** (before the commit checkpoint):
 
 ```bash
-cargo clippy --workspace --all-targets --exclude coxswain-e2e -- -D warnings
 cargo test --workspace --exclude coxswain-e2e
 ```
 
-`clippy` subsumes `check`, and the subcommands don't share build artifacts — so a standalone `check` before `clippy`, or per-chunk full runs, are wasted multi-minute rebuilds.
+It is a separate artifact family (`--cfg test`) that cannot be folded into the clippy one — which is exactly why it runs once rather than per chunk.
 
 Every clippy warning is a blocker. Fix the root cause — never silence with `#[allow(...)]`. For upstream-imposed names that trip a lint, re-export with a project-canonical alias at the crate boundary.
 
@@ -146,6 +154,14 @@ Intermediate commits: `Refs #N` footer
 Final commit: `Fixes #N` footer
 
 ## 7 — Push and PR
+
+Before pushing, dispatch the `code-review` agent as **TIER 2** (its default model, opus) scoped to `git diff main`. This is the exhaustive pass — every dimension, looped until dry — and it runs exactly once per issue. Address blockers before the push.
+
+Then run the doc gate, which fmt/clippy/test do not cover:
+
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --exclude coxswain-e2e --no-deps
+```
 
 Push when instructed:
 

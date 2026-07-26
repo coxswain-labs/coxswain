@@ -5,15 +5,12 @@ metadata:
 spec:
   group: gateway.coxswain-labs.dev
   names:
-    categories: []
     kind: CoxswainBackendPolicy
     plural: coxswainbackendpolicies
-    shortNames: []
     singular: coxswainbackendpolicy
   scope: Namespaced
   versions:
-  - additionalPrinterColumns: []
-    name: v1alpha1
+  - name: v1alpha1
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for CoxswainBackendPolicySpec via `CustomResource`
