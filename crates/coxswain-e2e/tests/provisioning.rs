@@ -43,6 +43,7 @@ mod common;
 use common::dedicated::{
     GATEWAY_NAME, RESOURCE_NAME, apply_and_wait, assert_provisioning_contract, wait_for_cut_over,
 };
+use common::discovery::{leader_discovery_metrics, scrape_metric_label_sum};
 
 /// 1. Apply a dedicated-mode Gateway → assert all three resources are created
 ///    with the GEP-1762 labels (including merged infrastructure labels), the
@@ -2062,6 +2063,28 @@ mod serial {
         })
         .await?;
 
+        // Baseline the leader's roster-fold counters (#666) before the shared
+        // relay is even provisioned. `rejected` is a cumulative process-lifetime
+        // counter shared across every serial test on this controller pod and
+        // legitimately moves on ordinary namespace/relay teardown elsewhere in
+        // the suite, so the assertion below is a delta against this baseline,
+        // never an absolute value.
+        let (_leader_pf, server_url) = leader_discovery_metrics(&h.client).await?;
+        let accepted_before = scrape_metric_label_sum(
+            &server_url,
+            "coxswain_discovery_roster_reports_total",
+            "result=\"accepted\"",
+        )
+        .await
+        .unwrap_or(0.0);
+        let rejected_before = scrape_metric_label_sum(
+            &server_url,
+            "coxswain_discovery_roster_reports_total",
+            "result=\"rejected\"",
+        )
+        .await
+        .unwrap_or(0.0);
+
         let deployments: Api<Deployment> =
             Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
         let services: Api<Service> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
@@ -2119,6 +2142,58 @@ mod serial {
         wait_shared_pool_serves(&h, &ns.name)
             .await
             .context("shared pool stopped serving traffic across the shared-relay repoint")?;
+
+        // The shared relay's upstream RosterReport is accepted on the live path
+        // (#666) — this is the only e2e coverage of the SharedPool arm of the
+        // gate, distinct from the namespace-relay arm covered in `discovery.rs`.
+        // By now the pool has served traffic through the relay, so its roster
+        // reporter has certainly published at least once; poll because the
+        // port-forwarded scrape and the fold are independently timed.
+        wait::poll_until(
+            Duration::from_secs(30),
+            wait::POLL,
+            || {
+                let server_url = server_url.clone();
+                async move {
+                    let now = scrape_metric_label_sum(
+                        &server_url,
+                        "coxswain_discovery_roster_reports_total",
+                        "result=\"accepted\"",
+                    )
+                    .await;
+                    format!(
+                        "controller coxswain_discovery_roster_reports_total{{result=\"accepted\"}} \
+                         to exceed the {accepted_before} baseline; currently: {now:?}"
+                    )
+                }
+            },
+            || {
+                let server_url = server_url.clone();
+                async move {
+                    let now = scrape_metric_label_sum(
+                        &server_url,
+                        "coxswain_discovery_roster_reports_total",
+                        "result=\"accepted\"",
+                    )
+                    .await?;
+                    (now > accepted_before).then_some(())
+                }
+            },
+        )
+        .await?;
+        let rejected_now = scrape_metric_label_sum(
+            &server_url,
+            "coxswain_discovery_roster_reports_total",
+            "result=\"rejected\"",
+        )
+        .await
+        .with_context(|| {
+            format!("scrape roster_reports_total{{result=\"rejected\"}} from {server_url}")
+        })?;
+        assert_eq!(
+            rejected_now, rejected_before,
+            "the shared relay's own roster must never move the rejected counter"
+        );
 
         Ok(())
     }

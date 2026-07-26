@@ -143,7 +143,7 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     //   The `UpstreamResolverConfig` reads it so a leaf repoints onto a relay only
     //   *after* it can serve — the make-before-break gate.
     // Both empty when relay tiering is off (authorizer denies every Namespace
-    // subscribe, identical to the `DenyAllNamespaces` default; the resolver points
+    // subscribe, identical to the `DenyAll` default; the resolver points
     // every leaf at the controller).
     let provisioned_relays = Shared::<HashSet<String>>::new();
     let active_relays = Shared::<HashSet<String>>::new();
@@ -178,6 +178,8 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         relay_port: RELAY_DISCOVERY_PORT,
         relay_sa: RELAY_SERVICE_ACCOUNT.to_string(),
         active_relays: active_relays.clone(),
+        trust_domain: args.controller.discovery_trust_domain.clone(),
+        install_namespace: args.common.pod_namespace.clone(),
     });
     let (relay_changed_tx, relay_changed_rx) = watch::channel(0u64);
     let discovery_service = coxswain_discovery::DiscoveryService::new(
@@ -187,9 +189,13 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     )
     .with_leader_gate(leader_watch_rx.clone())
     .with_scope_authorizer(Arc::new(ProvisionedRelayAuthorizer::new(
-        provisioned_relays.clone(),
-        RELAY_SERVICE_ACCOUNT,
-        args.controller.discovery_trust_domain.clone(),
+        coxswain_discovery::RelayAuthzConfig {
+            provisioned: provisioned_relays.clone(),
+            relay_sa: RELAY_SERVICE_ACCOUNT.to_string(),
+            trust_domain: args.controller.discovery_trust_domain.clone(),
+            shared_relay_sa: SHARED_RELAY_SERVICE_ACCOUNT.to_string(),
+            install_namespace: args.common.pod_namespace.clone(),
+        },
     )))
     .with_upstream_directives(upstream_resolver.clone(), relay_changed_rx);
     let discovery_addr = SocketAddr::new(

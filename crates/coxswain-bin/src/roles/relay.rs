@@ -31,7 +31,7 @@ use crate::wiring::{
 /// rotating bootstrapped SVID and the mounted trust bundle, so it needs no CA
 /// Secret, trust-bundle ConfigMap, or TokenReview (all of which the controller's
 /// discovery server needs and none of which the relay's RBAC-less SA can reach).
-/// The default `DenyAllNamespaces` authorizer on the downstream `DiscoveryService`
+/// The default `DenyAll` authorizer on the downstream `DiscoveryService`
 /// rejects any leaf `Namespace` subscribe (relay-behind-relay is out of scope).
 pub(crate) fn run_relay(args: RelayRoleArgs) -> Result<()> {
     init_logger(args.common.log_format, &args.common.log_filter)?;
@@ -99,7 +99,7 @@ pub(crate) fn run_relay(args: RelayRoleArgs) -> Result<()> {
 
     // Downstream discovery service over the relay's own `SnapshotSource`. No
     // leader gate (the relay is not leader-elected) and the default
-    // `DenyAllNamespaces` authorizer (a leaf never subscribes `Namespace`).
+    // `DenyAll` authorizer (a leaf never subscribes `Namespace`).
     // Directive forwarding (#601): the upstream client fans controller
     // `PreferredUpstream` directives into `directive_tx`; the downstream server
     // forwards each to the leaf it targets so a repoint reaches a relay-fronted

@@ -116,6 +116,13 @@ pub struct UpstreamResolverConfig {
     /// repoint set): a dedicated leaf in one of these streams from the relay, else
     /// from the controller (#601/#602).
     pub active_relays: Shared<HashSet<String>>,
+    /// Trust domain every relay SVID must carry — part of the strict identity
+    /// triple [`Self::is_shared_relay`] checks (#666), matching the check
+    /// `ScopeAuthorizer::allows_roster` applies to the same identity.
+    pub trust_domain: String,
+    /// Namespace the shared relay runs in (the coxswain install namespace) —
+    /// the other half of the [`Self::is_shared_relay`] identity triple (#666).
+    pub install_namespace: String,
 }
 
 impl UpstreamResolverConfig {
@@ -164,18 +171,31 @@ impl UpstreamResolverConfig {
         }
     }
 
-    /// Whether the peer on this stream is the shared relay itself (its SVID carries
-    /// `shared_relay_sa`) — the discriminator the shared-pool repoint push needs, as
-    /// the shared relay and the shared proxies both subscribe `Scope::SharedPool`
-    /// (unlike the dedicated tier, where relay=`Namespace` and proxy=`Gateway` are
-    /// distinct scopes). `None` peer (plaintext/test path) → treated as a proxy.
+    /// Whether the peer on this stream is the shared relay itself (its SVID is
+    /// exactly `(trust_domain, install_namespace, shared_relay_sa)`) — the
+    /// discriminator the shared-pool repoint push needs, as the shared relay and
+    /// the shared proxies both subscribe `Scope::SharedPool` (unlike the
+    /// dedicated tier, where relay=`Namespace` and proxy=`Gateway` are distinct
+    /// scopes). `None` peer (plaintext/test path) → treated as a proxy.
+    ///
+    /// Checks the full identity triple, not `shared_relay_sa` alone (#666):
+    /// bootstrap issues an SVID to any ServiceAccount that passes `TokenReview`
+    /// with no allowlist, so a tenant could otherwise mint
+    /// `ServiceAccount/coxswain-relay-shared` in their own namespace and match
+    /// on SA name alone. The projected token cryptographically binds the SVID's
+    /// namespace to the pod's own namespace, so pinning `install_namespace` too
+    /// makes the identity unforgeable from outside it — matching the same
+    /// strict triple `ScopeAuthorizer::allows_roster` requires for this
+    /// identity.
     #[must_use]
     pub fn is_shared_relay(&self, peer: Option<&crate::auth::PeerSvid>) -> bool {
         peer.is_some_and(|p| {
             p.uri_sans.iter().any(|uri| {
-                SpiffeId::parse(uri)
-                    .ok()
-                    .is_some_and(|id| id.service_account() == self.shared_relay_sa)
+                SpiffeId::parse(uri).is_ok_and(|id| {
+                    id.trust_domain() == self.trust_domain
+                        && id.namespace() == self.install_namespace
+                        && id.service_account() == self.shared_relay_sa
+                })
             })
         })
     }
@@ -596,6 +616,8 @@ mod tests {
             relay_port: 50051,
             relay_sa: "coxswain-relay".to_owned(),
             active_relays: Shared::from_value(set),
+            trust_domain: "cluster.local".to_owned(),
+            install_namespace: "coxswain-system".to_owned(),
         })
     }
 

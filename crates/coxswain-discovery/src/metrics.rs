@@ -70,12 +70,14 @@ pub fn connected_proxies() -> &'static IntGauge {
 /// Counter: cumulative discovery stream-open outcomes, by result.
 ///
 /// Labels: `result` (`accepted` — Subscribe validated and node registered;
-/// `rejected` — wire-version mismatch, malformed scope, or SVID/scope-binding
-/// denial before registration; `rejected_not_leader` — dial reached a standby
-/// replica while the Stream RPC is leader-gated, #531). A rising `rejected`
-/// rate flags misconfigured or hostile clients; a steady `rejected_not_leader`
-/// trickle during leader churn is expected (proxies redial until they land on
-/// the leader).
+/// `rejected` — wire-version mismatch, malformed scope, SVID/scope-binding
+/// denial before registration, or a `node_id` colliding with an already-connected
+/// relay (#666 — a hijack attempt, or a legitimate relay losing its own
+/// reconnect race); `rejected_not_leader` — dial reached a standby replica
+/// while the Stream RPC is leader-gated, #531). A rising `rejected` rate flags
+/// misconfigured or hostile clients; a steady `rejected_not_leader` trickle
+/// during leader churn is expected (proxies redial until they land on the
+/// leader).
 ///
 /// # Panics
 ///
@@ -87,6 +89,45 @@ pub fn streams_total() -> &'static IntCounterVec {
             Opts::new(
                 "coxswain_discovery_streams_total",
                 "Cumulative discovery stream-open outcomes, by result"
+            ),
+            &["result"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
+/// Counter: cumulative `RosterReport` fold outcomes, by result (#666).
+///
+/// Labels: `result` —
+/// - `accepted`: the sender's identity matched the relay tier authorized for
+///   its subscribed scope, and every reported child belonged to that same
+///   scope. The expected steady state for a live relay.
+/// - `partial`: the sender's identity was authorized, but at least one
+///   reported child named a scope outside its own reach (a namespace relay
+///   naming another tenant's Gateway, or the shared pool). A well-formed
+///   relay's own downstream registry can never produce this — it should be
+///   flat at zero forever; alert on it. This is the signal for the one
+///   attacker this project's threat model treats as in scope: a compromised
+///   relay attempting to widen its blast radius past its own leaves.
+/// - `rejected`: the sender was not authorized at all — a plain proxy, an
+///   unauthenticated connection, or a relay whose namespace lost its
+///   provisioning grant. Unlike `partial`, this is **not** always flat at
+///   zero: a namespace's relay record is dropped the moment its owning
+///   Kubernetes `Namespace` starts terminating (ahead of the relay's own pod
+///   actually stopping), so a relay's last in-flight roster during that
+///   teardown window legitimately lands here. A sustained or climbing rate
+///   outside of namespace/relay teardown is the signal worth alerting on.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn roster_reports_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_discovery_roster_reports_total",
+                "Cumulative RosterReport fold outcomes, by result"
             ),
             &["result"]
         )

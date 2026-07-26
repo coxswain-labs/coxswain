@@ -69,7 +69,7 @@ pub use error::{AuthError, DiscoveryError, WireError};
 pub use materialize::{MaterializedView, materialize};
 pub use relay::{RelayUpstream, namespace_relay, shared_relay};
 pub use server::{
-    DenyAllNamespaces, DiscoveryService, ProvisionedRelayAuthorizer, ScopeAuthorizer,
+    DenyAll, DiscoveryService, ProvisionedRelayAuthorizer, RelayAuthzConfig, ScopeAuthorizer,
     SnapshotSource,
 };
 pub use subscription::Scope;
