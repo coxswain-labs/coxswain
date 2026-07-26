@@ -633,6 +633,7 @@ fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfig {
                             .map(|s| s.to_string())
                             .collect(),
                         always_set_cookie: h.always_set_cookie,
+                        allowed_headers: h.allowed_headers.iter().map(|s| s.to_string()).collect(),
                     }),
                     None,
                 ),
@@ -644,6 +645,7 @@ fn auth_to_wire(auth: &IngressAuthConfig) -> p::IngressAuthConfig {
                             .iter()
                             .map(|s| s.to_string())
                             .collect(),
+                        allowed_headers: g.allowed_headers.iter().map(|s| s.to_string()).collect(),
                     }),
                 ),
             };

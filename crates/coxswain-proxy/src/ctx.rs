@@ -185,7 +185,8 @@ pub struct ProxyCtx {
     /// Headers from the ext_authz response to inject into the upstream request.
     ///
     /// Populated by `policy::auth::enforce` when the auth service returns 2xx and
-    /// the route's `auth-response-headers` allow-list is non-empty.  Applied in
+    /// the route's `auth-response-headers` allow-list is non-empty.  Applied (read,
+    /// never `.take()`d — see [`Self::strip_upstream_headers`] for why) in
     /// `upstream_request_filter` after rule-level filters.  `None` (the common
     /// case) incurs no cost.
     ///
@@ -193,15 +194,29 @@ pub struct ProxyCtx {
     /// at the auth-response parsing step so `upstream_request_filter` can use a
     /// case-insensitive comparison without per-request allocation.
     pub auth_response_headers: Option<Vec<(Box<str>, Box<str>)>>,
-    /// Request header names to strip before forwarding upstream (#441).
+    /// Request header names to strip before forwarding upstream.
     ///
-    /// Populated by `policy::auth::enforce` with the bearer-token
-    /// header name(s) when a `JwtAuth` check succeeds and its `forward` field
-    /// is `false` (Envoy `JwtProvider.forward` default) — the raw token must
-    /// not reach the upstream. Applied in `upstream_request_filter` before
-    /// [`Self::auth_response_headers`] is applied, so a `claimToHeaders` entry
-    /// can never be immediately stripped by a same-named removal. `None` (the
-    /// common case: no JWT filter, or `forward: true`) incurs no cost.
+    /// Populated by `policy::auth::enforce`, from two independent sources that
+    /// may both contribute to the same request:
+    /// - The bearer-token header name(s) when a `JwtAuth` check succeeds and its
+    ///   `forward` field is `false` (Envoy `JwtProvider.forward` default, #441)
+    ///   — the raw token must not reach the upstream.
+    /// - Every `ext_authz` `allowedResponseHeaders` name, unconditionally,
+    ///   before the check even runs (#663) — the proxy only ever *sets* a name
+    ///   the auth service's allow response actually echoes, so an
+    ///   allow-listed-but-unechoed name must still be stripped or a client's
+    ///   forged copy would be indistinguishable from a proxy-verified one.
+    ///
+    /// Applied in `upstream_request_filter` before [`Self::auth_response_headers`]
+    /// is applied, so a `claimToHeaders` entry can never be immediately stripped
+    /// by a same-named removal. `None` (no JWT filter and no `ext_authz`
+    /// `allowedResponseHeaders` configured) incurs no cost.
+    ///
+    /// Read via `.as_deref()`, never `.take()`d: Pingora retries a failed
+    /// upstream attempt against a *fresh* clone of the downstream request while
+    /// reusing this same `ProxyCtx`, so `upstream_request_filter` — and this
+    /// strip — runs once per attempt. Consuming the list on attempt 1 would
+    /// leave a client-forged header unstripped on a retried attempt.
     pub strip_upstream_headers: Option<Vec<Box<str>>>,
     /// Bounded mpsc senders feeding in-flight mirror tasks (#360).
     ///
@@ -233,8 +248,10 @@ pub struct ProxyCtx {
     /// `SslDigest` carries a verified `edge::tls::ClientCertInfo`. Holding the
     /// already-percent-encoded `HeaderValue` (built once per connection) makes
     /// this a cheap `Bytes` clone rather than a per-request PEM copy + re-encode
-    /// (#620). Consumed (`.take()`d) in `upstream_request_filter`. `None` (the
-    /// common case) incurs no cost.
+    /// (#620). Read (`.clone()`d), never `.take()`d, in `upstream_request_filter`
+    /// — same retry-safety reasoning as [`Self::strip_upstream_headers`]: a
+    /// retried upstream attempt must still receive the verified certificate.
+    /// `None` (the common case) incurs no cost.
     pub client_cert_header: Option<http::HeaderValue>,
     /// Effective client IP resolved in `request_filter` (#271).
     ///

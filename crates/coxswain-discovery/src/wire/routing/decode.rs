@@ -13,14 +13,15 @@ use std::time::{Duration, UNIX_EPOCH};
 use coxswain_core::endpoints::{EndpointPool, empty_group_status};
 use coxswain_core::routing::{
     BackendClientCert, BackendGroup, BackendProtocol, BasicCredential, CircuitBreakerConfig,
-    CompressionConfig, CorsConfig, CorsOrigin, ExtAuthConfig, ExtAuthTransport, FilterAction,
+    CompressionConfig, CorsConfig, CorsOrigin, DEFAULT_ALLOWED_HEADERS_GRPC,
+    DEFAULT_ALLOWED_HEADERS_HTTP, ExtAuthConfig, ExtAuthTransport, FilterAction,
     ForwardedForConfig, GrpcExtAuthConfig, HashSource, HeaderMod, HeaderPredicate,
     HostRouterBuilder, HttpExtAuthConfig, IngressAuthConfig, JwtConfig, JwtHeaderLoc, LoadBalance,
     MatchPredicates, MirrorFraction, NormalizeLevel, PasswordHash, PathModifier, QueryPredicate,
     RateLimitConfig, RateLimitKey, RouteEntry, RouteKind, RouteTimeouts, RouterError,
     SessionAffinity, SubjectAltName, TcpRouteTable, TcpRouteTableBuilder, TlsPassthroughTable,
     TlsPassthroughTableBuilder, UdpRouteTable, UdpRouteTableBuilder, UpstreamCa, UpstreamTls,
-    ValueMatch, WildcardKind,
+    ValueMatch, WildcardKind, resolve_allowed_headers,
 };
 // Whole-table route types + the pool-from-resources helper are used only by the
 // test-only `decode_world` route oracle (production decode is partition-wise via
@@ -837,8 +838,19 @@ fn auth_from_wire(dto: &p::IngressAuthConfig) -> Result<IngressAuthConfig, WireE
             // which the encoder never emits). Neither present → a forward-
             // incompatible or malformed entry: fail that route's auth **closed**
             // (Unavailable → 503) rather than erroring the whole snapshot decode.
+            // `allowed_headers` (#663) is resolved through the same
+            // `resolve_allowed_headers` the reflector uses, not copied verbatim:
+            // a sender one version behind that doesn't yet populate this field
+            // (e.g. a relay mid-rolling-upgrade) decodes it as an empty `Vec`,
+            // and `is_allowed_request_header` on the receiving proxy fails
+            // closed on an empty list — silently withholding every header,
+            // including `authorization`, from every ext_authz check. Applying
+            // the per-protocol default here closes that version-skew window the
+            // same way an unconfigured CRD is closed, rather than opening a
+            // distinct silent-total-deny failure mode.
             let transport = if let Some(g) = ext.grpc.as_ref() {
                 ExtAuthTransport::Grpc(GrpcExtAuthConfig::new(
+                    resolve_allowed_headers(&g.allowed_headers, DEFAULT_ALLOWED_HEADERS_GRPC),
                     g.response_headers
                         .iter()
                         .map(|s| Box::from(s.as_str()))
@@ -846,6 +858,7 @@ fn auth_from_wire(dto: &p::IngressAuthConfig) -> Result<IngressAuthConfig, WireE
                 ))
             } else if let Some(http) = ext.http.as_ref() {
                 ExtAuthTransport::Http(HttpExtAuthConfig::new(
+                    resolve_allowed_headers(&http.allowed_headers, DEFAULT_ALLOWED_HEADERS_HTTP),
                     http.response_headers
                         .iter()
                         .map(|s| Box::from(s.as_str()))

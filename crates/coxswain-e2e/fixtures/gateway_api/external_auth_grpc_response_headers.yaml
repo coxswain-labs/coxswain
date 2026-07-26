@@ -1,0 +1,69 @@
+# CoxswainExternalAuth gRPC transport with allowedResponseHeaders (#663). Clone
+# of external_auth_grpc.yaml. Apply backends::ECHO and backends::EXT_AUTHZ_GRPC
+# first. `allowedResponseHeaders` names TWO headers:
+#   - x-ext-authz-check-result — Istio's ext-authz sample ALWAYS sets this to
+#     "allowed" on its OkHttpResponse.Headers when it allows the request, so it
+#     proves the legitimately-returned value is forwarded and overwrites a
+#     client-forged copy of the same name (#663 happy path).
+#   - x-forged-role — the sample never returns this, so it proves a client-forged
+#     copy is stripped even though the check allows the request (#663 sad path).
+#
+# `allowedHeaders: [x-ext-authz]` is also required, same reason as
+# external_auth_grpc.yaml — GEP-1494's GRPC default doesn't include it, and the
+# sample denies without it.
+#
+# Gateway: coxswain-extauth-grpc-rh on GATEWAY_HTTP_PORT.
+# Route host: gwextauthgrpcrh.TESTNS.local, path / -> echo-a:3000.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-extauth-grpc-rh
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
+metadata:
+  name: extauth-grpc-rh
+spec:
+  protocol: GRPC
+  backendRef:
+    name: ext-authz-grpc
+    port: 9000
+  allowedHeaders:
+    - x-ext-authz
+  allowedResponseHeaders:
+    - x-ext-authz-check-result
+    - x-forged-role
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: extauth-grpc-rh-route
+spec:
+  parentRefs:
+    - name: coxswain-extauth-grpc-rh
+  hostnames:
+    - "gwextauthgrpcrh.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: ExternalAuth
+            name: extauth-grpc-rh
+      backendRefs:
+        - name: echo-a
+          port: 3000

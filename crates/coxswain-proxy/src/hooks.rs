@@ -687,13 +687,16 @@ pub(crate) async fn upstream_request_filter(
         .map(|r| (r.filters.as_ref(), &*r.original_host, &*r.original_path))
         .unwrap_or((&[], "", ""));
 
-    // Strip client-supplied forwarding headers before any operator filter or
-    // proxy-generated header insertion runs (#409).  The proxy owns Forwarded,
-    // X-Forwarded-For, X-Forwarded-Proto, and X-Real-IP: client-injected values
-    // must never reach the backend.  When PROXY protocol is active,
+    // Strip client-supplied proxy-owned trust headers before any operator
+    // filter, proxy-generated header insertion, or verified-client-cert
+    // forwarding runs (#409, #663).  The proxy owns Forwarded, X-Forwarded-For,
+    // X-Forwarded-Proto, X-Real-IP, and X-SSL-Client-Cert: client-injected
+    // values must never reach the backend.  When PROXY protocol is active,
     // apply_request_filters below re-inserts a proxy-generated Forwarded value
-    // derived from the real client address.
-    TrafficFilter::strip_client_forwarding_headers(upstream_request);
+    // derived from the real client address; forward_client_cert below
+    // re-inserts a verified client certificate when this host's mTLS config
+    // calls for it.
+    TrafficFilter::strip_proxy_owned_headers(upstream_request);
 
     // Forward the normalized path (#280): if path normalization changed the
     // downstream path (e.g. `merge-slashes` collapsed `//`), `original_path`
@@ -737,11 +740,23 @@ pub(crate) async fn upstream_request_filter(
         )?;
     }
 
-    // Strip the bearer-token header(s) a successful JwtAuth check consumed,
-    // when the CRD's `forward` is `false` (#441). Applied before the
+    // Strip the bearer-token header(s) a successful JwtAuth check consumed
+    // when the CRD's `forward` is `false` (#441), and every name an ext_authz
+    // check's `allowedResponseHeaders` owns (#663). Applied before the
     // auth-response-headers block below so a `claimToHeaders` entry can never
     // be immediately stripped by a same-named removal.
-    if let Some(names) = ctx.strip_upstream_headers.take() {
+    //
+    // Read, never `.take()`: Pingora retries a failed upstream attempt (up to
+    // `max_retries`) by re-running this filter against a *fresh* clone of the
+    // downstream request (`session.req_header().clone()` in
+    // `pingora_proxy::proxy_1to1`/`proxy_1to2`) while reusing the same `ctx`
+    // across attempts. A one-shot `.take()` would strip on attempt 1 only,
+    // leaving a client-forged header to sail through untouched on attempt 2 —
+    // silently defeating the very fix this block exists for. Re-applying the
+    // same names on every attempt is idempotent and correctly scoped, since
+    // the decision ("this check owns these names") is a per-request fact,
+    // not a one-time action.
+    if let Some(names) = ctx.strip_upstream_headers.as_deref() {
         for name in names {
             if let Ok(hn) = http::HeaderName::from_bytes(name.as_bytes()) {
                 upstream_request.remove_header(&hn);
@@ -751,8 +766,9 @@ pub(crate) async fn upstream_request_filter(
 
     // Auth-response headers injected by an ext_authz `allowed_upstream_headers`
     // / `headersToUpstreamOnAllow` allow-list — applied last so auth-service
-    // headers cannot be overwritten by upstream header modifiers.
-    if let Some(hdrs) = ctx.auth_response_headers.take() {
+    // headers cannot be overwritten by upstream header modifiers. Read, never
+    // `.take()` — same retry-safety reasoning as `strip_upstream_headers` above.
+    if let Some(hdrs) = ctx.auth_response_headers.as_deref() {
         for (name, value) in hdrs {
             // Parse into typed `HeaderName`/`HeaderValue` — `insert_header`
             // accepts these without a `'static` requirement.

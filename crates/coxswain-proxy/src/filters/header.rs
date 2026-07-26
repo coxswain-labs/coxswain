@@ -1,7 +1,7 @@
 //! Header-modifier mechanics shared by the request and response filter paths:
 //! the `RequestHeaderModifier` / `ResponseHeaderModifier` application
-//! ([`apply_header_mod`]) and the proxy-owned forwarding-header deny-list that
-//! gates operator re-injection on the request path (#409, #410).
+//! ([`apply_header_mod`]) and the proxy-owned trust-header deny-list that
+//! gates operator re-injection on the request path (#409, #410, #663).
 
 use coxswain_core::routing::HeaderMod;
 use http::{HeaderName, HeaderValue};
@@ -9,31 +9,47 @@ use pingora_http::{RequestHeader, ResponseHeader};
 
 /// Headers the proxy unconditionally owns on every upstream request.
 ///
-/// The proxy strips whatever the downstream client sent and, when PROXY-protocol
-/// is active, replaces `Forwarded` with a proxy-generated value derived from the
-/// real client address.  Route operators must also not re-inject these headers via
-/// `RequestHeaderModifier` filters — `apply_header_mod` skips `set`/`add` operations
-/// for any name in this list when called on the request path (#409, #410).
+/// Two kinds share this list because both are trust signals a backend may act
+/// on, and both must never be a client's word to take:
+///
+/// - The four forwarding headers (`Forwarded`, `X-Forwarded-For`,
+///   `X-Forwarded-Proto`, `X-Real-IP`) — the proxy strips whatever the
+///   downstream client sent and, when PROXY-protocol is active, replaces
+///   `Forwarded` with a proxy-generated value derived from the real client
+///   address.
+/// - `X-SSL-Client-Cert` (#663) — the proxy inserts the verified mTLS client
+///   certificate here (see [`crate::policy::client_cert::forward_client_cert`])
+///   only when the host requires mTLS, `pass_to_upstream` is set, and a cert
+///   was actually presented. On every other path (no mTLS on this host,
+///   `pass_to_upstream: false`, or a GEP-91 insecure-fallback request with no
+///   cert) nothing re-inserts it, so without this strip a client-supplied
+///   `X-SSL-Client-Cert: <forged PEM>` would reach the backend untouched.
+///
+/// Route operators must also not re-inject any of these headers via
+/// `RequestHeaderModifier` filters — `apply_header_mod` skips `set`/`add`
+/// operations for any name in this list when called on the request path
+/// (#409, #410).
 ///
 /// Never extend this list with headers the proxy does not itself set;
 /// strip-without-replace is the safe default for unknown infrastructure headers.
-pub(crate) static CLIENT_FORWARDING_HEADERS: std::sync::LazyLock<[http::HeaderName; 4]> =
+pub(crate) static PROXY_OWNED_HEADERS: std::sync::LazyLock<[http::HeaderName; 5]> =
     std::sync::LazyLock::new(|| {
         [
             http::HeaderName::from_static("forwarded"),
             http::HeaderName::from_static("x-forwarded-for"),
             http::HeaderName::from_static("x-forwarded-proto"),
             http::HeaderName::from_static("x-real-ip"),
+            http::HeaderName::from_static("x-ssl-client-cert"),
         ]
     });
 
-/// Returns `true` when `name` is a proxy-owned forwarding header that neither
+/// Returns `true` when `name` is a proxy-owned trust header that neither
 /// clients nor route operators may inject.
 ///
 /// Used by [`apply_header_mod`] to gate `set`/`add` operations on the request
 /// path — the `remove` operation is always allowed.
-pub(crate) fn is_owned_forwarding_header(name: &http::HeaderName) -> bool {
-    CLIENT_FORWARDING_HEADERS.iter().any(|h| h == name)
+pub(crate) fn is_proxy_owned_header(name: &http::HeaderName) -> bool {
+    PROXY_OWNED_HEADERS.iter().any(|h| h == name)
 }
 
 pub(crate) trait HeaderTarget {
@@ -69,9 +85,9 @@ impl HeaderTarget for ResponseHeader {
 /// Apply a [`HeaderMod`] to `target`, skipping `set`/`add` entries for which
 /// `skip` returns `true`.
 ///
-/// On the **request path** pass [`is_owned_forwarding_header`] as `skip` so that
-/// route operators cannot re-inject proxy-owned forwarding headers after the
-/// client-strip step (#409, #410).  On the **response path** pass `|_| false`.
+/// On the **request path** pass [`is_proxy_owned_header`] as `skip` so that
+/// route operators cannot re-inject proxy-owned trust headers after the
+/// client-strip step (#409, #410, #663).  On the **response path** pass `|_| false`.
 ///
 /// The `remove` loop is never gated — silently removing a blocked header is
 /// harmless and prevents stale values reaching the backend.
@@ -97,7 +113,7 @@ pub(crate) fn apply_header_mod<H: HeaderTarget>(
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_header_mod, is_owned_forwarding_header};
+    use super::{apply_header_mod, is_proxy_owned_header};
     use coxswain_core::routing::HeaderMod;
     use pingora_http::{RequestHeader, ResponseHeader};
 
@@ -160,27 +176,28 @@ mod tests {
     }
 
     #[test]
-    fn is_owned_forwarding_header_recognises_all_four() {
+    fn is_proxy_owned_header_recognises_all_five() {
         for name in &[
             "forwarded",
             "x-forwarded-for",
             "x-forwarded-proto",
             "x-real-ip",
+            "x-ssl-client-cert",
         ] {
             let h = http::HeaderName::from_bytes(name.as_bytes()).unwrap();
             assert!(
-                is_owned_forwarding_header(&h),
-                "{name} must be recognised as a proxy-owned header (#410)"
+                is_proxy_owned_header(&h),
+                "{name} must be recognised as a proxy-owned header (#410, #663)"
             );
         }
     }
 
     #[test]
-    fn is_owned_forwarding_header_allows_custom_headers() {
+    fn is_proxy_owned_header_allows_custom_headers() {
         for name in &["x-team-id", "x-request-id", "x-proxy-engine"] {
             let h = http::HeaderName::from_bytes(name.as_bytes()).unwrap();
             assert!(
-                !is_owned_forwarding_header(&h),
+                !is_proxy_owned_header(&h),
                 "{name} must NOT be treated as a proxy-owned header (#410)"
             );
         }

@@ -167,7 +167,9 @@ On Kubernetes ≥ 1.30, the Helm chart installs a `ValidatingAdmissionPolicy` th
 
 ## Security
 
-Coxswain unconditionally strips `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Real-IP` from every upstream request before any route filter runs. The proxy owns these headers; client-supplied values are never forwarded. When PROXY protocol is enabled (via `--ingress-accept-proxy-protocol` for Ingress or a `ClientTrafficPolicy` for Gateway listeners), Coxswain injects a proxy-generated `Forwarded` header derived from the real PROXY-protocol client address.
+Coxswain unconditionally strips `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-Real-IP`, and `X-SSL-Client-Cert` from every upstream request before any route filter runs. The proxy owns these headers; client-supplied values are never forwarded. When PROXY protocol is enabled (via `--ingress-accept-proxy-protocol` for Ingress or a `ClientTrafficPolicy` for Gateway listeners), Coxswain injects a proxy-generated `Forwarded` header derived from the real PROXY-protocol client address. On an mTLS host with `auth-tls-pass-certificate-to-upstream: "true"`, it re-inserts `X-SSL-Client-Cert` carrying the verified client certificate after the strip, so a client's own copy of the header is always replaced rather than trusted.
+
+The same rule applies to `ext-auth`'s `allowedResponseHeaders`: every configured name is stripped from the client's request before the check runs, regardless of whether the auth service actually echoes it back. A route that allow-lists a header the auth service doesn't always return would otherwise let a client's forged value through untouched on the requests where it isn't returned.
 
 ## RBAC
 

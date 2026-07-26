@@ -7,6 +7,12 @@
 #   * extauth-grpc-malformed-closed omits failClosed (defaults true)  → deny (503).
 #   * extauth-grpc-malformed-open   sets failClosed: false            → allow (200).
 #
+# extauth-grpc-malformed-open also sets `allowedResponseHeaders: [x-forged-role]`
+# (#663): the check never runs to completion (malformed response), so nothing
+# legitimate can ever set this header on the fail-open path — the worst case for
+# a client-forged copy to survive if the strip weren't unconditional and
+# retry-safe.
+#
 # Gateway: coxswain-extauth-grpc-malformed on GATEWAY_HTTP_PORT.
 # Route hosts: gwextauthgrpcmalformedclosed.TESTNS.local,
 #              gwextauthgrpcmalformedopen.TESTNS.local, both path / -> echo-a:3000.
@@ -45,6 +51,8 @@ spec:
   backendRef:
     name: malformed-authz
     port: 9000
+  allowedResponseHeaders:
+    - x-forged-role
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute

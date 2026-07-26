@@ -77,10 +77,22 @@ pub struct CoxswainExternalAuthSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forward_body: Option<ForwardBodyConfig>,
 
-    /// Request header names forwarded to the auth service. When `None` or empty,
-    /// the GEP-1494 default set is sent (`Authorization`, `Location`,
-    /// `Proxy-Authenticate`, `Set-Cookie`, `WWW-Authenticate`) plus the pseudo
-    /// headers required to build the check request.
+    /// Request header names forwarded to the auth service — every other client
+    /// header (besides the pseudo-headers below) is withheld, so a client cannot
+    /// smuggle a credential or a same-named-as-trusted header to the auth
+    /// service just because the operator forgot to name it here. `Host`, the
+    /// request method, and path are always forwarded regardless of this list —
+    /// they identify the request being authorized, not client-supplied trust
+    /// material.
+    ///
+    /// When `None` or empty, GEP-1494's per-protocol default applies: `HTTP`
+    /// sends only `Authorization`; `GRPC` sends `Authorization`, `Location`,
+    /// `Proxy-Authenticate`, `Set-Cookie`, `WWW-Authenticate`.
+    ///
+    /// Capped at 32 entries: the proxy scans this list once per surviving
+    /// client header on every request, so an unbounded list is a per-request
+    /// CPU amplification a tenant who owns the CR fully controls.
+    #[schemars(length(max = 32))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_headers: Option<Vec<String>>,
 

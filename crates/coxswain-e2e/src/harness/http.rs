@@ -59,6 +59,20 @@ impl EchoResponse {
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name)?.get(0)?.as_str()
     }
+
+    /// All values of a request header as the echo server observed it, in receipt
+    /// order.  Empty when the header was absent.  Used to distinguish an
+    /// `insert`-style overwrite (exactly one value survives) from an `append`
+    /// that would leave a client-forged value alongside a proxy-set one — see
+    /// [`Self::header`] for the canonical-casing note.
+    #[must_use]
+    pub fn header_values(&self, name: &str) -> Vec<&str> {
+        self.headers
+            .get(name)
+            .and_then(serde_json::Value::as_array)
+            .map(|arr| arr.iter().filter_map(serde_json::Value::as_str).collect())
+            .unwrap_or_default()
+    }
 }
 
 /// HTTP test client pre-configured to send requests to the coxswain proxy.
@@ -499,6 +513,33 @@ pub async fn https_get_with_client_cert(
     client_cert_pem: &str,
     client_key_pem: &str,
 ) -> anyhow::Result<(u16, Option<EchoResponse>)> {
+    https_get_with_client_cert_and_headers(
+        host,
+        path,
+        tls_addr,
+        client_cert_pem,
+        client_key_pem,
+        &[],
+    )
+    .await
+}
+
+/// As [`https_get_with_client_cert`], plus `extra_headers` sent on the request —
+/// used to prove a header the proxy forwards conditionally (e.g. the verified
+/// `X-SSL-Client-Cert`) overwrites rather than appends a client-supplied forgery
+/// of the same name (#663).
+///
+/// # Errors
+///
+/// Same as [`https_get_with_client_cert`].
+pub async fn https_get_with_client_cert_and_headers(
+    host: &str,
+    path: &str,
+    tls_addr: std::net::SocketAddr,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+    extra_headers: &[(&str, &str)],
+) -> anyhow::Result<(u16, Option<EchoResponse>)> {
     // reqwest `Identity::from_pem` parses a PEM that contains both the certificate
     // chain and the private key in any order.  Concatenate cert + key.
     let pem = format!("{client_cert_pem}{client_key_pem}");
@@ -513,11 +554,11 @@ pub async fn https_get_with_client_cert(
         .context("build HTTPS client with client cert")?;
 
     let url = format!("https://{}:{}{path}", host, tls_addr.port());
-    let resp = client
-        .get(&url)
-        .send()
-        .await
-        .context("HTTPS GET with client cert")?;
+    let mut req = client.get(&url);
+    for (k, v) in extra_headers {
+        req = req.header(*k, *v);
+    }
+    let resp = req.send().await.context("HTTPS GET with client cert")?;
     let status = resp.status().as_u16();
     if resp.status().is_success() {
         let body = resp

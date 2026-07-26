@@ -303,15 +303,29 @@ pub const EXTERNAL_AUTH_ROUTE_DENY: &str = fixture!("external_auth_route_deny.ya
 /// applies to every route and is additive — a route cannot weaken it (both hosts
 /// return 403).
 pub const EXTERNAL_AUTH_GATEWAY_ADDITIVE: &str = fixture!("external_auth_gateway_additive.yaml");
-/// Gateway + `CoxswainExternalAuth` (protocol: GRPC, `ext-authz-grpc:9000`) +
-/// HTTPRoute `ExtensionRef` (#23 gRPC transport). Allowed with `x-ext-authz:
-/// allow`, denied (403) otherwise. Apply `backends::EXT_AUTHZ_GRPC` first.
+/// Gateway + `CoxswainExternalAuth` (protocol: GRPC, `ext-authz-grpc:9000`,
+/// `allowedHeaders: [x-ext-authz]` — required since #663, GEP-1494's GRPC
+/// default doesn't include it) + HTTPRoute `ExtensionRef` (#23 gRPC transport).
+/// Allowed with `x-ext-authz: allow`, denied (403) otherwise. Apply
+/// `backends::EXT_AUTHZ_GRPC` first.
 pub const EXTERNAL_AUTH_GRPC: &str = fixture!("external_auth_grpc.yaml");
+/// Clone of [`EXTERNAL_AUTH_GRPC`] whose `CoxswainExternalAuth` sets
+/// `allowedResponseHeaders: [x-ext-authz-check-result, x-forged-role]` (#663).
+/// Istio's sample always returns `x-ext-authz-check-result: allowed` on allow,
+/// but never returns `x-forged-role`. Used to verify the legitimately-returned
+/// header overwrites a client-forged copy, and the unechoed-but-allow-listed
+/// header is stripped from the client's request rather than reaching the
+/// backend. Apply `backends::ECHO` and `backends::EXT_AUTHZ_GRPC` first.
+pub const EXTERNAL_AUTH_GRPC_RESPONSE_HEADERS: &str =
+    fixture!("external_auth_grpc_response_headers.yaml");
 /// Gateway + two `CoxswainExternalAuth` CRs (protocol: GRPC,
 /// `malformed-authz:9000`) + two HTTPRoutes on distinct hosts (#615). The
 /// backend answers every check with a status-less `CheckResponse`: the
 /// `failClosed`-default CR denies (503), the `failClosed: false` CR allows
-/// (200). Apply `backends::ECHO` and `backends::MALFORMED_AUTHZ` first.
+/// (200) and sets `allowedResponseHeaders: [x-forged-role]` (#663) — the check
+/// never completes on this path, so it proves the strip applies even when
+/// nothing legitimate could ever have set the header. Apply `backends::ECHO`
+/// and `backends::MALFORMED_AUTHZ` first.
 pub const EXTERNAL_AUTH_GRPC_MALFORMED: &str = fixture!("external_auth_grpc_malformed.yaml");
 /// Gateway with an HTTPS (Terminate) listener and an HTTP listener, both routed
 /// through a `CoxswainExternalAuth` (protocol: GRPC, `scheme-authz:9000`)

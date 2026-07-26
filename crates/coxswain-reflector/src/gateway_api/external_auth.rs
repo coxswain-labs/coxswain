@@ -18,7 +18,8 @@ use coxswain_core::crd::{CoxswainExternalAuth, CoxswainExternalAuthSpec, Externa
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::reference_grants::{self, ReferenceGrantKey};
 use coxswain_core::routing::{
-    ExtAuthConfig, ExtAuthTransport, GrpcExtAuthConfig, HttpExtAuthConfig, IngressAuthConfig,
+    DEFAULT_ALLOWED_HEADERS_GRPC, DEFAULT_ALLOWED_HEADERS_HTTP, ExtAuthConfig, ExtAuthTransport,
+    GrpcExtAuthConfig, HttpExtAuthConfig, IngressAuthConfig, resolve_allowed_headers,
 };
 use k8s_openapi::api::core::v1::Service;
 #[cfg(test)]
@@ -77,14 +78,23 @@ pub(crate) fn resolve_spec(
         .map(|h| h.to_ascii_lowercase().into_boxed_str())
         .collect();
 
+    let raw_allowed_headers = spec.allowed_headers.as_deref().unwrap_or(&[]);
     let transport = match spec.protocol {
         ExternalAuthProtocol::Http => {
-            ExtAuthTransport::Http(HttpExtAuthConfig::new(response_headers, false))
+            let allowed_headers =
+                resolve_allowed_headers(raw_allowed_headers, DEFAULT_ALLOWED_HEADERS_HTTP);
+            ExtAuthTransport::Http(HttpExtAuthConfig::new(
+                allowed_headers,
+                response_headers,
+                false,
+            ))
         }
         ExternalAuthProtocol::Grpc => {
             // Envoy `envoy.service.auth.v3.Authorization/Check` (#23 P4). The proxy
             // sends the request context and maps the CheckResponse.
-            ExtAuthTransport::Grpc(GrpcExtAuthConfig::new(response_headers))
+            let allowed_headers =
+                resolve_allowed_headers(raw_allowed_headers, DEFAULT_ALLOWED_HEADERS_GRPC);
+            ExtAuthTransport::Grpc(GrpcExtAuthConfig::new(allowed_headers, response_headers))
         }
     };
     IngressAuthConfig::External(ExtAuthConfig::new(
@@ -435,6 +445,129 @@ mod tests {
         assert!(!newer_status.accepted, "newer policy loses → not Accepted");
         assert!(newer_status.conflicted);
         assert_eq!(newer_status.conflicted_reason, "TargetConflict");
+    }
+
+    // ── `allowedHeaders` resolution (#663) ────────────────────────────────────
+    //
+    // `resolve_allowed_headers` itself (the default-fallback logic) is tested at
+    // its definition in `coxswain_core::routing::common::auth` — these tests
+    // cover only the wiring here: does `resolve_spec` feed each protocol branch
+    // the *matching* default constant (an HTTP/GRPC constant swap would compile
+    // and pass every other test).
+
+    fn spec_with_allowed_headers(
+        protocol: ExternalAuthProtocol,
+        allowed_headers: Option<Vec<String>>,
+    ) -> CoxswainExternalAuthSpec {
+        CoxswainExternalAuthSpec {
+            backend_ref: coxswain_core::crd::ExternalAuthBackendRef {
+                group: String::new(),
+                kind: "Service".to_string(),
+                name: "authz".to_string(),
+                namespace: None,
+                port: 4180,
+            },
+            protocol,
+            timeout: None,
+            fail_closed: None,
+            forward_body: None,
+            allowed_headers,
+            allowed_response_headers: None,
+            target_refs: Vec::new(),
+        }
+    }
+
+    /// A resolvable backend (a ready `EndpointSlice` for `authz`/4180) so
+    /// `resolve_spec` reaches the transport branch instead of failing closed —
+    /// the Service itself is deliberately absent from the store, matching the
+    /// existing `endpoint_cache` fixture convention elsewhere in this crate:
+    /// `resolve_from_group` falls back to the requested port as the pod target
+    /// port when no Service entry maps it otherwise.
+    fn resolvable_authz_endpoints() -> crate::endpoints::pool::EndpointCache {
+        crate::tests::fixtures::endpoint_cache(vec![crate::tests::fixtures::make_slice(
+            "ns", "authz", "10.0.0.1",
+        )])
+    }
+
+    #[test]
+    fn resolve_spec_selects_the_http_default_on_the_http_branch() {
+        let spec = spec_with_allowed_headers(ExternalAuthProtocol::Http, None);
+        let resolved = resolve_spec(
+            &spec,
+            "ns",
+            &crate::tests::fixtures::empty_svc_store(),
+            &resolvable_authz_endpoints(),
+            &HashSet::new(),
+        );
+        let IngressAuthConfig::External(cfg) = resolved else {
+            panic!("expected External with a resolvable backend, got {resolved:?}");
+        };
+        let ExtAuthTransport::Http(http_cfg) = &cfg.transport else {
+            panic!("expected Http transport");
+        };
+        assert_eq!(
+            http_cfg
+                .allowed_headers
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            DEFAULT_ALLOWED_HEADERS_HTTP
+        );
+    }
+
+    #[test]
+    fn resolve_spec_selects_the_grpc_default_on_the_grpc_branch() {
+        let spec = spec_with_allowed_headers(ExternalAuthProtocol::Grpc, None);
+        let resolved = resolve_spec(
+            &spec,
+            "ns",
+            &crate::tests::fixtures::empty_svc_store(),
+            &resolvable_authz_endpoints(),
+            &HashSet::new(),
+        );
+        let IngressAuthConfig::External(cfg) = resolved else {
+            panic!("expected External with a resolvable backend, got {resolved:?}");
+        };
+        let ExtAuthTransport::Grpc(grpc_cfg) = &cfg.transport else {
+            panic!("expected Grpc transport");
+        };
+        assert_eq!(
+            grpc_cfg
+                .allowed_headers
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            DEFAULT_ALLOWED_HEADERS_GRPC
+        );
+    }
+
+    #[test]
+    fn resolve_spec_lower_cases_and_prefers_configured_names_over_the_default() {
+        let spec = spec_with_allowed_headers(
+            ExternalAuthProtocol::Http,
+            Some(vec!["Cookie".to_string(), "X-Request-Id".to_string()]),
+        );
+        let resolved = resolve_spec(
+            &spec,
+            "ns",
+            &crate::tests::fixtures::empty_svc_store(),
+            &resolvable_authz_endpoints(),
+            &HashSet::new(),
+        );
+        let IngressAuthConfig::External(cfg) = resolved else {
+            panic!("expected External with a resolvable backend, got {resolved:?}");
+        };
+        let ExtAuthTransport::Http(http_cfg) = &cfg.transport else {
+            panic!("expected Http transport");
+        };
+        assert_eq!(
+            http_cfg
+                .allowed_headers
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            ["cookie", "x-request-id"]
+        );
     }
 
     #[test]
