@@ -428,6 +428,41 @@ pub fn client_snapshots_applied_total() -> &'static IntCounterVec {
     })
 }
 
+/// Counter: cumulative upstream pointers a node processed, labelled by
+/// `outcome` (#665):
+///
+/// - `applied` — resolved to a legal upstream and swapped the routing target.
+/// - `noop` — named the upstream the node is already on (the #658 guard).
+/// - `rejected` — named an upstream outside the node's local policy.
+///
+/// `applied` and `noop` are emitted only for a live `PreferredUpstream`
+/// directive; `rejected` covers **both** writers to the upstream cell — a live
+/// directive and the pointer riding a bootstrap response — because a refusal
+/// matters identically whichever path delivered it.
+///
+/// `rejected` is the one that matters operationally: it should be flat at zero
+/// forever. Anything else means either a controller/leaf naming drift or a
+/// sender attempting to point this node at a discovery server of its choosing,
+/// and the two are indistinguishable from the leaf's side — so the counter
+/// makes the refusal observable rather than log-only.
+///
+/// # Panics
+///
+/// Panics on duplicate prometheus registration — see [`connected_proxies`].
+pub fn client_directives_total() -> &'static IntCounterVec {
+    static COUNTER: OnceLock<IntCounterVec> = OnceLock::new();
+    COUNTER.get_or_init(|| {
+        register_int_counter_vec!(
+            Opts::new(
+                "coxswain_discovery_client_directives_total",
+                "Cumulative upstream-repoint directives processed, by outcome (applied|noop|rejected)"
+            ),
+            &["outcome"]
+        )
+        .unwrap_or_else(|e| panic!("invariant: metric already registered — this is a bug: {e}"))
+    })
+}
+
 /// Histogram: wall-clock cost of one `apply::apply_message` call in
 /// [`crate::client`] — the "proxy apply" stage of the #513 convergence
 /// pipeline (staging every wire DTO and, on success, publishing the

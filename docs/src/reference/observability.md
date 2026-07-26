@@ -147,6 +147,7 @@ The control-plane gRPC channel between controller (server) and proxies (clients)
 | `coxswain_discovery_svid_issued_total` | Server | Counter | — (SVIDs the CA signed on the Bootstrap path; a flat line while SVIDs expire flags a stuck issuance path) |
 | `coxswain_discovery_client_bootstrap_total` | Client | Counter | `result` (`success`/`failure`) — proxy-side rotation outcome; sustained `failure` means the proxy is serving its last-good SVID toward expiry |
 | `coxswain_discovery_client_svid_expiry_seconds` | Client | Gauge | — (seconds until the proxy's current SVID `notAfter`; approaching `0` means rotation is not keeping up with the TTL) |
+| `coxswain_discovery_client_directives_total` | Client | Counter | `outcome` (`applied`/`noop`/`rejected`) — upstream pointers processed. `applied`/`noop` cover live repoint directives; `rejected` covers **both** writers to the upstream cell (a live directive and the pointer riding a bootstrap response). `rejected` means a pointer named an upstream outside the node's [upstream policy](../operations/control-plane-security.md#the-upstream-policy) and should be flat at zero forever; alert on any increase |
 
 ### Metric labels per Gateway
 

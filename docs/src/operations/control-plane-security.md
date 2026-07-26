@@ -167,7 +167,62 @@ The binding check is skipped only when no peer certificate is present — a path
 
 A [relay](../architecture/discovery-protocol.md#the-relay-tier) is both a discovery **client** (upstream, to the controller) and a discovery **server** (downstream, to proxies). Its ServiceAccount holds **zero Kubernetes verbs** — the same read-only invariant as a proxy — so it never touches the CA Secret, trust bundle, or the controller's `TokenReview`. Downstream it presents its own rotating SVID as its serving certificate and enforces the identical trust-domain and Gateway-scope-binding checks the controller does; it **rejects `Namespace` subscribes** (only the controller serves that scope).
 
-A proxy behind a relay is handed its upstream `(endpoint, expected server SA)` in the bootstrap response and verifies that identity on its stream — bootstrap always targets the controller directly, never a relay. Run **≥2 relay replicas** for availability; if a relay becomes unreachable, the proxy **re-bootstraps** to the controller (the always-up anchor) and is re-pointed at the current upstream. This repoints the control stream only — the data plane keeps serving its last-good snapshot throughout, so a relay rebalance never disrupts live traffic.
+A proxy behind a relay is handed its upstream `(endpoint, expected server SA)` in the bootstrap response, and can be re-pointed live by a `PreferredUpstream` directive on its stream — bootstrap always targets the controller directly, never a relay. Run **≥2 relay replicas** for availability; if a relay becomes unreachable, the proxy **re-bootstraps** to the controller (the always-up anchor) and is re-pointed at the current upstream. This repoints the control stream only — the data plane keeps serving its last-good snapshot throughout, so a relay rebalance never disrupts live traffic.
+
+### The upstream policy
+
+A node never accepts an identity from the network. An upstream pointer — whether it arrives in a bootstrap response or as a live directive — names an endpoint *and* the ServiceAccount whose SPIFFE identity is then trusted there. Deriving the identity from those fields would let whoever sent the pointer choose the server **and** the identity that server must present.
+
+Instead every node resolves the pointer against the three upstreams it can name from its own launch flags:
+
+| Upstream | Host it will accept | Identity it derives |
+|---|---|---|
+| Controller | `coxswain-controller-discovery.<install-ns>.svc` | `spiffe://<trust-domain>/ns/<install-ns>/sa/coxswain-controller` |
+| Its own namespace's relay | `coxswain-relay.<own-ns>.svc` | `spiffe://<trust-domain>/ns/<own-ns>/sa/coxswain-relay` |
+| Shared relay | `coxswain-relay-shared.<install-ns>.svc` | `spiffe://<trust-domain>/ns/<install-ns>/sa/coxswain-relay-shared` |
+
+`<install-ns>` is read from the node's own `--discovery-bootstrap-endpoint`, so no extra configuration is involved. A pointer may only **select** one of the three; it cannot define a fourth. The `expected_server_sa` it carries is cross-checked against the locally-derived value and rejected on disagreement, so it never becomes the *source* of the identity.
+
+Two things beyond the host are pinned as part of that identity:
+
+- The **scheme** must be `https`. This is not cosmetic — the gRPC client decides whether to run a TLS handshake at all from the scheme, so an `http://` pointer at an otherwise legal host would stream the node's entire routing world in cleartext with neither side's identity checked.
+- The name must end at `.svc` or the default cluster domain. `coxswain-relay.team-a.svc.example.net` satisfies a naive "third label is `svc`" reading while resolving to a name the sender controls.
+
+The **port** is deliberately not pinned. The controller's stream port is a controller-side flag a node never receives, and pinning host plus identity already makes the port irrelevant: whatever answers must present the pinned SVID.
+
+Only the **namespace** relay is scoped to the node's own namespace — a proxy in `team-a` will not accept `coxswain-relay.team-b.svc` even though that is a perfectly well-formed relay host.
+
+Every refusal logs the offending endpoint and increments `coxswain_discovery_client_directives_total{outcome="rejected"}`. **That counter should be flat at zero forever** — a non-zero value means either a naming drift between controller and node versions or a sender attempting to point the node elsewhere, and from the node's side the two are indistinguishable. Alert on it.
+
+What a refusal costs depends on where the node is:
+
+- A node that **already has an upstream** keeps it and keeps serving its last-good routing snapshot. The refusal is a no-op on the data plane.
+- A node still **cold** (no upstream yet) has nothing to fall back to — the routing-stream upstream is bootstrap-delivered, so there is no static endpoint. It stays unready with no routing table until it is offered an upstream it can verify.
+
+The second case is deliberate: the alternative is streaming routing configuration from a peer the node could not verify, which is exactly what the policy exists to prevent. A node that cannot establish a trusted upstream stays out of service rather than serving unverified configuration.
+
+!!! note "Why there is no end-to-end test of a refusal"
+
+    Coxswain normally ships an end-to-end test for both the happy and the failing path of every feature. The refusal path here is a deliberate exception, because it cannot be provoked from outside the system.
+
+    A node only ever receives an upstream pointer *from its current upstream*. Injecting a refusable one therefore means first making a hostile server that node's upstream — which is the exact repoint this policy blocks. Standing up an impostor at one of the three legal host names does not help either: it would then need that upstream's SVID, so it fails at the mTLS handshake and exercises a different control entirely. The proxy and relay Deployments are controller-rendered, so their flags cannot be tampered with from outside.
+
+    The resolution logic is a pure function and is covered exhaustively by unit tests, including the scheme, userinfo, extra-label, and foreign-namespace cases. The end-to-end suite instead asserts that a legitimate repoint is *resolved through* the policy — that it is genuinely on the live path — by requiring `outcome="applied"` to be non-zero and `outcome="rejected"` to be zero after a real relay repoint.
+
+### What a compromised relay can and cannot do
+
+A relay is provisioned by the controller, but that governs how it is *created*, not its runtime integrity. Treat relay compromise (a node-level compromise where it is scheduled, or namespace RBAC that permits `pods/exec` on it) as in scope — the same assumed-compromise posture as the read-only-proxy invariant above.
+
+**Cannot:** point its leaves at a discovery server of its choosing. The upstream policy bounds every leaf to the three upstreams above, and reaching any of them requires that upstream's own SVID.
+
+**Cannot:** write to Kubernetes, read the CA private key, or serve a `Namespace` subscribe.
+
+**Can:** serve arbitrary routing content to the leaves it legitimately fronts, and withhold or delay updates to them. Snapshots carry no controller signature independent of the transport, so a leaf verifies *who it is talking to*, not *who authored the configuration*. The reach is the relay's own leaf set:
+
+- A **namespace relay** fronts the dedicated proxies in its namespace — routing for that namespace only.
+- The **shared relay** fronts every shared-pool proxy, so its reach is the cluster-wide shared routing world. It runs in the install namespace, where Kubernetes RBAC access is already equivalent to controller access; node-level compromise is what separates the two.
+
+If that residual matters for your threat model, run without the relay tier: proxies then stream directly from the controller and no intermediary sees or forwards configuration. End-to-end payload provenance, which would close it, is not yet implemented.
 
 ## Configuration
 

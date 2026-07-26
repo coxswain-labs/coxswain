@@ -11,8 +11,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use coxswain_admin::{AdminServer, EventSources, OperatorAggregator};
 use coxswain_controller::{
-    IngressPorts, OperatorConfig, RELAY_DISCOVERY_PORT, RELAY_SERVICE_ACCOUNT,
-    SHARED_RELAY_SERVICE_ACCOUNT, StatusWriterConfig, spawn_status_writer,
+    CONTROLLER_DISCOVERY_SERVICE, IngressPorts, OperatorConfig, RELAY_DISCOVERY_PORT,
+    RELAY_SERVICE_ACCOUNT, SHARED_RELAY_SERVICE_ACCOUNT, StatusWriterConfig, spawn_status_writer,
 };
 use coxswain_core::health::HealthRegistry;
 use coxswain_core::ownership::ObjectKey;
@@ -165,8 +165,8 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     // moves. The bootstrap service reuses the same resolver so a leaf's initial
     // upstream and its live repoints are computed identically.
     let controller_stream_endpoint = format!(
-        "https://coxswain-controller-discovery.{}.svc:{}",
-        args.common.pod_namespace, args.controller.discovery_port
+        "https://{}.{}.svc:{}",
+        CONTROLLER_DISCOVERY_SERVICE, args.common.pod_namespace, args.controller.discovery_port
     );
     let upstream_resolver = Arc::new(UpstreamResolverConfig {
         controller_endpoint: controller_stream_endpoint,

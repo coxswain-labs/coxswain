@@ -48,6 +48,17 @@ pub const RELAY_SERVICE_ACCOUNT: &str = "coxswain-relay";
 /// and the `expected_server_sa` the pool verifies stay in lockstep by construction.
 pub const SHARED_RELAY_SERVICE_ACCOUNT: &str = "coxswain-relay-shared";
 
+/// Fixed name of the controller's routing-stream (`Subscribe`) `Service`.
+///
+/// Distinct from the bootstrap `Service`
+/// (`coxswain-controller-discovery-bootstrap`), which is all-replicas so SVID
+/// issuance survives leader churn while this one is leader-selected. Public so
+/// `coxswain-bin` builds both the controller-side upstream resolver and each
+/// leaf's [`coxswain_discovery::UpstreamPolicy`] from the *same* constant the
+/// controller endpoint is formatted with — the endpoint leaves are pointed at
+/// and the host they will accept stay in lockstep by construction.
+pub const CONTROLLER_DISCOVERY_SERVICE: &str = "coxswain-controller-discovery";
+
 /// The dedicated relay's downstream routing (Stream) port.
 ///
 /// Public so `coxswain-bin` builds the discovery best-upstream resolver (#601)

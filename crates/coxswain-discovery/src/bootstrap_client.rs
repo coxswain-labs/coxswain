@@ -33,7 +33,7 @@ use crate::auth::{DiscoveryBootstrapClientTls, SpiffeMatcher};
 use crate::proto::v1::{BootstrapRequest, discovery_client::DiscoveryClient as TonicClient};
 use crate::subscription::Scope;
 use crate::svid::{SharedSvid, SvidMaterial};
-use crate::upstream::{SharedUpstream, UpstreamTarget, expected_server_matcher};
+use crate::upstream::{SharedUpstream, UpstreamPolicy, UpstreamTarget, expected_server_matcher};
 use crate::version::WIRE_VERSION;
 
 // ── BootstrapClientConfig ─────────────────────────────────────────────────────
@@ -64,7 +64,23 @@ pub struct BootstrapClientConfig {
     pub scope: Scope,
     /// Namespace to attribute an upstream whose endpoint is not cluster service
     /// DNS (test loopback) when building the returned upstream's matcher (#601).
+    ///
+    /// Only consulted when `upstream_policy` is `None`.
     pub fallback_namespace: String,
+    /// The closed set of upstreams the bootstrap response may point this node at
+    /// (#665).
+    ///
+    /// The response's `(upstream_endpoint, expected_server_sa)` is resolved
+    /// through this rather than being used to derive the expected SVID directly,
+    /// so a node never takes an identity off the wire on *any* path. Bootstrap is
+    /// already controller-authenticated, so this is defence in depth here — but
+    /// it makes the invariant global and gives both writers to the upstream cell
+    /// one code path.
+    ///
+    /// `None` (default) keeps the pre-#665 wire-derived behaviour and is
+    /// **test-only**; `coxswain-bin` always populates it. Set after construction
+    /// — `new` is already at the project's argument-count ceiling.
+    pub upstream_policy: Option<UpstreamPolicy>,
     /// Initial backoff duration (default: 250 ms).
     pub backoff_base: Duration,
     /// Maximum backoff ceiling (default: 30 s).
@@ -91,6 +107,7 @@ impl BootstrapClientConfig {
             controller_namespace: controller_namespace.into(),
             scope,
             fallback_namespace: fallback_namespace.into(),
+            upstream_policy: None,
             backoff_base: Duration::from_millis(250),
             backoff_cap: Duration::from_secs(30),
         }
@@ -407,15 +424,56 @@ async fn do_bootstrap(
     // Resolve the delivered upstream pointer (#601). An empty endpoint means the
     // controller sent no directive (additive field, or a plaintext test path) —
     // the client keeps its configured fallback endpoint.
-    let upstream = (!resp.upstream_endpoint.is_empty()).then(|| {
-        let matcher = expected_server_matcher(
-            &config.trust_domain,
-            &resp.upstream_endpoint,
-            &resp.expected_server_sa,
-            &config.fallback_namespace,
-        );
-        UpstreamTarget::new(resp.upstream_endpoint, matcher)
-    });
+    //
+    // The pointer goes through the node's own upstream policy (#665) rather than
+    // deriving the expected SVID from the response's own fields.
+    //
+    // A refused pointer leaves the cell untouched. On a node that already has an
+    // upstream that is a true no-op — it keeps streaming from where it is. On a
+    // COLD node the cell is still empty, and since #601 there is no static
+    // fallback endpoint to fall back to, so the client reports `NoUpstream` and
+    // backs off until a pointer it accepts arrives: no routing table, and the
+    // pod never becomes Ready.
+    //
+    // That is deliberate rather than an oversight. The alternative is streaming
+    // routing from a peer the node could not verify, which is the outcome the
+    // policy exists to prevent — a node that cannot establish a trusted upstream
+    // must stay out of service. It is also not silently stuck: every refusal
+    // logs the offending endpoint and increments the `rejected` counter, and the
+    // unready `routing_table_loaded` check names the subsystem.
+    let upstream = if resp.upstream_endpoint.is_empty() {
+        None
+    } else {
+        match config.upstream_policy.as_ref() {
+            Some(policy) => match policy.resolve(&resp.upstream_endpoint, &resp.expected_server_sa)
+            {
+                Ok(target) => Some(target),
+                Err(e) => {
+                    warn!(
+                        endpoint = %resp.upstream_endpoint,
+                        expected_server_sa = %resp.expected_server_sa,
+                        error = %e,
+                        "discovery bootstrap: refusing delivered upstream outside this node's \
+                         upstream policy; this node will not stream routing until it is offered \
+                         an upstream it can verify"
+                    );
+                    crate::metrics::client_directives_total()
+                        .with_label_values(&["rejected"])
+                        .inc();
+                    None
+                }
+            },
+            None => {
+                let matcher = expected_server_matcher(
+                    &config.trust_domain,
+                    &resp.upstream_endpoint,
+                    &resp.expected_server_sa,
+                    &config.fallback_namespace,
+                );
+                Some(UpstreamTarget::new(resp.upstream_endpoint, matcher))
+            }
+        }
+    };
 
     Ok((material, resp.not_after_unix, upstream))
 }

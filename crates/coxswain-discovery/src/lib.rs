@@ -76,7 +76,8 @@ pub use subscription::Scope;
 pub use svid::{SharedSvid, SvidMaterial};
 pub use transport::serve_discovery_with_tls;
 pub use upstream::{
-    SharedUpstream, UpstreamTarget, expected_server_matcher, namespace_from_service_dns,
+    SharedUpstream, UpstreamNames, UpstreamPolicy, UpstreamRejection, UpstreamTarget,
+    expected_server_matcher, namespace_from_service_dns,
 };
 pub use version::{ContentHash, WIRE_VERSION};
 pub use wire::{scope_from_wire, scope_to_wire};
