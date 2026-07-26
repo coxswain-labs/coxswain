@@ -213,6 +213,19 @@ controller:
   # Gateway status. Required for cert-manager HTTP-01 + external-dns.
   statusAddress: ""
 
+  # COXSWAIN_EGRESS_ALLOW_CIDR — CIDR ranges the controller may connect to,
+  # beyond the public internet, when fetching a tenant-authored
+  # JwtAuth.spec.jwks.remote.uri (#664). A tenant with create-rights in their
+  # own namespace controls this URL; empty (the default) refuses every
+  # reserved/special-purpose destination (RFC 1918, loopback, link-local —
+  # including cloud metadata — CGNAT, documentation ranges, multicast), so a
+  # tenant can't turn the privileged controller into an SSRF proxy against the
+  # cluster network. List a CIDR (e.g. the cluster's Service CIDR) to let
+  # remote.uri name an in-cluster identity provider. A listed CIDR is also the
+  # ONLY destination class where a plaintext http:// remote.uri is accepted;
+  # every other destination, listed or not, must use https://.
+  egressAllowCidrs: []
+
   # Enable the Gateway API surface (GatewayClass, HTTPRoute, etc.). When
   # false, --disable-gateway-api is passed to both the controller and the
   # shared proxy; no Gateway API reflectors are started and gateway_api_crds

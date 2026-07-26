@@ -42,7 +42,7 @@ pub fn run() -> Result<()> {
     })?;
 
     match role {
-        Role::Controller(controller_args) => run_controller(controller_args),
+        Role::Controller(controller_args) => run_controller(*controller_args),
         Role::Proxy(proxy_args) => match proxy_args.scope() {
             ProxyScope::Shared => run_proxy_shared(proxy_args),
             ProxyScope::Dedicated { name, namespace } => {

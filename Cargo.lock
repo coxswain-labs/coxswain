@@ -814,6 +814,7 @@ dependencies = [
  "coxswain-core",
  "coxswain-discovery",
  "coxswain-reflector",
+ "ipnet",
  "k8s-openapi",
  "kube",
  "kube-leader-election",

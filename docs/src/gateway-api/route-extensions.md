@@ -128,8 +128,9 @@ spec:
 Semantics:
 
 - `spec.jwks` is exactly one of:
-  - `remote.uri` — a JWKS endpoint. **Resolved by the controller, never the proxy** (the Istio model, not Envoy's default proxy-side fetch): the read-only data plane never egresses to an identity provider. `remote.refreshInterval` (default `5m`) bounds the refetch cadence; a shorter upstream `Cache-Control: max-age` is honored instead.
+  - `remote.uri` — a JWKS endpoint. **Resolved by the controller, never the proxy** (the Istio model, not Envoy's default proxy-side fetch): the read-only data plane never egresses to an identity provider. `remote.refreshInterval` (default `5m`, floored at `30s`) bounds the refetch cadence; the response's `Cache-Control` header is not consulted.
   - `inline.jwks` — a JWKS object given directly in the spec (no controller fetch).
+- `remote.uri` is tenant-authored — anyone with create-rights on `JwtAuth` in a namespace controls what the privileged controller fetches. The controller refuses `remote.uri` unless it is `https://` (or a plaintext `http://` destination the operator explicitly allowlisted) and unless it resolves to a public IP, so a route can't be used to make the controller probe the cluster network or cloud metadata. Reaching an in-cluster identity provider requires the operator to list its CIDR via `--egress-allow-cidr` (see [Configuration reference](../reference/configuration.md)); until then, `remote.uri` naming an in-cluster address fails closed exactly like an unreachable one.
 - The bearer token is read from `Authorization: Bearer <token>` by default, or from `fromHeaders` when set.
 - Signature verification uses **the key's own declared `alg`**, never the token header's `alg` (prevents algorithm-confusion attacks). Only asymmetric algorithms are supported (RS/PS/ES/EdDSA) — JWKS is inherently asymmetric.
 - `iss` must match `spec.issuer`. `aud` is checked against `spec.audiences` only when `audiences` is non-empty.

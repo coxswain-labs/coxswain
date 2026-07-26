@@ -171,6 +171,8 @@ Coxswain unconditionally strips `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Pro
 
 The same rule applies to `ext-auth`'s `allowedResponseHeaders`: every configured name is stripped from the client's request before the check runs, regardless of whether the auth service actually echoes it back. A route that allow-lists a header the auth service doesn't always return would otherwise let a client's forged value through untouched on the requests where it isn't returned.
 
+`JwtAuth.spec.jwks.remote.uri` is tenant-authored (any namespace with create-rights on `JwtAuth` controls it), and the controller — a privileged, cluster-network-reachable pod — fetches it every 30 s–5 min. The controller refuses `remote.uri` unless it is `https://` and resolves to a public IP: every reserved/special-purpose range (RFC 1918 private space, loopback, link-local — including cloud metadata at `169.254.169.254` — CGNAT, documentation ranges, multicast) is denied by default, closing off SSRF against the cluster network or cloud metadata service. Set `controller.egressAllowCidrs` (`--egress-allow-cidr`) to permit specific additional destinations — typically an in-cluster identity provider's Service CIDR. A CIDR listed there is also the only destination class where a plaintext `http://` `remote.uri` is accepted; every other destination requires `https://`. See [JwtAuth](../gateway-api/route-extensions.md#jwt-authentication) and the [configuration reference](../reference/configuration.md).
+
 ## RBAC
 
 The default `ClusterRole` grants Coxswain cluster-wide:

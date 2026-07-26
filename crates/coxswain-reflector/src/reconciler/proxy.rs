@@ -256,6 +256,14 @@ pub struct ReconcilerOptions {
     /// egress to an identity provider (the Istio model, not Envoy's default
     /// proxy-side fetch); see [`crate::jwks`].
     pub fetch_remote_jwks: bool,
+    /// Destinations, beyond the public internet, the controller may connect
+    /// to when fetching a tenant-authored `JwtAuth.spec.jwks.remote.uri`
+    /// (`--egress-allow-cidr`, #664). Empty (the default) means
+    /// public-internet-only — every reserved/special-purpose range (RFC 1918,
+    /// loopback, link-local/cloud-metadata, CGNAT, …) is refused. Only
+    /// meaningful when [`Self::fetch_remote_jwks`] is `true`; see
+    /// `crate::egress`.
+    pub egress_allow_cidrs: Vec<ipnet::IpNet>,
     /// Bounds for the adaptive rebuild debounce (#512). Replaces the
     /// reconciler's original fixed 500 ms coalescing timer — see
     /// `super::debounce::settle`.
@@ -282,6 +290,7 @@ impl Default for ReconcilerOptions {
             ingress_event_tx: None,
             enable_gateway_api: true,
             fetch_remote_jwks: false,
+            egress_allow_cidrs: Vec::new(),
             enable_ingress: true,
             debounce: crate::DebounceSettings::default(),
             liveness_gate: None,
@@ -1064,6 +1073,8 @@ struct ReconcilerConfig {
     enable_ingress: bool,
     /// See [`ReconcilerOptions::fetch_remote_jwks`].
     fetch_remote_jwks: bool,
+    /// See [`ReconcilerOptions::egress_allow_cidrs`].
+    egress_allow_cidrs: Vec<ipnet::IpNet>,
     /// See [`ReconcilerOptions::debounce`].
     debounce: crate::DebounceSettings,
     /// See [`ReconcilerOptions::liveness_gate`].
@@ -1444,6 +1455,7 @@ impl BackgroundService for SharedProxyReconciler {
             enable_gateway_api: self.opts.enable_gateway_api,
             enable_ingress: self.opts.enable_ingress,
             fetch_remote_jwks: self.opts.fetch_remote_jwks,
+            egress_allow_cidrs: self.opts.egress_allow_cidrs.clone(),
             debounce: self.opts.debounce,
             liveness_gate: self.opts.liveness_gate.clone(),
             status_queue: self.opts.status_queue.clone(),
@@ -2355,6 +2367,7 @@ async fn spawn_tasks(
         enable_gateway_api,
         enable_ingress,
         fetch_remote_jwks,
+        egress_allow_cidrs,
         debounce,
         liveness_gate,
         status_queue,
@@ -2869,6 +2882,7 @@ async fn spawn_tasks(
     if fetch_remote_jwks {
         let cache = jwks_cache.clone();
         let jwt_auths_for_fetch = jwt_auth_reader.clone();
+        let egress_policy = crate::egress::EgressPolicy::new(egress_allow_cidrs.clone());
         // Single connection-pooling client for JWKS fetches — mirrors the
         // ext_authz sub-request client (bin/lib.rs); rustls backend, no
         // native-tls dep. `run()` installs the crypto provider before any
@@ -2876,10 +2890,33 @@ async fn spawn_tasks(
         // rustls-init failure is environmental, not a logic bug, so degrade
         // (skip the fetcher — JWT validation fails closed on absent keys) rather
         // than crashing the controller.
-        match reqwest::Client::builder().use_rustls_tls().build() {
+        //
+        // SSRF guard (#664, see `crate::egress`): redirects are disabled
+        // outright (a validated destination must not be silently swapped for
+        // an unvalidated one via a 3xx hop) and DNS resolution is pinned to
+        // `GuardedResolver`, which filters every resolved address through
+        // `egress_policy` before the connector ever dials it. `https_only`
+        // stays off — `crate::jwks::fetch_one`'s own scheme check allows an
+        // operator-allowlisted `http` destination (an in-cluster identity
+        // provider without TLS); every other scheme is already rejected there.
+        // `no_proxy()` is load-bearing, not cosmetic: reqwest's default client
+        // reads `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` from the environment and,
+        // when set, dials the *proxy's* host — `GuardedResolver` would then
+        // vet only the proxy address while the tenant's real target travels
+        // inside the CONNECT tunnel, unresolved and unchecked. A controller
+        // pod that needs an egress proxy for its own outbound traffic must
+        // route it some other way (e.g. a transparent network-level proxy),
+        // not via these env vars.
+        match reqwest::Client::builder()
+            .use_rustls_tls()
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(crate::egress::GuardedResolver::new(egress_policy.clone()))
+            .no_proxy()
+            .build()
+        {
             Ok(jwks_client) => {
                 set.spawn(async move {
-                    crate::jwks::run(cache, jwt_auths_for_fetch, jwks_client).await;
+                    crate::jwks::run(cache, jwt_auths_for_fetch, jwks_client, egress_policy).await;
                 });
             }
             Err(e) => {

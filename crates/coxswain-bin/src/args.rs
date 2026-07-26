@@ -98,8 +98,11 @@ pub(crate) struct ServeArgs {
 /// Pod role — selects which subsystems run and which flags are accepted.
 #[derive(Subcommand, Debug)]
 pub(crate) enum Role {
-    /// Reconciler + status writer pod.
-    Controller(ControllerRoleArgs),
+    /// Reconciler + status writer pod. Boxed: `ControllerRoleArgs` grew past
+    /// `Proxy`/`Relay`'s size once `--egress-allow-cidr` (#664) was added,
+    /// which otherwise leaves every `Role` value as large as the biggest
+    /// variant regardless of which role was actually selected.
+    Controller(Box<ControllerRoleArgs>),
     /// Read-only data plane pod. Use `--shared` for the shared pool or
     /// `--dedicated` for a per-Gateway pod.
     Proxy(ProxyRoleArgs),
@@ -1038,6 +1041,27 @@ pub(crate) struct ControllerArgs {
         value_parser = humantime::parse_duration,
     )]
     pub reconcile_debounce_max: Duration,
+
+    /// Comma-separated CIDR ranges the controller may connect to, beyond the
+    /// public internet, when fetching a tenant-authored
+    /// `JwtAuth.spec.jwks.remote.uri` (#664).
+    ///
+    /// A tenant with create-rights in their own namespace controls this URL;
+    /// without this flag the controller refuses every reserved/special-purpose
+    /// destination (RFC 1918 private space, loopback, link-local — including
+    /// cloud metadata at `169.254.169.254` — CGNAT, documentation ranges,
+    /// multicast) so a tenant can't turn the privileged controller into an SSRF
+    /// proxy against the cluster network. List a CIDR here to let `remote.uri`
+    /// name an in-cluster identity provider (e.g. its Service ClusterIP range).
+    ///
+    /// A listed CIDR is also the **only** class of destination where a
+    /// plaintext `http://` `remote.uri` is ever accepted (an in-cluster
+    /// provider without TLS) — every other destination, listed or not, must
+    /// use `https://`.
+    ///
+    /// Example: `10.96.0.0/12` (a typical Service CIDR).
+    #[arg(long, env = "COXSWAIN_EGRESS_ALLOW_CIDR", value_delimiter = ',')]
+    pub egress_allow_cidr: Vec<IpNet>,
 }
 
 impl ControllerArgs {
