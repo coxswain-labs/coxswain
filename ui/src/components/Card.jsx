@@ -34,7 +34,7 @@ export function CardHeader({ name, badge }) {
 export function CardFooter({ left, right }) {
   return (
     <div class="card-foot">
-      <span style="font-size:12px;color:var(--muted)">{left}</span>
+      <span class="card-foot-left">{left}</span>
       {right}
     </div>
   );

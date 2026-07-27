@@ -186,6 +186,10 @@ img { max-width: 100%; }
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
+/* The drawer repeats the brand as a static <span>, not the header's <a> — it's
+   not a navigation target here (the header link + close button already cover
+   that), just a label. */
+.nav-drawer-header .nav-brand { pointer-events: none; }
 .nav-drawer-close {
   display: flex; align-items: center; justify-content: center;
   width: var(--touch); height: var(--touch);
@@ -402,6 +406,8 @@ section { margin-bottom: 32px; }
   flex-wrap: wrap;
 }
 .breadcrumb a { color: var(--blue); cursor: pointer; }
+/* Current (non-link) crumb — brighter than the trail's default muted color. */
+.breadcrumb-current { color: var(--text); }
 /* Inline-flex + stretch centers the chevron glyph against the smaller crumb
    text instead of trusting its (off-center) font baseline. */
 .breadcrumb-sep {
@@ -628,6 +634,7 @@ section { margin-bottom: 32px; }
   margin-top: 12px; padding-top: 12px;
   border-top: 1px solid var(--border);
 }
+.card-foot-left { font-size: 12px; color: var(--muted); }
 .card-foot-right { display: inline-flex; align-items: center; gap: 8px; }
 
 /* ── Badges ──────────────────────────────────────────────────────────────── */
@@ -1267,6 +1274,11 @@ input[type=checkbox] { accent-color: var(--blue); }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 .error-msg { color: var(--red); }
+/* Inline "no results" text within an otherwise-populated list (fleet
+   inventory sections, event feed) — smaller and plainer than `.empty-box`,
+   which is a standalone contained box. */
+.list-empty { color: var(--muted); font-size: 13px; }
+.list-empty--padded { padding: 12px; }
 
 /* ── Topology canvas ─────────────────────────────────────────────────────── */
 /* Lag notice — a pill in the canvas top bar, centered horizontally across the

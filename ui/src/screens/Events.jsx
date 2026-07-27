@@ -112,7 +112,7 @@ export function Events() {
       {/* Feed */}
       <div class="ev-feed" role="log" aria-live={paused ? 'off' : 'polite'} aria-label="Event log">
         {visible.length === 0 && (
-          <div style="color:var(--muted);font-size:13px;padding:12px">
+          <div class="list-empty list-empty--padded">
             {events.length === 0 ? 'Waiting for events…' : 'No events match the active filter.'}
           </div>
         )}

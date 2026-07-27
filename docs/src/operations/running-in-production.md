@@ -213,7 +213,7 @@ adminAuth:
 
 Only the Secret's *name* reaches the controller; it reads the Secret with the RBAC it already holds and re-reads it every 30 seconds, so rotating the credential needs no restart. Only bcrypt is accepted — a plaintext or SHA-1 entry is rejected at load. If the Secret is deleted or becomes unreadable the admin surface returns `503`; it never falls back to unauthenticated, so a typo in the name cannot silently reopen it. A transient apiserver error does *not* clear the credential — the last known-good one is kept until the apiserver gives a definitive answer.
 
-Authentication covers everything that exposes cluster data: `/api/v1/{manifests,fleet,routing,problems,events,topology}`, `/api/v1/pods/*/logs`, and the operator UI at `/`. Three endpoints stay open because gating them would break the product rather than protect it:
+Authentication covers everything that exposes cluster data: `/api/v1/{manifests,fleet,routing,problems,events,topology}`, `/api/v1/pods/*/logs`, and the operator UI at `/`, `/app.js`, and `/app.css`. Three endpoints stay open because gating them would break the product rather than protect it:
 
 | Endpoint | Why it stays open |
 |---|---|
@@ -222,6 +222,8 @@ Authentication covers everything that exposes cluster data: `/api/v1/{manifests,
 | `/api/v1/topology/local` | The same fan-out, for the merged HA topology view. |
 
 None of the three returns manifests, environment variables, pod logs, or routing tables, and all three remain behind the `NetworkPolicy` fence. The health port is a separate listener and is never authenticated — kubelet probes keep working untouched.
+
+**Content-Security-Policy (always on, not opt-in).** The three UI responses (`/`, `/app.js`, `/app.css`) carry a strict `Content-Security-Policy` — `default-src 'none'` with narrow, genuinely-true allowances for `script-src 'self'`, `style-src 'self'`, `img-src 'self' data:`, and `connect-src 'self'` — plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. This is defense in depth for the operator UI's one HTML-injection sink (a manifest viewer that renders syntax-highlighted, tenant-supplied JSON): even if that sink were ever compromised, the CSP blocks a same-origin fetch/script escalation and stops the browser from executing content sniffed as script. It requires no configuration and cannot be disabled.
 
 Basic auth is deliberately not offered on proxy and relay admin ports: those serve only `/metrics` and `/api/v1/health`, and those pods hold zero Kubernetes RBAC by design, so they cannot read a credential Secret. `NetworkPolicy` is the control there.
 

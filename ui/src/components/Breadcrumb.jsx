@@ -17,7 +17,7 @@ export function Breadcrumb({ items }) {
           {item.onClick ? (
             <a key={item.label} onClick={item.onClick}>{item.label}</a>
           ) : (
-            <span key={item.label} style="color:var(--text)">{item.label}</span>
+            <span key={item.label} class="breadcrumb-current">{item.label}</span>
           )}
         </>
       ))}

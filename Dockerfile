@@ -2,9 +2,11 @@
 
 # Multi-stage build for coxswain.
 #
-# Stage 0 (ui-builder): compile the Vite + Preact operator UI into a single
-#                       self-contained dist/index.html that the Rust build
-#                       embeds at compile time via include_str!.
+# Stage 0 (ui-builder): compile the Vite + Preact operator UI into
+#                       dist/{index.html,app.js,app.css} that the Rust build
+#                       embeds at compile time via include_str! (three files,
+#                       not one — #669, so the served CSP can claim
+#                       script-src 'self' truthfully instead of inlining).
 # Stage 1 (planner):   generate a cargo-chef recipe for the dependency tree.
 # Stage 2 (builder):   cook deps into a cached layer (BoringSSL builds here,
 #                      ~5-10 min on amd64) then compile the coxswain binary.
