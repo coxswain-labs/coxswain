@@ -35,7 +35,12 @@ pub enum KeyAlgorithm {
 ///
 /// Validation happens once in the controller before insertion; the proxy re-parses
 /// on each SNI handshake (cheap relative to the handshake itself).
-#[derive(Debug)]
+///
+/// `Debug` is hand-implemented to redact `cert_pem` and `key_pem` — `key_pem` is
+/// this listener's private key, and `TlsStore`/`PortTlsStore` embed this type
+/// directly, so a future `debug!(?store)` must not dump every listener's key
+/// (#668, same pattern as `BackendClientCert` in
+/// `routing::common::upstream_tls`).
 pub struct TlsCert {
     /// Raw PEM-encoded certificate chain.
     pub cert_pem: Vec<u8>,
@@ -95,6 +100,18 @@ impl TlsCert {
 impl PartialEq for TlsCert {
     fn eq(&self, other: &Self) -> bool {
         self.cert_pem == other.cert_pem && self.key_pem == other.key_pem
+    }
+}
+
+impl std::fmt::Debug for TlsCert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsCert")
+            .field("cert_pem", &"<redacted>")
+            .field("key_pem", &"<redacted>")
+            .field("source", &self.source)
+            .field("not_after", &self.not_after)
+            .field("key_algorithm", &self.key_algorithm)
+            .finish()
     }
 }
 
@@ -1055,6 +1072,45 @@ mod tests {
                 .with_key_algorithm(algo)
                 .with_not_after(not_after),
         )
+    }
+
+    // ── Redacting Debug (#668) ────────────────────────────────────────────────
+
+    #[test]
+    fn tls_cert_debug_redacts_pem_bytes_but_keeps_diagnostics() {
+        let c = TlsCert::new(
+            b"-----BEGIN CERTIFICATE-----".to_vec(),
+            b"-----BEGIN PRIVATE KEY-----".to_vec(),
+            "ns/secret".to_string(),
+        );
+        let out = format!("{c:?}");
+        assert!(out.contains("redacted"), "must redact PEM fields: {out}");
+        assert!(out.contains("ns/secret"), "must keep source: {out}");
+        assert!(
+            !out.contains("PRIVATE KEY") && !out.contains("CERTIFICATE"),
+            "must not leak PEM bytes: {out}"
+        );
+    }
+
+    #[test]
+    fn tls_store_debug_transitively_redacts_certs() {
+        // TlsStore keeps its derived Debug — this pins that the derive still
+        // redacts once TlsCert's Debug is hand-implemented.
+        let mut b = TlsStoreBuilder::new();
+        b.add_cert(
+            "example.com",
+            cert_algo(1, "ns/secret", KeyAlgorithm::Ecdsa, None),
+        );
+        let store = b.build();
+        let out = format!("{store:?}");
+        assert!(
+            out.contains("redacted"),
+            "must redact cert PEM fields: {out}"
+        );
+        assert!(
+            !out.contains("[1, 99]") && !out.contains("[1, 107]"),
+            "must not leak raw PEM bytes via the default Vec<u8> Debug format: {out}"
+        );
     }
 
     // ── TlsStore lookups ──────────────────────────────────────────────────────
