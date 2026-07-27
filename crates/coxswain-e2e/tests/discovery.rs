@@ -354,7 +354,7 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
     // pre-outage holder is filtered by the pod-Ready check) and scrape it.
     let h2 = Harness::start().await?;
     use coxswain_e2e::harness::leader;
-    leader::wait_for_leader_reconciled(&h.client, Duration::from_secs(60)).await?;
+    leader::wait_for_leader_reconciled(&h.client, Duration::from_secs(120)).await?;
 
     // Gate on the proxy actually reconnecting BEFORE creating the post-restart
     // route: poll until shared-proxy health clears Degraded and returns to
@@ -743,6 +743,219 @@ async fn invalid_sa_token_is_rejected_with_event() -> anyhow::Result<()> {
         },
     )
     .await?;
+
+    Ok(())
+}
+
+/// Render the rogue relay pod's phase, restart count, and first container's
+/// state, for a poll timeout message that can distinguish "the pod never
+/// even started streaming" (image pull, scheduling, a bad mount) from a
+/// genuine roster-gate regression — a bare metric-delta message can't tell
+/// those apart.
+async fn rogue_relay_pod_status(client: &kube::Client, ns: &str) -> String {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    let list = match pods
+        .list(&ListParams::default().labels("app=rogue-relay"))
+        .await
+    {
+        Ok(list) => list,
+        Err(e) => return format!("could not list rogue-relay pods: {e}"),
+    };
+    let Some(pod) = list.items.into_iter().next() else {
+        return "no rogue-relay pod found yet".to_owned();
+    };
+    let phase = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.clone())
+        .unwrap_or_else(|| "<unknown>".to_owned());
+    let container = pod
+        .status
+        .as_ref()
+        .and_then(|s| s.container_statuses.as_ref())
+        .and_then(|cs| cs.first());
+    let restarts = container.map(|c| c.restart_count).unwrap_or(0);
+    let state = container
+        .and_then(|c| c.state.as_ref())
+        .map(|s| format!("{s:?}"))
+        .unwrap_or_else(|| "<no container status>".to_owned());
+    format!("phase={phase} restarts={restarts} container_state={state}")
+}
+
+/// Sad path (#682): a pod running the real `serve relay --shared` binary role
+/// under an ordinary (non-`coxswain-relay-shared`) ServiceAccount bootstraps
+/// successfully — bootstrap authenticates any ServiceAccount that passes
+/// TokenReview, with no identity allowlist — and its upstream `RosterReport`
+/// is silently dropped, never folded into the node registry.
+///
+/// This is the live-cluster proof for the sender-identity gate (#666)'s
+/// `rejected` outcome: no new hostile-client code is needed, since the
+/// SHIPPED relay binary always wires its roster reporter regardless of which
+/// identity it runs under — enforcing that identity is the *server's* job,
+/// not the client's. The controller is the sole diagnostic emitter; there is
+/// no Warning Event for this path (unlike the wrong-audience bootstrap
+/// rejection above), so the Prometheus counter is the only observable.
+#[tokio::test]
+async fn rogue_relay_identity_is_rejected_by_roster_gate() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "roster-reject").await?;
+    copy_trust_bundle(&h.client, &ns.name).await?;
+
+    // Baseline BEFORE the rogue pod exists — `rejected` is a cumulative
+    // process-lifetime counter shared across every serial test on this
+    // controller pod, and legitimately moves on ordinary namespace/relay
+    // teardown elsewhere in the suite (#666), so the assertion below is a
+    // delta against this baseline, never an absolute value.
+    let (_leader_pf, server_url) = leader_discovery_metrics(&h.client).await?;
+    let rejected_before = scrape_metric_label_sum(
+        &server_url,
+        "coxswain_discovery_roster_reports_total",
+        "result=\"rejected\"",
+    )
+    .await
+    .unwrap_or(0.0);
+
+    // The real `serve relay --shared` binary, correctly audienced (bootstrap
+    // must succeed — the roster fold is what's under test, not bootstrap
+    // itself), but with NO `serviceAccountName` override: it runs as this
+    // fresh namespace's `default` SA, which is neither `coxswain-relay-shared`
+    // nor in the install namespace, so it fails the shared-relay identity
+    // check on both counts.
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    let rogue: Deployment = serde_json::from_value(json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": { "name": "rogue-relay", "namespace": ns.name },
+        "spec": {
+            "replicas": 1,
+            "selector": { "matchLabels": { "app": "rogue-relay" } },
+            "template": {
+                "metadata": { "labels": { "app": "rogue-relay" } },
+                "spec": {
+                    "containers": [{
+                        "name": "coxswain",
+                        "image": "coxswain:e2e",
+                        "imagePullPolicy": "Never",
+                        "args": ["serve", "relay", "--shared"],
+                        "env": [
+                            { "name": "POD_NAME", "valueFrom": { "fieldRef": { "fieldPath": "metadata.name" } } },
+                            { "name": "POD_NAMESPACE", "valueFrom": { "fieldRef": { "fieldPath": "metadata.namespace" } } },
+                            { "name": "COXSWAIN_DISCOVERY_ENDPOINT", "value": "https://coxswain-controller-discovery.coxswain-system.svc:50051" },
+                            { "name": "COXSWAIN_DISCOVERY_BOOTSTRAP_ENDPOINT", "value": "https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052" },
+                            { "name": "COXSWAIN_DISCOVERY_SA_TOKEN_PATH", "value": "/var/run/secrets/coxswain/discovery-token/token" },
+                            { "name": "COXSWAIN_DISCOVERY_CA_BUNDLE_PATH", "value": "/var/run/secrets/coxswain/trust-bundle/ca.crt" },
+                            { "name": "COXSWAIN_DISCOVERY_TRUST_DOMAIN", "value": "cluster.local" }
+                        ],
+                        "volumeMounts": [
+                            { "name": "discovery-token", "mountPath": "/var/run/secrets/coxswain/discovery-token", "readOnly": true },
+                            { "name": "trust-bundle", "mountPath": "/var/run/secrets/coxswain/trust-bundle", "readOnly": true }
+                        ]
+                    }],
+                    "volumes": [
+                        {
+                            "name": "discovery-token",
+                            "projected": {
+                                "sources": [{
+                                    "serviceAccountToken": {
+                                        "path": "token",
+                                        "audience": "coxswain-discovery",
+                                        "expirationSeconds": 3600
+                                    }
+                                }]
+                            }
+                        },
+                        {
+                            "name": "trust-bundle",
+                            "configMap": { "name": "coxswain-discovery-trust", "optional": false }
+                        }
+                    ]
+                }
+            }
+        }
+    }))?;
+    deployments.create(&PostParams::default(), &rogue).await?;
+
+    // The client queues an initial RosterReport behind its Subscribe on every
+    // session (`client.rs`'s `stream_until_closed`, #585) — it does not wait
+    // for the relay's downstream registry to change, so the rogue reports
+    // promptly regardless of whether any leaf ever attaches to it. Poll past
+    // bootstrap + dial latency; the timeout message also renders the rogue
+    // pod's own status, since the most likely failure here is the pod never
+    // reaching the point of streaming at all (image pull, scheduling, a bad
+    // mount), which a metric-only message can't distinguish from a genuine
+    // gate regression.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || {
+            let server_url = server_url.clone();
+            let client = h.client.clone();
+            let ns_name = ns.name.clone();
+            async move {
+                let now = scrape_metric_label_sum(
+                    &server_url,
+                    "coxswain_discovery_roster_reports_total",
+                    "result=\"rejected\"",
+                )
+                .await;
+                let pod = rogue_relay_pod_status(&client, &ns_name).await;
+                format!(
+                    "controller coxswain_discovery_roster_reports_total{{result=\"rejected\"}} \
+                     to exceed the {rejected_before} baseline; currently: {now:?}; rogue pod: {pod}"
+                )
+            }
+        },
+        || {
+            let server_url = server_url.clone();
+            async move {
+                let now = scrape_metric_label_sum(
+                    &server_url,
+                    "coxswain_discovery_roster_reports_total",
+                    "result=\"rejected\"",
+                )
+                .await?;
+                (now > rejected_before).then_some(())
+            }
+        },
+    )
+    .await?;
+
+    // Defense-in-depth cross-check: the rogue DOES connect (Subscribe/connect
+    // is scope-only, not identity-gated — only its RosterReport is under
+    // test), so its own node_id legitimately appears in the topology as an
+    // ordinary SharedPool node. What must never happen is the fold: it must
+    // never be marked `is_relay`, and no OTHER node may claim it as `parent`.
+    let pod_name = Api::<Pod>::namespaced(h.client.clone(), &ns.name)
+        .list(&ListParams::default().labels("app=rogue-relay"))
+        .await?
+        .items
+        .into_iter()
+        .next()
+        .and_then(|p| p.metadata.name)
+        .context("the rogue relay pod must exist by the time its RosterReport was rejected")?;
+    let topology_url = h.controller_admin_url("/api/v1/topology");
+    let topology = fetch_topology(&topology_url).await?;
+    let rogue_node = find_node(&topology, &pod_name).with_context(|| {
+        format!(
+            "the rogue relay's own node_id ('{pod_name}') must appear as an ordinary connected node"
+        )
+    })?;
+    assert_eq!(
+        rogue_node.get("is_relay").and_then(|v| v.as_bool()),
+        Some(false),
+        "the rogue relay's RosterReport must never fold — its own node must never be marked is_relay"
+    );
+    let folded_under_rogue = topology
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .into_iter()
+        .flatten()
+        .any(|n| n.get("parent").and_then(|v| v.as_str()) == Some(pod_name.as_str()));
+    assert!(
+        !folded_under_rogue,
+        "no node may appear folded (parent == rogue node_id) — the rejected RosterReport \
+         must never have produced children"
+    );
 
     Ok(())
 }
@@ -1753,7 +1966,7 @@ async fn controller_restart_full_resync_reconverges() -> anyhow::Result<()> {
     // arbitrary port-forward can land on the standby (leader=0 forever), and a
     // held forward can wedge if it dials the admin port before it serves.
     use coxswain_e2e::harness::leader;
-    leader::wait_for_leader_reconciled(&h.client, Duration::from_secs(60)).await?;
+    leader::wait_for_leader_reconciled(&h.client, Duration::from_secs(120)).await?;
 
     // Wait for the proxy to clear Degraded, asserting per-tick that traffic never
     // drops throughout the reconnect window.

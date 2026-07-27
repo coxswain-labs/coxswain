@@ -49,6 +49,7 @@
 //! the admin UI convergence panel (T8) and by the controller's Gateway
 //! `Programmed` readiness gate (#531).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -69,18 +70,22 @@ use crate::version::WIRE_VERSION;
 use crate::wire::scope_from_wire;
 
 mod authz;
+mod identity;
 mod source;
 mod stream;
 mod view_cache;
 
 pub use authz::{DenyAll, ProvisionedRelayAuthorizer, RelayAuthzConfig, ScopeAuthorizer};
 pub use source::SnapshotSource;
-pub(crate) use stream::{NOT_LEADER_MSG, NOT_LEADER_NEEDLE};
+pub(crate) use stream::{
+    NODE_ID_COLLISION_MSG, NODE_ID_COLLISION_NEEDLE, NOT_LEADER_MSG, NOT_LEADER_NEEDLE,
+};
 // The gate itself is exercised in prod by `view_cache::view_for`; this crate-level
 // alias exists only so the cross-module `relay` unit tests can reach it.
 #[cfg(test)]
 pub(crate) use view_cache::gateway_svid_denied;
 
+use identity::{LiveNodeIdentities, claim_node_id};
 use stream::{StreamServices, StreamSubscription, node_scope_from, read_subscribe, run_stream};
 use view_cache::{SharedViewCache, ViewCacheState};
 
@@ -133,6 +138,10 @@ pub struct DiscoveryService {
     /// `broadcast`) so a leaf subscribing after a directive is published still reads
     /// it on open. `None` on the controller's own server (it originates directives).
     directive_tx: Option<watch::Sender<Option<p::PreferredUpstream>>>,
+    /// `node_id` collision guard (#682): the authenticated identity currently
+    /// holding each connected `node_id`. Checked and claimed at `stream()` open
+    /// time, released by `run_stream`'s shutdown paths. See [`identity`].
+    node_identities: LiveNodeIdentities,
 }
 
 impl DiscoveryService {
@@ -157,6 +166,7 @@ impl DiscoveryService {
             upstream_resolver: None,
             relay_changed_rx: None,
             directive_tx: None,
+            node_identities: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -346,32 +356,36 @@ impl Discovery for DiscoveryService {
 
         let node_id = sub.node_id.clone();
 
-        // node_id collision guard (#666): `node_id` is entirely client-chosen
-        // and unauthenticated, and `connect()` below replaces any existing row
-        // with the same key by design (it tolerates a node's own rapid
-        // reconnect race). Without this guard, any authenticated peer could
-        // subscribe with a live relay's `node_id`, silently clearing its
-        // `is_relay` row, and — on that impostor session's immediate
-        // disconnect — `evict_children` would wipe the real relay's entire
-        // folded subtree without ever sending a `RosterReport`. Refusing a new
-        // connect over a row already marked `is_relay` closes that without a
-        // new identity-tracking subsystem: a relay's row is only ever
-        // `is_relay` via `apply_roster`, which runs after this same relay's own
-        // Subscribe already registered it, so this precisely targets "a
-        // node_id with a live folded subtree." A legitimate relay that loses
-        // its own reconnect race gets `ALREADY_EXISTS`; the client has no
-        // special classification for it, so it takes the ordinary exponential
-        // reconnect backoff (`client.rs`'s ceiling, not the fast `NOT_LEADER`
-        // retry band) — still self-healing once the stale session's own
-        // `disconnect()` clears the row, just not fast.
-        if self.registry.is_relay_node(&node_id) {
+        // node_id collision guard (#666, generalized #682): `node_id` is
+        // entirely client-chosen and unauthenticated, and `connect()` below
+        // replaces any existing row with the same key by design (it
+        // tolerates a node's own rapid reconnect race). Without this guard,
+        // any authenticated peer could subscribe with another node's live
+        // `node_id`, silently clearing its row — for a relay specifically,
+        // that also clears `is_relay`, and on the impostor session's
+        // immediate disconnect `evict_children` would wipe the real relay's
+        // entire folded subtree without ever sending a `RosterReport`.
+        // Binding every claimed `node_id` to the peer's own identity
+        // fingerprint (`identity::claim_node_id`) closes this for every
+        // stream, not just relay rows, while still permitting the same
+        // identity's own rapid reconnect through unchanged — a claim is only
+        // ever refused for a genuinely DIFFERENT fingerprint, never this
+        // node's own reconnect. `ALREADY_EXISTS` therefore means a real
+        // collision (e.g. two pods that ended up with the same
+        // `POD_NAME`-derived node_id), not a transient race; the client
+        // classifies it (`client::is_node_id_collision`) only for a clearer
+        // log message, and deliberately takes ordinary exponential backoff
+        // rather than a fast-retry band — the condition persists until the
+        // other identity disconnects, so retrying fast would just hammer
+        // this server.
+        let fingerprint = peer_svid.as_ref().map(PeerSvid::fingerprint);
+        let Some(node_id_claim) = claim_node_id(&self.node_identities, &node_id, &fingerprint)
+        else {
             crate::metrics::streams_total()
                 .with_label_values(&["rejected"])
                 .inc();
-            return Err(Status::already_exists(
-                "discovery: node_id already registered as a connected relay",
-            ));
-        }
+            return Err(Status::already_exists(NODE_ID_COLLISION_MSG));
+        };
 
         // Register the node before spawning so connect() is visible
         // even if the first snapshot races with a load().
@@ -392,6 +406,7 @@ impl Discovery for DiscoveryService {
             relay_changed_rx: self.relay_changed_rx.clone(),
             directive_tx: self.directive_tx.clone(),
             authorizer: self.authorizer.clone(),
+            node_identities: self.node_identities.clone(),
         };
         let (tx, rx) = mpsc::channel::<Result<p::ServerMessage, Status>>(4);
 
@@ -399,6 +414,7 @@ impl Discovery for DiscoveryService {
             node_id,
             scope,
             peer_svid,
+            node_id_claim,
         };
         tokio::spawn(async move {
             run_stream(subscription, services, inbound, tx).await;
@@ -1544,6 +1560,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn node_id_collision_message_carries_the_client_needle() {
+        assert!(
+            NODE_ID_COLLISION_MSG.contains(NODE_ID_COLLISION_NEEDLE),
+            "client::is_node_id_collision matches on the needle; a reworded \
+             NODE_ID_COLLISION_MSG that drops it silently breaks fast-retry \
+             across the whole proxy fleet"
+        );
+    }
+
     #[tokio::test]
     async fn stream_rejected_with_failed_precondition_when_not_leader() {
         // Gate starts `false`: a replica accepts no streams until its first
@@ -2625,11 +2651,20 @@ mod tests {
         drop(tx);
     }
 
-    /// The #666 node_id collision guard: a second stream claiming a `node_id`
-    /// already marked `is_relay` is refused `ALREADY_EXISTS`, and the first
-    /// relay's folded subtree is untouched.
+    /// The #682 generalized node_id guard binds a claim to an identity
+    /// fingerprint, not to `is_relay` alone — so the SAME identity's own
+    /// reconnect must still pass through unchanged, over a live relay's row
+    /// exactly as it would over any other. Over the plaintext test harness
+    /// two connections fingerprint identically (no `PeerSvid` on either side
+    /// — the guard's documented, accepted plaintext-path limitation, since
+    /// production discovery mandates mTLS), so this is also the only shape a
+    /// real stream can exercise here; refusal of a genuinely DIFFERENT
+    /// identity is unit-tested directly against `identity::claim_node_id`
+    /// (`server::identity::tests::different_identity_is_refused`) — no
+    /// plaintext harness can present two distinct identities to prove that
+    /// negative over an actual stream.
     #[tokio::test]
-    async fn colliding_node_id_against_live_relay_is_refused() {
+    async fn same_identity_reconnect_to_a_live_relay_node_id_is_not_refused() {
         let h = start_harness_with_authorizer(Arc::new(AllowAllNamespaces)).await;
         let (relay_tx, _relay_rx) =
             open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "team-a"))
@@ -2646,22 +2681,14 @@ mod tests {
         .await;
         assert!(h.registry.load().nodes["relay-1"].is_relay);
 
-        // A second stream claims the same node_id — any scope, any identity.
-        let err = open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "team-a"))
-            .await
-            .expect_err("a node_id collision against a live relay must be refused");
-        assert_eq!(err.code(), tonic::Code::AlreadyExists, "got: {err:?}");
+        // A second stream reconnects under the SAME node_id, same (absent)
+        // identity — the guard must not refuse this.
+        let (relay_tx_2, _relay_rx_2) =
+            open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "team-a"))
+                .await
+                .expect("a same-identity reconnect must not be refused");
 
-        // The real relay's row and its folded subtree are untouched.
-        let snap = h.registry.load();
-        assert!(
-            snap.nodes["relay-1"].is_relay,
-            "the impostor's rejected connect must not clear the real relay's row"
-        );
-        assert!(
-            snap.nodes.contains_key("phantom-child"),
-            "the real relay's folded subtree must survive the collision attempt"
-        );
         drop(relay_tx);
+        drop(relay_tx_2);
     }
 }

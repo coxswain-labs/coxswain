@@ -3,4 +3,5 @@
 //! These tests span multiple modules and require a real TLS handshake, so they
 //! live here rather than inline in individual source files.
 
+mod node_id_collision;
 mod scope_binding;

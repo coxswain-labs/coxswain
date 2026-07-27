@@ -147,11 +147,12 @@ where
         // FIN/RST — a conntrack eviction, an asymmetric network partition) can
         // linger from this side (#666): without an active probe, a dead stream
         // sits in `inbound.message()` indefinitely, so its `NodeRegistryHandle`
-        // row is never `disconnect()`-ed. That matters beyond a stale gauge — the
-        // `is_relay_node` node_id-collision guard refuses a relay's own
-        // reconnect while its prior row is still live, so an unreaped dead
-        // session would lock a relay out of ever reconnecting under the same
-        // node_id. Matches the cadence the client already keeps alive with
+        // row is never `disconnect()`-ed. That matters beyond a stale gauge —
+        // the node's registry row and any folded subtree (a relay's leaves)
+        // stay keyed to the dead session until it is reaped, so a stalled
+        // reap directly delays how quickly the #531 convergence gate and the
+        // topology view notice the node is actually gone. Matches the cadence
+        // the client already keeps alive with
         // (`DiscoveryClientConfig::http2_keep_alive_interval` default, 30s).
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))

@@ -160,8 +160,9 @@ pub async fn wait_for_new_leader(
 ///
 /// [`pod_admin_forward`] polls up to 30 s for the local port to bind, which is
 /// right for a one-shot caller and wrong inside a poll loop: one bad tick would
-/// consume half a 60 s budget. Capping it keeps the tick cost near the poll
-/// interval, so the wait actually gets the ~120 attempts its interval implies.
+/// consume most of the caller's budget. Capping it keeps the tick cost near the
+/// poll interval, so the wait actually gets close to the number of attempts its
+/// interval implies.
 const FORWARD_TICK_BUDGET: Duration = Duration::from_secs(4);
 
 /// Wait until the CURRENT Lease holder reports `leader=1` plus at least one
@@ -175,11 +176,16 @@ const FORWARD_TICK_BUDGET: Duration = Duration::from_secs(4);
 /// forward accepts the local connection, fails the upstream dial once, and
 /// never recovers — starving the entire wait on a dead tunnel).
 ///
-/// The per-tick forward is capped at [`FORWARD_TICK_BUDGET`]. Without that cap
-/// the defence starves itself: [`pod_admin_forward`] waits up to 30 s for the
-/// port to bind, so in exactly the post-outage window this gate exists for — the
-/// pod Ready before its admin listener is up — a 60 s budget is two attempts
-/// deep, not the ~120 the 500 ms poll interval suggests.
+/// The per-tick forward is capped at [`FORWARD_TICK_BUDGET`], but each tick
+/// still spawns a real `kubectl port-forward` child process
+/// (`start_port_forward`), so the tick cost is never free — it competes for
+/// the same fork/exec and API-server capacity every other concurrently-running
+/// e2e test's own port-forwards are also drawing on. Callers pass a timeout of
+/// **at least 120 s** for this reason: under a serial suite's full concurrent
+/// load, 60 s was observed to occasionally miss a window where the condition
+/// was already true (confirmed via the timeout message's own post-deadline
+/// scrape) purely because too few ticks landed inside the budget, not because
+/// the controller was actually failing to converge.
 ///
 /// # Errors
 ///

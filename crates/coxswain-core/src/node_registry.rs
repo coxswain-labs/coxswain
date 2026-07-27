@@ -781,23 +781,6 @@ impl NodeRegistryHandle {
         self.0.map.lock().gateway_node_count(namespace, name)
     }
 
-    /// Whether `node_id` currently names a connected, `is_relay`-marked row —
-    /// i.e. a relay with a live folded subtree (#666).
-    ///
-    /// Lock-only, no snapshot clone (same style as [`Self::gateway_node_count`]):
-    /// the discovery server's `stream()` handler calls this on every new
-    /// Subscribe to refuse a `node_id` collision against a live relay, so it
-    /// must stay cheap on the accept hot path.
-    #[must_use]
-    pub fn is_relay_node(&self, node_id: &str) -> bool {
-        self.0
-            .map
-            .lock()
-            .nodes
-            .get(node_id)
-            .is_some_and(|e| e.is_relay)
-    }
-
     /// Remove a node's row on stream exit.
     ///
     /// No-op if the node is not present.

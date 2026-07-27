@@ -109,13 +109,17 @@ fn source_with_two_gateways() -> SnapshotSource {
 /// Start a real `DiscoveryService` behind mTLS, wrapping each accepted stream
 /// in `PeerSvidStream` so the handler receives `PeerSvid` in request extensions.
 ///
-/// Returns the bound socket address.  The server runs as a detached
+/// Returns the bound socket address and a handle to the service's node
+/// registry (so callers can inspect connected-node state, e.g. the #682
+/// node_id collision guard's tests). The server runs as a detached
 /// `tokio::spawn` task and lives until the test runtime drops.
-async fn start_service(server_tls: &DiscoveryServerTls) -> std::net::SocketAddr {
+pub(super) async fn start_service(
+    server_tls: &DiscoveryServerTls,
+) -> (std::net::SocketAddr, NodeRegistryHandle) {
     let source = source_with_two_gateways();
     let registry = NodeRegistryHandle::new();
     let (_, rebuild_rx) = tokio::sync::watch::channel(0u64);
-    let svc = DiscoveryService::new(source, registry, rebuild_rx);
+    let svc = DiscoveryService::new(source, registry.clone(), rebuild_rx);
 
     let acceptor = server_tls
         .acceptor()
@@ -143,10 +147,14 @@ async fn start_service(server_tls: &DiscoveryServerTls) -> std::net::SocketAddr 
             .serve_with_incoming(incoming),
     );
 
-    addr
+    (addr, registry)
 }
 
-/// Open a discovery stream over TLS, sending a `Subscribe` with `scope`.
+/// Open a discovery stream over TLS, sending a `Subscribe` with `scope`,
+/// under the fixed test node_id `"test-dedicated-proxy"`. Drops the outbound
+/// sender immediately (closing the client's request body right after
+/// `Subscribe`) — fine for these tests, which only ever read one message and
+/// never need the session to outlive that read.
 ///
 /// Returns the response stream on success, or the gRPC `Status` on rejection
 /// (PERMISSION_DENIED, INVALID_ARGUMENT, TLS error, etc.).
@@ -155,13 +163,40 @@ async fn try_stream_with_scope(
     client_tls: &DiscoveryClientTls,
     scope: Scope,
 ) -> Result<tonic::Streaming<p::ServerMessage>, tonic::Status> {
+    let (_tx, stream) =
+        try_stream_with_node_id_and_scope(addr, client_tls, "test-dedicated-proxy", scope).await?;
+    Ok(stream)
+}
+
+/// Open a discovery stream over TLS, sending a `Subscribe` with `node_id` and
+/// `scope`.
+///
+/// Returns the outbound sender alongside the response stream — the caller
+/// **must** keep the sender alive for as long as the session should stay
+/// open: dropping it closes the client's request body (EOF), which
+/// `run_stream` reads as `Ok(None)` and answers by tearing the session down
+/// (including releasing its `node_id` claim, #682), same as a real client
+/// disconnecting. Returns the gRPC `Status` on rejection (PERMISSION_DENIED,
+/// INVALID_ARGUMENT, ALREADY_EXISTS, TLS error, etc.).
+pub(super) async fn try_stream_with_node_id_and_scope(
+    addr: std::net::SocketAddr,
+    client_tls: &DiscoveryClientTls,
+    node_id: &str,
+    scope: Scope,
+) -> Result<
+    (
+        tokio::sync::mpsc::Sender<ClientMessage>,
+        tonic::Streaming<p::ServerMessage>,
+    ),
+    tonic::Status,
+> {
     use crate::proto::v1::discovery_client::DiscoveryClient as TonicClient;
     use tokio_stream::wrappers::ReceiverStream;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<ClientMessage>(4);
     tx.send(ClientMessage {
         kind: Some(CKind::Subscribe(p::Subscribe {
-            node_id: "test-dedicated-proxy".into(),
+            node_id: node_id.to_owned(),
             wire_version: WIRE_VERSION,
             scope: Some(scope_to_wire(&scope)),
         })),
@@ -178,7 +213,7 @@ async fn try_stream_with_scope(
     let channel = ep.connect_lazy();
     let mut grpc = TonicClient::new(channel);
     let response = grpc.stream(ReceiverStream::new(rx)).await?;
-    Ok(response.into_inner())
+    Ok((tx, response.into_inner()))
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -204,7 +239,7 @@ async fn gateway_svid_matching_scope_accepted() {
         expected_server: SpiffeMatcher::Exact(CONTROLLER_SVID.into()),
     };
 
-    let addr = start_service(&server_tls).await;
+    let (addr, _registry) = start_service(&server_tls).await;
 
     let mut inbound = try_stream_with_scope(
         addr,
@@ -250,7 +285,7 @@ async fn gateway_svid_mismatched_scope_permission_denied() {
         expected_server: SpiffeMatcher::Exact(CONTROLLER_SVID.into()),
     };
 
-    let addr = start_service(&server_tls).await;
+    let (addr, _registry) = start_service(&server_tls).await;
 
     // `gw-a-coxswain` SVID but claiming `other-gw`'s scope — mismatch.
     let err = try_stream_with_scope(

@@ -571,6 +571,7 @@ impl Supervisor {
             const FAILED: StreamEnd = StreamEnd {
                 applied: false,
                 not_leader: false,
+                node_id_collision: false,
                 repoint: false,
             };
             let end = match build_channel(&self.config) {
@@ -616,7 +617,17 @@ impl Supervisor {
             // to the cap before the SVID arrives. A not-leader rejection is an
             // expected routing outcome (#531): it neither resets nor bumps the
             // exponent, and takes the fast-retry band instead of the
-            // exponential delay.
+            // exponential delay. A node_id collision (#682) is deliberately
+            // NOT given the same fast-retry treatment: `claim_node_id` always
+            // grants this identity's own reconnect (see `identity.rs`), so an
+            // `ALREADY_EXISTS` here can only mean a genuinely DIFFERENT
+            // identity currently holds this `node_id` — a persistent
+            // misconfiguration (e.g. two pods that ended up with the same
+            // `POD_NAME`-derived node_id, which Kubernetes only guarantees
+            // unique within one namespace, not cluster-wide), not a
+            // self-healing race. Fast-retrying it would just hammer the
+            // controller forever instead of backing off toward the cap while
+            // an operator resolves the collision.
             if end.applied || forced_reconnect {
                 attempt = 0;
             } else if !end.not_leader {
@@ -710,6 +721,7 @@ impl Supervisor {
         const CLOSED: StreamEnd = StreamEnd {
             applied: false,
             not_leader: false,
+            node_id_collision: false,
             repoint: false,
         };
         let (tx, rx) = mpsc::channel::<p::ClientMessage>(4);
@@ -767,6 +779,29 @@ impl Supervisor {
                 return StreamEnd {
                     applied: false,
                     not_leader: true,
+                    node_id_collision: false,
+                    repoint: false,
+                };
+            }
+            Err(e) if is_node_id_collision(&e) => {
+                // A DIFFERENT identity currently holds this node_id (#682) —
+                // `claim_node_id` always grants this identity's own
+                // reconnect, so this cannot be this node's own prior session.
+                // Not self-healing on any predictable timescale: it persists
+                // until the other identity disconnects or an operator
+                // resolves the collision (e.g. two pods that ended up with
+                // the same `POD_NAME`-derived node_id — Kubernetes only
+                // guarantees that name unique within one namespace, not
+                // cluster-wide). Ordinary exponential backoff, not a
+                // fast-retry band; see `StreamEnd::node_id_collision`.
+                warn!(
+                    "discovery client: node_id already claimed by a different identity; \
+                     backing off (this does not self-heal without operator intervention)"
+                );
+                return StreamEnd {
+                    applied: false,
+                    not_leader: false,
+                    node_id_collision: true,
                     repoint: false,
                 };
             }
@@ -887,6 +922,7 @@ impl Supervisor {
                                 return StreamEnd {
                                     applied: applied_this_session,
                                     not_leader: false,
+                                    node_id_collision: false,
                                     repoint: true,
                                 };
                             }
@@ -977,6 +1013,7 @@ impl Supervisor {
         StreamEnd {
             applied: applied_this_session,
             not_leader: ended_not_leader,
+            node_id_collision: false,
             repoint: false,
         }
     }
@@ -1302,7 +1339,7 @@ const NOT_LEADER_RETRY_SLOW_MAX_MS: u64 = 2_000;
 /// cold clients escalate to the full cap.
 const RECONNECT_ATTEMPT_CLAMP_WITH_SNAPSHOT: u32 = 4;
 
-/// Outcome of one stream session, as the supervisor's backoff input (#531).
+/// Outcome of one stream session, as the supervisor's backoff input (#531, #682).
 struct StreamEnd {
     /// At least one snapshot was applied this session (resets the exponential
     /// backoff — the connection was healthy).
@@ -1310,6 +1347,18 @@ struct StreamEnd {
     /// The session ended with the server's not-leader rejection (at accept or
     /// via mid-stream demotion) — retry fast instead of backing off.
     not_leader: bool,
+    /// The session ended because the server refused this `Subscribe`'s
+    /// `node_id` as already claimed by a **different** identity (#682) —
+    /// always an accept-time rejection, never mid-stream. `claim_node_id`
+    /// always grants this identity's own reconnect, so this can only mean a
+    /// genuinely different identity currently holds `node_id` — a persistent
+    /// misconfiguration, not a transient race. Deliberately takes the
+    /// ordinary exponential backoff (bumps `attempt` like any other failure)
+    /// rather than a fast-retry band: fast-retrying a collision that will not
+    /// resolve on its own would just hammer the controller. Carried only for
+    /// a clearer log message distinguishing it from a generic connect
+    /// failure.
+    node_id_collision: bool,
     /// The session ended because a `PreferredUpstream` directive repointed this
     /// client (#601), or a forced-reconnect watch fired. An intentional
     /// reconnect: reset the backoff exponent and dial the new target.
@@ -1324,6 +1373,7 @@ impl StreamEnd {
         Self {
             applied: self.applied,
             not_leader: self.not_leader,
+            node_id_collision: self.node_id_collision,
             repoint: true,
         }
     }
@@ -1356,6 +1406,19 @@ const REBOOTSTRAP_AFTER_ATTEMPTS: u32 = 3;
 fn is_not_leader(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::FailedPrecondition
         && status.message().contains(crate::server::NOT_LEADER_NEEDLE)
+}
+
+/// Whether a stream error is the `node_id` collision guard's rejection (#682).
+///
+/// `ALREADY_EXISTS` is unambiguous on this RPC today (no other rejection uses
+/// it), but the message text is matched too regardless, via the same needle
+/// constant the server builds [`crate::server::NODE_ID_COLLISION_MSG`] from —
+/// same wire-stability reasoning as [`is_not_leader`].
+fn is_node_id_collision(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::AlreadyExists
+        && status
+            .message()
+            .contains(crate::server::NODE_ID_COLLISION_NEEDLE)
 }
 
 /// Uniform jittered delay for not-leader retries: the fast band until
