@@ -133,7 +133,7 @@ export function Nav({ activeScreen }) {
         aria-hidden={!open}
       >
         <div class="nav-drawer-header">
-          <span class="nav-brand" style="pointer-events:none">
+          <span class="nav-brand">
             <span class="nav-logo" aria-hidden="true">⛵</span>
             <span class="nav-name">Coxswain</span>
           </span>

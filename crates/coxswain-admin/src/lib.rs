@@ -59,14 +59,25 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 // ── AdminServer ───────────────────────────────────────────────────────────────
 
-/// Embedded operator UI HTML, built from `ui/` by `npm run build`.
+/// Embedded operator UI HTML document, built from `ui/` by `npm run build`.
 ///
 /// The build step must run before `cargo build`; CI and `Dockerfile` ensure
 /// this ordering. `include_str!` resolves at compile time relative to this
 /// source file — the path escapes to the workspace root via `../../`.
+/// References `/app.js` and `/app.css` (served by [`UI_JS`] / [`UI_CSS`]
+/// below) rather than inlining them — see `ui/vite.config.js` for why (#669).
 const UI_HTML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../ui/dist/index.html"
+));
+
+/// Embedded operator UI JavaScript bundle, served at `GET /app.js`.
+const UI_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../ui/dist/app.js"));
+
+/// Embedded operator UI stylesheet, served at `GET /app.css`.
+const UI_CSS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../ui/dist/app.css"
 ));
 
 /// Pingora HTTP app serving the Coxswain admin surface.
@@ -358,6 +369,8 @@ impl AdminServer {
         // Fast path: exact matches.
         match path {
             "/" => return self.ui_response(),
+            "/app.js" => return self.ui_asset_response(UI_JS, "text/javascript; charset=utf-8"),
+            "/app.css" => return self.ui_asset_response(UI_CSS, "text/css; charset=utf-8"),
             "/metrics" => return metrics_response(),
             "/api/v1/health" => {
                 // The apiserver version is fetched + cached by the aggregator
@@ -507,15 +520,34 @@ fn metrics_response() -> Response<Vec<u8>> {
 // ── GET / (operator UI) ───────────────────────────────────────────────────────
 
 impl AdminServer {
-    /// Serve the embedded operator UI HTML, or 404 when the UI is not enabled.
+    /// Serve the embedded operator UI HTML document, or 404 when the UI is not
+    /// enabled.
     ///
-    /// The HTML is a single self-contained file (produced by
-    /// `vite-plugin-singlefile`): all JavaScript and CSS are inlined; no
-    /// external network requests at runtime. This satisfies air-gapped
-    /// deployments reached via `kubectl port-forward`.
+    /// The UI is three embedded files (`UI_HTML`, `UI_JS`, `UI_CSS`) served at
+    /// fixed paths (`/`, `/app.js`, `/app.css`) — no external network requests
+    /// at runtime, so this still satisfies air-gapped deployments reached via
+    /// `kubectl port-forward`; it just no longer inlines the JS/CSS into one
+    /// file (#669, so `Content-Security-Policy: script-src 'self'` can be true
+    /// rather than worked around).
     fn ui_response(&self) -> Response<Vec<u8>> {
         if self.serve_ui {
             aggregator::html_response(UI_HTML)
+        } else {
+            aggregator::not_found()
+        }
+    }
+
+    /// Serve one embedded operator UI asset, or 404 when the UI is not
+    /// enabled — the same gate as [`Self::ui_response`], so `/app.js` and
+    /// `/app.css` 404 structurally on pod roles that don't serve the UI
+    /// (proxy roles) exactly like `/` does.
+    fn ui_asset_response(
+        &self,
+        body: &'static str,
+        content_type: &'static str,
+    ) -> Response<Vec<u8>> {
+        if self.serve_ui {
+            aggregator::ui_asset_response(body, content_type)
         } else {
             aggregator::not_found()
         }
@@ -664,6 +696,8 @@ mod tests {
         // (the aggregate view) must NOT inherit `/api/v1/topology/local`'s pass.
         for path in [
             "/",
+            "/app.js",
+            "/app.css",
             "/api/v1/topology",
             "/api/v1/manifests/pod/kube-system/etcd-0",
             "/api/v1/pods/coxswain-abc/logs",
@@ -720,6 +754,53 @@ mod tests {
             Some(&b"text/html; charset=utf-8"[..])
         );
         // The body should be non-empty and contain the Vite-generated HTML.
+        assert!(!resp.body().is_empty());
+    }
+
+    #[test]
+    fn ui_response_sets_a_strict_content_security_policy() {
+        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false)).with_ui();
+        let resp = admin.ui_response();
+        let csp = resp
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .expect("UI response must carry a CSP header")
+            .to_str()
+            .expect("CSP header must be valid UTF-8");
+        // 'self' is claimed for both directives — must be true, not worked
+        // around: no 'unsafe-inline' anywhere, since the UI bundle no longer
+        // inlines its script/style (#669).
+        assert!(csp.contains("script-src 'self'"), "CSP: {csp}");
+        assert!(csp.contains("style-src 'self'"), "CSP: {csp}");
+        assert!(!csp.contains("unsafe-inline"), "CSP: {csp}");
+        assert!(!csp.contains("unsafe-eval"), "CSP: {csp}");
+        assert_eq!(
+            resp.headers()
+                .get(header::X_CONTENT_TYPE_OPTIONS)
+                .map(|h| h.as_bytes()),
+            Some(&b"nosniff"[..]),
+            "nosniff is load-bearing for script-src 'self', not garnish"
+        );
+    }
+
+    #[test]
+    fn ui_asset_response_returns_404_when_serve_ui_false() {
+        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false));
+        let resp = admin.ui_asset_response(UI_JS, "text/javascript; charset=utf-8");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn ui_asset_response_serves_the_asset_with_its_content_type_when_serve_ui_true() {
+        let admin = AdminServer::new(HealthRegistry::new(), leader_flag(false)).with_ui();
+        let resp = admin.ui_asset_response(UI_CSS, "text/css; charset=utf-8");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .map(|h| h.as_bytes()),
+            Some(&b"text/css; charset=utf-8"[..])
+        );
         assert!(!resp.body().is_empty());
     }
 }

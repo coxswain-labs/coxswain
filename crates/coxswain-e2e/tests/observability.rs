@@ -24,6 +24,11 @@
 //!   error-path emission, and disabled-mode silence.
 //! - `pod_logs_stream_from_controller_not_proxy` — the `/api/v1/pods/{name}/logs`
 //!   relay (#285): controller serves it, proxy 404s, unknown pod 404s.
+//! - `operator_ui_serves_its_bundle_under_a_strict_csp` +
+//!   `ui_asset_paths_are_not_served_by_proxy_roles` — the operator UI's
+//!   `Content-Security-Policy` (`#669`): the header is genuinely satisfiable
+//!   (every asset the HTML references actually loads under it), and the new
+//!   `/app.js`/`/app.css` routes inherit the same proxy-role 404 as `/`.
 //! - `conflict_emits_warning_event_on_loser` — route conflict (`#390`): the losing
 //!   Ingress receives a `Warning RouteConflict` Event naming the winner; the winner
 //!   does not.
@@ -982,6 +987,102 @@ async fn pod_logs_stream_from_controller_not_proxy() -> anyhow::Result<()> {
         .await?
         .status();
     assert_eq!(unknown, 404, "unknown pod name must 404");
+    Ok(())
+}
+
+/// The operator UI document (`GET /`) carries a strict `Content-Security-Policy`
+/// that is genuinely satisfiable, not merely present (#669): `script-src 'self'`
+/// and `style-src 'self'` only work because the UI build emits `app.js`/
+/// `app.css` as real fetched files rather than inlining them, so this test
+/// fetches every asset the returned HTML actually references and asserts each
+/// one loads — the exact failure mode a `script-src 'self'` header would hide
+/// if the bundle were still inlined (the page would render blank, but a test
+/// that only checked the header's text would still pass).
+#[tokio::test]
+async fn operator_ui_serves_its_bundle_under_a_strict_csp() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let client = reqwest::Client::new();
+
+    let resp = client.get(h.controller_admin_url("/")).send().await?;
+    assert_eq!(resp.status(), 200, "operator UI document must be served");
+
+    let csp = resp
+        .headers()
+        .get("content-security-policy")
+        .context("operator UI response must carry a Content-Security-Policy header")?
+        .to_str()
+        .context("CSP header must be valid UTF-8")?
+        .to_owned();
+    assert!(
+        csp.contains("script-src 'self'"),
+        "CSP must scope script-src to 'self': {csp}"
+    );
+    assert!(
+        csp.contains("style-src 'self'"),
+        "CSP must scope style-src to 'self': {csp}"
+    );
+    assert!(
+        !csp.contains("unsafe-inline") && !csp.contains("unsafe-eval"),
+        "CSP must not fall back to unsafe-inline/unsafe-eval: {csp}"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("x-content-type-options")
+            .and_then(|h| h.to_str().ok()),
+        Some("nosniff"),
+        "nosniff is load-bearing for script-src 'self', not garnish"
+    );
+
+    let body = resp.text().await?;
+    for (asset, expected_content_type) in [("/app.js", "javascript"), ("/app.css", "text/css")] {
+        assert!(
+            body.contains(asset),
+            "operator UI document must reference {asset}: {body}"
+        );
+        let asset_resp = client.get(h.controller_admin_url(asset)).send().await?;
+        assert_eq!(asset_resp.status(), 200, "{asset} must be served");
+        let content_type = asset_resp
+            .headers()
+            .get("content-type")
+            .and_then(|h| h.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            content_type.contains(expected_content_type),
+            "{asset} content-type must contain {expected_content_type:?}, got {content_type:?}"
+        );
+        assert!(
+            !asset_resp.bytes().await?.is_empty(),
+            "{asset} body must be non-empty"
+        );
+    }
+    Ok(())
+}
+
+/// The UI asset routes are not a fresh unauthenticated surface on data-plane
+/// pods (#669): `/app.js` 404s on a proxy admin port exactly like `/` already
+/// does (proxy roles wire no UI), and an asset path the build never emits
+/// 404s on the controller too — the route table has no wildcard fallback.
+#[tokio::test]
+async fn ui_asset_paths_are_not_served_by_proxy_roles() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let client = reqwest::Client::new();
+
+    let proxy_status = client.get(h.admin_url("/app.js")).send().await?.status();
+    assert_eq!(
+        proxy_status, 404,
+        "proxy admin must not serve the operator UI bundle (read-only-proxy invariant)"
+    );
+
+    let unknown_status = client
+        .get(h.controller_admin_url("/app.js.map"))
+        .send()
+        .await?
+        .status();
+    assert_eq!(
+        unknown_status, 404,
+        "an asset path the build never emits must 404, not fall through to a wildcard"
+    );
     Ok(())
 }
 

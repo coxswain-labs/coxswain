@@ -575,7 +575,8 @@ impl Supervisor {
             };
             let end = match build_channel(&self.config) {
                 Ok(channel) => {
-                    let mut grpc = TonicClient::new(channel);
+                    let mut grpc = TonicClient::new(channel)
+                        .max_decoding_message_size(crate::MAX_SERVER_MESSAGE_BYTES);
                     // Both the SVID-rotation and the bootstrap-delivered-upstream
                     // watches force a clean reconnect; a `pending` future stands in
                     // for an unwired receiver so the select shape is uniform.

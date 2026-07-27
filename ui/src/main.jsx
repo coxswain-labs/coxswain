@@ -6,7 +6,7 @@ import './styles.css';
  * Application entry point.
  *
  * Mounts the <App/> tree into the `#app` div provided by index.html.
- * The styles import ensures the CSS is inlined into the single-file output
- * by vite-plugin-singlefile.
+ * The styles import ensures Vite bundles it into `dist/app.css`, served at a
+ * fixed path (`GET /app.css`) rather than inlined into the HTML.
  */
 render(<App />, document.getElementById('app'));

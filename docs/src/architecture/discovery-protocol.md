@@ -67,6 +67,7 @@ Endpoint-derived status is computed **client-side** from the same shared rule th
 4. **Referential integrity.** After any message, every `endpoint_ref` a route reaches resolves to an endpoint resource the client holds. The server ships a newly-referenced endpoint set in the same message that first references it, and tombstones one in the same message its last referrer leaves.
 5. **Emptiness travels as removal** — with one deliberate exception: an endpoint resource that exists with zero addresses is meaningful (it is the `503` "valid but empty" signal), so it is sent, not tombstoned.
 6. **Version self-check.** Each message carries a global `version` — an order-independent hash of the per-resource hashes of the post-apply world. The client recomputes it from what it just staged and refuses to commit on a mismatch (Nack → full resync). This is the same content-hash formula the old whole-table wire used, so the convergence machinery below is unchanged.
+7. **No silent aliasing.** Ports, HTTP status codes, and backend weights travel the wire as `uint32` but narrow to `u16`/domain range on decode. A value outside that range is rejected as a decode failure (Nack → last-good), never silently truncated — an out-of-range port could otherwise alias an unrelated one. Message size is bounded in both directions: 1 MiB on what the server accepts from a client, 64 MiB on what a client accepts from the server, so a malfunctioning peer cannot force unbounded memory use or, on the client side, a snapshot the decoder refuses to read at all.
 
 ### Convergence
 

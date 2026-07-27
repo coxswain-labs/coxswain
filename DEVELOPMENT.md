@@ -202,7 +202,7 @@ curl -s http://localhost:8082/api/v1/routing/ingresses  | jq .   # active Ingres
 
 ## Operator UI
 
-The operator web UI lives in `ui/` (Vite + Preact, built to a single self-contained `dist/index.html`). That file is embedded into `coxswain-admin` via `include_str!` and served at `GET /` on the **controller admin port** (controller role only — proxy pods return 404). `dist/` is gitignored: the Docker `ui-builder` stage rebuilds it, so it is never committed.
+The operator web UI lives in `ui/` (Vite + Preact, built to `dist/index.html` + `dist/app.js` + `dist/app.css`). All three are embedded into `coxswain-admin` via `include_str!` and served at `GET /`, `GET /app.js`, and `GET /app.css` on the **controller admin port** (controller role only — proxy pods return 404 on all three). The three-file split (rather than one inlined bundle) lets the served CSP claim `script-src 'self'`/`style-src 'self'` truthfully instead of needing `'unsafe-inline'` or a content hash kept in sync with the build. `dist/` is gitignored: the Docker `ui-builder` stage rebuilds it, so it is never committed.
 
 ### Fast iteration (no cluster)
 

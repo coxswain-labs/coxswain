@@ -19,7 +19,9 @@ import { Topology } from './screens/Topology.jsx';
  * current URL hash. No client-side router library — the hash format is simple
  * enough that a switch is cleaner and carries no bundle cost.
  *
- * All screens are loaded eagerly (single-file output, no code splitting needed).
+ * All screens are loaded eagerly — no code splitting configured, since the
+ * whole app is small enough that lazy-loading a screen would cost more in
+ * request round-trips than it saves in initial bundle size.
  */
 export function App() {
   const { screen, params, query } = useHashRoute();

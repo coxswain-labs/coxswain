@@ -129,7 +129,7 @@ export function Fleet({ query }) {
                 <ControllerCard key={c.pod_name} controller={c} />
               ))}
               {!controllers.loading && shownControllers.length === 0 && (
-                <div style="color:var(--muted);font-size:13px">
+                <div class="list-empty">
                   {searching ? 'No controllers match.' : 'No controller pods found.'}
                 </div>
               )}
@@ -153,7 +153,7 @@ export function Fleet({ query }) {
                 <ProxyCard key={p.pod_name} proxy={p} />
               ))}
               {!proxies.loading && shownShared.length === 0 && (
-                <div style="color:var(--muted);font-size:13px">
+                <div class="list-empty">
                   {searching ? 'No shared proxies match.' : 'No shared proxy pods found.'}
                 </div>
               )}
@@ -173,7 +173,7 @@ export function Fleet({ query }) {
             <ErrorState error={proxies.error} />
           ) : dedicatedByNs.length === 0 ? (
             !proxies.loading && (
-              <div style="color:var(--muted);font-size:13px">
+              <div class="list-empty">
                 {searching ? 'No dedicated proxies match.' : 'No dedicated proxy pods found.'}
               </div>
             )

@@ -82,6 +82,40 @@ pub use upstream::{
 pub use version::{ContentHash, WIRE_VERSION};
 pub use wire::{scope_from_wire, scope_to_wire};
 
+/// Decode cap the server applies to every inbound [`proto::v1::ClientMessage`]
+/// (`transport::serve_discovery_with_tls`).
+///
+/// Every arm is small except `RosterReport` (#585), which scales with one
+/// relay's leaf count — at roughly 150 bytes/entry, 1 MiB covers a relay with
+/// several thousand leaves. tonic's crate default is 4 MiB with no explicit
+/// bound at all; this is a named, intentional cap rather than an implicit one.
+/// The stream is mTLS+SPIFFE-gated, so this is bug containment, not an
+/// untrusted-input bound.
+pub(crate) const MAX_CLIENT_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// Decode cap the client applies to every inbound [`proto::v1::ServerMessage`]
+/// (`client::DiscoveryClient`, `bootstrap_client`).
+///
+/// `Snapshot` is not chunked — one message carries every `Resource` in the
+/// subscribed scope (route hosts, PEM cert stores, all endpoints). tonic 0.14
+/// defaults `max_send_message_size` to unbounded but `max_decode_message_size`
+/// to 4 MiB (`DEFAULT_MAX_RECV_MESSAGE_SIZE`), so an unbounded server and a
+/// 4 MiB client cap is a live convergence cliff on a large cluster: the
+/// controller sends a snapshot the client then refuses to decode, Nacks,
+/// reconnects, and never converges. 64 MiB raises the cliff to a size no
+/// realistic cluster snapshot approaches while still bounding a malfunctioning
+/// or malicious peer.
+pub(crate) const MAX_SERVER_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
+// Both must be non-zero (a zero cap would reject every message, including a
+// legitimately empty one), and the client cap — bounding a whole-world
+// Snapshot — must exceed the server cap, which bounds only a single small
+// ClientMessage arm. A `const` assertion checks this at compile time on every
+// build, not just under `cargo test`.
+const _: () = assert!(MAX_CLIENT_MESSAGE_BYTES > 0);
+const _: () = assert!(MAX_SERVER_MESSAGE_BYTES > 0);
+const _: () = assert!(MAX_SERVER_MESSAGE_BYTES > MAX_CLIENT_MESSAGE_BYTES);
+
 /// Bench-only apply surface — exists **solely** for `benches/delta_apply.rs`,
 /// which compiles as an external crate and so cannot reach the `pub(crate)`
 /// `apply` pipeline directly. Deliberately `#[doc(hidden)]`; **not** public

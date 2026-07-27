@@ -79,12 +79,27 @@ fn dns_san_matches(expected: &str, cert_san: &str) -> bool {
 }
 
 /// CA certificate source for a [`BackendTLSPolicy`](https://gateway-api.sigs.k8s.io/references/spec/#gateway.networking.k8s.io/v1alpha3.BackendTLSPolicy) attachment.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is hand-implemented to redact `Bundle`'s PEM bytes — a CA bundle is
+/// public trust-anchor material, not a secret, but dumping kilobytes of PEM
+/// into a log line is noise, and redacting it keeps this type consistent with
+/// [`BackendClientCert`], which sits on the same struct and does carry a
+/// secret.
+#[derive(Clone)]
 pub enum UpstreamCa {
     /// `wellKnownCACertificates: System` — use the OS trust store.
     System,
     /// `caCertificateRefs` — raw PEM bytes from the referenced ConfigMap.
     Bundle(Arc<[u8]>),
+}
+
+impl std::fmt::Debug for UpstreamCa {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UpstreamCa::System => f.write_str("System"),
+            UpstreamCa::Bundle(_) => f.write_str("Bundle(<redacted>)"),
+        }
+    }
 }
 
 /// Client certificate the Gateway presents to the upstream for backend mutual TLS,
@@ -95,7 +110,11 @@ pub enum UpstreamCa {
 /// connections — the only spec-sanctioned upstream-TLS-origination path). The
 /// PEM bytes are resolved controller-side from a `kubernetes.io/tls` Secret and
 /// travel the discovery wire; the proxy parses them into a Pingora `CertKey` lazily.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Debug` is hand-implemented to redact `cert_pem` and `key_pem` — `key_pem`
+/// is a private key, so a future `debug!(?group)` on a routing structure that
+/// embeds this type must not dump it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct BackendClientCert {
     /// PEM-encoded client certificate chain (`tls.crt`).
     pub cert_pem: Arc<[u8]>,
@@ -114,6 +133,16 @@ impl BackendClientCert {
             key_pem,
             source,
         }
+    }
+}
+
+impl std::fmt::Debug for BackendClientCert {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendClientCert")
+            .field("cert_pem", &"<redacted>")
+            .field("key_pem", &"<redacted>")
+            .field("source", &self.source)
+            .finish()
     }
 }
 
@@ -469,5 +498,66 @@ mod tests {
             .group_key;
         // Value pinned — regenerate by temporarily removing this assert and printing.
         assert_ne!(key, 0x1234, "group_key must be mixed by both builders");
+    }
+
+    // ── Redacting Debug (#668) ────────────────────────────────────────────────
+
+    #[test]
+    fn backend_client_cert_debug_redacts_pem_bytes_but_keeps_source() {
+        // `Arc<[u8]>`'s derived Debug renders as a numeric byte array (e.g.
+        // `[45, 45, ...]`), never as the ASCII text — so a text search like
+        // `!out.contains("PRIVATE KEY")` would pass even against the plain
+        // derive this test exists to guard against. Assert against the actual
+        // unredacted rendering instead.
+        let cert_bytes: Arc<[u8]> = Arc::from(b"-----BEGIN CERTIFICATE-----".as_slice());
+        let key_bytes: Arc<[u8]> = Arc::from(b"-----BEGIN PRIVATE KEY-----".as_slice());
+        let cc = BackendClientCert::new(
+            cert_bytes.clone(),
+            key_bytes.clone(),
+            Arc::from("ns/secret"),
+        );
+        let out = format!("{cc:?}");
+        assert!(out.contains("redacted"), "must redact PEM fields: {out}");
+        assert!(out.contains("ns/secret"), "must keep source: {out}");
+        assert!(
+            !out.contains(&format!("{cert_bytes:?}")),
+            "must not leak cert_pem bytes: {out}"
+        );
+        assert!(
+            !out.contains(&format!("{key_bytes:?}")),
+            "must not leak key_pem bytes: {out}"
+        );
+    }
+
+    #[test]
+    fn upstream_ca_debug_redacts_bundle_bytes() {
+        let system = UpstreamCa::System;
+        assert_eq!(format!("{system:?}"), "System");
+
+        let bundle_bytes: Arc<[u8]> = Arc::from(b"-----BEGIN CERTIFICATE-----".as_slice());
+        let bundle = UpstreamCa::Bundle(bundle_bytes.clone());
+        let out = format!("{bundle:?}");
+        assert!(out.contains("redacted"), "must redact bundle bytes: {out}");
+        assert!(
+            !out.contains(&format!("{bundle_bytes:?}")),
+            "must not leak bundle bytes: {out}"
+        );
+    }
+
+    #[test]
+    fn upstream_tls_debug_transitively_redacts_client_cert() {
+        // UpstreamTls keeps its derived Debug — this pins that the derive still
+        // redacts once BackendClientCert's Debug is hand-implemented.
+        let key_bytes: Arc<[u8]> = Arc::from(b"-----BEGIN PRIVATE KEY-----".as_slice());
+        let cc = Arc::new(BackendClientCert::new(
+            Arc::from(b"cert".as_slice()),
+            key_bytes.clone(),
+            Arc::from("ns/secret"),
+        ));
+        let out = format!("{:?}", tls("svc.example.com").with_client_cert(cc));
+        assert!(
+            !out.contains(&format!("{key_bytes:?}")),
+            "UpstreamTls::Debug must not leak the client-cert private key: {out}"
+        );
     }
 }

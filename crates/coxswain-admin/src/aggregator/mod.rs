@@ -276,13 +276,47 @@ pub(super) fn non_ready_checks(health_body: &serde_json::Value) -> Vec<String> {
 
 // ── Response helpers ──────────────────────────────────────────────────────────
 
+/// Security headers applied to every response serving part of the operator UI
+/// bundle (the HTML document and its `/app.js` / `/app.css` assets) — defense
+/// in depth against a theoretical future XSS in the UI's one
+/// `dangerouslySetInnerHTML` sink (`ManifestDialog.jsx`, which renders
+/// `Prism.highlight` output over tenant-supplied manifest JSON; not
+/// exploitable today, but nothing currently backs that up beyond the sink's
+/// own escaping).
+///
+/// `script-src 'self'` and `style-src 'self'` are true by construction, not a
+/// carve-out: `ui/vite.config.js` emits `app.js`/`app.css` as real fetched
+/// files at fixed paths rather than inlining them into the HTML, so there is
+/// no inline script/style requiring `'unsafe-inline'` or a content hash kept
+/// in sync with the build. `nosniff` is load-bearing, not garnish — without
+/// it, `script-src 'self'` could in principle be satisfied by a same-origin
+/// JSON endpoint the browser mis-sniffs as script.
+fn apply_ui_security_headers(headers: &mut http::HeaderMap) {
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; \
+             connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; \
+             object-src 'none'",
+        ),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+}
+
 /// Build an HTML HTTP response from a static body string.
 ///
-/// Used by `AdminServer::ui_response` to serve the embedded operator UI. The UI
-/// is a single inlined document served from a stable path (`/`) but rebuilt on
-/// every deploy, so it is sent `no-store` — a cached copy would silently mask a
-/// new rollout. The bundle is tiny and same-origin, so there is no caching
-/// benefit to trade away.
+/// Used by `AdminServer::ui_response` to serve the embedded operator UI
+/// document. Served from a stable path (`/`) but rebuilt on every deploy, so
+/// it is sent `no-store` — a cached copy would silently mask a new rollout.
+/// The bundle is tiny and same-origin, so there is no caching benefit to
+/// trade away.
 pub(crate) fn html_response(body: &'static str) -> Response<Vec<u8>> {
     let mut r = Response::new(body.as_bytes().to_vec());
     *r.status_mut() = StatusCode::OK;
@@ -295,6 +329,29 @@ pub(crate) fn html_response(body: &'static str) -> Response<Vec<u8>> {
         header::CACHE_CONTROL,
         HeaderValue::from_static("no-store, no-cache, must-revalidate"),
     );
+    apply_ui_security_headers(headers);
+    r
+}
+
+/// Build a response serving one operator UI asset (`/app.js` or `/app.css`).
+///
+/// Same `no-store` reasoning as [`html_response`]: the filename is stable and
+/// unhashed (`ui/vite.config.js` pins `app.js`/`app.[ext]` so `coxswain-admin`
+/// can `include_str!` a fixed path), so a cached asset from the previous
+/// rollout paired with freshly-served HTML would silently mismatch.
+pub(crate) fn ui_asset_response(
+    body: &'static str,
+    content_type: &'static str,
+) -> Response<Vec<u8>> {
+    let mut r = Response::new(body.as_bytes().to_vec());
+    *r.status_mut() = StatusCode::OK;
+    let headers = r.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
+    );
+    apply_ui_security_headers(headers);
     r
 }
 
