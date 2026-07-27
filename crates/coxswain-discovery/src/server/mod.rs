@@ -73,7 +73,7 @@ mod source;
 mod stream;
 mod view_cache;
 
-pub use authz::{DenyAllNamespaces, ProvisionedRelayAuthorizer, ScopeAuthorizer};
+pub use authz::{DenyAll, ProvisionedRelayAuthorizer, RelayAuthzConfig, ScopeAuthorizer};
 pub use source::SnapshotSource;
 pub(crate) use stream::{NOT_LEADER_MSG, NOT_LEADER_NEEDLE};
 // The gate itself is exercised in prod by `view_cache::view_for`; this crate-level
@@ -112,7 +112,7 @@ pub struct DiscoveryService {
     /// carries a per-stream SVID check). See [`view_for`].
     shared_view: SharedViewCache,
     /// Authorizer for `Scope::Namespace` subscribes (#582). Defaults to
-    /// [`DenyAllNamespaces`]; `coxswain-bin` installs the provenance-backed
+    /// [`DenyAll`]; `coxswain-bin` installs the provenance-backed
     /// [`ProvisionedRelayAuthorizer`] where relays are provisioned.
     authorizer: Arc<dyn ScopeAuthorizer>,
     /// Best-upstream resolver for live repoint directives (#601). When `Some`,
@@ -153,7 +153,7 @@ impl DiscoveryService {
             rebuild_rx,
             leader_rx: None,
             shared_view: Arc::new(Mutex::new(ViewCacheState::default())),
-            authorizer: Arc::new(DenyAllNamespaces),
+            authorizer: Arc::new(DenyAll),
             upstream_resolver: None,
             relay_changed_rx: None,
             directive_tx: None,
@@ -178,7 +178,7 @@ impl DiscoveryService {
 
     /// Install a [`ScopeAuthorizer`] for `Scope::Namespace` subscribes (#582).
     ///
-    /// Replaces the [`DenyAllNamespaces`] default. `coxswain-bin` calls this
+    /// Replaces the [`DenyAll`] default. `coxswain-bin` calls this
     /// once a provenance-backed authorizer exists (#584); until then every
     /// service denies every `Namespace` subscribe.
     #[must_use]
@@ -330,7 +330,7 @@ impl Discovery for DiscoveryService {
         // absent PeerSvid — a Namespace subscribe fans out every dedicated
         // Gateway in the namespace to one stream, so an unauthenticated
         // connection must be denied by the same authorizer as an
-        // authenticated one (the default `DenyAllNamespaces` denies both; a
+        // authenticated one (the default `DenyAll` denies both; a
         // stub-allow authorizer in tests can accept either explicitly).
         if let Scope::Namespace { namespace } = &scope {
             let peer = peer_svid.clone().unwrap_or_default();
@@ -345,6 +345,33 @@ impl Discovery for DiscoveryService {
         }
 
         let node_id = sub.node_id.clone();
+
+        // node_id collision guard (#666): `node_id` is entirely client-chosen
+        // and unauthenticated, and `connect()` below replaces any existing row
+        // with the same key by design (it tolerates a node's own rapid
+        // reconnect race). Without this guard, any authenticated peer could
+        // subscribe with a live relay's `node_id`, silently clearing its
+        // `is_relay` row, and — on that impostor session's immediate
+        // disconnect — `evict_children` would wipe the real relay's entire
+        // folded subtree without ever sending a `RosterReport`. Refusing a new
+        // connect over a row already marked `is_relay` closes that without a
+        // new identity-tracking subsystem: a relay's row is only ever
+        // `is_relay` via `apply_roster`, which runs after this same relay's own
+        // Subscribe already registered it, so this precisely targets "a
+        // node_id with a live folded subtree." A legitimate relay that loses
+        // its own reconnect race gets `ALREADY_EXISTS`; the client has no
+        // special classification for it, so it takes the ordinary exponential
+        // reconnect backoff (`client.rs`'s ceiling, not the fast `NOT_LEADER`
+        // retry band) — still self-healing once the stale session's own
+        // `disconnect()` clears the row, just not fast.
+        if self.registry.is_relay_node(&node_id) {
+            crate::metrics::streams_total()
+                .with_label_values(&["rejected"])
+                .inc();
+            return Err(Status::already_exists(
+                "discovery: node_id already registered as a connected relay",
+            ));
+        }
 
         // Register the node before spawning so connect() is visible
         // even if the first snapshot races with a load().
@@ -364,6 +391,7 @@ impl Discovery for DiscoveryService {
             upstream_resolver: self.upstream_resolver.clone(),
             relay_changed_rx: self.relay_changed_rx.clone(),
             directive_tx: self.directive_tx.clone(),
+            authorizer: self.authorizer.clone(),
         };
         let (tx, rx) = mpsc::channel::<Result<p::ServerMessage, Status>>(4);
 
@@ -423,6 +451,8 @@ mod tests {
 
     const AUTHZ_TD: &str = "cluster.local";
     const AUTHZ_RELAY_SA: &str = "coxswain-relay";
+    const AUTHZ_SHARED_RELAY_SA: &str = "coxswain-relay-shared";
+    const AUTHZ_INSTALL_NS: &str = "coxswain-system";
 
     fn relay_peer(ns: &str, sa: &str) -> PeerSvid {
         PeerSvid {
@@ -432,7 +462,13 @@ mod tests {
 
     fn provenance_authorizer(provisioned: &[&str]) -> ProvisionedRelayAuthorizer {
         let set: HashSet<String> = provisioned.iter().map(|s| (*s).to_owned()).collect();
-        ProvisionedRelayAuthorizer::new(Shared::from_value(set), AUTHZ_RELAY_SA, AUTHZ_TD)
+        ProvisionedRelayAuthorizer::new(RelayAuthzConfig {
+            provisioned: Shared::from_value(set),
+            relay_sa: AUTHZ_RELAY_SA.to_owned(),
+            trust_domain: AUTHZ_TD.to_owned(),
+            shared_relay_sa: AUTHZ_SHARED_RELAY_SA.to_owned(),
+            install_namespace: AUTHZ_INSTALL_NS.to_owned(),
+        })
     }
 
     /// #585 wire decode: `record_roster_report` folds a `RosterReport` into the
@@ -483,7 +519,18 @@ mod tests {
                 },
             ],
         };
-        record_roster_report("relay-x", report, &registry);
+        let all_in_scope = record_roster_report(
+            "relay-x",
+            &Scope::Namespace {
+                namespace: "prod".to_owned(),
+            },
+            report,
+            &registry,
+        );
+        assert!(
+            all_in_scope,
+            "every child in this fixture is a Gateway in the relay's own namespace"
+        );
 
         let snap = registry.load();
         let bound = &snap.nodes["leaf-bound"];
@@ -595,6 +642,178 @@ mod tests {
         );
     }
 
+    // ── RosterReport sender authorization (#666) ──────────────────────────────
+
+    fn shared_relay_authz_peer() -> PeerSvid {
+        PeerSvid {
+            uri_sans: vec![format!(
+                "spiffe://{AUTHZ_TD}/ns/{AUTHZ_INSTALL_NS}/sa/{AUTHZ_SHARED_RELAY_SA}"
+            )],
+        }
+    }
+
+    #[test]
+    fn roster_report_authorized_for_provisioned_namespace_relay() {
+        let a = provenance_authorizer(&["team-a"]);
+        assert!(
+            a.allows_roster(
+                &relay_peer("team-a", AUTHZ_RELAY_SA),
+                &Scope::Namespace {
+                    namespace: "team-a".to_owned()
+                }
+            ),
+            "the provisioned namespace relay's own identity must authorize its roster"
+        );
+    }
+
+    #[test]
+    fn roster_report_authorized_for_shared_relay_identity() {
+        let a = provenance_authorizer(&[]);
+        assert!(
+            a.allows_roster(&shared_relay_authz_peer(), &Scope::SharedPool),
+            "the shared relay's identity must authorize its roster with no provenance set needed"
+        );
+    }
+
+    #[test]
+    fn roster_report_rejected_for_shared_pool_stream_without_relay_identity() {
+        // The #666 regression: an ordinary shared-pool proxy (no SVID, or any
+        // SVID other than the shared relay's) must never be treated as a relay.
+        let a = provenance_authorizer(&[]);
+        assert!(
+            !a.allows_roster(&PeerSvid::default(), &Scope::SharedPool),
+            "an unauthenticated SharedPool stream must never submit a roster"
+        );
+        assert!(
+            !a.allows_roster(
+                &relay_peer("some-tenant", "coxswain-shared-proxy"),
+                &Scope::SharedPool
+            ),
+            "an ordinary shared-pool proxy's SVID must never submit a roster"
+        );
+    }
+
+    #[test]
+    fn roster_report_rejected_for_gateway_scope_stream() {
+        let a = provenance_authorizer(&["team-a"]);
+        let scope = Scope::Gateway {
+            namespace: "team-a".to_owned(),
+            name: "my-gw".to_owned(),
+        };
+        assert!(
+            !a.allows_roster(&relay_peer("team-a", AUTHZ_RELAY_SA), &scope),
+            "no leaf ever reports a roster; Gateway scope must always be denied"
+        );
+    }
+
+    #[test]
+    fn roster_report_rejected_by_deny_all_default() {
+        let scope = Scope::Namespace {
+            namespace: "team-a".to_owned(),
+        };
+        assert!(
+            !DenyAll.allows_roster(&relay_peer("team-a", AUTHZ_RELAY_SA), &scope),
+            "the fail-closed default must deny every roster, even a well-formed relay identity"
+        );
+    }
+
+    // ── RosterReport payload scoping (#666) ───────────────────────────────────
+
+    /// A namespace relay authorized for `team-a` reports a child scoped to a
+    /// DIFFERENT tenant's Gateway. Without the payload-scope constraint this
+    /// would hold (or falsely satisfy) `team-b`'s own `Programmed` gate.
+    #[test]
+    fn roster_report_drops_children_outside_relays_own_namespace() {
+        let registry = NodeRegistryHandle::new();
+        registry.connect(
+            "relay-team-a",
+            NodeScope::Namespace {
+                namespace: "team-a".to_owned(),
+            },
+            SystemTime::UNIX_EPOCH,
+        );
+        let report = p::RosterReport {
+            children: vec![p::RosterEntry {
+                node_id: "phantom-leaf".to_owned(),
+                scope: Some(crate::wire::scope_to_wire(&Scope::Gateway {
+                    name: "gw".to_owned(),
+                    namespace: "team-b".to_owned(),
+                })),
+                acked_version: Some("v1".to_owned()),
+                target_version: Some("v1".to_owned()),
+                acked_seq: Some(1),
+                bound_reported: true,
+                bound_ports: vec![443],
+                connected_since_unix: 100,
+                last_ack_at_unix: Some(200),
+            }],
+        };
+        let all_in_scope = record_roster_report(
+            "relay-team-a",
+            &Scope::Namespace {
+                namespace: "team-a".to_owned(),
+            },
+            report,
+            &registry,
+        );
+        assert!(
+            !all_in_scope,
+            "an out-of-namespace child must be reported as a payload-scope violation"
+        );
+
+        let snap = registry.load();
+        assert!(
+            !snap.nodes.contains_key("phantom-leaf"),
+            "a child scoped outside the relay's own namespace must be dropped, not folded"
+        );
+        assert!(
+            snap.nodes["relay-team-a"].is_relay,
+            "the relay's own row is still marked (an out-of-scope child does not wedge the report)"
+        );
+    }
+
+    /// The shared relay reports a `Gateway`-scoped child. Without the
+    /// payload-scope constraint this would stall
+    /// `all_shared_nodes_acked` cluster-wide (folded children are never
+    /// `is_relay`, so the gate's `is_relay` exclusion does not save it).
+    #[test]
+    fn roster_report_drops_non_shared_pool_children_reported_by_shared_relay() {
+        let registry = NodeRegistryHandle::new();
+        registry.connect(
+            "shared-relay-x",
+            NodeScope::SharedPool,
+            SystemTime::UNIX_EPOCH,
+        );
+        let report = p::RosterReport {
+            children: vec![p::RosterEntry {
+                node_id: "phantom-gateway-leaf".to_owned(),
+                scope: Some(crate::wire::scope_to_wire(&Scope::Gateway {
+                    name: "gw".to_owned(),
+                    namespace: "team-a".to_owned(),
+                })),
+                acked_version: None,
+                target_version: Some("v1".to_owned()),
+                acked_seq: None,
+                bound_reported: false,
+                bound_ports: Vec::new(),
+                connected_since_unix: 100,
+                last_ack_at_unix: None,
+            }],
+        };
+        let all_in_scope =
+            record_roster_report("shared-relay-x", &Scope::SharedPool, report, &registry);
+        assert!(
+            !all_in_scope,
+            "a Gateway-scoped child under a SharedPool relay must be reported as a payload-scope violation"
+        );
+
+        let snap = registry.load();
+        assert!(
+            !snap.nodes.contains_key("phantom-gateway-leaf"),
+            "a Gateway-scoped child reported by the shared relay must be dropped, not folded"
+        );
+    }
+
     // ── test harness ─────────────────────────────────────────────────────────
 
     struct TestHarness {
@@ -700,7 +919,7 @@ mod tests {
     }
 
     async fn start_harness_with_gate(leader_rx: Option<watch::Receiver<bool>>) -> TestHarness {
-        start_harness_with(leader_rx, Arc::new(DenyAllNamespaces)).await
+        start_harness_with(leader_rx, Arc::new(DenyAll)).await
     }
 
     /// Start the harness with a custom [`ScopeAuthorizer`] installed (#582),
@@ -742,11 +961,16 @@ mod tests {
     }
 
     /// A [`ScopeAuthorizer`] test double that allows every `Namespace` subscribe
-    /// — the inverse of the production [`DenyAllNamespaces`] default.
+    /// and every `RosterReport` — the inverse of the production [`DenyAll`]
+    /// default.
     struct AllowAllNamespaces;
 
     impl ScopeAuthorizer for AllowAllNamespaces {
         fn allows_namespace(&self, _peer: &PeerSvid, _namespace: &str) -> bool {
+            true
+        }
+
+        fn allows_roster(&self, _peer: &PeerSvid, _scope: &Scope) -> bool {
             true
         }
     }
@@ -1931,7 +2155,7 @@ mod tests {
         }
     }
 
-    /// The default [`DenyAllNamespaces`] authorizer rejects a `Namespace`
+    /// The default [`DenyAll`] authorizer rejects a `Namespace`
     /// subscribe with `PERMISSION_DENIED`, even on the plaintext (no PeerSvid)
     /// test path — unlike the Gateway binding check, this must NOT fail-open.
     #[tokio::test]
@@ -1980,11 +2204,13 @@ mod tests {
     #[tokio::test]
     async fn provenance_authorizer_denies_unauthenticated_namespace_subscribe() {
         let provisioned = Shared::from_value(HashSet::from(["prod".to_owned()]));
-        let authz = Arc::new(ProvisionedRelayAuthorizer::new(
+        let authz = Arc::new(ProvisionedRelayAuthorizer::new(RelayAuthzConfig {
             provisioned,
-            "coxswain-relay",
-            "cluster.local",
-        ));
+            relay_sa: "coxswain-relay".to_owned(),
+            trust_domain: "cluster.local".to_owned(),
+            shared_relay_sa: "coxswain-relay-shared".to_owned(),
+            install_namespace: "coxswain-system".to_owned(),
+        }));
         let h = start_harness_with_authorizer(authz).await;
         let err = open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "prod"))
             .await
@@ -2010,6 +2236,8 @@ mod tests {
             relay_port: 50051,
             relay_sa: "coxswain-relay".to_owned(),
             active_relays: Shared::from_value(set),
+            trust_domain: "cluster.local".to_owned(),
+            install_namespace: "coxswain-system".to_owned(),
         })
     }
 
@@ -2315,5 +2543,125 @@ mod tests {
             &directive("", ""),
             &Scope::SharedPool
         ));
+    }
+
+    // ── RosterReport dispatch-site gate (#666) ────────────────────────────────
+
+    /// Send a `RosterReport` claiming a single child on `tx`.
+    async fn send_roster_report(tx: &tokio::sync::mpsc::Sender<ClientMessage>, child_ns: &str) {
+        tx.send(ClientMessage {
+            kind: Some(CKind::RosterReport(p::RosterReport {
+                children: vec![p::RosterEntry {
+                    node_id: "phantom-child".to_owned(),
+                    scope: Some(crate::wire::scope_to_wire(&Scope::Gateway {
+                        name: "gw".to_owned(),
+                        namespace: child_ns.to_owned(),
+                    })),
+                    acked_version: Some("v1".to_owned()),
+                    target_version: Some("v1".to_owned()),
+                    acked_seq: Some(1),
+                    bound_reported: true,
+                    bound_ports: vec![443],
+                    connected_since_unix: 100,
+                    last_ack_at_unix: Some(200),
+                }],
+            })),
+        })
+        .await
+        .unwrap_or_else(|e| panic!("invariant: pre-send channel is open: {e}"));
+    }
+
+    /// The #666 regression, exercised on the real dispatch path (not just the
+    /// extracted `allows_roster`/`record_roster_report` functions): an ordinary
+    /// `SharedPool` stream under the default `DenyAll` authorizer sends a
+    /// `RosterReport` — it must never be folded into the registry.
+    #[tokio::test]
+    async fn roster_report_on_shared_pool_stream_never_folds_under_deny_all() {
+        let h = start_harness().await;
+        let (tx, _rx) = open_stream(h.addr, "impostor-shared-proxy").await;
+        send_roster_report(&tx, "team-a").await;
+
+        // Bounded negative wait: give the server ample time to (mis)process the
+        // report, then assert it never landed.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !h.registry.load().nodes.contains_key("phantom-child"),
+            "a RosterReport from an unauthorized SharedPool stream must never be folded"
+        );
+        assert!(
+            !h.registry.load().nodes["impostor-shared-proxy"].is_relay,
+            "the sender must never be marked as a relay"
+        );
+        drop(tx);
+    }
+
+    /// Companion positive: a `Scope::Namespace` stream under a permissive
+    /// authorizer sends a matching-namespace `RosterReport` — it DOES fold,
+    /// proving the gate doesn't regress the legitimate relay path.
+    #[tokio::test]
+    async fn roster_report_on_namespace_stream_folds_under_allowing_authorizer() {
+        let h = start_harness_with_authorizer(Arc::new(AllowAllNamespaces)).await;
+        let (tx, _rx) =
+            open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "team-a"))
+                .await
+                .expect("Namespace subscribe must be accepted by an allowing authorizer");
+        send_roster_report(&tx, "team-a").await;
+
+        poll_until(|| {
+            h.registry
+                .load()
+                .nodes
+                .contains_key("phantom-child")
+                .then_some(())
+        })
+        .await;
+        let snap = h.registry.load();
+        assert_eq!(
+            snap.nodes["phantom-child"].parent.as_deref(),
+            Some("relay-1"),
+            "a matching-namespace child from an authorized relay must fold"
+        );
+        assert!(snap.nodes["relay-1"].is_relay);
+        drop(tx);
+    }
+
+    /// The #666 node_id collision guard: a second stream claiming a `node_id`
+    /// already marked `is_relay` is refused `ALREADY_EXISTS`, and the first
+    /// relay's folded subtree is untouched.
+    #[tokio::test]
+    async fn colliding_node_id_against_live_relay_is_refused() {
+        let h = start_harness_with_authorizer(Arc::new(AllowAllNamespaces)).await;
+        let (relay_tx, _relay_rx) =
+            open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "team-a"))
+                .await
+                .expect("Namespace subscribe must be accepted");
+        send_roster_report(&relay_tx, "team-a").await;
+        poll_until(|| {
+            h.registry
+                .load()
+                .nodes
+                .contains_key("phantom-child")
+                .then_some(())
+        })
+        .await;
+        assert!(h.registry.load().nodes["relay-1"].is_relay);
+
+        // A second stream claims the same node_id — any scope, any identity.
+        let err = open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "team-a"))
+            .await
+            .expect_err("a node_id collision against a live relay must be refused");
+        assert_eq!(err.code(), tonic::Code::AlreadyExists, "got: {err:?}");
+
+        // The real relay's row and its folded subtree are untouched.
+        let snap = h.registry.load();
+        assert!(
+            snap.nodes["relay-1"].is_relay,
+            "the impostor's rejected connect must not clear the real relay's row"
+        );
+        assert!(
+            snap.nodes.contains_key("phantom-child"),
+            "the real relay's folded subtree must survive the collision attempt"
+        );
+        drop(relay_tx);
     }
 }

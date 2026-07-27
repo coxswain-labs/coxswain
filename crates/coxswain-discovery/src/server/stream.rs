@@ -24,6 +24,7 @@ use crate::proto::v1::{self as p, client_message::Kind as CKind, server_message:
 use crate::subscription::Scope;
 use crate::wire::scope_from_wire;
 
+use super::authz::ScopeAuthorizer;
 use super::source::SnapshotSource;
 use super::view_cache::{SharedViewCache, view_for};
 
@@ -271,6 +272,10 @@ pub(super) struct StreamServices {
     /// server. Each stream subscribes a receiver and reads the retained directive on
     /// open (late-subscriber replay) and on change.
     pub(super) directive_tx: Option<watch::Sender<Option<p::PreferredUpstream>>>,
+    /// Gates a `RosterReport` fold to the relay tier's authenticated identity
+    /// (#666) — the same authorizer [`DiscoveryService`](crate::DiscoveryService)
+    /// uses for the open-time `Namespace` subscribe check.
+    pub(super) authorizer: Arc<dyn ScopeAuthorizer>,
 }
 
 /// Immutable references the outbound handlers need, borrowed from the stream
@@ -325,6 +330,7 @@ pub(super) async fn run_stream(
         upstream_resolver,
         mut relay_changed_rx,
         directive_tx,
+        authorizer,
     } = services;
     // Relay directive-forwarding (#601/#652): a relay's downstream leaf subscribes
     // to the latest-directive cell its upstream client publishes into, and forwards
@@ -423,7 +429,41 @@ pub(super) async fn run_stream(
                                 record_node_status(&sub.node_id, &ns, &registry);
                             }
                             Some(CKind::RosterReport(rr)) => {
-                                record_roster_report(&sub.node_id, rr, &registry);
+                                // Sender-identity gate (#666): only the relay tier
+                                // whose identity matches this stream's own
+                                // subscribed scope may fold a roster. Dropped
+                                // (not closed) on denial — closing would reset
+                                // the client's reconnect backoff on every
+                                // session that delivered the initial snapshot
+                                // (always sent before this arm can fire), turning
+                                // a persistently-misconfigured identity into a
+                                // reconnect storm instead of a quiet rejection.
+                                let peer = sub.peer_svid.clone().unwrap_or_default();
+                                if authorizer.allows_roster(&peer, &sub.scope) {
+                                    // `all_in_scope == false` means an otherwise-
+                                    // authorized relay named a child outside its
+                                    // own reach (payload-scope gate, #666) — the
+                                    // one attacker this project's threat model
+                                    // treats as in scope (a compromised relay),
+                                    // so it must not read as a clean `accepted`.
+                                    let all_in_scope =
+                                        record_roster_report(&sub.node_id, &sub.scope, rr, &registry);
+                                    crate::metrics::roster_reports_total()
+                                        .with_label_values(&[if all_in_scope {
+                                            "accepted"
+                                        } else {
+                                            "partial"
+                                        }])
+                                        .inc();
+                                } else {
+                                    crate::metrics::roster_reports_total()
+                                        .with_label_values(&["rejected"])
+                                        .inc();
+                                    debug!(
+                                        node_id = %sub.node_id,
+                                        "discovery: RosterReport from unauthorized stream, dropped"
+                                    );
+                                }
                             }
                             Some(CKind::Subscribe(_)) => {
                                 // Duplicate Subscribe mid-stream; ignore (idempotent).
@@ -944,19 +984,55 @@ pub(super) fn unix_secs_to_system_time(secs: i64) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
+/// Whether a folded child's `scope` belongs to the reporting relay's own
+/// authorized `scope` (#666).
+///
+/// A namespace relay's `Scope::Namespace{ns}` may only report `Gateway`
+/// children in that same `ns`; the shared relay's `Scope::SharedPool` may only
+/// report `SharedPool` children. Without this, a sender already authorized by
+/// [`ScopeAuthorizer::allows_roster`] could still name a phantom row outside
+/// its own reach — another tenant's Gateway, or the cluster-wide shared pool —
+/// which the #531 gate helpers select by scope alone with no provenance check.
+/// `Scope::Gateway` never reaches here (no leaf ever reports a roster; the
+/// dispatch site's `allows_roster` gate already denies it), so it is
+/// unconditionally `false`.
+fn roster_child_in_scope(parent_scope: &Scope, child: &NodeScope) -> bool {
+    match parent_scope {
+        Scope::Namespace { namespace } => {
+            matches!(child, NodeScope::Gateway { namespace: ns, .. } if ns == namespace)
+        }
+        Scope::SharedPool => matches!(child, NodeScope::SharedPool),
+        Scope::Gateway { .. } => false,
+    }
+}
+
 /// Fold a relay's `RosterReport` into the registry (#585).
 ///
 /// Each `RosterEntry` is decoded into a [`RosterChild`] and handed to
 /// [`NodeRegistryHandle::apply_roster`], which wholesale-replaces this relay's
-/// subtree and marks it `is_relay`. An entry with a missing/undecodable scope or
-/// out-of-`u16` port is dropped (fail-closed: that leaf simply won't appear this
-/// round; the relay re-reports), never wedging the whole report. An empty report
-/// legitimately evicts the relay's subtree (the relay has no leaves).
+/// subtree and marks it `is_relay`. An entry is dropped (fail-closed: that leaf
+/// simply won't appear this round; the relay re-reports), never wedging the
+/// whole report, when its scope is missing, undecodable, its port is
+/// out-of-`u16`, or — the #666 payload-scope constraint — its decoded scope
+/// does not belong to `scope`, the reporting relay's own authorized scope (see
+/// [`roster_child_in_scope`]). An empty report legitimately evicts the relay's
+/// subtree (the relay has no leaves).
+///
+/// Returns `false` if any child was dropped for the payload-scope reason
+/// specifically (not a malformed/undecodable one) — the caller uses this to
+/// distinguish a clean fold from one where an otherwise-authorized relay named
+/// a child outside its own reach, which the sender-identity gate alone cannot
+/// see. This is the one attacker this project's own threat model treats as in
+/// scope (a compromised relay, `docs/src/operations/control-plane-security.md`
+/// "What a compromised relay can and cannot do"), so it must not read as a
+/// clean `accepted`.
 pub(super) fn record_roster_report(
     parent_node_id: &str,
+    scope: &Scope,
     report: p::RosterReport,
     registry: &NodeRegistryHandle,
-) {
+) -> bool {
+    let mut all_in_scope = true;
     let mut children = Vec::with_capacity(report.children.len());
     for entry in report.children {
         let Some(wire_scope) = entry.scope.as_ref() else {
@@ -967,8 +1043,8 @@ pub(super) fn record_roster_report(
             );
             continue;
         };
-        let scope = match scope_from_wire(wire_scope) {
-            Ok(scope) => node_scope_from(&scope),
+        let child_scope = match scope_from_wire(wire_scope) {
+            Ok(child_scope) => node_scope_from(&child_scope),
             Err(e) => {
                 debug!(
                     parent_node_id,
@@ -979,6 +1055,15 @@ pub(super) fn record_roster_report(
                 continue;
             }
         };
+        if !roster_child_in_scope(scope, &child_scope) {
+            all_in_scope = false;
+            warn!(
+                parent_node_id,
+                node_id = %entry.node_id,
+                "discovery: RosterEntry scope outside the relay's own authorized scope, dropped"
+            );
+            continue;
+        }
         // `bound_reported == false` ⇒ the leaf has not reported bound ports;
         // preserve the None/Some(∅) distinction the #531 gate relies on.
         let bound_ports = entry.bound_reported.then(|| {
@@ -990,7 +1075,7 @@ pub(super) fn record_roster_report(
         });
         children.push(RosterChild {
             node_id: entry.node_id,
-            scope,
+            scope: child_scope,
             last_acked_version: entry.acked_version,
             target_version: entry.target_version,
             last_acked_seq: entry.acked_seq,
@@ -1000,6 +1085,7 @@ pub(super) fn record_roster_report(
         });
     }
     registry.apply_roster(parent_node_id, children);
+    all_in_scope
 }
 
 /// Wrap a wire snapshot in a `ServerMessage`, send it, and — only on a successful

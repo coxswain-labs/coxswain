@@ -24,6 +24,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -138,6 +139,18 @@ where
     });
 
     tonic::transport::Server::builder()
+        // Bounds how long a half-open connection (peer vanished without a clean
+        // FIN/RST — a conntrack eviction, an asymmetric network partition) can
+        // linger from this side (#666): without an active probe, a dead stream
+        // sits in `inbound.message()` indefinitely, so its `NodeRegistryHandle`
+        // row is never `disconnect()`-ed. That matters beyond a stale gauge — the
+        // `is_relay_node` node_id-collision guard refuses a relay's own
+        // reconnect while its prior row is still live, so an unreaped dead
+        // session would lock a relay out of ever reconnecting under the same
+        // node_id. Matches the cadence the client already keeps alive with
+        // (`DiscoveryClientConfig::http2_keep_alive_interval` default, 30s).
+        .http2_keepalive_interval(Some(Duration::from_secs(30)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(10)))
         .add_service(service)
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await

@@ -2038,6 +2038,29 @@ async fn dedicated_proxy_repoints_to_relay_without_dropping_traffic() -> anyhow:
     let h = Harness::start_with_options(relay_tiering_threshold_1()).await?;
     let ns = NamespaceGuard::create(&h.client, "relay-repoint").await?;
 
+    // Baseline the leader's roster-fold counters (#666) before this test's own
+    // relay exists. `rejected` is a cumulative process-lifetime counter shared
+    // across every serial test on this controller pod, and legitimately moves
+    // on ordinary namespace/relay teardown elsewhere in the suite — so the
+    // assertion below is a delta against this baseline, never an absolute
+    // value, exactly like the existing `bootstrap_total{result="rejected"}`
+    // baseline pattern above.
+    let (_leader_pf, server_url) = leader_discovery_metrics(&h.client).await?;
+    let accepted_before = scrape_metric_label_sum(
+        &server_url,
+        "coxswain_discovery_roster_reports_total",
+        "result=\"accepted\"",
+    )
+    .await
+    .unwrap_or(0.0);
+    let rejected_before = scrape_metric_label_sum(
+        &server_url,
+        "coxswain_discovery_roster_reports_total",
+        "result=\"rejected\"",
+    )
+    .await
+    .unwrap_or(0.0);
+
     // Dedicated proxy converged and serving traffic (initially from the controller).
     let (http, host, proxy_uid) = converge_dedicated_proxy(&h, &ns.name).await?;
 
@@ -2049,6 +2072,58 @@ async fn dedicated_proxy_repoints_to_relay_without_dropping_traffic() -> anyhow:
     // relay in the controller topology.
     let topology_url = h.controller_admin_url("/api/v1/topology");
     wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
+
+    // The fold above is a real `RosterReport` fold (#666): the relay's own
+    // identity was authorized to submit it. Proving the gate sits on this live
+    // path (not just in unit tests) means `accepted` climbing past the
+    // baseline; poll because the port-forwarded scrape and the fold are
+    // independently timed. `rejected` must not move at all — this namespace's
+    // relay is never torn down in this test.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || {
+            let server_url = server_url.clone();
+            async move {
+                let now = scrape_metric_label_sum(
+                    &server_url,
+                    "coxswain_discovery_roster_reports_total",
+                    "result=\"accepted\"",
+                )
+                .await;
+                format!(
+                    "controller coxswain_discovery_roster_reports_total{{result=\"accepted\"}} \
+                     to exceed the {accepted_before} baseline; currently: {now:?}"
+                )
+            }
+        },
+        || {
+            let server_url = server_url.clone();
+            async move {
+                let now = scrape_metric_label_sum(
+                    &server_url,
+                    "coxswain_discovery_roster_reports_total",
+                    "result=\"accepted\"",
+                )
+                .await?;
+                (now > accepted_before).then_some(())
+            }
+        },
+    )
+    .await?;
+    let rejected_now = scrape_metric_label_sum(
+        &server_url,
+        "coxswain_discovery_roster_reports_total",
+        "result=\"rejected\"",
+    )
+    .await
+    .with_context(|| {
+        format!("scrape roster_reports_total{{result=\"rejected\"}} from {server_url}")
+    })?;
+    assert_eq!(
+        rejected_now, rejected_before,
+        "a legitimate relay's own roster must never move the rejected counter"
+    );
 
     // Data plane untouched by the repoint: traffic still flows to the same backend,
     // the proxy pod was never recreated, and its container never restarted.
