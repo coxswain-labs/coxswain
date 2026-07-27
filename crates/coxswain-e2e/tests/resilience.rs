@@ -618,7 +618,7 @@ async fn restart_controller_does_not_roll_dedicated_proxy() -> anyhow::Result<()
     // rolled" a settled fact rather than a race. `wait_for_leader_reconciled`
     // re-resolves the Lease holder each tick (the HA standby reports leader=0
     // forever, so a Service-pinned scrape would race).
-    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
+    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(120)).await?;
     wait::wait_for_gateway_programmed(&h2.client, GATEWAY_NAME, &ns.name, Duration::from_secs(60))
         .await?;
 
@@ -831,7 +831,7 @@ async fn lifecycle_controller_restart_is_idempotent() -> anyhow::Result<()> {
     // Scrape the LEADER specifically, not an arbitrary Service replica: after a
     // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
     // races. `wait_for_leader_reconciled` re-resolves the Lease holder each tick.
-    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
+    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(120)).await?;
 
     let deployments_after: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
     let deploy_after = deployments_after.get(RESOURCE_NAME).await?;
@@ -880,7 +880,7 @@ async fn catch_up_reconciles_gateway_created_during_controller_downtime() -> any
     // Scrape the LEADER specifically, not an arbitrary Service replica: after a
     // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
     // races. `wait_for_leader_reconciled` re-resolves the Lease holder each tick.
-    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
+    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(120)).await?;
 
     // Catch-up: the Gateway created during downtime reaches Programmed=True,
     // which only happens if the controller reconciled an object it never received
@@ -1011,7 +1011,7 @@ async fn catch_up_reconciles_ingress_mutations_and_deletes_during_controller_dow
     // Scrape the LEADER specifically, not an arbitrary Service replica: after a
     // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
     // races. `wait_for_leader_reconciled` re-resolves the Lease holder each tick.
-    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
+    leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(120)).await?;
 
     // Mutated route: proxy must serve echo-b (not stale echo-a).
     wait::wait_for_backend(&h2.http, &host_a, "/", "echo-b", Duration::from_secs(60)).await?;

@@ -25,6 +25,7 @@ use crate::subscription::Scope;
 use crate::wire::scope_from_wire;
 
 use super::authz::ScopeAuthorizer;
+use super::identity::{LiveNodeIdentities, release_node_id};
 use super::source::SnapshotSource;
 use super::view_cache::{SharedViewCache, view_for};
 
@@ -42,6 +43,23 @@ pub(crate) const NOT_LEADER_MSG: &str =
 /// change wording: controller and proxy binaries skew across upgrades, so an
 /// old proxy classifies a new controller's rejection by this exact phrase.
 pub(crate) const NOT_LEADER_NEEDLE: &str = "not the leader";
+
+/// Stream-rejection message sent when a `Subscribe`'s `node_id` is already
+/// claimed by a different authenticated identity (#682's generalization of
+/// #666's relay-only guard).
+///
+/// The discovery client matches on this text (plus `ALREADY_EXISTS`) to
+/// classify the rejection as an expected fast-retry, the same shape as
+/// [`NOT_LEADER_MSG`]: the peer's own prior session usually just hasn't been
+/// reaped yet, not a systemic failure.
+pub(crate) const NODE_ID_COLLISION_MSG: &str =
+    "discovery: node_id already claimed by a different authenticated identity";
+
+/// The wire-stable substring `client::is_node_id_collision` matches on. Must
+/// appear verbatim in [`NODE_ID_COLLISION_MSG`] — enforced by a unit test —
+/// and must never change wording, for the same cross-version-skew reason as
+/// [`NOT_LEADER_NEEDLE`].
+pub(crate) const NODE_ID_COLLISION_NEEDLE: &str = "claimed by a different authenticated identity";
 
 // ── nonce counter ─────────────────────────────────────────────────────────────
 
@@ -227,6 +245,11 @@ pub(super) struct StreamSubscription {
     /// connections (test/degraded mode).  Used to bind `Scope::Gateway` claims
     /// to the authenticated SVID identity on every snapshot build.
     pub(super) peer_svid: Option<PeerSvid>,
+    /// This session's `node_id` claim generation (#682), as returned by
+    /// [`super::identity::claim_node_id`] at open time. Passed back to
+    /// `release_node_id` on shutdown so only this exact claim — never a
+    /// same-identity reconnect's newer one — can be released.
+    pub(super) node_id_claim: u64,
 }
 
 /// Mutable per-stream flow-control state, grouped to keep helper function
@@ -276,6 +299,9 @@ pub(super) struct StreamServices {
     /// (#666) — the same authorizer [`DiscoveryService`](crate::DiscoveryService)
     /// uses for the open-time `Namespace` subscribe check.
     pub(super) authorizer: Arc<dyn ScopeAuthorizer>,
+    /// `node_id` collision guard (#682); released by both shutdown paths below
+    /// once this session ends. See [`super::identity`].
+    pub(super) node_identities: LiveNodeIdentities,
 }
 
 /// Immutable references the outbound handlers need, borrowed from the stream
@@ -331,6 +357,7 @@ pub(super) async fn run_stream(
         mut relay_changed_rx,
         directive_tx,
         authorizer,
+        node_identities,
     } = services;
     // Relay directive-forwarding (#601/#652): a relay's downstream leaf subscribes
     // to the latest-directive cell its upstream client publishes into, and forwards
@@ -396,11 +423,22 @@ pub(super) async fn run_stream(
     match push_if_changed(&ctx, &view, &mut state).await {
         Ok(_) => {}
         Err(StreamClosed) => {
-            registry.disconnect(&sub.node_id);
-            // If this stream was a relay, evict its folded leaf subtree so the
-            // #531 gate fails closed on the now-invisible leaves (#585). No-op
-            // for a non-relay node (no children tagged with its id).
-            registry.evict_children(&sub.node_id);
+            // Only touch the registry if this session's claim was still the
+            // live one (#682). A superseded session (a stale reconnect race:
+            // this same identity already re-claimed `node_id` under a fresh
+            // generation before this shutdown ran) is no longer the owner of
+            // `node_id`'s registry row either — `connect()` already
+            // overwrote it for the newer session — so `disconnect`/
+            // `evict_children` here would delete the NEW session's live row
+            // and wipe its subtree, not just clean up a stale claim.
+            if release_node_id(&node_identities, &sub.node_id, sub.node_id_claim) {
+                registry.disconnect(&sub.node_id);
+                // If this stream was a relay, evict its folded leaf subtree so
+                // the #531 gate fails closed on the now-invisible leaves
+                // (#585). No-op for a non-relay node (no children tagged with
+                // its id).
+                registry.evict_children(&sub.node_id);
+            }
             crate::metrics::connected_proxies().dec();
             return;
         }
@@ -572,9 +610,15 @@ pub(super) async fn run_stream(
         }
     }
 
-    registry.disconnect(&sub.node_id);
-    // Relay subtree eviction on stream exit (#585); no-op for a non-relay node.
-    registry.evict_children(&sub.node_id);
+    // Only touch the registry if this session's claim was still the live one
+    // (#682) — see the sibling shutdown path above for why a superseded
+    // session must not mutate a row/subtree that already belongs to a newer
+    // session.
+    if release_node_id(&node_identities, &sub.node_id, sub.node_id_claim) {
+        registry.disconnect(&sub.node_id);
+        // Relay subtree eviction on stream exit (#585); no-op for a non-relay node.
+        registry.evict_children(&sub.node_id);
+    }
     crate::metrics::connected_proxies().dec();
 }
 

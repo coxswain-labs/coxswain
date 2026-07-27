@@ -87,6 +87,30 @@ pub struct PeerSvid {
     pub uri_sans: Vec<String>,
 }
 
+impl PeerSvid {
+    /// Stable identity fingerprint for `node_id` collision detection (#682): the
+    /// sorted, joined URI SANs.
+    ///
+    /// Sorted so the fingerprint does not depend on certificate-encoding SAN
+    /// order — two presentations of the same identity must fingerprint
+    /// identically. Two peers with the same fingerprint are treated as the
+    /// same authenticated identity (a legitimate reconnect); distinct
+    /// fingerprints are refused a shared `node_id` regardless of subscribed
+    /// scope. An mTLS peer whose certificate carries no URI SAN fingerprints
+    /// to `""`. The plaintext/test path (no `PeerSvid` at all — see
+    /// [`crate::server`]'s `stream()`) is a *different* case: its caller maps
+    /// the absent `PeerSvid` to `None`, never calling this method at all, and
+    /// every such connection is treated as the same identity as every other
+    /// — indistinguishable by design, since production discovery mandates
+    /// mTLS end-to-end and this path exists only for tests/degraded mode.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        let mut sans = self.uri_sans.clone();
+        sans.sort();
+        sans.join(",")
+    }
+}
+
 /// Returns `true` if any URI SAN in `uri_sans` encodes the SPIFFE identity of the
 /// dedicated proxy for `(namespace, expected_sa)`.
 ///
@@ -758,6 +782,46 @@ pub(crate) mod tests {
             server_key_pem: server_key.serialize_pem().into_bytes(),
             client_cert_pem: client_cert.pem().into_bytes(),
             client_key_pem: client_key.serialize_pem().into_bytes(),
+        }
+    }
+
+    /// Two client leaf certs (`client_svid_a`, `client_svid_b`) issued by the
+    /// SAME fresh CA, alongside a controller SVID — the same shape as
+    /// [`SpiffeTestCerts`] but for tests that need two DISTINCT client
+    /// identities both trusted by one server (e.g. the #682 node_id collision
+    /// guard, which must distinguish them without either failing the TLS
+    /// handshake).
+    pub(crate) struct SpiffeTestCertsTwoClients {
+        pub ca_cert_pem: Vec<u8>,
+        pub server_cert_pem: Vec<u8>,
+        pub server_key_pem: Vec<u8>,
+        pub client_a_cert_pem: Vec<u8>,
+        pub client_a_key_pem: Vec<u8>,
+        pub client_b_cert_pem: Vec<u8>,
+        pub client_b_key_pem: Vec<u8>,
+    }
+
+    /// Generate a fresh CA + controller SVID + two distinct client leaf certs
+    /// under that same CA. See [`SpiffeTestCertsTwoClients`].
+    pub(crate) fn gen_certs_with_two_client_svids(
+        client_svid_a: &str,
+        client_svid_b: &str,
+    ) -> SpiffeTestCertsTwoClients {
+        let (ca_cert, ca_key, ca_params) = gen_ca();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let (server_cert, server_key) = gen_leaf(CONTROLLER_SPIFFE, &issuer);
+        let (client_a_cert, client_a_key) = gen_leaf(client_svid_a, &issuer);
+        let (client_b_cert, client_b_key) = gen_leaf(client_svid_b, &issuer);
+
+        SpiffeTestCertsTwoClients {
+            ca_cert_pem: ca_cert.pem().into_bytes(),
+            server_cert_pem: server_cert.pem().into_bytes(),
+            server_key_pem: server_key.serialize_pem().into_bytes(),
+            client_a_cert_pem: client_a_cert.pem().into_bytes(),
+            client_a_key_pem: client_a_key.serialize_pem().into_bytes(),
+            client_b_cert_pem: client_b_cert.pem().into_bytes(),
+            client_b_key_pem: client_b_key.serialize_pem().into_bytes(),
         }
     }
 

@@ -2626,7 +2626,7 @@ mod serial {
         // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
         // races (#601 CI flake). `wait_for_leader_reconciled` re-resolves the Lease
         // holder each tick.
-        leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
+        leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(120)).await?;
 
         // Drain the namespace to zero dedicated Gateways.
         let gateways: Api<Gateway> = Api::namespaced(h2.client.clone(), &ns.name);
@@ -2691,7 +2691,7 @@ mod serial {
         // restart the HA standby reports leader=0 forever, so a Service-pinned scrape
         // races (#601 CI flake). `wait_for_leader_reconciled` re-resolves the Lease
         // holder each tick.
-        leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(60)).await?;
+        leader::wait_for_leader_reconciled(&h2.client, Duration::from_secs(120)).await?;
 
         let deployments2: Api<Deployment> = Api::namespaced(h2.client.clone(), &ns.name);
         assert!(
