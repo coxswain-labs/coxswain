@@ -387,7 +387,8 @@ async fn do_bootstrap(
     })?;
 
     let channel = ep.connect_lazy();
-    let mut grpc = TonicClient::new(channel);
+    let mut grpc =
+        TonicClient::new(channel).max_decoding_message_size(crate::MAX_SERVER_MESSAGE_BYTES);
 
     let req = BootstrapRequest {
         sa_token: sa_token.clone(),

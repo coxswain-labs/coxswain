@@ -107,6 +107,10 @@ impl AsyncWrite for PeerSvidStream {
 /// [`Connected`] and injects `PeerSvid` into request extensions — the
 /// discovery handler uses it to enforce the Gateway scope-binding check.
 ///
+/// Every inbound message is capped at `crate::MAX_CLIENT_MESSAGE_BYTES`,
+/// applied here rather than per call site because this function is the single
+/// choke point for every discovery/bootstrap listener `coxswain-bin` starts.
+///
 /// Returns when `shutdown` resolves (graceful drain) or the server errors.
 ///
 /// # Errors
@@ -151,7 +155,7 @@ where
         // (`DiscoveryClientConfig::http2_keep_alive_interval` default, 30s).
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-        .add_service(service)
+        .add_service(service.max_decoding_message_size(crate::MAX_CLIENT_MESSAGE_BYTES))
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await
         .map_err(std::io::Error::other)

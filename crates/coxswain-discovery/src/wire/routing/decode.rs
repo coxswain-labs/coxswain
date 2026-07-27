@@ -21,7 +21,7 @@ use coxswain_core::routing::{
     RateLimitConfig, RateLimitKey, RouteEntry, RouteKind, RouteTimeouts, RouterError,
     SessionAffinity, SubjectAltName, TcpRouteTable, TcpRouteTableBuilder, TlsPassthroughTable,
     TlsPassthroughTableBuilder, UdpRouteTable, UdpRouteTableBuilder, UpstreamCa, UpstreamTls,
-    ValueMatch, WildcardKind, resolve_allowed_headers,
+    ValueMatch, WildcardKind, compile_bounded, resolve_allowed_headers,
 };
 // Whole-table route types + the pool-from-resources helper are used only by the
 // test-only `decode_world` route oracle (production decode is partition-wise via
@@ -35,6 +35,7 @@ use crate::proto::v1 as p;
 use crate::wire::endpoints::endpoint_key_from_wire;
 #[cfg(test)]
 use crate::wire::endpoints::endpoint_pool_from_resources;
+use crate::wire::narrow_u16;
 
 // ────────────────────────────────────────────────────────────────────────────
 // MaterializedGroup (#383)
@@ -114,7 +115,8 @@ where
     let mut hosts_by_port: std::collections::BTreeMap<u16, Vec<&p::HostEntry>> =
         std::collections::BTreeMap::new();
     for port_entry in &dto.ports {
-        let entry = hosts_by_port.entry(port_entry.port as u16).or_default();
+        let port = narrow_u16(port_entry.port, "routing_table.ports.port")?;
+        let entry = hosts_by_port.entry(port).or_default();
         entry.extend(port_entry.hosts.iter());
     }
     build_route_table::<Kind>(&hosts_by_port, pool)
@@ -257,11 +259,11 @@ fn build_route_entry(dto: &p::RouteEntry, pool: &EndpointPool) -> Result<RouteEn
     // #383 provenance split: a baked (endpoint-independent) status wins; else
     // install the endpoint-derived status the server omitted, re-derived from the
     // resolved pool. Reproduces the reflector's precedence exactly.
-    entry = entry.with_error_status(
-        dto.error_status
-            .map(|s| s as u16)
-            .or(materialized.empty_status),
-    );
+    let error_status = dto
+        .error_status
+        .map(|s| narrow_u16(s, "route_entry.error_status"))
+        .transpose()?;
+    entry = entry.with_error_status(error_status.or(materialized.empty_status));
 
     if let Some(max) = dto.max_body_size {
         entry = entry.with_max_body_size(Some(max));
@@ -335,7 +337,7 @@ pub(crate) fn bg_from_wire(
     let mut has_keyed_ref = false;
     let mut has_valid_empty = false;
     for wb in &dto.weighted {
-        let weight = wb.weight as u16;
+        let weight = narrow_u16(wb.weight, "weighted_backend.weight")?;
         let addrs = if let Some(reference) = &wb.endpoint_ref {
             has_keyed_ref = true;
             // The pool is keyed by u16-narrowed `EndpointKey`s (out-of-range
@@ -599,13 +601,20 @@ fn filter_from_wire(
         p::filter_action::Action::ResponseHeaderModifier(hm) => Ok(
             FilterAction::ResponseHeaderModifier(header_mod_from_wire(hm)?),
         ),
-        p::filter_action::Action::RequestRedirect(rd) => Ok(FilterAction::RequestRedirect {
-            scheme: rd.scheme.clone(),
-            hostname: rd.hostname.clone(),
-            port: rd.port.map(|p| p as u16),
-            status_code: rd.status_code as u16,
-            path: rd.path.as_ref().map(path_modifier_from_wire).transpose()?,
-        }),
+        p::filter_action::Action::RequestRedirect(rd) => {
+            let port = rd
+                .port
+                .map(|p| narrow_u16(p, "request_redirect.port"))
+                .transpose()?;
+            let status_code = narrow_u16(rd.status_code, "request_redirect.status_code")?;
+            Ok(FilterAction::RequestRedirect {
+                scheme: rd.scheme.clone(),
+                hostname: rd.hostname.clone(),
+                port,
+                status_code,
+                path: rd.path.as_ref().map(path_modifier_from_wire).transpose()?,
+            })
+        }
         p::filter_action::Action::UrlRewrite(uw) => Ok(FilterAction::UrlRewrite {
             hostname: uw.hostname.clone(),
             path: uw.path.as_ref().map(path_modifier_from_wire).transpose()?,
@@ -706,7 +715,7 @@ fn path_modifier_from_wire(dto: &p::PathModifier) -> Result<PathModifier, WireEr
             replacement: rp.replacement.clone(),
         }),
         p::path_modifier::Modifier::RegexReplace(rr) => {
-            let regex = Arc::new(regex::Regex::new(&rr.pattern)?);
+            let regex = Arc::new(compile_bounded(&rr.pattern)?);
             Ok(PathModifier::RegexReplace {
                 regex,
                 replacement: rr.replacement.clone().into_boxed_str(),
@@ -766,7 +775,7 @@ fn value_match_from_wire(dto: &p::ValueMatch) -> Result<ValueMatch, WireError> {
         field: "value_match.value",
     })? {
         p::value_match::Value::Exact(s) => Ok(ValueMatch::Exact(s.clone())),
-        p::value_match::Value::Regex(pat) => Ok(ValueMatch::Regex(regex::Regex::new(pat)?)),
+        p::value_match::Value::Regex(pat) => Ok(ValueMatch::Regex(compile_bounded(pat)?)),
     }
 }
 
@@ -1047,7 +1056,7 @@ pub(crate) fn passthrough_from_wire(
 ) -> Result<TlsPassthroughTable, WireError> {
     let mut builder = TlsPassthroughTableBuilder::new();
     for port_entry in &dto.ports {
-        let port = port_entry.port as u16;
+        let port = narrow_u16(port_entry.port, "tls_passthrough_table.ports.port")?;
         for entry in &port_entry.entries {
             let bg = match &entry.backend_group {
                 Some(bg) => Arc::new(bg_from_wire(bg, pool, 0)?.group),
@@ -1080,7 +1089,7 @@ pub(crate) fn tcp_table_from_wire(
 ) -> Result<TcpRouteTable, WireError> {
     let mut builder = TcpRouteTableBuilder::new();
     for port_entry in &dto.ports {
-        let port = port_entry.port as u16;
+        let port = narrow_u16(port_entry.port, "tcp_route_table.ports.port")?;
         let bg = match &port_entry.backend_group {
             Some(bg) => Arc::new(bg_from_wire(bg, pool, 0)?.group),
             None => continue,
@@ -1105,7 +1114,7 @@ pub(crate) fn udp_table_from_wire(
 ) -> Result<UdpRouteTable, WireError> {
     let mut builder = UdpRouteTableBuilder::new();
     for port_entry in &dto.ports {
-        let port = port_entry.port as u16;
+        let port = narrow_u16(port_entry.port, "udp_route_table.ports.port")?;
         let bg = match &port_entry.backend_group {
             Some(bg) => Arc::new(bg_from_wire(bg, pool, 0)?.group),
             None => continue,
@@ -1171,7 +1180,7 @@ pub(crate) fn decode_world(resources: &[p::Resource]) -> Result<DecodedWorld, Wi
             let host = rh.host.clone().ok_or(WireError::UnknownResourceKey {
                 reason: "route_host resource missing its host bucket",
             })?;
-            let port = rh.port as u16;
+            let port = narrow_u16(rh.port, "route_host_resource.port")?;
             match p::RouteTableKind::try_from(rh.table).unwrap_or(p::RouteTableKind::Unspecified) {
                 p::RouteTableKind::Ingress => ingress_ports.entry(port).or_default().push(host),
                 p::RouteTableKind::Gateway => gateway_ports.entry(port).or_default().push(host),

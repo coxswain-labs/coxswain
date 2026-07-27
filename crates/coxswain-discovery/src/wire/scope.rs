@@ -44,6 +44,7 @@ use coxswain_core::listener_status::{
 use crate::error::WireError;
 use crate::proto::v1 as p;
 use crate::subscription::Scope;
+use crate::wire::narrow_u16;
 
 // ────────────────────────────────────────────────────────────────────────────
 // Scope: to_wire / from_wire
@@ -131,6 +132,9 @@ pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerI
         p::ListenerReadiness::UdpProxy => ListenerReadiness::UdpProxy,
     };
 
+    let port = narrow_u16(dto.port, "listener_info.port")?;
+    let internal_port = narrow_u16(dto.internal_port, "listener_info.internal_port")?;
+
     let li = ListenerInfo {
         readiness,
         attached_routes: dto.attached_routes,
@@ -143,8 +147,8 @@ pub(crate) fn listener_info_from_wire(dto: &p::ListenerInfo) -> Result<ListenerI
         } else {
             RouteNamespaceSet::Only(std::collections::BTreeSet::new())
         },
-        port: dto.port as u16,
-        internal_port: dto.internal_port as u16,
+        port,
+        internal_port,
         conflict: if dto.protocol_conflict {
             ConflictReason::ProtocolConflict
         } else if dto.conflicted {
@@ -216,6 +220,50 @@ mod tests {
                 }
             ),
             "expected MissingRequiredField(scope.kind), got {err:?}",
+        );
+    }
+
+    // ── ListenerInfo port narrowing (#667) ────────────────────────────────────
+
+    /// One past `u16::MAX` — the boundary value `narrow_u16` must reject.
+    const OUT_OF_RANGE_U16: u32 = u16::MAX as u32 + 1;
+
+    #[test]
+    fn listener_info_rejects_out_of_range_port() {
+        let dto = p::ListenerInfo {
+            port: OUT_OF_RANGE_U16,
+            ..Default::default()
+        };
+        let err = listener_info_from_wire(&dto).expect_err("out-of-range port must be rejected");
+        assert!(
+            matches!(
+                err,
+                WireError::ValueOutOfRange {
+                    field: "listener_info.port",
+                    ..
+                }
+            ),
+            "expected ValueOutOfRange on listener_info.port, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn listener_info_rejects_out_of_range_internal_port() {
+        let dto = p::ListenerInfo {
+            internal_port: OUT_OF_RANGE_U16,
+            ..Default::default()
+        };
+        let err =
+            listener_info_from_wire(&dto).expect_err("out-of-range internal_port must be rejected");
+        assert!(
+            matches!(
+                err,
+                WireError::ValueOutOfRange {
+                    field: "listener_info.internal_port",
+                    ..
+                }
+            ),
+            "expected ValueOutOfRange on listener_info.internal_port, got {err:?}"
         );
     }
 }

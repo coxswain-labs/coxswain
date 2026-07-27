@@ -244,4 +244,21 @@ pub enum WireError {
         /// Global version the client recomputed from the post-apply world.
         computed: String,
     },
+
+    /// A `u32` wire scalar that domain-narrows to `u16` (a port, an HTTP status
+    /// code, or a backend weight) exceeded `u16::MAX`.
+    ///
+    /// The trusted encoder only ever emits values that originated as a `u16`
+    /// promoted to `u32` on the wire, so this is unreachable from the current
+    /// server — but decode must not silently truncate an out-of-range value
+    /// (e.g. port `65616` aliasing port `80`), which is a wire-format
+    /// confusion rather than a normal decode failure. Fail the decode closed
+    /// (Nack + last-good) like every other malformed-input variant here.
+    #[error("wire value out of range for {field}: {value} exceeds u16::MAX")]
+    ValueOutOfRange {
+        /// Name of the field that carried the out-of-range value.
+        field: &'static str,
+        /// The raw wire value, before the rejected narrowing.
+        value: u32,
+    },
 }

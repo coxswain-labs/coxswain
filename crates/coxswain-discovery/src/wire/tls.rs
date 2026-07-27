@@ -51,6 +51,7 @@ use coxswain_core::tls::{
 
 use crate::error::WireError;
 use crate::proto::v1 as p;
+use crate::wire::narrow_u16;
 
 // ────────────────────────────────────────────────────────────────────────────
 // TLS store: to_wire
@@ -140,7 +141,8 @@ pub fn port_tls_from_wire(dto: &p::PortTlsStore) -> Result<PortTlsStore, WireErr
                 .ok_or(WireError::MissingRequiredField {
                     field: "port_tls_entry.store",
                 })?;
-            Ok((entry.port as u16, tls_from_wire(store_dto)?))
+            let port = narrow_u16(entry.port, "port_tls_entry.port")?;
+            Ok((port, tls_from_wire(store_dto)?))
         })
         .collect::<Result<Vec<(u16, TlsStore)>, WireError>>()?;
     Ok(PortTlsStore::from_port_stores(stores))
@@ -326,9 +328,10 @@ pub fn client_cert_from_wire(dto: &p::ClientCertStore) -> Result<ClientCertStore
                 field: "client_cert_entry.state",
             },
         )?);
-        // u32 narrowing matches the routing decoder: the sole producer writes
-        // `u32::from(u16)`, so the value is in range by construction.
-        let port = entry.port as u16;
+        // The sole producer writes `u32::from(u16)`, so this is in range in
+        // practice — but decode still enforces it rather than truncating, for
+        // the same reason every other wire scalar does (`narrow_u16`).
+        let port = narrow_u16(entry.port, "client_cert_entry.port")?;
         // Empty host_pattern → the port's default bucket in add_config.
         builder.add_config(port, &entry.host_pattern, Arc::new(state));
     }
@@ -350,6 +353,54 @@ fn client_cert_state_from_wire(dto: &p::ClientCertConfigState) -> ClientCertConf
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Bind-port narrowing (#667) ────────────────────────────────────────────
+
+    /// One past `u16::MAX` — the boundary value `narrow_u16` must reject.
+    const OUT_OF_RANGE_U16: u32 = u16::MAX as u32 + 1;
+
+    #[test]
+    fn port_tls_store_rejects_out_of_range_port() {
+        let dto = p::PortTlsStore {
+            ports: vec![p::PortTlsEntry {
+                port: OUT_OF_RANGE_U16,
+                store: Some(p::TlsStore::default()),
+            }],
+        };
+        let err = port_tls_from_wire(&dto).expect_err("out-of-range port must be rejected");
+        assert!(
+            matches!(
+                err,
+                WireError::ValueOutOfRange {
+                    field: "port_tls_entry.port",
+                    ..
+                }
+            ),
+            "expected ValueOutOfRange on port_tls_entry.port, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn client_cert_store_rejects_out_of_range_port() {
+        let dto = p::ClientCertStore {
+            entries: vec![p::ClientCertEntry {
+                host_pattern: String::new(),
+                state: Some(p::ClientCertConfigState { kind: None }),
+                port: OUT_OF_RANGE_U16,
+            }],
+        };
+        let err = client_cert_from_wire(&dto).expect_err("out-of-range port must be rejected");
+        assert!(
+            matches!(
+                err,
+                WireError::ValueOutOfRange {
+                    field: "client_cert_entry.port",
+                    ..
+                }
+            ),
+            "expected ValueOutOfRange on client_cert_entry.port, got {err:?}"
+        );
+    }
 
     // ── 5. TLS store exact + wildcard + default ───────────────────────────────
 

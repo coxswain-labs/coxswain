@@ -87,11 +87,12 @@ mod tests {
 
     use super::{
         EndpointCollector, MAX_MIRROR_DEPTH, bg_from_wire, decode_world, gateway_route_resources,
-        ingress_route_resources, rate_limit_from_wire, upstream_tls_from_wire,
-        upstream_tls_to_wire,
+        ingress_route_resources, passthrough_from_wire, rate_limit_from_wire, tcp_table_from_wire,
+        udp_table_from_wire, upstream_tls_from_wire, upstream_tls_to_wire,
     };
     use crate::error::WireError;
     use crate::proto::v1 as p;
+    use crate::wire::narrow_u16;
     use crate::wire::tests::*;
     use coxswain_core::endpoints::EndpointPool;
 
@@ -1594,5 +1595,254 @@ mod tests {
             .resolve_origin("https://any.example")
             .expect("allow_all_origins should match anything");
         assert_eq!(hv, "https://any.example");
+    }
+
+    // ── Wire scalar narrowing (#667): out-of-range u32 → u16 is rejected ──────
+    //
+    // The domain types here are already `u16`, so an out-of-range wire value can
+    // only be produced by constructing the proto DTO directly (never via
+    // `to_wire`) — exactly like `dangling_ref_errors` and the mirror-depth test
+    // above. Happy-path narrowing (an in-range port/weight/status decodes
+    // correctly) is already exhaustively covered by every other round-trip test
+    // in this module; these only need to prove the new rejection path.
+
+    /// One past `u16::MAX` — the boundary value `narrow_u16` must reject.
+    const OUT_OF_RANGE_U16: u32 = u16::MAX as u32 + 1;
+
+    #[test]
+    fn narrow_u16_rejects_the_first_value_past_u16_max() {
+        let err = narrow_u16(OUT_OF_RANGE_U16, "test.field").unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WireError::ValueOutOfRange {
+                    field: "test.field",
+                    value: OUT_OF_RANGE_U16
+                }
+            ),
+            "expected ValueOutOfRange{{field: \"test.field\", value: {OUT_OF_RANGE_U16}}}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn narrow_u16_accepts_the_full_u16_range() {
+        assert_eq!(narrow_u16(0, "test.field").unwrap(), 0);
+        assert_eq!(
+            narrow_u16(u32::from(u16::MAX), "test.field").unwrap(),
+            u16::MAX
+        );
+    }
+
+    #[test]
+    fn route_host_resource_rejects_out_of_range_bind_port() {
+        let resource = p::Resource {
+            payload: Some(p::resource::Payload::RouteHost(p::RouteHostResource {
+                table: p::RouteTableKind::Ingress as i32,
+                port: OUT_OF_RANGE_U16,
+                host: Some(p::HostEntry {
+                    pattern: Some(p::host_entry::Pattern::Exact("example.com".to_owned())),
+                    normalize_level: 0,
+                    routes: vec![],
+                }),
+            })),
+            ..Default::default()
+        };
+        // DecodedWorld is not Debug (routing tables aren't), so match rather than unwrap_err.
+        let err = match decode_world(&[resource]) {
+            Ok(_) => panic!("expected a ValueOutOfRange error, got a decoded world"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err,
+                WireError::ValueOutOfRange {
+                    field: "route_host_resource.port",
+                    ..
+                }
+            ),
+            "expected ValueOutOfRange on route_host_resource.port, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn route_entry_rejects_out_of_range_baked_error_status() {
+        let resources = vec![
+            keyed_route_resource(
+                "api.example.com",
+                "default",
+                "svc",
+                80,
+                Some(OUT_OF_RANGE_U16),
+            ),
+            endpoint_resource("default", "svc", 80, true, &["10.0.0.1:8080"]),
+        ];
+        let err = match decode_world(&resources) {
+            Ok(_) => panic!("expected a ValueOutOfRange error, got a decoded world"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err,
+                WireError::ValueOutOfRange {
+                    field: "route_entry.error_status",
+                    ..
+                }
+            ),
+            "expected ValueOutOfRange on route_entry.error_status, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn weighted_backend_rejects_out_of_range_weight() {
+        let dto = p::BackendGroup {
+            name: "ns/svc".to_string(),
+            weighted: vec![p::WeightedBackend {
+                addrs: vec!["10.0.0.1:80".to_string()],
+                weight: OUT_OF_RANGE_U16,
+                endpoint_ref: None,
+            }],
+            load_balance: Some(p::LoadBalance {
+                algorithm: Some(p::load_balance::Algorithm::RoundRobin(true)),
+            }),
+            ..Default::default()
+        };
+        let err = bg_from_wire(&dto, &EndpointPool::new(), 0).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WireError::ValueOutOfRange {
+                    field: "weighted_backend.weight",
+                    ..
+                }
+            ),
+            "expected ValueOutOfRange on weighted_backend.weight, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn tls_passthrough_table_rejects_out_of_range_port() {
+        let dto = p::TlsPassthroughTable {
+            ports: vec![p::TlsPassthroughPort {
+                port: OUT_OF_RANGE_U16,
+                entries: vec![],
+            }],
+        };
+        let err = passthrough_from_wire(&dto, &EndpointPool::new()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WireError::ValueOutOfRange {
+                    field: "tls_passthrough_table.ports.port",
+                    ..
+                }
+            ),
+            "expected ValueOutOfRange on tls_passthrough_table.ports.port, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn tcp_route_table_rejects_out_of_range_port() {
+        let dto = p::TcpRouteTable {
+            ports: vec![p::TcpRoutePort {
+                port: OUT_OF_RANGE_U16,
+                backend_group: None,
+            }],
+        };
+        let err = tcp_table_from_wire(&dto, &EndpointPool::new()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WireError::ValueOutOfRange {
+                    field: "tcp_route_table.ports.port",
+                    ..
+                }
+            ),
+            "expected ValueOutOfRange on tcp_route_table.ports.port, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn udp_route_table_rejects_out_of_range_port() {
+        let dto = p::UdpRouteTable {
+            ports: vec![p::UdpRoutePort {
+                port: OUT_OF_RANGE_U16,
+                backend_group: None,
+            }],
+        };
+        let err = udp_table_from_wire(&dto, &EndpointPool::new()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                WireError::ValueOutOfRange {
+                    field: "udp_route_table.ports.port",
+                    ..
+                }
+            ),
+            "expected ValueOutOfRange on udp_route_table.ports.port, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn request_redirect_rejects_out_of_range_port_and_status_code() {
+        let filter = p::FilterAction {
+            action: Some(p::filter_action::Action::RequestRedirect(
+                p::RequestRedirect {
+                    scheme: None,
+                    hostname: None,
+                    port: Some(OUT_OF_RANGE_U16),
+                    status_code: 301,
+                    path: None,
+                },
+            )),
+        };
+        // `RouteEntry.backend_group` is required on the wire even for a
+        // redirect-only route (`encode.rs` always emits `Some`); a minimal
+        // literal-address group satisfies decode without exercising anything
+        // else this test isn't about.
+        let bg = p::BackendGroup {
+            name: "redirect".to_string(),
+            weighted: vec![p::WeightedBackend {
+                addrs: vec!["10.0.0.1:80".to_string()],
+                weight: 1,
+                endpoint_ref: None,
+            }],
+            load_balance: Some(p::LoadBalance {
+                algorithm: Some(p::load_balance::Algorithm::RoundRobin(true)),
+            }),
+            ..Default::default()
+        };
+        let resource = p::Resource {
+            payload: Some(p::resource::Payload::RouteHost(p::RouteHostResource {
+                table: p::RouteTableKind::Ingress as i32,
+                port: 80,
+                host: Some(p::HostEntry {
+                    pattern: Some(p::host_entry::Pattern::Exact("example.com".to_owned())),
+                    normalize_level: 0,
+                    routes: vec![p::RouteEntry {
+                        kind: p::RouteKind::Prefix as i32,
+                        path: "/".to_owned(),
+                        backend_group: Some(bg),
+                        filters: vec![filter],
+                        route_id: "redirect-route".to_owned(),
+                        ..Default::default()
+                    }],
+                }),
+            })),
+            ..Default::default()
+        };
+        let err = match decode_world(&[resource]) {
+            Ok(_) => panic!("expected a ValueOutOfRange error, got a decoded world"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err,
+                WireError::ValueOutOfRange {
+                    field: "request_redirect.port",
+                    ..
+                }
+            ),
+            "expected ValueOutOfRange on request_redirect.port, got {err:?}"
+        );
     }
 }

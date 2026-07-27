@@ -11,18 +11,21 @@
 # `compile_path_regex`, which delegates to it), which caps the program at
 # `REGEX_SIZE_LIMIT`.
 #
-# Scope: `coxswain-core` + `coxswain-reflector` src. Per this repo's inline-test
-# convention (unit tests live in a bottom `#[cfg(test)] mod tests`), the scan stops
-# at the first `#[cfg(test)]` so test patterns using `Regex::new` are exempt.
-# Comment lines are skipped. `RegexSet::new` / `RegexBuilder::new` do not contain
-# the `Regex::new` token and are not matched (the builder forms carry their own
+# Scope: `coxswain-core` + `coxswain-reflector` + `coxswain-discovery` src. The
+# discovery wire decoder (`wire/routing/decode.rs`) recompiles the same
+# tenant-originated patterns from untrusted proto bytes (#667) — a blind spot
+# until #667 added it here. Per this repo's inline-test convention (unit tests
+# live in a bottom `#[cfg(test)] mod tests`), the scan stops at the first
+# `#[cfg(test)]` so test patterns using `Regex::new` are exempt. Comment lines
+# are skipped. `RegexSet::new` / `RegexBuilder::new` do not contain the
+# `Regex::new` token and are not matched (the builder forms carry their own
 # size_limit at their call sites).
 #
 # Run from the repo root. Exits non-zero with a list of offending sites.
 
 set -euo pipefail
 
-roots=(crates/coxswain-core/src crates/coxswain-reflector/src)
+roots=(crates/coxswain-core/src crates/coxswain-reflector/src crates/coxswain-discovery/src)
 offenders=""
 
 while IFS= read -r -d '' path; do
@@ -49,4 +52,4 @@ if [ -n "$offenders" ]; then
   exit 1
 fi
 
-echo "OK: no bare Regex::new on tenant-supplied input in core/reflector src."
+echo "OK: no bare Regex::new on tenant-supplied input in core/reflector/discovery src."
