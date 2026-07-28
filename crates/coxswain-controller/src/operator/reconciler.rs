@@ -39,9 +39,9 @@
 //! health drifts, so a cert-ref or route-resolution change reaches the patch
 //! path within watch latency without a dedicated retrigger channel.
 
-use super::admin_fence::AdminFenceConfig;
 use super::relay_params::{self, EffectiveRelayPolicy};
 use super::render_shared_proxy::ProxyPoolConfig;
+use super::telemetry_fence::TelemetryFenceConfig;
 use super::{
     apply, harden, params, relay_autoscaler, render, render_relay, render_shared, status, vip,
 };
@@ -231,10 +231,13 @@ pub struct OperatorConfig {
     /// reservation surfaces `Programmed=False, reason=PortUnavailable` —
     /// same semantics as the shared-pool writer (#201).
     pub ingress_ports: IngressPorts,
-    /// Admin server port rendered into the `gateway.coxswain-labs.dev/admin-port`
-    /// annotation on every dedicated-proxy pod. Propagated from the
-    /// `--admin-port` / `COXSWAIN_ADMIN_PORT` CLI argument.
-    pub admin_port: u16,
+    /// Telemetry server port rendered into the
+    /// `gateway.coxswain-labs.dev/telemetry-port` annotation, the `telemetry`
+    /// container port, and the `--telemetry-port` flag on every provisioned
+    /// pod — all three must agree or probes and scrapes hit a closed port.
+    /// Propagated from the `--telemetry-port` / `COXSWAIN_TELEMETRY_PORT` CLI
+    /// argument.
+    pub telemetry_port: u16,
     /// Server-auth-only bootstrap endpoint rendered as
     /// `--discovery-bootstrap-endpoint=<endpoint>` so the dedicated proxy can
     /// obtain its SVID (projected token + trust mount, #423).
@@ -278,7 +281,7 @@ pub struct OperatorConfig {
     /// Admin-port fencing policy (#670), install-wide: applied identically to
     /// the shared pool, every dedicated proxy, and every relay, since all three
     /// bind the same admin surface.
-    pub admin_fence: AdminFenceConfig,
+    pub telemetry_fence: TelemetryFenceConfig,
     /// Shared handle for publishing definitively-failed static-address VIP
     /// provisioning to the status writer (#531/#533). Constructed in
     /// `coxswain-bin` and cloned into the `Controller` too, so the single
@@ -367,9 +370,10 @@ pub(crate) struct ReconcileContext {
     /// for the listener `PortUnavailable` precedence check, and rendered onto
     /// the shared proxy pool's container ports + listener flags (#604).
     pub(super) ingress_ports: IngressPorts,
-    /// Admin server port injected as `gateway.coxswain-labs.dev/admin-port` on
-    /// every rendered dedicated-proxy pod, and the shared pool's `--admin-port`.
-    pub(super) admin_port: u16,
+    /// Telemetry server port injected as
+    /// `gateway.coxswain-labs.dev/telemetry-port` on every provisioned pod, and
+    /// passed to each as `--telemetry-port`.
+    pub(super) telemetry_port: u16,
     /// Bootstrap endpoint + token/bundle paths + trust domain rendered into the
     /// dedicated-proxy Deployment so it can obtain an SVID (#423). Reused
     /// verbatim by the shared proxy pool (#604).
@@ -409,7 +413,7 @@ pub(crate) struct ReconcileContext {
     pub(super) enable_gateway_api: bool,
     /// Admin-port fencing policy (#670), applied to every provisioned pod —
     /// shared pool, dedicated proxy, and relay alike.
-    pub(super) admin_fence: AdminFenceConfig,
+    pub(super) telemetry_fence: TelemetryFenceConfig,
     /// Signals the serialized [`run_vip_reconciler`] task to run a whole-VIP
     /// pass (#472). Per-Gateway reconciles only *signal* here — they never
     /// provision VIP Services themselves, so the allocation stays single-writer.
@@ -508,7 +512,7 @@ impl ReconcileContext {
             nodes_store: stores.nodes,
             listener_status: config.listener_status,
             ingress_ports: config.ingress_ports,
-            admin_port: config.admin_port,
+            telemetry_port: config.telemetry_port,
             discovery_bootstrap_endpoint: config.discovery_bootstrap_endpoint,
             discovery_sa_token_path: config.discovery_sa_token_path,
             discovery_ca_bundle_path: config.discovery_ca_bundle_path,
@@ -524,7 +528,7 @@ impl ReconcileContext {
             health_port: config.health_port,
             enable_ingress: config.enable_ingress,
             enable_gateway_api: config.enable_gateway_api,
-            admin_fence: config.admin_fence,
+            telemetry_fence: config.telemetry_fence,
             vip_trigger: Arc::new(tokio::sync::Notify::new()),
             shared_install_trigger: Arc::new(tokio::sync::Notify::new()),
             vip_failures: config.vip_failures,
@@ -1102,8 +1106,8 @@ async fn reconcile_inner(
         discovery_sa_token_path: &ctx.discovery_sa_token_path,
         discovery_ca_bundle_path: &ctx.discovery_ca_bundle_path,
         discovery_trust_domain: &ctx.discovery_trust_domain,
-        admin_port: ctx.admin_port,
-        admin_fence: &ctx.admin_fence,
+        telemetry_port: ctx.telemetry_port,
+        telemetry_fence: &ctx.telemetry_fence,
         effective_ports: dedicated_ports,
     });
 
@@ -1748,7 +1752,8 @@ mod tests {
     use std::sync::LazyLock;
 
     /// Default (fencing-on) policy the render tests below borrow.
-    static TEST_ADMIN_FENCE: LazyLock<AdminFenceConfig> = LazyLock::new(AdminFenceConfig::default);
+    static TEST_TELEMETRY_FENCE: LazyLock<TelemetryFenceConfig> =
+        LazyLock::new(TelemetryFenceConfig::default);
 
     #[test]
     fn gateway_key_uses_namespace_and_name() {
@@ -2017,8 +2022,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         let r_b = render::render(&render::RenderInputs {
@@ -2031,8 +2036,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         assert_ne!(
@@ -2073,8 +2078,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         };
         let r1 = render::render(&inputs);

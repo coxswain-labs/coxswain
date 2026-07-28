@@ -1,5 +1,19 @@
-//! Health HTTP endpoints: `/healthz` (always 200) and `/readyz` (gated on the
-//! aggregate of every subsystem registered in the shared [`HealthRegistry`]).
+//! Management HTTP endpoints served on the two unauthenticated listeners.
+//!
+//! - [`HealthServer`] — `/healthz` (always 200) and `/readyz` (gated on the
+//!   aggregate of every subsystem registered in the shared [`HealthRegistry`]).
+//!   Probed by kubelet, whose traffic is node-sourced and therefore effectively
+//!   un-fenceable, so this port carries nothing but pass/fail.
+//! - [`TelemetryServer`] — `/metrics` and `/statusz`. Read by Prometheus and by
+//!   peer pods building the fleet view. Open by default, fenceable on request.
+//!
+//! Anything authenticated or cluster-scoped lives on the operator port in
+//! `coxswain-admin` instead. See [`TelemetryServer`]'s own docs for why the
+//! split is by port rather than by path.
+
+mod telemetry;
+
+pub use telemetry::TelemetryServer;
 
 use async_trait::async_trait;
 use coxswain_core::health::{HealthRegistry, LivenessGate};

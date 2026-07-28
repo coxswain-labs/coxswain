@@ -96,36 +96,59 @@ readinessProbe:
   periodSeconds: 10
   failureThreshold: 6
 
-# -- Bind address shared by the health and admin servers on both pods.
-# COXSWAIN_MANAGEMENT_BIND_ADDRESS — set to a management-network IP to restrict
-# /healthz, /readyz, /metrics, /routes, /status access; leave as 0.0.0.0 to keep
+# -- Bind address shared by all three management servers on every pod.
+# COXSWAIN_MANAGEMENT_BIND_ADDRESS — set to a management-network IP to keep the
+# management surface off the data-plane interface; leave as 0.0.0.0 to keep
 # kubelet probes and Prometheus scraping working out of the box.
 management:
   bindAddress: "0.0.0.0"
 
 # -- Health endpoint port (COXSWAIN_HEALTH_PORT). Serves /healthz and /readyz.
+# Every role binds it. Reachable from anywhere and not fenceable: kubelet probes
+# are node-sourced and most CNIs cannot select them in a NetworkPolicy. Carries
+# no cluster data — pass/fail only.
 # The bind address is controlled by management.bindAddress.
 health:
   port: 8081
 
-# -- Admin endpoint port (COXSWAIN_ADMIN_PORT). Serves /metrics, /routes, /status.
+# -- Telemetry endpoint port (COXSWAIN_TELEMETRY_PORT). Serves /metrics and
+# /statusz. Every role binds it, and it is never authenticated: Prometheus
+# cannot present a credential, and the controller probes peer pods here while
+# holding only the bcrypt hash of the operator credential. Open to all sources
+# by default so scraping works unconfigured; fence it with
+# networkPolicy.telemetry.fenced below.
 # The bind address is controlled by management.bindAddress.
-admin:
+telemetry:
+  port: 8083
+
+# -- Operator endpoint port (COXSWAIN_OPERATOR_PORT). Serves the operator UI and
+# /api/v1/*. CONTROLLER ONLY — proxy and relay pods do not bind it at all.
+# Everything on it is cluster-scoped and, when operatorAuth is configured, every
+# path is authenticated with no exemptions.
+# The bind address is controlled by management.bindAddress.
+operator:
   port: 8082
 
-# -- Admin-port fencing. The management surface binds 0.0.0.0 so kubelet probes
-# and Prometheus scraping work out of the box, and the pod network is flat — so
-# without a NetworkPolicy any pod in any namespace can reach every coxswain
-# pod's admin port. On the controller that port relays verbatim Kubernetes
-# manifests (including Pod env) and pod logs; on a proxy or relay it serves
-# /metrics, whose gateway_name/gateway_namespace labels map the whole routing
-# topology.
+# -- NetworkPolicy fencing for the management surface. The pod network is flat,
+# so without a policy any pod in any namespace can reach every coxswain pod's
+# management ports.
 #
-# One policy is rendered per pod set: the controller's here in the chart, and
-# one each for the shared pool / dedicated proxies / relays by the controller
-# itself (it owns those Deployments). Each admits the admin port only from pods
-# in the policy's own namespace; every other port stays open to all sources, so
-# the data plane, kubelet probes, and the discovery stream are untouched.
+# Two surfaces, fenced differently on purpose:
+#
+#   operator  — the controller's UI + /api/v1/*, which relays verbatim Kubernetes
+#               manifests (including Pod env) and pod logs. Fenced by DEFAULT.
+#               Rendered here in the chart; proxy and relay pods do not bind this
+#               port at all, so they have nothing to fence.
+#   telemetry — /metrics and /statusz on every pod. NOT fenced by default: see
+#               networkPolicy.telemetry.fenced below for the trade.
+#
+# The health and discovery ports stay open to all sources: kubelet probes are
+# node-sourced (no CNI can reliably select them) and carry no cluster data, and
+# the discovery port is already mutually authenticated by SVID mTLS.
+#
+# The telemetry fence is rendered per pod set — one each for the shared pool /
+# dedicated proxies / relays, by the controller itself, since it owns those
+# Deployments.
 networkPolicy:
   # Set false on clusters whose CNI does not enforce NetworkPolicy (the object
   # would be inert anyway), or when you fence the surface with your own policy.
@@ -133,43 +156,63 @@ networkPolicy:
   # networkpolicies RBAC either way — it needs the delete verb precisely in order
   # to reclaim them.)
   enabled: true
-  admin:
-    # Additional NetworkPolicyPeers admitted to the admin port, beyond pods in
-    # the target pod's own namespace and pods in the install namespace (which is
-    # what lets the controller aggregate a dedicated proxy in a tenant
-    # namespace). The case the default gets wrong is Prometheus scraping from a
-    # third namespace: the PodMonitor below targets pod IPs directly, so those
-    # scrapes are denied unless its namespace is named here.
+  operator:
+    # Additional NetworkPolicyPeers admitted to the controller's operator port,
+    # beyond pods in the install namespace. Needed for tooling that calls
+    # /api/v1/* from another namespace; `kubectl port-forward` is unaffected
+    # (it is node-sourced, not subject to pod selectors).
     #
     # Entries are verbatim NetworkPolicyPeer objects, e.g.:
     #   extraIngress:
     #     - namespaceSelector:
     #         matchLabels:
-    #           kubernetes.io/metadata.name: monitoring
+    #           kubernetes.io/metadata.name: platform-tools
+    extraIngress: []
+  telemetry:
+    # Fence /metrics and /statusz to the pod's own namespace + the install
+    # namespace. OFF by default, deliberately inverting the operator port's
+    # secure-by-default posture.
+    #
+    # What it would protect is the routing inventory: the metric labels
+    # enumerate route objects (httproute/<ns>/<name>:<rule>) and backend Service
+    # names. That is recon material, not credentials, and anyone with
+    # `get httproutes` already has it.
+    #
+    # What fencing by default would cost is certain and silent: PodMonitor
+    # scrapes pod IPs directly, so a Prometheus outside those two namespaces —
+    # which is where essentially every install puts it, kube-prometheus-stack
+    # defaults to `monitoring` — is dropped with no error anywhere. Targets sit
+    # at "context deadline exceeded" and a dashboard is simply empty.
+    #
+    # Turn it on when untrusted workloads share the pod network, and add your
+    # scraper's namespace to extraIngress below in the same change.
+    fenced: false
+    # Peers admitted in addition to the pod's own namespace and the install
+    # namespace. Only consulted when fenced is true. Same NetworkPolicyPeer
+    # shape as operator.extraIngress above.
     extraIngress: []
 
-# -- Optional HTTP Basic authentication on the controller's admin port, as a
+# -- Optional HTTP Basic authentication on the controller's operator port, as a
 # second factor alongside the NetworkPolicy above. Off by default.
 #
 # Create the Secret yourself, holding ONE htpasswd line (bcrypt only) under the
 # key `auth`, in the release namespace:
 #
 #   htpasswd -nbB admin 's3cret' > auth
-#   kubectl create secret generic coxswain-admin-auth \
+#   kubectl create secret generic coxswain-operator-auth \
 #     --namespace coxswain-system --from-file=auth
 #
-# Then set `secretName: coxswain-admin-auth`. The controller reads the Secret
+# Then set `secretName: coxswain-operator-auth`. The controller reads the Secret
 # with the RBAC it already has and re-reads it every 30s, so rotating the
 # credential does not need a restart. If the Secret is missing or unusable the
-# admin surface returns 503 rather than falling back to unauthenticated.
+# operator surface returns 503 rather than falling back to unauthenticated.
 #
-# This covers the CONTROLLER's admin port only — the port that serves manifests
-# and logs. Proxy and relay admin ports serve only /metrics and /api/v1/health
-# and are fenced by NetworkPolicy alone.
-#
-# NOTE: enabling this also requires credentials on anything scraping the
-# controller's /metrics, including the PodMonitor below.
-adminAuth:
+# Covers EVERY path on the operator port, with no exemptions — the port carries
+# nothing that an unauthenticatable caller needs. Prometheus scrapes /metrics
+# and the controller probes peers at /statusz on the telemetry port, which is
+# never authenticated, so enabling this breaks neither. Proxy and relay pods do
+# not bind an operator port at all.
+operatorAuth:
   secretName: ""
 
 # -- Discovery gRPC server port (COXSWAIN_DISCOVERY_PORT).

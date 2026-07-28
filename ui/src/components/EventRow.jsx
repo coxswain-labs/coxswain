@@ -17,7 +17,7 @@ export function formatEventDetail(type, data) {
     case 'rebuild.completed':
       return `cycle: ${data.cycle}`;
     case 'proxy.connected':
-      return `pod: ${data.pod}  mode: ${data.mode}  addr: ${data.admin_addr}`;
+      return `pod: ${data.pod}  mode: ${data.mode}  addr: ${data.telemetry_addr}`;
     case 'proxy.disconnected':
       return `pod: ${data.pod}  reason: ${data.reason ?? '—'}`;
     case 'controller.connected':

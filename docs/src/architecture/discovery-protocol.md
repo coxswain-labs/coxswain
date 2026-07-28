@@ -151,11 +151,11 @@ Both proxy roles hold **zero Kubernetes API credentials**. All routing data arri
 |---|:-:|:-:|:-:|
 | `/healthz`, `/readyz` | ✓ | ✓ | ✓ |
 | `/metrics` | ✓ (reconcile counts, leader status) | ✓ (traffic, errors) | ✓ (scoped to this Gateway) |
-| `/api/v1/health` | ✓ (subsystem detail, version, leader) | ✓ | ✓ |
+| `/statusz` | ✓ (subsystem detail, version) | ✓ | ✓ |
 | `GET /` (operator UI) + `/api/v1/{fleet,routing}/*` | ✓ (cluster-wide aggregate + summaries, incl. each proxy's compiled routing table at `fleet/proxies/{name}/routes`) | — | — |
 | `/api/v1/{problems,events,manifests/*,pods/*/logs}` | ✓ | — | — |
 
-Proxy pods carry no admin query surface beyond `/healthz`/`/readyz`/`/metrics`/`/api/v1/health` — the
+Proxy pods carry no management surface beyond `/healthz`/`/readyz`/`/metrics`/`/statusz` — the
 controller is the sole reader of Kubernetes state and pushes routing to proxies over the discovery
 stream, so it already holds what each proxy serves and answers `fleet/proxies/{name}/routes` from its
 own local snapshot rather than fanning out to the pod.

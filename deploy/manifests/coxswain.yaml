@@ -13,22 +13,30 @@ metadata:
 
 ---
 # Source: coxswain/templates/controller-networkpolicy.yaml
-# Admin-port fence for the controller pod (#670).
+# Management-surface fence for the controller pod (#670).
 #
-# The controller's admin port relays verbatim Kubernetes manifests (including Pod
-# `spec.containers[].env`, frequently credentials) and coxswain pod logs, with no
-# authentication of its own. The pod network is flat, so without this policy any
-# pod in any namespace can read all of it.
+# The controller's operator port relays verbatim Kubernetes manifests (including
+# Pod `spec.containers[].env`, frequently credentials) and coxswain pod logs. The
+# pod network is flat, so without this policy any pod in any namespace can read
+# all of it. Basic auth (`operatorAuth`) is the optional second factor; this is
+# the primary control.
 #
 # Unlike the proxy and relay policies — which the controller renders itself, and
 # which must leave a dynamic, unknowable set of data-plane ports open — the
-# controller binds a fixed four ports, so this policy can enumerate them. That
+# controller binds a fixed five ports, so this policy can enumerate them. That
 # makes it strictly closed: any port added here in future without a matching rule
 # is denied rather than silently exposed.
 #
 # Left open to all sources, deliberately:
-#   health    — kubelet probes are node-sourced, not pod-sourced, and
-#               /healthz + /readyz carry no cluster data.
+#   health    — kubelet probes are node-sourced, not pod-sourced, and no CNI can
+#               reliably select them; `/healthz` + `/readyz` carry no cluster data.
+#   telemetry — `/metrics` and `/statusz`. Unauthenticatable by construction:
+#               PodMonitor has no credential knob and a probing pod holds only
+#               the credential's bcrypt hash. Fencing it by default would
+#               silently drop every scrape from a Prometheus outside this
+#               namespace, so it is opt-in via `networkPolicy.telemetry.fenced`
+#               — which is enforced on provisioned pods by the controller, and
+#               here by the conditional rule below.
 #   discovery — already mutually authenticated by SVID mTLS, and its callers are
 #               dedicated proxies and relays in arbitrary tenant namespaces,
 #               which no static selector can enumerate.
@@ -36,7 +44,7 @@ metadata:
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: coxswain-controller-admin
+  name: coxswain-controller-operator
   namespace: coxswain-system
   labels:
     app.kubernetes.io/name: coxswain
@@ -63,11 +71,11 @@ spec:
           port: 50051
         - protocol: TCP
           port: 50052
-    # The admin surface: same-namespace pods, plus any operator-configured peers.
-    # The controller is itself in the install namespace, so `podSelector: {}`
-    # already covers its peer-replica fan-out and a co-located Prometheus. A
-    # scraper elsewhere needs an extraIngress entry. `kubectl port-forward` is
-    # unaffected either way — it is node-sourced, not subject to pod selectors.
+        - protocol: TCP
+          port: 8083
+    # The operator surface: same-namespace pods, plus any operator-configured
+    # peers. `kubectl port-forward` is unaffected either way — it is node-sourced,
+    # not subject to pod selectors.
     - from:
         - podSelector: {}
       ports:
@@ -170,7 +178,7 @@ rules:
     verbs: ["get", "list", "watch"]
   # Admin-port fencing (#670): the provisioning operator server-side-applies one
   # NetworkPolicy per controller-provisioned pod set — the shared pool, each
-  # dedicated proxy, and each relay — restricting their admin port to callers in
+  # dedicated proxy, and each relay — restricting their telemetry port to callers in
   # the pod's own namespace and the install namespace.
   #
   # Deliberately NOT gated on `networkPolicy.enabled`. Disabling the fence is
@@ -259,7 +267,7 @@ rules:
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
   # Read pod logs (#285) so the operator UI can tail controller/proxy logs
-  # through the controller admin port. `pods/log` is a separate subresource not
+  # through the controller operator port. `pods/log` is a separate subresource not
   # covered by the `pods` get/list/watch above. Read-only; the proxy SA has no
   # `pods` access at all, so this never reaches the data plane.
   - apiGroups: [""]
@@ -452,9 +460,32 @@ spec:
       port: 8081
       targetPort: health
       protocol: TCP
-    - name: admin
+    - name: telemetry
+      port: 8083
+      targetPort: telemetry
+      protocol: TCP
+---
+# Source: coxswain/templates/controller-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: coxswain-controller-operator
+  namespace: coxswain-system
+  labels:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/instance: coxswain
+    app.kubernetes.io/component: controller
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: coxswain
+    app.kubernetes.io/instance: coxswain
+    app.kubernetes.io/component: controller
+    discovery.coxswain-labs.dev/leader: "true"
+  ports:
+    - name: operator
       port: 8082
-      targetPort: admin
+      targetPort: operator
       protocol: TCP
 
 ---
@@ -509,7 +540,9 @@ spec:
         app.kubernetes.io/instance: coxswain
         app.kubernetes.io/component: controller
       annotations:
-        gateway.coxswain-labs.dev/admin-port: "8082"
+        # Load-bearing: the fleet snapshot skips any pod without it, so the
+        # controller would not appear in its own fleet view.
+        gateway.coxswain-labs.dev/telemetry-port: "8083"
     spec:
       serviceAccountName: coxswain-controller
       automountServiceAccountToken: true
@@ -526,7 +559,10 @@ spec:
             - name: health
               containerPort: 8081
               protocol: TCP
-            - name: admin
+            - name: telemetry
+              containerPort: 8083
+              protocol: TCP
+            - name: operator
               containerPort: 8082
               protocol: TCP
             - name: discovery
@@ -550,16 +586,22 @@ spec:
               value: "json"
             - name: COXSWAIN_HEALTH_PORT
               value: "8081"
-            - name: COXSWAIN_ADMIN_PORT
+            - name: COXSWAIN_TELEMETRY_PORT
+              value: "8083"
+            - name: COXSWAIN_OPERATOR_PORT
               value: "8082"
             - name: COXSWAIN_DISCOVERY_PORT
               value: "50051"
             - name: COXSWAIN_MANAGEMENT_BIND_ADDRESS
               value: "0.0.0.0"
-            # Admin-port fencing. The value is a Secret NAME, never a credential:
-            # the controller reads the Secret itself so rotation needs no restart.
-            - name: COXSWAIN_ADMIN_FENCE_ENABLED
-              value: "true"
+            # Telemetry-port fencing for the pods the controller provisions
+            # (shared pool, dedicated proxies, relays). Off unless both the
+            # master switch and the telemetry opt-in are set — the controller's
+            # own operator-port policy is rendered by the chart, not from here.
+            - name: COXSWAIN_TELEMETRY_FENCE_ENABLED
+              value: "false"
+            # The value is a Secret NAME, never a credential: the controller
+            # reads the Secret itself so rotation needs no restart.
             - name: COXSWAIN_CONTROLLER_NAME
               value: "coxswain-labs.dev/gateway-controller"
             - name: COXSWAIN_INGRESS_HTTP_PORT

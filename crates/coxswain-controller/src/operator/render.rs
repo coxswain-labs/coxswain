@@ -59,12 +59,13 @@
 //! Protocol is always `TCP` (HTTP/HTTPS/TLS all ride TCP at the Service layer;
 //! the proxy distinguishes them at L7 by listener config).
 
-use super::admin_fence::{AdminFenceConfig, render_admin_fence};
 use super::harden::{self, HardeningReport};
 use super::merge::strategic_merge_pod_template;
 use super::params::EffectiveParams;
 use super::reconciler::GatewayIdentity;
+use super::telemetry_fence::{TelemetryFenceConfig, render_telemetry_fence};
 use coxswain_core::crd::ServiceType;
+use coxswain_core::fleet::TELEMETRY_PORT_ANNOTATION;
 use coxswain_core::naming::gep1762_resource_name;
 use coxswain_reflector::EffectiveListenerPort;
 use coxswain_reflector::gw_types::v::gateways::Gateway;
@@ -155,11 +156,11 @@ pub(super) struct RenderInputs<'a> {
     /// SPIFFE trust domain. Rendered as `--discovery-trust-domain=<domain>`;
     /// the proxy derives the expected controller SPIFFE id from it.
     pub(super) discovery_trust_domain: &'a str,
-    /// Admin server port rendered as the `gateway.coxswain-labs.dev/admin-port`
+    /// Telemetry server port rendered as the `gateway.coxswain-labs.dev/telemetry-port`
     /// annotation on the pod template so fleet discovery can reach this pod.
-    pub(super) admin_port: u16,
+    pub(super) telemetry_port: u16,
     /// Admin-port fencing policy (#670), install-wide.
-    pub(super) admin_fence: &'a AdminFenceConfig,
+    pub(super) telemetry_fence: &'a TelemetryFenceConfig,
     /// Effective listener ports (Gateway's own + attached ListenerSets', GEP-1713)
     /// the dedicated proxy's Service and container expose. Empty falls back to
     /// `gateway.spec.listeners` — so a ListenerSet listener on a new port is
@@ -234,7 +235,7 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
     let name = resource_name(&inputs.identity.key.name, inputs.gateway_class_name);
     let namespace = inputs.identity.key.ns.clone();
     let labels = final_labels(inputs.gateway, "dedicated-proxy");
-    let annotations = final_annotations(inputs.gateway, inputs.admin_port);
+    let annotations = final_annotations(inputs.gateway, inputs.telemetry_port);
     let owner_ref = gateway_owner_reference(inputs.identity);
     let common = Common {
         name: &name,
@@ -256,28 +257,32 @@ pub(super) fn render(inputs: &RenderInputs<'_>) -> RenderedSpecs {
         deployment,
         hpa: render_hpa(&common, inputs.params),
         pdb: render_pdb(&common, inputs.params),
-        network_policy: render_network_policy(&common, inputs.admin_port, inputs.admin_fence),
+        network_policy: render_network_policy(
+            &common,
+            inputs.telemetry_port,
+            inputs.telemetry_fence,
+        ),
         sanitized,
     }
 }
 
-/// Render this Gateway's admin-port fence (#670), or `None` when fencing is off.
+/// Render this Gateway's telemetry-port fence (#670), or `None` when fencing is off.
 ///
 /// Shares the trio's name, labels, and owner reference, so it is reclaimed by
 /// the same garbage collection that reclaims the Deployment when the Gateway is
 /// deleted.
 fn render_network_policy(
     common: &Common<'_>,
-    admin_port: u16,
-    config: &AdminFenceConfig,
+    telemetry_port: u16,
+    config: &TelemetryFenceConfig,
 ) -> Option<NetworkPolicy> {
     config.enabled.then(|| {
-        let mut policy = render_admin_fence(
+        let mut policy = render_telemetry_fence(
             common.name,
             common.namespace,
             common.labels.clone(),
             pod_selector_labels(common.labels),
-            admin_port,
+            telemetry_port,
             config,
         );
         policy.metadata.owner_references = Some(vec![common.owner_ref.clone()]);
@@ -345,11 +350,11 @@ fn pod_selector_labels(labels: &BTreeMap<String, String>) -> BTreeMap<String, St
 /// is no reserved-annotation enforcement — user-supplied
 /// `Gateway.spec.infrastructure.annotations` are overlaid on top so operators
 /// can override values when needed.
-fn standard_annotations(admin_port: u16) -> BTreeMap<String, String> {
+fn standard_annotations(telemetry_port: u16) -> BTreeMap<String, String> {
     let mut annotations = BTreeMap::new();
     annotations.insert(
-        "gateway.coxswain-labs.dev/admin-port".to_string(),
-        admin_port.to_string(),
+        TELEMETRY_PORT_ANNOTATION.to_string(),
+        telemetry_port.to_string(),
     );
     annotations
 }
@@ -388,7 +393,7 @@ pub(super) fn final_labels(gateway: &Gateway, component: &str) -> BTreeMap<Strin
 /// onto `base`. User values win on collision — annotations don't drive
 /// selectors so overrides are safe. Shared with both the dedicated trio (whose
 /// `base` is [`standard_annotations`]) and the shared-mode identity SA / VIP
-/// Service (whose `base` is empty — they carry no admin-port annotation).
+/// Service (whose `base` is empty — they carry no telemetry-port annotation).
 pub(super) fn overlay_infra_annotations(
     mut base: BTreeMap<String, String>,
     gateway: &Gateway,
@@ -407,10 +412,10 @@ pub(super) fn overlay_infra_annotations(
 }
 
 /// Build the final annotation map for the dedicated trio: start with
-/// [`standard_annotations`] (which sets the admin-port annotation) then overlay
+/// [`standard_annotations`] (which sets the telemetry-port annotation) then overlay
 /// user-supplied `Gateway.spec.infrastructure.annotations`.
-fn final_annotations(gateway: &Gateway, admin_port: u16) -> BTreeMap<String, String> {
-    overlay_infra_annotations(standard_annotations(admin_port), gateway)
+fn final_annotations(gateway: &Gateway, telemetry_port: u16) -> BTreeMap<String, String> {
+    overlay_infra_annotations(standard_annotations(telemetry_port), gateway)
 }
 
 /// Build the `controller=true, blockOwnerDeletion=true` owner reference back
@@ -654,6 +659,11 @@ fn render_deployment(
         format!("--discovery-trust-domain={}", inputs.discovery_trust_domain),
     ];
     args.push("--log-format=json".to_string());
+    // Must match the telemetry-port annotation and container port stamped
+    // above: the annotation is what the fleet snapshot probes and the container
+    // port is what the PodMonitor scrapes, so a pod binding the clap default
+    // while advertising a configured port answers neither.
+    args.push(format!("--telemetry-port={}", inputs.telemetry_port));
     // Keepalive pool size: pass through to dedicated proxies so their pools
     // are governed by the same operator-configured default (inherited from the
     // shared proxy Helm value via the controller's own env).
@@ -665,7 +675,11 @@ fn render_deployment(
         name: "coxswain".to_string(),
         image: Some(image),
         args: Some(args),
-        ports: Some(container_ports(inputs.gateway, inputs.effective_ports)),
+        ports: Some(container_ports(
+            inputs.gateway,
+            inputs.effective_ports,
+            inputs.telemetry_port,
+        )),
         env: Some(pod_identity_env()),
         resources: inputs.params.resources.clone(),
         security_context: Some(container_hardening_security_context(
@@ -809,6 +823,7 @@ pub(super) fn discovery_volume_mounts() -> Vec<VolumeMount> {
 fn container_ports(
     gateway: &Gateway,
     effective_ports: &[EffectiveListenerPort],
+    telemetry_port: u16,
 ) -> Vec<ContainerPort> {
     let mut seen: BTreeSet<i32> = BTreeSet::new();
     let mut out = Vec::new();
@@ -822,12 +837,18 @@ fn container_ports(
             ..Default::default()
         });
     }
-    // Expose health (8081) and admin (8082) as named container ports so the
-    // PodMonitor template's `port: admin` resolves uniformly across the
-    // shared-proxy and operator-rendered dedicated proxies. The ports aren't
-    // mapped onto the Service (which would put admin on the LoadBalancer IP);
-    // the chart's PodMonitor scrapes the pod IP directly.
-    for (name, port) in [("health", 8081), ("admin", 8082)] {
+    // Expose health and telemetry as named container ports so the PodMonitor
+    // template's `port: telemetry` resolves uniformly across the shared-proxy
+    // and operator-rendered dedicated proxies. The ports aren't mapped onto the
+    // Service (which would put them on the LoadBalancer IP); the chart's
+    // PodMonitor scrapes the pod IP directly.
+    //
+    // `telemetry_port` must be the same value the telemetry-port annotation
+    // carries: the annotation is what the fleet snapshot probes and this is what
+    // the pod actually binds, so a divergence means every probe and scrape hits
+    // a closed port. Health stays at its default — unlike the shared pool, this
+    // renderer passes no `--health-port`, so the pod binds the clap default.
+    for (name, port) in [("health", 8081), ("telemetry", i32::from(telemetry_port))] {
         if seen.insert(port) {
             out.push(ContainerPort {
                 name: Some(name.to_string()),
@@ -1058,7 +1079,8 @@ mod tests {
 
     /// Default (fencing-on) policy every render test borrows, so adding the
     /// fence didn't have to thread a binding through ~15 call sites.
-    static TEST_ADMIN_FENCE: LazyLock<AdminFenceConfig> = LazyLock::new(AdminFenceConfig::default);
+    static TEST_TELEMETRY_FENCE: LazyLock<TelemetryFenceConfig> =
+        LazyLock::new(TelemetryFenceConfig::default);
 
     fn make_gateway(namespace: &str, name: &str, listeners: Vec<(&str, u16, &str)>) -> Gateway {
         Gateway {
@@ -1180,8 +1202,8 @@ mod tests {
             discovery_sa_token_path: "/t",
             discovery_ca_bundle_path: "/ca",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         let spec = result.service.spec.expect("service spec");
@@ -1191,6 +1213,64 @@ mod tests {
 
     /// GatewayClass-only defaults: replicas defaults to 1, serviceType to
     /// LoadBalancer, image to the controller's, no podTemplate overlay.
+    #[test]
+    fn a_non_default_telemetry_port_reaches_the_container_arg_annotation_and_port() {
+        // Three places must agree, and only the arg makes the pod actually bind
+        // it: the annotation is what the fleet snapshot probes, the named
+        // container port is what the PodMonitor scrapes. When the arg was
+        // missing, a configured `telemetry.port` left the pod on the clap
+        // default while advertising the configured value — every `/statusz`
+        // probe and every scrape hit a closed port, and the fleet view read
+        // `reachable: false` forever with nothing logged.
+        let gw = make_gateway("default", "my-gw", vec![("http", 80, "HTTP")]);
+        let params = EffectiveParams::default();
+        let result = render(&RenderInputs {
+            gateway: &gw,
+            identity: &GatewayIdentity::from_gateway(&gw).expect("test gateway has identity"),
+            params: &params,
+            controller_image: "ghcr.io/coxswain-labs/coxswain:v0.2",
+            gateway_class_name: "coxswain",
+            discovery_bootstrap_endpoint: "http://coxswain-controller-discovery.default.svc:50052",
+            discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
+            discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
+            discovery_trust_domain: "cluster.local",
+            telemetry_port: 9000,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
+            effective_ports: &[],
+        });
+
+        let template = result.deployment.spec.expect("deployment spec").template;
+        let annotations = template
+            .metadata
+            .as_ref()
+            .and_then(|m| m.annotations.clone())
+            .unwrap_or_default();
+        assert_eq!(
+            annotations
+                .get(coxswain_core::fleet::TELEMETRY_PORT_ANNOTATION)
+                .map(String::as_str),
+            Some("9000"),
+            "the fleet snapshot reads the port from this annotation"
+        );
+
+        let container = &template.spec.expect("pod spec").containers[0];
+        let args = container.args.clone().unwrap_or_default();
+        assert!(
+            args.contains(&"--telemetry-port=9000".to_string()),
+            "the pod must be told to bind the port it advertises; args were {args:?}"
+        );
+        let telemetry_port = container
+            .ports
+            .as_ref()
+            .and_then(|ps| ps.iter().find(|p| p.name.as_deref() == Some("telemetry")))
+            .map(|p| p.container_port);
+        assert_eq!(
+            telemetry_port,
+            Some(9000),
+            "the named container port is what PodMonitor resolves"
+        );
+    }
+
     #[test]
     fn renders_with_default_replicas_and_service_type() {
         let gw = make_gateway("default", "my-gw", vec![("http", 80, "HTTP")]);
@@ -1205,8 +1285,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
 
@@ -1260,8 +1340,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         assert_eq!(result.deployment.spec.unwrap().replicas, Some(5));
@@ -1287,8 +1367,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
@@ -1312,6 +1392,10 @@ mod tests {
                     .to_string(),
                 "--discovery-trust-domain=cluster.local".to_string(),
                 "--log-format=json".to_string(),
+                // Must be present, and must match the telemetry-port annotation
+                // and container port: the pod has to bind the port it advertises
+                // or every `/statusz` probe and scrape hits a closed one.
+                "--telemetry-port=8082".to_string(),
             ]
         );
 
@@ -1351,8 +1435,8 @@ mod tests {
                 discovery_sa_token_path: "/t",
                 discovery_ca_bundle_path: "/c",
                 discovery_trust_domain: "cluster.local",
-                admin_port: 8082,
-                admin_fence: &TEST_ADMIN_FENCE,
+                telemetry_port: 8082,
+                telemetry_fence: &TEST_TELEMETRY_FENCE,
                 effective_ports: ports,
             })
             .deployment
@@ -1424,8 +1508,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
@@ -1460,8 +1544,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         let ports = result.service.spec.unwrap().ports.expect("ports");
@@ -1494,8 +1578,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
@@ -1596,8 +1680,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         for labels in [
@@ -1640,8 +1724,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         let pod_spec = result.deployment.spec.unwrap().template.spec.unwrap();
@@ -1700,8 +1784,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         let pod = result
@@ -1792,8 +1876,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         for meta in [
@@ -1839,8 +1923,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         for meta in [
@@ -1885,8 +1969,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         let labels = result.deployment.metadata.labels.as_ref().expect("labels");
@@ -1927,8 +2011,8 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             effective_ports: &[],
         });
         for meta in [
@@ -2143,7 +2227,7 @@ mod tests {
             anno.get("coxswain.example/owner"),
             Some(&"tenant-team".to_string())
         );
-        // No admin-port annotation (that's a dedicated-pod concern).
+        // No telemetry-port annotation (that's a dedicated-pod concern).
         assert!(!anno.contains_key("gateway.coxswain-labs.dev/admin-port"));
         let refs = sa.metadata.owner_references.expect("owner refs");
         assert_eq!(refs.len(), 1);
@@ -2174,7 +2258,7 @@ mod tests {
     #[test]
     fn shared_identity_sa_has_no_annotations_when_infra_absent() {
         // No infra annotations → annotations field omitted (legal subset of {} for
-        // the conformance check), and no stray admin-port annotation.
+        // the conformance check), and no stray telemetry-port annotation.
         let gw = make_gateway("team-a", "gw", vec![("http", 80, "HTTP")]);
         let sa = render_shared_gateway_service_account(
             &gw,
@@ -2222,16 +2306,20 @@ mod tests {
             "dedicated Service must expose the ListenerSet listener port, got {ports:?}"
         );
 
-        // The proxy container binds the ListenerSet port too (plus health/admin).
-        let cports = container_ports(&gw, &effective);
+        // The proxy container binds the ListenerSet port too (plus health/telemetry).
+        let cports = container_ports(&gw, &effective, 8083);
         let cp: Vec<i32> = cports.iter().map(|c| c.container_port).collect();
         assert!(
             cp.contains(&8001),
             "container must bind the ListenerSet port"
         );
         assert!(
-            cp.contains(&8081) && cp.contains(&8082),
-            "health/admin container ports preserved"
+            cp.contains(&8081) && cp.contains(&8083),
+            "health/telemetry container ports preserved"
+        );
+        assert!(
+            !cp.contains(&8082),
+            "a dedicated proxy serves no operator port"
         );
 
         // Empty effective → fall back to spec.listeners (existing behaviour).

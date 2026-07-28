@@ -193,10 +193,10 @@ curl -H "Host: echo.example.com" http://localhost:8080/
 
 **6. Open the operator console:**
 
-The controller serves a built-in web UI on its admin port — cluster health, the live routing table across Gateways and Ingresses, per-pod fleet status, and recent events:
+The controller serves a built-in web UI on its operator port — cluster health, the live routing table across Gateways and Ingresses, per-pod fleet status, and recent events. The Service below targets the elected leader, so the topology view is served by the replica that holds the discovery streams:
 
 ```bash
-kubectl port-forward -n coxswain-system svc/coxswain-controller 8082:8082 &
+kubectl port-forward -n coxswain-system svc/coxswain-controller-operator 8082:8082 &
 # open http://localhost:8082
 ```
 

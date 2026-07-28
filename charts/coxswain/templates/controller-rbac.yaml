@@ -75,7 +75,7 @@ rules:
     verbs: ["get", "list", "watch"]
   # Admin-port fencing (#670): the provisioning operator server-side-applies one
   # NetworkPolicy per controller-provisioned pod set — the shared pool, each
-  # dedicated proxy, and each relay — restricting their admin port to callers in
+  # dedicated proxy, and each relay — restricting their telemetry port to callers in
   # the pod's own namespace and the install namespace.
   #
   # Deliberately NOT gated on `networkPolicy.enabled`. Disabling the fence is
@@ -164,7 +164,7 @@ rules:
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
   # Read pod logs (#285) so the operator UI can tail controller/proxy logs
-  # through the controller admin port. `pods/log` is a separate subresource not
+  # through the controller operator port. `pods/log` is a separate subresource not
   # covered by the `pods` get/list/watch above. Read-only; the proxy SA has no
   # `pods` access at all, so this never reaches the data plane.
   - apiGroups: [""]

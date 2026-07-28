@@ -113,7 +113,8 @@ To run a dedicated-mode proxy (per-Gateway data plane) locally, see [docs/src/ga
 | `80`   | HTTP proxy (data plane)                          |
 | `443`  | HTTPS proxy (data plane, SNI TLS)                |
 | `8081` | Health endpoints (`/healthz`, `/readyz`)         |
-| `8082` | Admin endpoints (`/metrics`, `/api/v1/health`; operator UI + the `/api/v1/*` routing/fleet API on the controller) |
+| `8082` | Operator endpoints — the UI and the `/api/v1/*` routing/fleet API. **Controller role only**; proxy and relay pods do not bind it |
+| `8083` | Telemetry endpoints (`/metrics`, `/statusz`) on every role. Never authenticated |
 
 The bind address for all listeners defaults to `0.0.0.0`. Pass `--proxy-bind-address 127.0.0.1` to restrict to localhost.
 
@@ -125,15 +126,15 @@ curl -s http://localhost:8081/healthz      # ok
 curl -s http://localhost:8081/readyz       # ok (after every subsystem check is Ready)
 
 # Admin diagnostics
-curl -s http://localhost:8082/api/v1/health          # {"version":"...","kubernetes_version":"...","leader":...,"subsystems":{...}}
-curl -s http://localhost:8082/api/v1/routing/summary # per-category route + problem counts (controller role)
-curl -s http://localhost:8082/metrics                # Prometheus text
+curl -s http://localhost:8083/statusz                # {"version":"...","subsystems":{...}} — every role
+curl -s http://localhost:8082/api/v1/routing/summary # per-category route + problem counts (controller only)
+curl -s http://localhost:8083/metrics                # Prometheus text — every role
 
 # Kubernetes
 kubectl get gatewayclass                   # should show "coxswain" accepted
 ```
 
-The full controller admin API (the `/api/v1/{fleet,routing}/*` surface, summaries, problems, health) is described in `api/openapi.yaml` — an internal aid kept in sync with the dispatch.
+The full controller operator API (the `/api/v1/{fleet,routing}/*` surface, summaries, problems, health) is described in `api/openapi.yaml` — an internal aid kept in sync with the dispatch.
 
 `/readyz` returns 200 iff every registered subsystem check is `Ready` or `Degraded` (`Pending` and `Failed` flip it to 503). `/api/v1/health`'s `subsystems` exposes the full per-subsystem detail. If the Gateway API CRDs (or RBAC for any watched resource) are missing, the corresponding reflector errors out instead of emitting `InitDone`, its check stays `Pending`, and `/readyz` stays 503 — the pod is not actually ready until its dependencies are installed.
 
@@ -190,7 +191,7 @@ curl -H "Host: cross-ns.local" http://localhost:8000/    # 503 Service Unavailab
 
 ### Observe the routing table
 
-The proxy no longer exposes a route-dump endpoint — observe the live table through the controller's aggregated admin API (or the operator UI at `http://localhost:8082/`):
+The proxy no longer exposes a route-dump endpoint — observe the live table through the controller's aggregated operator API (or the operator UI at `http://localhost:8082/`):
 
 ```bash
 curl -s http://localhost:8082/api/v1/routing/summary    | jq .   # per-category counts
@@ -202,7 +203,7 @@ curl -s http://localhost:8082/api/v1/routing/ingresses  | jq .   # active Ingres
 
 ## Operator UI
 
-The operator web UI lives in `ui/` (Vite + Preact, built to `dist/index.html` + `dist/app.js` + `dist/app.css`). All three are embedded into `coxswain-admin` via `include_str!` and served at `GET /`, `GET /app.js`, and `GET /app.css` on the **controller admin port** (controller role only — proxy pods return 404 on all three). The three-file split (rather than one inlined bundle) lets the served CSP claim `script-src 'self'`/`style-src 'self'` truthfully instead of needing `'unsafe-inline'` or a content hash kept in sync with the build. `dist/` is gitignored: the Docker `ui-builder` stage rebuilds it, so it is never committed.
+The operator web UI lives in `ui/` (Vite + Preact, built to `dist/index.html` + `dist/app.js` + `dist/app.css`). All three are embedded into `coxswain-admin` via `include_str!` and served at `GET /`, `GET /app.js`, and `GET /app.css` on the **controller operator port** (controller role only — proxy pods do not bind that port at all). The three-file split (rather than one inlined bundle) lets the served CSP claim `script-src 'self'`/`style-src 'self'` truthfully instead of needing `'unsafe-inline'` or a content hash kept in sync with the build. `dist/` is gitignored: the Docker `ui-builder` stage rebuilds it, so it is never committed.
 
 ### Fast iteration (no cluster)
 
@@ -230,7 +231,7 @@ The full `Dockerfile` builds the UI in its `ui-builder` stage, so a normal image
 ```bash
 docker build -t coxswain:ui .                                   # builds UI + binary
 kubectl -n coxswain-system rollout restart deploy/coxswain-controller deploy/coxswain-shared-proxy
-kubectl -n coxswain-system port-forward svc/coxswain-controller 8082:8082
+kubectl -n coxswain-system port-forward svc/coxswain-controller-operator 8082:8082
 # open http://localhost:8082/
 ```
 

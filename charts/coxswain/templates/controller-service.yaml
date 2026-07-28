@@ -1,4 +1,28 @@
 {{- if .Values.controller.enabled -}}
+{{/*
+Two Services for the controller's management surface, with OPPOSITE selectors —
+the same split, for the same reason, as the discovery stream/bootstrap pair.
+
+  <fullname>           — ALL replicas. Health and telemetry are per-pod facts
+                         (is THIS pod ready, what are THIS pod's counters), so
+                         answering from an arbitrary replica is meaningless;
+                         you address a specific pod, or Prometheus scrapes pod
+                         IPs directly via the PodMonitor.
+  <fullname>-operator  — the LEADER only. The operator API's topology view reads
+                         the node registry, which only the leader populates:
+                         since #531 standbys accept no discovery streams, so a
+                         standby's registry is empty rather than partial. A
+                         Service that load-balanced across replicas would render
+                         an empty topology at random depending on which pod
+                         answered.
+
+During a leaderless window the operator Service has zero endpoints and the UI is
+briefly unreachable. That is deliberate and honest: the data genuinely is not
+available anywhere, and the alternative — an empty topology served with a 200 —
+is indistinguishable from a healthy cluster with nothing connected. Health and
+telemetry stay reachable throughout on the all-replica Service above, so
+troubleshooting the election itself is unaffected.
+*/}}
 apiVersion: v1
 kind: Service
 metadata:
@@ -19,8 +43,30 @@ spec:
       port: {{ .Values.health.port }}
       targetPort: health
       protocol: TCP
-    - name: admin
-      port: {{ .Values.admin.port }}
-      targetPort: admin
+    - name: telemetry
+      port: {{ .Values.telemetry.port }}
+      targetPort: telemetry
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "coxswain.controller.fullname" . }}-operator
+  namespace: {{ include "coxswain.namespace" . }}
+  labels:
+    {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+  {{- with .Values.service.internal.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
+    discovery.coxswain-labs.dev/leader: "true"
+  ports:
+    - name: operator
+      port: {{ .Values.operator.port }}
+      targetPort: operator
       protocol: TCP
 {{- end }}

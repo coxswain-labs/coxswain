@@ -2,10 +2,10 @@
 
 ## Port forward
 
-Most commands below query the admin port. Open a port-forward in a separate terminal first: 
+Most commands below query the telemetry port (`/metrics`, `/statusz`). Open a port-forward in a separate terminal first: 
 
 ```bash
-kubectl -n coxswain-system port-forward svc/coxswain-shared-proxy-internal 8082:8082
+kubectl -n coxswain-system port-forward svc/coxswain-shared-proxy-internal 8083:8083
 ```
 
 ## `/readyz` returns 503 on startup
@@ -18,7 +18,7 @@ The readiness endpoint gates on every registered subsystem reaching `Ready` or `
 Inspect which subsystem is blocking:
 
 ```bash
-curl -s http://localhost:8082/api/v1/health | jq .subsystems
+curl -s http://localhost:8083/statusz | jq .subsystems
 ```
 
 Controller subsystem stuck in `Pending` (CRD missing or controller RBAC wrong):
@@ -63,8 +63,8 @@ Common causes for the **proxy** being `Pending`:
 ## Routes are not being picked up
 
 ```bash
-# Check the routing table — served from the controller's admin port, not the proxy's
-curl -s http://<controller-admin-address>:8082/api/v1/fleet/proxies/<pod-name>/routes | jq .
+# Check the routing table — served from the controller's operator port, not the proxy's
+curl -s http://<controller-operator-address>:8082/api/v1/fleet/proxies/<pod-name>/routes | jq .
 
 # Check HTTPRoute status
 kubectl describe httproute my-route
@@ -236,5 +236,5 @@ The routing table is rebuilt from scratch on every reconcile. Very large cluster
 Profile with:
 
 ```bash
-curl -s http://localhost:8082/metrics | grep routing_table_rebuild_duration
+curl -s http://localhost:8083/metrics | grep routing_table_rebuild_duration
 ```

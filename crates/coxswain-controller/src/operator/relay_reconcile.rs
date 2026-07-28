@@ -370,8 +370,8 @@ async fn apply_relay_at(
         discovery_trust_domain: &ctx.discovery_trust_domain,
         resources,
         pod_template: policy.pod_template.as_ref(),
-        admin_port: ctx.admin_port,
-        admin_fence: &ctx.admin_fence,
+        telemetry_port: ctx.telemetry_port,
+        telemetry_fence: &ctx.telemetry_fence,
         pdb_replica_ceiling: clamp_u32_to_i32(pdb_ceiling),
     });
 

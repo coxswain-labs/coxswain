@@ -68,6 +68,10 @@ pub struct OperatorAggregator {
     /// pods. A Gateway absent from the registry (e.g. a cutover still in
     /// flight) reads as an empty routing table, not an error.
     dedicated_registry: DedicatedRoutingRegistry,
+    /// Current lease holder's pod name, published by the controller's lease
+    /// loop. `None` on dev/proxy roles. Read to attribute leadership in the
+    /// fleet view without an apiserver round trip per request.
+    leader_identity: Option<coxswain_core::LeaderIdentityCell>,
     /// Kubernetes client, initialised lazily on the first K8s-backed request.
     kube: OnceCell<Client>,
     /// Apiserver GitVersion (e.g. `v1.31.2`), fetched once from the `/version`
@@ -83,37 +87,53 @@ pub struct OperatorAggregator {
 /// Maximum number of concurrent pod-log streams the controller will relay.
 const MAX_CONCURRENT_LOG_STREAMS: usize = 8;
 
+/// The controller's own routing snapshots, handed to the aggregator as one
+/// value.
+///
+/// These are the same cells the controller feeds to the discovery server
+/// (#537): the aggregator never fans out to a proxy pod to answer "what does it
+/// serve", it reads its own copy of what it pushed. Grouped rather than passed
+/// as three parallel arguments so [`OperatorAggregator::new`] stays under the
+/// argument-count threshold as it gains collaborators.
+pub struct AggregatorRoutingTables {
+    /// Shared-pool Ingress routing table.
+    pub ingress: SharedIngressRoutingTable,
+    /// Shared-pool Gateway-API routing table.
+    pub gateway: SharedGatewayRoutingTable,
+    /// Per-Gateway dedicated routing snapshots.
+    pub dedicated: DedicatedRoutingRegistry,
+}
+
 impl OperatorAggregator {
     /// Construct an aggregator with the given fleet, cluster, node-registry,
     /// and routing-table handles.
     ///
     /// `node_registry` is `Some` on controller roles (discovery is active) and
-    /// `None` on dev/proxy roles. `ingress_routes`/`gateway_routes`/
-    /// `dedicated_registry` are the same cells the controller feeds to the
-    /// discovery server (#537) — this aggregator never fans out to a proxy
-    /// pod to answer "what does it serve", it reads its own copy of what it
-    /// pushed. The fan-out `http` client is built once by the caller at startup
-    /// (where a rustls-init failure surfaces as a typed startup error) and
-    /// plumbed in; the fan-out targets (pod health/logs) are plain HTTP and TLS
-    /// is never exercised at request time.
+    /// `None` on dev/proxy roles, as is `leader_identity` — the cell the
+    /// controller's lease loop publishes the current holder into, which the
+    /// fleet view reads instead of trusting each pod's self-report. The fan-out
+    /// `http` client is built once by the caller at startup (where a rustls-init
+    /// failure surfaces as a typed startup error) and plumbed in; the fan-out
+    /// targets (pod `/statusz`) are plain HTTP and TLS is never exercised at
+    /// request time.
     #[must_use]
     pub fn new(
         http: reqwest::Client,
         fleet: SharedFleet,
         cluster: SharedClusterSummary,
         node_registry: Option<NodeRegistryHandle>,
-        ingress_routes: SharedIngressRoutingTable,
-        gateway_routes: SharedGatewayRoutingTable,
-        dedicated_registry: DedicatedRoutingRegistry,
+        routing: AggregatorRoutingTables,
+        leader_identity: Option<coxswain_core::LeaderIdentityCell>,
     ) -> Self {
         Self {
             http,
             fleet,
             cluster,
             node_registry,
-            ingress_routes,
-            gateway_routes,
-            dedicated_registry,
+            ingress_routes: routing.ingress,
+            gateway_routes: routing.gateway,
+            dedicated_registry: routing.dedicated,
+            leader_identity,
             kube: OnceCell::new(),
             k8s_version: OnceCell::new(),
             log_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOG_STREAMS)),
@@ -156,12 +176,27 @@ impl OperatorAggregator {
 
 // ── URL helpers ───────────────────────────────────────────────────────────────
 
-/// Build an admin base URL for `entry`, handling IPv6 bracket notation.
+/// Build a telemetry base URL for `entry`, handling IPv6 bracket notation.
+///
+/// The telemetry port is the only port a peer may be dialed on — see
+/// [`TELEMETRY_PORT_ANNOTATION`](coxswain_core::fleet::TELEMETRY_PORT_ANNOTATION).
+/// The operator port is authenticated and this pod holds only the credential's
+/// bcrypt hash, so it could not authenticate to a peer even if it wanted to;
+/// `FleetEntry` deliberately does not carry that port at all.
 pub(super) fn pod_base_url(entry: &FleetEntry) -> String {
     match entry.pod_ip {
-        IpAddr::V4(_) => format!("http://{}:{}", entry.pod_ip, entry.admin_port),
-        IpAddr::V6(_) => format!("http://[{}]:{}", entry.pod_ip, entry.admin_port),
+        IpAddr::V4(_) => format!("http://{}:{}", entry.pod_ip, entry.telemetry_port),
+        IpAddr::V6(_) => format!("http://[{}]:{}", entry.pod_ip, entry.telemetry_port),
     }
+}
+
+/// The `/statusz` URL for `entry` — the single peer-probe endpoint.
+///
+/// Every fleet-view probe goes through here rather than formatting the path at
+/// each call site, so the "one pod asks another pod about itself" surface stays
+/// exactly one URL wide.
+pub(super) fn pod_statusz_url(entry: &FleetEntry) -> String {
+    format!("{}/statusz", pod_base_url(entry))
 }
 
 /// Find a [`FleetEntry`] by `pod_name` across all fleet buckets.
@@ -174,6 +209,7 @@ pub(super) fn find_entry<'a>(
         .iter()
         .chain(&snapshot.shared_proxies)
         .chain(&snapshot.dedicated_proxies)
+        .chain(&snapshot.relays)
         .find(|e| e.pod_name == pod_name)
 }
 
@@ -199,7 +235,7 @@ impl OperatorAggregator {
             "pod_name": entry.pod_name,
             "pod_namespace": entry.pod_namespace,
             "pod_ip": entry.pod_ip.to_string(),
-            "admin_port": entry.admin_port,
+            "telemetry_port": entry.telemetry_port,
             "component": component,
         });
         if let Some(ref gw) = entry.gateway_ref {
@@ -222,9 +258,9 @@ impl OperatorAggregator {
 }
 
 /// Attach a coarse health rollup to a fleet-entry JSON from that pod's
-/// `/api/v1/health` body.
+/// `/statusz` body.
 ///
-/// List endpoints already fetch each pod's `/api/v1/health` for liveness; rolling
+/// List endpoints already fetch each pod's `/statusz` for liveness; rolling
 /// it down here lets the browser render per-pod health (Fleet chips, Dashboard
 /// "degraded pods") without a second fan-out. Sets `health` (`"ready"` or
 /// `"degraded"`) and `degraded_checks` (the `"subsystem/check"` names that aren't
@@ -241,7 +277,7 @@ pub(super) fn attach_health_rollup(entry: &mut serde_json::Value, health_body: &
 }
 
 /// Collect the `"subsystem/check"` identifiers whose state is not `ready` from a
-/// `/api/v1/health` body.
+/// `/statusz` body.
 ///
 /// Anything other than the literal `"ready"` state (`degraded`, `pending`,
 /// `failed`) counts as non-ready — the UI surfaces it amber and defers the
@@ -406,7 +442,7 @@ pub(super) fn component_str(c: Component) -> &'static str {
 pub(super) mod tests {
     use super::*;
     use coxswain_core::fleet::{
-        ADMIN_PORT_ANNOTATION, COMPONENT_LABEL, GATEWAY_NAME_LABEL, SharedFleet, build_snapshot,
+        COMPONENT_LABEL, GATEWAY_NAME_LABEL, SharedFleet, TELEMETRY_PORT_ANNOTATION, build_snapshot,
     };
     use k8s_openapi::api::core::v1::{Pod, PodStatus};
     use kube::api::ObjectMeta;
@@ -417,13 +453,13 @@ pub(super) mod tests {
     ///
     /// `component` should be the string value stored in
     /// [`COMPONENT_LABEL`] (e.g. `"shared-proxy"`, `"dedicated-proxy"`,
-    /// `"controller"`).  `admin_port` is the string stored in
-    /// [`ADMIN_PORT_ANNOTATION`] (usually `"8082"`).
+    /// `"controller"`).  `telemetry_port` is the string stored in
+    /// [`TELEMETRY_PORT_ANNOTATION`] (usually `"8082"`).
     pub(crate) fn make_pod(
         name: &str,
         component: &str,
         pod_ip: &str,
-        admin_port: &str,
+        telemetry_port: &str,
         gateway_name: Option<&str>,
     ) -> Pod {
         let mut labels = BTreeMap::new();
@@ -432,7 +468,10 @@ pub(super) mod tests {
             labels.insert(GATEWAY_NAME_LABEL.to_string(), gw.to_string());
         }
         let mut annotations = BTreeMap::new();
-        annotations.insert(ADMIN_PORT_ANNOTATION.to_string(), admin_port.to_string());
+        annotations.insert(
+            TELEMETRY_PORT_ANNOTATION.to_string(),
+            telemetry_port.to_string(),
+        );
         Pod {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
@@ -486,6 +525,7 @@ pub(super) mod tests {
             ingress_routes: SharedIngressRoutingTable::new(),
             gateway_routes: SharedGatewayRoutingTable::new(),
             dedicated_registry: DedicatedRoutingRegistry::new(),
+            leader_identity: None,
             kube: OnceCell::new(),
             k8s_version: OnceCell::new(),
             log_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_LOG_STREAMS)),

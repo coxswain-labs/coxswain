@@ -101,7 +101,7 @@ enum Event {
     ProxyConnected {
         pod: String,
         mode: &'static str,
-        admin_addr: String,
+        telemetry_addr: String,
     },
     /// A proxy pod left the fleet.
     ProxyDisconnected { pod: String },
@@ -143,8 +143,8 @@ impl Event {
             Event::ProxyConnected {
                 pod,
                 mode,
-                admin_addr,
-            } => serde_json::json!({ "pod": pod, "mode": mode, "admin_addr": admin_addr }),
+                telemetry_addr,
+            } => serde_json::json!({ "pod": pod, "mode": mode, "telemetry_addr": telemetry_addr }),
             Event::ProxyDisconnected { pod } => {
                 serde_json::json!({ "pod": pod, "reason": "pod-deleted" })
             }
@@ -205,7 +205,7 @@ fn diff_fleet(prev: &FleetSnapshot, cur: &FleetSnapshot) -> Vec<Event> {
             events.push(Event::ProxyConnected {
                 pod: e.pod_name.clone(),
                 mode,
-                admin_addr: SocketAddr::new(e.pod_ip, e.admin_port).to_string(),
+                telemetry_addr: SocketAddr::new(e.pod_ip, e.telemetry_port).to_string(),
             });
         }
     }
@@ -410,7 +410,8 @@ mod tests {
         ClusterSummary, ControllerSummary, GatewaySummary, ProxyAssignment,
     };
     use coxswain_core::fleet::{
-        ADMIN_PORT_ANNOTATION, COMPONENT_LABEL, FleetSnapshot, GATEWAY_NAME_LABEL, build_snapshot,
+        COMPONENT_LABEL, FleetSnapshot, GATEWAY_NAME_LABEL, TELEMETRY_PORT_ANNOTATION,
+        build_snapshot,
     };
     use k8s_openapi::api::core::v1::{Pod, PodStatus};
     use kube::api::ObjectMeta;
@@ -425,7 +426,7 @@ mod tests {
             labels.insert(GATEWAY_NAME_LABEL.to_string(), gw.to_string());
         }
         let mut annotations = BTreeMap::new();
-        annotations.insert(ADMIN_PORT_ANNOTATION.to_string(), "8082".to_string());
+        annotations.insert(TELEMETRY_PORT_ANNOTATION.to_string(), "8082".to_string());
         Pod {
             metadata: ObjectMeta {
                 name: Some(name.to_string()),
@@ -457,13 +458,13 @@ mod tests {
         let ev = Event::ProxyConnected {
             pod: "shared-proxy-abc".to_string(),
             mode: "shared",
-            admin_addr: "10.0.1.5:8082".to_string(),
+            telemetry_addr: "10.0.1.5:8082".to_string(),
         };
         assert_eq!(ev.name(), "proxy.connected");
         let d = ev.data();
         assert_eq!(d["pod"], "shared-proxy-abc");
         assert_eq!(d["mode"], "shared");
-        assert_eq!(d["admin_addr"], "10.0.1.5:8082");
+        assert_eq!(d["telemetry_addr"], "10.0.1.5:8082");
     }
 
     #[test]
@@ -508,7 +509,7 @@ mod tests {
             Event::ProxyConnected {
                 pod: "proxy-0".to_string(),
                 mode: "shared",
-                admin_addr: "10.0.0.2:8082".to_string(),
+                telemetry_addr: "10.0.0.2:8082".to_string(),
             }
         );
     }

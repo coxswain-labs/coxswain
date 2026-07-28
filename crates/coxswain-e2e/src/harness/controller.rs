@@ -96,10 +96,14 @@ pub struct ControllerOptions {
     /// the chart default (`true`). `Some(false)` asserts the controller reclaims
     /// the policies it previously applied.
     pub network_policy_enabled: Option<bool>,
-    /// Sets `adminAuth.secretName` (#670) — requires HTTP Basic auth on the
-    /// controller's admin port, from a Secret the test creates first. `None`
-    /// leaves the chart default (no auth).
-    pub admin_auth_secret_name: Option<String>,
+    /// Sets `operatorAuth.secretName` (#670) — requires HTTP Basic auth on every
+    /// path of the controller's operator port, from a Secret the test creates
+    /// first. `None` leaves the chart default (no auth).
+    pub operator_auth_secret_name: Option<String>,
+    /// Sets `networkPolicy.telemetry.fenced` (#676) — restricts `/metrics` and
+    /// `/statusz` to the pod's own namespace plus the install namespace. `None`
+    /// leaves the chart default (unfenced).
+    pub telemetry_fenced: Option<bool>,
 }
 
 /// Handle to the in-cluster coxswain installation for one test.
@@ -118,23 +122,27 @@ pub struct ControllerProcess {
     pub tls_addr: SocketAddr,
     /// Local port-forwarded address for `/healthz` / `/readyz`.
     pub health_addr: SocketAddr,
-    /// Local port-forwarded address for `/metrics` / `/api/v1/health` on the
-    /// shared-proxy pod. The proxy carries no other admin query surface
-    /// (#537) — routing views live on the controller.
-    pub admin_addr: SocketAddr,
-    /// Local port-forwarded address for the controller pod's admin endpoint.
-    /// Serves `/api/v1/health` and the aggregator surface
-    /// `/api/v1/{fleet,routing}/*` plus `/api/v1/{problems,manifests/*}`.
+    /// Local port-forwarded address for `/metrics` / `/statusz` on the
+    /// shared-proxy pod. That is the proxy's entire management surface — it
+    /// binds no operator port at all (#676).
+    pub telemetry_addr: SocketAddr,
+    /// Local port-forwarded address for the CONTROLLER's telemetry port,
+    /// serving its own `/metrics` and `/statusz`.
+    pub controller_telemetry_addr: SocketAddr,
+    /// Local port-forwarded address for the controller's operator endpoint, via
+    /// the leader-selecting Service. Serves `/api/v1/health` and the aggregator
+    /// surface `/api/v1/{fleet,routing}/*` plus `/api/v1/{problems,manifests/*}`.
     /// Use `fleet/proxies/{pod}/routes` (see
     /// [`super::Harness::shared_proxy_routes_url`]) for a proxy's compiled
     /// routing table — served from the controller's own local snapshot, not
     /// a fan-out to the pod.
-    pub controller_admin_addr: SocketAddr,
+    pub controller_operator_addr: SocketAddr,
     // `None` when the shared proxy pool is disabled (`proxy.shared.enabled=false`,
     // #604): its internal Service does not exist, so there is nothing to forward.
     health_pf: Option<Child>,
-    admin_pf: Option<Child>,
-    controller_admin_pf: Child,
+    telemetry_pf: Option<Child>,
+    controller_telemetry_pf: Child,
+    controller_operator_pf: Child,
 }
 
 impl ControllerProcess {
@@ -179,7 +187,8 @@ impl ControllerProcess {
             watch_namespace: opts.watch_namespace,
             egress_allow_cidrs: opts.egress_allow_cidrs,
             network_policy_enabled: opts.network_policy_enabled,
-            admin_auth_secret_name: opts.admin_auth_secret_name,
+            operator_auth_secret_name: opts.operator_auth_secret_name,
+            telemetry_fenced: opts.telemetry_fenced,
         };
         if overrides != HelmOverrides::default() {
             let root = workspace_root().context("workspace root")?;
@@ -215,11 +224,12 @@ impl ControllerProcess {
         };
 
         let health_port = free_port()?;
-        let admin_port = free_port()?;
+        let telemetry_port = free_port()?;
 
-        let controller_admin_port = free_port()?;
+        let controller_telemetry_port = free_port()?;
+        let controller_operator_port = free_port()?;
 
-        let (health_pf, admin_pf) = if shared_proxy_absent {
+        let (health_pf, telemetry_pf) = if shared_proxy_absent {
             (None, None)
         } else {
             let health_pf = start_port_forward(
@@ -229,28 +239,69 @@ impl ControllerProcess {
                 COXSWAIN_NAMESPACE,
             )
             .await?;
-            let admin_pf = start_port_forward(
+            let telemetry_pf = start_port_forward(
                 &format!("svc/{SHARED_PROXY_INTERNAL_SVC}"),
-                admin_port,
-                8082,
+                telemetry_port,
+                8083,
                 COXSWAIN_NAMESPACE,
             )
             .await?;
-            (Some(health_pf), Some(admin_pf))
+            (Some(health_pf), Some(telemetry_pf))
         };
-        let controller_admin_pf = start_port_forward(
+        let controller_telemetry_pf = start_port_forward(
             &format!("svc/{CONTROLLER_SVC}"),
-            controller_admin_port,
+            controller_telemetry_port,
+            8083,
+            COXSWAIN_NAMESPACE,
+        )
+        .await?;
+        // Two waits, and both are load-bearing for the leader-selecting operator
+        // Service.
+        //
+        // First the rollout: `helm upgrade --wait` returns once the new pods are
+        // Ready, but the OUTGOING leader keeps the lease — and therefore the
+        // leader label — until it actually terminates. So the Service can still
+        // resolve to a previous-generation pod, and a test that just changed
+        // controller config would read the old config back. Waiting for the
+        // rollout to complete removes every old-generation pod, after which the
+        // label can only be on a new one.
+        super::wait::wait_for_rollout_complete(
+            COXSWAIN_NAMESPACE,
+            "coxswain-controller",
+            Duration::from_secs(180),
+        )
+        .await
+        .context("controller rollout never completed")?;
+        // Then the endpoint: between a restart and the next lease acquisition
+        // the Service is legitimately endpoint-less, and `kubectl port-forward`
+        // against an endpoint-less Service never binds — failing with a bare
+        // "never accepted connections" that reads like a harness defect. Waiting
+        // for a leader is what an operator does too.
+        super::wait::wait_for_service_endpoints(
+            COXSWAIN_NAMESPACE,
+            CONTROLLER_OPERATOR_SVC,
+            Duration::from_secs(180),
+        )
+        .await
+        .context("operator Service never got a leader endpoint")?;
+        let controller_operator_pf = start_port_forward(
+            &format!("svc/{CONTROLLER_OPERATOR_SVC}"),
+            controller_operator_port,
             8082,
             COXSWAIN_NAMESPACE,
         )
         .await?;
 
         let health_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), health_port);
-        let admin_addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), admin_port);
-        let controller_admin_addr = SocketAddr::new(
+        let telemetry_addr =
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), telemetry_port);
+        let controller_telemetry_addr = SocketAddr::new(
             IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            controller_admin_port,
+            controller_telemetry_port,
+        );
+        let controller_operator_addr = SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            controller_operator_port,
         );
 
         // After every helm upgrade, poll the controller's own /readyz via a
@@ -267,11 +318,13 @@ impl ControllerProcess {
             proxy_addr: SocketAddr::new(lb_ip, INGRESS_HTTP_PORT),
             tls_addr: SocketAddr::new(lb_ip, INGRESS_HTTPS_PORT),
             health_addr,
-            admin_addr,
-            controller_admin_addr,
+            telemetry_addr,
+            controller_telemetry_addr,
+            controller_operator_addr,
             health_pf,
-            admin_pf,
-            controller_admin_pf,
+            telemetry_pf,
+            controller_telemetry_pf,
+            controller_operator_pf,
         })
     }
 }
@@ -290,6 +343,20 @@ impl ControllerProcess {
     ///
     /// Returns an error if listing the pods or reading their logs fails.
     pub async fn shared_proxy_access_logs(&self) -> anyhow::Result<Vec<serde_json::Value>> {
+        // Never read logs across a rollout. Every caller is a global-config
+        // mutator whose `helm upgrade` rolls the shared proxy, and the selector
+        // below matches Terminating pods too — `kubectl logs -l` can pick one
+        // and have it disappear mid-fetch, failing with a bare
+        // `pods "…" not found` that reads like a harness bug rather than a
+        // race. Settling first also guarantees the logs come from the pod
+        // running the config under test, not its predecessor.
+        super::wait::wait_for_rollout_complete(
+            COXSWAIN_NAMESPACE,
+            "coxswain-shared-proxy",
+            Duration::from_secs(180),
+        )
+        .await?;
+
         let out = Command::new("kubectl")
             .args([
                 "logs",
@@ -328,10 +395,11 @@ impl Drop for ControllerProcess {
         if let Some(pf) = &mut self.health_pf {
             let _ = pf.start_kill();
         }
-        if let Some(pf) = &mut self.admin_pf {
+        if let Some(pf) = &mut self.telemetry_pf {
             let _ = pf.start_kill();
         }
-        let _ = self.controller_admin_pf.start_kill();
+        let _ = self.controller_telemetry_pf.start_kill();
+        let _ = self.controller_operator_pf.start_kill();
     }
 }
 
@@ -485,6 +553,12 @@ pub(crate) fn free_port() -> anyhow::Result<u16> {
 
 /// Name of the controller ClusterIP Service (health + admin).
 const CONTROLLER_SVC: &str = "coxswain-controller";
+
+/// Leader-selecting Service fronting the controller's operator port (#676).
+/// Distinct from [`CONTROLLER_SVC`], which selects every replica: the operator
+/// API's topology view is only answerable by the replica holding the discovery
+/// streams, so it must not land on a standby.
+const CONTROLLER_OPERATOR_SVC: &str = "coxswain-controller-operator";
 
 /// Poll the controller pod's `/readyz` via a temporary port-forward until it
 /// returns 200 or 60 s elapses.

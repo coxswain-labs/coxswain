@@ -11,15 +11,21 @@ Verify both pods are ready:
 
 Check controller readiness:
 
-  kubectl -n {{ include "coxswain.namespace" . }} port-forward svc/{{ include "coxswain.controller.fullname" . }} {{ .Values.health.port }}:{{ .Values.health.port }} {{ .Values.admin.port }}:{{ .Values.admin.port }}
+  kubectl -n {{ include "coxswain.namespace" . }} port-forward svc/{{ include "coxswain.controller.fullname" . }} {{ .Values.health.port }}:{{ .Values.health.port }} {{ .Values.telemetry.port }}:{{ .Values.telemetry.port }}
   curl http://localhost:{{ .Values.health.port }}/readyz
-  curl http://localhost:{{ .Values.admin.port }}/status
+  curl http://localhost:{{ .Values.telemetry.port }}/statusz
+
+Open the operator UI (this Service targets the elected leader, so the topology
+view is served by the replica that actually holds the discovery streams):
+
+  kubectl -n {{ include "coxswain.namespace" . }} port-forward svc/{{ include "coxswain.controller.fullname" . }}-operator {{ .Values.operator.port }}:{{ .Values.operator.port }}
+  open http://localhost:{{ .Values.operator.port }}/
 
 Check shared-proxy readiness:
 
-  kubectl -n {{ include "coxswain.namespace" . }} port-forward svc/{{ include "coxswain.sharedProxy.fullname" . }}-internal {{ .Values.health.port }}:{{ .Values.health.port }} {{ .Values.admin.port }}:{{ .Values.admin.port }}
+  kubectl -n {{ include "coxswain.namespace" . }} port-forward svc/{{ include "coxswain.sharedProxy.fullname" . }}-internal {{ .Values.health.port }}:{{ .Values.health.port }} {{ .Values.telemetry.port }}:{{ .Values.telemetry.port }}
   curl http://localhost:{{ .Values.health.port }}/readyz
-  curl http://localhost:{{ .Values.admin.port }}/routes
+  curl http://localhost:{{ .Values.telemetry.port }}/statusz
 
 {{- if and .Values.proxy.shared.enabled (eq .Values.service.gateway.type "LoadBalancer") }}
 
@@ -36,30 +42,45 @@ gateway Service maps 80/443 → 8080/8443. CAP_NET_BIND_SERVICE is not required.
 
 {{- if .Values.networkPolicy.enabled }}
 
-The admin port ({{ .Values.admin.port }}) is fenced by a NetworkPolicy on every
-coxswain pod: only pods in the same namespace may reach it. On the controller
-that port serves Kubernetes manifests and pod logs, so this keeps it away from
-other tenants. Everything else — the data plane, probes, discovery — is
-unaffected, and `kubectl port-forward` still works.
+The controller's operator port ({{ .Values.operator.port }}) is fenced by a
+NetworkPolicy: only pods in the same namespace may reach it. That port serves
+Kubernetes manifests and pod logs, so this keeps it away from other tenants.
+Proxy and relay pods do not bind it at all. Everything else — the data plane,
+probes, discovery — is unaffected, and `kubectl port-forward` still works.
+{{- if .Values.networkPolicy.telemetry.fenced }}
 
-To let Prometheus scrape from another namespace, add its namespace to
-`networkPolicy.admin.extraIngress`. If your CNI does not enforce NetworkPolicy
-the object is inert; set `networkPolicy.enabled: false` to omit it.
+networkPolicy.telemetry.fenced is on, so /metrics and /statusz are restricted to
+the pod's own namespace and {{ include "coxswain.namespace" . }}. The PodMonitor
+scrapes pod IPs directly, so a Prometheus in any other namespace is DROPPED
+SILENTLY — add its namespace to `networkPolicy.telemetry.extraIngress` or its
+targets will sit at "context deadline exceeded" with nothing logged.
 {{- else }}
 
-WARNING: networkPolicy.enabled is false, so the admin port ({{ .Values.admin.port }})
-is reachable from every pod in the cluster. On the controller that port serves
-verbatim Kubernetes manifests (including Pod environment variables) and pod
-logs. Fence it with your own NetworkPolicy, or set `adminAuth.secretName`.
+/metrics and /statusz are reachable from any namespace, so Prometheus scrapes
+without further configuration. Set `networkPolicy.telemetry.fenced: true` to
+restrict them — the metric labels enumerate route and backend names, which is
+worth closing when untrusted workloads share the pod network.
 {{- end }}
-{{- if .Values.adminAuth.secretName }}
 
-The controller's admin port requires HTTP Basic auth from Secret
-"{{ .Values.adminAuth.secretName }}" (key `auth`, one bcrypt htpasswd line).
-This covers /metrics too, so scrapers need the credential. If the Secret is
-missing or unusable the admin surface returns 503:
+If your CNI does not enforce NetworkPolicy the object is inert; set
+`networkPolicy.enabled: false` to omit it.
+{{- else }}
 
-  kubectl -n {{ include "coxswain.namespace" . }} get secret {{ .Values.adminAuth.secretName }}
+WARNING: networkPolicy.enabled is false, so the operator port
+({{ .Values.operator.port }}) is reachable from every pod in the cluster. It
+serves verbatim Kubernetes manifests (including Pod environment variables) and
+pod logs. Fence it with your own NetworkPolicy, or set
+`operatorAuth.secretName`.
+{{- end }}
+{{- if .Values.operatorAuth.secretName }}
+
+The controller's operator port requires HTTP Basic auth from Secret
+"{{ .Values.operatorAuth.secretName }}" (key `auth`, one bcrypt htpasswd line).
+Every path on that port is covered, with no exemptions. Prometheus is
+unaffected: /metrics lives on the telemetry port, which is never authenticated.
+If the Secret is missing or unusable the operator surface returns 503:
+
+  kubectl -n {{ include "coxswain.namespace" . }} get secret {{ .Values.operatorAuth.secretName }}
 {{- end }}
 
 The shared-proxy ServiceAccount holds no Kubernetes API access — it exists

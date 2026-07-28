@@ -66,7 +66,7 @@ use std::time::Duration;
 use coxswain_e2e::{
     ControllerOptions, FixtureVars, Harness, NamespaceGuard,
     fixtures::{self, backends, dedicated_proxy as dedicated, gateway_api as gwa, ingress},
-    harness::{HttpClient, wait},
+    harness::{HttpClient, leader, wait},
 };
 
 mod common;
@@ -205,7 +205,7 @@ async fn fresh_proxy_converges_and_registers_in_node_registry() -> anyhow::Resul
     // entry for this proxy with in_sync=true and a non-null last_acked_version.
     // The node_id is the pod name (POD_NAME downward API = metadata.name), which
     // for a Deployment called "disc-converge" is "disc-converge-<rs>-<pod>".
-    let topology_url = h.controller_admin_url("/api/v1/topology");
+    let topology_url = h.controller_operator_url("/api/v1/topology");
     let node = wait::poll_until(
         Duration::from_secs(30),
         wait::POLL,
@@ -312,7 +312,7 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
     // The proxy detects the dropped TCP connection within seconds of the
     // controller pod terminating (OS-side RST/FIN). Poll until the shared proxy
     // health shows `Degraded` (still serving; /readyz stays 200).
-    let proxy_health_url = h.admin_url("/api/v1/health");
+    let proxy_health_url = h.telemetry_url("/statusz");
     wait::poll_until(
         Duration::from_secs(60),
         wait::POLL,
@@ -366,7 +366,7 @@ async fn proxy_degrades_during_controller_outage_then_recovers() -> anyhow::Resu
     // below on the same apply→serve path every steady-state routing test uses,
     // instead of coupling two independent async convergences (reconnect + push)
     // into one bounded wait.
-    let proxy_health_url2 = h2.admin_url("/api/v1/health");
+    let proxy_health_url2 = h2.telemetry_url("/statusz");
     wait::poll_until(
         Duration::from_secs(90),
         wait::POLL,
@@ -632,7 +632,7 @@ async fn invalid_sa_token_is_rejected_with_event() -> anyhow::Result<()> {
 
     // Baseline the controller's rejection counter so we can prove this rogue's
     // rejects (not some earlier test's) drive the metric up.
-    let metrics_url = h.controller_admin_url("/metrics");
+    let metrics_url = h.controller_telemetry_url("/metrics");
     let rejected_before = scrape_metric_label_sum(
         &metrics_url,
         "coxswain_discovery_bootstrap_total",
@@ -933,7 +933,7 @@ async fn rogue_relay_identity_is_rejected_by_roster_gate() -> anyhow::Result<()>
         .next()
         .and_then(|p| p.metadata.name)
         .context("the rogue relay pod must exist by the time its RosterReport was rejected")?;
-    let topology_url = h.controller_admin_url("/api/v1/topology");
+    let topology_url = h.controller_operator_url("/api/v1/topology");
     let topology = fetch_topology(&topology_url).await?;
     let rogue_node = find_node(&topology, &pod_name).with_context(|| {
         format!(
@@ -1520,7 +1520,7 @@ async fn rolling_deploy_sends_only_endpoint_deltas() -> anyhow::Result<()> {
     wait::wait_for_backend(&h.http, &host_b, "/", "echo-b", Duration::from_secs(60)).await?;
     wait::wait_for_backend(&h.http, &host_c, "/", "echo-c", Duration::from_secs(60)).await?;
 
-    let metrics_url = h.admin_url("/metrics");
+    let metrics_url = h.telemetry_url("/metrics");
     let before = read_client_counters(&metrics_url).await;
 
     // Re-IP echo-a's pod. The rollout waits for the new ReplicaSet to be Ready.
@@ -1630,7 +1630,7 @@ async fn structural_change_recompiles_only_affected_partition() -> anyhow::Resul
     wait::wait_for_backend(&h.http, &host_b, "/", "echo-b", Duration::from_secs(60)).await?;
     wait::wait_for_backend(&h.http, &host_c, "/", "echo-c", Duration::from_secs(60)).await?;
 
-    let metrics_url = h.admin_url("/metrics");
+    let metrics_url = h.telemetry_url("/metrics");
     let before = read_client_counters(&metrics_url).await;
 
     // A fourth host, reusing an existing Service so the delta carries only the new
@@ -1704,7 +1704,7 @@ async fn route_delete_tombstones_partition() -> anyhow::Result<()> {
     let (_leader_pf, server_url) = leader_discovery_metrics(&h.client).await?;
     let removed_before = counter(&server_url, M_SERVER_REMOVED).await;
 
-    let client_url = h.admin_url("/metrics");
+    let client_url = h.telemetry_url("/metrics");
     let before = read_client_counters(&client_url).await;
 
     // Delete host a's route.
@@ -1794,7 +1794,7 @@ async fn endpoint_drain_yields_503_without_route_resend() -> anyhow::Result<()> 
     let (_leader_pf, server_url) = leader_discovery_metrics(&h.client).await?;
     let sent_before = counter(&server_url, M_SERVER_SENT).await;
 
-    let client_url = h.admin_url("/metrics");
+    let client_url = h.telemetry_url("/metrics");
     let before = read_client_counters(&client_url).await;
 
     // Drain echo-a: endpoints empty, Service survives.
@@ -1924,7 +1924,8 @@ async fn controller_restart_full_resync_reconverges() -> anyhow::Result<()> {
     // Baseline the client full counter BEFORE the outage. The proxy pod is not
     // restarted (only the controller is), so this counter is monotonic across the
     // whole test and a post-reconnect read is directly comparable.
-    let client_full_before = counter_kind(&h.admin_url("/metrics"), M_CLIENT_APPLIED, "full").await;
+    let client_full_before =
+        counter_kind(&h.telemetry_url("/metrics"), M_CLIENT_APPLIED, "full").await;
 
     // ── Phase 1: controller down → proxy degrades, keeps serving last-good ─────
     // Capture the HA replica count so phase 2 restores it exactly: the install
@@ -1932,7 +1933,7 @@ async fn controller_restart_full_resync_reconverges() -> anyhow::Result<()> {
     // (later in this serial pass) asserts a standby exists.
     let ha_replicas = controller_replicas().await?.max(1);
     scale_controller(0).await?;
-    let proxy_health_url = h.admin_url("/api/v1/health");
+    let proxy_health_url = h.telemetry_url("/statusz");
     wait::poll_until(
         Duration::from_secs(60),
         wait::POLL,
@@ -1970,7 +1971,7 @@ async fn controller_restart_full_resync_reconverges() -> anyhow::Result<()> {
 
     // Wait for the proxy to clear Degraded, asserting per-tick that traffic never
     // drops throughout the reconnect window.
-    let proxy_health_url2 = h2.admin_url("/api/v1/health");
+    let proxy_health_url2 = h2.telemetry_url("/statusz");
     wait::poll_until(
         Duration::from_secs(90),
         wait::POLL,
@@ -1997,7 +1998,8 @@ async fn controller_restart_full_resync_reconverges() -> anyhow::Result<()> {
     .context("shared proxy did not return to Ready after controller restart")?;
 
     // Client end: the reconnect applied a full resync.
-    let client_full_after = counter_kind(&h2.admin_url("/metrics"), M_CLIENT_APPLIED, "full").await;
+    let client_full_after =
+        counter_kind(&h2.telemetry_url("/metrics"), M_CLIENT_APPLIED, "full").await;
     assert!(
         client_full_after > client_full_before,
         "reconnect must apply a full resync (protocol invariant: first message per \
@@ -2283,7 +2285,7 @@ async fn dedicated_proxy_repoints_to_relay_without_dropping_traffic() -> anyhow:
 
     // The dedicated proxy repoints onto the relay: it appears folded under the
     // relay in the controller topology.
-    let topology_url = h.controller_admin_url("/api/v1/topology");
+    let topology_url = h.controller_operator_url("/api/v1/topology");
     wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
 
     // The fold above is a real `RosterReport` fold (#666): the relay's own
@@ -2368,7 +2370,7 @@ async fn dedicated_proxy_repoints_to_relay_without_dropping_traffic() -> anyhow:
 /// same from outside; that is why the caller also reports the scrape error
 /// separately rather than folding it into a zero.
 async fn directive_counters(pod: &str, ns: &str) -> anyhow::Result<String> {
-    let pf = coxswain_e2e::harness::leader::pod_admin_forward_in(pod, ns).await?;
+    let pf = coxswain_e2e::harness::leader::pod_telemetry_forward_in(pod, ns).await?;
     let body = pf.metrics_text(Duration::from_secs(5)).await?;
     let read = |outcome: &str| {
         wait::labelled_metric_value(
@@ -2417,7 +2419,7 @@ async fn repoint_directive_resolves_through_local_upstream_policy() -> anyhow::R
     wait_for_relay_ready(&deployments).await?;
 
     // The repoint landed — the proxy now streams through the relay.
-    let topology_url = h.controller_admin_url("/api/v1/topology");
+    let topology_url = h.controller_operator_url("/api/v1/topology");
     wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
 
     // Scrape the LEAF's own counters: the policy runs on the proxy, not the
@@ -2454,7 +2456,7 @@ async fn repoint_directive_resolves_through_local_upstream_policy() -> anyhow::R
             let pod_name = pod_name.clone();
             let ns = ns.name.clone();
             async move {
-                let pf = coxswain_e2e::harness::leader::pod_admin_forward_in(&pod_name, &ns)
+                let pf = coxswain_e2e::harness::leader::pod_telemetry_forward_in(&pod_name, &ns)
                     .await
                     .ok()?;
                 let body = pf.metrics_text(Duration::from_secs(5)).await.ok()?;
@@ -2515,7 +2517,7 @@ async fn relay_and_dedicated_proxy_serve_last_good_during_controller_outage() ->
     let (http, host, _uid) = converge_dedicated_proxy(&h, &ns.name).await?;
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_relay_ready(&deployments).await?;
-    let topology_url = h.controller_admin_url("/api/v1/topology");
+    let topology_url = h.controller_operator_url("/api/v1/topology");
     wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
 
     // ── Controller down → relay + proxy hold last-good, traffic uninterrupted ──
@@ -2567,7 +2569,7 @@ async fn dedicated_proxy_serves_last_good_while_relay_restarts() -> anyhow::Resu
     let (http, host, proxy_uid) = converge_dedicated_proxy(&h, &ns.name).await?;
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_relay_ready(&deployments).await?;
-    let topology_url = h.controller_admin_url("/api/v1/topology");
+    let topology_url = h.controller_operator_url("/api/v1/topology");
     wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
 
     // ── Restart the relay → proxy holds last-good across the gap ──────────────
@@ -2616,7 +2618,7 @@ async fn dedicated_proxy_falls_back_to_controller_when_relay_deprovisioned() -> 
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
     let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_relay_ready(&deployments).await?;
-    let topology_url = h.controller_admin_url("/api/v1/topology");
+    let topology_url = h.controller_operator_url("/api/v1/topology");
     wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
 
     // ── Veto the relay → the controller GCs it ────────────────────────────────
@@ -2746,7 +2748,7 @@ async fn relay_repoint_keeps_serving_during_teardown() -> anyhow::Result<()> {
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
     let services: Api<Service> = Api::namespaced(h.client.clone(), &ns.name);
     wait_for_relay_ready(&deployments).await?;
-    let topology_url = h.controller_admin_url("/api/v1/topology");
+    let topology_url = h.controller_operator_url("/api/v1/topology");
     wait_for_proxy_under_relay(&topology_url, &ns.name).await?;
 
     // Drop to a single subscriber: below break-even (2) but NONZERO. After the
@@ -2812,5 +2814,170 @@ async fn relay_repoint_keeps_serving_during_teardown() -> anyhow::Result<()> {
         .context("traffic dropped across the below-break-even relay teardown")?
         .assert_backend("echo-a");
 
+    Ok(())
+}
+
+// ── topology is leader-authoritative (#676) ──────────────────────────────────
+
+#[tokio::test]
+async fn topology_is_complete_through_the_operator_service_and_503s_on_a_standby()
+-> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let leader_pod = leader::leader_pod_name(&h.client).await?;
+
+    // Happy path: the leader-selecting operator Service resolves to the replica
+    // that actually holds the discovery streams, so the topology is populated.
+    // Poll: a proxy's stream and its first Ack land shortly after startup.
+    let url = h.controller_operator_url("/api/v1/topology");
+    let topology = wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || {
+            let url = url.clone();
+            async move {
+                match fetch_topology(&url).await {
+                    Ok(t) => {
+                        format!("operator Service to serve a populated topology; last body: {t}")
+                    }
+                    Err(e) => format!(
+                        "operator Service to serve a populated topology; last fetch \
+                         failed: {e}"
+                    ),
+                }
+            }
+        },
+        || {
+            let url = url.clone();
+            async move {
+                let t = fetch_topology(&url).await.ok()?;
+                let n = t.get("nodes")?.as_array()?.len();
+                (t["discovery_active"] == serde_json::Value::Bool(true) && n > 0).then_some(t)
+            }
+        },
+    )
+    .await?;
+    assert!(
+        find_node(&topology, "coxswain-shared-proxy").is_some(),
+        "the shared proxy must appear in the topology served via the operator \
+         Service, got {topology}"
+    );
+
+    // Sad path: a standby reached DIRECTLY (bypassing the Service, as a pod-IP
+    // port-forward would) must say it cannot answer. Before #676 it served an
+    // empty node list, which renders identically to a healthy cluster with
+    // nothing connected — the failure this whole change exists to remove.
+    let pods: Api<Pod> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    let lp = ListParams::default().labels("app.kubernetes.io/component=controller");
+    let standby = pods
+        .list(&lp)
+        .await?
+        .into_iter()
+        .filter_map(|p| p.metadata.name)
+        .find(|n| *n != leader_pod);
+    let Some(standby) = standby else {
+        anyhow::bail!(
+            "HA default runs >= 2 controller replicas but only the leader ({leader_pod}) \
+             was found — the standby half of this test never ran"
+        );
+    };
+
+    let pf = leader::pod_operator_forward(&standby).await?;
+    let resp = reqwest::get(format!("{}/api/v1/topology", pf.base_url)).await?;
+    let status = resp.status();
+    let body = resp.text().await.unwrap_or_default();
+    assert_eq!(
+        status, 503,
+        "standby {standby} must refuse to answer the topology; got {status} with {body}"
+    );
+    assert!(
+        !body.contains("\"nodes\""),
+        "the standby's 503 must not carry a node list that could be rendered as \
+         truth; got {body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn topology_survives_a_leader_change() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let url = h.controller_operator_url("/api/v1/topology");
+
+    // Establish the populated baseline through the Service.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || {
+            let url = url.clone();
+            async move {
+                match fetch_topology(&url).await {
+                    Ok(t) => format!("populated topology before the failover; last body: {t}"),
+                    Err(e) => {
+                        format!("populated topology before the failover; last fetch failed: {e}")
+                    }
+                }
+            }
+        },
+        || {
+            let url = url.clone();
+            async move {
+                let t = fetch_topology(&url).await.ok()?;
+                (!t.get("nodes")?.as_array()?.is_empty()).then_some(())
+            }
+        },
+    )
+    .await?;
+
+    let old_leader = leader::leader_pod_name(&h.client).await?;
+    let pods: Api<Pod> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    pods.delete(&old_leader, &DeleteParams::default()).await?;
+    let new_leader = leader::wait_for_new_leader(&h.client, &old_leader, Duration::from_secs(120))
+        .await
+        .context("a standby must take the lease after the leader is deleted")?;
+    assert_ne!(new_leader, old_leader);
+
+    // `url` above is backed by a port-forward the harness opened once, and the
+    // operator Service selects the leader — so kubectl bound it to the pod just
+    // deleted and that tunnel is now dead. Re-resolve against the new leader,
+    // or the poll below would time out on connection-refused and blame the
+    // election for a stale tunnel.
+    let pf = leader::pod_operator_forward(&new_leader).await?;
+    let url = format!("{}/api/v1/topology", pf.base_url);
+
+    // Happy path: the new leader serves the full topology once proxies redial
+    // it. Only a populated body satisfies the poll — a 200 with an empty node
+    // list would be the exact regression this suite exists to catch.
+    let recovered = wait::poll_until(
+        Duration::from_secs(180),
+        wait::POLL,
+        || {
+            let url = url.clone();
+            let new_leader = new_leader.clone();
+            async move {
+                match fetch_topology(&url).await {
+                    Ok(t) => format!(
+                        "topology to repopulate on the new leader {new_leader}; \
+                         last body: {t}"
+                    ),
+                    Err(e) => format!(
+                        "topology to repopulate on the new leader {new_leader}; \
+                         last fetch failed: {e}"
+                    ),
+                }
+            }
+        },
+        || {
+            let url = url.clone();
+            async move {
+                let t = fetch_topology(&url).await.ok()?;
+                let n = t.get("nodes")?.as_array()?.len();
+                (t["discovery_active"] == serde_json::Value::Bool(true) && n > 0).then_some(t)
+            }
+        },
+    )
+    .await?;
+    assert!(
+        find_node(&recovered, "coxswain-shared-proxy").is_some(),
+        "the shared proxy must reappear in the topology after failover, got {recovered}"
+    );
     Ok(())
 }

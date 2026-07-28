@@ -1,5 +1,5 @@
 {
-  "admin_port": 8082,
+  "telemetry_port": 8083,
   "component": "shared-proxy",
   "pod_ip": "10.42.0.101",
   "pod_name": "coxswain-shared-proxy-66d-bk9p4",

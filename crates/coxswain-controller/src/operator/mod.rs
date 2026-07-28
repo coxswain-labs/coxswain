@@ -48,7 +48,6 @@
 //! - The reconcile is leader-gated: only the controller pod holding the
 //!   leadership lease applies — non-leaders re-queue.
 
-pub(crate) mod admin_fence;
 pub(crate) mod apply;
 pub(crate) mod harden;
 pub(crate) mod merge;
@@ -65,11 +64,12 @@ pub(crate) mod render_shared_proxy;
 pub(crate) mod shared_alloc;
 pub(crate) mod shared_install;
 pub(crate) mod status;
+pub(crate) mod telemetry_fence;
 pub(crate) mod vip;
 
-pub use admin_fence::AdminFenceConfig;
 pub use reconciler::{OperatorConfig, RelayConfig};
 pub use render_shared_proxy::ProxyPoolConfig;
+pub use telemetry_fence::TelemetryFenceConfig;
 // #574 fold: the operator no longer runs as its own `BackgroundService`. The
 // controller builds the reconcile context off the reflector's `OperatorStores`,
 // the unified worker's dedicated branch calls `reconcile_dedicated`, and the

@@ -184,9 +184,9 @@ function podManifest(name, ns, role, i, restarts) {
 
 function emitControllers() {
   const list = CONTROLLERS.map((c, i) => (c.reachable === false
-    ? { component: 'controller', pod_name: c.name, pod_namespace: SYS, pod_ip: `10.42.0.${10 + i}`, admin_port: 8082, reachable: false, ...runtime(i, CTRL_RESTARTS[i] ?? 0) }
+    ? { component: 'controller', pod_name: c.name, pod_namespace: SYS, pod_ip: `10.42.0.${10 + i}`, telemetry_port: 8083, reachable: false, ...runtime(i, CTRL_RESTARTS[i] ?? 0) }
     : {
-        admin_port: 8082, component: 'controller', degraded_checks: c.degraded,
+        telemetry_port: 8083, component: 'controller', degraded_checks: c.degraded,
         health: c.health, is_leader: c.leader, pod_ip: `10.42.0.${10 + i}`,
         pod_name: c.name, pod_namespace: SYS, reachable: true, ...runtime(i, CTRL_RESTARTS[i] ?? 0),
       }));
@@ -194,12 +194,12 @@ function emitControllers() {
   CONTROLLERS.forEach((c, i) => {
     write(`/api/v1/manifests/pod/${SYS}/${c.name}`, podManifest(c.name, SYS, 'controller', i, CTRL_RESTARTS[i] ?? 0));
     if (c.reachable === false) {
-      write(`/api/v1/fleet/controllers/${c.name}`, { pod_name: c.name, component: 'controller', pod_namespace: SYS, pod_ip: `10.42.0.${10 + i}`, admin_port: 8082, reachable: false, ...runtime(i, CTRL_RESTARTS[i] ?? 0) });
+      write(`/api/v1/fleet/controllers/${c.name}`, { pod_name: c.name, component: 'controller', pod_namespace: SYS, pod_ip: `10.42.0.${10 + i}`, telemetry_port: 8083, reachable: false, ...runtime(i, CTRL_RESTARTS[i] ?? 0) });
       write(`/api/v1/fleet/controllers/${c.name}/health`, { pod_name: c.name, reachable: false });
       return;
     }
     write(`/api/v1/fleet/controllers/${c.name}`, {
-      admin_port: 8082, component: 'controller', is_leader: c.leader,
+      telemetry_port: 8083, component: 'controller', is_leader: c.leader,
       pod_ip: `10.42.0.${10 + i}`, pod_name: c.name, pod_namespace: SYS, reachable: true,
       ...runtime(i, CTRL_RESTARTS[i] ?? 0),
     });
@@ -222,10 +222,10 @@ const PROXIES = [
 ];
 function proxyListEntry(p, i) {
   if (p.reachable === false) {
-    return { component: p.kind, gateway_ref: p.gw, pod_name: p.name, pod_namespace: p.ns, pod_ip: `10.42.0.${100 + i}`, admin_port: 8082, reachable: false, ...runtime(i, PROXY_RESTARTS[i] ?? 0) };
+    return { component: p.kind, gateway_ref: p.gw, pod_name: p.name, pod_namespace: p.ns, pod_ip: `10.42.0.${100 + i}`, telemetry_port: 8083, reachable: false, ...runtime(i, PROXY_RESTARTS[i] ?? 0) };
   }
   const e = {
-    admin_port: 8082, component: p.kind, degraded_checks: p.degraded, health: p.health,
+    telemetry_port: 8083, component: p.kind, degraded_checks: p.degraded, health: p.health,
     pod_ip: `10.42.0.${100 + i}`, pod_name: p.name, pod_namespace: p.ns, reachable: true,
     ...runtime(i, PROXY_RESTARTS[i] ?? 0),
   };
@@ -237,12 +237,12 @@ function emitProxies() {
   PROXIES.forEach((p, i) => {
     write(`/api/v1/manifests/pod/${p.ns}/${p.name}`, podManifest(p.name, p.ns, p.kind, i, PROXY_RESTARTS[i] ?? 0));
     if (p.reachable === false) {
-      write(`/api/v1/fleet/proxies/${p.name}`, { component: p.kind, gateway_ref: p.gw, pod_name: p.name, pod_namespace: p.ns, pod_ip: `10.42.0.${100 + i}`, admin_port: 8082, reachable: false, ...runtime(i, PROXY_RESTARTS[i] ?? 0) });
+      write(`/api/v1/fleet/proxies/${p.name}`, { component: p.kind, gateway_ref: p.gw, pod_name: p.name, pod_namespace: p.ns, pod_ip: `10.42.0.${100 + i}`, telemetry_port: 8083, reachable: false, ...runtime(i, PROXY_RESTARTS[i] ?? 0) });
       write(`/api/v1/fleet/proxies/${p.name}/health`, { pod_name: p.name, reachable: false });
       write(`/api/v1/fleet/proxies/${p.name}/routes`, { pod_name: p.name, reachable: false });
       return;
     }
-    const detail = { admin_port: 8082, component: p.kind, pod_ip: `10.42.0.${100 + i}`, pod_name: p.name, pod_namespace: p.ns, reachable: true, ...runtime(i, PROXY_RESTARTS[i] ?? 0) };
+    const detail = { telemetry_port: 8083, component: p.kind, pod_ip: `10.42.0.${100 + i}`, pod_name: p.name, pod_namespace: p.ns, reachable: true, ...runtime(i, PROXY_RESTARTS[i] ?? 0) };
     if (p.gw) detail.gateway_ref = p.gw;
     write(`/api/v1/fleet/proxies/${p.name}`, detail);
     write(`/api/v1/fleet/proxies/${p.name}/health`, {
@@ -655,6 +655,18 @@ function emitTopology() {
     discovery_active:    true,
     controller_version:  TOPO_CTRL_VERSION,
     nodes,
+  });
+  // Standby variant (#676): only the leader accepts discovery streams, so a
+  // standby refuses rather than serving an empty node list that reads as a
+  // healthy cluster with nothing connected. Load the dev server with
+  // `?mock=standby` — `client.js` forwards the parameter onto every API call
+  // and the plugin honours `__status` — to see the Topology screen's
+  // not-leader branch.
+  write('/api/v1/topology__standby', {
+    __status: 503,
+    error:
+      'not the discovery leader — only the leader accepts proxy streams, so this ' +
+      'replica has no topology to report; reach the leader-selecting operator Service',
   });
 }
 

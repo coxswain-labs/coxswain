@@ -1,5 +1,5 @@
 {
-  "admin_port": 8082,
+  "telemetry_port": 8083,
   "component": "controller",
   "is_leader": false,
   "pod_ip": "10.42.0.11",

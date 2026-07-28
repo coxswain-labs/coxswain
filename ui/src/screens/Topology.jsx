@@ -39,6 +39,24 @@ export function Topology() {
     );
   }
 
+  // A standby answers 503: only the leader accepts discovery streams, so only
+  // it has a topology. Reached through the leader-selecting operator Service
+  // this never happens; it does when someone port-forwards a specific pod.
+  // Saying so beats "failed to load", and beats the empty canvas this used to
+  // render from a standby's empty registry — which looked like a healthy
+  // cluster with nothing connected.
+  if (topo.error?.status === 503) {
+    return (
+      <div class="screen">
+        <p class="topo-empty">
+          This controller replica is not the discovery leader, so it has no
+          topology to show. Reach the leader through the
+          <code> coxswain-controller-operator </code> Service.
+        </p>
+      </div>
+    );
+  }
+
   if (topo.error) {
     return (
       <div class="screen">
@@ -48,7 +66,10 @@ export function Topology() {
   }
 
   const { discovery_active, controller_version, nodes = [] } = topo.data ?? {};
-  const allInSync = summary.data?.all_in_sync ?? true;
+  // Absent means "this replica cannot tell" (no registry, or not the leader) —
+  // distinct from a known-converged `true`. Only an explicit `false` is a
+  // convergence warning; anything else must not raise one.
+  const convergenceLagging = summary.data?.all_in_sync === false;
 
   // Control plane: leader (the snapshot source) + any standbys. Falls back to a
   // single synthetic controller when fleet/controllers isn't available (dev).
@@ -59,7 +80,7 @@ export function Topology() {
     degraded:  (c.degraded_checks?.length ?? 0) > 0 || c.health === 'degraded',
   }));
 
-  const notice = discovery_active && !allInSync
+  const notice = discovery_active && convergenceLagging
     ? "A proxy hasn't Ack'd the latest snapshot — re-converging…"
     : null;
 

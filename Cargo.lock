@@ -771,7 +771,6 @@ dependencies = [
  "kube",
  "pingora-core",
  "pingora-http",
- "prometheus 0.14.0",
  "reqwest",
  "rustls",
  "serde",
@@ -932,6 +931,10 @@ dependencies = [
  "coxswain-core",
  "http",
  "pingora-core",
+ "prometheus 0.14.0",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

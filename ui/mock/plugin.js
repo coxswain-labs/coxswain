@@ -29,8 +29,9 @@ import { dirname, join } from 'node:path';
 const DATA_DIR = join(dirname(fileURLToPath(import.meta.url)), 'data');
 
 /** Map an `/api/v1/...` request path to its fixture file on disk. */
-function fixtureFile(urlPath) {
-  return join(DATA_DIR, `${urlPath.replace(/\//g, '_')}.json`);
+function fixtureFile(urlPath, variant) {
+  const base = urlPath.replace(/\//g, '_');
+  return join(DATA_DIR, `${base}${variant ? `__${variant}` : ''}.json`);
 }
 
 /** Routing list endpoints → the array key in their fixture. These honour the
@@ -133,7 +134,7 @@ function pageList(fixture, key, params) {
 /** Named events mirroring `events.rs`, looped to drive the live UI. */
 const SSE_EVENTS = [
   ['rebuild.completed', { cycle: 7, published: true }],
-  ['proxy.connected', { pod: 'tenant-a-gw-coxswain-7db74-j8cjt', mode: 'dedicated-proxy', admin_addr: '10.42.0.102:8082' }],
+  ['proxy.connected', { pod: 'tenant-a-gw-coxswain-7db74-j8cjt', mode: 'dedicated-proxy', telemetry_addr: '10.42.0.102:8083' }],
   ['controller.connected', { pod: 'coxswain-controller-7f9c8-stdby' }],
   ['ownership.changed', { gateway: 'tenant-b/tenant-b-gw', from: 'shared', to: 'dedicated' }],
   ['leader.changed', { pod: 'coxswain-controller-7f9c8-leadr', is_leader: true }],
@@ -163,6 +164,12 @@ export function mockApi() {
       server.middlewares.use((req, res, next) => {
         const url = (req.url || '').split('?')[0];
         if (!url.startsWith('/api/v1/')) return next();
+
+        // `?mock=<variant>` selects an alternate fixture
+        // (`_api_v1_topology__standby.json`), falling back to the base file.
+        // Lets one dev server reach both the happy state and the awkward ones
+        // without editing fixtures by hand.
+        const variant = new URLSearchParams((req.url || '').split('?')[1] || '').get('mock');
 
         if (LOGS_RE.test(url)) {
           res.writeHead(200, {
@@ -198,7 +205,10 @@ export function mockApi() {
 
         res.setHeader('Content-Type', 'application/json');
         res.setHeader('Cache-Control', 'no-store');
-        const file = fixtureFile(url);
+        // Prefer the variant fixture when one exists; otherwise the base.
+        const variantFile = variant ? fixtureFile(url, variant) : null;
+        const file =
+          variantFile && existsSync(variantFile) ? variantFile : fixtureFile(url);
 
         // Routing list endpoints: serve a filtered + windowed page from the full
         // fixture so search/namespace/pagination behave like the controller.
@@ -236,6 +246,17 @@ export function mockApi() {
         }
 
         if (existsSync(file)) {
+          // A fixture may carry `__status` to model a non-200 answer — the
+          // controller's real behaviour for states like a standby refusing the
+          // topology (503). Without this the only reachable dev state is the
+          // happy one, and the UI's error branches go unexercised.
+          const raw = JSON.parse(readFileSync(file, 'utf8'));
+          if (raw && typeof raw === 'object' && raw.__status) {
+            const { __status, ...body } = raw;
+            res.statusCode = __status;
+            res.end(JSON.stringify(body));
+            return;
+          }
           res.end(readFileSync(file));
         } else {
           res.statusCode = 404;

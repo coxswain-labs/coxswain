@@ -1404,8 +1404,11 @@ async fn fresh_route_converges_after_churn_burst() -> anyhow::Result<()> {
         .await?;
 
     // And the wedge signature is absent: every relist completed.
-    wait::wait_for_relists_settled(&h.controller_admin_url("/metrics"), Duration::from_secs(30))
-        .await?;
+    wait::wait_for_relists_settled(
+        &h.controller_telemetry_url("/metrics"),
+        Duration::from_secs(30),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1435,8 +1438,11 @@ async fn route_churn_burst_leaves_no_stuck_relist() -> anyhow::Result<()> {
     churn_httproutes(&h.client, &ns.name, ROUTE_CHURN_CYCLES).await?;
 
     // Primary assertion: no reflector is stuck mid-relist (the #573 signature).
-    wait::wait_for_relists_settled(&h.controller_admin_url("/metrics"), Duration::from_secs(30))
-        .await?;
+    wait::wait_for_relists_settled(
+        &h.controller_telemetry_url("/metrics"),
+        Duration::from_secs(30),
+    )
+    .await?;
 
     // No zombie: the existing Gateway's status is still maintained (re-confirmed
     // Programmed at current generation), not frozen behind a wedged store.
@@ -1641,7 +1647,7 @@ fn metric_sum(exposition: &str, metric: &str) -> f64 {
 }
 
 async fn proxy_metric_sum(h: &Harness, metric: &str) -> anyhow::Result<f64> {
-    let body = reqwest::get(h.admin_url("/metrics"))
+    let body = reqwest::get(h.telemetry_url("/metrics"))
         .await
         .context("scrape proxy /metrics")?
         .text()

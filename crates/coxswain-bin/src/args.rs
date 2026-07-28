@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 use coxswain_controller::{
-    AdminFenceConfig, IngressDefaultBackend, NetworkPolicyPeer, ProxyPoolConfig,
-    RELAY_DISCOVERY_PORT, RelayConfig,
+    IngressDefaultBackend, NetworkPolicyPeer, ProxyPoolConfig, RELAY_DISCOVERY_PORT, RelayConfig,
+    TelemetryFenceConfig,
 };
 use ipnet::IpNet;
 
@@ -117,7 +117,7 @@ pub(crate) enum Role {
 /// Flags shared by every role.
 ///
 /// Includes logging, pod identity, the controller-name filter, and the
-/// management-surface (health + admin) bind/port settings. These are the
+/// management-surface (health, telemetry, operator) bind/port settings. These are the
 /// minimum every pod needs regardless of what subsystems it runs.
 #[derive(Args, Debug)]
 pub(crate) struct CommonArgs {
@@ -155,15 +155,16 @@ pub(crate) struct CommonArgs {
     #[arg(long = "log", env = "COXSWAIN_LOG", default_value = "info")]
     pub log_filter: String,
 
-    /// IP address shared by the health and admin HTTP servers.
+    /// IP address shared by the health, telemetry, and operator HTTP servers.
     ///
     /// Set a management-network IP to restrict access; the default `0.0.0.0`
     /// lets kubelet probes and Prometheus scraping work out of the box.
     /// Independent of the data-plane `--proxy-bind-address`.
     ///
-    /// SECURITY: on the controller role the admin API serves pod logs and
+    /// SECURITY: on the controller role the operator API serves pod logs and
     /// verbatim Kubernetes manifests, including Pod environment variables. Also
-    /// restrict it with `--admin-fence-enabled` and `--admin-basic-auth-secret`.
+    /// restrict it with `--operator-fence-enabled` and
+    /// `--operator-basic-auth-secret`.
     #[arg(
         long,
         env = "COXSWAIN_MANAGEMENT_BIND_ADDRESS",
@@ -171,11 +172,22 @@ pub(crate) struct CommonArgs {
     )]
     pub management_bind_address: IpAddr,
 
-    /// Port to listen on for the admin, metrics, and diagnostics endpoints.
+    /// Port to listen on for the operator UI and `/api/v1` endpoints.
     ///
-    /// The bind address is controlled by `--management-bind-address`.
-    #[arg(long, env = "COXSWAIN_ADMIN_PORT", default_value_t = 8082)]
-    pub admin_port: u16,
+    /// Controller role only; proxy and relay pods do not serve this surface.
+    /// Every path on it is covered by `--operator-basic-auth-secret` when that
+    /// is set, with no exemptions. The bind address is controlled by
+    /// `--management-bind-address`.
+    #[arg(long, env = "COXSWAIN_OPERATOR_PORT", default_value_t = 8082)]
+    pub operator_port: u16,
+
+    /// Port to listen on for `/metrics` and `/statusz`.
+    ///
+    /// Served by every role and never authenticated: Prometheus cannot present
+    /// a credential, and peer pods hold only the credential's hash. The bind
+    /// address is controlled by `--management-bind-address`.
+    #[arg(long, env = "COXSWAIN_TELEMETRY_PORT", default_value_t = 8083)]
+    pub telemetry_port: u16,
 
     /// Port to listen on for liveness and readiness health endpoints.
     ///
@@ -299,7 +311,7 @@ pub(crate) struct ProxyArgs {
     ///
     /// Shared by the HTTP and HTTPS listeners; combine with
     /// `--ingress-http-port` and/or `--ingress-https-port` to form each
-    /// listener's full bind address. The health and admin servers bind
+    /// listener's full bind address. The management servers bind
     /// separately via `--management-bind-address`.
     #[arg(long, env = "COXSWAIN_PROXY_BIND_ADDRESS", default_value = "0.0.0.0")]
     pub proxy_bind_address: IpAddr,
@@ -452,7 +464,7 @@ fn parse_json(s: &str) -> Result<serde_json::Value, String> {
     serde_json::from_str(s).map_err(|e| format!("invalid pod-template JSON: {e}"))
 }
 
-/// The `--admin-fence-extra-ingress` peer list (#670).
+/// The `--telemetry-fence-extra-ingress` peer list (#670).
 ///
 /// A newtype rather than a bare `Vec<NetworkPolicyPeer>` because clap infers a
 /// `Vec<T>` field as a *multi-value* argument and downcasts each occurrence to
@@ -463,7 +475,7 @@ fn parse_json(s: &str) -> Result<serde_json::Value, String> {
 #[derive(Clone, Debug)]
 pub(crate) struct NetworkPolicyPeers(pub Vec<NetworkPolicyPeer>);
 
-/// Parse the `--admin-fence-extra-ingress` value into [`NetworkPolicyPeers`] (#670).
+/// Parse the `--telemetry-fence-extra-ingress` value into [`NetworkPolicyPeers`] (#670).
 ///
 /// Parsed into the typed Kubernetes objects here, at startup, rather than
 /// carried as opaque JSON to the render path: a malformed peer would otherwise
@@ -473,7 +485,7 @@ pub(crate) struct NetworkPolicyPeers(pub Vec<NetworkPolicyPeer>);
 fn parse_network_policy_peers(s: &str) -> Result<NetworkPolicyPeers, String> {
     serde_json::from_str(s)
         .map(NetworkPolicyPeers)
-        .map_err(|e| format!("invalid admin-fence extra-ingress JSON: {e}"))
+        .map_err(|e| format!("invalid telemetry-fence extra-ingress JSON: {e}"))
 }
 
 /// Parse the `--shared-vip-service-type` value into a [`ServiceType`] (#472).
@@ -535,42 +547,50 @@ pub(crate) struct ControllerArgs {
     #[arg(long, env = "COXSWAIN_STATUS_ADDRESS")]
     pub status_address: Option<String>,
 
-    /// Restrict the admin port of every provisioned pod (shared pool, dedicated
-    /// proxies, relays) to callers in the pod's own namespace, via a `NetworkPolicy`.
+    /// Restrict the telemetry port of every provisioned pod (shared pool,
+    /// dedicated proxies, relays) to callers in the pod's own namespace and the
+    /// install namespace, via a `NetworkPolicy`.
     ///
-    /// On by default; all other ports stay reachable from anywhere. Set `false`
-    /// to leave the admin port open and remove any policy already applied.
+    /// Off by default, so Prometheus scrapes `/metrics` from any namespace with
+    /// no further configuration. Set `true` when the routing inventory in the
+    /// metric labels (route and backend names, per namespace) should not be
+    /// readable by arbitrary pods; add any scraper outside those two namespaces
+    /// to `--telemetry-fence-extra-ingress` at the same time, or its scrapes
+    /// start being dropped. All other ports stay reachable from anywhere.
     #[arg(
         long,
-        env = "COXSWAIN_ADMIN_FENCE_ENABLED",
-        default_value_t = true,
+        env = "COXSWAIN_TELEMETRY_FENCE_ENABLED",
+        default_value_t = false,
         action = clap::ArgAction::Set,
     )]
-    pub admin_fence_enabled: bool,
+    pub telemetry_fence_enabled: bool,
 
-    /// Additional callers to allow through the admin-port restriction, as a JSON
-    /// array of Kubernetes `NetworkPolicyPeer` objects.
+    /// Additional callers to allow through the telemetry-port restriction, as a
+    /// JSON array of Kubernetes `NetworkPolicyPeer` objects.
     ///
-    /// Needed to let a Prometheus in another namespace scrape `/metrics`, e.g.
+    /// Only consulted when `--telemetry-fence-enabled` is set. Needed to let a
+    /// Prometheus outside the pod's own namespace and the install namespace
+    /// scrape `/metrics`, e.g.
     /// `[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}}]`.
     #[arg(
         long,
-        env = "COXSWAIN_ADMIN_FENCE_EXTRA_INGRESS",
+        env = "COXSWAIN_TELEMETRY_FENCE_EXTRA_INGRESS",
         default_value = "[]",
         value_parser = parse_network_policy_peers,
     )]
-    pub admin_fence_extra_ingress: NetworkPolicyPeers,
+    pub telemetry_fence_extra_ingress: NetworkPolicyPeers,
 
-    /// Require HTTP Basic auth on the admin port, from a `Secret` of this name
-    /// in the pod's namespace.
+    /// Require HTTP Basic auth on the operator port, from a `Secret` of this
+    /// name in the pod's namespace.
     ///
     /// The Secret holds one bcrypt htpasswd line (`htpasswd -nbB <user> <pass>`)
     /// under the key `auth`. It is re-read every 30s, so rotating the credential
-    /// needs no restart. Covers the whole admin listener including `/metrics`;
-    /// the health port is unaffected. A missing or unusable Secret returns 503
-    /// rather than serving the surface unauthenticated. Unset = no auth.
-    #[arg(long, env = "COXSWAIN_ADMIN_BASIC_AUTH_SECRET")]
-    pub admin_basic_auth_secret: Option<String>,
+    /// needs no restart. Covers every path on the operator listener with no
+    /// exemptions; the health and telemetry ports are unaffected and are never
+    /// authenticated. A missing or unusable Secret returns 503 rather than
+    /// serving the surface unauthenticated. Unset = no auth.
+    #[arg(long, env = "COXSWAIN_OPERATOR_BASIC_AUTH_SECRET")]
+    pub operator_basic_auth_secret: Option<String>,
 
     /// Label selector targeting the shared proxy pod, used as the `selector` of
     /// every per-Gateway shared-mode VIP Service.
@@ -1077,14 +1097,14 @@ impl ControllerArgs {
         }
     }
 
-    /// Build the [`AdminFenceConfig`] the operator carries (#670) from the
-    /// `--admin-fence-*` flags. The peers are already typed
+    /// Build the [`TelemetryFenceConfig`] the operator carries (#670) from the
+    /// `--telemetry-fence-*` flags. The peers are already typed
     /// `NetworkPolicyPeer`s — [`parse_network_policy_peers`] rejects a malformed
     /// one at startup — so the renderer emits them verbatim.
-    pub(crate) fn admin_fence_config(&self, install_namespace: &str) -> AdminFenceConfig {
-        AdminFenceConfig {
-            enabled: self.admin_fence_enabled,
-            extra_ingress: self.admin_fence_extra_ingress.0.clone(),
+    pub(crate) fn telemetry_fence_config(&self, install_namespace: &str) -> TelemetryFenceConfig {
+        TelemetryFenceConfig {
+            enabled: self.telemetry_fence_enabled,
+            extra_ingress: self.telemetry_fence_extra_ingress.0.clone(),
             install_namespace: install_namespace.to_string(),
         }
     }
@@ -1849,36 +1869,41 @@ mod tests {
     }
 
     #[test]
-    fn admin_fence_defaults_to_enabled_with_no_extra_peers() {
-        // Fencing is opt-out: an install that says nothing must still get the
-        // policy, or the default deployment stays exposed.
+    fn telemetry_fence_defaults_to_disabled_with_no_extra_peers() {
+        // Deliberately opt-IN, inverting the operator fence's opt-out default:
+        // the telemetry port carries no manifests or logs, and a fenced default
+        // silently drops every scrape from a Prometheus outside the install
+        // namespace — which is where essentially every install puts it.
         let fence = controller_args(&[])
             .controller
-            .admin_fence_config("coxswain-system");
-        assert!(fence.enabled, "the admin fence must default to on");
+            .telemetry_fence_config("coxswain-system");
+        assert!(
+            !fence.enabled,
+            "the telemetry fence must default to off so scraping works unconfigured"
+        );
         assert!(fence.extra_ingress.is_empty());
     }
 
     #[test]
-    fn admin_fence_can_be_disabled() {
-        let fence = controller_args(&["--admin-fence-enabled=false"])
+    fn telemetry_fence_can_be_enabled() {
+        let fence = controller_args(&["--telemetry-fence-enabled=true"])
             .controller
-            .admin_fence_config("coxswain-system");
-        assert!(!fence.enabled);
+            .telemetry_fence_config("coxswain-system");
+        assert!(fence.enabled);
     }
 
     #[test]
-    fn admin_fence_extra_ingress_parses_a_json_peer_array() {
+    fn telemetry_fence_extra_ingress_parses_a_json_peer_array() {
         // Regression: declaring this field as a bare `Vec<NetworkPolicyPeer>`
         // compiled, rendered correct `--help`, and then panicked on every parse
         // — clap infers a `Vec<T>` field as multi-value and downcasts to `T`.
         // Only an actual parse catches it, so this test is the guard.
         let fence = controller_args(&[
-            "--admin-fence-extra-ingress",
+            "--telemetry-fence-extra-ingress",
             r#"[{"namespaceSelector":{"matchLabels":{"kubernetes.io/metadata.name":"monitoring"}}}]"#,
         ])
         .controller
-        .admin_fence_config("coxswain-system");
+        .telemetry_fence_config("coxswain-system");
         assert_eq!(fence.extra_ingress.len(), 1);
         let selector = fence.extra_ingress[0]
             .namespace_selector
@@ -1895,7 +1920,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_fence_extra_ingress_rejects_malformed_json() {
+    fn telemetry_fence_extra_ingress_rejects_malformed_json() {
         // Fails the pod's startup rather than rendering a policy that silently
         // omits the scraper it was meant to admit.
         assert!(
@@ -1903,7 +1928,7 @@ mod tests {
                 "coxswain",
                 "serve",
                 "controller",
-                "--admin-fence-extra-ingress",
+                "--telemetry-fence-extra-ingress",
                 "{not json",
             ])
             .is_err(),
@@ -1912,20 +1937,20 @@ mod tests {
     }
 
     #[test]
-    fn admin_basic_auth_secret_is_unset_by_default_and_takes_a_name() {
+    fn operator_basic_auth_secret_is_unset_by_default_and_takes_a_name() {
         assert!(
             controller_args(&[])
                 .controller
-                .admin_basic_auth_secret
+                .operator_basic_auth_secret
                 .is_none(),
             "Basic auth is opt-in"
         );
         assert_eq!(
-            controller_args(&["--admin-basic-auth-secret", "coxswain-admin-auth"])
+            controller_args(&["--operator-basic-auth-secret", "coxswain-operator-auth"])
                 .controller
-                .admin_basic_auth_secret
+                .operator_basic_auth_secret
                 .as_deref(),
-            Some("coxswain-admin-auth")
+            Some("coxswain-operator-auth")
         );
     }
 }

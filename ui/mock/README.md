@@ -16,6 +16,23 @@ controller's named events on a loop (so the live indicator goes green), and
 (so the Logs dialog tails real-looking output). The plugin is dev-only —
 `vite build` never includes it or the fixtures.
 
+### Variants and non-200 states
+
+A fixture whose JSON carries `__status` is served with that HTTP status, and the
+key is stripped from the body — so error branches in the UI are reachable in dev,
+not just describable.
+
+Load the page with `?mock=<variant>` (e.g.
+<http://localhost:5173/?mock=standby>) to select alternate fixtures: `client.js`
+forwards the parameter onto every API request, and the plugin tries
+`data/<path>__<variant>.json` first, falling back to the base file. So one dev
+server reaches both the happy path and the awkward one, from the UI rather than
+only from `curl`. Current variants:
+
+- `standby` — `/api/v1/topology` returns the `503` a non-leader replica does.
+  Only the leader accepts discovery streams, so only it has a topology; this
+  drives the Topology screen's not-leader branch.
+
 ### Filter + pagination
 
 Paths that carry the shared list envelope are filtered + windowed in the plugin

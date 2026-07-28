@@ -7,10 +7,8 @@
 use std::collections::{BTreeSet, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
-use coxswain_admin::AdminServer;
 use coxswain_controller::{
     ControllerConfig, GatewayListenerStatusHandle, IngressPorts, LeaseSettings,
 };
@@ -429,9 +427,13 @@ pub(crate) fn build_ingress_listeners(common: &CommonArgs, proxy: &ProxyArgs) ->
 }
 
 /// Configuration bundle for [`wire_management_servers`].
+///
+/// Carries no leadership flag: neither listener wired here reports leadership.
+/// `/readyz` is per-pod by definition, and `/statusz` deliberately omits it —
+/// the Lease is authoritative and, unlike a probe, resolves even for a pod that
+/// cannot be reached.
 pub(crate) struct ManagementServerConfig {
     pub(crate) health: HealthRegistry,
-    pub(crate) leader: Arc<AtomicBool>,
 }
 
 pub(crate) fn wire_management_servers(
@@ -454,13 +456,24 @@ pub(crate) fn wire_management_servers(
         svc
     });
 
-    let admin_addr = SocketAddr::new(common.management_bind_address, common.admin_port);
-    // Proxy roles carry no admin query surface beyond /metrics and
-    // /api/v1/health (#537) — the routing view lives on the controller,
-    // served from its own local snapshot at `fleet/proxies/{name}/routes`.
-    let admin = AdminServer::new(config.health, config.leader)
-        .with_api_surfaces(!common.disable_gateway_api, !common.disable_ingress);
-    server.add_service(admin.into_service(admin_addr));
+    // Proxy and relay roles serve no operator surface at all: no UI, no
+    // `/api/v1/*`, nothing authenticated. The routing view lives on the
+    // controller, served from its own local snapshot at
+    // `fleet/proxies/{name}/routes` (#537), and per-pod health reaches the
+    // controller via `/statusz` below. So these roles bind exactly two
+    // management listeners, and there is no operator port on them to fence,
+    // authenticate, or accidentally expose.
+    let telemetry_addr = SocketAddr::new(common.management_bind_address, common.telemetry_port);
+    server.add_service({
+        let mut svc = Service::new(
+            "telemetry".to_string(),
+            coxswain_health::TelemetryServer {
+                registry: config.health,
+            },
+        );
+        svc.add_tcp(&telemetry_addr.to_string());
+        svc
+    });
 }
 
 /// Resolve the per-service proxy worker-thread count. A non-zero `configured`

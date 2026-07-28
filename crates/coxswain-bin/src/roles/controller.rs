@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use coxswain_admin::{AdminServer, EventSources, OperatorAggregator};
+use coxswain_admin::{AdminServer, AggregatorRoutingTables, EventSources, OperatorAggregator};
 use coxswain_controller::{
     CONTROLLER_DISCOVERY_SERVICE, IngressPorts, OperatorConfig, RELAY_DISCOVERY_PORT,
     RELAY_SERVICE_ACCOUNT, SHARED_RELAY_SERVICE_ACCOUNT, StatusWriterConfig, spawn_status_writer,
@@ -115,6 +115,11 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     // promotion. Initialized false → discovery starts gated-closed and opens
     // on first promotion, so startup order is a non-issue.
     let (leader_watch_tx, leader_watch_rx) = tokio::sync::watch::channel(false);
+    // Published by the controller's lease loop on every renewal tick (#676) and
+    // read by the aggregator to attribute leadership — no apiserver call on the
+    // request path, and fresher than any poll could be.
+    let leader_identity = coxswain_core::LeaderIdentityCell::new();
+
     // Definitively-failed static-address VIP set (#533): written by the operator's
     // VIP reconciler, read by the status writer so a Gateway still provisioning
     // its VIP is held Pending rather than briefly reporting AddressNotUsable.
@@ -243,7 +248,7 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             args.common.ingress_http_port,
             args.common.ingress_https_port,
         ),
-        admin_port: args.common.admin_port,
+        telemetry_port: args.common.telemetry_port,
         // Bootstrap lives on its own all-replicas Service (#531): the stream
         // Service is leader-selected, but SVID issuance must keep working through
         // leader churn. Since #601 this is the sole endpoint the operator renders
@@ -263,9 +268,9 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         health_port: args.common.health_port,
         enable_ingress: !args.common.disable_ingress,
         enable_gateway_api: !args.common.disable_gateway_api,
-        admin_fence: args
+        telemetry_fence: args
             .controller
-            .admin_fence_config(&args.common.pod_namespace),
+            .telemetry_fence_config(&args.common.pod_namespace),
         vip_failures: vip_failures.clone(),
         node_registry: Some(node_registry_for_operator),
         publish_index: Some(publish_index.clone()),
@@ -287,6 +292,7 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             .controller
             .with_vip_failures(vip_failures)
             .with_leadership_watch(leader_watch_tx)
+            .with_leader_identity(leader_identity.clone())
             .with_node_registry(node_registry_for_controller)
             .with_publish_index(publish_index)
             .with_operator(operator_config, operator_stores),
@@ -309,9 +315,12 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         fleet,
         status_writer.outputs.cluster_summary,
         Some(node_registry_for_agg),
-        status_writer.outputs.ingress_routes.clone(),
-        status_writer.outputs.gateway_routes.clone(),
-        status_writer.outputs.dedicated_registry.clone(),
+        AggregatorRoutingTables {
+            ingress: status_writer.outputs.ingress_routes.clone(),
+            gateway: status_writer.outputs.gateway_routes.clone(),
+            dedicated: status_writer.outputs.dedicated_registry.clone(),
+        },
+        Some(leader_identity.clone()),
     );
 
     let health_addr = SocketAddr::new(args.common.management_bind_address, args.common.health_port);
@@ -327,7 +336,28 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         svc
     });
 
-    let admin_addr = SocketAddr::new(args.common.management_bind_address, args.common.admin_port);
+    // The controller is scraped and peer-probed like any other role, so it binds
+    // the same unauthenticated telemetry listener. It is also the *only* role
+    // that additionally binds the operator port below.
+    let telemetry_addr = SocketAddr::new(
+        args.common.management_bind_address,
+        args.common.telemetry_port,
+    );
+    server.add_service({
+        let mut svc = Service::new(
+            "telemetry".to_string(),
+            coxswain_health::TelemetryServer {
+                registry: health.clone(),
+            },
+        );
+        svc.add_tcp(&telemetry_addr.to_string());
+        svc
+    });
+
+    let operator_addr = SocketAddr::new(
+        args.common.management_bind_address,
+        args.common.operator_port,
+    );
     // The controller has no local routing tables of its own to wire — its
     // routing surface is the aggregate `/api/v1/{fleet,routing}/*` above, and
     // the proxy admin query surface (`/api/v1/routes`) was retired in #537.
@@ -349,7 +379,7 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     // credential read races the first request. What makes that safe is the cell's
     // initial value: it starts empty, and empty means 503, so the surface is
     // closed until a credential loads rather than briefly open.
-    if let Some(secret) = args.controller.admin_basic_auth_secret.as_deref() {
+    if let Some(secret) = args.controller.operator_basic_auth_secret.as_deref() {
         let watcher = coxswain_admin::AdminCredentialWatcher::new(
             secret.to_string(),
             args.common.pod_namespace.clone(),
@@ -362,12 +392,13 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         tracing::info!(secret, "admin: Basic authentication enabled");
     }
 
-    server.add_service(admin.into_service(admin_addr));
+    server.add_service(admin.into_service(operator_addr));
 
     tracing::info!(
         management_bind_address = %args.common.management_bind_address,
         health_port = args.common.health_port,
-        admin_port = args.common.admin_port,
+        telemetry_port = args.common.telemetry_port,
+        operator_port = args.common.operator_port,
         discovery_addr = %discovery_addr,
         bootstrap_addr = %bootstrap_addr,
         "Listening"

@@ -28,6 +28,7 @@
 //! identity the controller's provenance authorizer
 //! ([`coxswain_discovery::ProvisionedRelayAuthorizer`]) matches.
 
+use coxswain_core::fleet::TELEMETRY_PORT_ANNOTATION;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, PodSpec, PodTemplateSpec, ResourceRequirements, Service,
@@ -41,12 +42,12 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::BTreeMap;
 
-use super::admin_fence::{AdminFenceConfig, render_admin_fence};
 use super::harden::HardeningReport;
 use super::render::{
     container_hardening_security_context, discovery_volume_mounts, discovery_volumes,
     http_get_probe, merge_pod_template, pod_hardening_security_context,
 };
+use super::telemetry_fence::{TelemetryFenceConfig, render_telemetry_fence};
 
 /// Fixed name of every per-namespace relay `ServiceAccount` / `Deployment` /
 /// `Service`. One relay per namespace, so a constant name is unambiguous (no
@@ -165,11 +166,12 @@ pub(crate) struct RelayRenderInputs<'a> {
     /// the `CoxswainRelayPolicy.spec.podTemplate` scheduling escape hatch (#589). `None`
     /// leaves the controller-rendered pod untouched.
     pub pod_template: Option<&'a serde_json::Value>,
-    /// Admin server port the relay binds — the install-wide `--admin-port`, the
-    /// same value every other role's management surface uses.
-    pub admin_port: u16,
-    /// Admin-port fencing policy (#670), install-wide.
-    pub admin_fence: &'a AdminFenceConfig,
+    /// Telemetry server port the relay binds — the install-wide
+    /// `--telemetry-port`, the same value every other role uses. Also stamped
+    /// as the pod's telemetry-port annotation so the fleet snapshot can see it.
+    pub telemetry_port: u16,
+    /// Telemetry-port fencing policy (#670), install-wide.
+    pub telemetry_fence: &'a TelemetryFenceConfig,
     /// The replica *ceiling* used for the PDB decision (#589): a relay gets a
     /// `PodDisruptionBudget` (maxUnavailable: 1) when the most replicas it may run is ≥2.
     /// It equals the autoscaling `maxReplicas` when autoscaling is on, otherwise the static
@@ -304,6 +306,10 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> (Deployment, Harde
         ),
         format!("--discovery-trust-domain={}", inputs.discovery_trust_domain),
         format!("--discovery-port={RELAY_DISCOVERY_PORT}"),
+        // Same invariant as the dedicated proxy: the pod must bind the port its
+        // annotation and container port advertise, or the controller's
+        // `/statusz` probe and every scrape hit a closed port.
+        format!("--telemetry-port={}", inputs.telemetry_port),
         "--log-format=json".to_string(),
     ];
 
@@ -326,6 +332,15 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> (Deployment, Harde
                 container_port: RELAY_HEALTH_PORT,
                 ..Default::default()
             },
+            // Named `telemetry` so the chart's PodMonitor — which resolves the
+            // scrape target by port *name* — actually matches a relay. Without
+            // this entry the relay is silently skipped by discovery and its
+            // `/metrics` is never collected.
+            ContainerPort {
+                name: Some("telemetry".to_string()),
+                container_port: i32::from(inputs.telemetry_port),
+                ..Default::default()
+            },
         ]),
         // Readiness gates the Service endpoint on the relay actually caching a
         // routing world and serving downstream (`routing_table_loaded` +
@@ -346,6 +361,14 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> (Deployment, Harde
     let base_pod_template = PodTemplateSpec {
         metadata: Some(ObjectMeta {
             labels: Some(relay_labels(component)),
+            // Load-bearing: `build_snapshot` skips any pod without this
+            // annotation, so without it a relay never enters `FleetSnapshot`
+            // and the whole `relays` bucket stays empty no matter how many are
+            // running.
+            annotations: Some(BTreeMap::from([(
+                TELEMETRY_PORT_ANNOTATION.to_string(),
+                inputs.telemetry_port.to_string(),
+            )])),
             ..Default::default()
         }),
         spec: Some(PodSpec {
@@ -440,21 +463,21 @@ fn render_relay_pdb(inputs: &RelayRenderInputs<'_>) -> Option<PodDisruptionBudge
     })
 }
 
-/// Render the relay's admin-port fence (#670), or `None` when fencing is off.
+/// Render the relay's telemetry-port fence (#670), or `None` when fencing is off.
 ///
-/// The relay binds the admin surface from the same `wire_management_servers`
+/// The relay binds the telemetry surface from the same `wire_management_servers`
 /// path every other role uses, so it needs the same fence — its `/metrics`
 /// carries the fan-out topology of every leaf behind it.
 fn render_relay_network_policy(inputs: &RelayRenderInputs<'_>) -> Option<NetworkPolicy> {
     let variant = inputs.variant;
-    inputs.admin_fence.enabled.then(|| {
-        render_admin_fence(
+    inputs.telemetry_fence.enabled.then(|| {
+        render_telemetry_fence(
             variant.name(),
             variant.deploy_namespace(),
             relay_labels(variant.component()),
             relay_selector_labels(variant.component()),
-            inputs.admin_port,
-            inputs.admin_fence,
+            inputs.telemetry_port,
+            inputs.telemetry_fence,
         )
     })
 }
@@ -478,7 +501,8 @@ mod tests {
     use std::sync::LazyLock;
 
     /// Default (fencing-on) policy every relay render test borrows.
-    static TEST_ADMIN_FENCE: LazyLock<AdminFenceConfig> = LazyLock::new(AdminFenceConfig::default);
+    static TEST_TELEMETRY_FENCE: LazyLock<TelemetryFenceConfig> =
+        LazyLock::new(TelemetryFenceConfig::default);
 
     fn inputs() -> RelayRenderInputs<'static> {
         inputs_for(RelayVariant::Namespace {
@@ -503,8 +527,8 @@ mod tests {
             discovery_trust_domain: "cluster.local",
             resources: relay_resources("50m", "64Mi", "256Mi"),
             pod_template: None,
-            admin_port: 8082,
-            admin_fence: &TEST_ADMIN_FENCE,
+            telemetry_port: 8082,
+            telemetry_fence: &TEST_TELEMETRY_FENCE,
             pdb_replica_ceiling: 2,
         }
     }

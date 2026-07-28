@@ -9,13 +9,13 @@
 //! - cross-cutting: `/api/v1/{health,problems,events,manifests/*,pods/*/logs}`.
 //!
 //! The routing list endpoints and `fleet/proxies/{name}/routes` accept the
-//! shared filter/pagination envelope (see `page`). Proxy pods are dumb data
-//! planes (#537): they carry no query surface of their own beyond
-//! `/api/v1/health` and `/metrics`. `fleet/proxies/{name}/routes` is served
-//! from the controller's own routing snapshot, filtered to the target proxy's
-//! scope — never a fan-out to the pod. `/metrics` and the embedded operator UI
-//! at `GET /` are the two convention-bound endpoints that stay outside
-//! `/api/v1/` (Prometheus scrape path and the web root).
+//! shared filter/pagination envelope (see `page`). This server is bound by the
+//! **controller role only** (#676): proxy and relay pods serve no operator
+//! surface at all, only the health and telemetry listeners in `coxswain-health`.
+//! `fleet/proxies/{name}/routes` is served from the controller's own routing
+//! snapshot, filtered to the target proxy's scope — never a fan-out to the pod
+//! (#537). The embedded operator UI at `GET /` is the one endpoint here that
+//! sits outside `/api/v1/` (the web root).
 //!
 //! The full surface (paths + response schemas) is described in
 //! `api/openapi.yaml` — an internal aid; keep it in sync with the dispatch
@@ -29,7 +29,7 @@ mod logs;
 mod page;
 mod routes_dto;
 
-pub use aggregator::OperatorAggregator;
+pub use aggregator::{AggregatorRoutingTables, OperatorAggregator};
 pub use auth::{
     AUTH_SECRET_KEY, AdminAuth, AdminAuthError, AdminCredentialCell, AdminCredentialWatcher,
     parse_admin_credential,
@@ -41,7 +41,7 @@ use auth::AuthOutcome;
 use aggregator::json_response;
 use async_trait::async_trait;
 use coxswain_core::health::{HealthRegistry, SubsystemSnapshot};
-use http::{HeaderValue, Response, StatusCode, header};
+use http::{Response, StatusCode, header};
 use page::ListParams;
 use pingora_core::apps::{HttpPersistentSettings, HttpServerApp, ReusedHttpStream};
 use pingora_core::modules::http::HttpModules;
@@ -50,7 +50,6 @@ use pingora_core::protocols::http::{HttpTask, ServerSession};
 use pingora_core::server::ShutdownWatch;
 use pingora_core::services::listening::Service;
 use pingora_http::ResponseHeader;
-use prometheus::{Encoder, TextEncoder};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -82,20 +81,22 @@ const UI_CSS: &str = include_str!(concat!(
 
 /// Pingora HTTP app serving the Coxswain admin surface.
 ///
-/// The available endpoints vary by pod role:
+/// Bound by the controller role only, so every endpoint below is
+/// controller-only. `/metrics` and `/statusz` are **not** here — they live on
+/// the telemetry listener (`coxswain_health::TelemetryServer`), which is what
+/// lets every path on this one be authenticated with no exemptions.
 ///
-/// | Endpoint | All roles | Controller/dev only |
-/// |---|---|---|
-/// | `GET /` (operator UI) | | ✓ |
-/// | `/metrics` | ✓ | |
-/// | `/api/v1/health` | ✓ | |
-/// | `/api/v1/fleet/{summary,controllers,proxies}` (+ sub-resources) | | ✓ |
-/// | `/api/v1/routing/{summary,gateways,httproutes,ingresses}` | | ✓ |
-/// | `/api/v1/routing/routes/{kind}/{ns}/{name}` | | ✓ |
-/// | `/api/v1/{problems,manifests/*}` | | ✓ |
-/// | `/api/v1/topology` | | ✓ |
-/// | `/api/v1/events` (SSE) | | ✓ |
-/// | `/api/v1/pods/{name}/logs` (chunked) | | ✓ |
+/// | Endpoint |
+/// |---|
+/// | `GET /` (operator UI) |
+/// | `/api/v1/health` |
+/// | `/api/v1/fleet/{summary,controllers,proxies}` (+ sub-resources) |
+/// | `/api/v1/routing/{summary,gateways,httproutes,ingresses}` |
+/// | `/api/v1/routing/routes/{kind}/{ns}/{name}` |
+/// | `/api/v1/{problems,manifests/*}` |
+/// | `/api/v1/topology` (503 on a non-leader) |
+/// | `/api/v1/events` (SSE) |
+/// | `/api/v1/pods/{name}/logs` (chunked) |
 ///
 /// The routing list endpoints and `fleet/proxies/{name}/routes` accept the
 /// shared filter/pagination envelope (`host`/`path`/`limit`/`offset`/`status`,
@@ -130,7 +131,7 @@ pub struct AdminServer {
     /// Optional HTTP Basic authentication. `None` (the default) serves the
     /// surface unauthenticated, as before — the `NetworkPolicy` fence is the
     /// primary control and this is the opt-in second factor. When `Some`, it
-    /// gates every endpoint except those in `is_infrastructure_endpoint`.
+    /// gates every endpoint on this listener, with no exemptions.
     basic_auth: Option<AdminAuth>,
     /// HTTP module pipeline (response compression) applied to every buffered
     /// endpoint. The SSE stream deliberately bypasses it — compression buffers,
@@ -163,11 +164,10 @@ impl AdminServer {
 
     /// Require HTTP Basic authentication on this server's sensitive endpoints.
     ///
-    /// Everything that exposes cluster data is gated. Three infrastructure
-    /// endpoints are not — see `is_infrastructure_endpoint` for the list and
-    /// why each one has to stay reachable. The health *server* is a separate
-    /// listener on its own port and is unaffected either way, so kubelet probes
-    /// never need credentials.
+    /// Gates **every** path on this listener — there is no exemption list. The
+    /// health and telemetry servers are separate listeners on their own ports
+    /// and are never authenticated, so kubelet probes, Prometheus scrapes, and
+    /// peer `/statusz` probes need no credential and are unaffected.
     #[must_use]
     pub fn with_basic_auth(mut self, auth: AdminAuth) -> Self {
         self.basic_auth = Some(auth);
@@ -255,9 +255,16 @@ impl HttpServerApp for AdminServer {
         // buffered pipeline — the log relay and the SSE stream are exactly the
         // endpoints worth protecting, and both return before `build_response` is
         // ever reached.
-        if let Some(auth) = self.basic_auth.as_ref()
-            && !is_infrastructure_endpoint(session.req_header().uri.path())
-        {
+        //
+        // Every path on this listener is gated, with no exemption list. The
+        // three endpoints that used to need one — `/metrics`, `/api/v1/health`
+        // as a peer-probe target, and `/api/v1/topology/local` — were exempt
+        // because an unauthenticatable caller (Prometheus, or a peer pod holding
+        // only the credential's bcrypt hash) had to reach them on this port.
+        // None of them lives here any more: the first two moved to the telemetry
+        // listener and the third was deleted with the fan-out, so the carve-out
+        // has no remaining justification and the port boundary replaces it.
+        if let Some(auth) = self.basic_auth.as_ref() {
             let header = session
                 .req_header()
                 .headers
@@ -371,7 +378,6 @@ impl AdminServer {
             "/" => return self.ui_response(),
             "/app.js" => return self.ui_asset_response(UI_JS, "text/javascript; charset=utf-8"),
             "/app.css" => return self.ui_asset_response(UI_CSS, "text/css; charset=utf-8"),
-            "/metrics" => return metrics_response(),
             "/api/v1/health" => {
                 // The apiserver version is fetched + cached by the aggregator
                 // (controller/dev roles only); proxy roles wire none, so the
@@ -402,7 +408,7 @@ impl AdminServer {
 
         match segs.as_slice() {
             // ── fleet (all coxswain pods) ─────────────────────────────────────
-            ["fleet", "summary"] => agg.fleet_summary().await,
+            ["fleet", "summary"] => agg.fleet_summary(self.leader.load(Ordering::Acquire)).await,
             ["fleet", "controllers"] => agg.list_controllers().await,
             ["fleet", "controllers", name] => agg.get_controller(name).await,
             ["fleet", "controllers", name, "health"] => agg.get_controller_health(name).await,
@@ -426,45 +432,11 @@ impl AdminServer {
             // ── cross-cutting ─────────────────────────────────────────────────
             ["manifests", kind, namespace, name] => agg.get_manifest(kind, namespace, name).await,
             ["problems"] => agg.list_problems().await,
-            ["topology"] => agg.topology().await,
-            // Internal-only: fetched by peer controller replicas to build the
-            // merged topology view (#500 HA — each replica's registry only
-            // holds the proxies that connected to IT). Harmless to call
-            // directly; not surfaced in the UI.
-            ["topology", "local"] => agg.topology_local().await,
+            ["topology"] => agg.topology(self.leader.load(Ordering::Acquire)),
 
             _ => aggregator::not_found(),
         }
     }
-}
-
-/// Whether `path` is an infrastructure endpoint that stays reachable even when
-/// Basic auth is configured.
-///
-/// Three paths are exempt, and the list is deliberately closed:
-///
-/// - `/metrics` — the chart's own `PodMonitor` scrapes it by pod IP. Gating it
-///   would break monitoring on every install that enables auth, with no
-///   credential knob on the `PodMonitor` to fix it.
-/// - `/api/v1/health` — the controller's aggregator probes **peer** pods on this
-///   path to build the fleet view. It cannot present the credential: the pod
-///   only ever holds the bcrypt *hash*, never the password. Gating it would make
-///   every controller and proxy report `reachable: false` the moment auth was
-///   turned on.
-/// - `/api/v1/topology/local` — same fan-out, for the merged HA topology view.
-///
-/// None of the three exposes what this feature exists to protect: no manifests,
-/// no `spec.containers[].env`, no pod logs, no routing tables. They report this
-/// pod's own liveness, its metric counters, and the proxies connected to it —
-/// and they remain behind the `NetworkPolicy` fence, which is the primary
-/// control. Everything genuinely sensitive (`/api/v1/{manifests,fleet,routing,
-/// problems,events,topology}`, `/api/v1/pods/*/logs`, and the UI at `/`) stays
-/// authenticated.
-fn is_infrastructure_endpoint(path: &str) -> bool {
-    matches!(
-        path,
-        "/metrics" | "/api/v1/health" | "/api/v1/topology/local"
-    )
 }
 
 /// Write an auth denial (401 or 503) straight onto the session and close.
@@ -496,25 +468,6 @@ fn logs_pod_name(path: &str) -> Option<&str> {
         ["pods", name, "logs"] => Some(name),
         _ => None,
     }
-}
-
-// ── /metrics ──────────────────────────────────────────────────────────────────
-
-fn metrics_response() -> Response<Vec<u8>> {
-    let encoder = TextEncoder::new();
-    let mut buffer = Vec::new();
-    if let Err(e) = encoder.encode(&prometheus::gather(), &mut buffer) {
-        tracing::warn!(error = %e, "Failed to encode Prometheus metrics");
-        let mut r = Response::new(Vec::new());
-        *r.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-        return r;
-    }
-    let content_type = HeaderValue::from_str(encoder.format_type())
-        .unwrap_or_else(|_| HeaderValue::from_static("text/plain"));
-    let mut r = Response::new(buffer);
-    *r.status_mut() = StatusCode::OK;
-    r.headers_mut().insert(header::CONTENT_TYPE, content_type);
-    r
 }
 
 // ── GET / (operator UI) ───────────────────────────────────────────────────────
@@ -589,10 +542,12 @@ struct HealthResponse<'a> {
     /// operator UI renders an em dash in that case.
     #[serde(skip_serializing_if = "Option::is_none")]
     kubernetes_version: Option<&'a str>,
-    /// `true` while this pod holds the leader-election lease. Always `false` on
-    /// proxy roles. The controller aggregator reads this off each peer's
-    /// `/api/v1/health` to report per-pod leadership (it replaced the retired
-    /// `/api/v1/cluster` leader probe).
+    /// `true` while this pod holds the leader-election lease.
+    ///
+    /// Describes the *serving* pod only, for a human reading its own health.
+    /// Fleet-wide leadership attribution does not come from here — the
+    /// aggregator resolves it from the Lease, which is authoritative and
+    /// resolves even for a pod that cannot be reached.
     leader: bool,
     subsystems: BTreeMap<Arc<str>, SubsystemSnapshot>,
     /// Which API surfaces are enabled on this pod role.
@@ -675,43 +630,6 @@ mod tests {
             logs_pod_name("/api/v1/pods/coxswain-abc/logs"),
             Some("coxswain-abc")
         );
-    }
-
-    #[test]
-    fn only_the_three_fan_out_and_scrape_paths_bypass_basic_auth() {
-        // These three must stay open: the controller's aggregator probes peers
-        // on the health/topology paths and can only ever hold the bcrypt hash,
-        // and the chart's PodMonitor scrapes /metrics by pod IP.
-        for path in ["/metrics", "/api/v1/health", "/api/v1/topology/local"] {
-            assert!(
-                is_infrastructure_endpoint(path),
-                "{path} must stay reachable"
-            );
-        }
-    }
-
-    #[test]
-    fn every_sensitive_path_is_subject_to_basic_auth() {
-        // The exemption is a closed list, not a prefix match: `/api/v1/topology`
-        // (the aggregate view) must NOT inherit `/api/v1/topology/local`'s pass.
-        for path in [
-            "/",
-            "/app.js",
-            "/app.css",
-            "/api/v1/topology",
-            "/api/v1/manifests/pod/kube-system/etcd-0",
-            "/api/v1/pods/coxswain-abc/logs",
-            "/api/v1/fleet/proxies",
-            "/api/v1/routing/gateways",
-            "/api/v1/problems",
-            "/api/v1/events",
-            "/metrics/../api/v1/manifests",
-        ] {
-            assert!(
-                !is_infrastructure_endpoint(path),
-                "{path} exposes cluster data and must require credentials"
-            );
-        }
     }
 
     #[test]

@@ -8,7 +8,7 @@ use coxswain_core::fleet::FleetEntry;
 use futures::future::join_all;
 
 use super::proxies::routes_block;
-use super::{OperatorAggregator, json_response, non_ready_checks, pod_base_url};
+use super::{OperatorAggregator, json_response, non_ready_checks, pod_statusz_url};
 use crate::page::ListParams;
 use crate::routes_dto::{Problem, ProxyRoutes, RouteRef, RoutesResponse, RoutingProblems};
 
@@ -27,10 +27,11 @@ impl OperatorAggregator {
     /// `routing` conflicts/dead-routes come from [`Self::local_proxy_routes`]
     /// (deduped, `kind`-tagged) rather than a fan-out — no proxy query surface
     /// remains beyond metrics. `fleet` classes still come from probing each
-    /// pod's `/api/v1/health`: `unreachable` pods don't answer, `degraded` pods
-    /// answer with failing checks, and `leaderless` is `true` when no reachable
-    /// controller reports `leader`. The operator UI renders this directly rather
-    /// than re-deriving severity client-side.
+    /// pod's `/statusz`: `unreachable` pods don't answer and `degraded` pods
+    /// answer with failing checks. `leaderless` does **not** come from those
+    /// probes — it is read from the Lease, so a leader that is momentarily
+    /// unreachable does not raise a false alarm. The operator UI renders this
+    /// directly rather than re-deriving severity client-side.
     pub(crate) async fn list_problems(&self) -> Response<Vec<u8>> {
         let raw = self.local_proxy_routes();
         let fleet = self.fleet_problems().await;
@@ -68,35 +69,29 @@ impl OperatorAggregator {
             .collect()
     }
 
-    /// Probe every coxswain pod's `/api/v1/health` and bucket the fleet problem
+    /// Probe every coxswain pod's `/statusz` and bucket the fleet problem
     /// classes (`leaderless`/`unreachable`/`degraded`). See [`Self::list_problems`].
     async fn fleet_problems(&self) -> serde_json::Value {
         let snapshot = self.fleet.load();
-        // (entry, is_controller) for every pod in the fleet.
-        let pods: Vec<(FleetEntry, bool)> = snapshot
+        let pods: Vec<FleetEntry> = snapshot
             .controllers
             .iter()
-            .map(|e| (e.clone(), true))
-            .chain(
-                snapshot
-                    .shared_proxies
-                    .iter()
-                    .chain(&snapshot.dedicated_proxies)
-                    .map(|e| (e.clone(), false)),
-            )
+            .chain(&snapshot.shared_proxies)
+            .chain(&snapshot.dedicated_proxies)
+            .cloned()
             .collect();
-        let any_controller = pods.iter().any(|(_, is_ctrl)| *is_ctrl);
+        let any_controller = !snapshot.controllers.is_empty();
 
-        let probes = pods.iter().map(|(e, is_ctrl)| async move {
-            let url = format!("{}/api/v1/health", pod_base_url(e));
-            (e, *is_ctrl, self.fetch_json(&url).await)
-        });
-        let results = join_all(probes).await;
+        let probes = join_all(pods.iter().map(|e| async move {
+            let url = pod_statusz_url(e);
+            (e, self.fetch_json(&url).await)
+        }));
+        let results = probes.await;
+        let holder = self.lease_holder();
 
         let mut unreachable = Vec::new();
         let mut degraded = Vec::new();
-        let mut any_leader = false;
-        for (e, is_ctrl, body) in results {
+        for (e, body) in results {
             match body {
                 None => {
                     let mut v = Self::entry_json(e);
@@ -104,9 +99,6 @@ impl OperatorAggregator {
                     unreachable.push(v);
                 }
                 Some(body) => {
-                    if is_ctrl && body["leader"].as_bool().unwrap_or(false) {
-                        any_leader = true;
-                    }
                     let checks = non_ready_checks(&body);
                     if !checks.is_empty() {
                         let mut v = Self::entry_json(e);
@@ -119,7 +111,11 @@ impl OperatorAggregator {
         }
 
         serde_json::json!({
-            "leaderless": any_controller && !any_leader,
+            // From the Lease, not from the probes: a leader that is momentarily
+            // unreachable still holds the lease, and reporting the cluster as
+            // leaderless then would raise a false alarm for the one condition
+            // this field exists to detect.
+            "leaderless": any_controller && holder.is_none(),
             "unreachable": unreachable,
             "degraded": degraded,
         })
@@ -132,9 +128,12 @@ impl OperatorAggregator {
     /// `/health` probe (a pod is `error` when unreachable, `warn` when degraded,
     /// else `ok`).
     ///
-    /// `all_in_sync` is `true` vacuously when discovery is not active (dev/proxy
-    /// roles have no registry) — the UI banner only appears when it is `false`.
-    pub(crate) async fn fleet_summary(&self) -> Response<Vec<u8>> {
+    /// `all_in_sync` is **omitted** unless this replica can actually answer it.
+    /// It reads the node registry, which only the leader populates — a standby
+    /// would report `true` vacuously off an empty registry and the UI would hide
+    /// a convergence warning that is genuinely firing on the leader. Absent
+    /// means "unknown here"; the UI banner keys off an explicit `false`.
+    pub(crate) async fn fleet_summary(&self, is_leader: bool) -> Response<Vec<u8>> {
         let snapshot = self.fleet.load();
         let controllers: Vec<FleetEntry> = snapshot.controllers.to_vec();
         let shared: Vec<FleetEntry> = snapshot.shared_proxies.to_vec();
@@ -144,13 +143,16 @@ impl OperatorAggregator {
             self.category_health(&shared),
             self.category_health(&dedicated),
         );
-        let all_in_sync = self.node_registry.as_ref().is_none_or(|r| r.all_in_sync());
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "controllers": controllers,
             "shared_proxies": shared_proxies,
             "dedicated_proxies": dedicated_proxies,
-            "all_in_sync": all_in_sync,
         });
+        // Dev/proxy roles have no registry at all; a standby has an empty one.
+        // Both are "cannot answer", not "everything is converged".
+        if is_leader && let Some(reg) = self.node_registry.as_ref() {
+            body["all_in_sync"] = serde_json::Value::Bool(reg.all_in_sync());
+        }
         json_response(body.to_string())
     }
 
@@ -158,7 +160,7 @@ impl OperatorAggregator {
     /// severity).
     async fn category_health(&self, entries: &[FleetEntry]) -> CategorySummary {
         let probes = entries.iter().map(|e| async move {
-            let url = format!("{}/api/v1/health", pod_base_url(e));
+            let url = pod_statusz_url(e);
             match self.fetch_json(&url).await {
                 None => Severity::Error,
                 Some(body) if non_ready_checks(&body).is_empty() => Severity::Ok,
@@ -296,6 +298,51 @@ mod tests {
     use crate::aggregator::tests::*;
     use crate::routes_dto::ProxyRoutes;
     use coxswain_core::cluster::SharedClusterSummary;
+
+    // ── all_in_sync leader gating (#676) ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn fleet_summary_omits_all_in_sync_on_a_standby() {
+        // A standby's registry is empty because it accepts no discovery
+        // streams, so `all_in_sync()` reads vacuously true there. Publishing
+        // that would hide a convergence warning genuinely firing on the leader.
+        // Absent means "cannot answer here"; the UI banner keys on an explicit
+        // `false`, so absence is safe and a stray `true` is not.
+        let reg = coxswain_core::node_registry::NodeRegistryHandle::new();
+        let agg = make_agg_with_registry(
+            coxswain_core::fleet::SharedFleet::default(),
+            SharedClusterSummary::default(),
+            reg,
+        );
+
+        let resp = agg.fleet_summary(false).await;
+
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap_or_default();
+        assert!(
+            body.get("all_in_sync").is_none(),
+            "a standby must not answer the convergence question at all, got {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fleet_summary_reports_all_in_sync_on_the_leader() {
+        // The counterpart: without this, omitting the key unconditionally would
+        // also satisfy the assertion above and the banner would never fire.
+        let reg = coxswain_core::node_registry::NodeRegistryHandle::new();
+        let agg = make_agg_with_registry(
+            coxswain_core::fleet::SharedFleet::default(),
+            SharedClusterSummary::default(),
+            reg,
+        );
+
+        let resp = agg.fleet_summary(true).await;
+
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap_or_default();
+        assert!(
+            body.get("all_in_sync").is_some(),
+            "the leader must answer the convergence question, got {body}"
+        );
+    }
 
     // ── local_proxy_routes (#537) ─────────────────────────────────────────────
 

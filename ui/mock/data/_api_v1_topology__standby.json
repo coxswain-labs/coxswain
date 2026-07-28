@@ -1,0 +1,4 @@
+{
+  "__status": 503,
+  "error": "not the discovery leader — only the leader accepts proxy streams, so this replica has no topology to report; reach the leader-selecting operator Service"
+}

@@ -36,7 +36,7 @@ On a cluster below the newest version:
 - **Their readiness checks report `degraded`, not `pending`.** `/readyz` stays
   `200` and the pod serves traffic. A `degraded` check names the reason
   (`Gateway API CRD not installed`) and is visible at
-  `/api/v1/health` under `subsystems.controller.checks.<name>`. This is the
+  `/statusz` under `subsystems.controller.checks.<name>`. This is the
   distinction that matters operationally: `degraded` means "deliberately not
   running", `pending` would mean "still starting" and would block readiness
   forever.

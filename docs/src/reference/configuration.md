@@ -46,10 +46,11 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 |---------|------|---------|-------------|
 | `COXSWAIN_ACCESS_LOG` | `--access-log` | `true` | Emit one structured access-log event per proxied request on the `coxswain_proxy::access` target; set `false` to silence. See [Observability](observability.md#access-logs) |
 | `COXSWAIN_ACCESS_LOG_PATH_MODE` | `--access-log-path-mode` | `full` | What the access-log `path` field records: `full`, `pattern`, or `none` |
-| `COXSWAIN_ADMIN_BASIC_AUTH_SECRET` | `--admin-basic-auth-secret` | _(none)_ | _(controller)_ Name of a Secret in the install namespace holding one bcrypt htpasswd line under key `auth`. Requires HTTP Basic auth on the whole admin listener, `/metrics` included. Re-read every 30s, so rotation needs no restart; a missing or unusable Secret closes the surface with `503` rather than serving it unauthenticated. See [Running in production](../operations/running-in-production.md#the-admin-and-management-ports) |
-| `COXSWAIN_ADMIN_FENCE_ENABLED` | `--admin-fence-enabled` | `true` | _(controller)_ Restrict the admin port of every provisioned pod (shared pool, dedicated proxies, relays) to callers in the pod's own namespace, via a `NetworkPolicy`. All other ports stay reachable from anywhere. `false` removes any policy already applied |
-| `COXSWAIN_ADMIN_FENCE_EXTRA_INGRESS` | `--admin-fence-extra-ingress` | `[]` | _(controller)_ JSON array of Kubernetes `NetworkPolicyPeer` objects allowed through the admin-port restriction, e.g. to let a Prometheus in another namespace scrape `/metrics` |
-| `COXSWAIN_ADMIN_PORT` | `--admin-port` | `8082` | Port for admin, metrics, and diagnostics endpoints |
+| `COXSWAIN_OPERATOR_BASIC_AUTH_SECRET` | `--operator-basic-auth-secret` | _(none)_ | _(controller)_ Name of a Secret in the install namespace holding one bcrypt htpasswd line under key `auth`. Requires HTTP Basic auth on **every** path of the operator listener, with no exemptions. `/metrics` is unaffected — it lives on the telemetry port. Re-read every 30s, so rotation needs no restart; a missing or unusable Secret closes the surface with `503` rather than serving it unauthenticated. See [Running in production](../operations/running-in-production.md#the-management-ports) |
+| `COXSWAIN_TELEMETRY_FENCE_ENABLED` | `--telemetry-fence-enabled` | `false` | _(controller)_ Restrict the telemetry port of every provisioned pod (shared pool, dedicated proxies, relays) to callers in the pod's own namespace and the install namespace, via a `NetworkPolicy`. Off by default so Prometheus scrapes from any namespace unconfigured. All other ports stay reachable from anywhere; `false` removes any policy already applied |
+| `COXSWAIN_TELEMETRY_FENCE_EXTRA_INGRESS` | `--telemetry-fence-extra-ingress` | `[]` | _(controller)_ JSON array of Kubernetes `NetworkPolicyPeer` objects allowed through the telemetry-port restriction, e.g. to let a Prometheus in another namespace scrape `/metrics`. Only consulted when the fence is enabled |
+| `COXSWAIN_OPERATOR_PORT` | `--operator-port` | `8082` | _(controller)_ Port for the operator UI and `/api/v1/*` |
+| `COXSWAIN_TELEMETRY_PORT` | `--telemetry-port` | `8083` | Port for `/metrics` and `/statusz` |
 | `COXSWAIN_CONTROLLER_LEASE_RENEW_INTERVAL` | `--controller-lease-renew-interval` | `5s` | How often the leader renews its lease; must be ≤ 1/3 of the TTL |
 | `COXSWAIN_CONTROLLER_LEASE_TTL` | `--controller-lease-ttl` | `15s` | How long a lease stays valid without renewal; must be ≥ 3× the renew interval |
 | `COXSWAIN_CONTROLLER_NAME` | `--controller-name` | `coxswain-labs.dev/gateway-controller` | GatewayClass `spec.controllerName` to claim |
@@ -71,9 +72,9 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | `COXSWAIN_INGRESS_HTTPS_PORT` | `--ingress-https-port` | _(none)_ | Port for inbound HTTPS traffic (SNI TLS); unset to bind no static Ingress HTTPS listener |
 | `COXSWAIN_LOG` | `--log` | `info` | Log level; supports `RUST_LOG` directive syntax (e.g. `info,coxswain=debug`) |
 | `COXSWAIN_LOG_FORMAT` | `--log-format` | `json` | `json` (production) or `console` (human-readable) |
-| `COXSWAIN_MANAGEMENT_BIND_ADDRESS` | `--management-bind-address` | `0.0.0.0` | IP the health (`/healthz`, `/readyz`) and admin (`/metrics`, `/api/v1/health`) servers bind to |
+| `COXSWAIN_MANAGEMENT_BIND_ADDRESS` | `--management-bind-address` | `0.0.0.0` | IP all three management servers (health, telemetry, operator) bind to |
 | `COXSWAIN_INGRESS_ACCEPT_PROXY_PROTOCOL` | `--ingress-accept-proxy-protocol` | `false` | Require HAProxy PROXY v1/v2 on **Ingress** inbound connections; must be combined with `--ingress-proxy-trusted-sources`. Note: h2c prior-knowledge and h2 ALPN are not available on PROXY-wrapped connections (h1-only on that path). Gateway listeners use `ClientTrafficPolicy` instead (see below). |
-| `COXSWAIN_PROXY_BIND_ADDRESS` | `--proxy-bind-address` | `0.0.0.0` | IP the data-plane HTTP/HTTPS proxy listeners bind to; health and admin bind separately via `--management-bind-address` |
+| `COXSWAIN_PROXY_BIND_ADDRESS` | `--proxy-bind-address` | `0.0.0.0` | IP the data-plane HTTP/HTTPS proxy listeners bind to; the management servers bind separately via `--management-bind-address` |
 | `COXSWAIN_PROXY_DEFAULT_BACKEND_REQUEST_TIMEOUT` | `--proxy-default-backend-request-timeout` | _(none)_ | Default upstream-only timeout when `HTTPRouteRule.timeouts.backendRequest` is not set |
 | `COXSWAIN_PROXY_DEFAULT_REQUEST_TIMEOUT` | `--proxy-default-request-timeout` | _(none)_ | Default total request timeout (client → proxy → upstream → client) when `HTTPRouteRule.timeouts.request` is not set |
 | `COXSWAIN_PROXY_LISTENER_DRAIN_TIMEOUT` | `--proxy-listener-drain-timeout` | `30s` | Drain window for in-flight requests when a Gateway listener is removed at runtime |
@@ -98,8 +99,9 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 |------|---------|---------|-----------|
 | HTTP proxy | _(none)_ | `COXSWAIN_INGRESS_HTTP_PORT` | Inbound HTTP data plane |
 | HTTPS proxy | _(none)_ | `COXSWAIN_INGRESS_HTTPS_PORT` | Inbound HTTPS data plane (SNI TLS) |
-| Health | `8081` | `COXSWAIN_HEALTH_PORT` | `/healthz`, `/readyz` |
-| Admin | `8082` | `COXSWAIN_ADMIN_PORT` | `/metrics`, `/api/v1/health` (controller role also serves `/api/v1/{fleet,routing,problems,...}`) |
+| Health | `8081` | `COXSWAIN_HEALTH_PORT` | `/healthz`, `/readyz` — kubelet probes |
+| Telemetry | `8083` | `COXSWAIN_TELEMETRY_PORT` | `/metrics`, `/statusz` — Prometheus and the controller's fleet-view probes. Never authenticated |
+| Operator | `8082` | `COXSWAIN_OPERATOR_PORT` | _(controller)_ operator UI and `/api/v1/*`. Every path authenticated when `operatorAuth` is set |
 | Discovery (Stream) | `50051` | `COXSWAIN_DISCOVERY_PORT` | _(controller)_ mTLS gRPC routing-snapshot stream |
 | Bootstrap | `50052` | `COXSWAIN_DISCOVERY_BOOTSTRAP_PORT` | _(controller)_ server-auth gRPC SVID issuance |
 
@@ -107,7 +109,7 @@ Both API surfaces are enabled by default. Use `controller.gatewayApi.enabled=fal
 
 ### Self-healing Gateway API CRD detection
 
-When the Gateway API surface is enabled but the CRDs aren't installed yet, Coxswain doesn't crash: a `gateway_api_crds` health check stays `Pending` (blocking `/readyz`), a background task re-probes every 30 s, and the Gateway API reflectors start in-process once the CRDs appear — no pod restart. The active surfaces show in every pod's `/api/v1/health` under `api_surfaces.gateway_api` / `api_surfaces.ingress`. See the [capability matrix](../gateway-api/capability-matrix.md) for how detection degrades across Gateway API versions.
+When the Gateway API surface is enabled but the CRDs aren't installed yet, Coxswain doesn't crash: a `gateway_api_crds` health check stays `Pending` (blocking `/readyz`), a background task re-probes every 30 s, and the Gateway API reflectors start in-process once the CRDs appear — no pod restart. The active surfaces show in the controller's `/api/v1/health` under `api_surfaces.gateway_api` / `api_surfaces.ingress`. See the [capability matrix](../gateway-api/capability-matrix.md) for how detection degrades across Gateway API versions.
 
 ## HTTP/2 support
 
@@ -172,10 +174,10 @@ for the model, CA provisioning modes (`auto` / `external` + cert-manager / BYO),
 SVID rotation, and troubleshooting.
 
 !!! note
-    The data plane and the management surface bind independently: `COXSWAIN_PROXY_BIND_ADDRESS` for the HTTP/HTTPS proxy listeners, and `COXSWAIN_MANAGEMENT_BIND_ADDRESS` for the health and admin servers. Both default to `0.0.0.0`; set the management address to a management-network IP to keep `/metrics`, `/api/v1/health`, and the health endpoints off the data-plane interface.
+    The data plane and the management surface bind independently: `COXSWAIN_PROXY_BIND_ADDRESS` for the HTTP/HTTPS proxy listeners, and `COXSWAIN_MANAGEMENT_BIND_ADDRESS` for all three management servers. Both default to `0.0.0.0`; set the management address to a management-network IP to keep the health, telemetry, and operator endpoints off the data-plane interface.
 
-!!! warning "Fence the admin port"
-    On the controller, the admin port serves verbatim Kubernetes manifests (including Pod environment variables) and pod logs. It is fenced by a `NetworkPolicy` by default, and `COXSWAIN_ADMIN_BASIC_AUTH_SECRET` adds authentication. See [the admin and management ports](../operations/running-in-production.md#the-admin-and-management-ports) before changing either.
+!!! warning "Fence the operator port"
+    On the controller, the operator port serves verbatim Kubernetes manifests (including Pod environment variables) and pod logs. It is fenced by a `NetworkPolicy` by default, and `COXSWAIN_OPERATOR_BASIC_AUTH_SECRET` adds authentication. See [the management ports](../operations/running-in-production.md#the-management-ports) before changing either.
 
 ## Leader election
 

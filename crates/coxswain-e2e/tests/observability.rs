@@ -115,7 +115,7 @@ async fn status_exposes_per_subsystem_checks() -> anyhow::Result<()> {
     // its local `proxy` subsystem. The controller aggregates the proxy's health
     // via the discovery NodeRegistry, which populates shortly after the proxy's
     // discovery handshake completes, so poll rather than racing a single fetch.
-    let url = h.controller_admin_url("/api/v1/health");
+    let url = h.controller_telemetry_url("/statusz");
     let health: serde_json::Value = wait::poll_until(
         Duration::from_secs(60),
         wait::POLL,
@@ -193,7 +193,7 @@ async fn absent_gateway_api_kinds_degrade_instead_of_blocking_readiness() -> any
     // Resolved by *served version*, matching how the controller resolves it.
     let installed = capability::served_gateway_api_kinds(&h.client).await?;
 
-    let url = h.controller_admin_url("/api/v1/health");
+    let url = h.controller_telemetry_url("/statusz");
     let health: serde_json::Value = wait::poll_until(
         Duration::from_secs(60),
         wait::POLL,
@@ -304,7 +304,10 @@ async fn proxy_pod_emits_proxy_prefix_metrics() -> anyhow::Result<()> {
         h.http.get(&host, "/a").await?;
     }
 
-    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let metrics = reqwest::get(h.telemetry_url("/metrics"))
+        .await?
+        .text()
+        .await?;
     assert!(
         metrics.contains("coxswain_proxy_requests_total{"),
         "proxy /metrics must expose coxswain_proxy_requests_total"
@@ -343,7 +346,7 @@ async fn proxy_pod_emits_proxy_prefix_metrics() -> anyhow::Result<()> {
 async fn controller_pod_emits_controller_prefix_metrics() -> anyhow::Result<()> {
     let h = Harness::start().await?;
 
-    let metrics = reqwest::get(h.controller_admin_url("/metrics"))
+    let metrics = reqwest::get(h.controller_telemetry_url("/metrics"))
         .await?
         .text()
         .await?;
@@ -404,11 +407,14 @@ async fn convergence_stage_metrics_recorded_after_route_change() -> anyhow::Resu
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
     wait::wait_for_backends(&ns.name).await?;
 
-    let before_controller = reqwest::get(h.controller_admin_url("/metrics"))
+    let before_controller = reqwest::get(h.controller_telemetry_url("/metrics"))
         .await?
         .text()
         .await?;
-    let before_proxy = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let before_proxy = reqwest::get(h.telemetry_url("/metrics"))
+        .await?
+        .text()
+        .await?;
     let leader = is_leader(&before_controller);
     let before_debounce = count_or_zero(
         &before_controller,
@@ -443,13 +449,13 @@ async fn convergence_stage_metrics_recorded_after_route_change() -> anyhow::Resu
                 .to_string()
         },
         || async {
-            let controller = reqwest::get(h.controller_admin_url("/metrics"))
+            let controller = reqwest::get(h.controller_telemetry_url("/metrics"))
                 .await
                 .ok()?
                 .text()
                 .await
                 .ok()?;
-            let proxy = reqwest::get(h.admin_url("/metrics")).await.ok()?.text().await.ok()?;
+            let proxy = reqwest::get(h.telemetry_url("/metrics")).await.ok()?.text().await.ok()?;
             let advanced = count_or_zero(
                 &controller,
                 "coxswain_controller_reconcile_debounce_seconds_count",
@@ -487,11 +493,14 @@ async fn convergence_stage_metrics_recorded_after_route_change() -> anyhow::Resu
 async fn stage_metrics_are_role_scoped() -> anyhow::Result<()> {
     let h = Harness::start().await?;
 
-    let controller = reqwest::get(h.controller_admin_url("/metrics"))
+    let controller = reqwest::get(h.controller_telemetry_url("/metrics"))
         .await?
         .text()
         .await?;
-    let proxy = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let proxy = reqwest::get(h.telemetry_url("/metrics"))
+        .await?
+        .text()
+        .await?;
 
     assert!(
         controller.contains("coxswain_controller_reconcile_debounce_seconds"),
@@ -560,7 +569,7 @@ async fn event_burst_within_window_coalesces_to_few_rebuilds() -> anyhow::Result
     let host = format!("ingress.{}.local", ns.name);
     wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
 
-    let before = reqwest::get(h.controller_admin_url("/metrics"))
+    let before = reqwest::get(h.controller_telemetry_url("/metrics"))
         .await?
         .text()
         .await?;
@@ -603,7 +612,7 @@ async fn event_burst_within_window_coalesces_to_few_rebuilds() -> anyhow::Result
             if burst_start.elapsed() < SETTLE_BUDGET {
                 return None;
             }
-            let body = reqwest::get(h.controller_admin_url("/metrics"))
+            let body = reqwest::get(h.controller_telemetry_url("/metrics"))
                 .await
                 .ok()?
                 .text()
@@ -693,7 +702,10 @@ async fn named_http_rule_surfaces_rule_name_in_route_metric() -> anyhow::Result<
 
     let expected_route_id = format!("httproute/{}/http-named-rule-route:named-rule", ns.name);
 
-    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let metrics = reqwest::get(h.telemetry_url("/metrics"))
+        .await?
+        .text()
+        .await?;
     let named_label = format!("route=\"{expected_route_id}\"");
     assert!(
         metrics.lines().any(|l| l.contains(&named_label)),
@@ -844,7 +856,7 @@ async fn wait_for_problem(
     pick: impl Fn(&serde_json::Value) -> bool,
     timeout: Duration,
 ) -> anyhow::Result<serde_json::Value> {
-    let url = h.controller_admin_url("/api/v1/problems");
+    let url = h.controller_operator_url("/api/v1/problems");
     let client = reqwest::Client::new();
     wait::poll_until(
         timeout,
@@ -951,7 +963,7 @@ async fn pod_logs_stream_from_controller_not_proxy() -> anyhow::Result<()> {
 
     // Discover a live controller pod name from the aggregator's fleet view.
     let controllers: serde_json::Value = client
-        .get(h.controller_admin_url("/api/v1/fleet/controllers"))
+        .get(h.controller_operator_url("/api/v1/fleet/controllers"))
         .send()
         .await?
         .json()
@@ -963,7 +975,7 @@ async fn pod_logs_stream_from_controller_not_proxy() -> anyhow::Result<()> {
 
     // Controller relays the snapshot: 200 with a non-empty body.
     let resp = client
-        .get(h.controller_admin_url(&logs_path))
+        .get(h.controller_operator_url(&logs_path))
         .send()
         .await?;
     assert_eq!(resp.status(), 200, "controller must relay pod logs");
@@ -974,7 +986,11 @@ async fn pod_logs_stream_from_controller_not_proxy() -> anyhow::Result<()> {
     );
 
     // Proxy admin: same path 404s — proxies wire no aggregator.
-    let proxy_status = client.get(h.admin_url(&logs_path)).send().await?.status();
+    let proxy_status = client
+        .get(h.telemetry_url(&logs_path))
+        .send()
+        .await?
+        .status();
     assert_eq!(
         proxy_status, 404,
         "proxy admin must not expose pod logs (read-only-proxy invariant)"
@@ -982,7 +998,7 @@ async fn pod_logs_stream_from_controller_not_proxy() -> anyhow::Result<()> {
 
     // Unknown pod: 404 from the controller (resolved against the fleet).
     let unknown = client
-        .get(h.controller_admin_url("/api/v1/pods/does-not-exist/logs?tail=10&follow=false"))
+        .get(h.controller_operator_url("/api/v1/pods/does-not-exist/logs?tail=10&follow=false"))
         .send()
         .await?
         .status();
@@ -1003,7 +1019,7 @@ async fn operator_ui_serves_its_bundle_under_a_strict_csp() -> anyhow::Result<()
     let h = Harness::start().await?;
     let client = reqwest::Client::new();
 
-    let resp = client.get(h.controller_admin_url("/")).send().await?;
+    let resp = client.get(h.controller_operator_url("/")).send().await?;
     assert_eq!(resp.status(), 200, "operator UI document must be served");
 
     let csp = resp
@@ -1039,7 +1055,7 @@ async fn operator_ui_serves_its_bundle_under_a_strict_csp() -> anyhow::Result<()
             body.contains(asset),
             "operator UI document must reference {asset}: {body}"
         );
-        let asset_resp = client.get(h.controller_admin_url(asset)).send().await?;
+        let asset_resp = client.get(h.controller_operator_url(asset)).send().await?;
         assert_eq!(asset_resp.status(), 200, "{asset} must be served");
         let content_type = asset_resp
             .headers()
@@ -1068,14 +1084,18 @@ async fn ui_asset_paths_are_not_served_by_proxy_roles() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let client = reqwest::Client::new();
 
-    let proxy_status = client.get(h.admin_url("/app.js")).send().await?.status();
+    let proxy_status = client
+        .get(h.telemetry_url("/app.js"))
+        .send()
+        .await?
+        .status();
     assert_eq!(
         proxy_status, 404,
         "proxy admin must not serve the operator UI bundle (read-only-proxy invariant)"
     );
 
     let unknown_status = client
-        .get(h.controller_admin_url("/app.js.map"))
+        .get(h.controller_operator_url("/app.js.map"))
         .send()
         .await?
         .status();
@@ -1111,7 +1131,7 @@ async fn routing_api_surfaces_gateways_routes_and_problems() -> anyhow::Result<(
     let host = format!("echo.{}.local", ns.name);
     wait::wait_for_route(&gw, &host, "/a", Duration::from_secs(60)).await?;
 
-    let gateways_url = h.controller_admin_url("/api/v1/routing/gateways");
+    let gateways_url = h.controller_operator_url("/api/v1/routing/gateways");
     let client = reqwest::Client::new();
 
     // Poll /api/v1/routing/gateways until the Gateway we just applied is visible.
@@ -1191,9 +1211,12 @@ async fn routing_api_surfaces_gateways_routes_and_problems() -> anyhow::Result<(
         "expected Programmed or Accepted condition, got {cond_types:?}"
     );
 
-    // /api/v1/health carries the apiserver GitVersion (relocated from /cluster, #287).
+    // `/api/v1/health` carries the apiserver GitVersion (relocated from
+    // /cluster, #287). It stays on the operator port: it is a *cluster* fact
+    // sourced from the aggregator's kube client, not per-pod state, so `/statusz`
+    // does not carry it (#676).
     let health: serde_json::Value = client
-        .get(h.controller_admin_url("/api/v1/health"))
+        .get(h.controller_operator_url("/api/v1/health"))
         .send()
         .await?
         .json()
@@ -1218,7 +1241,7 @@ async fn routing_api_surfaces_gateways_routes_and_problems() -> anyhow::Result<(
     // /api/v1/routing/httproutes lists the applied HTTPRoute as a first-class
     // resource (#293), carrying parent_gateways + status + envelope fields.
     let httproutes: serde_json::Value = client
-        .get(h.controller_admin_url("/api/v1/routing/httproutes"))
+        .get(h.controller_operator_url("/api/v1/routing/httproutes"))
         .send()
         .await?
         .json()
@@ -1246,7 +1269,7 @@ async fn routing_api_surfaces_gateways_routes_and_problems() -> anyhow::Result<(
 
     // /api/v1/problems is the nested cross-cutting aggregate (#301).
     let problems: serde_json::Value = client
-        .get(h.controller_admin_url("/api/v1/problems"))
+        .get(h.controller_operator_url("/api/v1/problems"))
         .send()
         .await?
         .json()
@@ -1591,7 +1614,7 @@ async fn topology_shows_proxy_in_sync_after_ack() -> anyhow::Result<()> {
     let client = reqwest::Client::new();
 
     // Poll /api/v1/topology until a SharedPool node with in_sync=true appears.
-    let topo_url = h.controller_admin_url("/api/v1/topology");
+    let topo_url = h.controller_operator_url("/api/v1/topology");
     let topo: serde_json::Value = wait::poll_until(
         Duration::from_secs(60),
         wait::POLL,
@@ -1674,7 +1697,7 @@ async fn topology_shows_proxy_in_sync_after_ack() -> anyhow::Result<()> {
     // (transiently not-in-sync / unreachable), which would flip it false through no
     // fault of the shared proxy. The shared proxy's own sync is already proven
     // authoritatively by the /topology `in_sync` check above.
-    let summary_url = h.controller_admin_url("/api/v1/fleet/summary");
+    let summary_url = h.controller_operator_url("/api/v1/fleet/summary");
     let summary: serde_json::Value = client.get(&summary_url).send().await?.json().await?;
     assert_eq!(
         summary["shared_proxies"]["worst"],
@@ -1709,7 +1732,7 @@ async fn topology_reconverges_after_routing_change() -> anyhow::Result<()> {
     wait::wait_for_route(&h.http, &host, "/a", Duration::from_secs(60)).await?;
 
     // Poll /api/v1/topology until the proxy has re-converged on the new version.
-    let topo_url = h.controller_admin_url("/api/v1/topology");
+    let topo_url = h.controller_operator_url("/api/v1/topology");
     wait::poll_until(
         Duration::from_secs(60),
         wait::POLL,
@@ -1752,7 +1775,7 @@ async fn topology_reconverges_after_routing_change() -> anyhow::Result<()> {
     // `all_in_sync` flag, which the parallel e2e pass pollutes with concurrent
     // tests' mid-provisioning dedicated proxies (this proxy's re-convergence is
     // already proven by the /topology `in_sync` poll above).
-    let summary_url = h.controller_admin_url("/api/v1/fleet/summary");
+    let summary_url = h.controller_operator_url("/api/v1/fleet/summary");
     let summary: serde_json::Value = client.get(&summary_url).send().await?.json().await?;
     assert_eq!(
         summary["shared_proxies"]["worst"],
@@ -1903,7 +1926,7 @@ async fn udp_datagram_to_unrouted_port_increments_drop_counter() -> anyhow::Resu
         },
         || async {
             sock.send(b"into-the-void").await.ok()?;
-            let body = reqwest::get(h.admin_url("/metrics"))
+            let body = reqwest::get(h.telemetry_url("/metrics"))
                 .await
                 .ok()?
                 .text()
@@ -1920,6 +1943,105 @@ async fn udp_datagram_to_unrouted_port_increments_drop_counter() -> anyhow::Resu
     )
     .await?;
 
+    Ok(())
+}
+
+// ── management port split (#676) ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn metrics_and_statusz_are_served_only_on_the_telemetry_port() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+
+    // Happy path: both endpoints answer on the telemetry port, unauthenticated
+    // and with no NetworkPolicy configuration. This is the property the split
+    // exists to guarantee — Prometheus and the controller's own peer probes
+    // must work with zero operator setup.
+    for pod in [
+        h.controller_telemetry_url("/metrics"),
+        h.controller_telemetry_url("/statusz"),
+        h.telemetry_url("/metrics"),
+        h.telemetry_url("/statusz"),
+    ] {
+        let resp = reqwest::get(&pod).await?;
+        assert_eq!(
+            resp.status(),
+            200,
+            "{pod} must answer on the telemetry port without credentials"
+        );
+    }
+
+    // Sad path: neither path exists on the operator port any more. If either
+    // still answered there it would need an auth exemption again, which is the
+    // coupling this change removes.
+    for gone in [
+        h.controller_operator_url("/metrics"),
+        h.controller_operator_url("/statusz"),
+    ] {
+        let status = reqwest::get(&gone).await?.status();
+        assert_eq!(
+            status, 404,
+            "{gone} must not be served on the operator port — it moved to telemetry"
+        );
+    }
+
+    // `/statusz` carries the per-check detail the fleet view needs, and neither
+    // the leader flag (the Lease owns that) nor api_surfaces (UI-only).
+    let body: serde_json::Value = reqwest::get(h.controller_telemetry_url("/statusz"))
+        .await?
+        .json()
+        .await?;
+    assert!(
+        body["subsystems"].is_object(),
+        "/statusz must carry subsystem detail, got {body}"
+    );
+    assert!(
+        body.get("leader").is_none(),
+        "/statusz must not report leadership — it comes from the Lease: {body}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn fleet_view_names_the_lease_holder_as_leader() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let client = kube::Client::try_default().await?;
+
+    // The authoritative answer, read straight off the Lease.
+    let holder = leader::leader_pod_name(&client).await?;
+
+    let body: serde_json::Value =
+        reqwest::get(h.controller_operator_url("/api/v1/fleet/controllers"))
+            .await?
+            .json()
+            .await?;
+    let controllers = body["controllers"]
+        .as_array()
+        .with_context(|| format!("fleet/controllers must return a list, got {body}"))?;
+
+    let leaders: Vec<&str> = controllers
+        .iter()
+        .filter(|c| c["is_leader"] == serde_json::Value::Bool(true))
+        .filter_map(|c| c["pod_name"].as_str())
+        .collect();
+
+    // Happy path: exactly the Lease holder is flagged.
+    assert_eq!(
+        leaders,
+        vec![holder.as_str()],
+        "exactly the Lease holder must be reported as leader, got {leaders:?} \
+         (Lease says {holder}) in {body}"
+    );
+
+    // Sad path: with an HA default of 2 replicas, at least one standby must be
+    // present and NOT flagged — otherwise the assertion above would also pass
+    // on a single-replica install where any answer looks right.
+    let standbys = controllers.len().saturating_sub(1);
+    assert!(
+        standbys >= 1,
+        "expected >=1 standby to prove non-leaders are not flagged; \
+         fleet/controllers returned {} pod(s): {body}",
+        controllers.len()
+    );
     Ok(())
 }
 
@@ -1950,7 +2072,7 @@ mod serial {
         fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
         wait::wait_for_backends(&ns.name).await?;
 
-        let before = reqwest::get(h.controller_admin_url("/metrics"))
+        let before = reqwest::get(h.controller_telemetry_url("/metrics"))
             .await?
             .text()
             .await?;
@@ -1975,7 +2097,7 @@ mod serial {
                     .to_string()
             },
             || async {
-                let body = reqwest::get(h.controller_admin_url("/metrics"))
+                let body = reqwest::get(h.controller_telemetry_url("/metrics"))
                     .await
                     .ok()?
                     .text()
@@ -2135,7 +2257,10 @@ mod serial {
         );
 
         // Metrics must still be observed even when access logging is off.
-        let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+        let metrics = reqwest::get(h.telemetry_url("/metrics"))
+            .await?
+            .text()
+            .await?;
         assert!(
             metrics.contains("coxswain_proxy_requests_total{"),
             "metrics must still emit even with access logging disabled"
@@ -2173,7 +2298,7 @@ mod serial {
         // follower never registers these series and a Service-level forward
         // (which pins an arbitrary replica) would fail ~half the time.
         let leader_pod = leader::live_leader_pod_name(&h.client).await?;
-        let forward = leader::pod_admin_forward(&leader_pod).await?;
+        let forward = leader::pod_telemetry_forward(&leader_pod).await?;
 
         wait::poll_until(
             Duration::from_secs(90),
@@ -2272,7 +2397,7 @@ mod serial {
         wait::wait_for_resource(&deployments, RELAY_NAME, Duration::from_secs(60)).await?;
 
         let leader_pod = leader::live_leader_pod_name(&h.client).await?;
-        let forward = leader::pod_admin_forward(&leader_pod).await?;
+        let forward = leader::pod_telemetry_forward(&leader_pod).await?;
 
         // The series must exist first, or "absent" proves nothing.
         wait::poll_until(

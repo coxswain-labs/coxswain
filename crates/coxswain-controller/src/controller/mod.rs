@@ -78,11 +78,10 @@ mod udp_route_events;
 pub use config::{ControllerConfig, ControllerConfigError, LeaseSettings, StatusAddress};
 
 use conditions::{gateway_accepted, gateway_programmed_at_current_gen};
+use coxswain_core::leader::LEASE_NAME;
 use gateway_class_status::gateway_class_needs_status_patch;
 use gateway_status::gateway_needs_status_patch;
 use ingress_status::ingress_lb_already_matches;
-
-const LEASE_NAME: &str = "coxswain-leader-lock";
 
 /// Wall-clock bound on the provisioned-relay rehydration `LIST` run on the
 /// leadership-promotion edge (#593). The promotion branch sits on the
@@ -191,6 +190,10 @@ pub struct Controller {
     /// operator's promotion re-drive (#531). `None` in tests; the bin always
     /// wires it. The lease loop is the single sender.
     leadership_watch: Option<tokio::sync::watch::Sender<bool>>,
+    /// Cell carrying the current lease holder's pod name (#676). Published on
+    /// every renewal tick so the admin aggregator can attribute leadership
+    /// without its own apiserver read. `None` (tests/dev) disables publishing.
+    leader_identity: Option<coxswain_core::LeaderIdentityCell>,
     /// Connected-proxy registry (bound-port reports) read by the shared-mode
     /// `Programmed` readiness gate (#531). `None` (tests/dev) disables the
     /// gate — today's address-only convergence behaviour.
@@ -231,6 +234,7 @@ impl Controller {
             ingress_event_rx: parking_lot::Mutex::new(None),
             vip_failures: Shared::new(),
             leadership_watch: None,
+            leader_identity: None,
             node_registry: None,
             publish_index: None,
             operator: parking_lot::Mutex::new(None),
@@ -277,6 +281,18 @@ impl Controller {
     #[must_use]
     pub fn with_leadership_watch(mut self, tx: tokio::sync::watch::Sender<bool>) -> Self {
         self.leadership_watch = Some(tx);
+        self
+    }
+
+    /// Publish the lease holder's pod name into `cell` on every renewal tick.
+    ///
+    /// The admin aggregator reads it to say *which* replica leads. Distinct
+    /// from [`Self::with_leadership_watch`], which answers "am I the leader" for
+    /// this process's own gates; this answers "who is" for the whole fleet, and
+    /// only the lease loop is positioned to know that for free.
+    #[must_use]
+    pub fn with_leader_identity(mut self, cell: coxswain_core::LeaderIdentityCell) -> Self {
+        self.leader_identity = Some(cell);
         self
     }
 
@@ -339,10 +355,10 @@ impl Controller {
         let mut lease_state =
             LeadershipState::new(self.config.lease.ttl, self.config.lease.renew_interval);
         let renew_bound = self.config.lease.renew_interval;
-        let mut is_leader = lease_state.observe(
-            Self::try_renew(&lease_lock, &self.config.pod_name, renew_bound).await,
-            tokio::time::Instant::now(),
-        );
+        let (outcome, holder) =
+            Self::try_renew(&lease_lock, &self.config.pod_name, renew_bound).await;
+        let mut is_leader = lease_state.observe(outcome, tokio::time::Instant::now());
+        self.publish_leader_identity(is_leader, outcome, holder.as_deref());
         self.leader.store(is_leader, Ordering::Release);
         crate::metrics::leader().set(i64::from(is_leader));
         self.publish_leadership(is_leader);
@@ -569,10 +585,10 @@ impl Controller {
                     break;
                 }
                 _ = renewal_interval.tick() => {
-                    let leading = lease_state.observe(
-                        Self::try_renew(&lease_lock, &self.config.pod_name, renew_bound).await,
-                        tokio::time::Instant::now(),
-                    );
+                    let (outcome, holder) =
+                        Self::try_renew(&lease_lock, &self.config.pod_name, renew_bound).await;
+                    let leading = lease_state.observe(outcome, tokio::time::Instant::now());
+                    self.publish_leader_identity(leading, outcome, holder.as_deref());
                     ctx.refresh_held_pending(leading);
                     if leading != is_leader {
                         if leading {
@@ -641,19 +657,86 @@ impl Controller {
     /// renewal loop while the lease expires under us. Bounding each attempt to
     /// one renew interval keeps [`LeadershipState`]'s wall-clock demotion
     /// deadline observable in time.
-    async fn try_renew(lease_lock: &LeaseLock, pod_name: &str, bound: Duration) -> RenewOutcome {
+    /// Returns the outcome plus the `Lease`'s `holderIdentity` when the attempt
+    /// reached the apiserver — the standby branch is the only way this replica
+    /// learns *which* peer leads, and the object is already in hand.
+    async fn try_renew(
+        lease_lock: &LeaseLock,
+        pod_name: &str,
+        bound: Duration,
+    ) -> (RenewOutcome, Option<String>) {
+        let holder = |lease: &k8s_openapi::api::coordination::v1::Lease| {
+            lease
+                .spec
+                .as_ref()
+                .and_then(|s| s.holder_identity.clone())
+                .filter(|h| !h.is_empty())
+        };
         match tokio::time::timeout(bound, lease_lock.try_acquire_or_renew()).await {
-            Ok(Ok(LeaseLockResult::Acquired(_))) => RenewOutcome::Leading,
-            Ok(Ok(LeaseLockResult::NotAcquired(_))) => RenewOutcome::Standby,
+            Ok(Ok(LeaseLockResult::Acquired(lease))) => (RenewOutcome::Leading, holder(&lease)),
+            Ok(Ok(LeaseLockResult::NotAcquired(lease))) => (RenewOutcome::Standby, holder(&lease)),
             Ok(Err(e)) => {
                 tracing::warn!(pod = %pod_name, error = %e, "Lease operation failed");
-                RenewOutcome::RenewError
+                (RenewOutcome::RenewError, None)
             }
             Err(_) => {
                 tracing::warn!(pod = %pod_name, bound = ?bound, "Lease operation timed out");
-                RenewOutcome::RenewError
+                (RenewOutcome::RenewError, None)
             }
         }
+    }
+
+    /// Publish who currently holds the lease into [`Self::leader_identity`].
+    ///
+    /// The admin aggregator reads the cell to attribute leadership in the fleet
+    /// view without issuing an apiserver request of its own — this loop is
+    /// already talking to the Lease, so the information is free here and would
+    /// cost a round trip anywhere else.
+    ///
+    /// **`leading` must be [`LeadershipState::observe`]'s verdict, not the raw
+    /// [`RenewOutcome`].** `observe` tolerates renew errors only until a
+    /// wall-clock deadline inside the lease TTL and then demotes; keying this
+    /// off the raw outcome instead would let a replica that has already stopped
+    /// writing status keep advertising itself as leader for as long as the
+    /// apiserver stayed unreachable — reintroducing, one level lower, exactly
+    /// the stale self-report that reading the Lease exists to eliminate.
+    ///
+    /// A renew error that has *not* yet tripped that deadline keeps `leading`
+    /// true, so the cell holds steady through a transient blip. Once it has, the
+    /// cell clears: this replica can no longer see the lease, and `None` is the
+    /// honest answer. It does mean a sustained apiserver outage renders as
+    /// "leaderless" rather than "unknown" — acceptable because an outage that
+    /// long is itself the louder alarm, and the alternative is a leader
+    /// attribution nobody can verify.
+    fn publish_leader_identity(&self, leading: bool, outcome: RenewOutcome, holder: Option<&str>) {
+        if let Some(cell) = &self.leader_identity {
+            cell.store(Arc::new(leader_identity_for(
+                &self.config.pod_name,
+                leading,
+                outcome,
+                holder,
+            )));
+        }
+    }
+}
+
+/// The value [`Controller::publish_leader_identity`] should store.
+///
+/// Split out as a pure function so the demotion-under-renew-error case is
+/// testable without constructing a live `Controller` — that case is the whole
+/// reason this keys off `leading` rather than `outcome`.
+fn leader_identity_for(
+    own_pod: &str,
+    leading: bool,
+    outcome: RenewOutcome,
+    holder: Option<&str>,
+) -> Option<Arc<str>> {
+    if leading {
+        Some(Arc::from(own_pod))
+    } else if outcome == RenewOutcome::Standby {
+        holder.map(Arc::from)
+    } else {
+        None
     }
 }
 
@@ -2483,6 +2566,59 @@ mod tests {
         assert!(
             !s.observe(RenewOutcome::Standby, at(t0, 5)),
             "a positive observation that another replica holds the lease is never tolerated"
+        );
+    }
+
+    // ── leader_identity_for (#676) ────────────────────────────────────────────
+
+    #[test]
+    fn leader_identity_names_this_pod_while_leading() {
+        assert_eq!(
+            leader_identity_for("ctrl-0", true, RenewOutcome::Leading, Some("ctrl-0")).as_deref(),
+            Some("ctrl-0")
+        );
+    }
+
+    #[test]
+    fn leader_identity_names_the_peer_holder_while_standby() {
+        assert_eq!(
+            leader_identity_for("ctrl-1", false, RenewOutcome::Standby, Some("ctrl-0")).as_deref(),
+            Some("ctrl-0"),
+            "a standby learns who leads from the Lease it just read"
+        );
+    }
+
+    #[test]
+    fn leader_identity_holds_this_pod_through_a_tolerated_renew_error() {
+        // `LeadershipState::observe` absorbs renew errors until its wall-clock
+        // deadline, so `leading` is still true here. The cell must not flap to
+        // "leaderless" on every transient apiserver blip.
+        assert_eq!(
+            leader_identity_for("ctrl-0", true, RenewOutcome::RenewError, None).as_deref(),
+            Some("ctrl-0")
+        );
+    }
+
+    #[test]
+    fn leader_identity_clears_once_a_renew_error_has_demoted_this_pod() {
+        // The bug this guards: keying off the raw `RenewOutcome` instead of
+        // `observe`'s verdict left the cell advertising this pod as leader for
+        // as long as the apiserver stayed unreachable — while the pod had
+        // already demoted and stopped writing status. That is precisely the
+        // stale self-report that reading the Lease exists to eliminate.
+        assert_eq!(
+            leader_identity_for("ctrl-0", false, RenewOutcome::RenewError, None),
+            None,
+            "a demoted replica must not keep advertising itself as leader"
+        );
+    }
+
+    #[test]
+    fn leader_identity_is_none_when_the_lease_names_nobody() {
+        assert_eq!(
+            leader_identity_for("ctrl-1", false, RenewOutcome::Standby, None),
+            None,
+            "an empty holderIdentity is a genuinely leaderless window"
         );
     }
 

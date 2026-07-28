@@ -12,7 +12,7 @@ use kube::api::{Api, ListParams, ObjectMeta, Patch, PatchParams, PostParams};
 use serde_json::json;
 use std::time::Duration;
 
-use coxswain_e2e::harness::leader::{self, PodAdminForward};
+use coxswain_e2e::harness::leader::{self, PodManagementForward};
 use coxswain_e2e::harness::wait;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -371,13 +371,13 @@ pub async fn counter_kind(metrics_url: &str, metric: &str, kind: &str) -> f64 {
 /// `Stream` RPC is leader-gated (#531), so a standby never touches them. The
 /// harness's Service-level controller port-forward pins an *arbitrary* Ready
 /// replica, so per-stream counters must be scraped from the leader specifically.
-/// Hold the returned [`PodAdminForward`] across the poll loop (dropping it closes
+/// Hold the returned [`PodManagementForward`] across the poll loop (dropping it closes
 /// the tunnel) and scrape its URL with [`counter`] / [`counter_kind`].
 pub async fn leader_discovery_metrics(
     client: &kube::Client,
-) -> anyhow::Result<(PodAdminForward, String)> {
+) -> anyhow::Result<(PodManagementForward, String)> {
     let leader = leader::leader_pod_name(client).await?;
-    let pf = leader::pod_admin_forward(&leader).await?;
+    let pf = leader::pod_telemetry_forward(&leader).await?;
     let url = format!("{}/metrics", pf.base_url);
     Ok((pf, url))
 }

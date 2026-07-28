@@ -430,12 +430,12 @@ kubectl get secret example-com-tls -o jsonpath='{.type}'
 kubectl get secret example-com-tls -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -text -noout
 ```
 
-Check the routing table (from the controller's admin port — see
+Check the routing table (from the controller's operator port — see
 [Observability reference](../reference/observability.md#routes-endpoint)) and logs:
 
 ```bash
-curl http://<controller-admin-address>:8082/api/v1/fleet/proxies/<pod-name>/routes
-curl http://localhost:8082/api/v1/health
+curl http://<controller-operator-address>:8082/api/v1/fleet/proxies/<pod-name>/routes
+curl http://localhost:8083/statusz
 ```
 
 A missing or malformed Secret produces a warning log but does not affect HTTP routes.
