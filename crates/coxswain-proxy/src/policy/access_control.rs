@@ -155,8 +155,9 @@ pub(crate) fn ip_denied(client_ip: Option<std::net::IpAddr>, nets: &[ipnet::IpNe
 /// `Ok(true)` on a block.
 ///
 /// The deny-list is evaluated first: a denied IP is blocked even when the
-/// allow-list would admit it. Both checks fail open on a `None` client IP per
-/// [`ip_denied`] / [`ip_allowed`]. The response is written explicitly via
+/// allow-list would admit it. A `None` client IP passes the deny-list
+/// (fail-open, [`ip_denied`]) but is rejected by a non-empty allow-list
+/// (fail-closed, [`ip_allowed`]). The response is written explicitly via
 /// `write_response_header` rather than `Err(Error::explain(...))` because
 /// Pingora's generic `fail_to_proxy` path does not reliably deliver a
 /// client-visible response over HTTP/2, while the low-level write works on both

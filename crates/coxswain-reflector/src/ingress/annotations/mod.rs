@@ -54,7 +54,7 @@ use std::collections::BTreeMap;
 /// by the parse helper itself (both roles); the K8s Event is controller-only.
 #[derive(Debug, Clone)]
 pub struct AnnotationIssue {
-    /// Full annotation key string (e.g. `"ingress.coxswain-labs.dev/connect-timeout"`).
+    /// Full annotation key string (e.g. `"ingress.coxswain-labs.dev/read-timeout"`).
     pub annotation: &'static str,
     /// Operator-facing message reusing today's warn message text.
     pub message: String,

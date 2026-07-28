@@ -31,17 +31,21 @@ pub const TRUST_FORWARDED_FOR: &str = "ingress.coxswain-labs.dev/trust-forwarded
 /// Header name from which to read the real client IP when `trust-forwarded-for`
 /// is `"true"`.  Defaults to `X-Forwarded-For` when absent.  The proxy performs a
 /// case-insensitive header lookup, so `x-forwarded-for`, `X-Forwarded-For`, and
-/// `CF-Connecting-IP` are all valid values.  The first non-private IP in the
-/// header value is used as the client IP.
+/// `CF-Connecting-IP` are all valid values.  The rightmost non-trusted,
+/// non-private IP in the header value is used as the client IP — a proxy chain
+/// is read right-to-left, skipping any hop that is itself a trusted proxy CIDR
+/// or a private address, so an attacker-supplied leftmost entry cannot spoof
+/// the client IP.
 pub const FORWARDED_FOR_HEADER: &str = "ingress.coxswain-labs.dev/forwarded-for-header";
 
 /// Comma-separated IPv4/IPv6 CIDR blocks that identify trusted upstream proxies.
 /// When set, the forwarded header is only trusted when the L4 peer IP falls
 /// inside one of these CIDRs; requests from outside the list use the L4 peer
-/// address directly, preventing spoofing from untrusted callers.  When absent,
-/// the header is trusted unconditionally (suitable when Coxswain is always behind
-/// a controlled proxy).  Bare addresses without a prefix are accepted as host
-/// routes (`/32` / `/128`).
+/// address directly, preventing spoofing from untrusted callers.  When absent
+/// (or empty after parsing), the header is trusted by **nobody** — the L4 peer
+/// address is always used — so misconfiguring this annotation fails closed
+/// rather than opening a spoofing vector.  Bare addresses without a prefix are
+/// accepted as host routes (`/32` / `/128`).
 pub const FORWARDED_FOR_TRUSTED_CIDRS: &str =
     "ingress.coxswain-labs.dev/forwarded-for-trusted-cidrs";
 

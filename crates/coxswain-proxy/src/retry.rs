@@ -114,9 +114,11 @@ pub(crate) fn error_while_proxy(
 /// # Status rules
 ///
 /// - `HTTPStatus(code)` — passthrough (Pingora-level overrides).
-/// - `ReadTimedout | WriteTimedout` while a request or backend-request budget is
-///   controlling → 504 (Gateway API spec, GEP-1742).
-/// - `ConnectTimedout` while a backend-request budget is active → 502.
+/// - `ReadTimedout | WriteTimedout` while the request timeout or an upstream
+///   connect-timeout budget is controlling → 504. Gateway API's GEP-1742
+///   prescribes no status code for this case; 504 is Coxswain's choice.
+/// - `ConnectTimedout` while an upstream connect-timeout budget is active →
+///   502.
 /// - Everything else: 502 for upstream sources, 0 (no response written) for
 ///   downstream connection-level errors, 400 for other downstream errors, 500
 ///   for internal faults.
@@ -124,19 +126,20 @@ fn select_failure_status(
     etype: &pingora_core::ErrorType,
     esource: &ErrorSource,
     request_timeout_is_controlling: bool,
-    backend_request_timeout_active: bool,
+    upstream_timeout_budget_active: bool,
 ) -> u16 {
     match etype {
         HTTPStatus(code) => *code,
-        // request/backendRequest read/write timeouts → 504 (Gateway API spec, GEP-1742).
-        // Connect failure while backendRequest active → 502 (upstream unreachable).
+        // request timeout, or an upstream-side read/write timeout under a
+        // configured connect-timeout budget, → 504.
+        // Connect failure under that same budget → 502 (upstream unreachable).
         // Flags set in upstream_peer avoid races with OS timer granularity.
         ReadTimedout | WriteTimedout
-            if request_timeout_is_controlling || backend_request_timeout_active =>
+            if request_timeout_is_controlling || upstream_timeout_budget_active =>
         {
             504
         }
-        ConnectTimedout if backend_request_timeout_active => 502,
+        ConnectTimedout if upstream_timeout_budget_active => 502,
         _ => match esource {
             ErrorSource::Upstream => 502,
             ErrorSource::Downstream => match etype {
@@ -163,7 +166,7 @@ pub(crate) async fn fail_to_proxy(
         e.etype(),
         e.esource(),
         ctx.request_timeout_is_controlling,
-        ctx.backend_request_timeout_active,
+        ctx.upstream_timeout_budget_active,
     );
     let error_type = classify_upstream_error(e);
     inc_upstream_error(ctx, error_type);
@@ -296,7 +299,7 @@ mod tests {
         );
     }
 
-    // ── ConnectTimedout (`connect-timeout` annotation) ────────────────────────
+    // ── ConnectTimedout (CoxswainBackendPolicy connect timeout) ───────────────
 
     #[test]
     fn connect_timeout_without_backend_budget_maps_to_502_via_upstream_source() {

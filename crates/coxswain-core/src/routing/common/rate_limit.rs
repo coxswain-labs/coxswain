@@ -20,9 +20,10 @@ use std::sync::Arc;
 pub enum RateLimitKey {
     /// Limit by real client IP address (the default).
     ///
-    /// Uses the PROXY-protocol peer when present, else the L4 downstream peer
-    /// — the same resolution the allow-source-range filter uses. A request
-    /// whose peer address is indeterminate is admitted (fail-open); the proxy
+    /// Resolves the same way the allow-source-range filter does: the
+    /// PROXY-protocol peer or L4 downstream peer, honouring a trusted
+    /// forwarded header when one is configured for the route. A request whose
+    /// peer address is indeterminate is admitted (fail-open); the proxy
     /// cannot attribute it to a key and so cannot enforce a per-client limit.
     ClientIp,
 

@@ -27,16 +27,24 @@ fn empty_auth_chain() -> Arc<[Arc<IngressAuthConfig>]> {
 /// Per-rule timeout configuration.
 ///
 /// `request` / `backend_request` are parsed from `HTTPRouteRule.timeouts` (Gateway
-/// API). `connect` / `read` / `send` are parsed from the Ingress
-/// `ingress.coxswain-labs.dev/{connect,read,send}-timeout` annotations and map to the
-/// upstream TCP-connect, response-read, and request-send phases respectively.
+/// API). `read` / `send` are parsed from the Ingress
+/// `ingress.coxswain-labs.dev/{read,send}-timeout` annotations and map to the
+/// upstream response-read and request-send phases respectively. `connect` is
+/// always `None` here — the upstream TCP-connect timeout now resolves per
+/// backend from `CoxswainBackendPolicy` (`BackendGroup::connect_timeout`), not
+/// from a route-level field.
 #[derive(Clone, Debug, Default)]
 pub struct RouteTimeouts {
     /// Total request timeout (client → proxy → upstream → proxy → client). 504 on expiry.
     pub request: Option<Duration>,
-    /// Upstream-only timeout (proxy → upstream response). 502 on expiry.
+    /// Upstream-only timeout (proxy → upstream response). 504 on read/write
+    /// expiry; a connect failure under this budget maps to 502 (connect is
+    /// always upstream-sourced).
     pub backend_request: Option<Duration>,
-    /// Upstream TCP-connect timeout (`ingress.coxswain-labs.dev/connect-timeout`).
+    /// Unused: retained for layout stability, always `None`. The upstream
+    /// TCP-connect timeout resolves per backend from `CoxswainBackendPolicy`
+    /// (`BackendGroup::connect_timeout`) since the Ingress `connect-timeout`
+    /// annotation was removed.
     pub connect: Option<Duration>,
     /// Upstream response-read timeout (`ingress.coxswain-labs.dev/read-timeout`).
     pub read: Option<Duration>,
