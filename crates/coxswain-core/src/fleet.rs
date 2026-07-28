@@ -88,6 +88,15 @@ pub struct FleetEntry {
     pub restarts: i32,
     /// Pod phase (`status.phase`), e.g. `"Running"`.
     pub phase: Option<String>,
+    /// The pod's `Ready` condition (`status.conditions[type=Ready]`), or `None`
+    /// when the condition is not yet present.
+    ///
+    /// Kubelet's own verdict, which is why the operator API can report pod
+    /// liveness without probing the pod (#677). Deliberately distinct from
+    /// "connected": a proxy can be `Ready` and serving traffic while its
+    /// discovery stream is down, and conflating the two is what made one relay
+    /// flap look like N pods dying.
+    pub ready: Option<bool>,
     /// Pod creation timestamp (`metadata.creationTimestamp`) as RFC3339, for age.
     pub created_at: Option<String>,
     /// Wall-clock time at which this entry was last observed (i.e. when the
@@ -225,6 +234,17 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
             .map(|cs| cs.iter().map(|c| c.restart_count).sum())
             .unwrap_or(0);
         let phase = pod.status.as_ref().and_then(|s| s.phase.clone());
+        // Kubelet already runs this pod's own `/readyz`; its verdict lands here
+        // on the Pod watch the controller is already running. That makes pod
+        // liveness answerable without any probe of our own (#677) — and answers
+        // it better, because it survives the controller→pod network path being
+        // broken, which a probe would misreport as the pod being down.
+        let ready = pod
+            .status
+            .as_ref()
+            .and_then(|s| s.conditions.as_ref())
+            .and_then(|cs| cs.iter().find(|c| c.type_ == "Ready"))
+            .map(|c| c.status == "True");
         let created_at = pod
             .metadata
             .creation_timestamp
@@ -241,6 +261,7 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
             node,
             restarts,
             phase,
+            ready,
             created_at,
             last_seen: now,
         };
@@ -295,6 +316,51 @@ mod tests {
                 ..Default::default()
             }),
         }
+    }
+
+    /// Attach a `Ready` condition with the given `status` string to `pod`.
+    fn with_ready_condition(mut pod: Pod, status: &str) -> Pod {
+        if let Some(s) = pod.status.as_mut() {
+            s.conditions = Some(vec![k8s_openapi::api::core::v1::PodCondition {
+                type_: "Ready".to_string(),
+                status: status.to_string(),
+                ..Default::default()
+            }]);
+        }
+        pod
+    }
+
+    #[test]
+    fn ready_reflects_the_pods_ready_condition_and_is_none_when_absent() {
+        // Kubelet's verdict is what the operator API reports as pod liveness
+        // (#677), so the three-way read has to be exact. `None` (condition not
+        // yet published on a freshly-scheduled pod) is deliberately distinct
+        // from `Some(false)`: unknown must not render as a fault.
+        let base = || {
+            make_pod(
+                "proxy-0",
+                "shared-proxy",
+                Some("10.0.0.1"),
+                Some("8082"),
+                None,
+            )
+        };
+        let ready = |pod: Pod| build_snapshot([&pod]).shared_proxies[0].ready;
+
+        assert_eq!(ready(with_ready_condition(base(), "True")), Some(true));
+        assert_eq!(ready(with_ready_condition(base(), "False")), Some(false));
+        assert_eq!(
+            ready(base()),
+            None,
+            "no Ready condition yet means unknown, not not-ready"
+        );
+        // Kubernetes uses the literal string "Unknown" while the node is
+        // unreachable. That is not readiness, so it must not read as `true`.
+        assert_eq!(
+            ready(with_ready_condition(base(), "Unknown")),
+            Some(false),
+            "only the literal \"True\" counts as ready"
+        );
     }
 
     #[test]

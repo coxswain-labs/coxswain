@@ -4,7 +4,7 @@
     "worst": "error"
   },
   "shared_proxies": {
-    "total": 2,
+    "total": 4,
     "worst": "warn"
   },
   "dedicated_proxies": {

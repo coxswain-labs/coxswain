@@ -5,10 +5,20 @@
 //! aggregator slot, so every endpoint in this module returns 404 structurally on
 //! proxy pods — the same pattern used for `/api/v1/cluster`.
 //!
-//! Fan-out to individual proxy admin ports is plain HTTP via [`reqwest`]; the
-//! 2-second timeout configured at client construction prevents a slow pod from
-//! blocking the whole response. A pod that doesn't respond within the deadline
-//! is surfaced as `"reachable": false` (HTTP 200, partial results are valid).
+//! There is **no fan-out to proxy or relay pods** (#677). Their status is read
+//! from state the controller already holds: the Pod watch answers "is it alive"
+//! (`ready`, kubelet's own verdict), and the node registry — fed by each pod's
+//! authenticated discovery stream — answers "is it taking config" (`connected`)
+//! and "what is broken on it" (`health`). Those views are consequently
+//! leader-only; see [`OperatorAggregator::require_registry`].
+//!
+//! One fan-out remains, to **peer controller replicas**' `/statusz` over plain
+//! HTTP via [`reqwest`]. It cannot be removed the same way: controllers run a
+//! discovery *server* and are never clients, and standbys reject inbound
+//! streams, so no channel exists to carry a peer replica's health. The 2-second
+//! timeout configured at client construction prevents a slow peer from blocking
+//! the whole response; one that misses the deadline is surfaced as
+//! `"reachable": false` (HTTP 200, partial results are valid).
 //!
 //! The Kubernetes client is lazily initialised on the first request that needs
 //! it (`get_gateway`, `get_ingress`, `get_httproute`, `get_ingress_route`).
@@ -24,7 +34,8 @@ use tokio::sync::{OnceCell, Semaphore};
 
 use coxswain_core::cluster::SharedClusterSummary;
 use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
-use coxswain_core::node_registry::NodeRegistryHandle;
+use coxswain_core::health::{CheckState, HealthSnapshot};
+use coxswain_core::node_registry::{NodeEntry, NodeRegistryHandle};
 use coxswain_core::routing::{SharedGatewayRoutingTable, SharedIngressRoutingTable};
 
 mod controllers;
@@ -199,6 +210,93 @@ pub(super) fn pod_statusz_url(entry: &FleetEntry) -> String {
     format!("{}/statusz", pod_base_url(entry))
 }
 
+/// Render a [`SystemTime`] as RFC 3339, the one timestamp format this API emits.
+///
+/// Clamped, and that clamp is load-bearing rather than defensive. Every
+/// timestamp reaching here originated as a peer-supplied `int64` on the
+/// discovery stream — a leaf's `connected_since`/`last_ack_at` folded from a
+/// relay's `RosterReport`, or (since #677) its `reported_at`. `humantime`'s
+/// `Display` *fails* for any instant at or past year 10000, and `to_string`
+/// turns that failure into a panic; with `panic = "abort"` in the release
+/// profile that takes the whole controller down, and the offending row is
+/// persisted in the registry, so the replacement re-reads it and aborts again.
+///
+/// A relay is the one attacker this project's threat model treats as in scope,
+/// and a nonsense timestamp is not worth a crash-loop: clamp to the last
+/// instant the formatter can render and let the operator see an absurd date.
+pub(super) fn fmt_rfc3339(t: std::time::SystemTime) -> String {
+    /// Last instant `humantime` can format: 9999-12-31T23:59:59Z.
+    const MAX_RENDERABLE_UNIX_SECS: u64 = 253_402_300_799;
+    let max = std::time::UNIX_EPOCH + std::time::Duration::from_secs(MAX_RENDERABLE_UNIX_SECS);
+    humantime::format_rfc3339(t.min(max)).to_string()
+}
+
+/// Attach a proxy/relay pod's status from the node registry (#677).
+///
+/// The join key is `pod_name == node_id`: the discovery client is constructed
+/// with the pod's own name as its `node_id` (`coxswain-bin`'s
+/// `build_discovery_client_config`), so the Kubernetes-sourced fleet snapshot
+/// and the stream-sourced registry address the same pod by the same string.
+///
+/// Writes two deliberately separate facts, because one bit cannot carry both and
+/// the old probe's `reachable` conflated them:
+///
+/// - `ready` — kubelet's own verdict, already on the `FleetEntry` (written by
+///   [`OperatorAggregator::entry_json`]). Survives the controller losing sight
+///   of the pod entirely.
+/// - `connected` — whether the pod holds a live discovery stream. A relay's
+///   stream dropping evicts its whole subtree at once, so this can go `false`
+///   for N pods that are all still `ready` and serving traffic; reporting that
+///   as N dead pods is exactly the false alarm the split prevents.
+///
+/// `health` is absent when the node has not reported yet — a pod that connected
+/// microseconds ago, or a pre-#677 build mid-rollout. That renders as
+/// "connected, health unknown", never as unhealthy.
+pub(super) fn attach_node_status(entry: &mut serde_json::Value, node: Option<&NodeEntry>) {
+    entry["connected"] = serde_json::Value::Bool(node.is_some());
+    let Some(health) = node.and_then(|n| n.health.as_ref()) else {
+        return;
+    };
+    let degraded = non_ready_check_names(&health.snapshot);
+    entry["health"] = serde_json::Value::String(
+        if degraded.is_empty() {
+            "ready"
+        } else {
+            "degraded"
+        }
+        .to_owned(),
+    );
+    entry["degraded_checks"] = serde_json::Value::from(degraded);
+    entry["version"] = serde_json::Value::String(health.version.clone());
+    entry["reported_at"] = serde_json::Value::String(fmt_rfc3339(health.reported_at));
+}
+
+/// Collect the `"subsystem/check"` identifiers whose state is not `Ready` from a
+/// reported [`HealthSnapshot`].
+///
+/// The typed counterpart of [`non_ready_checks`], which reads the same shape out
+/// of a probed pod's JSON body. Anything other than `Ready` counts as non-ready
+/// (`Degraded`, `Pending`, `Failed`) — the UI surfaces it amber and defers the
+/// reason to that pod's own health view. A subsystem with no checks contributes
+/// its own name when its aggregate is not `Ready`.
+pub(super) fn non_ready_check_names(snapshot: &HealthSnapshot) -> Vec<String> {
+    let mut out = Vec::new();
+    for (sub_name, sub) in &snapshot.subsystems {
+        if sub.checks.is_empty() {
+            if sub.state != CheckState::Ready {
+                out.push(sub_name.to_string());
+            }
+            continue;
+        }
+        for (check_name, state) in &sub.checks {
+            if *state != CheckState::Ready {
+                out.push(format!("{sub_name}/{check_name}"));
+            }
+        }
+    }
+    out
+}
+
 /// Find a [`FleetEntry`] by `pod_name` across all fleet buckets.
 pub(super) fn find_entry<'a>(
     snapshot: &'a FleetSnapshot,
@@ -216,6 +314,41 @@ pub(super) fn find_entry<'a>(
 // ── Fan-out helpers ───────────────────────────────────────────────────────────
 
 impl OperatorAggregator {
+    /// The node registry, or the 503 that says this replica cannot answer.
+    ///
+    /// Every registry-sourced view shares this gate for the reason the topology
+    /// view already documents: only the leader accepts discovery streams, so a
+    /// standby's registry is **empty, not partial**. Serving it would render
+    /// every proxy in the fleet as disconnected — indistinguishable from a real
+    /// cluster-wide outage, and far worse than admitting we cannot answer.
+    ///
+    /// Operators reach the leader through the leader-selecting operator
+    /// `Service`, so the common path never sees this; a direct pod-IP
+    /// `port-forward` to a standby is what it exists for.
+    ///
+    /// # Errors
+    ///
+    /// Returns the 503 response when this replica is not the leader, or when no
+    /// registry is wired at all (a role with discovery inactive).
+    pub(super) fn require_registry(
+        &self,
+        is_leader: bool,
+    ) -> Result<coxswain_core::node_registry::NodeRegistry, Box<Response<Vec<u8>>>> {
+        let Some(reg) = &self.node_registry else {
+            return Err(Box::new(service_unavailable(
+                "discovery is not active on this replica, so it holds no node registry \
+                 and cannot report proxy status",
+            )));
+        };
+        if !is_leader {
+            return Err(Box::new(service_unavailable(
+                "not the discovery leader — only the leader accepts proxy streams, so this \
+                 replica cannot report proxy status; reach the leader-selecting operator Service",
+            )));
+        }
+        Ok(reg.load())
+    }
+
     /// Perform a single `GET {url}` and deserialise the body as JSON.
     ///
     /// Returns `None` on any network error, non-2xx status, or parse
@@ -249,6 +382,14 @@ impl OperatorAggregator {
         }
         if let Some(ref phase) = entry.phase {
             obj["phase"] = serde_json::Value::String(phase.clone());
+        }
+        // Kubelet's own `Ready` verdict (#677) — pod liveness with no probe of
+        // our own, and the half of the retired `reachable` bit that answers "is
+        // this pod alive" rather than "is it taking config". Omitted while the
+        // condition is absent (a just-created pod), which reads as unknown
+        // rather than as not-ready.
+        if let Some(ready) = entry.ready {
+            obj["ready"] = serde_json::Value::Bool(ready);
         }
         if let Some(ref created) = entry.created_at {
             obj["created_at"] = serde_json::Value::String(created.clone());
@@ -482,9 +623,76 @@ pub(super) mod tests {
             spec: None,
             status: Some(PodStatus {
                 pod_ip: Some(pod_ip.to_string()),
+                // Ready by default: every existing fixture predates the
+                // condition mattering, and "the pod is fine" is the baseline
+                // those tests assume. `make_pod_not_ready` opts out.
+                conditions: Some(vec![ready_condition("True")]),
                 ..Default::default()
             }),
         }
+    }
+
+    /// Like [`make_pod`], but kubelet reports the pod as **not** Ready.
+    pub(crate) fn make_pod_not_ready(name: &str, component: &str, pod_ip: &str) -> Pod {
+        let mut pod = make_pod(name, component, pod_ip, "8082", None);
+        if let Some(status) = pod.status.as_mut() {
+            status.conditions = Some(vec![ready_condition("False")]);
+        }
+        pod
+    }
+
+    fn ready_condition(status: &str) -> k8s_openapi::api::core::v1::PodCondition {
+        k8s_openapi::api::core::v1::PodCondition {
+            type_: "Ready".to_string(),
+            status: status.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Build a [`NodeRegistryHandle`] with each named node connected on the
+    /// shared-pool scope, optionally carrying a health report.
+    ///
+    /// The join key the aggregator uses is `pod_name == node_id`, so a name
+    /// passed here must match the pod name in the paired fleet fixture.
+    pub(crate) fn registry_with(
+        nodes: impl IntoIterator<Item = (&'static str, Option<Vec<(&'static str, CheckState)>>)>,
+    ) -> NodeRegistryHandle {
+        use coxswain_core::health::SubsystemSnapshot;
+        use coxswain_core::node_registry::{NodeHealth, NodeScope};
+        use std::collections::BTreeMap;
+
+        let reg = NodeRegistryHandle::new();
+        for (node_id, checks) in nodes {
+            reg.connect(
+                node_id,
+                NodeScope::SharedPool,
+                std::time::SystemTime::UNIX_EPOCH,
+            );
+            let Some(checks) = checks else { continue };
+            let checks: BTreeMap<std::sync::Arc<str>, CheckState> = checks
+                .into_iter()
+                .map(|(n, s)| (std::sync::Arc::from(n), s))
+                .collect();
+            let state = checks
+                .values()
+                .max_by_key(|c| c.severity())
+                .cloned()
+                .unwrap_or(CheckState::Ready);
+            let mut subsystems = BTreeMap::new();
+            subsystems.insert(
+                std::sync::Arc::from("proxy"),
+                SubsystemSnapshot { state, checks },
+            );
+            reg.record_health(
+                node_id,
+                NodeHealth {
+                    version: "1.2.3".to_owned(),
+                    snapshot: HealthSnapshot { subsystems },
+                    reported_at: std::time::SystemTime::UNIX_EPOCH,
+                },
+            );
+        }
+        reg
     }
 
     /// Build an [`OperatorAggregator`] with a short (200 ms) timeout for tests.
@@ -774,6 +982,24 @@ pub(super) mod tests {
     #[test]
     fn internal_error_returns_500() {
         assert_eq!(internal_error().status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn fmt_rfc3339_clamps_a_far_future_timestamp_instead_of_aborting() {
+        // Every timestamp here is a peer-supplied int64 off the discovery
+        // stream. `humantime`'s Display FAILS past year 9999 and `to_string`
+        // turns that into a panic — under `panic = "abort"` that is the whole
+        // controller, re-triggered on every read of the persisted row. One
+        // hostile relay would crash-loop the control plane.
+        let absurd = std::time::UNIX_EPOCH + std::time::Duration::from_secs(u64::MAX / 2);
+        let rendered = fmt_rfc3339(absurd);
+        assert_eq!(
+            rendered, "9999-12-31T23:59:59Z",
+            "an unrenderable instant must clamp, not panic"
+        );
+        // The clamp must not disturb an ordinary timestamp.
+        let normal = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        assert_eq!(fmt_rfc3339(normal), "2023-11-14T22:13:20Z");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use coxswain_controller::{
     BootstrapRejectHook, CONTROLLER_DISCOVERY_SERVICE, CaMode, KubeTokenAuthenticator,
     RELAY_SERVICE_ACCOUNT, SHARED_RELAY_SERVICE_ACCOUNT, load_or_generate, spawn_trust_publisher,
 };
-use coxswain_core::health::SubsystemHandle;
+use coxswain_core::health::{HealthRegistry, SubsystemHandle};
 use coxswain_core::identity::{SpiffeId, SvidIssuer};
 use coxswain_discovery::{
     BootstrapClient, BootstrapClientConfig, BootstrapRunner, BootstrapService,
@@ -264,6 +264,7 @@ pub(crate) fn build_discovery_client_config(
     common: &CommonArgs,
     scope: Scope,
     bound_ports_rx: Option<watch::Receiver<BTreeSet<u16>>>,
+    health: HealthRegistry,
 ) -> (DiscoveryClientConfig, BootstrapRunner, SharedSvid) {
     // The routing-stream upstream is delivered by bootstrap, not a CLI flag (#601):
     // start with no static endpoints; the bootstrap loop populates `upstream_cell`.
@@ -275,6 +276,13 @@ pub(crate) fn build_discovery_client_config(
     // actually-bound set to the controller as NodeStatus messages, feeding the
     // Gateway Programmed readiness gate.
     config.bound_ports_rx = bound_ports_rx;
+    // Self-reported health (#677): the node pushes its own subsystem state up
+    // the stream it has already authenticated, so the controller serves the
+    // operator API's fleet and problems views from its registry instead of
+    // dialling this pod's `/statusz` over unauthenticated HTTP. Wired for BOTH
+    // roles — a relay reports no bound ports and never appears in its own
+    // roster, so this is the only channel its own health has.
+    config.health = Some(health);
 
     // Bootstrap always targets the controller (never tiered), so its server
     // namespace comes from the BOOTSTRAP endpoint's service DNS. Fall back to the
@@ -337,11 +345,12 @@ pub(crate) fn build_discovery_client(
     proxy_handle: SubsystemHandle,
     scope: Scope,
     bound_ports_rx: Option<watch::Receiver<BTreeSet<u16>>>,
+    health: HealthRegistry,
 ) -> anyhow::Result<(DiscoveryClient, Supervisor, BootstrapRunner)> {
     // A proxy client authenticates with its SVID but does not serve downstream, so
     // the returned serving-cell handle is unused here (the relay path uses it).
     let (config, bootstrap_runner, _svid) =
-        build_discovery_client_config(disco, common, scope, bound_ports_rx);
+        build_discovery_client_config(disco, common, scope, bound_ports_rx, health);
     let (client, supervisor) = DiscoveryClient::new(config, proxy_handle, "routing_table_loaded")?;
     Ok((client, supervisor, bootstrap_runner))
 }
@@ -448,8 +457,13 @@ mod tests {
     fn built_client_config_always_carries_an_upstream_policy() {
         let (common, disco) =
             proxy_args("https://coxswain-controller-discovery-bootstrap.coxswain-system.svc:50052");
-        let (config, _runner, _svid) =
-            build_discovery_client_config(&disco, &common, Scope::SharedPool, None);
+        let (config, _runner, _svid) = build_discovery_client_config(
+            &disco,
+            &common,
+            Scope::SharedPool,
+            None,
+            HealthRegistry::new(),
+        );
         let policy = config
             .upstream_policy
             .as_ref()

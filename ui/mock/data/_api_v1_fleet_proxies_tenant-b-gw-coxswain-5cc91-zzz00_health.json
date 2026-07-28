@@ -1,4 +1,5 @@
 {
   "pod_name": "tenant-b-gw-coxswain-5cc91-zzz00",
-  "reachable": false
+  "ready": false,
+  "connected": true
 }

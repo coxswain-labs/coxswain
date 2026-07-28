@@ -1,13 +1,14 @@
 {
   "component": "dedicated-proxy",
-  "gateway_ref": "tenant-b-gw",
   "pod_name": "tenant-b-gw-coxswain-5cc91-zzz00",
   "pod_namespace": "tenant-b",
-  "pod_ip": "10.42.0.105",
+  "pod_ip": "10.42.0.107",
   "telemetry_port": 8083,
-  "reachable": false,
-  "node": "node-w-2",
-  "restarts": 4,
+  "ready": false,
+  "connected": true,
+  "node": "node-w-1",
+  "restarts": 0,
   "phase": "Running",
-  "created_at": "2026-06-08T05:30:00Z"
+  "created_at": "2026-06-10T07:30:00Z",
+  "gateway_ref": "tenant-b-gw"
 }

@@ -10,10 +10,17 @@
 //! UI convergence panel (T8) and by the controller's shared-Gateway `Programmed`
 //! readiness gate (#531), which subscribes to [`NodeRegistryHandle::subscribe`] for
 //! re-drives on membership/bound-port changes.
+//!
+//! Since #677 each entry also carries the node's own subsystem health
+//! ([`NodeHealth`]), reported up the discovery stream. That makes the registry —
+//! not an unauthenticated HTTP probe of each pod — the source for the operator
+//! API's fleet, per-pod health, and problems views.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::SystemTime;
+
+use crate::health::HealthSnapshot;
 
 use parking_lot::Mutex;
 use tokio::sync::watch;
@@ -27,7 +34,7 @@ use tokio::sync::watch;
 /// admin must stay free of any discovery dependency). The discovery server owns
 /// the conversion from its own `Scope` into this core-local mirror at the
 /// crate boundary.
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind")]
 pub enum NodeScope {
     /// The shared proxy pool, serving all Ingress + Gateway routing that is not
@@ -52,7 +59,13 @@ pub enum NodeScope {
 // ── NodeEntry ────────────────────────────────────────────────────────────────
 
 /// Snapshot of a single connected proxy node.
-#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// Serialised, never deserialised: the registry is built from the wire
+/// (`Subscribe`/`Ack`/`NodeStatus`/`RosterReport`) and only ever rendered out to
+/// the operator API. The matching `Deserialize` existed for the
+/// controller-to-controller JSON fan-out at `/api/v1/topology/local`, which #685
+/// deleted.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct NodeEntry {
     /// Opaque identifier supplied by the proxy in its `Subscribe` message.
     pub node_id: String,
@@ -106,6 +119,34 @@ pub struct NodeEntry {
     /// this flag to be skipped. Missing in JSON from pre-#585 peers → `false`.
     #[serde(default)]
     pub is_relay: bool,
+    /// The node's own subsystem health, as last reported on its `NodeStatus`
+    /// (#677), or `None` if it has not reported yet this session.
+    ///
+    /// `None` is not a fault: it covers a node that connected microseconds ago
+    /// and a pre-#677 build mid-rollout alike. Both render as "connected, health
+    /// unknown" — never as unhealthy, which would turn a rolling upgrade into a
+    /// fleet-wide alarm.
+    pub health: Option<NodeHealth>,
+}
+
+/// A node's self-reported subsystem health (#677).
+///
+/// Wraps [`HealthSnapshot`] rather than re-modelling it, so the operator API can
+/// serve a per-pod health body identical to the one that pod's own `/statusz`
+/// renders — the field is the same type, serialised by the same impl.
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+pub struct NodeHealth {
+    /// Coxswain build version of the reporting node. During a rolling upgrade
+    /// this is how the operator sees which pods have crossed over.
+    pub version: String,
+    /// The node's per-subsystem check detail.
+    pub snapshot: HealthSnapshot,
+    /// When the reporting node sampled its own registry.
+    ///
+    /// Measures lag through the relay's coalesce-and-fold hop, not liveness: a
+    /// live stream already proves the report is current, so an old timestamp on
+    /// a connected node means "nothing changed", not "reporting is broken".
+    pub reported_at: SystemTime,
 }
 
 /// A leaf entry from a relay's `RosterReport` (#585), folded into the registry
@@ -135,6 +176,12 @@ pub struct RosterChild {
     pub connected_since: SystemTime,
     /// The leaf's most recent Ack time, or `None`.
     pub last_ack_at: Option<SystemTime>,
+    /// The leaf's own health as last reported to the relay (#677), or `None`.
+    ///
+    /// A relay-fronted leaf never streams to the controller, so this is the only
+    /// path its health has; without it the HTTP probe could be removed for
+    /// directly-connected proxies only.
+    pub health: Option<NodeHealth>,
 }
 
 impl NodeEntry {
@@ -149,6 +196,22 @@ impl NodeEntry {
     }
 }
 
+/// One roster child projected onto the fields the #531 `Programmed` gate reads.
+///
+/// See [`NodeRegistryHandle::gate_projection`], which is the only producer; the
+/// type exists so the comparison is by named field rather than by tuple
+/// position, where a mis-ordered clone would compile and silently compare the
+/// wrong things.
+#[derive(PartialEq)]
+struct GateRow {
+    node_id: String,
+    scope: NodeScope,
+    last_acked_version: Option<String>,
+    target_version: Option<String>,
+    last_acked_seq: Option<u64>,
+    bound_ports: Option<BTreeSet<u16>>,
+}
+
 // ── NodeRegistry ─────────────────────────────────────────────────────────────
 
 /// Snapshot of all currently-connected proxy nodes.
@@ -156,7 +219,7 @@ impl NodeEntry {
 /// This is a plain value type — create a point-in-time copy via
 /// [`NodeRegistryHandle::load`] and hold it briefly; do not cache it across
 /// reconcile cycles.
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct NodeRegistry {
     /// Map of `node_id` → per-node entry.
     pub nodes: HashMap<String, NodeEntry>,
@@ -510,6 +573,7 @@ impl NodeRegistryHandle {
             connected_since: now,
             bound_ports: None,
             last_acked_seq: None,
+            health: None,
             parent: None,
             is_relay: false,
         };
@@ -609,6 +673,33 @@ impl NodeRegistryHandle {
         self.bump_roster();
     }
 
+    /// Record a node's self-reported subsystem health (wholesale replace, #677).
+    ///
+    /// No-op if the node is not present (late report after `disconnect`).
+    ///
+    /// Bumps only the roster watch, never the `bump` gate watch: health is an operator-
+    /// visible fact with no bearing on the #531 `Programmed` gate, which turns
+    /// on acked versions and bound ports. Waking the gate on a health
+    /// transition would re-drive every shared Gateway's status for a change that
+    /// cannot alter the outcome. The roster watch must fire so a relay
+    /// republishes its leaf's health upstream.
+    ///
+    /// Re-reporting identical health is not a change — the reporter already
+    /// suppresses no-op transitions, and this is the second line of defence
+    /// against a reconnect storm re-driving relay republication.
+    pub fn record_health(&self, node_id: &str, health: NodeHealth) {
+        let mut guard = self.0.map.lock();
+        let Some(entry) = guard.nodes.get_mut(node_id) else {
+            return;
+        };
+        if entry.health.as_ref() == Some(&health) {
+            return;
+        }
+        entry.health = Some(health);
+        drop(guard);
+        self.bump_roster();
+    }
+
     /// Fold a relay's `RosterReport` into the registry (#585): wholesale-replace
     /// every child of `parent_node_id` with `children`, and mark the parent as a
     /// relay so the #531 quorum excludes its own ack.
@@ -631,11 +722,32 @@ impl NodeRegistryHandle {
     /// stale roster copy would displace the direct row and — worse — `parent`
     /// would flip to this relay, so the relay's later disconnect would
     /// [`Self::evict_children`] a healthy direct node.
+    /// A roster report is **wholesale-replace**, so the fold cannot tell what
+    /// changed by inspecting one field — it compares the gate-relevant projection
+    /// of the subtree before and after, and wakes the `Programmed` gate only when
+    /// that projection moved.
+    ///
+    /// Without the comparison, every report wakes the gate, which re-enqueues
+    /// every Gateway's status. That was tolerable while a report could only be
+    /// triggered by convergence state, but since #677 a leaf's health rides the
+    /// same message: a purely diagnostic check flapping on one leaf behind one
+    /// relay would otherwise re-drive status for the entire fleet, defeating on
+    /// the relay path exactly what [`Self::record_health`] guarantees on the
+    /// direct path.
     pub fn apply_roster(&self, parent_node_id: &str, children: Vec<RosterChild>) {
         let mut guard = self.0.map.lock();
-        if let Some(parent) = guard.nodes.get_mut(parent_node_id) {
-            parent.is_relay = true;
-        }
+        // Marking the parent is itself a gate change, and it must be sampled
+        // BEFORE the mutation: `is_relay` excludes a row from the shared-pool
+        // quorum, and a shared relay's own row is `SharedPool`-scoped with no
+        // bound ports — so it holds `all_shared_nodes_bound` false until this
+        // flag lands. The very first report a relay sends carries an empty
+        // child set, so the child projection alone would see no change and the
+        // quorum would go false→true with nothing woken.
+        let relay_newly_marked = match guard.nodes.get_mut(parent_node_id) {
+            Some(parent) => !std::mem::replace(&mut parent.is_relay, true),
+            None => false,
+        };
+        let before = Self::gate_projection(&guard.nodes, parent_node_id);
         // Drop the relay's prior children not present in the new report.
         guard
             .nodes
@@ -661,12 +773,53 @@ impl NodeRegistryHandle {
                 last_acked_seq: child.last_acked_seq,
                 parent: Some(parent_node_id.to_owned()),
                 is_relay: false,
+                health: child.health,
             };
             guard.nodes.insert(node_id, entry);
         }
+        let gate_changed =
+            relay_newly_marked || Self::gate_projection(&guard.nodes, parent_node_id) != before;
         drop(guard);
-        self.bump();
+        if gate_changed {
+            self.bump();
+        }
         self.bump_roster();
+    }
+
+    /// Project one relay's subtree onto exactly the fields the #531 `Programmed`
+    /// gate reads, sorted for order-independent comparison.
+    ///
+    /// Covers the **children** of one relay. Membership, scope, acked/target
+    /// version, acked seq and bound ports are what
+    /// [`NodeRegistry::all_shared_nodes_bound`],
+    /// [`NodeRegistry::all_shared_nodes_acked`], [`NodeRegistry::all_in_sync`]
+    /// and [`NodeRegistry::controller_version`] read off a child row.
+    /// Everything else on a [`NodeEntry`] — health, timestamps — is
+    /// operator-visible only and must not wake the gate.
+    ///
+    /// `is_relay` is a gate input too (those same predicates filter on it), but
+    /// it lives on the *parent* row, which this projection does not cover;
+    /// [`Self::apply_roster`] samples its transition separately.
+    ///
+    /// Deliberately *not* `#[derive]`d from the struct: adding a field to
+    /// `NodeEntry` should not silently enrol it in the gate's wake condition. A
+    /// new gate input has to be added here, at the same time as the predicate
+    /// that reads it.
+    fn gate_projection(nodes: &HashMap<String, NodeEntry>, parent_node_id: &str) -> Vec<GateRow> {
+        let mut rows: Vec<GateRow> = nodes
+            .values()
+            .filter(|e| e.parent.as_deref() == Some(parent_node_id))
+            .map(|e| GateRow {
+                node_id: e.node_id.clone(),
+                scope: e.scope.clone(),
+                last_acked_version: e.last_acked_version.clone(),
+                target_version: e.target_version.clone(),
+                last_acked_seq: e.last_acked_seq,
+                bound_ports: e.bound_ports.clone(),
+            })
+            .collect();
+        rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+        rows
     }
 
     /// Evict a relay's entire subtree (#585): remove every entry whose `parent`
@@ -1259,6 +1412,7 @@ mod tests {
             bound_ports: Some(ports(bound)),
             connected_since: now(),
             last_ack_at: Some(now()),
+            health: None,
         }
     }
 
@@ -1545,40 +1699,252 @@ mod tests {
         );
     }
 
-    #[test]
-    fn node_entry_json_without_bound_ports_defaults_to_none() {
-        // Pre-#531 peers serialize NodeEntry without the field. The registry is
-        // still deserialized from the wire on the relay roster path, so the
-        // `serde(default)` must keep holding.
-        let json = r#"{
-            "node_id": "node-a",
-            "scope": {"kind": "SharedPool"},
-            "last_acked_version": null,
-            "target_version": null,
-            "last_ack_at": null,
-            "connected_since": {"secs_since_epoch": 0, "nanos_since_epoch": 0}
-        }"#;
-        let entry: NodeEntry = serde_json::from_str(json).expect("legacy JSON must decode");
-        assert_eq!(entry.bound_ports, None);
+    // ── health reporting (#677) ─────────────────────────────────────────────────
+
+    /// Build a [`NodeHealth`] whose single check carries `state`.
+    fn health(version: &str, state: crate::health::CheckState) -> NodeHealth {
+        let mut checks = std::collections::BTreeMap::new();
+        checks.insert(Arc::from("routing_table_loaded"), state.clone());
+        let mut subsystems = std::collections::BTreeMap::new();
+        subsystems.insert(
+            Arc::from("proxy"),
+            crate::health::SubsystemSnapshot { state, checks },
+        );
+        NodeHealth {
+            version: version.to_owned(),
+            snapshot: crate::health::HealthSnapshot { subsystems },
+            reported_at: now(),
+        }
     }
 
     #[test]
-    fn node_entry_and_registry_round_trip_json() {
+    fn record_health_stores_the_report_and_wakes_only_the_roster_watch() {
+        // Health is operator-visible but cannot change the #531 Programmed
+        // outcome, which turns on acked versions and bound ports. Waking the
+        // gate would re-drive every shared Gateway's status for nothing; the
+        // roster watch MUST fire so a relay republishes the leaf's health.
         let reg = NodeRegistryHandle::new();
-        reg.connect("node-a", gw("default", "my-gw"), now());
-        reg.record_target("node-a", "v1".to_owned());
-        reg.record_ack("node-a", "v1".to_owned(), 1, now());
+        reg.connect("node-a", NodeScope::SharedPool, now());
+        let mut gate = reg.subscribe();
+        let mut roster = reg.subscribe_roster();
+        gate.borrow_and_update();
+        roster.borrow_and_update();
+
+        reg.record_health("node-a", health("1.2.3", crate::health::CheckState::Ready));
+
         let snap = reg.load();
+        let stored = snap.nodes["node-a"]
+            .health
+            .as_ref()
+            .expect("record_health must store the report");
+        assert_eq!(stored.version, "1.2.3");
+        assert!(
+            roster.has_changed().unwrap_or(false),
+            "the roster watch must fire so a relay republishes the leaf's health"
+        );
+        assert!(
+            !gate.has_changed().unwrap_or(true),
+            "the #531 gate watch must NOT fire — health cannot change its outcome"
+        );
+    }
 
-        let json = serde_json::to_string(&snap).expect("serialize");
-        let round_tripped: NodeRegistry = serde_json::from_str(&json).expect("deserialize");
+    #[test]
+    fn record_health_is_a_no_op_for_an_unchanged_report_or_an_absent_node() {
+        let reg = NodeRegistryHandle::new();
+        reg.connect("node-a", NodeScope::SharedPool, now());
+        let report = health("1.2.3", crate::health::CheckState::Ready);
+        reg.record_health("node-a", report.clone());
+        let mut roster = reg.subscribe_roster();
+        roster.borrow_and_update();
 
-        assert_eq!(round_tripped.nodes.len(), 1);
-        let entry = &round_tripped.nodes["node-a"];
-        assert_eq!(entry.scope, gw("default", "my-gw"));
-        assert_eq!(entry.target_version.as_deref(), Some("v1"));
-        assert_eq!(entry.last_acked_version.as_deref(), Some("v1"));
-        assert!(entry.in_sync());
+        reg.record_health("node-a", report);
+        assert!(
+            !roster.has_changed().unwrap_or(true),
+            "an identical re-report is not a change; a reconnect storm must not \
+             re-drive relay republication"
+        );
+
+        // A late report after `disconnect` must not resurrect the row.
+        reg.record_health("ghost", health("1.2.3", crate::health::CheckState::Ready));
+        assert!(
+            !reg.load().nodes.contains_key("ghost"),
+            "a report for an absent node must not create an entry"
+        );
+    }
+
+    #[test]
+    fn apply_roster_carries_leaf_health_through_the_fold() {
+        // A relay-fronted leaf never streams to the controller, so RosterReport
+        // is the ONLY path its health has. Without this the HTTP probe could be
+        // removed for directly-connected proxies only.
+        let reg = NodeRegistryHandle::new();
+        reg.connect(
+            "relay-a",
+            NodeScope::Namespace {
+                namespace: "ns".to_owned(),
+            },
+            now(),
+        );
+        let mut child = leaf("leaf-1", gw("ns", "gw1"), 5, &[443]);
+        child.health = Some(health(
+            "1.2.3",
+            crate::health::CheckState::Degraded {
+                reason: Arc::from("snapshot stale"),
+            },
+        ));
+
+        reg.apply_roster("relay-a", vec![child]);
+
+        let snap = reg.load();
+        let folded = snap.nodes["leaf-1"]
+            .health
+            .as_ref()
+            .expect("the fold must carry the leaf's health onto its NodeEntry");
+        assert_eq!(folded.version, "1.2.3");
+        assert_eq!(
+            folded.snapshot.subsystems["proxy"].state,
+            crate::health::CheckState::Degraded {
+                reason: Arc::from("snapshot stale")
+            },
+            "the degraded reason must survive the fold, not just the severity"
+        );
+    }
+
+    #[test]
+    fn a_roster_carrying_only_a_leaf_health_change_does_not_wake_the_programmed_gate() {
+        // `record_health` refuses to wake the gate on the DIRECT path. The relay
+        // path must match, or the guarantee is worthless behind a relay: a leaf's
+        // health flip bumps its relay's roster watch, the relay republishes its
+        // whole roster, and an unconditional bump here would re-enqueue every
+        // Gateway's status in the cluster for a purely diagnostic change.
+        let reg = NodeRegistryHandle::new();
+        reg.connect(
+            "relay-a",
+            NodeScope::Namespace {
+                namespace: "ns".to_owned(),
+            },
+            now(),
+        );
+        reg.apply_roster("relay-a", vec![leaf("leaf-1", gw("ns", "gw1"), 5, &[443])]);
+
+        let mut gate = reg.subscribe();
+        let mut roster = reg.subscribe_roster();
+        gate.borrow_and_update();
+        roster.borrow_and_update();
+
+        // Same leaf, same convergence state, different health.
+        let mut child = leaf("leaf-1", gw("ns", "gw1"), 5, &[443]);
+        child.health = Some(health("1.2.3", crate::health::CheckState::Ready));
+        reg.apply_roster("relay-a", vec![child]);
+
+        assert!(
+            !gate.has_changed().unwrap_or(true),
+            "a health-only roster must not re-drive Gateway status"
+        );
+        assert!(
+            roster.has_changed().unwrap_or(false),
+            "the roster watch must still fire so the operator view updates"
+        );
+        assert_eq!(
+            reg.load().nodes["leaf-1"]
+                .health
+                .as_ref()
+                .map(|h| h.version.clone()),
+            Some("1.2.3".to_owned()),
+            "suppressing the gate wake must not suppress the fold itself"
+        );
+    }
+
+    #[test]
+    fn the_first_roster_from_a_relay_wakes_the_gate_even_with_no_children() {
+        // A shared relay's own row is SharedPool-scoped and reports no bound
+        // ports, so it holds `all_shared_nodes_bound` false until `is_relay`
+        // excludes it from the quorum. That flag lands on the relay's FIRST
+        // report — which carries an empty child set, so comparing children
+        // alone sees no change. Missing this wake leaves a shared Gateway at
+        // Programmed=False until the requeue backstop fires.
+        let reg = NodeRegistryHandle::new();
+        reg.connect("relay-shared", NodeScope::SharedPool, now());
+        assert!(
+            !reg.load().all_shared_nodes_bound(&ports(&[30001])),
+            "precondition: the unmarked relay row holds the quorum closed"
+        );
+        let mut gate = reg.subscribe();
+        gate.borrow_and_update();
+
+        reg.apply_roster("relay-shared", Vec::new());
+
+        assert!(
+            gate.has_changed().unwrap_or(false),
+            "marking a row as a relay changes the quorum and must wake the gate"
+        );
+
+        // ...and the second, identical report must NOT wake it again.
+        let mut gate = reg.subscribe();
+        gate.borrow_and_update();
+        reg.apply_roster("relay-shared", Vec::new());
+        assert!(
+            !gate.has_changed().unwrap_or(true),
+            "the mark is idempotent; only the transition is a gate change"
+        );
+    }
+
+    #[test]
+    fn a_roster_that_moves_gate_state_still_wakes_the_gate() {
+        // The counterpart: without this, suppressing the bump unconditionally
+        // would satisfy the test above and the gate would never re-evaluate.
+        // Each case is a distinct gate input, so a projection that dropped any
+        // one of them would pass the others.
+        for (label, changed) in [
+            (
+                "bound ports",
+                leaf("leaf-1", gw("ns", "gw1"), 5, &[443, 8443]),
+            ),
+            ("acked seq", leaf("leaf-1", gw("ns", "gw1"), 6, &[443])),
+            ("membership", leaf("leaf-2", gw("ns", "gw1"), 5, &[443])),
+        ] {
+            let reg = NodeRegistryHandle::new();
+            reg.connect(
+                "relay-a",
+                NodeScope::Namespace {
+                    namespace: "ns".to_owned(),
+                },
+                now(),
+            );
+            reg.apply_roster("relay-a", vec![leaf("leaf-1", gw("ns", "gw1"), 5, &[443])]);
+            let mut gate = reg.subscribe();
+            gate.borrow_and_update();
+
+            reg.apply_roster("relay-a", vec![changed]);
+
+            assert!(
+                gate.has_changed().unwrap_or(false),
+                "a change in {label} is a gate input and must wake the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn a_leaf_that_has_not_reported_health_folds_to_none_not_a_failure() {
+        // Mid-rollout a pre-#677 leaf sends no health at all. That must read as
+        // "connected, health unknown" — rendering it unhealthy would turn a
+        // rolling upgrade into a fleet-wide alarm.
+        let reg = NodeRegistryHandle::new();
+        reg.connect(
+            "relay-a",
+            NodeScope::Namespace {
+                namespace: "ns".to_owned(),
+            },
+            now(),
+        );
+        reg.apply_roster("relay-a", vec![leaf("leaf-1", gw("ns", "gw1"), 5, &[443])]);
+
+        let snap = reg.load();
+        assert!(
+            snap.nodes.contains_key("leaf-1"),
+            "the leaf is still folded and still counted as connected"
+        );
+        assert!(snap.nodes["leaf-1"].health.is_none());
     }
 
     /// #621: an Ack fires the roster-change channel (the relay must republish the

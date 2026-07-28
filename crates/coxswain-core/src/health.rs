@@ -9,6 +9,11 @@
 //! State precedence (highest wins): `Failed > Degraded > Pending > Ready`. The
 //! registry is "ready" iff every subsystem is `Ready` or `Degraded` — `Degraded`
 //! keeps `/readyz` at 200 because the data plane is still functional.
+//!
+//! Readers that must *react* to a transition rather than poll for it subscribe
+//! via [`HealthRegistry::subscribe`]. That is what lets a proxy or relay push
+//! its own health up its discovery stream on change (#677), instead of the
+//! controller dialling the pod back over an unauthenticated HTTP probe.
 
 use serde::{Serialize, Serializer, ser::SerializeStruct};
 use std::collections::BTreeMap;
@@ -16,6 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use parking_lot::Mutex;
+use tokio::sync::watch;
 
 const SEV_READY: u8 = 0;
 const SEV_PENDING: u8 = 1;
@@ -94,7 +100,7 @@ impl Serialize for CheckState {
 /// `state` is derived from `checks` — it is always the highest-severity entry
 /// in the map, preserving the reason if the worst check is `Degraded` or
 /// `Failed`. An empty subsystem has aggregate `Ready`.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SubsystemSnapshot {
     /// Aggregate state of this subsystem (highest-severity check).
     pub state: CheckState,
@@ -105,7 +111,7 @@ pub struct SubsystemSnapshot {
 /// Snapshot of every registered subsystem, suitable for `/status` output.
 ///
 /// Iteration order is stable (`BTreeMap`) so the JSON output is reproducible.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct HealthSnapshot {
     /// Per-subsystem snapshot keyed by subsystem name.
     pub subsystems: BTreeMap<Arc<str>, SubsystemSnapshot>,
@@ -116,6 +122,12 @@ struct SubsystemInner {
     checks: Mutex<BTreeMap<Arc<str>, CheckState>>,
     /// Cached aggregate severity for lock-free readiness checks.
     aggregate_severity: AtomicU8,
+    /// The owning registry's change counter, cloned in at registration.
+    ///
+    /// Lives here rather than on [`HealthRegistry`] because a
+    /// [`SubsystemHandle`] holds only its own `SubsystemInner` — it has no
+    /// back-reference to the registry to bump.
+    changed: Arc<watch::Sender<u64>>,
 }
 
 /// Update handle for a single subsystem.
@@ -146,6 +158,13 @@ impl SubsystemHandle {
                 self.inner.name
             )
         });
+        // A re-post of the state a check already holds is not a change. Callers
+        // re-assert `ready` on every successful reconcile tick, so bumping
+        // unconditionally would wake every subscriber at reconcile frequency
+        // and turn the #677 health report into a per-tick stream message.
+        if *slot == state {
+            return;
+        }
         *slot = state;
         let max = checks
             .values()
@@ -153,6 +172,11 @@ impl SubsystemHandle {
             .max()
             .unwrap_or(SEV_READY);
         self.inner.aggregate_severity.store(max, Ordering::Release);
+        // Release the check lock before waking subscribers: a subscriber's first
+        // act is to re-read the registry via `snapshot()`, which takes this same
+        // lock.
+        drop(checks);
+        self.inner.changed.send_modify(|n| *n = n.wrapping_add(1));
     }
 
     /// Mark `check` as [`CheckState::Ready`].
@@ -202,6 +226,9 @@ impl SubsystemHandle {
 #[derive(Clone)]
 pub struct HealthRegistry {
     subsystems: Arc<Mutex<BTreeMap<Arc<str>, Arc<SubsystemInner>>>>,
+    /// Change counter bumped on every genuine check transition; see
+    /// [`Self::subscribe`].
+    changed: Arc<watch::Sender<u64>>,
 }
 
 impl HealthRegistry {
@@ -210,7 +237,25 @@ impl HealthRegistry {
     pub fn new() -> Self {
         Self {
             subsystems: Arc::new(Mutex::new(BTreeMap::new())),
+            changed: Arc::new(watch::Sender::new(0)),
         }
+    }
+
+    /// Subscribe to check-state transitions.
+    ///
+    /// The carried `u64` is an opaque counter; treat any change as "re-read the
+    /// registry via [`Self::snapshot`]". It fires only when a check's state
+    /// actually changes — re-posting the state a check already holds is not a
+    /// transition, so a subsystem that re-asserts `ready` every reconcile tick
+    /// does not wake subscribers.
+    ///
+    /// The intended consumer is the discovery client's health reporter (#677),
+    /// which turns each transition into one `HealthReport` on the stream the node
+    /// has already authenticated — replacing the controller's unauthenticated
+    /// HTTP probe of this pod.
+    #[must_use]
+    pub fn subscribe(&self) -> watch::Receiver<u64> {
+        self.changed.subscribe()
     }
 
     /// Register a subsystem with a fixed set of check names.
@@ -248,8 +293,15 @@ impl HealthRegistry {
             name: Arc::clone(&name_arc),
             checks: Mutex::new(check_map),
             aggregate_severity: AtomicU8::new(initial_severity),
+            changed: Arc::clone(&self.changed),
         });
         subsystems.insert(name_arc, Arc::clone(&inner));
+        // Registration changes the snapshot's shape (a new Pending subsystem),
+        // so a reporter that started before this call must re-read. Bump after
+        // releasing the lock — a woken subscriber's first act is `snapshot()`,
+        // which takes it.
+        drop(subsystems);
+        self.changed.send_modify(|n| *n = n.wrapping_add(1));
         SubsystemHandle { inner }
     }
 

@@ -206,9 +206,9 @@ export function Fleet({ query }) {
  * own full-width line below so it can wrap without crowding the badge. The
  * footer carries the optional gateway ref and a single status chip.
  */
-function PodCard({ namespace, name, badge, meta, reachable, health, degradedChecks, onClick }) {
+function PodCard({ namespace, name, badge, meta, alive, aliveLabel, aliveTitle, connected, health, degradedChecks, onClick }) {
   return (
-    <Card error={!reachable} onClick={reachable ? onClick : undefined}>
+    <Card error={!alive} onClick={alive ? onClick : undefined}>
       <div class="card-top">
         <span class="card-ns">{namespace || '—'}</span>
         {badge}
@@ -219,28 +219,64 @@ function PodCard({ namespace, name, badge, meta, reachable, health, degradedChec
       </div>
       <CardFooter
         left={meta}
-        right={<CardStatusChip reachable={reachable} health={health} degradedChecks={degradedChecks} />}
+        right={
+          <CardStatusChip
+            alive={alive}
+            aliveLabel={aliveLabel}
+            aliveTitle={aliveTitle}
+            connected={connected}
+            health={health}
+            degradedChecks={degradedChecks}
+          />
+        }
       />
     </Card>
   );
 }
 
-/** Single per-pod status chip: one consistent pill for the whole reachable +
- *  health story (unreachable / degraded / healthy), replacing the old pairing of
- *  a "healthy" pill next to a differently-styled "reachable" dot. */
-function CardStatusChip({ reachable, health, degradedChecks }) {
-  if (!reachable) {
+/**
+ * Single per-pod status chip, showing the worst of three independent facts.
+ *
+ * Worst-first, because the chip has room for one:
+ *   1. not alive     — the pod itself is down (err)
+ *   2. disconnected  — alive and serving, but no config stream (warn)
+ *   3. degraded      — alive, streaming, but a subsystem isn't ready (warn)
+ *   4. healthy       — all three clear (ok)
+ *
+ * `connected` is `undefined` for controllers, which run a config *server* rather
+ * than a client and so have no such state to report; that step is skipped rather
+ * than rendered as a failure.
+ *
+ * Note "disconnected" is amber, not red: the pod is still serving traffic from
+ * its last-good snapshot. It is red only in the sense that it will not pick up
+ * config changes.
+ */
+function CardStatusChip({ alive, aliveLabel, aliveTitle, connected, health, degradedChecks }) {
+  if (alive === false) {
     return (
-      <span class="health-chip sm err" title="Did not respond to health probe">
+      <span class="health-chip sm err" title={aliveTitle}>
         <Icon name="alert" size={12} />
-        unreachable
+        {aliveLabel}
+      </span>
+    );
+  }
+  if (connected === false) {
+    return (
+      <span
+        class="health-chip sm warn"
+        title="Holds no config stream to the controller — still serving its last-good snapshot, but not receiving updates"
+      >
+        <Icon name="alert" size={12} />
+        disconnected
       </span>
     );
   }
   const degraded = Boolean(health) && health !== 'ready';
   const title = degraded
     ? `Degraded: ${(degradedChecks ?? []).join(', ') || 'subsystem not ready'}`
-    : 'All subsystems ready';
+    : health
+      ? 'All subsystems ready'
+      : 'Connected; no health report yet';
   return (
     <span class={`health-chip sm ${degraded ? 'warn' : 'ok'}`} title={title}>
       <Icon name={degraded ? 'alert' : 'check'} size={12} />
@@ -250,20 +286,29 @@ function CardStatusChip({ reachable, health, degradedChecks }) {
 }
 
 function ProxyCard({ proxy }) {
-  // Pool is known from the snapshot even when unreachable, so the type badge
-  // stays put; the status chip carries reachable/health. Gateway ref only (no
-  // IP) as secondary meta — present for dedicated proxies, empty for shared.
+  // Pool is known from the snapshot even when the pod is down, so the type badge
+  // stays put; the status chip carries ready/connected/health. Gateway ref only
+  // (no IP) as secondary meta — present for dedicated proxies, empty for shared.
   const pool = proxy.component === 'dedicated-proxy' ? 'dedicated' : 'shared';
+  // `ready` is absent on a pod whose Ready condition kubelet hasn't published
+  // yet. Unknown is not a fault, so treat it as alive and let the chip fall
+  // through to the connected/health steps.
+  const alive = proxy.ready !== false;
   return (
     <PodCard
       namespace={proxy.pod_namespace}
       name={proxy.pod_name}
       badge={poolBadge(pool)}
       meta={proxy.gateway_ref ?? ''}
-      reachable={proxy.reachable}
+      alive={alive}
+      aliveLabel="not ready"
+      aliveTitle="Kubelet reports this pod as not ready"
+      connected={proxy.connected}
       health={proxy.health}
       degradedChecks={proxy.degraded_checks}
-      onClick={proxy.reachable ? () => nav.proxy(proxy.pod_name) : undefined}
+      // Still clickable while disconnected: the detail view's routes come from
+      // the controller's own snapshot, not from the pod, so it works regardless.
+      onClick={alive ? () => nav.proxy(proxy.pod_name) : undefined}
     />
   );
 }
@@ -271,6 +316,10 @@ function ProxyCard({ proxy }) {
 function ControllerCard({ controller }) {
   // Leadership is only known when reachable; otherwise omit the role badge
   // rather than imply "standby". The status chip carries reachable/health.
+  //
+  // Controllers keep the probe-based `reachable` bit: they run a config *server*
+  // and are never clients, so no stream carries their state and `/statusz` is
+  // the only channel that can. `connected` is therefore not applicable here.
   const badge = controller.reachable ? (
     <Badge variant={controller.is_leader ? 'leader' : 'standby'}>
       {controller.is_leader ? 'leader' : 'standby'}
@@ -282,7 +331,9 @@ function ControllerCard({ controller }) {
       name={controller.pod_name}
       badge={badge}
       meta=""
-      reachable={controller.reachable}
+      alive={controller.reachable}
+      aliveLabel="unreachable"
+      aliveTitle="Did not respond to health probe"
       health={controller.health}
       degradedChecks={controller.degraded_checks}
       onClick={controller.reachable ? () => nav.controller(controller.pod_name) : undefined}

@@ -100,7 +100,7 @@ Coxswain is configured via environment variables. Each setting maps to an enviro
 | HTTP proxy | _(none)_ | `COXSWAIN_INGRESS_HTTP_PORT` | Inbound HTTP data plane |
 | HTTPS proxy | _(none)_ | `COXSWAIN_INGRESS_HTTPS_PORT` | Inbound HTTPS data plane (SNI TLS) |
 | Health | `8081` | `COXSWAIN_HEALTH_PORT` | `/healthz`, `/readyz` — kubelet probes |
-| Telemetry | `8083` | `COXSWAIN_TELEMETRY_PORT` | `/metrics`, `/statusz` — Prometheus and the controller's fleet-view probes. Never authenticated |
+| Telemetry | `8083` | `COXSWAIN_TELEMETRY_PORT` | `/metrics`, `/statusz` — Prometheus, and peer-controller probes only (proxies and relays report over the discovery stream). Never authenticated |
 | Operator | `8082` | `COXSWAIN_OPERATOR_PORT` | _(controller)_ operator UI and `/api/v1/*`. Every path authenticated when `operatorAuth` is set |
 | Discovery (Stream) | `50051` | `COXSWAIN_DISCOVERY_PORT` | _(controller)_ mTLS gRPC routing-snapshot stream |
 | Bootstrap | `50052` | `COXSWAIN_DISCOVERY_BOOTSTRAP_PORT` | _(controller)_ server-auth gRPC SVID issuance |

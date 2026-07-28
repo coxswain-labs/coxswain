@@ -1,60 +1,65 @@
-//! `/api/v1/proxies` endpoints — shared + dedicated proxy pods with liveness.
+//! `/api/v1/proxies` endpoints — shared + dedicated proxy pods with status.
+//!
+//! Every field here comes from a source the controller already holds, and none
+//! from a probe of the pod (#677). Three questions, three authorities:
+//!
+//! - **"is this pod alive?"** — the Pod's `Ready` condition, off the watch the
+//!   controller already runs. Kubelet ran the probe; re-running it from here
+//!   only adds a way to be wrong when the controller→pod path breaks.
+//! - **"is it taking config?"** — the node registry, fed by the pod's own
+//!   authenticated discovery stream.
+//! - **"what is broken on it?"** — the health report riding that same stream.
+//!
+//! These endpoints therefore answer only on the leader, which is where the
+//! registry lives; see [`OperatorAggregator::require_registry`].
 
 use http::Response;
 
 use coxswain_core::fleet::{Component, FleetEntry};
 use coxswain_core::ownership::ObjectKey;
 use coxswain_core::routing::{GatewayRoutingTable, IngressRoutingTable, RoutingTable};
-use futures::future::join_all;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use super::{OperatorAggregator, attach_health_rollup, json_response, not_found, pod_statusz_url};
+use super::{OperatorAggregator, attach_node_status, json_response, not_found};
 use crate::page::ListParams;
 use crate::routes_dto::{ConflictRow, HostGroup, RouteBlock, RouteRow, RoutesResponse};
 
 impl OperatorAggregator {
-    /// `GET /api/v1/proxies` — all shared + dedicated proxy pods with liveness.
-    pub(crate) async fn list_proxies(&self) -> Response<Vec<u8>> {
+    /// `GET /api/v1/fleet/proxies` — all shared + dedicated proxy pods.
+    ///
+    /// 503 on a standby, per [`Self::require_registry`].
+    pub(crate) fn list_proxies(&self, is_leader: bool) -> Response<Vec<u8>> {
+        let registry = match self.require_registry(is_leader) {
+            Ok(reg) => reg,
+            Err(resp) => return *resp,
+        };
         let snapshot = self.fleet.load();
-        let entries: Vec<FleetEntry> = snapshot
+        let results: Vec<serde_json::Value> = snapshot
             .shared_proxies
             .iter()
             .chain(&snapshot.dedicated_proxies)
-            .cloned()
-            .collect();
-        let probes: Vec<_> = entries
-            .iter()
-            .map(|e| async move {
-                // The liveness probe already returns the pod's full health body;
-                // parse it (rather than discard it) so the entry carries a health
-                // rollup without a second per-pod round-trip.
-                let url = pod_statusz_url(e);
-                match self.fetch_json(&url).await {
-                    Some(body) => {
-                        let mut v = Self::entry_json(e);
-                        v["reachable"] = serde_json::Value::Bool(true);
-                        attach_health_rollup(&mut v, &body);
-                        v
-                    }
-                    // Carry the full entry (component, namespace, …) even when
-                    // unreachable so the UI can still bucket the pod by component
-                    // and label it; "unreachable" is a probe outcome, not a loss
-                    // of fleet-snapshot identity.
-                    None => {
-                        let mut v = Self::entry_json(e);
-                        v["reachable"] = serde_json::Value::Bool(false);
-                        v
-                    }
-                }
+            .map(|e| {
+                // The full entry (component, namespace, restarts, …) is carried
+                // even for a disconnected pod: losing the stream does not lose
+                // the pod's identity, and "which pool was that dead pod in" is
+                // exactly what an operator needs then.
+                let mut v = Self::entry_json(e);
+                attach_node_status(&mut v, registry.nodes.get(&e.pod_name));
+                v
             })
             .collect();
-        let results = join_all(probes).await;
         json_response(serde_json::json!({ "proxies": results }).to_string())
     }
 
-    /// `GET /api/v1/proxies/{pod-name}` — single proxy pod info + liveness.
-    pub(crate) async fn get_proxy(&self, pod_name: &str) -> Response<Vec<u8>> {
+    /// `GET /api/v1/fleet/proxies/{pod-name}` — single proxy pod status.
+    ///
+    /// 503 on a standby, per [`Self::require_registry`].
+    pub(crate) fn get_proxy(&self, pod_name: &str, is_leader: bool) -> Response<Vec<u8>> {
+        let registry = match self.require_registry(is_leader) {
+            Ok(reg) => reg,
+            Err(resp) => return *resp,
+        };
         let snapshot = self.fleet.load();
         let entry = snapshot
             .shared_proxies
@@ -64,17 +69,9 @@ impl OperatorAggregator {
         let Some(entry) = entry else {
             return not_found();
         };
-        let url = pod_statusz_url(entry);
-        match self.fetch_json(&url).await {
-            Some(_) => {
-                let mut v = Self::entry_json(entry);
-                v["reachable"] = serde_json::Value::Bool(true);
-                json_response(v.to_string())
-            }
-            None => json_response(
-                serde_json::json!({ "pod_name": pod_name, "reachable": false }).to_string(),
-            ),
-        }
+        let mut v = Self::entry_json(entry);
+        attach_node_status(&mut v, registry.nodes.get(pod_name));
+        json_response(v.to_string())
     }
 
     /// `GET /api/v1/fleet/proxies/{pod-name}/routes` — this pod's compiled
@@ -83,9 +80,14 @@ impl OperatorAggregator {
     /// Read from the controller's own local snapshot (#537) rather than an
     /// HTTP fan-out to the pod: the controller computed this pod's routing
     /// world and pushed it over the discovery stream, so it already holds
-    /// exactly what the proxy would report. `reachable` is `true` whenever
-    /// `pod_name` is a known fleet member — there is no network call left to
-    /// fail here; pod-level liveness is `/api/v1/fleet/proxies/{name}/health`.
+    /// exactly what the proxy would report.
+    ///
+    /// Carries no status field. It used to emit a constant `reachable: true`,
+    /// left over from the fan-out it replaced — nothing read it, and keeping a
+    /// second, differently-defined `reachable` on the proxy surface after #677
+    /// split the real one into `ready`/`connected` would only invite reading
+    /// this one as pod liveness. That question is
+    /// `/api/v1/fleet/proxies/{name}/health`.
     pub(crate) async fn get_proxy_routes(
         &self,
         pod_name: &str,
@@ -105,10 +107,7 @@ impl OperatorAggregator {
             ingress: routes_block(&ingress, params),
             gateway: routes_block(&gateway, params),
         };
-        json_response(
-            serde_json::json!({ "pod_name": pod_name, "reachable": true, "routes": routes })
-                .to_string(),
-        )
+        json_response(serde_json::json!({ "pod_name": pod_name, "routes": routes }).to_string())
     }
 
     /// `GET /api/v1/fleet/proxies/{pod-name}/facets` — this pod's distinct
@@ -178,9 +177,24 @@ impl OperatorAggregator {
         }
     }
 
-    /// `GET /api/v1/proxies/{pod-name}/health` — fan-out to the pod's
-    /// `/statusz`.
-    pub(crate) async fn get_proxy_health(&self, pod_name: &str) -> Response<Vec<u8>> {
+    /// `GET /api/v1/fleet/proxies/{pod-name}/health` — that pod's subsystem
+    /// detail, as it last reported over the discovery stream (#677).
+    ///
+    /// The `health` body is byte-identical to what the pod's own `/statusz`
+    /// renders — same `HealthSnapshot` type, same `Serialize` impl — so this
+    /// swapped its source without changing its shape.
+    ///
+    /// `health` is **absent** when the node has not reported: a pod that just
+    /// connected, or a pre-#677 build mid-rollout. Absent means "unknown here",
+    /// which the UI must not render as unhealthy; `connected` distinguishes it
+    /// from a pod that is not streaming at all.
+    ///
+    /// 503 on a standby, per [`Self::require_registry`].
+    pub(crate) fn get_proxy_health(&self, pod_name: &str, is_leader: bool) -> Response<Vec<u8>> {
+        let registry = match self.require_registry(is_leader) {
+            Ok(reg) => reg,
+            Err(resp) => return *resp,
+        };
         let snapshot = self.fleet.load();
         let entry = snapshot
             .shared_proxies
@@ -190,7 +204,20 @@ impl OperatorAggregator {
         let Some(entry) = entry else {
             return not_found();
         };
-        self.fetch_pod_health(pod_name, entry).await
+        let node = registry.nodes.get(pod_name);
+        let mut body = serde_json::json!({
+            "pod_name": pod_name,
+            "ready": entry.ready,
+            "connected": node.is_some(),
+        });
+        if let Some(health) = node.and_then(|n| n.health.as_ref()) {
+            body["health"] = serde_json::json!({
+                "version": health.version,
+                "subsystems": health.snapshot.subsystems,
+            });
+            body["reported_at"] = serde_json::Value::String(super::fmt_rfc3339(health.reported_at));
+        }
+        json_response(body.to_string())
     }
 }
 
@@ -324,15 +351,33 @@ mod tests {
     use crate::aggregator::tests::*;
     use coxswain_core::cluster::SharedClusterSummary;
     use coxswain_core::fleet::SharedFleet;
+    use coxswain_core::health::CheckState;
     use http::StatusCode;
 
     // ── fleet-miss 404 ────────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn get_proxy_returns_404_when_pod_not_in_fleet() {
-        let agg = make_agg(SharedFleet::default(), SharedClusterSummary::default());
+    /// Aggregator over `pods` whose registry holds `nodes`, on the leader.
+    fn agg_with(
+        pods: impl IntoIterator<Item = k8s_openapi::api::core::v1::Pod>,
+        nodes: impl IntoIterator<Item = (&'static str, Option<Vec<(&'static str, CheckState)>>)>,
+    ) -> OperatorAggregator {
+        make_agg_with_registry(
+            fleet_with(pods),
+            SharedClusterSummary::default(),
+            registry_with(nodes),
+        )
+    }
+
+    /// A single healthy check set, the common case.
+    fn healthy() -> Option<Vec<(&'static str, CheckState)>> {
+        Some(vec![("routing_table_loaded", CheckState::Ready)])
+    }
+
+    #[test]
+    fn get_proxy_returns_404_when_pod_not_in_fleet() {
+        let agg = agg_with([], []);
         assert_eq!(
-            agg.get_proxy("missing").await.status(),
+            agg.get_proxy("missing", true).status(),
             StatusCode::NOT_FOUND
         );
     }
@@ -348,104 +393,252 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn get_proxy_health_returns_404_when_pod_not_in_fleet() {
-        let agg = make_agg(SharedFleet::default(), SharedClusterSummary::default());
+    #[test]
+    fn get_proxy_health_returns_404_when_pod_not_in_fleet() {
+        let agg = agg_with([], []);
         assert_eq!(
-            agg.get_proxy_health("missing").await.status(),
+            agg.get_proxy_health("missing", true).status(),
             StatusCode::NOT_FOUND
         );
     }
 
-    // ── fan-out: list_proxies ─────────────────────────────────────────────────
+    // ── leader gate (#677) ────────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn list_proxies_empty_fleet_returns_empty_array() {
-        let agg = make_agg(SharedFleet::default(), SharedClusterSummary::default());
-        let resp = agg.list_proxies().await;
+    #[test]
+    fn proxy_views_return_503_on_a_standby_rather_than_an_all_disconnected_fleet() {
+        // A standby accepts no discovery streams, so its registry is EMPTY, not
+        // partial. Serving it would report every proxy in the cluster as
+        // disconnected — indistinguishable from a real outage. 503 is the only
+        // honest answer.
+        let agg = agg_with(
+            [make_pod(
+                "proxy-0",
+                "shared-proxy",
+                "10.0.0.1",
+                "8082",
+                None,
+            )],
+            [("proxy-0", healthy())],
+        );
+
+        for (label, resp) in [
+            ("list", agg.list_proxies(false)),
+            ("get", agg.get_proxy("proxy-0", false)),
+            ("health", agg.get_proxy_health("proxy-0", false)),
+        ] {
+            assert_eq!(
+                resp.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{label} must refuse to answer on a standby, got {}",
+                resp.status()
+            );
+        }
+    }
+
+    // ── list_proxies ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn list_proxies_empty_fleet_returns_empty_array() {
+        let agg = agg_with([], []);
+        let resp = agg.list_proxies(true);
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
         assert_eq!(body["proxies"], serde_json::json!([]));
     }
 
-    #[tokio::test]
-    async fn list_proxies_marks_reachable_and_unreachable_pods() {
-        let live_port = start_mock_http(r#"{"ok":true}"#).await;
-        let dead_port = refused_port();
+    #[test]
+    fn list_proxies_reports_ready_and_connected_as_independent_facts() {
+        // The heart of #677. Three pods, three distinct states that the old
+        // single `reachable` bit could not tell apart:
+        //   - converged:    Ready + streaming
+        //   - disconnected: Ready + serving traffic, but stream gone (a relay
+        //                   flap evicts N of these at once)
+        //   - not_ready:    kubelet says the pod itself is broken
         let pods = [
-            make_pod(
-                "proxy-live",
-                "shared-proxy",
-                "127.0.0.1",
-                &live_port.to_string(),
-                None,
-            ),
-            make_pod(
-                "proxy-dead",
-                "shared-proxy",
-                "127.0.0.1",
-                &dead_port.to_string(),
-                None,
-            ),
+            make_pod("proxy-ok", "shared-proxy", "10.0.0.1", "8082", None),
+            make_pod("proxy-cut", "shared-proxy", "10.0.0.2", "8082", None),
+            make_pod_not_ready("proxy-sick", "shared-proxy", "10.0.0.3"),
         ];
-        let agg = make_agg(fleet_with(pods), SharedClusterSummary::default());
+        // Only proxy-ok and proxy-sick hold streams; proxy-cut's is gone.
+        let agg = agg_with(pods, [("proxy-ok", healthy()), ("proxy-sick", healthy())]);
 
-        let resp = agg.list_proxies().await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        let resp = agg.list_proxies(true);
         let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
         let proxies = body["proxies"].as_array().unwrap();
-        assert_eq!(proxies.len(), 2);
-        let live = proxies
-            .iter()
-            .find(|p| p["pod_name"] == "proxy-live")
-            .unwrap();
-        assert_eq!(live["reachable"], true);
-        let dead = proxies
-            .iter()
-            .find(|p| p["pod_name"] == "proxy-dead")
-            .unwrap();
-        assert_eq!(dead["reachable"], false);
+        let by_name = |n: &str| {
+            proxies
+                .iter()
+                .find(|p| p["pod_name"] == n)
+                .unwrap_or_else(|| panic!("{n} missing from the proxy list"))
+        };
+
+        assert_eq!(by_name("proxy-ok")["ready"], true);
+        assert_eq!(by_name("proxy-ok")["connected"], true);
+        assert_eq!(by_name("proxy-ok")["health"], "ready");
+        assert_eq!(by_name("proxy-ok")["version"], "1.2.3");
+
+        assert_eq!(
+            by_name("proxy-cut")["ready"],
+            true,
+            "a lost stream says nothing about whether the pod is alive"
+        );
+        assert_eq!(by_name("proxy-cut")["connected"], false);
+
+        assert_eq!(by_name("proxy-sick")["ready"], false);
+        assert_eq!(
+            by_name("proxy-sick")["connected"],
+            true,
+            "a not-Ready pod can still hold its stream"
+        );
     }
 
-    // ── fan-out: get_proxy ────────────────────────────────────────────────────
+    #[test]
+    fn list_proxies_keeps_pod_identity_for_a_disconnected_pod() {
+        // Losing the stream must not lose the fleet-snapshot identity: "which
+        // pool was that dead pod in" is exactly what an operator needs then.
+        let pods = [make_pod(
+            "ded-0",
+            "dedicated-proxy",
+            "10.0.0.1",
+            "8082",
+            Some("gw-a"),
+        )];
+        let agg = agg_with(pods, []);
 
-    #[tokio::test]
-    async fn get_proxy_reachable_returns_pod_info_with_reachable_true() {
-        let port = start_mock_http(r#"{"ok":true}"#).await;
-        let pod = make_pod(
+        let resp = agg.list_proxies(true);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        let entry = &body["proxies"][0];
+        assert_eq!(entry["connected"], false);
+        assert_eq!(entry["component"], "dedicated-proxy");
+        assert_eq!(entry["gateway_ref"], "gw-a");
+    }
+
+    #[test]
+    fn a_connected_pod_that_has_not_reported_health_is_not_rendered_unhealthy() {
+        // Mid-rollout, a pre-#677 build streams but sends no HealthReport. That
+        // must read as "connected, health unknown" — rendering it degraded would
+        // turn every rolling upgrade into a fleet-wide alarm.
+        let pods = [make_pod(
+            "proxy-old",
+            "shared-proxy",
+            "10.0.0.1",
+            "8082",
+            None,
+        )];
+        let agg = agg_with(pods, [("proxy-old", None)]);
+
+        let resp = agg.list_proxies(true);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        let entry = &body["proxies"][0];
+        assert_eq!(entry["connected"], true);
+        assert_eq!(entry["ready"], true);
+        assert!(
+            entry.get("health").is_none(),
+            "absent, not \"degraded\": got {entry}"
+        );
+        assert!(entry.get("degraded_checks").is_none());
+    }
+
+    #[test]
+    fn a_non_ready_check_surfaces_as_degraded_with_the_check_named() {
+        let pods = [make_pod(
             "proxy-0",
             "shared-proxy",
-            "127.0.0.1",
-            &port.to_string(),
+            "10.0.0.1",
+            "8082",
             None,
+        )];
+        let agg = agg_with(
+            pods,
+            [(
+                "proxy-0",
+                Some(vec![(
+                    "routing_table_loaded",
+                    CheckState::Degraded {
+                        reason: std::sync::Arc::from("snapshot stale"),
+                    },
+                )]),
+            )],
         );
-        let agg = make_agg(fleet_with([pod]), SharedClusterSummary::default());
 
-        let resp = agg.get_proxy("proxy-0").await;
+        let resp = agg.list_proxies(true);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        let entry = &body["proxies"][0];
+        assert_eq!(entry["health"], "degraded");
+        assert_eq!(
+            entry["degraded_checks"],
+            serde_json::json!(["proxy/routing_table_loaded"]),
+            "the check must be named subsystem/check so the UI can point at it"
+        );
+    }
+
+    // ── get_proxy / get_proxy_health ──────────────────────────────────────────
+
+    #[test]
+    fn get_proxy_returns_pod_info_with_both_status_fields() {
+        let pods = [make_pod(
+            "proxy-0",
+            "shared-proxy",
+            "10.0.0.1",
+            "8082",
+            None,
+        )];
+        let agg = agg_with(pods, [("proxy-0", healthy())]);
+
+        let resp = agg.get_proxy("proxy-0", true);
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
         assert_eq!(body["pod_name"], "proxy-0");
-        assert_eq!(body["reachable"], true);
+        assert_eq!(body["ready"], true);
+        assert_eq!(body["connected"], true);
         assert_eq!(body["component"], "shared-proxy");
     }
 
-    #[tokio::test]
-    async fn get_proxy_unreachable_returns_reachable_false() {
-        let port = refused_port();
-        let pod = make_pod(
+    #[test]
+    fn get_proxy_health_returns_the_reported_subsystem_tree() {
+        // The `health` body must keep the shape `/statusz` produced, so the UI's
+        // per-pod health view did not change contract when its source did.
+        let pods = [make_pod(
             "proxy-0",
             "shared-proxy",
-            "127.0.0.1",
-            &port.to_string(),
+            "10.0.0.1",
+            "8082",
             None,
-        );
-        let agg = make_agg(fleet_with([pod]), SharedClusterSummary::default());
+        )];
+        let agg = agg_with(pods, [("proxy-0", healthy())]);
 
-        let resp = agg.get_proxy("proxy-0").await;
+        let resp = agg.get_proxy_health("proxy-0", true);
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
         assert_eq!(body["pod_name"], "proxy-0");
-        assert_eq!(body["reachable"], false);
+        assert_eq!(body["connected"], true);
+        assert_eq!(body["health"]["version"], "1.2.3");
+        assert_eq!(
+            body["health"]["subsystems"]["proxy"]["checks"]["routing_table_loaded"]["state"],
+            "ready"
+        );
+        assert!(body.get("reported_at").is_some());
+    }
+
+    #[test]
+    fn get_proxy_health_omits_health_for_a_pod_that_has_not_reported() {
+        let pods = [make_pod(
+            "proxy-0",
+            "shared-proxy",
+            "10.0.0.1",
+            "8082",
+            None,
+        )];
+        let agg = agg_with(pods, []);
+
+        let resp = agg.get_proxy_health("proxy-0", true);
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["connected"], false);
+        assert!(
+            body.get("health").is_none(),
+            "no report yet means absent, not an empty or failed tree: got {body}"
+        );
     }
 
     // ── local re-source: get_proxy_routes / get_proxy_facets (#537) ──────────
@@ -464,7 +657,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
         assert_eq!(body["pod_name"], "proxy-0");
-        assert_eq!(body["reachable"], true);
+        assert!(
+            body.get("reachable").is_none(),
+            "the routes view carries no status field — that question belongs to \
+             /health, and a second `reachable` with a different meaning would be \
+             read as pod liveness; body: {body}"
+        );
         assert_eq!(body["routes"]["ingress"]["hosts"], serde_json::json!([]));
         assert_eq!(body["routes"]["gateway"]["hosts"], serde_json::json!([]));
     }
@@ -487,7 +685,6 @@ mod tests {
         let resp = agg.get_proxy_routes("ded-0", &ListParams::default()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
-        assert_eq!(body["reachable"], true);
         assert_eq!(body["routes"]["ingress"]["hosts"], serde_json::json!([]));
         assert_eq!(body["routes"]["gateway"]["hosts"], serde_json::json!([]));
     }
@@ -511,28 +708,5 @@ mod tests {
             agg.get_proxy_facets("missing").await.status(),
             StatusCode::NOT_FOUND
         );
-    }
-
-    // ── fan-out: get_proxy_health ─────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn get_proxy_health_reachable_returns_health_key() {
-        let health_body = r#"{"version":"0.0.1","subsystems":{"reflector":"ok"}}"#;
-        let port = start_mock_http(health_body).await;
-        let pod = make_pod(
-            "proxy-0",
-            "shared-proxy",
-            "127.0.0.1",
-            &port.to_string(),
-            None,
-        );
-        let agg = make_agg(fleet_with([pod]), SharedClusterSummary::default());
-
-        let resp = agg.get_proxy_health("proxy-0").await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
-        assert_eq!(body["pod_name"], "proxy-0");
-        assert_eq!(body["reachable"], true);
-        assert!(body.get("health").is_some());
     }
 }

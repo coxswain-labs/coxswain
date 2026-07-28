@@ -2,15 +2,15 @@
   "apiVersion": "v1",
   "kind": "Pod",
   "metadata": {
-    "name": "tenant-a-gw-coxswain-7db74-j8cjt",
-    "namespace": "tenant-a",
-    "uid": "a1b2c3d4-0000-4000-8000-000000000004",
-    "resourceVersion": "1028",
-    "creationTimestamp": "2026-06-12T04:30:00Z",
+    "name": "coxswain-shared-proxy-66d-cut01",
+    "namespace": "coxswain-system",
+    "uid": "a1b2c3d4-0000-4000-8000-000000000002",
+    "resourceVersion": "1014",
+    "creationTimestamp": "2026-06-10T02:30:00Z",
     "labels": {
       "app.kubernetes.io/name": "coxswain",
-      "app.kubernetes.io/component": "dedicated-proxy",
-      "pod-template-hash": "7db74"
+      "app.kubernetes.io/component": "shared-proxy",
+      "pod-template-hash": "66d"
     },
     "annotations": {
       "coxswain-labs.dev/admin-port": "8082"
@@ -19,8 +19,8 @@
       {
         "apiVersion": "apps/v1",
         "kind": "ReplicaSet",
-        "name": "tenant-a-gw-coxswain-7db74",
-        "uid": "rs-dedicated-proxy-4",
+        "name": "coxswain-shared-proxy-66d",
+        "uid": "rs-shared-proxy-2",
         "controller": true,
         "blockOwnerDeletion": true
       }
@@ -28,14 +28,15 @@
   },
   "spec": {
     "serviceAccountName": "coxswain-proxy",
-    "nodeName": "node-w-1",
+    "nodeName": "node-w-2",
     "containers": [
       {
         "name": "coxswain",
         "image": "ghcr.io/coxswain-labs/coxswain:v0.1.0",
         "args": [
           "serve",
-          "proxy"
+          "proxy",
+          "--shared"
         ],
         "ports": [
           {
@@ -90,9 +91,9 @@
   },
   "status": {
     "phase": "Running",
-    "podIP": "10.42.0.104",
+    "podIP": "10.42.0.102",
     "hostIP": "192.168.65.4",
-    "startTime": "2026-06-12T04:30:00Z",
+    "startTime": "2026-06-10T02:30:00Z",
     "conditions": [
       {
         "type": "Initialized",
@@ -120,7 +121,7 @@
         "restartCount": 0,
         "state": {
           "running": {
-            "startedAt": "2026-06-12T04:30:00Z"
+            "startedAt": "2026-06-10T02:30:00Z"
           }
         }
       }

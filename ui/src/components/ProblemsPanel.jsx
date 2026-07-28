@@ -9,9 +9,18 @@ import { Icon } from './Icon.jsx';
  *
  * Ordering is by severity, highest first:
  *   1. No elected leader   — control plane can't write status
- *   2. Unreachable pods    — a pod is down / not responding
- *   3. Routing conflicts   — a route rule is silently shadowed
- *   4. Dead backends       — accepted route, 0 ready endpoints (503s)
+ *   2. Not-ready pods      — the pod itself is down
+ *   3. Disconnected pods   — pod is fine, but it stopped receiving config
+ *   4. Degraded pods       — pod reports a subsystem that isn't ready
+ *   5. Routing conflicts   — a route rule is silently shadowed
+ *   6. Dead backends       — accepted route, 0 ready endpoints (503s)
+ *
+ * "Not ready" and "disconnected" are separate sections, not one "unreachable"
+ * list, because they have different causes and different fixes: a not-ready pod
+ * is broken, while a disconnected one is healthy and still serving — it just
+ * froze on its last config. They also arrive at very different scales: one relay
+ * losing its stream disconnects its entire leaf subtree at once, and filing that
+ * under "pods are down" would page someone for a cluster that is serving fine.
  *
  * Every card deep-links to the most specific reachable view. Conflicts and dead
  * backends carry host/path + the proxy pods that see them, so they link to that
@@ -20,9 +29,9 @@ import { Icon } from './Icon.jsx';
  * route's identity (the proxy table is compiled). That's a follow-up that needs
  * the controller to resolve host/path → route.
  */
-export function ProblemsPanel({ conflicts = [], dead_routes = [], unreachable = [], degraded = [], leaderGap = false }) {
+export function ProblemsPanel({ conflicts = [], dead_routes = [], not_ready = [], disconnected = [], degraded = [], leaderGap = false }) {
   const total =
-    (leaderGap ? 1 : 0) + unreachable.length + degraded.length + conflicts.length + dead_routes.length;
+    (leaderGap ? 1 : 0) + not_ready.length + disconnected.length + degraded.length + conflicts.length + dead_routes.length;
 
   if (total === 0) {
     return <AllClear />;
@@ -47,23 +56,45 @@ export function ProblemsPanel({ conflicts = [], dead_routes = [], unreachable = 
         </ProblemSection>
       )}
 
-      {unreachable.length > 0 && (
+      {not_ready.length > 0 && (
         <ProblemSection
-          title="Unreachable pods"
-          count={unreachable.length}
+          title="Pods not ready"
+          count={not_ready.length}
           severity="err"
-          desc="These pods did not respond to a health probe. Check pod logs and RBAC."
+          desc="These pods are down: a proxy or relay whose readiness probe is failing, or a controller replica that did not answer. Check pod logs and RBAC."
         >
-          {unreachable.map((p) => (
+          {not_ready.map((p) => (
             <ProblemCard
               key={p.pod_name}
               variant="err"
               namespace={p.pod_namespace}
               kind={componentLabel(p.component)}
-              badge={<Badge variant="fail">unreachable</Badge>}
+              badge={<Badge variant="fail">not ready</Badge>}
               title={p.pod_name}
-              detail={`${p.component === 'controller' ? 'Controller' : 'Proxy'} did not respond to health probe.`}
-              onClick={p.component === 'controller' ? () => nav.controller(p.pod_name) : () => nav.proxy(p.pod_name)}
+              detail={notReadyDetail(p)}
+              onClick={podTarget(p)}
+            />
+          ))}
+        </ProblemSection>
+      )}
+
+      {disconnected.length > 0 && (
+        <ProblemSection
+          title="Disconnected pods"
+          count={disconnected.length}
+          severity="warn"
+          desc="These pods are running and still serving traffic, but they hold no config stream to the controller — so they are frozen on the last routing snapshot they received and will not pick up changes. If several disconnected at once, suspect the relay in front of them rather than the pods."
+        >
+          {disconnected.map((p) => (
+            <ProblemCard
+              key={p.pod_name}
+              variant="warn"
+              namespace={p.pod_namespace}
+              kind={componentLabel(p.component)}
+              badge={<Badge variant="warn">disconnected</Badge>}
+              title={p.pod_name}
+              detail="Serving its last-good snapshot; not receiving config updates."
+              onClick={podTarget(p)}
             />
           ))}
         </ProblemSection>
@@ -74,7 +105,7 @@ export function ProblemsPanel({ conflicts = [], dead_routes = [], unreachable = 
           title="Degraded pods"
           count={degraded.length}
           severity="warn"
-          desc="These pods are reachable but report a subsystem that isn't ready. Traffic may still flow, but the impaired subsystem needs attention — open the pod to see and follow logs for the failing check."
+          desc="These pods report a subsystem that isn't ready. Traffic may still flow, but the impaired subsystem needs attention — open the pod to see and follow logs for the failing check."
         >
           {degraded.map((p) => (
             <ProblemCard
@@ -85,7 +116,7 @@ export function ProblemsPanel({ conflicts = [], dead_routes = [], unreachable = 
               badge={<Badge variant="warn">degraded</Badge>}
               title={p.pod_name}
               detail={degradedDetail(p)}
-              onClick={p.component === 'controller' ? () => nav.controller(p.pod_name) : () => nav.proxy(p.pod_name)}
+              onClick={podTarget(p)}
             />
           ))}
         </ProblemSection>
@@ -144,7 +175,8 @@ function AllClear() {
   const checks = [
     'No routing conflicts',
     'All backends have ready endpoints',
-    'All pods reachable',
+    'All pods ready',
+    'All pods receiving config',
     'All subsystems ready',
     'Leader elected',
   ];
@@ -195,7 +227,32 @@ function componentLabel(component) {
     case 'controller': return 'Controller';
     case 'shared-proxy': return 'Proxy (shared)';
     case 'dedicated-proxy': return 'Proxy (dedicated)';
+    case 'relay': return 'Relay';
     default: return component || '';
+  }
+}
+
+/** The detail line for a not-ready pod. Controllers land here from a failed
+ *  peer probe (they run no config stream, so that is the only signal); proxies
+ *  and relays land here from kubelet's own readiness verdict. */
+function notReadyDetail(p) {
+  return p.component === 'controller'
+    ? 'Controller did not respond to a health probe.'
+    : 'Kubelet reports this pod as not ready.';
+}
+
+/** Deep-link a fleet problem card to wherever that pod is actually rendered.
+ *
+ *  Relays go to the Topology screen rather than the proxy detail: `/fleet/proxies`
+ *  lists shared and dedicated proxies only, so a relay has no entry there, and a
+ *  proxy detail page could not describe a relay anyway (it renders a compiled
+ *  route table; a relay serves a namespace aggregate). Topology is the one view
+ *  that draws the relay tier. */
+function podTarget(p) {
+  switch (p.component) {
+    case 'controller': return () => nav.controller(p.pod_name);
+    case 'relay': return () => nav.topology();
+    default: return () => nav.proxy(p.pod_name);
   }
 }
 

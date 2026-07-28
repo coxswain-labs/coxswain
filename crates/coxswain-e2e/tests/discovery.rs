@@ -2981,3 +2981,315 @@ async fn topology_survives_a_leader_change() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ── Group 6 — Node health over the discovery stream (#677) ────────────────────
+
+/// Fetch a JSON body from the operator API, failing with the URL in context.
+async fn fetch_operator_json(url: &str) -> anyhow::Result<serde_json::Value> {
+    let body = reqwest::get(url)
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .text()
+        .await
+        .with_context(|| format!("read body of {url}"))?;
+    serde_json::from_str(&body).with_context(|| format!("parse JSON from {url}: {body}"))
+}
+
+/// Locate a pod's entry in a `/api/v1/fleet/proxies` payload.
+fn proxy_entry<'a>(body: &'a serde_json::Value, pod: &str) -> Option<&'a serde_json::Value> {
+    body.get("proxies")?
+        .as_array()?
+        .iter()
+        .find(|p| p.get("pod_name").and_then(|v| v.as_str()) == Some(pod))
+}
+
+/// Happy path: the controller reports a converged proxy's readiness, stream
+/// state, and subsystem health **without ever dialling the pod** (#677).
+///
+/// This is the end-to-end proof that the HTTP fan-out was replaced rather than
+/// relocated. The health body reaching the operator API can only have arrived
+/// over the proxy's own mTLS discovery stream: nothing else carries a
+/// `HealthReport`, and the controller no longer probes a proxy's `/statusz` on
+/// any admin code path.
+///
+/// Read-only against the standing shared proxy — it mutates nothing, so it is
+/// atomic on the shared fixture.
+#[tokio::test]
+async fn fleet_view_reports_a_converged_proxy_as_ready_and_connected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let pod = leader::shared_proxy_pod_name(&h.client).await?;
+    let url = h.controller_operator_url("/api/v1/fleet/proxies");
+
+    // Poll rather than assert once: the shared proxy is converged in the
+    // standing fixture, but the serial pass may have just restarted the
+    // controller, and a reconnecting proxy re-reports health on stream open.
+    let entry = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || {
+            let (url, pod) = (url.clone(), pod.clone());
+            async move {
+                match fetch_operator_json(&url).await {
+                    Ok(b) => format!(
+                        "fleet view at '{url}' to report '{pod}' connected with a health report; \
+                         last entry: {:?}",
+                        proxy_entry(&b, &pod)
+                    ),
+                    Err(e) => format!("fleet view at '{url}' to answer; last fetch failed: {e}"),
+                }
+            }
+        },
+        || {
+            let (url, pod) = (url.clone(), pod.clone());
+            async move {
+                let body = fetch_operator_json(&url).await.ok()?;
+                let entry = proxy_entry(&body, &pod)?;
+                // Poll the *whole* converged condition, not a weaker prefix of
+                // it. On every reconnect the client marks `routing_table_loaded`
+                // Degraded and pre-queues a report carrying that state BEFORE
+                // the replacement snapshot lands — so `connected && health
+                // present` is briefly true with `health == "degraded"` after a
+                // controller restart, a leader failover, or an SVID rotation.
+                // Accepting that here and asserting "ready" below would flake
+                // exactly when the serial pass restarts the controller.
+                let converged = entry.get("connected")?.as_bool()?
+                    && entry.get("health")?.as_str()? == "ready"
+                    && entry.get("degraded_checks")? == &serde_json::json!([]);
+                converged.then(|| entry.clone())
+            }
+        },
+    )
+    .await
+    .context("the shared proxy never reached connected with an all-ready health report")?;
+
+    assert_eq!(
+        entry.get("ready").and_then(|v| v.as_bool()),
+        Some(true),
+        "kubelet reports the converged shared proxy Ready; entry: {entry}"
+    );
+    assert_eq!(
+        entry.get("health").and_then(|v| v.as_str()),
+        Some("ready"),
+        "a converged proxy reports every check ready; entry: {entry}"
+    );
+    assert_eq!(
+        entry.get("degraded_checks"),
+        Some(&serde_json::json!([])),
+        "a ready proxy names no failing checks; entry: {entry}"
+    );
+    // The version can only come from the reporting pod's own binary — the
+    // controller has no other way to learn it now that it does not probe.
+    assert!(
+        entry
+            .get("version")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty()),
+        "the report must carry the reporting build's version; entry: {entry}"
+    );
+    assert!(
+        entry.get("reported_at").and_then(|v| v.as_str()).is_some(),
+        "the report must carry the time the pod sampled itself; entry: {entry}"
+    );
+    // The retired field must be gone, not merely shadowed: leaving it would mean
+    // some probe still ran to produce it.
+    assert!(
+        entry.get("reachable").is_none(),
+        "`reachable` is retired — its presence means a probe still runs; entry: {entry}"
+    );
+
+    // The per-pod health view serves the same tree the pod's own /statusz does.
+    // Polled, not fetched once: a reconnect between the two calls would leave
+    // the tree Degraded for the same window described in the predicate above.
+    let health_url = h.controller_operator_url(&format!("/api/v1/fleet/proxies/{pod}/health"));
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || {
+            let url = health_url.clone();
+            async move {
+                format!(
+                    "per-pod health at '{url}' to report proxy/routing_table_loaded ready; \
+                     last body: {:?}",
+                    fetch_operator_json(&url).await
+                )
+            }
+        },
+        || {
+            let url = health_url.clone();
+            async move {
+                let body = fetch_operator_json(&url).await.ok()?;
+                (body.pointer("/health/subsystems/proxy/checks/routing_table_loaded/state")
+                    == Some(&serde_json::json!("ready")))
+                .then_some(())
+            }
+        },
+    )
+    .await
+    .context("the per-pod health view never carried an all-ready subsystem tree")?;
+
+    // And the proxy contributes to no fleet problem bucket while converged.
+    let problems_url = h.controller_operator_url("/api/v1/problems");
+    let buckets = |body: &serde_json::Value, pod: &str| -> Vec<String> {
+        ["not_ready", "disconnected", "degraded"]
+            .into_iter()
+            .filter(|b| {
+                body["fleet"][*b]
+                    .as_array()
+                    .is_some_and(|a| a.iter().any(|p| p["pod_name"].as_str() == Some(pod)))
+            })
+            .map(ToOwned::to_owned)
+            .collect()
+    };
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || {
+            let (url, pod) = (problems_url.clone(), pod.clone());
+            async move {
+                match fetch_operator_json(&url).await {
+                    Ok(b) => format!(
+                        "'{pod}' to appear in no fleet problem bucket; currently in {:?}",
+                        buckets(&b, &pod)
+                    ),
+                    Err(e) => format!("problems at '{url}' to answer; last fetch failed: {e}"),
+                }
+            }
+        },
+        || {
+            let (url, pod) = (problems_url.clone(), pod.clone());
+            async move {
+                let body = fetch_operator_json(&url).await.ok()?;
+                buckets(&body, &pod).is_empty().then_some(())
+            }
+        },
+    )
+    .await
+    .context("a converged proxy stayed in a fleet problem bucket")?;
+    Ok(())
+}
+
+/// Sad path: a proxy that never establishes a discovery stream is never
+/// admitted to the node registry, and so can never be reported healthy (#677).
+///
+/// The pod has a wrong trust domain, so its mTLS handshake fails — while its
+/// container runs normally with a live telemetry port. That combination is what
+/// makes the negative sharp: this pod **would answer** a `/statusz` probe. The
+/// pre-#677 controller would have reported it reachable and healthy, exactly
+/// masking a proxy that is receiving no config at all. Only a registry-sourced
+/// view can tell that it is not streaming.
+///
+/// ## Why this asserts on the registry rather than `/api/v1/fleet/proxies`
+///
+/// The controller's Pod watch is scoped to the tenant namespaces plus the
+/// install namespace, so a proxy in a test-owned namespace never enters
+/// `FleetSnapshot` and cannot appear in the fleet view at all — labelling it
+/// changes nothing.
+///
+/// Deploying it into the install namespace instead would put it in scope, and is
+/// deliberately NOT done: a `SharedPool`-scoped pod that never binds a listener
+/// holds `all_shared_nodes_bound` false, which would wedge the `Programmed` gate
+/// for every Gateway in every test that runs after this one. The blast radius of
+/// that fixture dwarfs what it would prove.
+///
+/// The `connected: false` rendering itself — the fleet entry, the `disconnected`
+/// problems bucket, and the absent `health` key — is therefore covered by the
+/// aggregator unit tests in `coxswain-admin/src/aggregator/{proxies,problems}.rs`,
+/// which construct that registry state directly.
+#[tokio::test]
+async fn a_proxy_that_never_streams_is_never_admitted_to_the_registry() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "disc-nostream").await?;
+    copy_trust_bundle(&h.client, &ns.name).await?;
+
+    let deploy = shared_proxy_deployment(&ns.name, "disc-nostream", "wrong.example")?;
+    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
+    deployments
+        .create(&PostParams::default(), &deploy)
+        .await
+        .context("create disc-nostream Deployment")?;
+
+    // The pod runs, but its handshake fails, so it never reaches the registry.
+    assert_pod_stays_not_ready(
+        &h.client,
+        &ns.name,
+        "app=disc-nostream",
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    let topology = fetch_topology(&h.controller_operator_url("/api/v1/topology")).await?;
+    assert!(
+        find_node(&topology, "disc-nostream").is_none(),
+        "a proxy whose handshake fails must never enter the node registry, so no view \
+         built from that registry can report it healthy; topology: {topology}"
+    );
+
+    // The standing shared proxy is the control: it holds a stream in the very
+    // same fetch, so an empty registry cannot be what produced the result above.
+    let pod = leader::shared_proxy_pod_name(&h.client).await?;
+    let converged = find_node(&topology, &pod).with_context(|| {
+        format!("the standing shared proxy '{pod}' is missing from the topology; {topology}")
+    })?;
+    assert_eq!(
+        converged.get("health").and_then(|v| v.as_str()),
+        Some("ready"),
+        "control: a proxy that DOES stream carries a health report in the same \
+         fetch; node: {converged}"
+    );
+    Ok(())
+}
+
+/// Sad path: a standby controller **refuses** to answer the registry-backed
+/// fleet views rather than reporting an empty registry as a dead fleet (#677).
+///
+/// A standby accepts no discovery streams, so its registry is empty rather than
+/// partial: answering `200` would report every proxy in the cluster as
+/// disconnected, which is indistinguishable from a real outage. This is also the
+/// sharpest available proof that the data source actually changed — a
+/// probe-based implementation would happily answer from any replica.
+#[tokio::test]
+async fn a_standby_refuses_the_fleet_view_instead_of_reporting_a_dead_fleet() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let leader_pod = leader::leader_pod_name(&h.client).await?;
+
+    let pods: Api<Pod> = Api::namespaced(h.client.clone(), leader::SYSTEM_NAMESPACE);
+    let standby = pods
+        .list(&ListParams::default().labels("app.kubernetes.io/component=controller"))
+        .await?
+        .into_iter()
+        .filter(leader::pod_is_ready)
+        .filter_map(|p| p.metadata.name)
+        .find(|n| *n != leader_pod)
+        .context(
+            "HA default runs >= 2 controller replicas; found no Ready standby besides the \
+             leader, so the standby assertion never ran",
+        )?;
+
+    let fwd = leader::pod_operator_forward(&standby).await?;
+    for path in ["/api/v1/fleet/proxies", "/api/v1/topology"] {
+        let url = format!("{}{path}", fwd.base_url);
+        let status = reqwest::get(&url)
+            .await
+            .with_context(|| format!("GET {url}"))?
+            .status();
+        assert_eq!(
+            status,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "standby {standby} must refuse '{path}' (503), not answer from an empty registry; \
+             got {status}"
+        );
+    }
+
+    // The leader answers the same path, so the 503 above is the standby gate
+    // firing rather than the endpoint being broken everywhere.
+    let leader_status = reqwest::get(h.controller_operator_url("/api/v1/fleet/proxies"))
+        .await?
+        .status();
+    assert_eq!(
+        leader_status,
+        reqwest::StatusCode::OK,
+        "the leader must still serve the fleet view; got {leader_status}"
+    );
+    Ok(())
+}

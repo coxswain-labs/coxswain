@@ -4,9 +4,9 @@
   "metadata": {
     "name": "tenant-a-gw-coxswain-7db74-r5tfb",
     "namespace": "tenant-a",
-    "uid": "a1b2c3d4-0000-4000-8000-000000000003",
-    "resourceVersion": "1021",
-    "creationTimestamp": "2026-06-11T03:30:00Z",
+    "uid": "a1b2c3d4-0000-4000-8000-000000000005",
+    "resourceVersion": "1035",
+    "creationTimestamp": "2026-06-08T05:30:00Z",
     "labels": {
       "app.kubernetes.io/name": "coxswain",
       "app.kubernetes.io/component": "dedicated-proxy",
@@ -20,7 +20,7 @@
         "apiVersion": "apps/v1",
         "kind": "ReplicaSet",
         "name": "tenant-a-gw-coxswain-7db74",
-        "uid": "rs-dedicated-proxy-3",
+        "uid": "rs-dedicated-proxy-5",
         "controller": true,
         "blockOwnerDeletion": true
       }
@@ -28,7 +28,7 @@
   },
   "spec": {
     "serviceAccountName": "coxswain-proxy",
-    "nodeName": "node-cp-1",
+    "nodeName": "node-w-2",
     "containers": [
       {
         "name": "coxswain",
@@ -90,9 +90,9 @@
   },
   "status": {
     "phase": "Running",
-    "podIP": "10.42.0.103",
+    "podIP": "10.42.0.105",
     "hostIP": "192.168.65.4",
-    "startTime": "2026-06-11T03:30:00Z",
+    "startTime": "2026-06-08T05:30:00Z",
     "conditions": [
       {
         "type": "Initialized",
@@ -117,10 +117,10 @@
         "image": "ghcr.io/coxswain-labs/coxswain:v0.1.0",
         "ready": true,
         "started": true,
-        "restartCount": 1,
+        "restartCount": 4,
         "state": {
           "running": {
-            "startedAt": "2026-06-11T03:30:00Z"
+            "startedAt": "2026-06-08T05:30:00Z"
           }
         }
       }

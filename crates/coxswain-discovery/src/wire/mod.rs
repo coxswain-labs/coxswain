@@ -1,5 +1,6 @@
 //! Wire-DTO conversions.
 pub(crate) mod endpoints;
+pub(crate) mod health;
 pub mod listener_status;
 pub mod resource;
 pub mod routing;
@@ -11,6 +12,8 @@ pub use resource::*;
 pub use routing::*;
 pub use scope::*;
 pub use tls::*;
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::WireError;
 
@@ -28,6 +31,27 @@ use crate::error::WireError;
 /// Returns [`WireError::ValueOutOfRange`] if `raw` exceeds `u16::MAX`.
 pub(crate) fn narrow_u16(raw: u32, field: &'static str) -> Result<u16, WireError> {
     u16::try_from(raw).map_err(|_| WireError::ValueOutOfRange { field, value: raw })
+}
+
+/// Encode a [`SystemTime`] as Unix seconds for the wire.
+///
+/// Clamped at both ends rather than fallible: a pre-epoch time reads 0 and a
+/// far-future one saturates `i64`. Every wire timestamp is diagnostic (report
+/// and ack times shown in the operator UI), so a host with a broken clock
+/// should degrade to a nonsense-but-harmless value, not fail the message that
+/// carries real state alongside it.
+pub(crate) fn system_time_to_unix(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Inverse of [`system_time_to_unix`], clamping a negative value to the epoch
+/// rather than panicking on the subtraction.
+pub(crate) fn unix_to_system_time(secs: i64) -> SystemTime {
+    u64::try_from(secs)
+        .ok()
+        .map_or(UNIX_EPOCH, |s| UNIX_EPOCH + Duration::from_secs(s))
 }
 
 #[cfg(test)]

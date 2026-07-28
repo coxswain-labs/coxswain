@@ -94,7 +94,7 @@ Two shapes:
 
 `Namespace` is exclusively the relay's *upstream* subscription: no leaf ever uses it, and a relay's own downstream server rejects it (relay-behind-relay is out of scope in v1). Bootstrap is **not** tiered &mdash; every node, relays included, obtains its SVID directly from the controller's all-replicas bootstrap listener.
 
-The wire changes are additive over v2 (the `Namespace` scope kind, the `GatewayMeta` resource, the `RosterReport` client message, and an envelope `publish_seq` on `Snapshot`; `WIRE_VERSION` stays 2), so all of the convergence machinery above is unchanged: version and per-Gateway publish-seq propagate verbatim leader &rarr; relay &rarr; leaf.
+The wire changes are additive over v2 (the `Namespace` scope kind, the `GatewayMeta` resource, the `RosterReport` and `HealthReport` client messages, and an envelope `publish_seq` on `Snapshot`; `WIRE_VERSION` stays 2), so all of the convergence machinery above is unchanged: version and per-Gateway publish-seq propagate verbatim leader &rarr; relay &rarr; leaf.
 
 ### Leaf roster reporting (`RosterReport`)
 
@@ -106,11 +106,27 @@ A relay's leaves connect to the relay, not the controller, so without extra plum
 
 The `Programmed` gate then evaluates the folded **leaf** entries, never the relay's own ack (a relay caches but binds nothing; its own row is excluded from the shared quorum by the `is_relay` flag, and it is never `Gateway`-scoped). Relay outage evicts the subtree, so a re-arming gate fails closed rather than gating a new publish on a blind spot.
 
+### Node health reporting (`HealthReport`)
+
+Every proxy and relay reports **its own subsystem health** up the same stream, as a `HealthReport` client message: the reporting build's version plus each subsystem's named checks and their states. It is sent immediately after `Subscribe` on every (re)connect, and again on every genuine check transition — re-asserting a state a check already holds is not a transition, so a subsystem that re-confirms itself every reconcile tick sends nothing.
+
+This is what lets the operator API answer "what is broken on that pod" without dialling the pod. The controller previously fanned out plain, unauthenticated HTTP to each pod's `/statusz`, which meant maintaining a back-channel it could not authenticate in order to ask a question the pod could simply tell it over a stream already secured by SVID mTLS.
+
+A relay-fronted leaf never streams to the controller at all, so its health rides its relay's `RosterReport` alongside its convergence state; the fold carries it onto the leaf's registry row unchanged. A relay reports its own health directly, since a relay never appears in its own roster.
+
+Three properties are load-bearing:
+
+- **It is its own message kind, not a field on `NodeStatus`.** `NodeStatus.bound_ports` is wholesale-replace and proto3 gives a `repeated` field no presence, so a relay — which binds no listener ports — could not send health inside a `NodeStatus` without also sending an empty port set, which the controller must read as an affirmative "nothing bound" and which would fail that node's `Programmed` bind gate.
+- **It gates nothing.** `Programmed` turns on acked versions and bound ports; health is operator-visible only. A node cannot affect any other node's readiness by reporting badly, and recording health deliberately does not wake the gate.
+- **Absent means unknown, never unhealthy.** A node that just connected, or one still on a build that predates health reporting, has no report. That renders as "connected, health unknown" — the alternative would turn every rolling upgrade into a fleet-wide alarm.
+
+There is no periodic heartbeat, because the stream is itself the freshness proof: while it is up, the last report *is* the current state. The report carries the time the node sampled its own registry, which measures lag through a relay's coalesce-and-fold hop — the only staleness the stream cannot rule out.
+
 ### Failure and rollout
 
 - **Controller outage** &mdash; the relay serves its last-good world (the same last-good / self-healing invariants above), degrades its health, and reconverges on reconnect. Leaves never disconnect.
 - **Relay outage** &mdash; leaves serve last-good and reconverge when the relay returns (a reconnecting leaf gets a fresh full via the `expect_full` gate). Relay HA is &ge;2 replicas behind the relay's Service, so a single-replica bounce is transparent. If a relay is genuinely unreachable (e.g. torn down in a rebalance race), the leaf **re-bootstraps** to the controller &mdash; the always-up anchor &mdash; and is re-pointed at whatever upstream is current. This is a bounded, last-resort SVID handshake per affected leaf, not a routing-snapshot stampede; the data plane keeps serving its last-good snapshot throughout the control-stream reconnect.
-- **Rollout order** is controller &rarr; relay &rarr; leaf, the same skew direction the wire already tolerates: a newer controller serves an older relay/leaf, and the additive `Namespace` / `GatewayMeta` resources are inert on any leaf that never subscribes them.
+- **Rollout order** is controller &rarr; relay &rarr; leaf, the same skew direction the wire already tolerates: a newer controller serves an older relay/leaf, and the additive `Namespace` / `GatewayMeta` resources are inert on any leaf that never subscribes them. A leaf that predates `HealthReport` simply never sends one and reads as "connected, health unknown" until it rolls.
 
 ## How `Programmed` status is gated
 

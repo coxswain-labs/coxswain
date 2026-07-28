@@ -1,7 +1,7 @@
 {
   "fleet": {
     "leaderless": false,
-    "unreachable": [
+    "not_ready": [
       {
         "pod_name": "coxswain-controller-7f9c8-gone",
         "pod_namespace": "coxswain-system",
@@ -12,7 +12,23 @@
         "pod_name": "tenant-b-gw-coxswain-5cc91-zzz00",
         "pod_namespace": "tenant-b",
         "component": "dedicated-proxy",
-        "reachable": false
+        "ready": false
+      }
+    ],
+    "disconnected": [
+      {
+        "pod_name": "coxswain-shared-proxy-66d-cut01",
+        "pod_namespace": "coxswain-system",
+        "component": "shared-proxy",
+        "ready": true,
+        "connected": false
+      },
+      {
+        "pod_name": "coxswain-relay-tenant-c-7f9-cut02",
+        "pod_namespace": "tenant-c",
+        "component": "relay",
+        "ready": true,
+        "connected": false
       }
     ],
     "degraded": [
@@ -29,7 +45,8 @@
         "pod_name": "coxswain-shared-proxy-66d-bk9p4",
         "pod_namespace": "coxswain-system",
         "component": "shared-proxy",
-        "reachable": true,
+        "ready": true,
+        "connected": true,
         "degraded_checks": [
           "routing_table_loaded"
         ]
@@ -38,7 +55,8 @@
         "pod_name": "tenant-a-gw-coxswain-7db74-r5tfb",
         "pod_namespace": "tenant-a",
         "component": "dedicated-proxy",
-        "reachable": true,
+        "ready": true,
+        "connected": true,
         "degraded_checks": [
           "routing_table_loaded"
         ]
@@ -160,7 +178,7 @@
         "backend_group": "tenant-b/api",
         "kind": "gateway",
         "pods": [
-          "tenant-b-gw-coxswain-5cc91-m2qd8"
+          "tenant-a-gw-coxswain-7db74-j8cjt"
         ],
         "route": {
           "kind": "HTTPRoute",
