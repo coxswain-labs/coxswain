@@ -207,7 +207,7 @@ Fail-closed and cross-namespace rules:
 
 ## Request size limit
 
-`RequestSizeLimit` caps the request body size for a route — the Gateway API surface for the Ingress `max-body-size` annotation. Like `BasicAuth`/`Compression`, this filter is **HTTPRoute-only** and is not enforced on `GRPCRoute` (see [below](#request-size-limit-is-not-enforced-on-grpcroute)).
+`RequestSizeLimit` caps the request body size for a route — the Gateway API surface for the Ingress `max-body-size` annotation. Like `BasicAuth`/`Compression`, this filter is **HTTPRoute-only**: attaching it to a `GRPCRoute` is rejected (see [below](#request-size-limit-is-not-supported-on-grpcroute)).
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -226,11 +226,11 @@ Semantics:
 - An **unparseable** `maxSize` on an existing CR fails **open** (no limit enforced) — the reference itself resolved, so there's nothing dangling.
 - A **missing** `RequestSizeLimit` CR fails **closed**: the rule installs as a `500` error route — a dangling `ExtensionRef` must not silently admit traffic the filter never saw (GEP-1364).
 
-### Request size limit is not enforced on GRPCRoute
+### Request size limit is not supported on GRPCRoute
 
-`RequestSizeLimit` attached to a `GRPCRoute` is accepted but **not enforced** — the reconciler skips it and logs a WARN line (as it does for `BasicAuth`/`Compression`). gRPC message sizes are instead governed by the backend's own `max_recv_msg_size` (gRPC servers reject oversized messages with `RESOURCE_EXHAUSTED`; the default receive cap is ~4 MB).
+`RequestSizeLimit` attached to a `GRPCRoute` is rejected — the same treatment as `BasicAuth`/`Compression`: the route's `Accepted` condition reports `False`/`UnsupportedValue`, and the reconciler never resolves the CR. gRPC message sizes are instead governed by the backend's own `max_recv_msg_size` (gRPC servers reject oversized messages with `RESOURCE_EXHAUSTED`; the default receive cap is ~4 MB).
 
-The reason is a `pingora-proxy` limitation: a `request_body_filter` rejection over HTTP/2 is swallowed by pingora's h2 proxy loop and never delivered to the client, deadlocking the request. gRPC never sends `Content-Length`, so the up-front check that guards HTTP/2 elsewhere cannot apply. Faithful edge enforcement for gRPC/HTTP/2 needs buffer-first rejection (as Envoy's `buffer` filter does) and is deferred until pingora ships request-body buffering.
+The reason `RequestSizeLimit` isn't implemented for gRPC at all is a `pingora-proxy` limitation: a `request_body_filter` rejection over HTTP/2 is swallowed by pingora's h2 proxy loop and never delivered to the client, deadlocking the request. gRPC never sends `Content-Length`, so the up-front check that guards HTTP/2 elsewhere cannot apply. Faithful edge enforcement for gRPC/HTTP/2 needs buffer-first rejection (as Envoy's `buffer` filter does) and is deferred until pingora ships request-body buffering — until then, the filter is rejected outright rather than silently accepted and ignored.
 
 ## Response compression
 

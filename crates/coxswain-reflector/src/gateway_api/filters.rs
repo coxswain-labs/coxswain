@@ -278,11 +278,10 @@ pub(super) fn build_filters(
                     }
                     // Resolved separately by the `resolve_*` scanners into per-route
                     // config off the filter list — no `FilterAction` emitted here.
-                    (
-                        super::COXSWAIN_GROUP,
-                        "RateLimit" | "IpAccessControl" | "BasicAuth" | "RequestSizeLimit"
-                        | "Compression" | "ExternalAuth" | "RetryPolicy" | "JwtAuth",
-                    ) => {}
+                    // `PathRewriteRegex` is already consumed by the arm above, so
+                    // this guard only ever matches the other 8 kinds despite
+                    // checking against the full list (#690).
+                    (group, kind) if super::http_extension_kind_supported(group, kind) => {}
                     _ => tracing::warn!(
                         group = %ext.group,
                         kind = %ext.kind,

@@ -1,0 +1,69 @@
+# GRPCRoute-status ExtensionRef kind-list fixture (#690).
+#
+# One Gateway, three GRPCRoutes, all with a healthy backend (grpc-echo:50051):
+#   good-grpc-route             → no ExtensionRef                 → Accepted=True (liveness gate)
+#   jwtauth-grpc-route          → dangling JwtAuth ref             → Accepted=True (was False/UnsupportedValue)
+#   requestsizelimit-grpc-route → dangling RequestSizeLimit ref    → Accepted=False/UnsupportedValue (was wrongly True)
+#
+# The CR never exists on the two ExtensionRef routes — only the *kind* is
+# under test here, not CR resolution (#689's grpc_route_status_ext_ref.yaml
+# already covers that).
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-kindcoverage-gw
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: good-grpc-route
+spec:
+  parentRefs:
+    - name: coxswain-grpc-kindcoverage-gw
+  rules:
+    - backendRefs:
+        - name: grpc-echo
+          port: 50051
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: jwtauth-grpc-route
+spec:
+  parentRefs:
+    - name: coxswain-grpc-kindcoverage-gw
+  rules:
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: JwtAuth
+            name: does-not-exist
+      backendRefs:
+        - name: grpc-echo
+          port: 50051
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: requestsizelimit-grpc-route
+spec:
+  parentRefs:
+    - name: coxswain-grpc-kindcoverage-gw
+  rules:
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: RequestSizeLimit
+            name: does-not-exist
+      backendRefs:
+        - name: grpc-echo
+          port: 50051

@@ -52,6 +52,52 @@ pub(crate) use route_status::{RefValidationStores, RouteLike};
 /// group) shares this one definition rather than keeping its own copy.
 pub(crate) const COXSWAIN_GROUP: &str = "gateway.coxswain-labs.dev";
 
+/// Coxswain `ExtensionRef` kinds `HTTPRoute`'s filter translator resolves.
+///
+/// Single source of truth for two independent questions that must never
+/// disagree: `filters::build_filters`'s "does enforcement know this kind"
+/// check, and `status::has_unsupported_filter`'s "does `Accepted` accept this
+/// kind" check. Before #690 these were two hand-maintained literal lists that
+/// drifted — enforcement supported 5 kinds status silently reported as
+/// `Accepted=False/UnsupportedValue` forever. A kind added here is
+/// automatically recognized by both; a kind resolved by neither by construction.
+pub(crate) const HTTP_ROUTE_EXTENSION_KINDS: &[&str] = &[
+    "RateLimit",
+    "IpAccessControl",
+    "BasicAuth",
+    "RequestSizeLimit",
+    "Compression",
+    "ExternalAuth",
+    "RetryPolicy",
+    "JwtAuth",
+    "PathRewriteRegex",
+];
+
+/// [`HTTP_ROUTE_EXTENSION_KINDS`]'s `GRPCRoute` counterpart — the narrower set
+/// `grpc_reconcile`'s filter translator resolves, shared with
+/// `grpc_status::has_unsupported_filter` (#690). `PathRewriteRegex` is
+/// meaningless for gRPC (the path *is* the `/{service}/{method}` RPC
+/// address); `BasicAuth`/`Compression`/`RequestSizeLimit` are HTTP-only idioms
+/// (see `grpc_reconcile`'s module doc for the per-kind rationale).
+pub(crate) const GRPC_ROUTE_EXTENSION_KINDS: &[&str] =
+    &["RateLimit", "IpAccessControl", "RetryPolicy", "JwtAuth"];
+
+/// Whether `(group, kind)` is an `ExtensionRef` HTTPRoute's filter translator
+/// resolves. The **only** place that decision is made — `filters::build_filters`'s
+/// enforcement guard and `status::has_unsupported_filter`'s `Accepted` guard both
+/// call this function rather than re-deriving the check, so a bug in the check
+/// itself (not just a stale kind list) can't diverge between the two call sites
+/// either (#690).
+pub(crate) fn http_extension_kind_supported(group: &str, kind: &str) -> bool {
+    group == COXSWAIN_GROUP && HTTP_ROUTE_EXTENSION_KINDS.contains(&kind)
+}
+
+/// [`http_extension_kind_supported`]'s `GRPCRoute` counterpart, backed by
+/// [`GRPC_ROUTE_EXTENSION_KINDS`].
+pub(crate) fn grpc_extension_kind_supported(group: &str, kind: &str) -> bool {
+    group == COXSWAIN_GROUP && GRPC_ROUTE_EXTENSION_KINDS.contains(&kind)
+}
+
 #[cfg(test)]
 mod tests;
 
