@@ -155,14 +155,13 @@ paths:
         - { $ref: '#/components/parameters/offset' }
       responses:
         '200':
-          description: Wrapped proxy routes (reachable is true whenever the pod is a known fleet member)
+          description: Wrapped proxy routes, served from the controller's own snapshot
           content:
             application/json:
               schema:
                 type: object
                 properties:
                   pod_name: { type: string }
-                  reachable: { type: boolean }
                   routes:
                     type: object
                     properties:
@@ -524,16 +523,41 @@ components:
 
     PodEntry:
       type: object
-      description: A fleet pod with liveness + health rollup; fields vary by reachability/role.
+      description: >
+        A fleet pod with its status; fields vary by role. Proxies and relays carry
+        `ready` + `connected`; controllers carry `reachable`, because they run a
+        discovery server rather than a client and so are still probed.
       properties:
         pod_name: { type: string }
         pod_namespace: { type: string }
         pod_ip: { type: string }
         telemetry_port: { type: integer }
-        component: { type: string, enum: [controller, shared-proxy, dedicated-proxy] }
-        reachable: { type: boolean }
-        health: { type: string, enum: [ready, degraded], description: Rollup; reachable pods only. }
+        component: { type: string, enum: [controller, shared-proxy, dedicated-proxy, relay] }
+        ready:
+          type: boolean
+          description: >
+            Proxies and relays. The pod's Kubernetes `Ready` condition — kubelet's
+            own verdict. Absent while the condition is unpublished (unknown, not a
+            fault).
+        connected:
+          type: boolean
+          description: >
+            Proxies and relays. Whether the pod holds a live discovery stream. A
+            pod can be `ready` and not `connected`: alive and serving traffic, but
+            frozen on its last routing snapshot.
+        reachable:
+          type: boolean
+          description: Controllers only. The peer `/statusz` probe succeeded.
+        health:
+          type: string
+          enum: [ready, degraded]
+          description: >
+            Rollup. Absent when the pod has not reported — a pod that just
+            connected, or one on a build predating health reporting. Absent means
+            unknown, never unhealthy.
         degraded_checks: { type: array, items: { type: string } }
+        version: { type: string, description: Reporting build's version; proxies and relays. }
+        reported_at: { type: string, description: When the pod sampled its own health. }
         is_leader: { type: boolean, description: Controllers only. }
         gateway_ref: { type: string, description: Dedicated proxies only. }
         restarts: { type: integer }
@@ -545,8 +569,15 @@ components:
       type: object
       properties:
         pod_name: { type: string }
-        reachable: { type: boolean }
-        health: { type: object, additionalProperties: true }
+        ready: { type: boolean, description: Proxies and relays; kubelet's Ready condition. }
+        connected: { type: boolean, description: Proxies and relays; holds a live discovery stream. }
+        reachable: { type: boolean, description: Controllers only; the peer probe succeeded. }
+        reported_at: { type: string }
+        health:
+          type: object
+          additionalProperties: true
+          description: >
+            The pod's own subsystem tree. Absent when it has not reported yet.
 
     GatewaySummary:
       type: object
@@ -678,7 +709,17 @@ components:
           type: object
           properties:
             leaderless: { type: boolean, description: No reachable controller holds the lease. }
-            unreachable: { type: array, items: { $ref: '#/components/schemas/PodEntry' } }
+            not_ready:
+              type: array
+              description: The pod itself is down — kubelet says not Ready, or a controller peer did not answer.
+              items: { $ref: '#/components/schemas/PodEntry' }
+            disconnected:
+              type: array
+              description: >
+                Ready and still serving, but holding no config stream — frozen on the
+                last snapshot. One relay losing its stream puts its whole leaf subtree
+                here at once.
+              items: { $ref: '#/components/schemas/PodEntry' }
             degraded: { type: array, items: { $ref: '#/components/schemas/PodEntry' } }
         routing:
           type: object

@@ -182,8 +182,9 @@ a distinction a port can express and a path cannot:
   is node-sourced and therefore not selectable by most CNIs, so this port cannot
   meaningfully be fenced. It carries nothing but pass/fail.
 - **Telemetry, `8083`** — `/metrics` and `/statusz`, on every role. Read by
-  Prometheus and by the controller when it builds the fleet view. **Never
-  authenticated**: `PodMonitor` has no credential field, and a probing pod holds
+  Prometheus, and by a controller probing its **peer controller replicas** —
+  never a proxy or a relay, which report their own health over the discovery
+  stream instead. **Never authenticated**: `PodMonitor` has no credential field, and a probing pod holds
   only the bcrypt *hash* of the operator credential, so it could not present one
   even in principle. Open to all sources by default; fenceable on request.
 - **Operator, `8082`** — the operator UI and the `/api/v1/*` surface, on the
@@ -195,16 +196,16 @@ a distinction a port can express and a path cannot:
 
 The operator port is reached through its own `Service`,
 `coxswain-controller-operator`, which selects the **elected leader**. That is not
-load-balancing avoidance: the topology view reads the node registry, and only the
-leader accepts discovery streams, so a standby's registry is empty rather than
-partial. A `Service` spanning replicas would serve an empty topology at random.
-During a leader election that `Service` briefly has no endpoints and the UI is
-unreachable — deliberately, because the honest alternative to "no answer" here is
-an empty topology indistinguishable from a healthy cluster with nothing
-connected. Health and telemetry stay reachable on the all-replica
-`coxswain-controller` `Service` throughout, so diagnosing the election itself is
-unaffected. A standby reached directly anyway answers `503` on
-`/api/v1/topology`, naming the reason.
+load-balancing avoidance: the topology, fleet, and problems views all read the
+node registry, and only the leader accepts discovery streams, so a standby's
+registry is empty rather than partial. A `Service` spanning replicas would serve
+an empty topology — and a fleet in which every proxy reads as disconnected — at
+random. During a leader election that `Service` briefly has no endpoints and the
+UI is unreachable — deliberately, because the honest alternative to "no answer"
+here is a view indistinguishable from a cluster-wide outage. Health and telemetry
+stay reachable on the all-replica `coxswain-controller` `Service` throughout, so
+diagnosing the election itself is unaffected. A standby reached directly anyway
+answers `503` on those endpoints, naming the reason.
 
 The Kubernetes pod network is flat, so an unfenced operator port is readable by
 any pod in any namespace. That is a strong reconnaissance and credential-pivot
@@ -242,9 +243,18 @@ empty, with nothing logged anywhere. Enable it when untrusted workloads share th
 pod network, and add the scraper's namespace in the same change.
 
 When the telemetry fence is on, it admits two peers automatically: pods in the
-policy's own namespace, and pods in the install namespace. The second is what
-lets the controller probe `/statusz` on a dedicated proxy, which runs in its
-Gateway's namespace rather than alongside the controller.
+policy's own namespace, and pods in the install namespace. Between them they
+cover a Prometheus deployed alongside either the workload or Coxswain itself; a
+scraper anywhere else needs an `extraIngress` entry.
+
+The controller does **not** probe this port on a proxy or relay. Those pods
+report their own health up the discovery stream they already authenticate with
+mTLS, so the controller reads their state from its node registry rather than
+dialling them back over a channel it has no way to authenticate. Fencing
+telemetry therefore cannot break the fleet view. The one exception is a
+controller replica probing its **peer replicas** — controllers run a discovery
+*server* and are never clients, so no stream carries a peer's health — and those
+are same-namespace by construction, which the first rule already admits.
 
 A proxy binds ports that are not knowable when the policy is written — the shared
 pool allocates one internal port per Gateway listener, and a dedicated proxy binds

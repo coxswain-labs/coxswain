@@ -516,6 +516,7 @@ mod tests {
                     bound_ports: vec![443, 8443],
                     connected_since_unix: 100,
                     last_ack_at_unix: Some(200),
+                    health: None,
                 },
                 // A leaf on a DIFFERENT Gateway that has NOT reported bound ports
                 // → None, not Some(∅) (fail-closed for its own Gateway).
@@ -532,6 +533,7 @@ mod tests {
                     bound_ports: Vec::new(),
                     connected_since_unix: 100,
                     last_ack_at_unix: None,
+                    health: None,
                 },
             ],
         };
@@ -582,6 +584,87 @@ mod tests {
         assert!(snap.gateway_node_bound("prod", "gw", &[443u16].into_iter().collect()));
         // ...while the unreported leaf holds its own Gateway's gate closed.
         assert!(!snap.gateway_node_bound("prod", "gw2", &[443u16].into_iter().collect()));
+    }
+
+    /// #677: a leaf behind a relay never streams to the controller, so its
+    /// health reaches the registry only by riding its relay's `RosterReport`.
+    /// Without this the HTTP fan-out could be deleted for directly-connected
+    /// proxies but not for relay-fronted ones.
+    #[test]
+    fn record_roster_report_folds_a_leafs_health_onto_its_registry_row() {
+        let registry = NodeRegistryHandle::new();
+        registry.connect(
+            "relay-x",
+            NodeScope::Namespace {
+                namespace: "prod".to_owned(),
+            },
+            SystemTime::UNIX_EPOCH,
+        );
+        let gw_scope = crate::wire::scope_to_wire(&Scope::Gateway {
+            name: "gw".to_owned(),
+            namespace: "prod".to_owned(),
+        });
+        let entry = |node_id: &str, health: Option<p::HealthReport>| p::RosterEntry {
+            node_id: node_id.to_owned(),
+            scope: Some(gw_scope.clone()),
+            acked_version: Some("v1".to_owned()),
+            target_version: Some("v1".to_owned()),
+            acked_seq: Some(9),
+            bound_reported: true,
+            bound_ports: vec![443],
+            connected_since_unix: 100,
+            last_ack_at_unix: Some(200),
+            health,
+        };
+        let report = p::RosterReport {
+            children: vec![
+                entry(
+                    "leaf-degraded",
+                    Some(p::HealthReport {
+                        version: "1.2.3".to_owned(),
+                        subsystems: vec![p::SubsystemHealth {
+                            name: "proxy".to_owned(),
+                            checks: vec![p::CheckHealth {
+                                name: "routing_table_loaded".to_owned(),
+                                state: p::CheckState::Degraded as i32,
+                                reason: "snapshot stale".to_owned(),
+                            }],
+                        }],
+                        reported_at_unix: 300,
+                    }),
+                ),
+                // Mid-rollout, on a build that predates health reporting.
+                entry("leaf-silent", None),
+            ],
+        };
+
+        record_roster_report(
+            "relay-x",
+            &Scope::Namespace {
+                namespace: "prod".to_owned(),
+            },
+            report,
+            &registry,
+        );
+
+        let snap = registry.load();
+        let health = snap.nodes["leaf-degraded"]
+            .health
+            .as_ref()
+            .expect("the fold must carry the leaf's health onto its row");
+        assert_eq!(health.version, "1.2.3");
+        assert_eq!(
+            health.snapshot.subsystems["proxy"].checks["routing_table_loaded"],
+            coxswain_core::health::CheckState::Degraded {
+                reason: std::sync::Arc::from("snapshot stale")
+            },
+            "the reason must survive the hop — it is the whole diagnostic value"
+        );
+        assert!(
+            snap.nodes["leaf-silent"].health.is_none(),
+            "a leaf that has not reported folds to None, which renders as \
+             'connected, health unknown' rather than unhealthy"
+        );
     }
 
     #[test]
@@ -762,6 +845,7 @@ mod tests {
                 bound_ports: vec![443],
                 connected_since_unix: 100,
                 last_ack_at_unix: Some(200),
+                health: None,
             }],
         };
         let all_in_scope = record_roster_report(
@@ -814,6 +898,7 @@ mod tests {
                 bound_ports: Vec::new(),
                 connected_since_unix: 100,
                 last_ack_at_unix: None,
+                health: None,
             }],
         };
         let all_in_scope =
@@ -2590,6 +2675,7 @@ mod tests {
                     bound_ports: vec![443],
                     connected_since_unix: 100,
                     last_ack_at_unix: Some(200),
+                    health: None,
                 }],
             })),
         })

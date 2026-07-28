@@ -44,6 +44,7 @@ pub(crate) fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
         proxy_handle,
         Scope::SharedPool,
         Some(bound_ports_rx),
+        health.clone(),
     )?;
     let listener_status = client.listener_status();
 
@@ -119,6 +120,7 @@ pub(crate) fn run_proxy_gateway(
         proxy_handle,
         scope,
         Some(bound_ports_rx),
+        health.clone(),
     )?;
     let listener_status = client.listener_status();
 

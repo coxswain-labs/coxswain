@@ -1,6 +1,8 @@
 {
   "pod_name": "tenant-a-gw-coxswain-7db74-j8cjt",
-  "reachable": true,
+  "ready": true,
+  "connected": true,
+  "reported_at": "2026-06-10T09:31:00Z",
   "health": {
     "version": "0.1.0",
     "subsystems": {

@@ -69,6 +69,15 @@ message ClientMessage {
     Nack nack = 3;
     NodeStatus node_status = 4; // node telemetry (#531); additive (no WIRE_VERSION bump)
     RosterReport roster_report = 5; // relay leaf-roster telemetry (#585); additive (no WIRE_VERSION bump)
+    // Node subsystem health (#677); additive (no WIRE_VERSION bump).
+    //
+    // Its own arm rather than a field on NodeStatus, because NodeStatus has
+    // wholesale-replace semantics for `bound_ports` and proto3 gives a
+    // `repeated` field no presence: a relay reporting health but no ports would
+    // send `bound_ports: []`, which the server must read as an affirmative
+    // empty set, failing the #531 bound gate for that node. A separate arm says
+    // nothing about ports.
+    HealthReport health_report = 6;
   }
 }
 
@@ -142,6 +151,60 @@ message NodeStatus {
   repeated uint32 bound_ports = 1;
 }
 
+// A node's own subsystem health, reported up its discovery stream (#677).
+//
+// Replaces the controller's unauthenticated HTTP probe of the node's
+// `/statusz`: the node pushes over the stream it already authenticated rather
+// than the controller dialling back over a channel it cannot authenticate. A
+// pre-#677 node sends this never, which the controller renders as "connected,
+// health unknown".
+//
+// Mirrors `coxswain_core::health::HealthSnapshot` plus the reporting build's
+// version, so the operator API can serve a per-pod health body without probing
+// the pod. Sent on the same trigger discipline as the rest of `NodeStatus`:
+// once after Subscribe, then on every change of the reported state.
+//
+// No periodic heartbeat by design. The live stream is itself the freshness
+// proof — while it is up, the last report IS the current state, and an old
+// `reported_at_unix` means "nothing changed", not "reporting is broken". The
+// timestamp exists to measure lag through the relay's coalesce-and-fold hop,
+// which is the only staleness the stream cannot rule out.
+message HealthReport {
+  string version = 1; // coxswain build version of the reporting node
+  repeated SubsystemHealth subsystems = 2; // sorted by name
+  int64 reported_at_unix = 3; // when the reporter sampled its registry (Unix seconds)
+}
+
+// One subsystem's checks. `state` is not carried: it is always the
+// highest-severity entry in `checks`, so sending it would be a second source of
+// truth that can disagree with the first. The reader re-derives it.
+message SubsystemHealth {
+  string name = 1;
+  repeated CheckHealth checks = 2; // sorted by name
+}
+
+// One named health check's current state.
+message CheckHealth {
+  string name = 1;
+  CheckState state = 2;
+  // Human-readable explanation, empty unless `state` is DEGRADED or FAILED.
+  // Not stable for machine parsing — the check NAME is the stable identifier.
+  string reason = 3;
+}
+
+// Wire form of `coxswain_core::health::CheckState`.
+//
+// UNSPECIFIED is proto3's zero value and means the reporter sent no state at
+// all; the reader maps it to PENDING (the same fail-closed "not yet reported"
+// reading), never to READY.
+enum CheckState {
+  CHECK_STATE_UNSPECIFIED = 0;
+  CHECK_STATE_PENDING = 1;
+  CHECK_STATE_READY = 2;
+  CHECK_STATE_DEGRADED = 3;
+  CHECK_STATE_FAILED = 4;
+}
+
 // Relay → controller leaf-roster telemetry (#585). A relay's downstream
 // NodeRegistry snapshot: every leaf proxy connected to this relay, with the
 // state the controller's #531 Programmed gate and topology panel need.
@@ -181,6 +244,13 @@ message RosterEntry {
   repeated uint32 bound_ports = 7; // u16 values, sorted; meaningful only when bound_reported
   int64 connected_since_unix = 8; // leaf's stream-open time at the relay (Unix seconds)
   optional int64 last_ack_at_unix = 9; // leaf's most recent Ack time (Unix seconds); absent = never acked
+  // The leaf's own health, as last reported to the relay on its own
+  // `HealthReport` (#677). Without this the fan-out could only be removed for
+  // proxies that stream to the controller directly: a relay-fronted leaf
+  // reaches the controller solely through this message, so its health has to
+  // ride here too. Absent when the leaf has not reported yet, or is a pre-#677
+  // build.
+  optional HealthReport health = 10;
 }
 
 // ────────────────────────────────────────────────────────────────────────────

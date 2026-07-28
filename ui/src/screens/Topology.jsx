@@ -494,19 +494,48 @@ function ControllerCard({ ctrl, version, cardRef }) {
   );
 }
 
-/** A single proxy or relay node card. Deep-links to its Fleet detail on click. */
+/**
+ * A single proxy or relay node card.
+ *
+ * Two independent signals, deliberately not merged: `in_sync` is convergence
+ * (has this node applied the current world), `health` is the node's own
+ * subsystem state as reported over its discovery stream. A node can be in sync
+ * and degraded, or lagging and perfectly healthy, and collapsing them would
+ * hide whichever one is actually firing.
+ *
+ * Only a proxy deep-links to Fleet: `/fleet/proxies` lists shared and dedicated
+ * proxies, so a relay has no entry there and the link would 404. This card is
+ * the relay's own view — and, since a relay never appears in its own roster,
+ * the only place its health is shown at all.
+ */
 function ProxyCard({ node }) {
   const ok = node.in_sync;
   const kind = node.is_relay ? 'Relay' : 'Proxy';
-  const link = linkProps(() => nav.proxy(node.node_id), `Open ${node.node_id} in Fleet`);
+  const degraded = Boolean(node.health) && node.health !== 'ready';
+  const link = node.is_relay
+    ? {}
+    : linkProps(() => nav.proxy(node.node_id), `Open ${node.node_id} in Fleet`);
+  const cls = [
+    'topo-proxy-card',
+    node.is_relay ? 'topo-proxy-card--relay' : 'topo-card--link',
+    ok && !degraded ? 'topo-proxy-card--ok' : 'topo-proxy-card--warn',
+  ].join(' ');
   return (
-    <div class={`topo-proxy-card topo-card--link ${node.is_relay ? 'topo-proxy-card--relay ' : ''}${ok ? 'topo-proxy-card--ok' : 'topo-proxy-card--warn'}`} {...link}>
+    <div class={cls} {...link}>
       <div class="topo-card-kind">
-        <span class={`topo-sync-dot ${ok ? 'ok' : 'warn'}`} aria-hidden="true" />
+        <span class={`topo-sync-dot ${ok && !degraded ? 'ok' : 'warn'}`} aria-hidden="true" />
         {kind}
       </div>
       <div class="topo-proxy-id">{node.node_id}</div>
       <div class="topo-proxy-status">{ok ? 'In sync' : 'Lagging'}</div>
+      {degraded && (
+        <div
+          class="topo-proxy-status topo-proxy-status--warn"
+          title={`Degraded: ${(node.degraded_checks ?? []).join(', ') || 'subsystem not ready'}`}
+        >
+          Degraded
+        </div>
+      )}
       <div class="topo-proxy-meta">
         <span class="topo-meta-label">Acked</span>
         <code class="topo-meta-val">{shortHash(node.last_acked_version)}</code>
@@ -515,6 +544,12 @@ function ProxyCard({ node }) {
         <span class="topo-meta-label">Since</span>
         <span class="topo-meta-val">{shortTime(node.connected_since)}</span>
       </div>
+      {node.version && (
+        <div class="topo-proxy-meta">
+          <span class="topo-meta-label">Version</span>
+          <span class="topo-meta-val">v{node.version}</span>
+        </div>
+      )}
     </div>
   );
 }

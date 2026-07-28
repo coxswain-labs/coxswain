@@ -76,8 +76,14 @@ pub(crate) fn run_relay(args: RelayRoleArgs) -> Result<()> {
     // controller via `RosterReport` (#585), wired here as the roster receiver.
     // The relay's downstream serving cert IS its rotating bootstrapped SVID; the
     // builder hands it back (the bootstrap endpoint is `required = true` at clap).
+    //
+    // It DOES report its own health (#677), and this is the only channel that
+    // can carry it: a relay never appears in its own `RosterReport` (that
+    // iterates its downstream registry, which holds leaves only), so without
+    // this wiring the controller would know a relay's convergence state but
+    // nothing about its subsystems.
     let (mut config, bootstrap_runner, svid) =
-        build_discovery_client_config(&args.discovery, &args.common, scope, None);
+        build_discovery_client_config(&args.discovery, &args.common, scope, None, health.clone());
     config.roster_rx = Some(roster_rx);
 
     // Assemble the upstream client + the downstream-serving `SnapshotSource` it

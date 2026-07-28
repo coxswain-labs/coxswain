@@ -466,6 +466,21 @@ pub(super) async fn run_stream(
                             Some(CKind::NodeStatus(ns)) => {
                                 record_node_status(&sub.node_id, &ns, &registry);
                             }
+                            Some(CKind::HealthReport(hr)) => {
+                                // No sender-identity gate, unlike RosterReport:
+                                // a node may only ever describe ITSELF here (the
+                                // row is keyed by this stream's own `node_id`,
+                                // not by anything in the payload), so there is no
+                                // cross-tenant row a compromised peer could
+                                // reach. Health also feeds no gate — the #531
+                                // `Programmed` quorum reads acked versions and
+                                // bound ports — so a lying peer defames only its
+                                // own operator view.
+                                registry.record_health(
+                                    &sub.node_id,
+                                    crate::wire::health::health_from_wire(&hr),
+                                );
+                            }
                             Some(CKind::RosterReport(rr)) => {
                                 // Sender-identity gate (#666): only the relay tier
                                 // whose identity matches this stream's own
@@ -1126,6 +1141,12 @@ pub(super) fn record_roster_report(
             bound_ports,
             connected_since: unix_secs_to_system_time(entry.connected_since_unix),
             last_ack_at: entry.last_ack_at_unix.map(unix_secs_to_system_time),
+            // Absent when the leaf has not reported yet or is a pre-#677 build;
+            // both render as "connected, health unknown" (#677).
+            health: entry
+                .health
+                .as_ref()
+                .map(crate::wire::health::health_from_wire),
         });
     }
     registry.apply_roster(parent_node_id, children);

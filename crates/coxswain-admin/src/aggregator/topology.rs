@@ -30,9 +30,8 @@
 
 use coxswain_core::node_registry::{NodeEntry, NodeRegistry, NodeScope};
 use http::Response;
-use std::time::SystemTime;
 
-use super::{OperatorAggregator, json_response, service_unavailable};
+use super::{OperatorAggregator, fmt_rfc3339, json_response, service_unavailable};
 
 impl OperatorAggregator {
     /// `GET /api/v1/topology` — discovery convergence snapshot.
@@ -107,21 +106,35 @@ fn scope_sort_key(scope: &NodeScope) -> (u8, &str, &str) {
 /// `is_relay` node is a relay tier node. Both absent/false for a directly
 /// connected proxy, which the UI draws one hop below the controller as before.
 fn node_json(entry: &NodeEntry) -> serde_json::Value {
-    serde_json::json!({
+    let mut v = serde_json::json!({
         "node_id": entry.node_id,
         "scope": entry.scope,
         "last_acked_version": entry.last_acked_version,
-        "connected_since": fmt_time(entry.connected_since),
-        "last_ack_at": entry.last_ack_at.map(fmt_time),
+        "connected_since": fmt_rfc3339(entry.connected_since),
+        "last_ack_at": entry.last_ack_at.map(fmt_rfc3339),
         "in_sync": entry.in_sync(),
         "parent": entry.parent,
         "is_relay": entry.is_relay,
-    })
-}
-
-/// Format a [`SystemTime`] as an RFC 3339 string.
-fn fmt_time(t: SystemTime) -> String {
-    humantime::format_rfc3339(t).to_string()
+    });
+    // Self-reported health (#677). This is the only place a RELAY's own health
+    // is rendered: `/api/v1/fleet/proxies` lists shared and dedicated proxies
+    // only, and a relay never appears in its own `RosterReport`. Absent for a
+    // node that has not reported yet or is a pre-#677 build.
+    if let Some(health) = &entry.health {
+        let degraded = super::non_ready_check_names(&health.snapshot);
+        v["health"] = serde_json::Value::String(
+            if degraded.is_empty() {
+                "ready"
+            } else {
+                "degraded"
+            }
+            .to_owned(),
+        );
+        v["degraded_checks"] = serde_json::Value::from(degraded);
+        v["version"] = serde_json::Value::String(health.version.clone());
+        v["reported_at"] = serde_json::Value::String(fmt_rfc3339(health.reported_at));
+    }
+    v
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -229,6 +242,7 @@ mod tests {
                 bound_ports: None,
                 connected_since: epoch(),
                 last_ack_at: None,
+                health: None,
             }],
         );
         let v = build_topology(&reg.load());

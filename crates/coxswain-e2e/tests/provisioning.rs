@@ -1725,18 +1725,23 @@ mod serial {
     use super::*;
 
     /// Turning on `networkPolicy.telemetry.fenced` must restrict `/metrics` and
-    /// `/statusz` **without** stranding the controller's own fleet view.
+    /// `/statusz` without disturbing anything else — and, since #677, the fleet
+    /// view is one of the things it cannot disturb **at all**.
     ///
-    /// The trap this guards: the install-namespace peer that lets the controller
-    /// reach a dedicated proxy in its Gateway's namespace belongs to whichever
-    /// port carries the fleet-view probe. That probe moved from the operator
-    /// port to `/statusz` on the telemetry port (#676), so the peer had to move
-    /// with it. Leave it on the operator fence — where it superficially looks
-    /// like it belongs — and every dedicated proxy reads permanently
-    /// `reachable: false` the moment anyone enables fencing, with nothing logged
-    /// anywhere.
+    /// This test used to guard a trap: the fleet view was built by probing each
+    /// pod's `/statusz`, so fencing the telemetry port without admitting the
+    /// install namespace made every dedicated proxy read permanently
+    /// `reachable: false`, with nothing logged anywhere. #677 removed that
+    /// coupling — a proxy now reports its own health up the discovery stream, so
+    /// the fleet view never traverses the fenced port.
+    ///
+    /// So the assertion inverts into a stronger one: with fencing **on**, the
+    /// fleet view still reports the dedicated proxy connected and healthy. That
+    /// holds regardless of whether the CNI enforces the policy, which is exactly
+    /// the point — the two are now independent. A regression that reintroduced a
+    /// probe would fail this on any enforcing CNI.
     #[tokio::test]
-    async fn fenced_telemetry_still_admits_the_controllers_fleet_probe() -> anyhow::Result<()> {
+    async fn fenced_telemetry_does_not_disturb_the_fleet_view() -> anyhow::Result<()> {
         let h = Harness::start_with_options(ControllerOptions {
             telemetry_fenced: Some(true),
             ..Default::default()
@@ -1788,8 +1793,9 @@ mod serial {
             });
         assert!(
             admits_install_ns,
-            "the telemetry fence must admit the install namespace, or the controller \
-             cannot reach a dedicated proxy's /statusz to aggregate it"
+            "the telemetry fence must admit the install namespace — it is what lets a \
+             Prometheus deployed alongside coxswain scrape a dedicated proxy running in \
+             its Gateway's namespace"
         );
         for port in [80, 443, 8080, 8443] {
             assert!(
@@ -1798,9 +1804,10 @@ mod serial {
             );
         }
 
-        // The behavioural half: the fleet view still reports the dedicated proxy
-        // reachable. Object shape alone would not catch the peer being dropped
-        // on a cluster whose CNI does enforce the policy.
+        // The behavioural half: with the fence ON, the fleet view still reports
+        // the dedicated proxy connected and carrying a health report. Object
+        // shape alone would not catch a regression that reintroduced a probe —
+        // that would only fail on a CNI that actually enforces the policy.
         let url = h.controller_operator_url("/api/v1/fleet/proxies");
         wait::poll_until(
             Duration::from_secs(120),
@@ -1808,16 +1815,16 @@ mod serial {
             || {
                 let url = url.clone();
                 async move {
-                    // Name the unreachable pods: that is the one fact that
-                    // distinguishes a missing install-namespace peer on the
-                    // fence from a proxy that simply never came up.
+                    // Name the pods that are not yet connected: that is the one
+                    // fact distinguishing "the fence broke the fleet view" from
+                    // "a proxy simply never came up".
                     let detail = match reqwest::get(&url).await {
                         Ok(r) => match r.json::<serde_json::Value>().await {
                             Ok(b) => b["proxies"]
                                 .as_array()
                                 .map(|ps| {
                                     ps.iter()
-                                        .filter(|p| p["reachable"] != serde_json::Value::Bool(true))
+                                        .filter(|p| p["connected"] != serde_json::Value::Bool(true))
                                         .filter_map(|p| p["pod_name"].as_str())
                                         .collect::<Vec<_>>()
                                         .join(", ")
@@ -1828,8 +1835,8 @@ mod serial {
                         Err(e) => format!("fetch failed: {e}"),
                     };
                     format!(
-                        "every proxy to report reachable under a fenced telemetry port; \
-                         still unreachable: [{detail}]"
+                        "every proxy to report connected with a health report under a \
+                         fenced telemetry port; still not connected: [{detail}]"
                     )
                 }
             },
@@ -1839,11 +1846,12 @@ mod serial {
                     let body: serde_json::Value =
                         reqwest::get(&url).await.ok()?.json().await.ok()?;
                     let proxies = body.get("proxies")?.as_array()?;
-                    let all_reachable = !proxies.is_empty()
-                        && proxies
-                            .iter()
-                            .all(|p| p["reachable"] == serde_json::Value::Bool(true));
-                    all_reachable.then_some(())
+                    let all_connected = !proxies.is_empty()
+                        && proxies.iter().all(|p| {
+                            p["connected"] == serde_json::Value::Bool(true)
+                                && p.get("health").is_some()
+                        });
+                    all_connected.then_some(())
                 }
             },
         )

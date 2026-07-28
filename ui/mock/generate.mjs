@@ -211,47 +211,63 @@ function emitControllers() {
 }
 
 // ── proxies ─────────────────────────────────────────────────────────────────
-// shared healthy · shared degraded · dedicated groups (mixed health) · unreachable
+// Since #677 a proxy carries two independent status bits, so the matrix is
+// wider than the single `reachable` it replaced:
+//   ready:false                     — kubelet says the pod is down
+//   ready:true, connected:false     — alive and serving, but frozen on its last
+//                                     snapshot (what a relay flap looks like)
+//   connected:true, health:absent   — streaming but has not reported yet, i.e.
+//                                     a pre-#677 build mid-rollout; must render
+//                                     as "healthy", never as degraded
 const PROXIES = [
   { name: 'coxswain-shared-proxy-66d-ah7x2', kind: 'shared-proxy',    ns: SYS,        health: 'ready',    degraded: [] },
   { name: 'coxswain-shared-proxy-66d-bk9p4', kind: 'shared-proxy',    ns: SYS,        health: 'degraded', degraded: ['routing_table_loaded'] },
+  { name: 'coxswain-shared-proxy-66d-cut01', kind: 'shared-proxy',    ns: SYS,        connected: false },
+  { name: 'coxswain-shared-proxy-66d-old99', kind: 'shared-proxy',    ns: SYS,        unreported: true },
   { name: 'tenant-a-gw-coxswain-7db74-j8cjt', kind: 'dedicated-proxy', ns: 'tenant-a', health: 'ready',    degraded: [], gw: 'tenant-a-gw' },
   { name: 'tenant-a-gw-coxswain-7db74-r5tfb', kind: 'dedicated-proxy', ns: 'tenant-a', health: 'degraded', degraded: ['routing_table_loaded'], gw: 'tenant-a-gw' },
   { name: 'tenant-b-gw-coxswain-5cc91-m2qd8', kind: 'dedicated-proxy', ns: 'tenant-b', health: 'ready',    degraded: [], gw: 'tenant-b-gw' },
-  { name: 'tenant-b-gw-coxswain-5cc91-zzz00', kind: 'dedicated-proxy', ns: 'tenant-b', reachable: false, gw: 'tenant-b-gw' },
+  { name: 'tenant-b-gw-coxswain-5cc91-zzz00', kind: 'dedicated-proxy', ns: 'tenant-b', ready: false, gw: 'tenant-b-gw' },
 ];
-function proxyListEntry(p, i) {
-  if (p.reachable === false) {
-    return { component: p.kind, gateway_ref: p.gw, pod_name: p.name, pod_namespace: p.ns, pod_ip: `10.42.0.${100 + i}`, telemetry_port: 8083, reachable: false, ...runtime(i, PROXY_RESTARTS[i] ?? 0) };
-  }
+/** Base pod identity, carried in every state — a pod that is down or cut off
+ *  still has a namespace, a pool and a gateway ref. */
+function proxyBase(p, i) {
   const e = {
-    telemetry_port: 8083, component: p.kind, degraded_checks: p.degraded, health: p.health,
-    pod_ip: `10.42.0.${100 + i}`, pod_name: p.name, pod_namespace: p.ns, reachable: true,
+    component: p.kind, pod_name: p.name, pod_namespace: p.ns,
+    pod_ip: `10.42.0.${100 + i}`, telemetry_port: 8083,
+    ready: p.ready !== false, connected: p.connected !== false,
     ...runtime(i, PROXY_RESTARTS[i] ?? 0),
   };
   if (p.gw) e.gateway_ref = p.gw;
   return e;
 }
+function proxyListEntry(p, i) {
+  const e = proxyBase(p, i);
+  // A pod that is down or disconnected has no current health report to show,
+  // and neither does one on a build that predates health reporting.
+  if (p.ready === false || p.connected === false || p.unreported) return e;
+  return { ...e, health: p.health, degraded_checks: p.degraded, version: '0.1.0', reported_at: '2026-06-10T09:31:00Z' };
+}
 function emitProxies() {
   write('/api/v1/fleet/proxies', { proxies: PROXIES.map(proxyListEntry) });
   PROXIES.forEach((p, i) => {
     write(`/api/v1/manifests/pod/${p.ns}/${p.name}`, podManifest(p.name, p.ns, p.kind, i, PROXY_RESTARTS[i] ?? 0));
-    if (p.reachable === false) {
-      write(`/api/v1/fleet/proxies/${p.name}`, { component: p.kind, gateway_ref: p.gw, pod_name: p.name, pod_namespace: p.ns, pod_ip: `10.42.0.${100 + i}`, telemetry_port: 8083, reachable: false, ...runtime(i, PROXY_RESTARTS[i] ?? 0) });
-      write(`/api/v1/fleet/proxies/${p.name}/health`, { pod_name: p.name, reachable: false });
-      write(`/api/v1/fleet/proxies/${p.name}/routes`, { pod_name: p.name, reachable: false });
-      return;
-    }
-    const detail = { telemetry_port: 8083, component: p.kind, pod_ip: `10.42.0.${100 + i}`, pod_name: p.name, pod_namespace: p.ns, reachable: true, ...runtime(i, PROXY_RESTARTS[i] ?? 0) };
-    if (p.gw) detail.gateway_ref = p.gw;
-    write(`/api/v1/fleet/proxies/${p.name}`, detail);
-    write(`/api/v1/fleet/proxies/${p.name}/health`, {
-      pod_name: p.name, reachable: true,
-      health: {
-        version: '0.1.0',
-        subsystems: { controller: controllerSubsystem(), proxy: proxySubsystem(p.degraded) },
-      },
-    });
+    write(`/api/v1/fleet/proxies/${p.name}`, proxyBase(p, i));
+    const noReport = p.ready === false || p.connected === false || p.unreported;
+    write(`/api/v1/fleet/proxies/${p.name}/health`, noReport
+      // `health` absent, not an empty tree: the controller has nothing to
+      // report for this pod, which the UI must not render as degraded.
+      ? { pod_name: p.name, ready: p.ready !== false, connected: p.connected !== false }
+      : {
+          pod_name: p.name, ready: true, connected: true,
+          reported_at: '2026-06-10T09:31:00Z',
+          health: {
+            version: '0.1.0',
+            subsystems: { controller: controllerSubsystem(), proxy: proxySubsystem(p.degraded) },
+          },
+        });
+    // Routes always resolve: they come from the controller's own snapshot, not
+    // from the pod, so they are available even when the pod is unreachable.
     write(`/api/v1/fleet/proxies/${p.name}/routes`, { pod_name: p.name, reachable: true, routes: routesFor(p) });
   });
 }
@@ -458,8 +474,14 @@ function emitSummaries() {
     ingresses: cat(INGRESSES),
     namespaces,
   });
-  // A pod's severity: error when unreachable, warn when degraded, else ok.
-  const podSev = (p) => (p.reachable === false ? 'error' : (p.degraded?.length ? 'warn' : 'ok'));
+  // A proxy's severity, worst-first (#677): error when kubelet says not ready,
+  // warn when disconnected (still serving, but frozen) or reporting a non-ready
+  // check, else ok. A connected pod that has not reported yet is `ok` — that is
+  // the mid-rollout state, not a fault.
+  const podSev = (p) =>
+    p.ready === false ? 'error'
+    : p.connected === false ? 'warn'
+    : (p.degraded?.length ? 'warn' : 'ok');
   const ctrlSev = (c) => (c.reachable === false ? 'error' : (c.degraded?.length ? 'warn' : 'ok'));
   const shared = PROXIES.filter((p) => p.kind === 'shared-proxy');
   const dedicated = PROXIES.filter((p) => p.kind === 'dedicated-proxy');
@@ -564,19 +586,31 @@ function emitProblems() {
   // `route` is the source route's identity (the rejected route for a conflict);
   // it points at routes that have detail fixtures so the deep-links resolve.
   const r = (kind, namespace, name) => ({ kind, namespace, name });
-  // Fleet problem classes, derived from the mock world (issue #301): unreachable
-  // pods, degraded pods, and whether a leader exists.
-  const unreachable = [
+  // Fleet problem classes, derived from the mock world (#301, split by #677).
+  // `not_ready` and `disconnected` are separate: a controller lands in the first
+  // via a failed probe, a proxy via kubelet's verdict, and a proxy that is alive
+  // but holds no config stream lands in the second — healthy, still serving, but
+  // frozen on its last snapshot.
+  const not_ready = [
     ...CONTROLLERS.filter((c) => c.reachable === false).map((c) => ({ pod_name: c.name, pod_namespace: SYS, component: 'controller', reachable: false })),
-    ...PROXIES.filter((p) => p.reachable === false).map((p) => ({ pod_name: p.name, pod_namespace: p.ns, component: p.kind, reachable: false })),
+    ...PROXIES.filter((p) => p.ready === false).map((p) => ({ pod_name: p.name, pod_namespace: p.ns, component: p.kind, ready: false })),
+  ];
+  const disconnected = [
+    ...PROXIES
+      .filter((p) => p.ready !== false && p.connected === false)
+      .map((p) => ({ pod_name: p.name, pod_namespace: p.ns, component: p.kind, ready: true, connected: false })),
+    // A relay in a fleet bucket (#677). Relays are bucketed alongside proxies
+    // by the controller, and their cards route to Topology rather than a proxy
+    // detail — /fleet/proxies lists proxies only, so nav.proxy would 404.
+    { pod_name: 'coxswain-relay-tenant-c-7f9-cut02', pod_namespace: 'tenant-c', component: 'relay', ready: true, connected: false },
   ];
   const degraded = [
     ...CONTROLLERS.filter((c) => c.reachable !== false && c.degraded?.length).map((c) => ({ pod_name: c.name, pod_namespace: SYS, component: 'controller', reachable: true, degraded_checks: c.degraded })),
-    ...PROXIES.filter((p) => p.reachable !== false && p.degraded?.length).map((p) => ({ pod_name: p.name, pod_namespace: p.ns, component: p.kind, reachable: true, degraded_checks: p.degraded })),
+    ...PROXIES.filter((p) => p.ready !== false && p.connected !== false && p.degraded?.length).map((p) => ({ pod_name: p.name, pod_namespace: p.ns, component: p.kind, ready: true, connected: true, degraded_checks: p.degraded })),
   ];
   const leaderless = !CONTROLLERS.some((c) => c.reachable !== false && c.leader);
   write('/api/v1/problems', {
-    fleet: { leaderless, unreachable, degraded },
+    fleet: { leaderless, not_ready, disconnected, degraded },
     routing: {
       conflicts: [
         { host: 'demo.local', path: '/', rejected_group: 'demo/old-frontend', kind: 'ingress', pods: sharedPods, route: r('Ingress', 'demo', 'frontend-ingress') },
@@ -611,14 +645,19 @@ function emitHealth() {
 // grouped by Gateway; a namespace relay (#585) fronting two dedicated leaves
 // (one lagging); and a shared-pool relay fronting two shared leaves — so the
 // N-tier controller → relay → leaf render and the relay badge are reachable in
-// dev. Timestamps are fixed so diffs stay stable.
+// dev. Per-node health (#677) covers all three states: ready, degraded, and
+// absent (a node that has not reported, i.e. a pre-#677 build mid-rollout).
+// The DEGRADED one is the namespace relay itself, because this view is the only
+// place a relay's own health is rendered — a relay never appears in its own
+// roster, and /fleet/proxies lists proxies only. Timestamps are fixed so diffs
+// stay stable.
 const TOPO_CTRL_VERSION = 'sha256:aabbcc112233';
 const TOPO_OLD_VERSION  = 'sha256:001122334455';
 const TOPO_SINCE        = '2024-06-01T00:00:00Z';
 const TOPO_NS_RELAY     = 'coxswain-relay-tenant-c-7f9-x1a2b';
 const TOPO_SHARED_RELAY = 'coxswain-relay-shared-6d4-q7r8s';
-function topoNode(id, scope, { inSync = true, parent = null, isRelay = false } = {}) {
-  return {
+function topoNode(id, scope, { inSync = true, parent = null, isRelay = false, health = 'ready', degraded = [] } = {}) {
+  const node = {
     node_id:            id,
     scope,
     last_acked_version: inSync ? TOPO_CTRL_VERSION : TOPO_OLD_VERSION,
@@ -628,6 +667,16 @@ function topoNode(id, scope, { inSync = true, parent = null, isRelay = false } =
     parent,
     is_relay:           isRelay,
   };
+  // `health: null` models a node that has not reported yet — the controller
+  // omits the key entirely, and the card must render neither healthy nor
+  // degraded for it.
+  if (health) {
+    node.health          = health;
+    node.degraded_checks = degraded;
+    node.version         = '0.1.0';
+    node.reported_at     = TOPO_SINCE;
+  }
+  return node;
 }
 function emitTopology() {
   const shared = PROXIES.filter((p) => p.kind === 'shared-proxy');
@@ -639,12 +688,16 @@ function emitTopology() {
     ...dedicated.map((p) =>
       topoNode(p.name, { kind: 'Gateway', namespace: p.ns, name: p.gw })),
 
-    // Namespace relay (#585) fronting two dedicated leaves in tenant-c.
-    topoNode(TOPO_NS_RELAY, { kind: 'Namespace', namespace: 'tenant-c' }, { isRelay: true }),
+    // Namespace relay (#585) fronting two dedicated leaves in tenant-c. The
+    // relay itself is degraded — the one node whose health has no other surface.
+    topoNode(TOPO_NS_RELAY, { kind: 'Namespace', namespace: 'tenant-c' },
+      { isRelay: true, health: 'degraded', degraded: ['relay/downstream_serving'] }),
     topoNode('tenant-c-gw-coxswain-3aa-leaf1', { kind: 'Gateway', namespace: 'tenant-c', name: 'tenant-c-gw' },
       { parent: TOPO_NS_RELAY }),
+    // A leaf that has not reported health at all (pre-#677 build mid-rollout):
+    // in sync, connected, health simply unknown — never rendered as unhealthy.
     topoNode('tenant-c-gw-coxswain-3aa-leaf2', { kind: 'Gateway', namespace: 'tenant-c', name: 'tenant-c-gw' },
-      { parent: TOPO_NS_RELAY, inSync: false }),
+      { parent: TOPO_NS_RELAY, inSync: false, health: null }),
 
     // Shared-pool relay fronting two shared leaves (one lagging).
     topoNode(TOPO_SHARED_RELAY, { kind: 'SharedPool' }, { isRelay: true }),

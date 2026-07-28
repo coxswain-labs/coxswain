@@ -1278,12 +1278,22 @@ async fn routing_api_surfaces_gateways_routes_and_problems() -> anyhow::Result<(
         problems["fleet"]["leaderless"].is_boolean(),
         "problems.fleet.leaderless must be present"
     );
-    for key in ["unreachable", "degraded"] {
+    // `not_ready` and `disconnected` replaced the single `unreachable` list
+    // (#677): the probe that conflated "the pod is down" with "the pod stopped
+    // receiving config" is gone, and those two now have different causes and
+    // different fixes.
+    for key in ["not_ready", "disconnected", "degraded"] {
         assert!(
             problems["fleet"][key].is_array(),
-            "problems.fleet.{key} must be an array"
+            "problems.fleet.{key} must be an array, got {problems}"
         );
     }
+    assert!(
+        problems["fleet"]["unreachable"].is_null(),
+        "the retired `unreachable` bucket must be gone, not shipped alongside its \
+         replacements — two sources of truth for the same question is how a UI ends \
+         up rendering a pod in both; got {problems}"
+    );
     for key in ["conflicts", "dead_routes"] {
         assert!(
             problems["routing"][key].is_array(),

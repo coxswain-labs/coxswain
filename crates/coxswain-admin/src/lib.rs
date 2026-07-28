@@ -412,11 +412,13 @@ impl AdminServer {
             ["fleet", "controllers"] => agg.list_controllers().await,
             ["fleet", "controllers", name] => agg.get_controller(name).await,
             ["fleet", "controllers", name, "health"] => agg.get_controller_health(name).await,
-            ["fleet", "proxies"] => agg.list_proxies().await,
-            ["fleet", "proxies", name] => agg.get_proxy(name).await,
+            ["fleet", "proxies"] => agg.list_proxies(self.leader.load(Ordering::Acquire)),
+            ["fleet", "proxies", name] => agg.get_proxy(name, self.leader.load(Ordering::Acquire)),
             ["fleet", "proxies", name, "routes"] => agg.get_proxy_routes(name, &params).await,
             ["fleet", "proxies", name, "facets"] => agg.get_proxy_facets(name).await,
-            ["fleet", "proxies", name, "health"] => agg.get_proxy_health(name).await,
+            ["fleet", "proxies", name, "health"] => {
+                agg.get_proxy_health(name, self.leader.load(Ordering::Acquire))
+            }
 
             // ── routing (config resources) ────────────────────────────────────
             ["routing", "summary"] => agg.routing_summary(),
@@ -431,7 +433,7 @@ impl AdminServer {
 
             // ── cross-cutting ─────────────────────────────────────────────────
             ["manifests", kind, namespace, name] => agg.get_manifest(kind, namespace, name).await,
-            ["problems"] => agg.list_problems().await,
+            ["problems"] => agg.list_problems(self.leader.load(Ordering::Acquire)).await,
             ["topology"] => agg.topology(self.leader.load(Ordering::Acquire)),
 
             _ => aggregator::not_found(),

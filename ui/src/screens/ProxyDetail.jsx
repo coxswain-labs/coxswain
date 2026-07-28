@@ -92,7 +92,14 @@ export function ProxyDetail({ pod, query }) {
   if (!meta.data)   return <EmptyState message="Proxy not found." />;
 
   const p = meta.data;
-  const isReachable = p.reachable ?? false;
+  // Two independent facts since #677, each from its own authority: kubelet's
+  // Ready condition says whether the pod is alive, the controller's node
+  // registry says whether it is still receiving config. A pod can be ready and
+  // disconnected — serving traffic from a frozen snapshot — which is precisely
+  // the state a single "reachable" badge used to hide. `ready` absent means
+  // kubelet has not published the condition yet: unknown, not a fault.
+  const isReady = p.ready !== false;
+  const isConnected = p.connected ?? false;
   const pool = p.component === 'dedicated-proxy' ? 'dedicated' : 'shared';
 
   const breadcrumb = [
@@ -103,10 +110,10 @@ export function ProxyDetail({ pod, query }) {
     { label: pod },
   ];
 
-  // Navigation aid only: the fleet-wide leader is the active controller, so a
-  // proxy links there as "take me to the control plane". Proxies watch
-  // Kubernetes independently today (no controller→proxy config push), so this
-  // is not a dependency — it'll gain meaning once the controller pushes config.
+  // The fleet-wide leader is the controller this proxy streams its config from
+  // — the one whose registry the `connected` badge above is read out of — so
+  // "disconnected" and "no leader" are usually the same incident seen from two
+  // ends, and this link is where to go next.
   const leaderPod = (controllers.data?.controllers ?? []).find(
     (x) => x.reachable && x.is_leader,
   )?.pod_name;
@@ -136,9 +143,12 @@ export function ProxyDetail({ pod, query }) {
         badges={(
           <>
             {poolBadge(pool)}
-            {isReachable
-              ? <Badge variant="ok">reachable</Badge>
-              : <Badge variant="fail">unreachable</Badge>}
+            {isReady
+              ? <Badge variant="ok">ready</Badge>
+              : <Badge variant="fail">not ready</Badge>}
+            {isConnected
+              ? <Badge variant="ok">connected</Badge>
+              : <Badge variant="warn">disconnected</Badge>}
           </>
         )}
         actions={(

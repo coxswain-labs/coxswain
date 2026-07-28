@@ -1,10 +1,18 @@
 //! `/api/v1/problems` + `/api/v1/fleet/summary` — cross-cutting problem
-//! aggregate and per-category fleet health, derived from fan-out probes.
+//! aggregate and per-category fleet health.
+//!
+//! Three sources, one per class of question. Routing problems come from the
+//! controller's own compiled snapshot (#537). Proxy and relay status comes from
+//! the node registry and the Pod watch (#677) — their health rides the discovery
+//! stream, so nothing here dials a data-plane pod. Only peer **controller**
+//! replicas are still probed over HTTP, because controllers run a discovery
+//! server rather than a client and no stream carries their health.
 
 use http::Response;
 
 use coxswain_core::cluster::{CategorySummary, Severity};
 use coxswain_core::fleet::FleetEntry;
+use coxswain_core::node_registry::NodeRegistry;
 use futures::future::join_all;
 
 use super::proxies::routes_block;
@@ -19,22 +27,24 @@ impl OperatorAggregator {
     /// Cross-cutting problem aggregate, namespaced by the two API axes (#301):
     /// ```json
     /// {
-    ///   "fleet":   { "leaderless": bool, "unreachable": [pod…], "degraded": [pod…] },
+    ///   "fleet":   { "leaderless": bool, "not_ready": [pod…],
+    ///                "disconnected": [pod…], "degraded": [pod…] },
     ///   "routing": { "conflicts": [...], "dead_routes": [...] }
     /// }
     /// ```
     ///
     /// `routing` conflicts/dead-routes come from [`Self::local_proxy_routes`]
     /// (deduped, `kind`-tagged) rather than a fan-out — no proxy query surface
-    /// remains beyond metrics. `fleet` classes still come from probing each
-    /// pod's `/statusz`: `unreachable` pods don't answer and `degraded` pods
-    /// answer with failing checks. `leaderless` does **not** come from those
-    /// probes — it is read from the Lease, so a leader that is momentarily
-    /// unreachable does not raise a false alarm. The operator UI renders this
+    /// remains beyond metrics. `fleet` classes come from three authorities:
+    /// `leaderless` from the Lease (so a leader that is momentarily unreachable
+    /// does not raise a false alarm), the proxy classes from the node registry
+    /// and the Pod watch (#677), and the controller classes from probing peer
+    /// replicas' `/statusz` — the one hop with no stream to ride, since
+    /// controllers are never discovery clients. The operator UI renders this
     /// directly rather than re-deriving severity client-side.
-    pub(crate) async fn list_problems(&self) -> Response<Vec<u8>> {
+    pub(crate) async fn list_problems(&self, is_leader: bool) -> Response<Vec<u8>> {
         let raw = self.local_proxy_routes();
-        let fleet = self.fleet_problems().await;
+        let fleet = self.fleet_problems(is_leader).await;
         let routing = aggregate_problems(&raw);
         json_response(serde_json::json!({ "fleet": fleet, "routing": routing }).to_string())
     }
@@ -69,34 +79,80 @@ impl OperatorAggregator {
             .collect()
     }
 
-    /// Probe every coxswain pod's `/statusz` and bucket the fleet problem
-    /// classes (`leaderless`/`unreachable`/`degraded`). See [`Self::list_problems`].
-    async fn fleet_problems(&self) -> serde_json::Value {
+    /// Bucket the fleet problem classes: `leaderless`, `not_ready`,
+    /// `disconnected`, `degraded`. See [`Self::list_problems`].
+    ///
+    /// `not_ready` and `disconnected` are separate buckets, not one
+    /// `unreachable` list, because the probe that used to conflate them is gone
+    /// and the two now have genuinely different causes and remedies (#677):
+    ///
+    /// - `not_ready` — kubelet says the pod is not Ready. The pod is the
+    ///   problem.
+    /// - `disconnected` — the pod is Ready but holds no discovery stream, so it
+    ///   is serving its last-good snapshot and will not pick up config changes.
+    ///   The *path to the controller* is the problem.
+    ///
+    /// Collapsing them would misreport the case that motivated the split: a
+    /// relay's stream dropping evicts its entire leaf subtree at once, so a
+    /// single relay flap puts N pods in `disconnected` while every one of them
+    /// is still `ready` and still serving traffic.
+    async fn fleet_problems(&self, is_leader: bool) -> serde_json::Value {
         let snapshot = self.fleet.load();
-        let pods: Vec<FleetEntry> = snapshot
-            .controllers
-            .iter()
-            .chain(&snapshot.shared_proxies)
-            .chain(&snapshot.dedicated_proxies)
-            .cloned()
-            .collect();
         let any_controller = !snapshot.controllers.is_empty();
+        let holder = self.lease_holder();
 
-        let probes = join_all(pods.iter().map(|e| async move {
+        let mut not_ready = Vec::new();
+        let mut disconnected = Vec::new();
+        let mut degraded = Vec::new();
+
+        // ── proxies + relays: registry + Pod watch, no probe ────────────────
+        //
+        // A standby has an empty registry, which would read as "every proxy
+        // disconnected". Skip the proxy classes entirely there rather than
+        // publish that; the operator Service selects the leader, so this is the
+        // direct-to-standby path only.
+        if let Ok(registry) = self.require_registry(is_leader) {
+            for e in snapshot
+                .shared_proxies
+                .iter()
+                .chain(&snapshot.dedicated_proxies)
+                .chain(&snapshot.relays)
+            {
+                let node = registry.nodes.get(&e.pod_name);
+                // `ready == None` (condition not yet published) is unknown, not
+                // a fault — a pod seconds into scheduling must not alarm.
+                if e.ready == Some(false) {
+                    not_ready.push(Self::entry_json(e));
+                } else if node.is_none() {
+                    disconnected.push(Self::entry_json(e));
+                }
+                if let Some(health) = node.and_then(|n| n.health.as_ref()) {
+                    let checks = super::non_ready_check_names(&health.snapshot);
+                    if !checks.is_empty() {
+                        let mut v = Self::entry_json(e);
+                        v["degraded_checks"] = serde_json::Value::from(checks);
+                        degraded.push(v);
+                    }
+                }
+            }
+        }
+
+        // ── controllers: the one hop that still probes ──────────────────────
+        //
+        // Controllers are never discovery clients (they run a discovery
+        // *server*, and standbys reject inbound streams), so no stream carries
+        // their health and `/statusz` is the only channel that can.
+        let controllers: Vec<FleetEntry> = snapshot.controllers.to_vec();
+        let probes = join_all(controllers.iter().map(|e| async move {
             let url = pod_statusz_url(e);
             (e, self.fetch_json(&url).await)
         }));
-        let results = probes.await;
-        let holder = self.lease_holder();
-
-        let mut unreachable = Vec::new();
-        let mut degraded = Vec::new();
-        for (e, body) in results {
+        for (e, body) in probes.await {
             match body {
                 None => {
                     let mut v = Self::entry_json(e);
                     v["reachable"] = serde_json::Value::Bool(false);
-                    unreachable.push(v);
+                    not_ready.push(v);
                 }
                 Some(body) => {
                     let checks = non_ready_checks(&body);
@@ -111,12 +167,13 @@ impl OperatorAggregator {
         }
 
         serde_json::json!({
-            // From the Lease, not from the probes: a leader that is momentarily
+            // From the Lease, not from any probe: a leader that is momentarily
             // unreachable still holds the lease, and reporting the cluster as
             // leaderless then would raise a false alarm for the one condition
             // this field exists to detect.
             "leaderless": any_controller && holder.is_none(),
-            "unreachable": unreachable,
+            "not_ready": not_ready,
+            "disconnected": disconnected,
             "degraded": degraded,
         })
     }
@@ -124,9 +181,12 @@ impl OperatorAggregator {
     /// `GET /api/v1/fleet/summary` — compact per-category counts + worst severity
     /// for controllers, shared proxies, and dedicated proxies (the Dashboard's
     /// three fleet tiles), plus `all_in_sync` for the topology convergence banner.
-    /// Backs the tiles without shipping the full pod lists. Reuses the per-pod
-    /// `/health` probe (a pod is `error` when unreachable, `warn` when degraded,
-    /// else `ok`).
+    /// Backs the tiles without shipping the full pod lists.
+    ///
+    /// Proxies are scored from the node registry and the Pod watch by
+    /// [`proxy_severity`] — `error` when kubelet says not Ready, `warn` when
+    /// disconnected or reporting a non-ready check. Only the controller tile is
+    /// probed, via [`Self::category_health`].
     ///
     /// `all_in_sync` is **omitted** unless this replica can actually answer it.
     /// It reads the node registry, which only the leader populates — a standby
@@ -136,13 +196,18 @@ impl OperatorAggregator {
     pub(crate) async fn fleet_summary(&self, is_leader: bool) -> Response<Vec<u8>> {
         let snapshot = self.fleet.load();
         let controllers: Vec<FleetEntry> = snapshot.controllers.to_vec();
-        let shared: Vec<FleetEntry> = snapshot.shared_proxies.to_vec();
-        let dedicated: Vec<FleetEntry> = snapshot.dedicated_proxies.to_vec();
-        let (controllers, shared_proxies, dedicated_proxies) = tokio::join!(
-            self.category_health(&controllers),
-            self.category_health(&shared),
-            self.category_health(&dedicated),
-        );
+        let registry = self.require_registry(is_leader).ok();
+        let severities = |entries: &[FleetEntry]| {
+            CategorySummary::from_severities(
+                entries
+                    .iter()
+                    .map(|e| proxy_severity(e, registry.as_ref()))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let shared_proxies = severities(&snapshot.shared_proxies);
+        let dedicated_proxies = severities(&snapshot.dedicated_proxies);
+        let controllers = self.category_health(&controllers).await;
         let mut body = serde_json::json!({
             "controllers": controllers,
             "shared_proxies": shared_proxies,
@@ -156,8 +221,13 @@ impl OperatorAggregator {
         json_response(body.to_string())
     }
 
-    /// Probe a set of pods and reduce to a [`CategorySummary`] (count + worst
-    /// severity).
+    /// Probe a set of **controller** pods and reduce to a [`CategorySummary`]
+    /// (count + worst severity).
+    ///
+    /// Controllers only: proxies and relays are scored from the registry by
+    /// [`proxy_severity`], with no probe. This remains a fan-out because
+    /// controllers are never discovery clients, so nothing else can answer for
+    /// a peer replica.
     async fn category_health(&self, entries: &[FleetEntry]) -> CategorySummary {
         let probes = entries.iter().map(|e| async move {
             let url = pod_statusz_url(e);
@@ -168,6 +238,39 @@ impl OperatorAggregator {
             }
         });
         CategorySummary::from_severities(join_all(probes).await)
+    }
+}
+
+/// Score one proxy/relay pod for the fleet-summary tiles (#677).
+///
+/// Ranked worst-first so the tile shows the condition that most needs acting
+/// on:
+///
+/// - `Error` — kubelet says not Ready, i.e. the pod itself is broken.
+/// - `Warn`  — Ready but disconnected (serving a frozen snapshot), or Ready and
+///   connected but reporting a non-ready check. Both are "still serving, needs
+///   attention", which is precisely what amber means here.
+/// - `Ok`    — Ready, connected, nothing degraded.
+///
+/// `registry` is `None` on a replica that cannot answer (a standby). Every pod
+/// then scores `Ok` rather than `Warn`: the tile must not turn amber for the
+/// whole fleet because *this replica* cannot see the streams — the accompanying
+/// `all_in_sync` is omitted for the same reason.
+fn proxy_severity(entry: &FleetEntry, registry: Option<&NodeRegistry>) -> Severity {
+    if entry.ready == Some(false) {
+        return Severity::Error;
+    }
+    let Some(registry) = registry else {
+        return Severity::Ok;
+    };
+    let Some(node) = registry.nodes.get(&entry.pod_name) else {
+        return Severity::Warn;
+    };
+    // An unreported node is "connected, health unknown" — not a fault. It is
+    // the mid-rollout state of every pod on a pre-#677 build.
+    match &node.health {
+        Some(h) if !super::non_ready_check_names(&h.snapshot).is_empty() => Severity::Warn,
+        _ => Severity::Ok,
     }
 }
 
@@ -298,6 +401,156 @@ mod tests {
     use crate::aggregator::tests::*;
     use crate::routes_dto::ProxyRoutes;
     use coxswain_core::cluster::SharedClusterSummary;
+    use coxswain_core::health::CheckState;
+
+    // ── fleet problem buckets (#677) ──────────────────────────────────────────
+
+    /// Extract the pod names in one `fleet` bucket of a `/problems` payload.
+    fn bucket(body: &serde_json::Value, name: &str) -> Vec<String> {
+        body["fleet"][name]
+            .as_array()
+            .unwrap_or_else(|| panic!("fleet.{name} must be an array, got {body}"))
+            .iter()
+            .map(|v| v["pod_name"].as_str().unwrap_or_default().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_ready_proxy_with_no_stream_is_disconnected_not_not_ready() {
+        // The relay-flap case that motivated splitting the bucket: when a
+        // relay's stream drops, `evict_children` removes its whole leaf subtree
+        // at once. Every one of those pods is still Ready and still serving
+        // traffic on its last-good snapshot, so reporting them as dead pods
+        // would raise N false alarms for one real problem.
+        let pods = [
+            make_pod("proxy-cut", "shared-proxy", "10.0.0.1", "8082", None),
+            make_pod("proxy-ok", "shared-proxy", "10.0.0.2", "8082", None),
+        ];
+        let agg = make_agg_with_registry(
+            fleet_with(pods),
+            SharedClusterSummary::default(),
+            registry_with([(
+                "proxy-ok",
+                Some(vec![("routing_table_loaded", CheckState::Ready)]),
+            )]),
+        );
+
+        let resp = agg.list_problems(true).await;
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+
+        assert_eq!(bucket(&body, "disconnected"), ["proxy-cut"]);
+        assert!(
+            bucket(&body, "not_ready").is_empty(),
+            "a lost stream is not a dead pod: {body}"
+        );
+        assert!(bucket(&body, "degraded").is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_not_ready_pod_is_bucketed_by_kubelet_not_by_its_stream() {
+        // The converse: the pod holds a perfectly good stream but kubelet says
+        // it is not Ready. That belongs in `not_ready`, and must NOT also appear
+        // in `disconnected` — one problem, one bucket, or the dashboard
+        // double-counts it.
+        let pods = [make_pod_not_ready("proxy-sick", "shared-proxy", "10.0.0.1")];
+        let agg = make_agg_with_registry(
+            fleet_with(pods),
+            SharedClusterSummary::default(),
+            registry_with([(
+                "proxy-sick",
+                Some(vec![("routing_table_loaded", CheckState::Ready)]),
+            )]),
+        );
+
+        let resp = agg.list_problems(true).await;
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+
+        assert_eq!(bucket(&body, "not_ready"), ["proxy-sick"]);
+        assert!(
+            bucket(&body, "disconnected").is_empty(),
+            "a not-Ready pod that is streaming is not disconnected: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_ready_check_reported_over_the_stream_lands_in_degraded() {
+        let pods = [make_pod(
+            "proxy-0",
+            "shared-proxy",
+            "10.0.0.1",
+            "8082",
+            None,
+        )];
+        let agg = make_agg_with_registry(
+            fleet_with(pods),
+            SharedClusterSummary::default(),
+            registry_with([(
+                "proxy-0",
+                Some(vec![(
+                    "routing_table_loaded",
+                    CheckState::Failed {
+                        reason: std::sync::Arc::from("snapshot rejected"),
+                    },
+                )]),
+            )]),
+        );
+
+        let resp = agg.list_problems(true).await;
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+
+        assert_eq!(bucket(&body, "degraded"), ["proxy-0"]);
+        assert_eq!(
+            body["fleet"]["degraded"][0]["degraded_checks"],
+            serde_json::json!(["proxy/routing_table_loaded"])
+        );
+        assert!(
+            bucket(&body, "not_ready").is_empty(),
+            "a degraded check keeps /readyz at 200, so the pod is still Ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relay_is_bucketed_alongside_proxies() {
+        // Relays report health on the same channel and are equally capable of
+        // being disconnected; leaving them out would make the relay tier the one
+        // component whose failure the problems view cannot see.
+        let pods = [make_pod("relay-0", "relay", "10.0.0.1", "8082", None)];
+        let agg = make_agg_with_registry(
+            fleet_with(pods),
+            SharedClusterSummary::default(),
+            registry_with([]),
+        );
+
+        let resp = agg.list_problems(true).await;
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(bucket(&body, "disconnected"), ["relay-0"]);
+    }
+
+    #[tokio::test]
+    async fn a_standby_reports_no_proxy_problems_rather_than_inventing_them() {
+        // A standby's registry is empty, so every proxy would read as
+        // disconnected. Publishing that would page an operator for a cluster
+        // that is entirely healthy.
+        let pods = [make_pod(
+            "proxy-0",
+            "shared-proxy",
+            "10.0.0.1",
+            "8082",
+            None,
+        )];
+        let agg = make_agg_with_registry(
+            fleet_with(pods),
+            SharedClusterSummary::default(),
+            registry_with([]),
+        );
+
+        let resp = agg.list_problems(false).await;
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert!(
+            bucket(&body, "disconnected").is_empty(),
+            "a standby cannot see streams and must not guess: {body}"
+        );
+    }
 
     // ── all_in_sync leader gating (#676) ──────────────────────────────────────
 

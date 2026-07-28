@@ -39,8 +39,14 @@ export function HealthChips({ subsystems }) {
 
 /**
  * Header-placed health chips for the pod-detail pages: renders nothing until the
- * pod's `/health` has subsystems (so an unreachable or still-loading pod shows no
- * chips — its reachability badge already covers that), then the same chips.
+ * pod's `/health` has subsystems, then the same chips.
+ *
+ * Three different states legitimately produce no subsystems — still loading, a
+ * pod that is down, and (for proxies since #677) one that is connected but has
+ * not sent a health report yet, e.g. a pre-#677 build mid-rollout. Rendering
+ * nothing is correct for all three: the header's own status badges say which it
+ * is, and inventing an "unknown" chip per subsystem would imply we know which
+ * subsystems exist when we have not been told.
  */
 export function PodHealthChips({ health }) {
   const subsystems = health?.data?.health?.subsystems;

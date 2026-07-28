@@ -1,13 +1,13 @@
 {
   "component": "shared-proxy",
-  "pod_name": "coxswain-shared-proxy-66d-ah7x2",
+  "pod_name": "coxswain-shared-proxy-66d-old99",
   "pod_namespace": "coxswain-system",
-  "pod_ip": "10.42.0.100",
+  "pod_ip": "10.42.0.103",
   "telemetry_port": 8083,
   "ready": true,
   "connected": true,
   "node": "node-cp-1",
-  "restarts": 0,
+  "restarts": 1,
   "phase": "Running",
-  "created_at": "2026-06-08T00:30:00Z"
+  "created_at": "2026-06-11T03:30:00Z"
 }

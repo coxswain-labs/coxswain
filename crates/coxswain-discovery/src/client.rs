@@ -38,6 +38,7 @@ use crate::upstream::{
     SharedUpstream, UpstreamPolicy, UpstreamRejection, UpstreamTarget, expected_server_matcher,
 };
 use crate::version::WIRE_VERSION;
+use crate::wire::system_time_to_unix;
 
 /// Configuration for the discovery gRPC client supervisor.
 ///
@@ -114,6 +115,14 @@ pub struct DiscoveryClientConfig {
     /// controller's registry for the #531 gate and the topology panel. `None`
     /// (default) = no reporting (leaf proxies and the controller never report).
     pub roster_rx: Option<watch::Receiver<coxswain_core::node_registry::NodeRegistry>>,
+    /// This node's own health registry, for self-reporting (#677).
+    ///
+    /// When `Some` (proxy and relay roles), the supervisor sends a
+    /// `HealthReport` immediately after `Subscribe` on every stream open, and
+    /// again on every check transition — so the controller can serve the
+    /// operator API's fleet and problems views without probing this pod over
+    /// unauthenticated HTTP. `None` (default) = no reporting.
+    pub health: Option<coxswain_core::health::HealthRegistry>,
     /// Runtime-swappable routing-stream upstream (#601).
     ///
     /// When `Some`, `build_channel` reads the current target (endpoints +
@@ -204,6 +213,7 @@ impl DiscoveryClientConfig {
             svid_rotated: None,
             bound_ports_rx: None,
             roster_rx: None,
+            health: None,
             upstream_cell: None,
             upstream_changed: None,
             re_bootstrap: None,
@@ -546,6 +556,16 @@ impl Supervisor {
             self.config.bound_ports_rx.take();
         let mut roster_rx: Option<watch::Receiver<coxswain_core::node_registry::NodeRegistry>> =
             self.config.roster_rx.take();
+        // Paired at the supervisor level, not per stream: the subscription must
+        // outlive one session so a transition that lands mid-reconnect is still
+        // pending when the next stream opens (#677). The pre-queued report on
+        // open covers it either way, but re-subscribing per session would drop
+        // the wake and rely on that alone.
+        let health: Option<(coxswain_core::health::HealthRegistry, watch::Receiver<u64>)> =
+            self.config.health.take().map(|reg| {
+                let rx = reg.subscribe();
+                (reg, rx)
+            });
         let mut attempt: u32 = 0;
         let mut consecutive_not_leader: u32 = 0;
 
@@ -582,7 +602,7 @@ impl Supervisor {
                     // watches force a clean reconnect; a `pending` future stands in
                     // for an unwired receiver so the select shape is uniform.
                     tokio::select! {
-                        result = self.stream_until_closed(&mut grpc, bound_ports_rx.as_mut(), roster_rx.as_mut()) => result,
+                        result = self.stream_until_closed(&mut grpc, bound_ports_rx.as_mut(), roster_rx.as_mut(), health.clone()) => result,
                         Ok(()) = wait_changed(&mut svid_rotation_rx) => {
                             debug!("discovery client: SVID rotated; forcing reconnect with fresh SVID");
                             FAILED.forced()
@@ -712,11 +732,17 @@ impl Supervisor {
     /// When `roster` is `Some` (relay roles), a `RosterReport` carrying the
     /// relay's downstream leaf registry is queued after `Subscribe` and re-sent
     /// on every roster change, on the same pre-queue + re-send rationale (#585).
+    ///
+    /// When `health` is `Some` (proxy and relay roles), a `HealthReport` is
+    /// queued after `Subscribe` and re-sent on every check transition, on the
+    /// same rationale (#677): a reconnect after leader failover must rebuild the
+    /// new leader's view without waiting for the node's health to change.
     async fn stream_until_closed(
         &mut self,
         grpc: &mut TonicClient<Channel>,
         mut bound_ports: Option<&mut watch::Receiver<std::collections::BTreeSet<u16>>>,
         mut roster: Option<&mut watch::Receiver<coxswain_core::node_registry::NodeRegistry>>,
+        mut health: Option<(coxswain_core::health::HealthRegistry, watch::Receiver<u64>)>,
     ) -> StreamEnd {
         const CLOSED: StreamEnd = StreamEnd {
             applied: false,
@@ -765,6 +791,18 @@ impl Supervisor {
         if let Some(rx) = roster.as_mut() {
             let registry = rx.borrow_and_update().clone();
             if tx.send(roster_report_message(&registry)).await.is_err() {
+                warn!("discovery client: outbound channel closed before stream open");
+                return CLOSED;
+            }
+        }
+
+        // Queue this node's own health behind Subscribe (#677). Same pre-queue
+        // rationale: a reconnect after leader failover must rebuild the new
+        // leader's fleet view immediately, not on the node's next health
+        // transition — which on a healthy pod may never come.
+        if let Some((registry, rx)) = health.as_mut() {
+            rx.borrow_and_update();
+            if tx.send(health_report_message(registry)).await.is_err() {
                 warn!("discovery client: outbound channel closed before stream open");
                 return CLOSED;
             }
@@ -902,6 +940,35 @@ impl Supervisor {
                             // watching; the stream will close shortly.
                             debug!("discovery client: roster sender dropped; no further RosterReport");
                             roster = None;
+                        }
+                    }
+                    continue;
+                }
+
+                // A local health check transitioned — report it (#677). Inert
+                // (`pending`) when no registry is wired (the controller's own
+                // client-less role never reaches here).
+                changed = async {
+                    match health.as_mut() {
+                        Some((_, rx)) => rx.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match changed {
+                        Ok(()) => {
+                            let Some((registry, _)) = health.as_ref() else { continue };
+                            debug!("discovery client: health changed; sending HealthReport");
+                            if tx.send(health_report_message(registry)).await.is_err() {
+                                debug!("discovery client: outbound channel closed after HealthReport");
+                                break;
+                            }
+                        }
+                        Err(_) => {
+                            // The registry outlives the client in every role, so
+                            // this is unreachable in practice; stop watching
+                            // rather than spinning on a closed channel.
+                            debug!("discovery client: health sender dropped; no further HealthReport");
+                            health = None;
                         }
                     }
                     continue;
@@ -1234,12 +1301,20 @@ fn node_status_message(ports: &std::collections::BTreeSet<u16>) -> p::ClientMess
     }
 }
 
-/// Unix seconds for a [`SystemTime`], clamped: a pre-epoch time reads 0 and a
-/// far-future one saturates `i64` rather than panicking on the cast.
-fn system_time_to_unix(t: std::time::SystemTime) -> i64 {
-    t.duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
+/// Build the `HealthReport` client message for this node's own health (#677).
+///
+/// Sampled at send time rather than carried on the watch: the watch is a bare
+/// change counter, so the value read here is always the registry's current
+/// state — which is what makes a burst of transitions collapse into one report
+/// instead of a queue of stale ones.
+fn health_report_message(registry: &coxswain_core::health::HealthRegistry) -> p::ClientMessage {
+    p::ClientMessage {
+        kind: Some(CKind::HealthReport(crate::wire::health::health_to_wire(
+            env!("CARGO_PKG_VERSION"),
+            &registry.snapshot(),
+            std::time::SystemTime::now(),
+        ))),
+    }
 }
 
 /// Encode a core [`NodeScope`] as the wire [`Scope`] for a `RosterEntry` (#585).
@@ -1285,6 +1360,11 @@ fn roster_report_message(
                 .unwrap_or_default(),
             connected_since_unix: system_time_to_unix(e.connected_since),
             last_ack_at_unix: e.last_ack_at.map(system_time_to_unix),
+            // A relay-fronted leaf never streams to the controller, so this is
+            // the only path its health has (#677). `None` until the leaf reports.
+            health: e.health.as_ref().map(|h| {
+                crate::wire::health::health_to_wire(&h.version, &h.snapshot, h.reported_at)
+            }),
         })
         .collect();
     p::ClientMessage {
@@ -1770,6 +1850,7 @@ mod tests {
             tls: None,
             bound_ports_rx: None,
             roster_rx: None,
+            health: None,
             svid_cell: None,
             expected_server: None,
             svid_rotated: None,
@@ -1997,6 +2078,99 @@ mod tests {
         assert!(
             matches!(&third.kind, Some(CKind::NodeStatus(ns)) if ns.bound_ports == vec![8080, 8443]),
             "expected NodeStatus [8080, 8443] after the set changed, got: {third:?}"
+        );
+
+        // Keep the server side alive until the assertions are done.
+        drop(srv_tx);
+    }
+
+    // ── health reporting (#677) ──────────────────────────────────────────────
+
+    /// With a health registry wired, the client reports its own subsystem state
+    /// as a `HealthReport` right after `Subscribe`, and again on every genuine
+    /// check transition — the channel that replaced the controller's
+    /// unauthenticated HTTP probe of this pod's `/statusz`.
+    #[tokio::test]
+    async fn reports_health_on_stream_open_and_on_every_check_transition() {
+        let (addr, mut connect_rx) = start_server().await;
+
+        let registry = HealthRegistry::new();
+        let handle = registry.register("disc", &["conn"]);
+        let proxy = registry.register("proxy", &["routing_table_loaded"]);
+        let mut config = test_config(addr);
+        config.health = Some(registry.clone());
+        let (_client, supervisor) =
+            DiscoveryClient::spawn(config, handle, "conn").expect("test endpoints are valid URIs");
+        let _task = tokio::spawn(supervisor.run());
+
+        let (srv_tx, mut cli_rx) = tokio::time::timeout(Duration::from_secs(2), connect_rx.recv())
+            .await
+            .expect("timed out waiting for client connection")
+            .expect("channel closed");
+
+        let first = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for Subscribe")
+            .expect("channel closed");
+        assert!(
+            matches!(first.kind, Some(CKind::Subscribe(_))),
+            "expected Subscribe as first client message, got: {first:?}"
+        );
+
+        // Pre-queued on open, so a reconnect after leader failover rebuilds the
+        // new leader's fleet view without waiting for a transition that may
+        // never come on a healthy pod.
+        let second = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for the initial HealthReport")
+            .expect("channel closed");
+        let Some(CKind::HealthReport(report)) = &second.kind else {
+            panic!("expected a HealthReport right after Subscribe, got: {second:?}");
+        };
+        assert_eq!(
+            report.version,
+            env!("CARGO_PKG_VERSION"),
+            "the report must carry the reporting build's version"
+        );
+        let names: Vec<&str> = report.subsystems.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["disc", "proxy"],
+            "every registered subsystem must be reported, sorted by name"
+        );
+
+        // A genuine transition → a fresh report carrying the new state and its
+        // reason. This is the whole point: the controller learns a pod degraded
+        // without ever dialling it.
+        proxy.degraded("routing_table_loaded", "snapshot stale");
+        let third = tokio::time::timeout(Duration::from_secs(2), cli_rx.recv())
+            .await
+            .expect("timed out waiting for the changed HealthReport")
+            .expect("channel closed");
+        let Some(CKind::HealthReport(report)) = &third.kind else {
+            panic!("expected a HealthReport after the check transitioned, got: {third:?}");
+        };
+        let check = report
+            .subsystems
+            .iter()
+            .find(|s| s.name == "proxy")
+            .and_then(|s| s.checks.first())
+            .expect("the proxy subsystem's check must be present");
+        assert_eq!(check.state, p::CheckState::Degraded as i32);
+        assert_eq!(
+            check.reason, "snapshot stale",
+            "the reason must survive to the wire — it is what the operator reads"
+        );
+
+        // Re-posting the state the check already holds is not a transition.
+        // Without this, a subsystem that re-asserts itself every reconcile tick
+        // would turn into a per-tick stream message.
+        proxy.degraded("routing_table_loaded", "snapshot stale");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), cli_rx.recv())
+                .await
+                .is_err(),
+            "an unchanged re-post must not produce another HealthReport"
         );
 
         // Keep the server side alive until the assertions are done.

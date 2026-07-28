@@ -45,7 +45,7 @@ export function Dashboard() {
   const f = fleet.data ?? {};
   const r = routing.data ?? {};
   const { fleet: fleetProblems = {}, routing: routeProblems = {} } = problems.data ?? {};
-  const { leaderless = false, unreachable = [], degraded = [] } = fleetProblems;
+  const { leaderless = false, not_ready = [], disconnected = [], degraded = [] } = fleetProblems;
   const { conflicts = [], dead_routes = [] } = routeProblems;
 
   // A category tile warns when its worst severity is anything but `ok` (the
@@ -90,7 +90,8 @@ export function Dashboard() {
       <ProblemsPanel
         conflicts={conflicts}
         dead_routes={dead_routes}
-        unreachable={unreachable}
+        not_ready={not_ready}
+        disconnected={disconnected}
         degraded={degraded}
         leaderGap={leaderless}
       />

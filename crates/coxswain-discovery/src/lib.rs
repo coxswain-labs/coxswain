@@ -86,11 +86,15 @@ pub use wire::{scope_from_wire, scope_to_wire};
 /// (`transport::serve_discovery_with_tls`).
 ///
 /// Every arm is small except `RosterReport` (#585), which scales with one
-/// relay's leaf count — at roughly 150 bytes/entry, 1 MiB covers a relay with
-/// several thousand leaves. tonic's crate default is 4 MiB with no explicit
-/// bound at all; this is a named, intentional cap rather than an implicit one.
-/// The stream is mTLS+SPIFFE-gated, so this is bug containment, not an
-/// untrusted-input bound.
+/// relay's leaf count. Each entry is the leaf's convergence state (~150 bytes)
+/// plus its folded `HealthReport` (#677) — the reporting build's version and
+/// each subsystem's named checks, so a proxy's single one-check subsystem adds
+/// well under 100 bytes and only a `Degraded`/`Failed` reason string makes an
+/// entry meaningfully larger. Call it ~250 bytes/entry healthy, and 1 MiB still
+/// covers a relay with a few thousand leaves. tonic's crate default is 4 MiB
+/// with no explicit bound at all; this is a named, intentional cap rather than
+/// an implicit one. The stream is mTLS+SPIFFE-gated, so this is bug
+/// containment, not an untrusted-input bound.
 pub(crate) const MAX_CLIENT_MESSAGE_BYTES: usize = 1024 * 1024;
 
 /// Decode cap the client applies to every inbound [`proto::v1::ServerMessage`]
