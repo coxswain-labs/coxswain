@@ -1,0 +1,46 @@
+# Compression ExtensionRef with missing CR fixture (apply backends::ECHO first).
+#
+# An HTTPRoute references a Compression CR that does not exist. Per GEP-1364
+# the reflector must fail closed (#689): the rule installs as a 500 error
+# route rather than silently admitting traffic with no compression.
+#
+# Gateway: coxswain-test-nocompress on GATEWAY_HTTP_PORT.
+# Route host: gwnocompress.TESTNS.local, path /compress/ -> echo-a:3000 (never reached).
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test-nocompress
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: nocompress-route
+spec:
+  parentRefs:
+    - name: coxswain-test-nocompress
+  hostnames:
+    - "gwnocompress.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /compress/
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: Compression
+            name: does-not-exist
+      backendRefs:
+        - name: echo-a
+          port: 3000

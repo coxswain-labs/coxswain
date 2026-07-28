@@ -84,6 +84,16 @@ impl RouteLike for HttpRoute {
         }
         out
     }
+
+    fn rule_ext_refs(&self) -> Vec<(&str, &str, &str)> {
+        self.spec
+            .rules
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .flat_map(|rule| super::filters::ext_refs(rule.filters.as_deref().unwrap_or(&[])))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -192,13 +202,36 @@ mod tests {
             .iter()
             .map(|(ns, name)| ObjectKey::new(*ns, *name))
             .collect();
+        let rate_limits = empty_rate_limit_store();
+        let retry_policies = empty_retry_policy_store();
+        let path_rewrites = empty_path_rewrite_store();
+        let ip_access = empty_ip_access_store();
+        let basic_auths = empty_basic_auth_store();
+        let external_auths = empty_external_auth_store();
+        let jwt_auths = empty_jwt_auth_store();
+        let request_size_limits = empty_request_size_limit_store();
+        let compressions = empty_compression_store();
+        let stores = crate::gateway_api::RefValidationStores {
+            services,
+            ext_refs: crate::fingerprint::ExtRefStores {
+                rate_limits: &rate_limits,
+                retry_policies: &retry_policies,
+                ip_access: &ip_access,
+                jwt_auths: &jwt_auths,
+                path_rewrites: Some(&path_rewrites),
+                basic_auths: Some(&basic_auths),
+                external_auths: Some(&external_auths),
+                request_size_limits: Some(&request_size_limits),
+                compressions: Some(&compressions),
+            },
+        };
         compute_route_health(
             routes,
             gateways,
             &owned_set,
             &std::collections::HashMap::new(),
             grants,
-            services,
+            &stores,
             "HTTPRoute",
         )
     }
@@ -296,6 +329,69 @@ mod tests {
         assert!(h.accepted);
         assert!(!h.resolved_refs);
         assert_eq!(h.resolved_refs_reason, "BackendNotFound");
+    }
+
+    #[test]
+    fn dangling_extension_ref_sets_resolved_refs_false_invalid_kind() {
+        use crate::gw_types::v::httproutes::{
+            HttpRouteRulesFilters, HttpRouteRulesFiltersExtensionRef, HttpRouteRulesFiltersType,
+        };
+
+        let gw = make_gateway("default", "gw", "", 80);
+        let route = Arc::new(HttpRoute {
+            metadata: ObjectMeta {
+                name: Some("route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: HttpRouteSpec {
+                parent_refs: Some(vec![HttpRouteParentRefs {
+                    name: "gw".to_string(),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                }]),
+                hostnames: None,
+                rules: Some(vec![HttpRouteRules {
+                    backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                        name: "svc".to_string(),
+                        port: Some(80),
+                        ..Default::default()
+                    }]),
+                    filters: Some(vec![HttpRouteRulesFilters {
+                        r#type: HttpRouteRulesFiltersType::ExtensionRef,
+                        extension_ref: Some(HttpRouteRulesFiltersExtensionRef {
+                            group: "gateway.coxswain-labs.dev".to_string(),
+                            kind: "RateLimit".to_string(),
+                            name: "does-not-exist".to_string(),
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }]),
+            },
+            ..Default::default()
+        });
+
+        // "svc" backend exists, so `check_backend_refs` passes — isolates the
+        // failure to the dangling `ExtensionRef` (#689/GEP-1364).
+        let map = run(
+            &[route],
+            &[gw],
+            &[("default", "gw")],
+            &HashSet::new(),
+            &service_store_with("default", "svc"),
+        );
+
+        let h = map.get(&key("default", "route", "default", "gw")).unwrap();
+        assert!(
+            h.accepted,
+            "expected Accepted=true — the kind itself is supported"
+        );
+        assert!(
+            !h.resolved_refs,
+            "a dangling ExtensionRef must set ResolvedRefs=False"
+        );
+        assert_eq!(h.resolved_refs_reason, "InvalidKind");
     }
 
     #[test]

@@ -54,4 +54,9 @@ impl RouteLike for UdpRoute {
             })
             .collect()
     }
+
+    fn rule_ext_refs(&self) -> Vec<(&str, &str, &str)> {
+        // UDPRoute has no rule-level `filters` field — no ExtensionRef surface.
+        vec![]
+    }
 }

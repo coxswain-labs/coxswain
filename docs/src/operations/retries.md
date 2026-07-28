@@ -55,7 +55,7 @@ metadata:
     ingress.coxswain-labs.dev/retry: "shop/resilient"
 ```
 
-**Fail-open**: if the referenced `RetryPolicy` CR is missing, the route serves with retrying disabled (a WARN is logged) rather than failing the route — the same posture as the Gateway API binding below.
+**Fail-open**: if the referenced `RetryPolicy` CR is missing, the route serves with retrying disabled (a WARN is logged) rather than failing the route.
 
 See the [Ingress annotations reference](../ingress/annotations.md#retry) for the full annotation semantics.
 
@@ -97,4 +97,4 @@ spec:
 
 The same CR works on a `GRPCRoute` rule — the `grpcCodes` field then governs which `grpc-status` outcomes retry. `codes` still applies on a `GRPCRoute` for transport-level HTTP errors.
 
-**Fail-open**: if the referenced `RetryPolicy` CR is missing, the route serves with retrying disabled (a WARN is logged) rather than failing the route.
+**Fail-closed**: if the referenced `RetryPolicy` CR is missing, the rule installs as a `500` error route (`ResolvedRefs=False`, reason `InvalidKind`) rather than silently serving with retrying disabled — per GEP-1364, a filter reference that cannot be resolved must not be silently skipped.

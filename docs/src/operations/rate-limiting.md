@@ -64,7 +64,7 @@ spec:
                   number: 8080
 ```
 
-**Fail-open**: if the referenced `RateLimit` CR is missing, the route serves with rate limiting disabled (a WARN is logged) rather than failing the route — the same posture as the Gateway API binding below. See the [`RateLimit` spec fields](#ratelimit-spec-fields) below for `requestsPerSecond`/`burst`/`byHeader`.
+**Fail-open**: if the referenced `RateLimit` CR is missing, the route serves with rate limiting disabled (a WARN is logged) rather than failing the route. See the [`RateLimit` spec fields](#ratelimit-spec-fields) below for `requestsPerSecond`/`burst`/`byHeader`.
 
 ### Example: 5 req/s per API key header
 
@@ -139,7 +139,7 @@ spec:
 
 The `RateLimit` CR must be in the same namespace as the `HTTPRoute`. A rule can reference at most one `RateLimit` (the first `ExtensionRef` with `group: gateway.coxswain-labs.dev` and `kind: RateLimit` wins).
 
-**Fail-open**: a dangling reference to a non-existent `RateLimit` CR emits a controller warning and installs the route with no rate limiting — traffic is never blocked by a missing CR.
+**Fail-closed**: a dangling reference to a non-existent `RateLimit` CR emits a controller warning and installs the rule as a `500` error route (`ResolvedRefs=False`, reason `InvalidKind`) rather than admitting unlimited traffic — per GEP-1364, a filter reference that cannot be resolved must not be silently skipped. A CR that exists but sets `requestsPerSecond: 0` is a different, intentional case: that reference resolved, so the route installs normally with no rate limiting.
 
 ## 429 response format
 

@@ -304,10 +304,11 @@ async fn gateway_route_rate_limited_via_extensionref() -> anyhow::Result<()> {
 }
 
 /// Gateway API `ExtensionRef` pointing at a `RateLimit` CR that does not exist:
-/// the reflector warns and fails-open — all requests are admitted (#25 sad path
-/// — dangling ExtensionRef).
+/// a dangling `ExtensionRef` must fail closed, not silently admit unlimited
+/// traffic — the rule installs as a `500` error route (#689/GEP-1364, #25 sad
+/// path).
 #[tokio::test]
-async fn gateway_route_unthrottled_when_ratelimit_cr_missing() -> anyhow::Result<()> {
+async fn gateway_route_rejected_when_ratelimit_cr_missing() -> anyhow::Result<()> {
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "rl-gw-norl").await?;
     fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
@@ -315,19 +316,13 @@ async fn gateway_route_unthrottled_when_ratelimit_cr_missing() -> anyhow::Result
     let gw = h.gateway_http(&ns.name).await?;
     let host = format!("gwnorl.{}.local", ns.name);
 
-    // Route must be live; missing CR → fail-open → all requests admitted.
-    wait::wait_for_route(&gw, &host, "/rl/", Duration::from_secs(60)).await?;
+    wait::wait_for_route_status(&gw, &host, "/rl/", 500, Duration::from_secs(60)).await?;
 
-    // 10 rapid requests — no rate limiter was installed, so all must be 200.
-    let mut statuses: Vec<u16> = Vec::new();
-    for _ in 0..10 {
-        let (status, _, _) = gw.get_full(&host, "/rl/").await?;
-        statuses.push(status);
+    // Consistently 500, not a one-off transient — a missing CR is a durable state.
+    for _ in 0..5 {
+        let status = gw.get_status(&host, "/rl/").await?;
+        anyhow::ensure!(status == 500, "expected sustained 500, got {status}");
     }
-    anyhow::ensure!(
-        statuses.iter().all(|&s| s == 200),
-        "missing RateLimit CR must be fail-open (all 200), got: {statuses:?}"
-    );
     Ok(())
 }
 
@@ -487,6 +482,23 @@ async fn gateway_ip_deny_precedes_allow_when_both_match() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// HTTPRoute `ExtensionRef` pointing at an `IpAccessControl` CR that does not
+/// exist: a dangling `ExtensionRef` must fail closed, not silently admit
+/// traffic with no IP filtering — the rule installs as a `500` error route
+/// (#689/GEP-1364, #479 sad path — dangling reference).
+#[tokio::test]
+async fn gateway_route_rejected_when_ip_access_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ipac-gw-nocr").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::IP_ACCESS_MISSING_CR, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwnoipac.{}.local", ns.name);
+
+    wait::wait_for_route_status(&gw, &host, "/ipac/", 500, Duration::from_secs(60)).await?;
+    Ok(())
+}
+
 // ── IP access control + rate limiting on GRPCRoute (#479, #25 gRPC parity) ─────
 //
 // The protocol-agnostic ExtensionRef filters apply to gRPC (HTTP/2) identically.
@@ -636,6 +648,30 @@ async fn grpc_route_ip_access_blocks_when_client_not_allowed() -> anyhow::Result
     Ok(())
 }
 
+/// GRPCRoute `ExtensionRef` pointing at an `IpAccessControl` CR that does not
+/// exist: a dangling `ExtensionRef` must fail closed, not silently admit
+/// traffic with no IP filtering — the rule installs as a `500` error route
+/// (#689/GEP-1364, #479 gRPC parity sad path).
+#[tokio::test]
+async fn grpc_route_rejected_when_ip_access_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "grpc-ipac-nocr").await?;
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::GRPC_IP_ACCESS_MISSING_CR, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("grpc-noipac.{}.local", ns.name);
+
+    wait::wait_for_route_status(
+        &gw,
+        &host,
+        "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo",
+        500,
+        Duration::from_secs(60),
+    )
+    .await?;
+    Ok(())
+}
+
 /// `RateLimit` on a GRPCRoute (rps=1): the first call is served (proving the route
 /// is live and the ExtensionRef accepted), then rapid follow-ups are rejected —
 /// the proxy's 429 surfaces as gRPC `Unavailable` (#25 gRPC parity).
@@ -677,6 +713,28 @@ async fn grpc_route_rate_limited_via_extensionref() -> anyhow::Result<()> {
         rate_limited,
         "expected at least one gRPC call to be rate-limited (RateLimit rps=1, 429 → Unavailable) on rapid-fire"
     );
+    Ok(())
+}
+
+/// GRPCRoute `ExtensionRef` pointing at a `RateLimit` CR that does not exist
+/// (#689/GEP-1364, #25 gRPC parity sad path).
+#[tokio::test]
+async fn grpc_route_rejected_when_rate_limit_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "grpc-rl-nocr").await?;
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::GRPC_RATE_LIMIT_MISSING_CR, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("grpc-norl.{}.local", ns.name);
+
+    wait::wait_for_route_status(
+        &gw,
+        &host,
+        "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo",
+        500,
+        Duration::from_secs(60),
+    )
+    .await?;
     Ok(())
 }
 
@@ -760,6 +818,30 @@ async fn grpc_route_jwt_auth_rejects_missing_or_invalid_token() -> anyhow::Resul
         Err(s) if s.code() == tonic::Code::Unauthenticated => {}
         other => anyhow::bail!("expected Unauthenticated for a wrong-issuer token, got {other:?}"),
     }
+    Ok(())
+}
+
+/// GRPCRoute `ExtensionRef` pointing at a `JwtAuth` CR that does not exist: a
+/// dangling `ExtensionRef` must fail closed, not silently admit traffic with
+/// no auth enforced — the rule installs as a `500` error route
+/// (#689/GEP-1364, #441 gRPC parity sad path).
+#[tokio::test]
+async fn grpc_route_rejected_when_jwt_auth_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "grpc-jwtauth-nocr").await?;
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::GRPC_JWT_AUTH_MISSING_CR, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("grpc-nojwtauth.{}.local", ns.name);
+
+    wait::wait_for_route_status(
+        &gw,
+        &host,
+        "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo",
+        500,
+        Duration::from_secs(60),
+    )
+    .await?;
     Ok(())
 }
 
@@ -1212,6 +1294,24 @@ async fn gateway_basic_auth_invalid_credential_rejected() -> anyhow::Result<()> 
     Ok(())
 }
 
+/// HTTPRoute `ExtensionRef` pointing at a `BasicAuth` CR that does not exist:
+/// a dangling `ExtensionRef` must fail closed, not silently admit traffic
+/// with no auth enforced — the rule installs as a `500` error route
+/// (#689/GEP-1364, #442 sad path — distinct from the missing-Secret 503 case
+/// above, where the `BasicAuth` CR itself resolves).
+#[tokio::test]
+async fn gateway_route_rejected_when_basic_auth_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "basicauth-gw-nocr").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::BASIC_AUTH_MISSING_CR, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwnobasicauth.{}.local", ns.name);
+
+    wait::wait_for_route_status(&gw, &host, "/basicauth/", 500, Duration::from_secs(60)).await?;
+    Ok(())
+}
+
 /// `BasicAuth` CR referencing an UNLABELED Secret: the reflector never loads
 /// it, so the proxy fails closed with 503 — even valid credentials are refused
 /// (#442 sad path — fail-closed label requirement).
@@ -1347,10 +1447,10 @@ async fn gateway_jwt_auth_valid_token_admitted() -> anyhow::Result<()> {
     // Poll for the fully-reconciled state, not just a 200: the reflector watches
     // the HTTPRoute and the JwtAuth CR independently, so there is a real window
     // where the route is already routable before the CR has synced — the
-    // ExtensionRef's deliberate fail-open (#441) means that window serves a
-    // plain 200 with *no* JWT enforcement at all (same status code, no
-    // claimToHeaders forwarding). A predicate keyed on status code alone would
-    // accept that transient state; require the forwarded claim to be correct.
+    // ExtensionRef fails **closed** during that window (#689/GEP-1364), serving
+    // 500 rather than admitting the request unauthenticated. Require the
+    // forwarded claim to be correct (not just status 200) so this test still
+    // passes once reconciliation genuinely settles, rather than racing it.
     let resp = wait::poll_until(
         Duration::from_secs(90),
         wait::POLL,
@@ -1412,6 +1512,23 @@ async fn gateway_jwt_auth_missing_token_rejected() -> anyhow::Result<()> {
             "expected 401 for a {label} token, got {status}"
         );
     }
+    Ok(())
+}
+
+/// HTTPRoute `ExtensionRef` pointing at a `JwtAuth` CR that does not exist: a
+/// dangling `ExtensionRef` must fail closed, not silently admit traffic with
+/// no auth enforced — the rule installs as a `500` error route
+/// (#689/GEP-1364, #441 sad path).
+#[tokio::test]
+async fn gateway_route_rejected_when_jwt_auth_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "jwtauth-gw-nocr").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::JWT_AUTH_MISSING_CR, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwnojwtauth.{}.local", ns.name);
+
+    wait::wait_for_route_status(&gw, &host, "/jwtauth/", 500, Duration::from_secs(60)).await?;
     Ok(())
 }
 
@@ -1576,6 +1693,24 @@ async fn gateway_external_auth_extensionref_denies_when_authz_403() -> anyhow::R
 
     // 404 = not yet programmed; a single 403 proves the proxy forwarded the deny.
     wait::wait_for_route_status(&gw, &host, "/", 403, Duration::from_secs(90)).await?;
+    Ok(())
+}
+
+/// HTTPRoute `ExtensionRef` pointing at a `CoxswainExternalAuth` CR that does
+/// not exist: a dangling `ExtensionRef` must fail closed, not silently admit
+/// traffic with no ext-auth check — the rule installs as a `500` error route
+/// (#689/GEP-1364, #23 sad path — dangling reference, distinct from the
+/// authz-service-denies 403 above).
+#[tokio::test]
+async fn gateway_route_rejected_when_external_auth_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "extauth-gw-nocr").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::EXTERNAL_AUTH_MISSING_CR, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwnoextauth.{}.local", ns.name);
+
+    wait::wait_for_route_status(&gw, &host, "/extauth/", 500, Duration::from_secs(60)).await?;
     Ok(())
 }
 

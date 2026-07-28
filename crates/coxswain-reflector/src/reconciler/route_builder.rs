@@ -1388,7 +1388,7 @@ fn build_tls_l4_routes(
         owned_gateways,
         effective,
         backend_grants,
-        stores.services,
+        &stores.ref_validation_stores(),
     )
 }
 
@@ -1600,7 +1600,7 @@ pub(super) fn build_tcp_routes(
         owned_gateways,
         effective,
         backend_grants,
-        stores.services,
+        &stores.ref_validation_stores(),
     )
 }
 
@@ -1812,7 +1812,7 @@ pub(super) fn build_udp_routes(
         owned_gateways,
         effective,
         backend_grants,
-        stores.services,
+        &stores.ref_validation_stores(),
     )
 }
 
@@ -2166,6 +2166,26 @@ mod tests {
             );
         svc.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
         let services = crate::MergedStore::single(svc.as_reader());
+        // TLSRoute's `rule_ext_refs()` is always `vec![]` (no ExtensionRef
+        // surface), so these stores are never queried — empty is fine.
+        let rate_limits = crate::tests::fixtures::empty_rate_limit_store();
+        let retry_policies = crate::tests::fixtures::empty_retry_policy_store();
+        let ip_access = crate::tests::fixtures::empty_ip_access_store();
+        let jwt_auths = crate::tests::fixtures::empty_jwt_auth_store();
+        let stores = crate::gateway_api::RefValidationStores {
+            services: &services,
+            ext_refs: crate::fingerprint::ExtRefStores {
+                rate_limits: &rate_limits,
+                retry_policies: &retry_policies,
+                ip_access: &ip_access,
+                jwt_auths: &jwt_auths,
+                path_rewrites: None,
+                basic_auths: None,
+                external_auths: None,
+                request_size_limits: None,
+                compressions: None,
+            },
+        };
 
         let map = TlsRouteReconciler::compute_route_health(
             &[route],
@@ -2173,7 +2193,7 @@ mod tests {
             &owned(),
             &effective,
             &HashSet::new(),
-            &services,
+            &stores,
         );
 
         let h = map

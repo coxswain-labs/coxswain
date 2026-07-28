@@ -1404,6 +1404,25 @@ async fn url_rewrite_replaces_request_host() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── PathRewriteRegex ExtensionRef (Gateway API, #689) ─────────────────────────
+
+/// HTTPRoute `ExtensionRef` pointing at a `PathRewriteRegex` CR that does not
+/// exist: a dangling `ExtensionRef` must fail closed, not silently forward
+/// with the path unrewritten — the rule installs as a `500` error route
+/// (#689/GEP-1364 sad path).
+#[tokio::test]
+async fn gateway_route_rejected_when_path_rewrite_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rewrite-gw-nocr").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::PATH_REWRITE_MISSING_CR, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwnorewrite.{}.local", ns.name);
+
+    wait::wait_for_route_status(&gw, &host, "/rewrite/", 500, Duration::from_secs(60)).await?;
+    Ok(())
+}
+
 /// Verifies `RequestRedirect` correctly emits 303, 307, and 308 status codes.
 #[tokio::test]
 async fn request_redirect_returns_various_status_codes() -> anyhow::Result<()> {

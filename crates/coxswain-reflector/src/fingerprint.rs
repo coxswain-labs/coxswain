@@ -174,7 +174,34 @@ pub(crate) struct ExtRefStores<'a> {
     pub(crate) compressions: Option<&'a MergedStore<coxswain_core::crd::Compression>>,
 }
 
-impl ExtRefStores<'_> {
+impl<'a> ExtRefStores<'a> {
+    /// The 4-kind subset every GRPCRoute-resolving call site needs: `RateLimit`,
+    /// `RetryPolicy`, `IpAccessControl`, `JwtAuth` — the only kinds
+    /// `grpc_reconcile.rs` resolves — with the 5 HTTP-only stores absent.
+    /// Named so the two call sites that each need this exact subset
+    /// (`GrpcRouteResolution::ext_ref_stores` for the fingerprint path,
+    /// `ReflectorStores`'s GRPCRoute `ResolvedRefs` status path, #689) share
+    /// one definition instead of two hand-rolled struct literals that could
+    /// silently drift when GRPCRoute starts resolving a 5th kind.
+    pub(crate) fn grpc(
+        rate_limits: &'a MergedStore<coxswain_core::crd::RateLimit>,
+        retry_policies: &'a MergedStore<coxswain_core::crd::RetryPolicy>,
+        ip_access: &'a MergedStore<coxswain_core::crd::IpAccessControl>,
+        jwt_auths: &'a MergedStore<coxswain_core::crd::JwtAuth>,
+    ) -> Self {
+        Self {
+            rate_limits,
+            retry_policies,
+            ip_access,
+            jwt_auths,
+            path_rewrites: None,
+            basic_auths: None,
+            external_auths: None,
+            request_size_limits: None,
+            compressions: None,
+        }
+    }
+
     /// Fingerprint of one spec-static `ExtensionRef` target `(kind, name)` in
     /// `route_ns` — the referenced CR's own `resourceVersion` via a direct
     /// store lookup (no scan) for registered kinds, the stable `(kind, name)`
@@ -188,12 +215,62 @@ impl ExtRefStores<'_> {
             "JwtAuth" => object_fingerprint(self.jwt_auths, route_ns, name),
             "PathRewriteRegex" => opt_fingerprint(self.path_rewrites, route_ns, kind, name),
             "BasicAuth" => opt_fingerprint(self.basic_auths, route_ns, kind, name),
-            "CoxswainExternalAuth" => opt_fingerprint(self.external_auths, route_ns, kind, name),
+            // The `ExtensionRef.kind` value operators set is `ExternalAuth` (see
+            // filters.rs's `resolve_external_auth`), not the CR's own Kind
+            // (`CoxswainExternalAuth`) — matching the latter here always missed,
+            // degrading every ExternalAuth ref to the imprecise `(kind, name)`
+            // sentinel instead of the CR's real resourceVersion.
+            "ExternalAuth" => opt_fingerprint(self.external_auths, route_ns, kind, name),
             "RequestSizeLimit" => opt_fingerprint(self.request_size_limits, route_ns, kind, name),
             "Compression" => opt_fingerprint(self.compressions, route_ns, kind, name),
             _ => hash_one(&(kind, name)),
         }
     }
+
+    /// Whether the CR named `(route_ns, name)` for `ExtensionRef` kind `kind`
+    /// exists — the #689/GEP-1364 "is this reference dangling" check,
+    /// dispatched through the same kind→store table as [`Self::fingerprint`]
+    /// so the two can never drift on which kinds are registered.
+    ///
+    /// `None` when `kind` is not a coxswain `ExtensionRef` kind this dispatch
+    /// knows about, or when this resolution's store for `kind` is absent (the
+    /// route kind doesn't resolve it at all, e.g. `BasicAuth` on `GRPCRoute`)
+    /// — in both cases there is nothing to validate here; the
+    /// `Accepted=UnsupportedValue` path (not `ResolvedRefs`) covers a foreign
+    /// or route-kind-unsupported ref. `Some(true)`/`Some(false)` otherwise.
+    pub(crate) fn exists(&self, route_ns: &str, kind: &str, name: &str) -> Option<bool> {
+        match kind {
+            "RateLimit" => Some(object_exists(self.rate_limits, route_ns, name)),
+            "RetryPolicy" => Some(object_exists(self.retry_policies, route_ns, name)),
+            "IpAccessControl" => Some(object_exists(self.ip_access, route_ns, name)),
+            "JwtAuth" => Some(object_exists(self.jwt_auths, route_ns, name)),
+            "PathRewriteRegex" => opt_exists(self.path_rewrites, route_ns, name),
+            "BasicAuth" => opt_exists(self.basic_auths, route_ns, name),
+            "ExternalAuth" => opt_exists(self.external_auths, route_ns, name),
+            "RequestSizeLimit" => opt_exists(self.request_size_limits, route_ns, name),
+            "Compression" => opt_exists(self.compressions, route_ns, name),
+            _ => None,
+        }
+    }
+}
+
+/// Whether an object named `(ns, name)` exists in `store` — O(1) via the
+/// store's index, not a scan.
+fn object_exists<K>(store: &MergedStore<K>, ns: &str, name: &str) -> bool
+where
+    K: Resource<DynamicType = ()> + Clone + Send + Sync + 'static,
+{
+    let key = reflector::ObjectRef::<K>::new(name).within(ns);
+    store.get(&key).is_some()
+}
+
+/// [`object_exists`] when the store is present, `None` when it is absent
+/// (this route type's translator doesn't resolve the kind at all).
+fn opt_exists<K>(store: Option<&MergedStore<K>>, ns: &str, name: &str) -> Option<bool>
+where
+    K: Resource<DynamicType = ()> + Clone + Send + Sync + 'static,
+{
+    store.map(|s| object_exists(s, ns, name))
 }
 
 /// [`object_fingerprint`] when the store is present (this route type's

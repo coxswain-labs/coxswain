@@ -885,6 +885,123 @@ async fn route_status_reports_resolved_refs_per_backend() -> anyhow::Result<()> 
     .await
 }
 
+/// A dangling `ExtensionRef` (its coxswain CR does not exist) must set
+/// `ResolvedRefs=False/InvalidKind` while the route stays `Accepted=True` —
+/// GEP-1364: the reference itself is unresolvable, which is a `ResolvedRefs`
+/// concern, not an `Accepted` one (#689).
+#[tokio::test]
+async fn route_status_reports_resolved_refs_false_for_dangling_extension_ref() -> anyhow::Result<()>
+{
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "route-status-extref").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::ROUTE_STATUS_EXT_REF, FixtureVars::new(&ns.name)).await?;
+
+    // The resolvable route programming proves the writer is live for this ns —
+    // so the ext-ref-ghost route below has had equal opportunity to be evaluated.
+    wait::wait_for_httproute_programmed(&h.client, "good-route", &ns.name, Duration::from_secs(30))
+        .await?;
+
+    let routes: Api<HttpRoute> = Api::namespaced(h.client.clone(), &ns.name);
+
+    let good = routes.get("good-route").await?;
+    assert_eq!(
+        route_parent_condition(&good, "ResolvedRefs"),
+        Some(("True".to_string(), "ResolvedRefs".to_string())),
+        "good-route (no ExtensionRef) must be ResolvedRefs=True"
+    );
+
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            let observed = routes.get("ext-ref-ghost-route").await.ok().map_or_else(
+                || "<could not fetch ext-ref-ghost-route>".to_string(),
+                |r| {
+                    format!(
+                        "Accepted={:?}, ResolvedRefs={:?}",
+                        route_parent_condition(&r, "Accepted"),
+                        route_parent_condition(&r, "ResolvedRefs"),
+                    )
+                },
+            );
+            format!(
+                "ext-ref-ghost-route to be Accepted=True + ResolvedRefs=False(InvalidKind); observed {observed}"
+            )
+        },
+        || async {
+            let r = routes.get("ext-ref-ghost-route").await.ok()?;
+            (route_parent_condition(&r, "Accepted").map(|(s, _)| s) == Some("True".to_string())
+                && route_parent_condition(&r, "ResolvedRefs")
+                    == Some(("False".to_string(), "InvalidKind".to_string())))
+            .then_some(())
+        },
+    )
+    .await
+}
+
+/// GRPCRoute counterpart of
+/// [`route_status_reports_resolved_refs_false_for_dangling_extension_ref`]
+/// (#689/GEP-1364) — proves the `ResolvedRefs`/`InvalidKind` wiring holds for
+/// GRPCRoute's narrower (4-kind) `ExtensionRef` surface too.
+#[tokio::test]
+async fn grpc_route_resolvedrefs_false_for_dangling_extension_ref() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-grpc-extref").await?;
+
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(gwa::GRPC_ROUTE_STATUS_EXT_REF, FixtureVars::new(&ns.name)).await?;
+
+    wait::wait_for_grpcroute_programmed(
+        &h.client,
+        "good-grpc-route",
+        &ns.name,
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    let routes: kube::Api<GrpcRoute> = kube::Api::namespaced(h.client.clone(), &ns.name);
+
+    let good = routes.get("good-grpc-route").await?;
+    assert_eq!(
+        grpcroute_parent_condition(&good, "ResolvedRefs"),
+        Some(("True".to_string(), "ResolvedRefs".to_string())),
+        "good-grpc-route (no ExtensionRef) must be ResolvedRefs=True"
+    );
+
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            let observed = routes.get("ext-ref-ghost-grpc-route").await.ok().map_or_else(
+                || "<could not fetch ext-ref-ghost-grpc-route>".to_string(),
+                |r| {
+                    format!(
+                        "Accepted={:?}, ResolvedRefs={:?}",
+                        grpcroute_parent_condition(&r, "Accepted"),
+                        grpcroute_parent_condition(&r, "ResolvedRefs"),
+                    )
+                },
+            );
+            format!(
+                "ext-ref-ghost-grpc-route to be Accepted=True + ResolvedRefs=False(InvalidKind); observed {observed}"
+            )
+        },
+        || async {
+            let r = routes.get("ext-ref-ghost-grpc-route").await.ok()?;
+            (grpcroute_parent_condition(&r, "Accepted").map(|(s, _)| s)
+                == Some("True".to_string())
+                && grpcroute_parent_condition(&r, "ResolvedRefs")
+                    == Some(("False".to_string(), "InvalidKind".to_string())))
+            .then_some(())
+        },
+    )
+    .await
+}
+
 /// Ownership negative: the status writer patches `loadBalancer` status only onto
 /// Ingresses whose class we own. An Ingress claiming a foreign IngressClass must
 /// be left untouched, even while an owned sibling in the same namespace is

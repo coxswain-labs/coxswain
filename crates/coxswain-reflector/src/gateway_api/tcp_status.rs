@@ -54,4 +54,9 @@ impl RouteLike for TcpRoute {
             })
             .collect()
     }
+
+    fn rule_ext_refs(&self) -> Vec<(&str, &str, &str)> {
+        // TCPRoute has no rule-level `filters` field — no ExtensionRef surface.
+        vec![]
+    }
 }

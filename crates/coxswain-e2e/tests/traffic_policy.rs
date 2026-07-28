@@ -783,6 +783,27 @@ async fn gateway_request_size_limit_enforces_cap() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// HTTPRoute `ExtensionRef` pointing at a `RequestSizeLimit` CR that does not
+/// exist: a dangling `ExtensionRef` must fail closed, not silently admit
+/// traffic with no size limit — the rule installs as a `500` error route
+/// (#689/GEP-1364, #443 sad path — dangling reference).
+#[tokio::test]
+async fn gateway_route_rejected_when_request_size_limit_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rsl-gw-nocr").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        gwa::REQUEST_SIZE_LIMIT_MISSING_CR,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwnorsl.{}.local", ns.name);
+
+    wait::wait_for_route_status(&gw, &host, "/rsl/", 500, Duration::from_secs(60)).await?;
+    Ok(())
+}
+
 // Minimal `grpcecho` proto (hand-derived from grpcecho.proto to avoid a
 // prost-build dependency) for the GRPCRoute RequestSizeLimit parity test (#443).
 // Service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
@@ -1168,6 +1189,49 @@ async fn grpc_retry_not_attempted_for_non_retriable_grpc_status() -> anyhow::Res
         "no retry may fire for grpc-status 12 when grpcCodes=[14]"
     );
 
+    Ok(())
+}
+
+/// HTTPRoute `ExtensionRef` pointing at a `RetryPolicy` CR that does not
+/// exist: a dangling `ExtensionRef` must fail closed, not silently serve with
+/// retries disabled — the rule installs as a `500` error route (#689/GEP-1364,
+/// #445 sad path).
+#[tokio::test]
+async fn gateway_route_rejected_when_retry_policy_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "retry-gw-nocr").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::RETRY_POLICY_MISSING_CR, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwnoretry.{}.local", ns.name);
+
+    wait::wait_for_route_status(&gw, &host, "/retry/", 500, Duration::from_secs(60)).await?;
+    Ok(())
+}
+
+/// GRPCRoute `ExtensionRef` pointing at a `RetryPolicy` CR that does not
+/// exist (#689/GEP-1364, #445 gRPC parity sad path).
+#[tokio::test]
+async fn grpc_route_rejected_when_retry_policy_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "retry-grpc-nocr").await?;
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(
+        gwa::GRPC_RETRY_POLICY_MISSING_CR,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("grpc-noretry.{}.local", ns.name);
+
+    wait::wait_for_route_status(
+        &gw,
+        &host,
+        "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo",
+        500,
+        Duration::from_secs(60),
+    )
+    .await?;
     Ok(())
 }
 
@@ -2554,6 +2618,24 @@ async fn gateway_compression_passthrough_without_accept_encoding() -> anyhow::Re
         "proxy must NOT compress when the client sends no Accept-Encoding"
     );
 
+    Ok(())
+}
+
+/// HTTPRoute `ExtensionRef` pointing at a `Compression` CR that does not
+/// exist: a dangling `ExtensionRef` must fail closed, not silently admit
+/// traffic with no compression — the rule installs as a `500` error route
+/// (#689/GEP-1364, #446 sad path — dangling reference, distinct from the
+/// no-Accept-Encoding passthrough above, where the CR itself resolves).
+#[tokio::test]
+async fn gateway_route_rejected_when_compression_cr_missing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "comp-gw-nocr").await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(gwa::COMPRESSION_MISSING_CR, FixtureVars::new(&ns.name)).await?;
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwnocompress.{}.local", ns.name);
+
+    wait::wait_for_route_status(&gw, &host, "/compress/", 500, Duration::from_secs(60)).await?;
     Ok(())
 }
 

@@ -99,6 +99,14 @@ pub(crate) fn empty_path_rewrite_store() -> MergedStore<PathRewriteRegex> {
     MergedStore::single(reflector::store::Writer::<PathRewriteRegex>::default().as_reader())
 }
 
+pub(crate) fn make_path_rewrite_store(crs: Vec<PathRewriteRegex>) -> MergedStore<PathRewriteRegex> {
+    let mut writer = reflector::store::Writer::<PathRewriteRegex>::default();
+    for cr in crs {
+        writer.apply_watcher_event(&watcher::Event::Apply(cr));
+    }
+    MergedStore::single(writer.as_reader())
+}
+
 pub(crate) fn empty_ip_access_store() -> MergedStore<IpAccessControl> {
     MergedStore::single(reflector::store::Writer::<IpAccessControl>::default().as_reader())
 }
@@ -139,6 +147,17 @@ pub(crate) fn empty_external_auth_store() -> MergedStore<coxswain_core::crd::Cox
     MergedStore::single(
         reflector::store::Writer::<coxswain_core::crd::CoxswainExternalAuth>::default().as_reader(),
     )
+}
+
+pub(crate) fn make_external_auth_store(
+    crs: Vec<coxswain_core::crd::CoxswainExternalAuth>,
+) -> MergedStore<coxswain_core::crd::CoxswainExternalAuth> {
+    let mut writer =
+        reflector::store::Writer::<coxswain_core::crd::CoxswainExternalAuth>::default();
+    for cr in crs {
+        writer.apply_watcher_event(&watcher::Event::Apply(cr));
+    }
+    MergedStore::single(writer.as_reader())
 }
 
 pub(crate) fn make_basic_auth_store(crs: Vec<BasicAuth>) -> MergedStore<BasicAuth> {

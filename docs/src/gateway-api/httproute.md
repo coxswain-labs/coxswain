@@ -277,7 +277,7 @@ Mirror traffic is visible in the proxy access log (`mirror: true` field) and cou
 |-----------|-----------|
 | `Accepted` | The route is attached to a Gateway listener |
 | `Programmed` | The route is active in the data plane |
-| `ResolvedRefs` | All `backendRefs` resolve to a reachable Service |
+| `ResolvedRefs` | All `backendRefs` resolve to a reachable Service, and every coxswain `ExtensionRef` filter targets a CR that exists |
 
 Inspect conditions when traffic is not flowing:
 

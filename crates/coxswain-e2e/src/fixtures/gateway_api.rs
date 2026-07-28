@@ -37,6 +37,11 @@ pub const GATEWAY_UNSUPPORTED_PROTOCOL: &str = fixture!("gateway_unsupported_pro
 /// for asserting per-parent `ResolvedRefs` (`True` vs `False/BackendNotFound`)
 /// while both stay `Accepted=True`.
 pub const ROUTE_STATUS_BACKENDS: &str = fixture!("route_status_backends.yaml");
+/// One Gateway with two HTTPRoutes, both with a resolvable backend — one with
+/// no `ExtensionRef`, one with a dangling `ExtensionRef` — for asserting
+/// per-parent `ResolvedRefs` (`True` vs `False/InvalidKind`) while both stay
+/// `Accepted=True` (#689/GEP-1364).
+pub const ROUTE_STATUS_EXT_REF: &str = fixture!("route_status_ext_ref.yaml");
 /// HTTPRoute with multiple backends pooled into a single upstream.
 pub const HOST_POOL: &str = fixture!("host_pool.yaml");
 /// HTTPRoute with a wildcard hostname listener.
@@ -232,8 +237,8 @@ pub const LISTENER_DRAIN: &str = fixture!("listener_drain.yaml");
 /// (within-quota → 200; over-quota → 429 + `Retry-After`).
 pub const RATE_LIMIT_EXTENSIONREF: &str = fixture!("rate_limit_extensionref.yaml");
 /// Gateway + HTTPRoute with a dangling `ExtensionRef` pointing at a
-/// `RateLimit` CR that does not exist (#25). Used to verify fail-open:
-/// the missing CR is ignored (warn) and all traffic is served.
+/// `RateLimit` CR that does not exist (#25, #689). Used to verify fail-closed:
+/// the missing CR installs the rule as a 500 error route (GEP-1364).
 pub const RATE_LIMIT_MISSING_CR: &str = fixture!("rate_limit_missing_cr.yaml");
 /// Gateway + `IpAccessControl` CR (allow-list only) + HTTPRoute with an
 /// `ExtensionRef`, plus a `ClientTrafficPolicy` enabling PROXY protocol so the
@@ -248,6 +253,10 @@ pub const IP_ACCESS_DENY: &str = fixture!("ip_access_deny.yaml");
 /// deny + HTTPRoute + PROXY-protocol `ClientTrafficPolicy` (#479). Verifies deny
 /// is evaluated before allow: a client in that range is rejected 403.
 pub const IP_ACCESS_DENY_PRECEDENCE: &str = fixture!("ip_access_deny_precedence.yaml");
+/// Gateway + HTTPRoute with a dangling `ExtensionRef` pointing at an
+/// `IpAccessControl` CR that does not exist (#479, #689). The rule installs
+/// as a 500 error route (GEP-1364) rather than admitting traffic unfiltered.
+pub const IP_ACCESS_MISSING_CR: &str = fixture!("ip_access_control_missing_cr.yaml");
 /// Gateway + GRPCRoute (`GrpcEcho/Echo`) + `IpAccessControl` allow-list covering
 /// all sources (`0.0.0.0/0`, `::/0`) via `ExtensionRef` (#479 gRPC happy path).
 /// The real client IP is admitted, so the gRPC call reaches `grpc-echo`.
@@ -256,15 +265,27 @@ pub const GRPC_IP_ACCESS_ALLOW: &str = fixture!("grpc_ip_access_allow.yaml");
 /// (TEST-NET-3) via `ExtensionRef` (#479 gRPC sad path). The real client IP is
 /// outside the range, so the gRPC call is rejected before the backend.
 pub const GRPC_IP_ACCESS_RESTRICTED: &str = fixture!("grpc_ip_access_restricted.yaml");
+/// Gateway + GRPCRoute with a dangling `ExtensionRef` pointing at an
+/// `IpAccessControl` CR that does not exist (#479, #689). The rule installs
+/// as a 500 error route (GEP-1364) rather than admitting traffic unfiltered.
+pub const GRPC_IP_ACCESS_MISSING_CR: &str = fixture!("grpc_ip_access_missing_cr.yaml");
 /// Gateway + GRPCRoute + `RateLimit` (rps=1) via `ExtensionRef` (#25 gRPC
 /// parity). The first call is served; rapid follow-ups are rejected.
 pub const GRPC_RATE_LIMIT: &str = fixture!("grpc_rate_limit.yaml");
+/// Gateway + GRPCRoute with a dangling `ExtensionRef` pointing at a
+/// `RateLimit` CR that does not exist (#25, #689). The rule installs as a
+/// 500 error route (GEP-1364) rather than admitting unlimited traffic.
+pub const GRPC_RATE_LIMIT_MISSING_CR: &str = fixture!("grpc_rate_limit_missing_cr.yaml");
 /// Gateway + GRPCRoute + `JwtAuth` (inline JWKS, ES256 test key) via
 /// `ExtensionRef` (#441 gRPC parity). A valid bearer token in the
 /// "authorization" gRPC metadata key admits the call; missing/invalid tokens
 /// are rejected (401 → gRPC `Unauthenticated`). Sign matching tokens via
 /// [`crate::jwt`].
 pub const GRPC_JWT_AUTH: &str = fixture!("grpc_jwt_auth.yaml");
+/// Gateway + GRPCRoute with a dangling `ExtensionRef` pointing at a `JwtAuth`
+/// CR that does not exist (#441, #689). The rule installs as a 500 error
+/// route (GEP-1364) rather than admitting traffic with no auth enforced.
+pub const GRPC_JWT_AUTH_MISSING_CR: &str = fixture!("grpc_jwt_auth_missing_cr.yaml");
 /// Gateway + `RetryPolicy` CR (attempts=2, codes=[503], backoff=200ms) + HTTPRoute
 /// `ExtensionRef` (#445 HTTP happy path). Routes to go-httpbin `/status/503`; the
 /// proxy fires two retries (observable via the retry metric) with backoff before the
@@ -282,6 +303,13 @@ pub const RETRY_GRPC: &str = fixture!("retry_grpc.yaml");
 /// sad path). UNIMPLEMENTED (12) is not in the set, so no retry fires. Apply
 /// `backends::GRPC_ECHO` first.
 pub const RETRY_GRPC_NON_RETRIABLE: &str = fixture!("retry_grpc_non_retriable.yaml");
+/// Gateway + HTTPRoute with a dangling `ExtensionRef` pointing at a
+/// `RetryPolicy` CR that does not exist (#445, #689). The rule installs as a
+/// 500 error route (GEP-1364) rather than silently serving with retries disabled.
+pub const RETRY_POLICY_MISSING_CR: &str = fixture!("retry_policy_missing_cr.yaml");
+/// Gateway + GRPCRoute with a dangling `ExtensionRef` pointing at a
+/// `RetryPolicy` CR that does not exist (#445, #689 gRPC parity).
+pub const GRPC_RETRY_POLICY_MISSING_CR: &str = fixture!("grpc_retry_policy_missing_cr.yaml");
 /// Gateway + `BasicAuth` CR (labeled htpasswd Secret, alice:secret bcrypt) +
 /// HTTPRoute with `ExtensionRef` (#442). Valid `Authorization: Basic`
 /// credentials are admitted; missing/invalid credentials get 401.
@@ -355,6 +383,21 @@ pub const BASIC_AUTH_XNS_TENANT: &str = fixture!("basic_auth_xns_tenant.yaml");
 /// the route namespace with `.with("TENANTNS", <tenant-ns>)`. Without the
 /// ReferenceGrant from [`BASIC_AUTH_XNS_TENANT`] the proxy fails closed (503).
 pub const BASIC_AUTH_XNS_ROUTE: &str = fixture!("basic_auth_xns_route.yaml");
+/// Gateway + HTTPRoute with a dangling `ExtensionRef` pointing at a
+/// `BasicAuth` CR that does not exist (#442, #689). The rule installs as a
+/// 500 error route (GEP-1364) rather than admitting traffic with no auth
+/// enforced — distinct from [`BASIC_AUTH_EXTENSIONREF_UNLABELED`], where the
+/// `BasicAuth` CR itself resolves but its Secret does not (503).
+pub const BASIC_AUTH_MISSING_CR: &str = fixture!("basic_auth_missing_cr.yaml");
+/// Gateway + HTTPRoute with a dangling `ExtensionRef` pointing at a
+/// `CoxswainExternalAuth` CR that does not exist (#23, #689). The rule
+/// installs as a 500 error route (GEP-1364) rather than admitting traffic
+/// with no ext-auth check.
+pub const EXTERNAL_AUTH_MISSING_CR: &str = fixture!("external_auth_missing_cr.yaml");
+/// Gateway + HTTPRoute with a dangling `ExtensionRef` pointing at a `JwtAuth`
+/// CR that does not exist (#441, #689). The rule installs as a 500 error
+/// route (GEP-1364) rather than admitting traffic with no auth enforced.
+pub const JWT_AUTH_MISSING_CR: &str = fixture!("jwt_auth_missing_cr.yaml");
 /// Gateway + `RequestSizeLimit` CR (maxSize: 1k) + HTTPRoute with
 /// `ExtensionRef` (#443). Under-limit bodies pass; over-limit bodies get 413.
 pub const REQUEST_SIZE_LIMIT_EXTENSIONREF: &str = fixture!("request_size_limit_extensionref.yaml");
@@ -362,10 +405,24 @@ pub const REQUEST_SIZE_LIMIT_EXTENSIONREF: &str = fixture!("request_size_limit_e
 /// (#443 GRPCRoute parity). Proves the byte cap applies to gRPC (HTTP/2)
 /// message bodies too.
 pub const REQUEST_SIZE_LIMIT_GRPCROUTE: &str = fixture!("request_size_limit_grpcroute.yaml");
+/// Gateway + HTTPRoute with a dangling `ExtensionRef` pointing at a
+/// `RequestSizeLimit` CR that does not exist (#443, #689). The rule installs
+/// as a 500 error route (GEP-1364) rather than admitting traffic with no
+/// size limit.
+pub const REQUEST_SIZE_LIMIT_MISSING_CR: &str = fixture!("request_size_limit_missing_cr.yaml");
 /// Gateway + `Compression` CR (gzip+brotli) + HTTPRoute with `ExtensionRef`
 /// (#446). Verifies `Content-Encoding`/`Vary` negotiation and the
 /// `application/grpc` passthrough guard.
 pub const COMPRESSION_EXTENSIONREF: &str = fixture!("compression_extensionref.yaml");
+/// Gateway + HTTPRoute with a dangling `ExtensionRef` pointing at a
+/// `Compression` CR that does not exist (#446, #689). The rule installs as a
+/// 500 error route (GEP-1364) rather than admitting traffic with no
+/// compression.
+pub const COMPRESSION_MISSING_CR: &str = fixture!("compression_missing_cr.yaml");
+/// Gateway + HTTPRoute with a dangling `ExtensionRef` pointing at a
+/// `PathRewriteRegex` CR that does not exist (#689). The rule installs as a
+/// 500 error route (GEP-1364) rather than forwarding with the path unrewritten.
+pub const PATH_REWRITE_MISSING_CR: &str = fixture!("path_rewrite_missing_cr.yaml");
 /// Dedicated-mode Gateway whose `CoxswainGatewayParameters` references an
 /// image that cannot be pulled (#210). The dedicated proxy Pod never becomes
 /// Ready, so the operator never publishes `DedicatedProxyReady=True` and the
@@ -432,6 +489,11 @@ pub const GRPC_ROUTE_NAMED_RULE: &str = fixture!("grpc_route_named_rule.yaml");
 /// Gateway + two GRPCRoutes: `good-grpc-route` (resolvable backend) and
 /// `ghost-grpc-route` (missing backend). Used for status-condition assertions.
 pub const GRPC_ROUTE_STATUS: &str = fixture!("grpc_route_status.yaml");
+
+/// Gateway + two GRPCRoutes, both with a resolvable backend — one with no
+/// `ExtensionRef`, one with a dangling `ExtensionRef` — for asserting
+/// per-parent `ResolvedRefs` (`True` vs `False/InvalidKind`) (#689/GEP-1364).
+pub const GRPC_ROUTE_STATUS_EXT_REF: &str = fixture!("grpc_route_status_ext_ref.yaml");
 
 /// `RateLimit` CR with `requestsPerSecond` omitted — rejected by the
 /// coxswain-owned CRD schema (`requestsPerSecond` is a required field).

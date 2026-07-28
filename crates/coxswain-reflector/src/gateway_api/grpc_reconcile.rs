@@ -124,17 +124,12 @@ impl GrpcRouteResolution<'_> {
     /// so the stable `(kind, name)` sentinel the dispatch falls back to is
     /// exactly right — the compiled output doesn't depend on the CR.
     pub(crate) fn ext_ref_stores(&self) -> crate::fingerprint::ExtRefStores<'_> {
-        crate::fingerprint::ExtRefStores {
-            rate_limits: self.rate_limits,
-            retry_policies: self.retry_policies,
-            ip_access: self.ip_access,
-            jwt_auths: self.jwt_auths,
-            path_rewrites: None,
-            basic_auths: None,
-            external_auths: None,
-            request_size_limits: None,
-            compressions: None,
-        }
+        crate::fingerprint::ExtRefStores::grpc(
+            self.rate_limits,
+            self.retry_policies,
+            self.ip_access,
+            self.jwt_auths,
+        )
     }
 }
 
@@ -303,7 +298,7 @@ pub(super) fn reconcile(
         }
         // RetryPolicy ExtensionRef (#445): GRPCRoute ⇒ `is_grpc=true`, so `grpcCodes`
         // (trailers-only retry) is honoured and defaults to `[14]` (UNAVAILABLE).
-        let retry =
+        let (retry, retry_missing) =
             super::filters::resolve_retry_policy(rule_filters, route_ns, retry_policies, true);
         group = group.with_retries(retry);
         let circuit_breaker = bp.and_then(|bp| bp.circuit_breaker.clone());
@@ -332,12 +327,33 @@ pub(super) fn reconcile(
 
         // `GrpcRouteRulesFilters` implements `ExtRefFilter`, so the shared HTTP
         // resolvers drive gRPC directly — no gRPC-specific scan loop (#523).
-        let (allow_source_range, deny_source_range) =
+        let ((allow_source_range, deny_source_range), ip_access_missing) =
             super::filters::resolve_ip_access(rule_filters, route_ns, ip_access);
-        let rate_limit = super::filters::resolve_rate_limit(rule_filters, route_ns, rate_limits);
-        let jwt_auth =
+        let (rate_limit, rate_limit_missing) =
+            super::filters::resolve_rate_limit(rule_filters, route_ns, rate_limits);
+        let (jwt_auth, jwt_auth_missing) =
             super::filters::resolve_jwt_auth(rule_filters, route_ns, jwt_auths, jwks_cache);
         let auth: Arc<[Arc<IngressAuthConfig>]> = jwt_auth.into_iter().collect();
+
+        // #689/GEP-1364: a dangling `ExtensionRef` (its CR does not exist) must
+        // not silently drop the filter — the rule fails closed with a 500
+        // instead. GRPCRoute has no redirect-only path, so `group_opt` is
+        // always `Some` and this always applies (unlike the HTTPRoute twin).
+        let ext_ref_missing =
+            retry_missing || ip_access_missing || rate_limit_missing || jwt_auth_missing;
+        let error_status = if ext_ref_missing {
+            if error_status.is_none() {
+                tracing::warn!(
+                    route = ?route.metadata.name,
+                    "Rule references a coxswain ExtensionRef CR that does not exist — \
+                     installing 500 error route (#689)"
+                );
+            }
+            error_status.or(Some(500))
+        } else {
+            error_status
+        };
+
         let ctx = GrpcRuleContext {
             filters: rule_filters,
             error_status,
@@ -1186,7 +1202,7 @@ mod tests {
             &["203.0.113.0/24"],
             &["10.0.0.0/8"],
         )]);
-        let (allow, deny) = super::super::filters::resolve_ip_access(
+        let ((allow, deny), unresolved) = super::super::filters::resolve_ip_access(
             &[grpc_ip_access_filter("policy")],
             "default",
             &store,
@@ -1199,30 +1215,34 @@ mod tests {
             *deny.expect("deny set"),
             vec!["10.0.0.0/8".parse::<ipnet::IpNet>().expect("valid")]
         );
+        assert!(!unresolved);
     }
 
     #[test]
     fn grpc_ip_access_no_ext_ref_is_none() {
         let store = crate::tests::fixtures::empty_ip_access_store();
-        let (allow, deny) = super::super::filters::resolve_ip_access::<GrpcRouteRulesFilters>(
-            &[],
-            "default",
-            &store,
-        );
+        let ((allow, deny), unresolved) = super::super::filters::resolve_ip_access::<
+            GrpcRouteRulesFilters,
+        >(&[], "default", &store);
         assert!(allow.is_none() && deny.is_none());
+        assert!(!unresolved);
     }
 
     #[test]
-    fn grpc_ip_access_missing_cr_fails_open() {
+    fn grpc_ip_access_missing_cr_fails_closed() {
         let store = crate::tests::fixtures::empty_ip_access_store();
-        let (allow, deny) = super::super::filters::resolve_ip_access(
+        let ((allow, deny), unresolved) = super::super::filters::resolve_ip_access(
             &[grpc_ip_access_filter("absent")],
             "default",
             &store,
         );
         assert!(
             allow.is_none() && deny.is_none(),
-            "missing CR must not filter"
+            "missing CR installs no filter config"
+        );
+        assert!(
+            unresolved,
+            "missing CR must signal the caller to fail closed (500)"
         );
     }
 
@@ -1255,39 +1275,42 @@ mod tests {
     fn grpc_rate_limit_resolves_config() {
         let store =
             crate::tests::fixtures::make_rate_limit_store(vec![rate_limit_cr("default", "rl", 10)]);
-        let cfg = super::super::filters::resolve_rate_limit(
+        let (cfg, unresolved) = super::super::filters::resolve_rate_limit(
             &[grpc_rate_limit_filter("rl")],
             "default",
             &store,
-        )
-        .expect("rate limit resolved");
-        assert_eq!(cfg.requests_per_second.get(), 10);
+        );
+        assert_eq!(
+            cfg.expect("rate limit resolved").requests_per_second.get(),
+            10
+        );
+        assert!(!unresolved);
     }
 
     #[test]
     fn grpc_rate_limit_no_ext_ref_is_none() {
         let store = crate::tests::fixtures::empty_rate_limit_store();
-        assert!(
-            super::super::filters::resolve_rate_limit::<GrpcRouteRulesFilters>(
-                &[],
-                "default",
-                &store
-            )
-            .is_none()
+        let (cfg, unresolved) = super::super::filters::resolve_rate_limit::<GrpcRouteRulesFilters>(
+            &[],
+            "default",
+            &store,
         );
+        assert!(cfg.is_none());
+        assert!(!unresolved);
     }
 
     #[test]
-    fn grpc_rate_limit_missing_cr_fails_open() {
+    fn grpc_rate_limit_missing_cr_fails_closed() {
         let store = crate::tests::fixtures::empty_rate_limit_store();
+        let (cfg, unresolved) = super::super::filters::resolve_rate_limit(
+            &[grpc_rate_limit_filter("absent")],
+            "default",
+            &store,
+        );
+        assert!(cfg.is_none(), "missing CR installs no rate limit config");
         assert!(
-            super::super::filters::resolve_rate_limit(
-                &[grpc_rate_limit_filter("absent")],
-                "default",
-                &store
-            )
-            .is_none(),
-            "missing CR must fail open (no rate limiting)"
+            unresolved,
+            "missing CR must signal the caller to fail closed (500)"
         );
     }
 
@@ -1322,47 +1345,48 @@ mod tests {
             "default", "jwtauth",
         )]);
         let cache = crate::tests::fixtures::empty_jwks_cache();
-        let resolved = super::super::filters::resolve_jwt_auth(
+        let (resolved, unresolved) = super::super::filters::resolve_jwt_auth(
             &[grpc_jwt_auth_filter("jwtauth")],
             "default",
             &store,
             &cache,
-        )
-        .expect("JwtAuth resolved");
+        );
+        let resolved = resolved.expect("JwtAuth resolved");
         assert!(matches!(
             resolved.as_ref(),
             coxswain_core::routing::IngressAuthConfig::Jwt(_)
         ));
+        assert!(!unresolved);
     }
 
     #[test]
     fn grpc_jwt_auth_no_ext_ref_is_none() {
         let store = crate::tests::fixtures::empty_jwt_auth_store();
         let cache = crate::tests::fixtures::empty_jwks_cache();
-        assert!(
-            super::super::filters::resolve_jwt_auth::<GrpcRouteRulesFilters>(
-                &[],
-                "default",
-                &store,
-                &cache
-            )
-            .is_none()
+        let (cfg, unresolved) = super::super::filters::resolve_jwt_auth::<GrpcRouteRulesFilters>(
+            &[],
+            "default",
+            &store,
+            &cache,
         );
+        assert!(cfg.is_none());
+        assert!(!unresolved);
     }
 
     #[test]
-    fn grpc_jwt_auth_missing_cr_fails_open() {
+    fn grpc_jwt_auth_missing_cr_fails_closed() {
         let store = crate::tests::fixtures::empty_jwt_auth_store();
         let cache = crate::tests::fixtures::empty_jwks_cache();
+        let (cfg, unresolved) = super::super::filters::resolve_jwt_auth(
+            &[grpc_jwt_auth_filter("absent")],
+            "default",
+            &store,
+            &cache,
+        );
+        assert!(cfg.is_none(), "missing CR installs no JWT check");
         assert!(
-            super::super::filters::resolve_jwt_auth(
-                &[grpc_jwt_auth_filter("absent")],
-                "default",
-                &store,
-                &cache
-            )
-            .is_none(),
-            "missing CR must fail open (no JWT check)"
+            unresolved,
+            "missing CR must signal the caller to fail closed (500)"
         );
     }
 
@@ -1450,6 +1474,65 @@ mod tests {
                 coxswain_core::routing::RouteOutcome::Error(500)
             ),
             "gRPC rule with empty backendRefs must resolve to Error(500)"
+        );
+    }
+
+    /// #689/GEP-1364: a GRPCRoute rule with a healthy backend but an
+    /// `ExtensionRef` pointing at a `RateLimit` CR that does not exist MUST
+    /// resolve to 500 — the filter must not be silently skipped. GRPCRoute has
+    /// no redirect-only path (see `reconcile`'s doc), so unlike the HTTPRoute
+    /// twin there is no scope boundary to also test here.
+    #[test]
+    fn grpc_dangling_extension_ref_installs_500() {
+        use crate::gw_types::v::grpcroutes::{
+            GrpcRouteParentRefs, GrpcRouteRules, GrpcRouteRulesFilters,
+            GrpcRouteRulesFiltersExtensionRef, GrpcRouteRulesFiltersType, GrpcRouteSpec,
+        };
+        use crate::tests::fixtures::{empty_svc_store, endpoint_cache, make_slice};
+        use kube::api::ObjectMeta;
+
+        let route = GrpcRoute {
+            metadata: ObjectMeta {
+                name: Some("grpc-route".to_string()),
+                namespace: Some("default".to_string()),
+                ..Default::default()
+            },
+            spec: GrpcRouteSpec {
+                parent_refs: Some(vec![GrpcRouteParentRefs {
+                    name: "gw".to_string(),
+                    ..Default::default()
+                }]),
+                hostnames: None,
+                rules: Some(vec![GrpcRouteRules {
+                    backend_refs: Some(vec![GrpcRouteRulesBackendRefs {
+                        name: "svc".to_string(),
+                        port: Some(80),
+                        ..Default::default()
+                    }]),
+                    filters: Some(vec![GrpcRouteRulesFilters {
+                        r#type: GrpcRouteRulesFiltersType::ExtensionRef,
+                        extension_ref: Some(GrpcRouteRulesFiltersExtensionRef {
+                            group: "gateway.coxswain-labs.dev".to_string(),
+                            kind: "RateLimit".to_string(),
+                            name: "does-not-exist".to_string(),
+                        }),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }]),
+            },
+            ..Default::default()
+        };
+        let entry = grpc_reconcile_first_entry(
+            &route,
+            &endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]),
+            &empty_svc_store(),
+            &HashMap::new(),
+        );
+        assert_eq!(
+            entry.error_status,
+            Some(500),
+            "a dangling ExtensionRef on a rule with a healthy backend must resolve to 500"
         );
     }
 
