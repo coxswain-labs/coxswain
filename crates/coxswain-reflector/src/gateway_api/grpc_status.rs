@@ -83,6 +83,16 @@ impl RouteLike for GrpcRoute {
         }
         out
     }
+
+    fn rule_ext_refs(&self) -> Vec<(&str, &str, &str)> {
+        self.spec
+            .rules
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .flat_map(|rule| super::filters::ext_refs(rule.filters.as_deref().unwrap_or(&[])))
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +172,24 @@ mod tests {
             ..Default::default()
         }));
         let services = crate::MergedStore::single(w.as_reader());
+        let rate_limits = crate::tests::fixtures::empty_rate_limit_store();
+        let retry_policies = crate::tests::fixtures::empty_retry_policy_store();
+        let ip_access = crate::tests::fixtures::empty_ip_access_store();
+        let jwt_auths = crate::tests::fixtures::empty_jwt_auth_store();
+        let stores = crate::gateway_api::RefValidationStores {
+            services: &services,
+            ext_refs: crate::fingerprint::ExtRefStores {
+                rate_limits: &rate_limits,
+                retry_policies: &retry_policies,
+                ip_access: &ip_access,
+                jwt_auths: &jwt_auths,
+                path_rewrites: None,
+                basic_auths: None,
+                external_auths: None,
+                request_size_limits: None,
+                compressions: None,
+            },
+        };
 
         let owned: HashSet<ObjectKey> = std::iter::once(ObjectKey::new("default", "gw")).collect();
         let map = compute_route_health(
@@ -170,7 +198,7 @@ mod tests {
             &owned,
             &std::collections::HashMap::new(),
             &HashSet::<ReferenceGrantKey>::new(),
-            &services,
+            &stores,
             "GRPCRoute",
         );
 

@@ -76,7 +76,7 @@ GRPCRoute supports the protocol-agnostic `ExtensionRef` filters — [`RateLimit`
 |-----------|-----------|
 | `Accepted` | The route is attached to a Gateway listener |
 | `Programmed` | The route is active in the data plane |
-| `ResolvedRefs` | All `backendRefs` resolve to a reachable Service |
+| `ResolvedRefs` | All `backendRefs` resolve to a reachable Service, and every coxswain `ExtensionRef` filter targets a CR that exists |
 
 ```bash
 kubectl describe grpcroute my-grpc-route

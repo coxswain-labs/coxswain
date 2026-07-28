@@ -1,0 +1,46 @@
+# PathRewriteRegex ExtensionRef with missing CR fixture (apply backends::ECHO first).
+#
+# An HTTPRoute references a PathRewriteRegex CR that does not exist. Per
+# GEP-1364 the reflector must fail closed (#689): the rule installs as a 500
+# error route rather than silently forwarding with the path unrewritten.
+#
+# Gateway: coxswain-test-norewrite on GATEWAY_HTTP_PORT.
+# Route host: gwnorewrite.TESTNS.local, path /rewrite/ -> echo-a:3000 (never reached).
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test-norewrite
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: norewrite-route
+spec:
+  parentRefs:
+    - name: coxswain-test-norewrite
+  hostnames:
+    - "gwnorewrite.${TESTNS}.local"
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /rewrite/
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: PathRewriteRegex
+            name: does-not-exist
+      backendRefs:
+        - name: echo-a
+          port: 3000

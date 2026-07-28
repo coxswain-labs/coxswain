@@ -1,0 +1,44 @@
+# GRPCRoute + JwtAuth ExtensionRef with missing CR (apply backends::GRPC_ECHO first).
+#
+# A GRPCRoute references a JwtAuth CR that does not exist. Per GEP-1364 the
+# reflector must fail closed (#689): the rule installs as a 500 error route
+# rather than silently admitting traffic with no auth enforced.
+#
+# Gateway: coxswain-grpc-nojwtauth on GATEWAY_HTTP_PORT.
+# Route host: grpc-nojwtauth.TESTNS.local, GrpcEcho/Echo -> grpc-echo:50051 (never reached).
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-nojwtauth
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-nojwtauth-route
+spec:
+  hostnames:
+    - "grpc-nojwtauth.${TESTNS}.local"
+  parentRefs:
+    - name: coxswain-grpc-nojwtauth
+  rules:
+    - matches:
+        - method:
+            type: Exact
+            service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+            method: Echo
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: JwtAuth
+            name: does-not-exist
+      backendRefs:
+        - name: grpc-echo
+          port: 50051

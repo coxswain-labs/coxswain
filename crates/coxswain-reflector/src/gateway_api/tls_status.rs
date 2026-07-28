@@ -53,4 +53,9 @@ impl RouteLike for TlsRoute {
             })
             .collect()
     }
+
+    fn rule_ext_refs(&self) -> Vec<(&str, &str, &str)> {
+        // TLSRoute has no rule-level `filters` field — no ExtensionRef surface.
+        vec![]
+    }
 }

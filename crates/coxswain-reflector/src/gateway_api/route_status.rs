@@ -13,6 +13,7 @@
 //! gate, and backend-ref validation) runs once here.
 
 use crate::MergedStore;
+use crate::fingerprint::ExtRefStores;
 use crate::gateway_api::hostnames::hostnames_intersect;
 use crate::gw_types::v::gateways::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
@@ -25,6 +26,15 @@ use k8s_openapi::api::core::v1::Service;
 use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+
+/// Stores [`compute_route_health`] needs to validate every reference kind a
+/// route can carry: plain `backendRef`s (`services`) and coxswain
+/// `ExtensionRef` filter targets (`ext_refs`, #689). Grouped so the function
+/// stays within the workspace argument-count threshold.
+pub(crate) struct RefValidationStores<'a> {
+    pub(crate) services: &'a MergedStore<Service>,
+    pub(crate) ext_refs: ExtRefStores<'a>,
+}
 
 struct ListenerEntry {
     name: String,
@@ -71,8 +81,8 @@ pub(crate) struct BackendRefView<'a> {
 /// Only the genuinely kind-specific bits are methods: the metadata/hostname/
 /// parent-ref projections (trivial field access over the codegen structs), the
 /// `has_unsupported_filter` predicate (which `FilterAction`s force
-/// `Accepted=UnsupportedValue`), and `health_backend_refs` (the backend refs to
-/// validate, after applying any kind-specific rule skip).
+/// `Accepted=UnsupportedValue`), and `health_backend_refs`/`rule_ext_refs` (the
+/// refs to validate, after applying any kind-specific rule skip).
 pub(crate) trait RouteLike {
     fn route_namespace(&self) -> Option<&str>;
     fn route_name(&self) -> Option<&str>;
@@ -84,6 +94,13 @@ pub(crate) trait RouteLike {
     /// Backend refs to validate for `ResolvedRefs`, with kind-specific rule
     /// skipping (e.g. HTTPRoute skips `RequestRedirect` rules) already applied.
     fn health_backend_refs(&self) -> Vec<BackendRefView<'_>>;
+    /// Every `ExtensionRef` `(group, kind, name)` across all rules, to
+    /// validate for `ResolvedRefs` (#689/GEP-1364 — a dangling reference to a
+    /// coxswain filter CR). Route types with no `ExtensionRef` filter surface
+    /// at all (`TLSRoute`/`TCPRoute`/`UDPRoute`) return `vec![]`. No
+    /// kind-filtering needed here: [`ExtRefStores::exists`] already returns
+    /// `None` (skip) for a kind this route type doesn't resolve.
+    fn rule_ext_refs(&self) -> Vec<(&str, &str, &str)>;
 }
 
 /// Computes `Accepted` and `ResolvedRefs` health for every (route, parent) pair
@@ -120,7 +137,7 @@ pub(super) fn compute_route_health<R: RouteLike>(
     owned_gateways: &HashSet<ObjectKey>,
     effective: &HashMap<ObjectKey, super::super::reconciler::listener_merge::EffectiveGateway>,
     backend_grants: &HashSet<ReferenceGrantKey>,
-    service_store: &MergedStore<Service>,
+    stores: &RefValidationStores<'_>,
     route_kind: &str,
 ) -> RouteStatusMap {
     let mut gw_listeners: HashMap<ObjectKey, Vec<ListenerEntry>> = gateways
@@ -281,7 +298,13 @@ pub(super) fn compute_route_health<R: RouteLike>(
             }
 
             let (resolved_refs, resolved_refs_reason) = if accepted {
-                check_backend_refs(route, route_ns, backend_grants, service_store)
+                let backend_result =
+                    check_backend_refs(route, route_ns, backend_grants, stores.services);
+                if backend_result.0 {
+                    check_ext_refs(route, route_ns, &stores.ext_refs)
+                } else {
+                    backend_result
+                }
             } else {
                 (true, "ResolvedRefs")
             };
@@ -415,6 +438,40 @@ fn check_backend_refs<R: RouteLike>(
             if service_store.get(&svc_key).is_none() {
                 return (false, "BackendNotFound");
             }
+        }
+    }
+    (true, "ResolvedRefs")
+}
+
+/// Validates every `ExtensionRef` filter target the route exposes for health
+/// (#689/GEP-1364).
+///
+/// Returns `(resolved_refs, reason)` — `resolved_refs=true` means every
+/// `ExtensionRef` targeting a coxswain kind this route type resolves has a
+/// CR that exists. A ref to a foreign/unsupported kind, or one this route
+/// type doesn't resolve at all (`ExtRefStores::exists` → `None`), is not a
+/// `ResolvedRefs` concern here — `Accepted=UnsupportedValue` covers it.
+///
+/// Known imprecision: `resolve_basic_auth`/`resolve_external_auth`/
+/// `resolve_jwt_auth` (`filters.rs`) keep scanning past a missing same-kind
+/// ref for a *later* one that resolves, so a rule carrying two refs of the
+/// identical auth kind (one dangling, one live) enforces the live one at the
+/// data plane but is flagged here on the first (dangling) ref regardless —
+/// this function has no per-rule grouping to replicate that keep-scanning
+/// behaviour. Harmless in the safe direction (over-reporting a failure, never
+/// under-reporting one) and only reachable by a nonsensical duplicate-kind
+/// rule, so not worth the added complexity.
+fn check_ext_refs<R: RouteLike>(
+    route: &R,
+    route_ns: &str,
+    ext_refs: &ExtRefStores<'_>,
+) -> (bool, &'static str) {
+    for (group, kind, name) in route.rule_ext_refs() {
+        if group != super::COXSWAIN_GROUP {
+            continue;
+        }
+        if ext_refs.exists(route_ns, kind, name) == Some(false) {
+            return (false, "InvalidKind");
         }
     }
     (true, "ResolvedRefs")

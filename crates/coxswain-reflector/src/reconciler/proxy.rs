@@ -1181,6 +1181,48 @@ pub(super) struct ReflectorStores<'a> {
     pub(super) coxswain_backend_policies: &'a MergedStore<CoxswainBackendPolicy>,
 }
 
+impl<'a> ReflectorStores<'a> {
+    /// [`crate::gateway_api::RefValidationStores`] with every coxswain
+    /// `ExtensionRef` CR store populated (#689) — the shape every route kind
+    /// but `GRPCRoute` uses for `compute_route_health` (`HTTPRoute` resolves
+    /// all 9 kinds; `TLSRoute`/`TCPRoute`/`UDPRoute` resolve none, so the
+    /// extra stores are simply never queried by their empty `rule_ext_refs`).
+    /// `GRPCRoute` uses [`Self::grpc_ref_validation_stores`] instead.
+    pub(super) fn ref_validation_stores(&self) -> crate::gateway_api::RefValidationStores<'a> {
+        crate::gateway_api::RefValidationStores {
+            services: self.services,
+            ext_refs: crate::fingerprint::ExtRefStores {
+                rate_limits: self.rate_limits,
+                retry_policies: self.retry_policies,
+                ip_access: self.ip_access,
+                jwt_auths: self.jwt_auths,
+                path_rewrites: Some(self.path_rewrites),
+                basic_auths: Some(self.basic_auths),
+                external_auths: Some(self.external_auths),
+                request_size_limits: Some(self.request_size_limits),
+                compressions: Some(self.compressions),
+            },
+        }
+    }
+
+    /// [`crate::gateway_api::RefValidationStores`] scoped to the 4 kinds
+    /// `GRPCRoute` resolves (#689), via the same
+    /// [`crate::fingerprint::ExtRefStores::grpc`] constructor
+    /// `GrpcRouteResolution::ext_ref_stores` uses for the fingerprint path —
+    /// one definition of "GRPCRoute's 4-kind subset" for both.
+    pub(super) fn grpc_ref_validation_stores(&self) -> crate::gateway_api::RefValidationStores<'a> {
+        crate::gateway_api::RefValidationStores {
+            services: self.services,
+            ext_refs: crate::fingerprint::ExtRefStores::grpc(
+                self.rate_limits,
+                self.retry_policies,
+                self.ip_access,
+                self.jwt_auths,
+            ),
+        }
+    }
+}
+
 pub(super) struct SharedOutputs<'a> {
     pub(super) ingress_routes: &'a SharedIngressRoutingTable,
     pub(super) gateway_routes: &'a SharedGatewayRoutingTable,
@@ -3436,25 +3478,29 @@ fn rebuild(
 
     // Per-(route, parent) health feeds both the route-status writer and the
     // cluster summary's traffic-served HTTPRoute status, so compute it before
-    // publishing the summary.
+    // publishing the summary. `ref_validation_stores` bundles the plain
+    // `backendRef` Service store with every coxswain `ExtensionRef` CR store
+    // (#689) so `ResolvedRefs` can validate both reference kinds.
+    let ref_validation_stores = stores.ref_validation_stores();
     let route_status_map = GatewayApiReconciler::compute_route_health(
         &routes,
         &gateways,
         &owned_gateways,
         &effective,
         &backend_grants,
-        stores.services,
+        &ref_validation_stores,
     );
 
     // GRPCRoute health uses a separate map and channel — RouteParentKey is kind-neutral
     // and an HTTPRoute + GRPCRoute with the same name/ns/gateway would collide.
+    let grpc_ref_validation_stores = stores.grpc_ref_validation_stores();
     let grpc_route_status_map = GrpcRouteReconciler::compute_route_health(
         &grpc_routes,
         &gateways,
         &owned_gateways,
         &effective,
         &backend_grants,
-        stores.services,
+        &grpc_ref_validation_stores,
     );
 
     // Publish the cluster summary while we still have access to gateway_listener_status

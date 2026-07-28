@@ -36,7 +36,8 @@ Semantics:
 
 - `pattern` is a Rust `regex` pattern, compiled once at reconcile (size-bounded) and shared across requests. `replacement` is a template — `$1`…`$n` expand from the pattern's capture groups, and a reference to a missing group expands to empty.
 - The pattern is matched against the request path and is **unanchored** unless you anchor it with `^`…`$`. A path that doesn't match is forwarded unchanged.
-- An **invalid** `pattern`, or a **missing** `PathRewriteRegex` CR, fails **open**: the filter is skipped (a WARN is logged) and the path is left as-is.
+- An **invalid** `pattern` on an existing CR fails **open**: the filter is skipped (a WARN is logged) and the path is left as-is — the reference itself resolved, so there's nothing dangling.
+- A **missing** `PathRewriteRegex` CR fails **closed**: the rule installs as a `500` error route and `ResolvedRefs` goes `False` (`InvalidKind`) — a dangling `ExtensionRef` must not silently admit traffic the filter never saw (GEP-1364).
 
 ## IP access control
 
@@ -60,7 +61,7 @@ Semantics:
 - **`deny` is evaluated before `allow`.** A client inside any `deny` range gets `403` even when `allow` would admit it.
 - **`allow` restricts to the listed ranges** — a client outside every `allow` range gets `403`. An empty `allow` list imposes no allow-list restriction (only `deny` applies); empty `allow` **and** empty `deny` performs no filtering.
 - **IPv4 and IPv6** CIDRs are both accepted; a bare address (`203.0.113.5`) is treated as a host route (`/32` / `/128`). Invalid CIDR tokens are logged and skipped rather than rejecting the whole policy.
-- A **missing** `IpAccessControl` CR fails open (a WARN is logged; the route is not filtered).
+- A **missing** `IpAccessControl` CR fails **closed**: the rule installs as a `500` error route and `ResolvedRefs` goes `False` (`InvalidKind`) — a dangling `ExtensionRef` must not silently admit traffic the filter never saw (GEP-1364).
 
 The client IP is resolved through the same path as the rest of the data plane: the PROXY-protocol peer when a `ClientTrafficPolicy` enables PROXY protocol on the listener, otherwise the L4 downstream peer. There is no Gateway-side trusted-forwarded-header surface yet, so behind an L7 load balancer that terminates the connection, enable PROXY protocol so the real client IP reaches the filter.
 
@@ -84,7 +85,7 @@ Semantics:
 - The referenced `Secret` **must** carry the label `ingress.coxswain-labs.dev/auth-basic: "true"` and store the htpasswd file under the key `auth` (nginx convention) — the same requirements as the Ingress annotation, so one Secret can back both surfaces.
 - Supported hash formats: bcrypt (`$2a$`/`$2b$`/`$2y$`) and Apache SHA1 (`{SHA}`, accepted but logged as weak).
 - Valid credentials are forwarded; missing/invalid credentials get `401` with `WWW-Authenticate`.
-- A missing, unlabeled, or unparseable Secret — or a missing `BasicAuth` CR's `secretRef` — fails **closed** with `503`, distinct from a missing `BasicAuth` CR itself (which fails open: no auth enforced).
+- A missing, unlabeled, or unparseable Secret — or a missing `BasicAuth` CR's `secretRef` — fails **closed** with `503`. A missing `BasicAuth` CR itself also fails **closed**: the rule installs as a `500` error route — a dangling `ExtensionRef` must not silently admit traffic the filter never saw (GEP-1364).
 - A `secretRef` whose `namespace` differs from the `BasicAuth` CR's namespace requires a matching `ReferenceGrant` in the Secret's namespace — `from` a `BasicAuth` (`gateway.coxswain-labs.dev`) in the CR's namespace, `to` a core `Secret`. Without the grant the reference fails **closed** (`503`); a tenant cannot bind another namespace's auth Secret. Same-namespace refs need no grant.
 
 ```yaml
@@ -137,7 +138,7 @@ Semantics:
 - On success, `claimToHeaders` copies named claims onto upstream request headers, and `forwardPayloadHeader` (if set) carries the base64url-encoded full claims payload. The original token is stripped from the upstream request unless `forward: true`.
 - Missing/invalid/expired/wrong-issuer/wrong-audience tokens get `401` with `WWW-Authenticate: Bearer`.
 - An unresolved JWKS (fetch not yet complete, fetch failing, or unparseable/empty) fails **closed** with `503` — an operator who attached this filter expects enforcement.
-- A missing `JwtAuth` CR fails **open** (no auth enforced), matching the other `ExtensionRef` auth resolvers.
+- A missing `JwtAuth` CR fails **closed**: the rule installs as a `500` error route — a dangling `ExtensionRef` must not silently admit traffic the filter never saw (GEP-1364).
 
 ## External authorization (ext_authz)
 
@@ -202,6 +203,7 @@ Fail-closed and cross-namespace rules:
 
 - `failClosed: true` (the default) denies with **503** when the auth service is unreachable, errors, or times out; `failClosed: false` fails **open** (request proceeds unauthorized). A `backendRef` that resolves to no ready endpoints — or an unsupported protocol — always fails **closed**, regardless of `failClosed`.
 - A `backendRef` whose `namespace` differs from the policy's namespace requires a matching `ReferenceGrant` — `from` a `CoxswainExternalAuth` (`gateway.coxswain-labs.dev`) `to` a core `Service`. Without it the reference fails **closed** (503). Same-namespace refs need no grant.
+- A **missing** `CoxswainExternalAuth` CR named by a route filter's `ExtensionRef` fails **closed**: the rule installs as a `500` error route — a dangling `ExtensionRef` must not silently admit traffic the filter never saw (GEP-1364). This is distinct from the `failClosed`/no-endpoints rules above, which govern a CR that *did* resolve.
 
 ## Request size limit
 
@@ -221,7 +223,8 @@ Semantics:
 - `maxSize` accepts a bare byte count or a `k`/`m`/`g`-suffixed size (binary multipliers, case-insensitive) — the same parser as the Ingress `max-body-size` annotation.
 - On HTTP/1.x, requests exceeding the limit are rejected with `413 Payload Too Large`, checked up front against `Content-Length` when present and mid-stream for chunked/streaming bodies.
 - On **HTTP/2**, only the up-front `Content-Length` check applies. A streaming HTTP/2 upload that omits `Content-Length` is **not** capped — it fails open (see the note below on why mid-stream HTTP/2 enforcement is deferred).
-- A missing `RequestSizeLimit` CR or an unparseable `maxSize` fails open (no limit enforced).
+- An **unparseable** `maxSize` on an existing CR fails **open** (no limit enforced) — the reference itself resolved, so there's nothing dangling.
+- A **missing** `RequestSizeLimit` CR fails **closed**: the rule installs as a `500` error route — a dangling `ExtensionRef` must not silently admit traffic the filter never saw (GEP-1364).
 
 ### Request size limit is not enforced on GRPCRoute
 
@@ -253,7 +256,7 @@ spec:
 
 Semantics:
 
-- At least one of `gzip` / `brotli` must be `true` for the CR to have any effect; when both are `false` (the default) it is a no-op.
+- At least one of `gzip` / `brotli` must be `true` for the CR to have any effect; when both are `false` (the default) it is a no-op — fails **open** (no compression), same as a missing CR would, but the reference itself resolved so there's nothing dangling.
 - Brotli is preferred over gzip when both are enabled and the client advertises `br` in `Accept-Encoding`.
 - `level` (1–9, default `6`), `minSize` (bytes, default `1024`), and `types` (default: `text/html`, `text/plain`, `text/css`, `application/json`, `application/javascript`) are the same defaults applied when the Ingress `compression` annotation resolves this CR.
-- A missing `Compression` CR fails open (no compression).
+- A **missing** `Compression` CR fails **closed**: the rule installs as a `500` error route — a dangling `ExtensionRef` must not silently admit traffic the filter never saw (GEP-1364).

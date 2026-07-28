@@ -19,8 +19,9 @@ pub(super) use crate::tests::fixtures::{
     empty_ip_access_store, empty_jwks_cache, empty_jwt_auth_store, empty_path_rewrite_store,
     empty_rate_limit_store, empty_request_size_limit_store, empty_retry_policy_store,
     empty_secret_store, empty_svc_store, endpoint_cache, make_basic_auth_store,
-    make_compression_store, make_ip_access_store, make_jwt_auth_store,
-    make_request_size_limit_store, make_secret_store, make_slice,
+    make_compression_store, make_external_auth_store, make_ip_access_store, make_jwt_auth_store,
+    make_path_rewrite_store, make_rate_limit_store, make_request_size_limit_store,
+    make_secret_store, make_slice,
 };
 
 pub(super) fn owned(pairs: &[(&str, &str)]) -> HashSet<ObjectKey> {

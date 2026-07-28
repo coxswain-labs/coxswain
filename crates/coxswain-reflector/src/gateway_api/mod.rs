@@ -42,7 +42,7 @@ pub(crate) use hostnames::hostnames_intersect;
 pub use reconcile::RouteResolution;
 pub(crate) use reconcile::route_fingerprint as http_route_fingerprint;
 pub(crate) use reconcile_tls::GatewayTlsTarget;
-pub(crate) use route_status::RouteLike;
+pub(crate) use route_status::{RefValidationStores, RouteLike};
 
 /// API group for the coxswain-proprietary `ExtensionRef` CRDs (`RateLimit`,
 /// `IpAccessControl`, `BasicAuth`, `RequestSizeLimit`, `Compression`,
@@ -85,7 +85,7 @@ impl GatewayApiReconciler {
             crate::reconciler::listener_merge::EffectiveGateway,
         >,
         backend_grants: &HashSet<ReferenceGrantKey>,
-        service_store: &MergedStore<Service>,
+        stores: &route_status::RefValidationStores<'_>,
     ) -> RouteStatusMap {
         route_status::compute_route_health(
             routes,
@@ -93,7 +93,7 @@ impl GatewayApiReconciler {
             owned_gateways,
             effective,
             backend_grants,
-            service_store,
+            stores,
             "HTTPRoute",
         )
     }
@@ -161,7 +161,7 @@ impl GrpcRouteReconciler {
             crate::reconciler::listener_merge::EffectiveGateway,
         >,
         backend_grants: &HashSet<ReferenceGrantKey>,
-        service_store: &MergedStore<Service>,
+        stores: &route_status::RefValidationStores<'_>,
     ) -> RouteStatusMap {
         route_status::compute_route_health(
             routes,
@@ -169,7 +169,7 @@ impl GrpcRouteReconciler {
             owned_gateways,
             effective,
             backend_grants,
-            service_store,
+            stores,
             "GRPCRoute",
         )
     }
@@ -198,7 +198,7 @@ impl TlsRouteReconciler {
             crate::reconciler::listener_merge::EffectiveGateway,
         >,
         backend_grants: &HashSet<ReferenceGrantKey>,
-        service_store: &MergedStore<Service>,
+        stores: &route_status::RefValidationStores<'_>,
     ) -> RouteStatusMap {
         route_status::compute_route_health(
             routes,
@@ -206,7 +206,7 @@ impl TlsRouteReconciler {
             owned_gateways,
             effective,
             backend_grants,
-            service_store,
+            stores,
             "TLSRoute",
         )
     }
@@ -235,7 +235,7 @@ impl TcpRouteReconciler {
             crate::reconciler::listener_merge::EffectiveGateway,
         >,
         backend_grants: &HashSet<ReferenceGrantKey>,
-        service_store: &MergedStore<Service>,
+        stores: &route_status::RefValidationStores<'_>,
     ) -> RouteStatusMap {
         route_status::compute_route_health(
             routes,
@@ -243,7 +243,7 @@ impl TcpRouteReconciler {
             owned_gateways,
             effective,
             backend_grants,
-            service_store,
+            stores,
             "TCPRoute",
         )
     }
@@ -272,7 +272,7 @@ impl UdpRouteReconciler {
             crate::reconciler::listener_merge::EffectiveGateway,
         >,
         backend_grants: &HashSet<ReferenceGrantKey>,
-        service_store: &MergedStore<Service>,
+        stores: &route_status::RefValidationStores<'_>,
     ) -> RouteStatusMap {
         route_status::compute_route_health(
             routes,
@@ -280,7 +280,7 @@ impl UdpRouteReconciler {
             owned_gateways,
             effective,
             backend_grants,
-            service_store,
+            stores,
             "UDPRoute",
         )
     }
