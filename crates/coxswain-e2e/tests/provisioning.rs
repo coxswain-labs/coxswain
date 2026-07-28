@@ -1324,7 +1324,7 @@ async fn raw_status(proxy_addr: SocketAddr, host: &str, path: &str) -> u16 {
 /// Sum `coxswain_proxy_upstream_retries_total` series for `condition` whose labels
 /// mention `ns_marker` (the test namespace). Mirrors `traffic_policy.rs`'s helper.
 async fn retry_count(h: &Harness, ns_marker: &str, condition: &str) -> u64 {
-    let Ok(resp) = reqwest::get(h.admin_url("/metrics")).await else {
+    let Ok(resp) = reqwest::get(h.telemetry_url("/metrics")).await else {
         return 0;
     };
     let Ok(body) = resp.text().await else {
@@ -1599,12 +1599,14 @@ async fn shared_proxy_pool_provisioned_at_install_without_gateways() -> anyhow::
 // Tests that mutate the shared Helm release (non-default ControllerOptions /
 // start_with_options) or that need flake-isolation timing must run serially
 // against the whole e2e job -- see `.config/nextest.toml` `test(/serial::/)`.
-// ── Admin-port fence (#670) ──────────────────────────────────────────────────
+// ── Management-port fences (#670, #676) ──────────────────────────────────────
 
-/// Name of the install's shared-pool admin fence.
-const SHARED_POOL_FENCE: &str = "coxswain-shared-proxy-admin";
-/// Name of the controller's admin fence (chart-rendered).
-const CONTROLLER_FENCE: &str = "coxswain-controller-admin";
+/// Name of the install's shared-pool telemetry fence. Only rendered when
+/// `networkPolicy.telemetry.fenced` is on — provisioned pods have no operator
+/// port, so an unfenced telemetry port leaves nothing to restrict.
+const SHARED_POOL_FENCE: &str = "coxswain-shared-proxy-telemetry";
+/// Name of the controller's operator-port fence (chart-rendered).
+const CONTROLLER_FENCE: &str = "coxswain-controller-operator";
 
 /// Whether `policy` admits `port` on TCP from any source — i.e. whether the
 /// fence leaves that port reachable.
@@ -1654,101 +1656,66 @@ fn tcp_port_is_fenced(policy: &NetworkPolicy, port: i32) -> bool {
         })
 }
 
-/// Happy path: the install fences the admin port on the controller, the shared
-/// pool, and every dedicated proxy — while leaving the data-plane and health
-/// ports open to all sources (#670).
+/// Happy path: by default the install fences the CONTROLLER's operator port —
+/// the one carrying manifests and pod logs — and leaves everything else open,
+/// including telemetry (#676).
 ///
 /// Object shape only. Neither OrbStack's nor kind's default CNI enforces
 /// `NetworkPolicy`, so no local test can assert that traffic is actually
 /// blocked; what *is* asserted here is the property a wrong policy would break
-/// on a cluster that does enforce it — that the fence covers 8082 and nothing
-/// else.
+/// on a cluster that does enforce it.
 #[tokio::test]
-async fn admin_fence_restricts_admin_port_and_leaves_data_plane_open() -> anyhow::Result<()> {
+async fn default_install_fences_the_operator_port_and_leaves_telemetry_open() -> anyhow::Result<()>
+{
     let h = Harness::start().await?;
     let ns = NamespaceGuard::create(&h.client, "prov-fence").await?;
 
     let install: Api<NetworkPolicy> = Api::namespaced(h.client.clone(), "coxswain-system");
-
-    for name in [CONTROLLER_FENCE, SHARED_POOL_FENCE] {
-        let policy = wait::wait_for_resource(&install, name, Duration::from_secs(30))
-            .await
-            .with_context(|| format!("admin fence {name} should be provisioned by default"))?;
-
-        assert!(
-            tcp_port_is_fenced(&policy, 8082),
-            "{name} must restrict the admin port 8082 to a scoped peer set"
-        );
-        assert!(
-            !tcp_port_is_open_to_all(&policy, 8082),
-            "{name} must not also admit 8082 from every source — that would void the fence"
-        );
-        assert!(
-            tcp_port_is_open_to_all(&policy, 8081),
-            "{name} must leave the health port open: kubelet probes are node-sourced"
-        );
-        assert_eq!(
-            policy.spec.as_ref().and_then(|s| s.policy_types.clone()),
-            Some(vec!["Ingress".to_string()]),
-            "{name} must not restrict egress — the controller must keep reaching the apiserver"
-        );
-    }
-
-    // A dedicated Gateway gets its own fence, owner-referenced like the rest of
-    // its trio so deleting the Gateway garbage-collects it.
-    let (_, _, _, _, _, _) = apply_and_wait(&h, &ns).await?;
-    let dedicated_policies: Api<NetworkPolicy> = Api::namespaced(h.client.clone(), &ns.name);
-    let policy =
-        wait::wait_for_resource(&dedicated_policies, RESOURCE_NAME, Duration::from_secs(30))
-            .await
-            .context("a dedicated proxy should be fenced like every other role")?;
+    let policy = wait::wait_for_resource(&install, CONTROLLER_FENCE, Duration::from_secs(30))
+        .await
+        .with_context(|| format!("{CONTROLLER_FENCE} should be provisioned by default"))?;
 
     assert!(
         tcp_port_is_fenced(&policy, 8082),
-        "the dedicated proxy's admin port must be restricted"
+        "{CONTROLLER_FENCE} must restrict the operator port 8082 to a scoped peer set"
     );
-    // A dedicated proxy runs in its Gateway's namespace, the controller in the
-    // install namespace — so a same-namespace-only rule would silently drop the
-    // controller's own `/api/v1/health` fan-out and strand the fleet view.
-    let admits_install_ns = policy
-        .spec
-        .as_ref()
-        .and_then(|s| s.ingress.as_ref())
-        .is_some_and(|rules| {
-            rules
-                .iter()
-                .filter_map(|r| r.from.as_ref())
-                .flatten()
-                .any(|p| {
-                    p.namespace_selector.as_ref().is_some_and(|s| {
-                        s.match_labels.as_ref().is_some_and(|l| {
-                            l.get("kubernetes.io/metadata.name").map(String::as_str)
-                                == Some("coxswain-system")
-                        })
-                    })
-                })
-        });
     assert!(
-        admits_install_ns,
-        "the fence must admit the install namespace, or the controller cannot reach \
-         a dedicated proxy's admin port to aggregate it"
+        !tcp_port_is_open_to_all(&policy, 8082),
+        "{CONTROLLER_FENCE} must not also admit 8082 from every source — that voids the fence"
     );
-    // The listener ports a dedicated proxy actually binds must stay reachable —
-    // this is the regression that would black-hole a Gateway's traffic.
-    for port in [80, 443, 8080, 8443] {
-        assert!(
-            tcp_port_is_open_to_all(&policy, port),
-            "port {port} must stay open to all sources; the fence may only close 8082"
-        );
-    }
+    assert!(
+        tcp_port_is_open_to_all(&policy, 8081),
+        "{CONTROLLER_FENCE} must leave the health port open: kubelet probes are node-sourced"
+    );
+    // The point of the split: scraping and peer probing work with no operator
+    // configuration. Fencing this by default silently breaks every Prometheus
+    // outside the install namespace.
+    assert!(
+        tcp_port_is_open_to_all(&policy, 8083),
+        "{CONTROLLER_FENCE} must leave the telemetry port open by default"
+    );
     assert_eq!(
-        policy
-            .metadata
-            .owner_references
-            .as_ref()
-            .map(std::vec::Vec::len),
-        Some(1),
-        "the fence must carry the Gateway owner reference so it is GC'd with the trio"
+        policy.spec.as_ref().and_then(|s| s.policy_types.clone()),
+        Some(vec!["Ingress".to_string()]),
+        "{CONTROLLER_FENCE} must not restrict egress — the controller must keep reaching \
+         the apiserver"
+    );
+
+    // Sad path / structural: provisioned pods bind no operator port at all, so
+    // with telemetry unfenced there is nothing left to fence and the renderers
+    // must apply-or-DELETE rather than emit an all-open no-op policy.
+    let shared = install.get(SHARED_POOL_FENCE).await;
+    assert!(
+        shared.is_err(),
+        "the shared pool has no operator port and telemetry is unfenced by default, \
+         so no policy should exist for it — found one"
+    );
+
+    let (_, _, _, _, _, _) = apply_and_wait(&h, &ns).await?;
+    let dedicated_policies: Api<NetworkPolicy> = Api::namespaced(h.client.clone(), &ns.name);
+    assert!(
+        dedicated_policies.get(RESOURCE_NAME).await.is_err(),
+        "a dedicated proxy has nothing to fence by default either"
     );
 
     Ok(())
@@ -1756,6 +1723,133 @@ async fn admin_fence_restricts_admin_port_and_leaves_data_plane_open() -> anyhow
 
 mod serial {
     use super::*;
+
+    /// Turning on `networkPolicy.telemetry.fenced` must restrict `/metrics` and
+    /// `/statusz` **without** stranding the controller's own fleet view.
+    ///
+    /// The trap this guards: the install-namespace peer that lets the controller
+    /// reach a dedicated proxy in its Gateway's namespace belongs to whichever
+    /// port carries the fleet-view probe. That probe moved from the operator
+    /// port to `/statusz` on the telemetry port (#676), so the peer had to move
+    /// with it. Leave it on the operator fence — where it superficially looks
+    /// like it belongs — and every dedicated proxy reads permanently
+    /// `reachable: false` the moment anyone enables fencing, with nothing logged
+    /// anywhere.
+    #[tokio::test]
+    async fn fenced_telemetry_still_admits_the_controllers_fleet_probe() -> anyhow::Result<()> {
+        let h = Harness::start_with_options(ControllerOptions {
+            telemetry_fenced: Some(true),
+            ..Default::default()
+        })
+        .await?;
+        let ns = NamespaceGuard::create(&h.client, "prov-tfence").await?;
+
+        let install: Api<NetworkPolicy> = Api::namespaced(h.client.clone(), "coxswain-system");
+        let pool = wait::wait_for_resource(&install, SHARED_POOL_FENCE, Duration::from_secs(60))
+            .await
+            .with_context(|| {
+                format!("{SHARED_POOL_FENCE} must appear once telemetry fencing is on")
+            })?;
+        assert!(
+            tcp_port_is_fenced(&pool, 8083),
+            "{SHARED_POOL_FENCE} must restrict the telemetry port when fencing is on"
+        );
+        assert!(
+            tcp_port_is_open_to_all(&pool, 8081),
+            "fencing telemetry must not touch the health port — kubelet probes are \
+             node-sourced and cannot be selected"
+        );
+
+        // A dedicated proxy lives in its Gateway's namespace; its fence must
+        // still admit the install namespace or the probe below cannot land.
+        let (_, _, _, _, _, _) = apply_and_wait(&h, &ns).await?;
+        let dedicated_policies: Api<NetworkPolicy> = Api::namespaced(h.client.clone(), &ns.name);
+        let policy =
+            wait::wait_for_resource(&dedicated_policies, RESOURCE_NAME, Duration::from_secs(60))
+                .await
+                .context("a dedicated proxy must be fenced once telemetry fencing is on")?;
+        let admits_install_ns = policy
+            .spec
+            .as_ref()
+            .and_then(|s| s.ingress.as_ref())
+            .is_some_and(|rules| {
+                rules
+                    .iter()
+                    .filter_map(|r| r.from.as_ref())
+                    .flatten()
+                    .any(|p| {
+                        p.namespace_selector.as_ref().is_some_and(|s| {
+                            s.match_labels.as_ref().is_some_and(|l| {
+                                l.get("kubernetes.io/metadata.name").map(String::as_str)
+                                    == Some("coxswain-system")
+                            })
+                        })
+                    })
+            });
+        assert!(
+            admits_install_ns,
+            "the telemetry fence must admit the install namespace, or the controller \
+             cannot reach a dedicated proxy's /statusz to aggregate it"
+        );
+        for port in [80, 443, 8080, 8443] {
+            assert!(
+                tcp_port_is_open_to_all(&policy, port),
+                "port {port} must stay open to all sources; the fence may only close 8083"
+            );
+        }
+
+        // The behavioural half: the fleet view still reports the dedicated proxy
+        // reachable. Object shape alone would not catch the peer being dropped
+        // on a cluster whose CNI does enforce the policy.
+        let url = h.controller_operator_url("/api/v1/fleet/proxies");
+        wait::poll_until(
+            Duration::from_secs(120),
+            wait::POLL,
+            || {
+                let url = url.clone();
+                async move {
+                    // Name the unreachable pods: that is the one fact that
+                    // distinguishes a missing install-namespace peer on the
+                    // fence from a proxy that simply never came up.
+                    let detail = match reqwest::get(&url).await {
+                        Ok(r) => match r.json::<serde_json::Value>().await {
+                            Ok(b) => b["proxies"]
+                                .as_array()
+                                .map(|ps| {
+                                    ps.iter()
+                                        .filter(|p| p["reachable"] != serde_json::Value::Bool(true))
+                                        .filter_map(|p| p["pod_name"].as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                })
+                                .unwrap_or_else(|| format!("unexpected body: {b}")),
+                            Err(e) => format!("unparseable body: {e}"),
+                        },
+                        Err(e) => format!("fetch failed: {e}"),
+                    };
+                    format!(
+                        "every proxy to report reachable under a fenced telemetry port; \
+                         still unreachable: [{detail}]"
+                    )
+                }
+            },
+            || {
+                let url = url.clone();
+                async move {
+                    let body: serde_json::Value =
+                        reqwest::get(&url).await.ok()?.json().await.ok()?;
+                    let proxies = body.get("proxies")?.as_array()?;
+                    let all_reachable = !proxies.is_empty()
+                        && proxies
+                            .iter()
+                            .all(|p| p["reachable"] == serde_json::Value::Bool(true));
+                    all_reachable.then_some(())
+                }
+            },
+        )
+        .await?;
+        Ok(())
+    }
 
     /// Happy path + GC lifecycle: with relay tiering enabled and a threshold of 1, a
     /// single dedicated Gateway provisions a namespace relay (zero-verb SA, no owner
@@ -2723,7 +2817,10 @@ mod serial {
         .await?;
 
         // Assert the health endpoint reports the surface as disabled.
-        let health: serde_json::Value = reqwest::get(h.controller_admin_url("/api/v1/health"))
+        // `api_surfaces` is deliberately NOT on `/statusz` (#676): that endpoint
+        // answers "what is broken on this pod" for peers, and which API surfaces
+        // are enabled is a UI concern read from the pod's own operator port.
+        let health: serde_json::Value = reqwest::get(h.controller_operator_url("/api/v1/health"))
             .await?
             .json()
             .await?;
@@ -2889,7 +2986,10 @@ mod serial {
         .await?;
 
         // Assert the health endpoint reports the surface as disabled.
-        let health: serde_json::Value = reqwest::get(h.controller_admin_url("/api/v1/health"))
+        // `api_surfaces` is deliberately NOT on `/statusz` (#676): that endpoint
+        // answers "what is broken on this pod" for peers, and which API surfaces
+        // are enabled is a UI concern read from the pod's own operator port.
+        let health: serde_json::Value = reqwest::get(h.controller_operator_url("/api/v1/health"))
             .await?
             .json()
             .await?;
@@ -3131,7 +3231,27 @@ mod serial {
     /// fence would leave the pool fenced by an object nothing owns any more,
     /// which no amount of re-running `helm upgrade` would clear.
     #[tokio::test]
-    async fn admin_fence_policies_are_reclaimed_when_fencing_is_disabled() -> anyhow::Result<()> {
+    async fn telemetry_fence_policies_are_reclaimed_when_fencing_is_disabled() -> anyhow::Result<()>
+    {
+        // Establish the fences FIRST. With telemetry fencing off by default the
+        // pool policy is never created, so asserting its absence against a
+        // default install passes before the controller does anything — the
+        // reclaim path could be entirely broken and this test would still be
+        // green.
+        let h = Harness::start_with_options(ControllerOptions {
+            telemetry_fenced: Some(true),
+            ..Default::default()
+        })
+        .await?;
+        let policies: Api<NetworkPolicy> = Api::namespaced(h.client.clone(), "coxswain-system");
+        wait::wait_for_resource(&policies, SHARED_POOL_FENCE, Duration::from_secs(90))
+            .await
+            .with_context(|| {
+                format!("precondition: {SHARED_POOL_FENCE} must exist before reclaim is testable")
+            })?;
+
+        // Now turn the master switch off: both the chart-rendered controller
+        // fence and the controller-rendered pool fence must be reclaimed.
         let h = Harness::start_with_options(ControllerOptions {
             network_policy_enabled: Some(false),
             ..Default::default()
@@ -3156,7 +3276,7 @@ mod serial {
                         })
                         .unwrap_or_default();
                     format!(
-                        "admin fences to be reclaimed when networkPolicy.enabled=false; \
+                        "fences to be reclaimed when networkPolicy.enabled=false; \
                          still present in coxswain-system: {present:?}"
                     )
                 }

@@ -161,18 +161,25 @@ impl Harness {
         .await
     }
 
-    /// Build an admin endpoint URL targeting the shared-proxy pod
-    /// (e.g. `admin_url("/metrics")`). The proxy carries no query surface of
-    /// its own beyond `/metrics` and `/api/v1/health` (#537) — routing views
-    /// live on the controller; see [`Self::shared_proxy_routes_url`].
-    pub fn admin_url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.controller.admin_addr)
+    /// Build a telemetry URL targeting the shared-proxy pod (e.g.
+    /// `telemetry_url("/metrics")`). That port serves `/metrics` and
+    /// `/statusz`, and is the proxy's entire management surface — it binds no
+    /// operator port (#676) and no routing views (#537); see
+    /// [`Self::shared_proxy_routes_url`].
+    pub fn telemetry_url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.controller.telemetry_addr)
     }
 
-    /// Build an admin endpoint URL targeting the controller pod.
-    /// Use for controller-specific paths like `/api/v1/routing/gateways`.
-    pub fn controller_admin_url(&self, path: &str) -> String {
-        format!("http://{}{path}", self.controller.controller_admin_addr)
+    /// Build a telemetry URL targeting the CONTROLLER pod's own `/metrics` and
+    /// `/statusz`.
+    pub fn controller_telemetry_url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.controller.controller_telemetry_addr)
+    }
+
+    /// Build an operator-API URL targeting the controller, via the
+    /// leader-selecting Service. Use for paths like `/api/v1/routing/gateways`.
+    pub fn controller_operator_url(&self, path: &str) -> String {
+        format!("http://{}{path}", self.controller.controller_operator_addr)
     }
 
     /// Build the controller's per-proxy routes URL for the (single, by
@@ -190,6 +197,6 @@ impl Harness {
     /// [`leader::shared_proxy_pod_name`]).
     pub async fn shared_proxy_routes_url(&self) -> anyhow::Result<String> {
         let pod = leader::shared_proxy_pod_name(&self.client).await?;
-        Ok(self.controller_admin_url(&format!("/api/v1/fleet/proxies/{pod}/routes")))
+        Ok(self.controller_operator_url(&format!("/api/v1/fleet/proxies/{pod}/routes")))
     }
 }

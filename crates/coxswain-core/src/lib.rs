@@ -16,6 +16,7 @@ pub mod fleet;
 pub mod gateway_api_capability;
 pub mod health;
 pub mod identity;
+pub mod leader;
 pub mod listener_status;
 pub mod naming;
 pub mod node_registry;
@@ -38,6 +39,7 @@ pub use identity::{
     AuthnError, CsrPem, IssuedSvid, IssuerError, SpiffeId, SpiffeIdError, SvidIssuer,
     TokenAuthenticator,
 };
+pub use leader::{LEASE_NAME, LeaderIdentityCell};
 pub use listener_status::GatewayListenerStatusHandle;
 pub use node_registry::{NodeEntry, NodeRegistry, NodeRegistryHandle, NodeScope, RosterChild};
 pub use publish_index::{GatewayPublishIndexHandle, PublishStamp};

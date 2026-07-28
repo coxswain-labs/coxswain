@@ -13,11 +13,15 @@ info:
       - `fleet/*`   — all coxswain pods (controllers + proxies)
       - `routing/*` — config resources (Gateways, HTTPRoutes, Ingresses)
 
-    The `/api/v1/*` surface is served only by the controller role;
-    proxy pods return 404 for everything except `/api/v1/health` (proxy pods
-    carry no other admin query surface beyond `/metrics`, #537). A proxy's
-    compiled routing table is served from the controller's own local
-    snapshot at `fleet/proxies/{name}/routes`, never fetched from the pod.
+    This surface lives on the controller's **operator port** (8082), which the
+    controller role alone binds — proxy and relay pods serve no `/api/v1/*` at
+    all (#676). Their entire management surface is `/healthz` + `/readyz` on the
+    health port and `/metrics` + `/statusz` on the telemetry port (8083); those
+    two are documented here only where the aggregator consumes them. When
+    `operatorAuth` is configured every path below requires HTTP Basic auth,
+    with no exemptions. A proxy's compiled routing table is served from the
+    controller's own local snapshot at `fleet/proxies/{name}/routes`, never
+    fetched from the pod (#537).
 
 servers:
   - url: http://localhost:8082
@@ -75,8 +79,12 @@ paths:
                     type: boolean
                     description: >-
                       Whether every connected proxy has Ack'd the controller's
-                      current snapshot. `true` vacuously when no proxies are
-                      connected. Backs the topology lag banner (#393).
+                      current snapshot. Backs the topology lag banner (#393).
+                      OMITTED entirely unless the answering replica is the
+                      leader: only the leader holds a populated node registry,
+                      so a standby would report `true` vacuously and hide a
+                      warning genuinely firing elsewhere. Treat absence as
+                      "unknown" and key any banner on an explicit `false`.
 
   /api/v1/fleet/controllers:
     get:
@@ -337,8 +345,8 @@ paths:
       responses:
         '200':
           description: >-
-            Convergence snapshot. `discovery_active` is `false` on proxy
-            roles (no registry); both states yield `nodes: []` when empty.
+            Convergence snapshot, served by the leader. `discovery_active` is
+            `false` on dev roles with no registry, which yields `nodes: []`.
           content:
             application/json:
               schema:
@@ -353,6 +361,20 @@ paths:
                   nodes:
                     type: array
                     items: { $ref: '#/components/schemas/TopologyNode' }
+        '503':
+          description: >-
+            This replica is not the discovery leader, so it has no topology to
+            report. Only the leader accepts proxy discovery streams; a standby's
+            registry is empty rather than partial, so answering with an empty
+            node list would be indistinguishable from a healthy cluster with
+            nothing connected. Reach the leader through the
+            `coxswain-controller-operator` Service.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
 
   /api/v1/manifests/{kind}/{namespace}/{name}:
     get:
@@ -507,7 +529,7 @@ components:
         pod_name: { type: string }
         pod_namespace: { type: string }
         pod_ip: { type: string }
-        admin_port: { type: integer }
+        telemetry_port: { type: integer }
         component: { type: string, enum: [controller, shared-proxy, dedicated-proxy] }
         reachable: { type: boolean }
         health: { type: string, enum: [ready, degraded], description: Rollup; reachable pods only. }

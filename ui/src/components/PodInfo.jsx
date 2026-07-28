@@ -5,7 +5,7 @@
  * rendered separately as chips in the page header (see `PodHealthChips`).
  *
  * @param detail the `get_controller`/`get_proxy` object (carries node, restarts,
- *               phase, created_at, pod_ip, admin_port, reachable)
+ *               phase, created_at, pod_ip, telemetry_port, reachable)
  * @param health the `useApi` result for that pod's `/health` ({data,loading,error}),
  *               used here only for the pod's reported version
  */

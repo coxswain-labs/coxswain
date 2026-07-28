@@ -9,7 +9,7 @@ use futures::future::join_all;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use super::{OperatorAggregator, attach_health_rollup, json_response, not_found, pod_base_url};
+use super::{OperatorAggregator, attach_health_rollup, json_response, not_found, pod_statusz_url};
 use crate::page::ListParams;
 use crate::routes_dto::{ConflictRow, HostGroup, RouteBlock, RouteRow, RoutesResponse};
 
@@ -29,7 +29,7 @@ impl OperatorAggregator {
                 // The liveness probe already returns the pod's full health body;
                 // parse it (rather than discard it) so the entry carries a health
                 // rollup without a second per-pod round-trip.
-                let url = format!("{}/api/v1/health", pod_base_url(e));
+                let url = pod_statusz_url(e);
                 match self.fetch_json(&url).await {
                     Some(body) => {
                         let mut v = Self::entry_json(e);
@@ -64,7 +64,7 @@ impl OperatorAggregator {
         let Some(entry) = entry else {
             return not_found();
         };
-        let url = format!("{}/api/v1/health", pod_base_url(entry));
+        let url = pod_statusz_url(entry);
         match self.fetch_json(&url).await {
             Some(_) => {
                 let mut v = Self::entry_json(entry);
@@ -179,7 +179,7 @@ impl OperatorAggregator {
     }
 
     /// `GET /api/v1/proxies/{pod-name}/health` — fan-out to the pod's
-    /// `/api/v1/health`.
+    /// `/statusz`.
     pub(crate) async fn get_proxy_health(&self, pod_name: &str) -> Response<Vec<u8>> {
         let snapshot = self.fleet.load();
         let entry = snapshot

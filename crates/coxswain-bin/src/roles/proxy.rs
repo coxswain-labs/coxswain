@@ -4,8 +4,6 @@
 //! in [`crate::wiring`], [`crate::services`], and [`crate::discovery`].
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 use coxswain_core::health::HealthRegistry;
@@ -60,12 +58,7 @@ pub(crate) fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
 
     register_discovery_background_services(&mut server, supervisor, bootstrap_runner);
 
-    let leader = Arc::new(AtomicBool::new(false));
-    wire_management_servers(
-        &mut server,
-        &args.common,
-        ManagementServerConfig { health, leader },
-    );
+    wire_management_servers(&mut server, &args.common, ManagementServerConfig { health });
 
     tracing::info!(
         proxy_bind_address = %args.proxy.proxy_bind_address,
@@ -73,7 +66,7 @@ pub(crate) fn run_proxy_shared(args: ProxyRoleArgs) -> Result<()> {
         ingress_https_port = ?args.common.ingress_https_port,
         management_bind_address = %args.common.management_bind_address,
         health_port = args.common.health_port,
-        admin_port = args.common.admin_port,
+        telemetry_port = args.common.telemetry_port,
         proxy_shutdown_grace_period = ?args.proxy.proxy_shutdown_grace_period,
         proxy_shutdown_timeout = ?args.proxy.proxy_shutdown_timeout,
         proxy_listener_drain_timeout = ?args.proxy.proxy_listener_drain_timeout,
@@ -140,18 +133,13 @@ pub(crate) fn run_proxy_gateway(
 
     register_discovery_background_services(&mut server, supervisor, bootstrap_runner);
 
-    let leader = Arc::new(AtomicBool::new(false));
-    wire_management_servers(
-        &mut server,
-        &args.common,
-        ManagementServerConfig { health, leader },
-    );
+    wire_management_servers(&mut server, &args.common, ManagementServerConfig { health });
 
     tracing::info!(
         proxy_bind_address = %args.proxy.proxy_bind_address,
         management_bind_address = %args.common.management_bind_address,
         health_port = args.common.health_port,
-        admin_port = args.common.admin_port,
+        telemetry_port = args.common.telemetry_port,
         proxy_shutdown_grace_period = ?args.proxy.proxy_shutdown_grace_period,
         proxy_shutdown_timeout = ?args.proxy.proxy_shutdown_timeout,
         proxy_listener_drain_timeout = ?args.proxy.proxy_listener_drain_timeout,

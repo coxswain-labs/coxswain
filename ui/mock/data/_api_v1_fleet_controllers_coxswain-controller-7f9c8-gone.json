@@ -3,7 +3,7 @@
   "component": "controller",
   "pod_namespace": "coxswain-system",
   "pod_ip": "10.42.0.13",
-  "admin_port": 8082,
+  "telemetry_port": 8083,
   "reachable": false,
   "node": "node-cp-1",
   "restarts": 7,

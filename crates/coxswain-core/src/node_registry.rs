@@ -169,9 +169,9 @@ impl NodeRegistry {
     /// SharedPool node is present.
     ///
     /// Free-standing on the plain snapshot type (not just
-    /// [`NodeRegistryHandle`]) so a registry merged from multiple controller
-    /// replicas — e.g. a topology fan-out union — can compute the same value
-    /// a single replica's live registry would.
+    /// [`NodeRegistryHandle`]) so a point-in-time snapshot computes the same
+    /// value the live registry would — the admin topology view reads a loaded
+    /// snapshot, not the handle.
     #[must_use]
     pub fn controller_version(&self) -> Option<String> {
         self.nodes
@@ -179,17 +179,6 @@ impl NodeRegistry {
             .filter(|e| e.scope == NodeScope::SharedPool && !e.is_relay)
             .min_by(|a, b| a.node_id.cmp(&b.node_id))
             .and_then(|e| e.target_version.clone())
-    }
-
-    /// Merge `other`'s nodes into `self`, keyed by `node_id`.
-    ///
-    /// A `node_id` present in both is overwritten by `other`'s entry — the
-    /// only legitimate source of a collision is the same node represented in
-    /// two fan-out responses (e.g. a controller's own local registry fetched
-    /// both directly and via its own peer endpoint), where the entries are
-    /// equivalent modulo a benign race, not a real conflict.
-    pub fn merge(&mut self, other: NodeRegistry) {
-        self.nodes.extend(other.nodes);
     }
 
     /// #531 shared-mode quorum: whether **every** currently-connected
@@ -980,38 +969,7 @@ mod tests {
         assert!(reg2.load().nodes.contains_key("node-a"));
     }
 
-    // ── NodeRegistry::merge / controller_version (topology fan-out) ─────────────
-
-    #[test]
-    fn merge_unions_disjoint_node_ids() {
-        let a = NodeRegistryHandle::new();
-        a.connect("node-a", shared(), now());
-        let b = NodeRegistryHandle::new();
-        b.connect("node-b", shared(), now());
-        let mut merged = a.load();
-        merged.merge(b.load());
-        assert_eq!(merged.nodes.len(), 2);
-        assert!(merged.nodes.contains_key("node-a"));
-        assert!(merged.nodes.contains_key("node-b"));
-    }
-
-    #[test]
-    fn merge_overwrites_on_shared_node_id() {
-        let a = NodeRegistryHandle::new();
-        a.connect("node-a", shared(), now());
-        a.record_target("node-a", "v1".to_owned());
-        let b = NodeRegistryHandle::new();
-        b.connect("node-a", shared(), now());
-        b.record_target("node-a", "v2".to_owned());
-        let mut merged = a.load();
-        merged.merge(b.load());
-        assert_eq!(merged.nodes.len(), 1, "same node_id collapses to one entry");
-        assert_eq!(
-            merged.nodes["node-a"].target_version.as_deref(),
-            Some("v2"),
-            "the merged-in registry wins on collision"
-        );
-    }
+    // ── controller_version ─────────────────────────────────────────────────────
 
     #[test]
     fn controller_version_on_plain_registry_matches_shared_handle() {
@@ -1589,8 +1547,9 @@ mod tests {
 
     #[test]
     fn node_entry_json_without_bound_ports_defaults_to_none() {
-        // Pre-#531 peers serialize NodeEntry without the field; the admin
-        // fan-out merge must keep decoding their JSON.
+        // Pre-#531 peers serialize NodeEntry without the field. The registry is
+        // still deserialized from the wire on the relay roster path, so the
+        // `serde(default)` must keep holding.
         let json = r#"{
             "node_id": "node-a",
             "scope": {"kind": "SharedPool"},

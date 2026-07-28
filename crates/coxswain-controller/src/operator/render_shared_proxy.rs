@@ -51,14 +51,14 @@ use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
 use kube::api::ObjectMeta;
 use std::collections::BTreeMap;
 
-use coxswain_core::fleet::ADMIN_PORT_ANNOTATION;
+use coxswain_core::fleet::TELEMETRY_PORT_ANNOTATION;
 
-use super::admin_fence::{AdminFenceConfig, render_admin_fence};
 use super::harden::HardeningReport;
 use super::render::{
     container_hardening_security_context, discovery_volume_mounts, discovery_volumes,
     http_get_probe, merge_pod_template, pod_hardening_security_context, pod_identity_env,
 };
+use super::telemetry_fence::{TelemetryFenceConfig, render_telemetry_fence};
 
 /// The tuning + sizing knobs for the controller-owned shared proxy pool (#604).
 ///
@@ -168,7 +168,7 @@ pub(crate) struct SharedProxyRenderInputs<'a> {
     /// Health server port (`/readyz`, `/healthz`).
     pub health_port: u16,
     /// Admin/metrics port.
-    pub admin_port: u16,
+    pub telemetry_port: u16,
     /// Whether the Ingress surface is enabled install-wide (mirrors the
     /// controller's `--disable-ingress`).
     pub enable_ingress: bool,
@@ -176,7 +176,7 @@ pub(crate) struct SharedProxyRenderInputs<'a> {
     /// controller's `--disable-gateway-api`).
     pub enable_gateway_api: bool,
     /// Admin-port fencing policy (#670), install-wide.
-    pub admin_fence: &'a AdminFenceConfig,
+    pub telemetry_fence: &'a TelemetryFenceConfig,
 }
 
 /// The rendered shared-pool objects. Applied-or-deleted by
@@ -192,7 +192,7 @@ pub(crate) struct RenderedSharedProxy {
     pub hpa: Option<HorizontalPodAutoscaler>,
     /// PDB protecting the pool — `Some` only when the effective replica ceiling ≥ 2.
     pub pdb: Option<PodDisruptionBudget>,
-    /// Internal ClusterIP Service exposing the health + admin ports.
+    /// Internal ClusterIP Service exposing the health + telemetry ports.
     pub internal_service: Service,
     /// Admin-port fence (#670) — `Some` unless fencing is disabled install-wide.
     /// Applied-or-deleted by [`super::apply::apply_shared_proxy`], so turning
@@ -297,7 +297,7 @@ fn shared_proxy_container_args(inputs: &SharedProxyRenderInputs<'_>) -> Vec<Stri
         format!("--discovery-trust-domain={}", inputs.discovery_trust_domain),
         "--log-format=json".to_string(),
         format!("--health-port={}", inputs.health_port),
-        format!("--admin-port={}", inputs.admin_port),
+        format!("--telemetry-port={}", inputs.telemetry_port),
     ];
 
     if inputs.enable_ingress {
@@ -360,7 +360,7 @@ fn shared_proxy_container_args(inputs: &SharedProxyRenderInputs<'_>) -> Vec<Stri
 
 /// The container ports the pool exposes: the named `http`/`https` ports the
 /// retained Ingress LB Service targets (only when Ingress is enabled and a port
-/// is configured), plus the always-present `health`/`admin` ports the internal
+/// is configured), plus the always-present `health`/`telemetry` ports the internal
 /// Service targets.
 fn shared_proxy_container_ports(inputs: &SharedProxyRenderInputs<'_>) -> Vec<ContainerPort> {
     let mut ports = Vec::new();
@@ -386,8 +386,8 @@ fn shared_proxy_container_ports(inputs: &SharedProxyRenderInputs<'_>) -> Vec<Con
         ..Default::default()
     });
     ports.push(ContainerPort {
-        name: Some("admin".to_string()),
-        container_port: i32::from(inputs.admin_port),
+        name: Some("telemetry".to_string()),
+        container_port: i32::from(inputs.telemetry_port),
         ..Default::default()
     });
     ports
@@ -417,13 +417,13 @@ fn render_shared_proxy_deployment(inputs: &SharedProxyRenderInputs<'_>) -> Deplo
         ..Default::default()
     };
 
-    // The admin-port annotation is load-bearing: the fleet snapshot
+    // The telemetry-port annotation is load-bearing: the fleet snapshot
     // (`coxswain_core::fleet::build_snapshot`) skips any pod that lacks it, so the
     // shared pool must carry it to appear in the operator's data-plane view.
     let mut annotations = BTreeMap::new();
     annotations.insert(
-        ADMIN_PORT_ANNOTATION.to_string(),
-        inputs.admin_port.to_string(),
+        TELEMETRY_PORT_ANNOTATION.to_string(),
+        inputs.telemetry_port.to_string(),
     );
 
     let base_pod_template = PodTemplateSpec {
@@ -492,7 +492,7 @@ fn needs_net_bind_service(inputs: &SharedProxyRenderInputs<'_>) -> bool {
             .any(|p| p < 1024)
 }
 
-/// Render the internal ClusterIP `Service` exposing the health + admin ports.
+/// Render the internal ClusterIP `Service` exposing the health + telemetry ports.
 fn render_shared_proxy_internal_service(inputs: &SharedProxyRenderInputs<'_>) -> Service {
     Service {
         metadata: shared_proxy_metadata(
@@ -512,9 +512,9 @@ fn render_shared_proxy_internal_service(inputs: &SharedProxyRenderInputs<'_>) ->
                     ..Default::default()
                 },
                 ServicePort {
-                    name: Some("admin".to_string()),
-                    port: i32::from(inputs.admin_port),
-                    target_port: Some(IntOrString::Int(i32::from(inputs.admin_port))),
+                    name: Some("telemetry".to_string()),
+                    port: i32::from(inputs.telemetry_port),
+                    target_port: Some(IntOrString::Int(i32::from(inputs.telemetry_port))),
                     protocol: Some("TCP".to_string()),
                     ..Default::default()
                 },
@@ -596,25 +596,25 @@ fn render_shared_proxy_pdb(inputs: &SharedProxyRenderInputs<'_>) -> Option<PodDi
     })
 }
 
-/// The admin-fence `NetworkPolicy` name: `<name>-admin`, alongside the internal
+/// The telemetry-fence `NetworkPolicy` name: `<name>-telemetry`, alongside the internal
 /// Service's `<name>-internal`. Shared with the apply-or-delete and reclaim
 /// paths so a rename can never orphan the policy.
 pub(super) fn network_policy_name(pool_name: &str) -> String {
-    format!("{pool_name}-admin")
+    format!("{pool_name}-telemetry")
 }
 
-/// Render the pool's admin-port fence (#670), or `None` when fencing is off.
+/// Render the pool's telemetry-port fence (#670), or `None` when fencing is off.
 fn render_shared_proxy_network_policy(
     inputs: &SharedProxyRenderInputs<'_>,
 ) -> Option<NetworkPolicy> {
-    inputs.admin_fence.enabled.then(|| {
-        render_admin_fence(
+    inputs.telemetry_fence.enabled.then(|| {
+        render_telemetry_fence(
             &network_policy_name(&inputs.config.name),
             inputs.namespace,
             shared_proxy_labels(inputs.selector),
             inputs.selector.clone(),
-            inputs.admin_port,
-            inputs.admin_fence,
+            inputs.telemetry_port,
+            inputs.telemetry_fence,
         )
     })
 }
@@ -698,10 +698,10 @@ mod tests {
             ingress_http_port: Some(8080),
             ingress_https_port: Some(8443),
             health_port: 8081,
-            admin_port: 8082,
+            telemetry_port: 8082,
             enable_ingress: true,
             enable_gateway_api: true,
-            admin_fence: Box::leak(Box::new(AdminFenceConfig::default())),
+            telemetry_fence: Box::leak(Box::new(TelemetryFenceConfig::default())),
         }
     }
 
@@ -818,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn pod_carries_admin_port_annotation_for_the_fleet_snapshot() {
+    fn pod_carries_telemetry_port_annotation_for_the_fleet_snapshot() {
         let c = config();
         let d = render_shared_proxy_deployment(&inputs(&c));
         let annotations = d
@@ -830,9 +830,11 @@ mod tests {
             .annotations
             .expect("pod annotations");
         assert_eq!(
-            annotations.get(ADMIN_PORT_ANNOTATION).map(String::as_str),
+            annotations
+                .get(TELEMETRY_PORT_ANNOTATION)
+                .map(String::as_str),
             Some("8082"),
-            "the fleet snapshot skips pods lacking the admin-port annotation"
+            "the fleet snapshot skips pods lacking the telemetry-port annotation"
         );
     }
 
@@ -948,15 +950,15 @@ mod tests {
             "hardening security context survives the overlay"
         );
         assert!(pod.containers.iter().any(|c| c.name == "coxswain"));
-        // Overlay annotation merges alongside the load-bearing admin-port annotation.
+        // Overlay annotation merges alongside the load-bearing telemetry-port annotation.
         let ann = tmpl.metadata.unwrap().annotations.unwrap();
         assert_eq!(
             ann.get("prometheus.io/scrape").map(String::as_str),
             Some("true")
         );
         assert!(
-            ann.contains_key(ADMIN_PORT_ANNOTATION),
-            "admin-port annotation not clobbered by the overlay"
+            ann.contains_key(TELEMETRY_PORT_ANNOTATION),
+            "telemetry-port annotation not clobbered by the overlay"
         );
     }
 
@@ -1041,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn internal_service_exposes_health_and_admin() {
+    fn internal_service_exposes_health_and_telemetry() {
         let c = config();
         let svc = render_shared_proxy_internal_service(&inputs(&c));
         assert_eq!(
@@ -1058,7 +1060,7 @@ mod tests {
             .filter_map(|p| p.name)
             .collect();
         assert!(names.contains(&"health".to_string()));
-        assert!(names.contains(&"admin".to_string()));
+        assert!(names.contains(&"telemetry".to_string()));
     }
 
     #[test]

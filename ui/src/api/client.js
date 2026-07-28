@@ -1,5 +1,19 @@
 /**
- * Fetch a JSON endpoint on the controller admin port.
+ * Forward the page's `?mock=<variant>` to the API request, in dev only.
+ *
+ * The mock backend selects an alternate fixture per request; without this the
+ * variant is reachable by `curl` but not by any screen, so error branches like
+ * the standby `503` on `/api/v1/topology` could never actually be seen. A no-op
+ * in production: nothing sets the parameter, and the real controller ignores it.
+ */
+function withMockVariant(path) {
+  const variant = new URLSearchParams(window.location.search).get('mock');
+  if (!variant) return path;
+  return `${path}${path.includes('?') ? '&' : '?'}mock=${encodeURIComponent(variant)}`;
+}
+
+/**
+ * Fetch a JSON endpoint on the controller operator port.
  *
  * Paths are relative to the page origin (works both when served embedded in
  * the binary and when Vite's dev server proxies to a port-forwarded controller).
@@ -11,7 +25,7 @@
 export async function fetchJson(path) {
   let resp;
   try {
-    resp = await fetch(path);
+    resp = await fetch(withMockVariant(path));
   } catch (e) {
     throw new Error(`Network error fetching ${path}: ${e.message}`);
   }

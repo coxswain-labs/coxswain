@@ -3351,13 +3351,13 @@ mod serial {
         let _secret = create_admin_auth_secret(&client).await?;
 
         let controller = ControllerProcess::start_with_options(ControllerOptions {
-            admin_auth_secret_name: Some(ADMIN_AUTH_SECRET.to_string()),
+            operator_auth_secret_name: Some(ADMIN_AUTH_SECRET.to_string()),
             ..Default::default()
         })
         .await?;
         let url = format!(
             "http://{}{GATED_ADMIN_PATH}",
-            controller.controller_admin_addr
+            controller.controller_operator_addr
         );
 
         // Poll rather than asserting once: the credential is loaded by a
@@ -3393,13 +3393,13 @@ mod serial {
         let _secret = create_admin_auth_secret(&client).await?;
 
         let controller = ControllerProcess::start_with_options(ControllerOptions {
-            admin_auth_secret_name: Some(ADMIN_AUTH_SECRET.to_string()),
+            operator_auth_secret_name: Some(ADMIN_AUTH_SECRET.to_string()),
             ..Default::default()
         })
         .await?;
         let url = format!(
             "http://{}{GATED_ADMIN_PATH}",
-            controller.controller_admin_addr
+            controller.controller_operator_addr
         );
 
         // Settle on the enforcing state first: before the credential loads the
@@ -3441,23 +3441,45 @@ mod serial {
         // or kubelet probes would fail and the pod would be killed.
         wait::wait_for_ready(controller.health_addr, Duration::from_secs(30)).await?;
 
-        // The three infrastructure endpoints stay reachable WITHOUT credentials
-        // even while the gated path above is challenging. This is load-bearing,
-        // not incidental: the controller probes peers on `/api/v1/health` and
-        // `/api/v1/topology/local` holding only the bcrypt hash (so it cannot
-        // authenticate to itself, and gating them would make every pod report
-        // `reachable: false`), and the chart's PodMonitor scrapes `/metrics` by
-        // pod IP with no credential field. An earlier revision of this test
-        // asserted a challenge against `/api/v1/health` and could never pass.
-        for exempt in ["/metrics", "/api/v1/health", "/api/v1/topology/local"] {
-            let exempt_url = format!("http://{}{exempt}", controller.controller_admin_addr);
-            assert_eq!(
-                admin_status(&exempt_url, None).await?,
-                200,
-                "{exempt} must stay reachable without credentials — gating it breaks \
-                 the controller's own fan-out or Prometheus scraping"
+        // Nothing on the operator port is exempt any more (#676). The three
+        // endpoints that used to need a carve-out — `/metrics`, `/api/v1/health`
+        // as a peer-probe target, and `/api/v1/topology/local` — needed one only
+        // because an unauthenticatable caller had to reach them here. The first
+        // two moved to the telemetry listener and the third was deleted with the
+        // fan-out, so any path answering 200 without credentials would be a
+        // regression, and `/api/v1/health` must now challenge like everything
+        // else.
+        for gated in [
+            "/",
+            "/metrics",
+            "/api/v1/health",
+            "/api/v1/topology",
+            "/api/v1/topology/local",
+            "/api/v1/fleet/summary",
+        ] {
+            let url = format!("http://{}{gated}", controller.controller_operator_addr);
+            let status = admin_status(&url, None).await?;
+            assert_ne!(
+                status, 200,
+                "{gated} answered 200 unauthenticated — the operator port must have \
+                 no exemption list"
             );
         }
+
+        // The counterpart: the telemetry listener is never authenticated, so the
+        // endpoints that moved there still answer without credentials. Without
+        // this half, the assertions above would also pass if auth had simply
+        // broken scraping and peer probing outright.
+        for open_path in ["/metrics", "/statusz"] {
+            let url = format!("http://{}{open_path}", controller.controller_telemetry_addr);
+            assert_eq!(
+                admin_status(&url, None).await?,
+                200,
+                "{open_path} must stay reachable without credentials — Prometheus has \
+                 no credential knob and a peer pod holds only the bcrypt hash"
+            );
+        }
+
         Ok(())
     }
 }

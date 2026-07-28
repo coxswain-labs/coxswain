@@ -5,8 +5,6 @@
 //! [`crate::discovery`].
 
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use anyhow::{Context, Result};
 use coxswain_core::health::HealthRegistry;
@@ -185,18 +183,13 @@ pub(crate) fn run_relay(args: RelayRoleArgs) -> Result<()> {
         ));
     }
 
-    let leader = Arc::new(AtomicBool::new(false));
-    wire_management_servers(
-        &mut server,
-        &args.common,
-        ManagementServerConfig { health, leader },
-    );
+    wire_management_servers(&mut server, &args.common, ManagementServerConfig { health });
 
     tracing::info!(
         downstream_discovery_port = args.discovery_port,
         management_bind_address = %args.common.management_bind_address,
         health_port = args.common.health_port,
-        admin_port = args.common.admin_port,
+        telemetry_port = args.common.telemetry_port,
         "Listening"
     );
     server.run_forever();

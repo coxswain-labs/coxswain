@@ -28,7 +28,7 @@ use coxswain_e2e::{
     ControllerOptions, ControllerProcess, FixtureVars, Harness, HttpClient, IngressClassGuard,
     NamespaceGuard, bootstrap,
     fixtures::{self, backends, gateway_api as gwa, ingress},
-    harness::{GATEWAY_TCP_PROXY_PORT, GATEWAY_UDP_PROXY_PORT, http, wait},
+    harness::{GATEWAY_TCP_PROXY_PORT, GATEWAY_UDP_PROXY_PORT, http, leader, wait},
 };
 use gateway_api_types::apis::standard::httproutes::HttpRoute;
 use k8s_openapi::api::core::v1::Service;
@@ -1960,7 +1960,10 @@ async fn grpc_route_with_named_rule_routes_by_method() -> anyhow::Result<()> {
 
     // The named rule's metric label uses the name; the unnamed rule (index 1)
     // still uses its positional index.
-    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let metrics = reqwest::get(h.telemetry_url("/metrics"))
+        .await?
+        .text()
+        .await?;
     let named_label = format!(
         "route=\"grpcroute/{}/grpc-named-rule-route:named-rule\"",
         ns.name
@@ -2253,7 +2256,7 @@ async fn mirrored_request_reaches_shadow_while_client_sees_primary() -> anyhow::
     let gw = h.gateway_http(&ns.name).await?;
     wait::wait_for_route(&gw, &host, "/mirror/probe", Duration::from_secs(60)).await?;
 
-    let metrics_url = h.admin_url("/metrics");
+    let metrics_url = h.telemetry_url("/metrics");
     let metrics_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -2314,7 +2317,7 @@ async fn percent_zero_mirror_never_dispatches() -> anyhow::Result<()> {
     let gw = h.gateway_http(&ns.name).await?;
     wait::wait_for_route(&gw, &host, "/mirror/probe", Duration::from_secs(60)).await?;
 
-    let metrics_url = h.admin_url("/metrics");
+    let metrics_url = h.telemetry_url("/metrics");
     let metrics_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -2357,7 +2360,7 @@ async fn multiple_mirrors_each_receive_a_copy() -> anyhow::Result<()> {
     let gw = h.gateway_http(&ns.name).await?;
     wait::wait_for_route(&gw, &host, "/mirror-multi/probe", Duration::from_secs(60)).await?;
 
-    let metrics_url = h.admin_url("/metrics");
+    let metrics_url = h.telemetry_url("/metrics");
     let metrics_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -2421,7 +2424,7 @@ async fn cross_namespace_mirror_requires_reference_grant() -> anyhow::Result<()>
     let gw = h.gateway_http(&ns.name).await?;
     wait::wait_for_route(&gw, &host, "/mirror-xns/probe", Duration::from_secs(60)).await?;
 
-    let metrics_url = h.admin_url("/metrics");
+    let metrics_url = h.telemetry_url("/metrics");
     let metrics_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(5))
         .build()
@@ -3067,6 +3070,17 @@ mod serial {
         let h = Harness::start().await?;
         let ns = NamespaceGuard::create(&h.client, "rt-ing-prop-time").await?;
 
+        // Same reasoning as the Gateway API twin: never measure across a proxy
+        // rollout. This one happens to run second today, so it is usually warm
+        // already — relying on ordering for a correct measurement is exactly the
+        // kind of accident that makes a benchmark lie later.
+        wait::wait_for_rollout_complete(
+            leader::SYSTEM_NAMESPACE,
+            "coxswain-shared-proxy",
+            Duration::from_secs(180),
+        )
+        .await?;
+
         fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
         wait::wait_for_backends(&ns.name).await?;
 
@@ -3117,6 +3131,20 @@ mod serial {
     async fn route_propagation_time_gateway_api_apply_to_first_success() -> anyhow::Result<()> {
         let h = Harness::start().await?;
         let ns = NamespaceGuard::create(&h.client, "rt-gw-prop-time").await?;
+
+        // Settle the data plane BEFORE the clock starts. An earlier serial test
+        // may have left non-default Helm values, and `Harness::start` restores
+        // them with an upgrade that rolls the shared proxy. `--wait` returns at
+        // pod-Ready, but the new pod still has to bootstrap its SVID, connect
+        // discovery, take a snapshot and bind listeners before it can serve this
+        // namespace's new Gateway port. Without this the measurement silently
+        // absorbs those seconds and reports them as route propagation.
+        wait::wait_for_rollout_complete(
+            leader::SYSTEM_NAMESPACE,
+            "coxswain-shared-proxy",
+            Duration::from_secs(180),
+        )
+        .await?;
 
         fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
         wait::wait_for_backends(&ns.name).await?;

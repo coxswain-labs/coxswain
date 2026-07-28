@@ -88,7 +88,10 @@ async fn annotation_connect_retry_retries_failed_connect() -> anyhow::Result<()>
 
     // Confirm the upstream-error metric is being emitted for this route.
     // (Exact retry-attempt count is validated by unit tests.)
-    let metrics = reqwest::get(h.admin_url("/metrics")).await?.text().await?;
+    let metrics = reqwest::get(h.telemetry_url("/metrics"))
+        .await?
+        .text()
+        .await?;
     assert!(
         metrics.contains("coxswain_proxy_upstream_errors_total{"),
         "proxy /metrics must expose coxswain_proxy_upstream_errors_total after a connect failure"
@@ -978,7 +981,7 @@ async fn gateway_request_size_limit_not_enforced_on_grpcroute() -> anyhow::Resul
 /// Sum `coxswain_proxy_upstream_retries_total` series for `condition` whose labels
 /// mention `ns_marker` (the test namespace, present in the `route`/`upstream` labels).
 async fn retry_count(h: &Harness, ns_marker: &str, condition: &str) -> u64 {
-    let Ok(resp) = reqwest::get(h.admin_url("/metrics")).await else {
+    let Ok(resp) = reqwest::get(h.telemetry_url("/metrics")).await else {
         return 0;
     };
     let Ok(body) = resp.text().await else {
@@ -2112,7 +2115,7 @@ async fn upstream_keepalive_reuses_connections() -> anyhow::Result<()> {
             "coxswain_proxy_upstream_connections_total{state=\"reused\"} to be > 0".to_string()
         },
         || async {
-            let metrics = reqwest::get(h.admin_url("/metrics"))
+            let metrics = reqwest::get(h.telemetry_url("/metrics"))
                 .await
                 .ok()?
                 .text()

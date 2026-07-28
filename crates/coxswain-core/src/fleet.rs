@@ -20,8 +20,15 @@ use std::time::Instant;
 /// `dedicated-proxy` / `relay`).
 pub const COMPONENT_LABEL: &str = "app.kubernetes.io/component";
 
-/// Annotation key carrying the admin server port for this pod.
-pub const ADMIN_PORT_ANNOTATION: &str = "gateway.coxswain-labs.dev/admin-port";
+/// Annotation key carrying the telemetry server port for this pod.
+///
+/// The telemetry port is the *only* peer-reachable management port, and this is
+/// deliberately the only port annotation in the fleet snapshot: every cross-pod
+/// dial in the aggregator is built from a [`FleetEntry`], so omitting the
+/// operator port here makes "no pod ever dials another pod's operator port"
+/// structural rather than a convention. The operator port is authenticated and
+/// a probing pod holds only the bcrypt hash, so it could not authenticate anyway.
+pub const TELEMETRY_PORT_ANNOTATION: &str = "gateway.coxswain-labs.dev/telemetry-port";
 
 /// Label key present on dedicated-proxy pods that identifies the owning Gateway name.
 pub const GATEWAY_NAME_LABEL: &str = "gateway.networking.k8s.io/gateway-name";
@@ -65,8 +72,10 @@ pub struct FleetEntry {
     pub pod_namespace: String,
     /// Parsed `status.podIP`.
     pub pod_ip: IpAddr,
-    /// Admin server port, from the [`ADMIN_PORT_ANNOTATION`] annotation.
-    pub admin_port: u16,
+    /// Telemetry server port, from the [`TELEMETRY_PORT_ANNOTATION`] annotation.
+    ///
+    /// The only peer-dialable port on the pod — see the annotation's docs.
+    pub telemetry_port: u16,
     /// Role this pod plays in the cluster.
     pub component: Component,
     /// For [`Component::DedicatedProxy`] pods: the owning Gateway name (from
@@ -115,8 +124,9 @@ pub type SharedFleet = Shared<FleetSnapshot>;
 /// Per pod:
 /// - Pods without `status.podIP` are **silently skipped** (not yet scheduled
 ///   or running).
-/// - Pods with a missing or unparseable [`ADMIN_PORT_ANNOTATION`] emit a
-///   `tracing::warn!` and are skipped.
+/// - Pods with a missing or unparseable [`TELEMETRY_PORT_ANNOTATION`] emit a
+///   `tracing::warn!` and are skipped — an entry with no telemetry port is
+///   unprobeable, so it would render permanently `reachable: false`.
 /// - Pods with an unknown `app.kubernetes.io/component` label value are
 ///   skipped with a warning.
 /// - All other pods are inserted into the appropriate bucket.
@@ -148,21 +158,21 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
             }
         };
 
-        let admin_port: u16 = match pod
+        let telemetry_port: u16 = match pod
             .metadata
             .annotations
             .as_ref()
-            .and_then(|a| a.get(ADMIN_PORT_ANNOTATION))
+            .and_then(|a| a.get(TELEMETRY_PORT_ANNOTATION))
         {
             Some(raw) => match raw.parse() {
                 Ok(p) => p,
                 Err(e) => {
                     tracing::warn!(
                         pod = %pod_name,
-                        annotation = ADMIN_PORT_ANNOTATION,
+                        annotation = TELEMETRY_PORT_ANNOTATION,
                         value = %raw,
                         error = %e,
-                        "fleet: skipping pod with invalid admin-port annotation"
+                        "fleet: skipping pod with invalid telemetry-port annotation"
                     );
                     continue;
                 }
@@ -170,8 +180,8 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
             None => {
                 tracing::warn!(
                     pod = %pod_name,
-                    annotation = ADMIN_PORT_ANNOTATION,
-                    "fleet: skipping pod missing admin-port annotation"
+                    annotation = TELEMETRY_PORT_ANNOTATION,
+                    "fleet: skipping pod missing telemetry-port annotation"
                 );
                 continue;
             }
@@ -225,7 +235,7 @@ pub fn build_snapshot<'a>(pods: impl IntoIterator<Item = &'a Pod>) -> FleetSnaps
             pod_name,
             pod_namespace,
             pod_ip,
-            admin_port,
+            telemetry_port,
             component,
             gateway_ref,
             node,
@@ -258,7 +268,7 @@ mod tests {
         name: &str,
         component: &str,
         pod_ip: Option<&str>,
-        admin_port: Option<&str>,
+        telemetry_port: Option<&str>,
         gateway_name: Option<&str>,
     ) -> Pod {
         let mut labels = BTreeMap::new();
@@ -268,8 +278,8 @@ mod tests {
         }
 
         let mut annotations = BTreeMap::new();
-        if let Some(port) = admin_port {
-            annotations.insert(ADMIN_PORT_ANNOTATION.to_string(), port.to_string());
+        if let Some(port) = telemetry_port {
+            annotations.insert(TELEMETRY_PORT_ANNOTATION.to_string(), port.to_string());
         }
 
         Pod {
@@ -309,7 +319,7 @@ mod tests {
         let snap = build_snapshot([&pod]);
         assert_eq!(snap.controllers.len(), 1);
         assert_eq!(snap.controllers[0].pod_name, "ctrl-0");
-        assert_eq!(snap.controllers[0].admin_port, 8082);
+        assert_eq!(snap.controllers[0].telemetry_port, 8082);
         assert_eq!(
             snap.controllers[0].pod_ip,
             "10.0.0.1".parse::<IpAddr>().unwrap()
@@ -370,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_admin_port_annotation_is_skipped() {
+    fn invalid_telemetry_port_annotation_is_skipped() {
         let pod = make_pod(
             "ctrl-0",
             "controller",

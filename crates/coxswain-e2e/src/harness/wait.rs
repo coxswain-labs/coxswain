@@ -618,6 +618,127 @@ where
     .await
 }
 
+/// Wait until `name`'s Service has at least one **ready** endpoint address.
+///
+/// Needed for leader-selecting Services. `coxswain-controller-operator` selects
+/// the pod carrying the leader label, so between a controller restart and the
+/// next lease acquisition it legitimately has zero endpoints — and
+/// `kubectl port-forward` against an endpoint-less Service never binds. Waiting
+/// here is what a human does too: you cannot reach the leader before there is
+/// one.
+///
+/// # Errors
+///
+/// Returns an error if no ready endpoint appears before `timeout` elapses.
+pub async fn wait_for_service_endpoints(
+    namespace: &str,
+    name: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let client = kube::Client::try_default().await?;
+    let api: Api<k8s_openapi::api::core::v1::Endpoints> = Api::namespaced(client, namespace);
+    poll_until(
+        timeout,
+        POLL,
+        || {
+            let api = api.clone();
+            let name = name.to_string();
+            async move {
+                let ready = api.get(&name).await.ok().map(|e| {
+                    e.subsets
+                        .unwrap_or_default()
+                        .into_iter()
+                        .flat_map(|s| s.addresses.unwrap_or_default())
+                        .filter_map(|a| a.target_ref.and_then(|r| r.name))
+                        .collect::<Vec<_>>()
+                });
+                format!(
+                    "service {namespace}/{name} to have a ready endpoint; current: {}",
+                    ready.map_or_else(|| "<no Endpoints object>".to_string(), |r| format!("{r:?}"))
+                )
+            }
+        },
+        || {
+            let api = api.clone();
+            let name = name.to_string();
+            async move {
+                let e = api.get(&name).await.ok()?;
+                e.subsets?
+                    .into_iter()
+                    .any(|s| s.addresses.is_some_and(|a| !a.is_empty()))
+                    .then_some(())
+            }
+        },
+    )
+    .await
+}
+
+/// Wait until `name`'s Deployment rollout has fully completed in `namespace`.
+///
+/// Stricter than "the pods are Ready": it requires the controller to have
+/// observed the current generation AND every replica to be updated *and*
+/// available, so no pod from the previous ReplicaSet is still serving.
+///
+/// Measurement tests need this. `helm upgrade --wait` returns once pods report
+/// Ready, but a freshly-rolled proxy still has to bootstrap its SVID, connect
+/// discovery, receive a snapshot, and bind listeners before it can serve a
+/// *new* Gateway's port — several seconds that otherwise land inside whatever
+/// the test is timing and get misattributed to the thing under measurement.
+///
+/// # Errors
+///
+/// Returns an error if the rollout has not completed before `timeout` elapses.
+pub async fn wait_for_rollout_complete(
+    namespace: &str,
+    name: &str,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    let client = kube::Client::try_default().await?;
+    let api: Api<k8s_openapi::api::apps::v1::Deployment> = Api::namespaced(client, namespace);
+    poll_until(
+        timeout,
+        POLL,
+        || {
+            let api = api.clone();
+            let name = name.to_string();
+            async move {
+                let observed = api.get(&name).await.ok().map(|d| {
+                    let spec_replicas = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+                    let st = d.status.unwrap_or_default();
+                    format!(
+                        "generation={:?} observed={:?} want={spec_replicas} \
+                         updated={:?} available={:?}",
+                        d.metadata.generation,
+                        st.observed_generation,
+                        st.updated_replicas,
+                        st.available_replicas,
+                    )
+                });
+                format!(
+                    "deployment {namespace}/{name} rollout to complete; last: {}",
+                    observed.unwrap_or_else(|| "unreadable".to_string())
+                )
+            }
+        },
+        || {
+            let api = api.clone();
+            let name = name.to_string();
+            async move {
+                let d = api.get(&name).await.ok()?;
+                let generation = d.metadata.generation;
+                let want = d.spec.as_ref().and_then(|s| s.replicas).unwrap_or(1);
+                let st = d.status.as_ref()?;
+                (st.observed_generation == generation
+                    && st.updated_replicas == Some(want)
+                    && st.available_replicas == Some(want)
+                    && st.replicas == Some(want))
+                .then_some(())
+            }
+        },
+    )
+    .await
+}
+
 /// Retry WebSocket handshakes against the proxy until one succeeds or `timeout` expires.
 pub async fn wait_for_ws_route(
     proxy_addr: SocketAddr,

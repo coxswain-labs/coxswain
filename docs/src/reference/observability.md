@@ -2,7 +2,7 @@
 
 ## Metrics
 
-Coxswain exposes the Prometheus endpoint at `http://<admin-address>:<admin-port>/metrics` (default port `8082`). Series are emitted under one of three prefixes:
+Coxswain exposes the Prometheus endpoint at `http://<telemetry-address>:<telemetry-port>/metrics` (default port `8083`). It is never authenticated, and reachable from any namespace unless you opt into `networkPolicy.telemetry.fenced`. Series are emitted under one of three prefixes:
 
 - `coxswain_proxy_*` — emitted by the shared and dedicated proxies.
 - `coxswain_controller_*` — emitted by the controller.
@@ -187,10 +187,10 @@ relabelings:
 
 On the **controller** pod, `/healthz` is also a liveness backstop for the watch-relist wedge: if any reflector's watch relist starts but never completes for longer than ~2.5 min (tracked by `coxswain_controller_watch_relists_pending`), the controller trips its liveness gate and `/healthz` returns `503 not live`, so the kubelet restarts the pod and its reflectors relist from scratch. The gate arms only after a kind has completed its first relist, so a slow cold-start initial sync never trips it. The proxy pod keeps the historical always-`200` liveness semantics.
 
-Inspect the per-subsystem detail via the admin port (open `kubectl -n coxswain-system port-forward svc/coxswain-shared-proxy-internal 8082:8082` in a separate terminal first; a non-default Helm release name `<rel>` prefixes the Service as `<rel>-coxswain-shared-proxy-internal`):
+Inspect the per-subsystem detail via the telemetry port (open `kubectl -n coxswain-system port-forward svc/coxswain-shared-proxy-internal 8083:8083` in a separate terminal first; a non-default Helm release name `<rel>` prefixes the Service as `<rel>-coxswain-shared-proxy-internal`):
 
 ```bash
-curl -s http://localhost:8082/api/v1/health | jq .
+curl -s http://localhost:8083/statusz | jq .
 ```
 
 Example output:
@@ -220,18 +220,18 @@ Example output:
 
 ## Routes endpoint
 
-Proxy pods carry no query surface beyond `/metrics` and `/api/v1/health` — a
+Proxy pods carry no query surface beyond `/metrics` and `/statusz` — a
 proxy's compiled routing table is served from the **controller's** own local
 routing snapshot, not fetched from the pod:
 
 ```bash
-curl -s http://<controller-admin-address>:8082/api/v1/fleet/proxies/<pod-name>/routes | jq .
+curl -s http://<controller-operator-address>:8082/api/v1/fleet/proxies/<pod-name>/routes | jq .
 ```
 
 Returns the named pod's routing table as JSON, nested under `routes`: all
 hostname entries, their rules, and resolved upstream addresses. Useful for
 debugging routing decisions without reading raw Kubernetes objects. List pod
-names with `curl -s http://<controller-admin-address>:8082/api/v1/fleet/proxies | jq .`.
+names with `curl -s http://<controller-operator-address>:8082/api/v1/fleet/proxies | jq .`.
 
 ## Access logs
 
@@ -413,7 +413,7 @@ Use `RUST_LOG` directive syntax for per-crate control:
 
     The chart ships a `PodMonitor` template gated on `.Values.podMonitor.enabled`. Enable it with `--set podMonitor.enabled=true` (or `podMonitor.enabled: true` in your values file). One selector matches both the shared proxy pool and the operator-rendered dedicated proxies; the relabel block injects `gateway_name` / `gateway_namespace` on dedicated metrics only (see [Metric labels per Gateway](#metric-labels-per-gateway) above).
 
-    Why `PodMonitor` and not `ServiceMonitor`? Dedicated proxy Services don't expose port `8082` — adding it would leak `/metrics` onto the LoadBalancer IP. PodMonitor scrapes the pod directly (port `admin`, `:8082`) and skips that issue entirely. Shared pool pods are also discovered the same way, so one resource covers every coxswain proxy in the cluster.
+    Why `PodMonitor` and not `ServiceMonitor`? Dedicated proxy Services don't expose the telemetry port — adding it would leak `/metrics` onto the LoadBalancer IP. PodMonitor scrapes the pod directly (port `telemetry`, `:8083`) and skips that issue entirely. Shared pool pods are also discovered the same way, so one resource covers every coxswain proxy in the cluster.
 
     Hardened installs that pin `podMonitorSelector` on the `Prometheus` resource must update it to include the chart's labels (`app.kubernetes.io/name: coxswain`) — by default kube-prometheus-stack matches both `ServiceMonitor` and `PodMonitor` broadly.
 
@@ -425,11 +425,11 @@ Use `RUST_LOG` directive syntax for per-crate control:
     scrape_configs:
       - job_name: coxswain-shared
         static_configs:
-          - targets: ['coxswain-shared-proxy-internal.coxswain-system.svc:8082']
+          - targets: ['coxswain-shared-proxy-internal.coxswain-system.svc:8083']
         metrics_path: /metrics
       - job_name: coxswain-controller
         static_configs:
-          - targets: ['coxswain-controller.coxswain-system.svc:8082']
+          - targets: ['coxswain-controller.coxswain-system.svc:8083']
         metrics_path: /metrics
     ```
 

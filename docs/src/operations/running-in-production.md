@@ -100,7 +100,7 @@ kubectl -n coxswain-system get deploy coxswain-shared-proxy \
   -o jsonpath='{.spec.template.spec.containers[0].readinessProbe}'
 ```
 
-If `/readyz` returns 503 on a running pod, inspect `/api/v1/health` to see which subsystem is blocked — see [Troubleshooting](troubleshooting.md#readyz-returns-503-on-startup).
+If `/readyz` returns 503 on a running pod, inspect `/statusz` on the telemetry port to see which subsystem is blocked — see [Troubleshooting](troubleshooting.md#readyz-returns-503-on-startup).
 
 ## Graceful shutdown
 
@@ -141,7 +141,7 @@ TLS Secrets must be in the correct namespace — for `Ingress`, the same namespa
 
 ## Observability
 
-Configure a Prometheus scrape against the admin port (`8082`) — see the [Observability reference](../reference/observability.md) for the PodMonitor and scrape_config examples. Alert on `/readyz` returning non-200 for more than one scrape interval.
+Configure a Prometheus scrape against the telemetry port (`8083`) — see the [Observability reference](../reference/observability.md) for the PodMonitor and scrape_config examples. Alert on `/readyz` returning non-200 for more than one scrape interval.
 
 The controller emits Kubernetes `Warning` Events on `Ingress` objects when a route conflict is detected (`reason: RouteConflict`) or an annotation value is invalid (`reason: InvalidAnnotation`). Set up an alerting rule or regularly query these events:
 
@@ -171,61 +171,138 @@ Coxswain unconditionally strips `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Pro
 
 The same rule applies to `ext-auth`'s `allowedResponseHeaders`: every configured name is stripped from the client's request before the check runs, regardless of whether the auth service actually echoes it back. A route that allow-lists a header the auth service doesn't always return would otherwise let a client's forged value through untouched on the requests where it isn't returned.
 
-### The admin and management ports
+### The management ports
 
-Every Coxswain pod binds two management ports, both on `management.bindAddress` (`0.0.0.0` by default, so kubelet probes and Prometheus scraping work without configuration):
+Every Coxswain pod binds management ports on `management.bindAddress` (`0.0.0.0`
+by default, so kubelet probes and Prometheus scraping work without
+configuration). There are three, split by **who has to be able to reach them** —
+a distinction a port can express and a path cannot:
 
-- **Health, `8081`** — `/healthz` and `/readyz`. Carries no cluster data.
-- **Admin, `8082`** — `/metrics` on every role, plus, on the **controller**, the operator UI and the `/api/v1/*` surface: verbatim Kubernetes manifests (`/api/v1/manifests/{kind}/{ns}/{name}`, including Pod `spec.containers[].env`, which frequently holds credentials), Coxswain pod logs, and the full routing topology.
+- **Health, `8081`** — `/healthz` and `/readyz`. Probed by kubelet, whose traffic
+  is node-sourced and therefore not selectable by most CNIs, so this port cannot
+  meaningfully be fenced. It carries nothing but pass/fail.
+- **Telemetry, `8083`** — `/metrics` and `/statusz`, on every role. Read by
+  Prometheus and by the controller when it builds the fleet view. **Never
+  authenticated**: `PodMonitor` has no credential field, and a probing pod holds
+  only the bcrypt *hash* of the operator credential, so it could not present one
+  even in principle. Open to all sources by default; fenceable on request.
+- **Operator, `8082`** — the operator UI and the `/api/v1/*` surface, on the
+  **controller only**. Verbatim Kubernetes manifests
+  (`/api/v1/manifests/{kind}/{ns}/{name}`, including Pod `spec.containers[].env`,
+  which frequently holds credentials), Coxswain pod logs, and the routing
+  topology. Fenced by default, and authenticated in full when `operatorAuth` is
+  set. Proxy and relay pods do not bind it at all.
 
-The Kubernetes pod network is flat, so an unfenced admin port is readable by any pod in any namespace. That is a strong reconnaissance and credential-pivot primitive in a multi-tenant cluster, where a tenant in namespace A could otherwise read namespace B's Pod environment. Two controls address it.
+The operator port is reached through its own `Service`,
+`coxswain-controller-operator`, which selects the **elected leader**. That is not
+load-balancing avoidance: the topology view reads the node registry, and only the
+leader accepts discovery streams, so a standby's registry is empty rather than
+partial. A `Service` spanning replicas would serve an empty topology at random.
+During a leader election that `Service` briefly has no endpoints and the UI is
+unreachable — deliberately, because the honest alternative to "no answer" here is
+an empty topology indistinguishable from a healthy cluster with nothing
+connected. Health and telemetry stay reachable on the all-replica
+`coxswain-controller` `Service` throughout, so diagnosing the election itself is
+unaffected. A standby reached directly anyway answers `503` on
+`/api/v1/topology`, naming the reason.
 
-**NetworkPolicy (on by default).** Coxswain ships one `NetworkPolicy` per pod set — the controller's from the chart, and one each for the shared pool, every dedicated proxy, and every relay, applied by the controller that owns those Deployments. Each admits the admin port from two places only: pods in the policy's own namespace, and pods in the install namespace. The second is what lets the controller aggregate a dedicated proxy, which runs in its Gateway's namespace rather than alongside the controller. Everything else stays reachable from anywhere: the data plane, kubelet probes, and the mTLS-authenticated discovery ports.
+The Kubernetes pod network is flat, so an unfenced operator port is readable by
+any pod in any namespace. That is a strong reconnaissance and credential-pivot
+primitive in a multi-tenant cluster, where a tenant in namespace A could
+otherwise read namespace B's Pod environment. Two controls address it.
 
-A proxy binds ports that are not knowable when the policy is written — the shared pool allocates one internal port per Gateway listener, and a dedicated proxy binds whatever its Gateway declares. Because a `NetworkPolicy` denies every port it does not name, those policies allow the full port range *except* the admin port, rather than enumerating the data plane. Adding or removing a listener therefore never requires the policy to be rewritten and can never be blocked by a stale one.
+**NetworkPolicy (operator port: on by default).** The controller's policy comes
+from the chart. It admits the operator port from pods in the install namespace
+only, and leaves the health, telemetry, and mTLS-authenticated discovery ports
+open.
 
-To let Prometheus scrape from another namespace, name it explicitly:
+**NetworkPolicy (telemetry port: off by default).** Coxswain can also fence
+`/metrics` and `/statusz` on every pod set — the shared pool, each dedicated
+proxy, each relay — but does not do so unless you ask:
 
 ```yaml
 networkPolicy:
-  admin:
+  telemetry:
+    fenced: true
     extraIngress:
       - namespaceSelector:
           matchLabels:
             kubernetes.io/metadata.name: monitoring
 ```
 
-Set `networkPolicy.enabled: false` on clusters whose CNI does not enforce `NetworkPolicy` (where the object is inert anyway), or if you fence the surface with your own policy. Disabling removes any policy the controller previously applied; it keeps the `networkpolicies` RBAC either way, since the delete verb is exactly what reclaiming them needs.
+The trade is deliberate and worth understanding before changing it. What fencing
+protects is the **routing inventory**: the metric labels enumerate route objects
+(`httproute/<ns>/<name>:<rule>`) and backend Service names. That is
+reconnaissance material, not credentials, and anyone holding `get httproutes`
+already has it. What fencing *costs*, if you enable it without listing your
+scraper, is certain and silent: `PodMonitor` targets pod IPs directly, so a
+Prometheus outside the pod's own namespace and the install namespace is simply
+dropped — its targets sit at `context deadline exceeded` and a dashboard goes
+empty, with nothing logged anywhere. Enable it when untrusted workloads share the
+pod network, and add the scraper's namespace in the same change.
 
-**Basic auth (opt-in).** A second factor for the controller's admin port, worth enabling whenever the port is reachable beyond the install namespace. Create a Secret holding one bcrypt htpasswd line under the key `auth`:
+When the telemetry fence is on, it admits two peers automatically: pods in the
+policy's own namespace, and pods in the install namespace. The second is what
+lets the controller probe `/statusz` on a dedicated proxy, which runs in its
+Gateway's namespace rather than alongside the controller.
+
+A proxy binds ports that are not knowable when the policy is written — the shared
+pool allocates one internal port per Gateway listener, and a dedicated proxy binds
+whatever its Gateway declares. Because a `NetworkPolicy` denies every port it does
+not name, those policies allow the full port range *except* the fenced port,
+rather than enumerating the data plane. Adding or removing a listener therefore
+never requires the policy to be rewritten and can never be blocked by a stale one.
+
+Set `networkPolicy.enabled: false` on clusters whose CNI does not enforce
+`NetworkPolicy` (where the object is inert anyway), or if you fence the surface
+with your own policy. Disabling removes any policy the controller previously
+applied; it keeps the `networkpolicies` RBAC either way, since the delete verb is
+exactly what reclaiming them needs.
+
+**Basic auth (opt-in).** A second factor for the controller's operator port,
+worth enabling whenever the port is reachable beyond the install namespace.
+Create a Secret holding one bcrypt htpasswd line under the key `auth`:
 
 ```bash
 htpasswd -nbB admin 's3cret' > auth
-kubectl create secret generic coxswain-admin-auth \
+kubectl create secret generic coxswain-operator-auth \
   --namespace coxswain-system --from-file=auth
 rm auth
 ```
 
 ```yaml
-adminAuth:
-  secretName: coxswain-admin-auth
+operatorAuth:
+  secretName: coxswain-operator-auth
 ```
 
-Only the Secret's *name* reaches the controller; it reads the Secret with the RBAC it already holds and re-reads it every 30 seconds, so rotating the credential needs no restart. Only bcrypt is accepted — a plaintext or SHA-1 entry is rejected at load. If the Secret is deleted or becomes unreadable the admin surface returns `503`; it never falls back to unauthenticated, so a typo in the name cannot silently reopen it. A transient apiserver error does *not* clear the credential — the last known-good one is kept until the apiserver gives a definitive answer.
+Only the Secret's *name* reaches the controller; it reads the Secret with the RBAC
+it already holds and re-reads it every 30 seconds, so rotating the credential
+needs no restart. Only bcrypt is accepted — a plaintext or SHA-1 entry is rejected
+at load. If the Secret is deleted or becomes unreadable the operator surface
+returns `503`; it never falls back to unauthenticated, so a typo in the name
+cannot silently reopen it. A transient apiserver error does *not* clear the
+credential — the last known-good one is kept until the apiserver gives a
+definitive answer.
 
-Authentication covers everything that exposes cluster data: `/api/v1/{manifests,fleet,routing,problems,events,topology}`, `/api/v1/pods/*/logs`, and the operator UI at `/`, `/app.js`, and `/app.css`. Three endpoints stay open because gating them would break the product rather than protect it:
+**Authentication covers every path on the operator port, with no exemptions.**
+Earlier releases had to carve out three endpoints — `/metrics`, `/api/v1/health`
+as a peer-probe target, and `/api/v1/topology/local` — because callers that
+cannot authenticate had to reach them on that port. None of them lives there any
+more: the first two moved to the telemetry listener, and the third was deleted
+along with the controller-to-controller fan-out it existed to serve. The port
+boundary now carries the distinction the exemption list used to, so enabling
+Basic auth cannot break scraping or the fleet view.
 
-| Endpoint | Why it stays open |
-|---|---|
-| `/metrics` | The chart's `PodMonitor` scrapes it by pod IP and has no credential field. |
-| `/api/v1/health` | The controller probes **peer** pods here to build the fleet view; it holds only the bcrypt hash, so it cannot authenticate to itself. |
-| `/api/v1/topology/local` | The same fan-out, for the merged HA topology view. |
-
-None of the three returns manifests, environment variables, pod logs, or routing tables, and all three remain behind the `NetworkPolicy` fence. The health port is a separate listener and is never authenticated — kubelet probes keep working untouched.
-
-**Content-Security-Policy (always on, not opt-in).** The three UI responses (`/`, `/app.js`, `/app.css`) carry a strict `Content-Security-Policy` — `default-src 'none'` with narrow, genuinely-true allowances for `script-src 'self'`, `style-src 'self'`, `img-src 'self' data:`, and `connect-src 'self'` — plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`. This is defense in depth for the operator UI's one HTML-injection sink (a manifest viewer that renders syntax-highlighted, tenant-supplied JSON): even if that sink were ever compromised, the CSP blocks a same-origin fetch/script escalation and stops the browser from executing content sniffed as script. It requires no configuration and cannot be disabled.
-
-Basic auth is deliberately not offered on proxy and relay admin ports: those serve only `/metrics` and `/api/v1/health`, and those pods hold zero Kubernetes RBAC by design, so they cannot read a credential Secret. `NetworkPolicy` is the control there.
+**Content-Security-Policy (always on, not opt-in).** The three UI responses (`/`,
+`/app.js`, `/app.css`) carry a strict `Content-Security-Policy` —
+`default-src 'none'` with narrow, genuinely-true allowances for
+`script-src 'self'`, `style-src 'self'`, `img-src 'self' data:`, and
+`connect-src 'self'` — plus `X-Content-Type-Options: nosniff` and
+`Referrer-Policy: no-referrer`. This is defense in depth for the operator UI's one
+HTML-injection sink (a manifest viewer that renders syntax-highlighted,
+tenant-supplied JSON): even if that sink were ever compromised, the CSP blocks a
+same-origin fetch/script escalation and stops the browser from executing content
+sniffed as script. It requires no configuration and cannot be disabled.
 
 ### Controller egress
 

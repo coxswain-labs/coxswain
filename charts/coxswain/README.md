@@ -89,7 +89,12 @@ All values can be overridden with `--set key=value` or a custom `values.yaml`.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `health.port` | `8081` | Health endpoint port (`/healthz`, `/readyz`) |
-| `admin.port` | `8082` | Admin endpoint port (`/metrics`, `/routes`, `/status`) |
+| `telemetry.port` | `8083` | Telemetry endpoint port (`/metrics`, `/statusz`). Never authenticated |
+| `operator.port` | `8082` | Operator endpoint port (UI, `/api/v1/*`). Controller only |
+| `operatorAuth.secretName` | `""` | Secret holding one bcrypt htpasswd line; requires Basic auth on every operator-port path |
+| `networkPolicy.operator.extraIngress` | `[]` | Extra `NetworkPolicyPeer`s admitted to the operator port |
+| `networkPolicy.telemetry.fenced` | `false` | Restrict `/metrics` and `/statusz` to the pod's own namespace plus the install namespace |
+| `networkPolicy.telemetry.extraIngress` | `[]` | Extra `NetworkPolicyPeer`s admitted when the telemetry fence is on |
 | `logFormat` | `json` | Log format: `json` or `console` |
 | `logFilter` | `info,coxswain_proxy=debug` | Log verbosity (RUST_LOG syntax) |
 
@@ -105,11 +110,15 @@ When `security.rootless: true`, the container binds 8080/8443 instead of 80/443 
 
 ### Services
 
-Two Services are created:
+Services created:
 
 - **`<release>-gateway`** — exposes data-plane ports (80/443). Type is configurable
   via `service.gateway.type` (default `LoadBalancer`).
-- **`<release>-internal`** — exposes health (8081) and admin (8082) as `ClusterIP`.
+- **`<release>-internal`** — exposes health (8081) and telemetry (8083) as `ClusterIP`.
+- **`coxswain-controller`** — health and telemetry on every controller replica.
+- **`coxswain-controller-operator`** — the operator port (8082) on the **elected
+  leader** only. The topology view reads state only the leader holds, so a
+  Service spanning replicas would answer emptily at random.
 
 | Key | Default | Description |
 |-----|---------|-------------|

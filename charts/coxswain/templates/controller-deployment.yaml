@@ -20,7 +20,9 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
-        gateway.coxswain-labs.dev/admin-port: {{ .Values.admin.port | quote }}
+        # Load-bearing: the fleet snapshot skips any pod without it, so the
+        # controller would not appear in its own fleet view.
+        gateway.coxswain-labs.dev/telemetry-port: {{ .Values.telemetry.port | quote }}
         {{- with .Values.controller.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -63,8 +65,11 @@ spec:
             - name: health
               containerPort: {{ .Values.health.port }}
               protocol: TCP
-            - name: admin
-              containerPort: {{ .Values.admin.port }}
+            - name: telemetry
+              containerPort: {{ .Values.telemetry.port }}
+              protocol: TCP
+            - name: operator
+              containerPort: {{ .Values.operator.port }}
               protocol: TCP
             - name: discovery
               containerPort: {{ .Values.discovery.port }}
@@ -87,22 +92,28 @@ spec:
               value: {{ .Values.logFormat | quote }}
             - name: COXSWAIN_HEALTH_PORT
               value: {{ .Values.health.port | quote }}
-            - name: COXSWAIN_ADMIN_PORT
-              value: {{ .Values.admin.port | quote }}
+            - name: COXSWAIN_TELEMETRY_PORT
+              value: {{ .Values.telemetry.port | quote }}
+            - name: COXSWAIN_OPERATOR_PORT
+              value: {{ .Values.operator.port | quote }}
             - name: COXSWAIN_DISCOVERY_PORT
               value: {{ .Values.discovery.port | quote }}
             - name: COXSWAIN_MANAGEMENT_BIND_ADDRESS
               value: {{ .Values.management.bindAddress | quote }}
-            # Admin-port fencing. The value is a Secret NAME, never a credential:
-            # the controller reads the Secret itself so rotation needs no restart.
-            - name: COXSWAIN_ADMIN_FENCE_ENABLED
-              value: {{ .Values.networkPolicy.enabled | quote }}
-            {{- with .Values.networkPolicy.admin.extraIngress }}
-            - name: COXSWAIN_ADMIN_FENCE_EXTRA_INGRESS
+            # Telemetry-port fencing for the pods the controller provisions
+            # (shared pool, dedicated proxies, relays). Off unless both the
+            # master switch and the telemetry opt-in are set — the controller's
+            # own operator-port policy is rendered by the chart, not from here.
+            - name: COXSWAIN_TELEMETRY_FENCE_ENABLED
+              value: {{ and .Values.networkPolicy.enabled .Values.networkPolicy.telemetry.fenced | quote }}
+            {{- with .Values.networkPolicy.telemetry.extraIngress }}
+            - name: COXSWAIN_TELEMETRY_FENCE_EXTRA_INGRESS
               value: {{ toJson . | quote }}
             {{- end }}
-            {{- with .Values.adminAuth.secretName }}
-            - name: COXSWAIN_ADMIN_BASIC_AUTH_SECRET
+            # The value is a Secret NAME, never a credential: the controller
+            # reads the Secret itself so rotation needs no restart.
+            {{- with .Values.operatorAuth.secretName }}
+            - name: COXSWAIN_OPERATOR_BASIC_AUTH_SECRET
               value: {{ . | quote }}
             {{- end }}
             - name: COXSWAIN_CONTROLLER_NAME

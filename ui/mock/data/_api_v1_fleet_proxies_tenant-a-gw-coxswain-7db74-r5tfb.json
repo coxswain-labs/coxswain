@@ -1,5 +1,5 @@
 {
-  "admin_port": 8082,
+  "telemetry_port": 8083,
   "component": "dedicated-proxy",
   "pod_ip": "10.42.0.103",
   "pod_name": "tenant-a-gw-coxswain-7db74-r5tfb",

@@ -4,7 +4,7 @@
   "pod_name": "tenant-b-gw-coxswain-5cc91-zzz00",
   "pod_namespace": "tenant-b",
   "pod_ip": "10.42.0.105",
-  "admin_port": 8082,
+  "telemetry_port": 8083,
   "reachable": false,
   "node": "node-w-2",
   "restarts": 4,

@@ -1,20 +1,28 @@
 {{- if and .Values.controller.enabled .Values.networkPolicy.enabled -}}
-# Admin-port fence for the controller pod (#670).
+# Management-surface fence for the controller pod (#670).
 #
-# The controller's admin port relays verbatim Kubernetes manifests (including Pod
-# `spec.containers[].env`, frequently credentials) and coxswain pod logs, with no
-# authentication of its own. The pod network is flat, so without this policy any
-# pod in any namespace can read all of it.
+# The controller's operator port relays verbatim Kubernetes manifests (including
+# Pod `spec.containers[].env`, frequently credentials) and coxswain pod logs. The
+# pod network is flat, so without this policy any pod in any namespace can read
+# all of it. Basic auth (`operatorAuth`) is the optional second factor; this is
+# the primary control.
 #
 # Unlike the proxy and relay policies — which the controller renders itself, and
 # which must leave a dynamic, unknowable set of data-plane ports open — the
-# controller binds a fixed four ports, so this policy can enumerate them. That
+# controller binds a fixed five ports, so this policy can enumerate them. That
 # makes it strictly closed: any port added here in future without a matching rule
 # is denied rather than silently exposed.
 #
 # Left open to all sources, deliberately:
-#   health    — kubelet probes are node-sourced, not pod-sourced, and
-#               /healthz + /readyz carry no cluster data.
+#   health    — kubelet probes are node-sourced, not pod-sourced, and no CNI can
+#               reliably select them; `/healthz` + `/readyz` carry no cluster data.
+#   telemetry — `/metrics` and `/statusz`. Unauthenticatable by construction:
+#               PodMonitor has no credential knob and a probing pod holds only
+#               the credential's bcrypt hash. Fencing it by default would
+#               silently drop every scrape from a Prometheus outside this
+#               namespace, so it is opt-in via `networkPolicy.telemetry.fenced`
+#               — which is enforced on provisioned pods by the controller, and
+#               here by the conditional rule below.
 #   discovery — already mutually authenticated by SVID mTLS, and its callers are
 #               dedicated proxies and relays in arbitrary tenant namespaces,
 #               which no static selector can enumerate.
@@ -22,7 +30,7 @@
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "coxswain.controller.fullname" . }}-admin
+  name: {{ include "coxswain.controller.fullname" . }}-operator
   namespace: {{ include "coxswain.namespace" . }}
   labels:
     {{- include "coxswain.controller.selectorLabels" . | nindent 4 }}
@@ -45,17 +53,32 @@ spec:
           port: {{ .Values.discovery.port }}
         - protocol: TCP
           port: {{ .Values.discovery.bootstrapPort }}
-    # The admin surface: same-namespace pods, plus any operator-configured peers.
-    # The controller is itself in the install namespace, so `podSelector: {}`
-    # already covers its peer-replica fan-out and a co-located Prometheus. A
-    # scraper elsewhere needs an extraIngress entry. `kubectl port-forward` is
-    # unaffected either way — it is node-sourced, not subject to pod selectors.
+        {{- if not .Values.networkPolicy.telemetry.fenced }}
+        - protocol: TCP
+          port: {{ .Values.telemetry.port }}
+        {{- end }}
+    {{- if .Values.networkPolicy.telemetry.fenced }}
+    # Telemetry, fenced on request. Same-namespace pods cover the controller's
+    # own peer probes; a scraper elsewhere needs an extraIngress entry, and
+    # without one its scrapes are dropped with no error anywhere.
     - from:
         - podSelector: {}
-        {{- with .Values.networkPolicy.admin.extraIngress }}
+        {{- with .Values.networkPolicy.telemetry.extraIngress }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
       ports:
         - protocol: TCP
-          port: {{ .Values.admin.port }}
+          port: {{ .Values.telemetry.port }}
+    {{- end }}
+    # The operator surface: same-namespace pods, plus any operator-configured
+    # peers. `kubectl port-forward` is unaffected either way — it is node-sourced,
+    # not subject to pod selectors.
+    - from:
+        - podSelector: {}
+        {{- with .Values.networkPolicy.operator.extraIngress }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.operator.port }}
 {{- end }}

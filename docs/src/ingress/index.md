@@ -232,7 +232,7 @@ When two `Ingress` objects define the same `(host, path, pathType)`, exactly one
 #   new-app (created later)  → new-svc   — shadowed, never serves /foo
 ```
 
-Delete or rename the conflicting path in one of the `Ingress` objects to restore it. Conflicts are reported via `GET /api/v1/problems` (`routing.conflicts`) on the controller admin port.
+Delete or rename the conflicting path in one of the `Ingress` objects to restore it. Conflicts are reported via `GET /api/v1/problems` (`routing.conflicts`) on the controller operator port.
 
 Routes with the same `(host, path)` but **different predicate conditions** — for example, an `HTTPRoute` rule with a method or header constraint on the same host and path — are not a conflict: they coexist and each serves its matching traffic.
 

@@ -121,10 +121,10 @@ async fn reconcile_shared_pool(ctx: &ReconcileContext) {
         ingress_http_port: ctx.ingress_ports.http,
         ingress_https_port: ctx.ingress_ports.https,
         health_port: ctx.health_port,
-        admin_port: ctx.admin_port,
+        telemetry_port: ctx.telemetry_port,
         enable_ingress: ctx.enable_ingress,
         enable_gateway_api: ctx.enable_gateway_api,
-        admin_fence: &ctx.admin_fence,
+        telemetry_fence: &ctx.telemetry_fence,
     };
     let rendered = render_shared_proxy(&inputs);
     if let Err(e) =
@@ -347,8 +347,8 @@ async fn apply_shared_relay_at(
         discovery_trust_domain: &ctx.discovery_trust_domain,
         resources,
         pod_template: None,
-        admin_port: ctx.admin_port,
-        admin_fence: &ctx.admin_fence,
+        telemetry_port: ctx.telemetry_port,
+        telemetry_fence: &ctx.telemetry_fence,
         pdb_replica_ceiling: clamp_u32_to_i32(pdb_ceiling),
     });
     super::apply::apply_relay(&ctx.client, &ctx.controller_namespace, &rendered).await

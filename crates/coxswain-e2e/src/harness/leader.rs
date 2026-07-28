@@ -20,14 +20,20 @@ use kube::{Api, Client};
 use super::controller::{free_port, start_port_forward};
 use super::wait;
 
-/// The leader-election Lease name (mirrors the controller's `LEASE_NAME`).
-pub const LEASE_NAME: &str = "coxswain-leader-lock";
+/// The leader-election Lease name — the single definition, shared with the
+/// controller and the admin aggregator.
+pub use coxswain_core::leader::LEASE_NAME;
 
 /// Namespace the harness installs coxswain into.
 pub const SYSTEM_NAMESPACE: &str = "coxswain-system";
 
-/// Remote admin port on controller pods, serving `/metrics` and `/api/v1`.
-const CONTROLLER_ADMIN_PORT: u16 = 8082;
+/// Remote telemetry port, serving `/metrics` and `/statusz`. Bound by every
+/// role — unlike the operator port, which only the controller binds.
+const TELEMETRY_PORT: u16 = 8083;
+
+/// Remote operator port, serving the UI and `/api/v1/*`. Controller-only (#676):
+/// forwarding it to a proxy or relay pod would bind to nothing.
+const OPERATOR_PORT: u16 = 8082;
 
 /// Current lease holder's pod name.
 ///
@@ -224,7 +230,7 @@ pub async fn wait_for_leader_reconciled(client: &Client, timeout: Duration) -> a
                     Err(_) => "<holder pod not found>",
                 };
                 let scrape =
-                    match tokio::time::timeout(FORWARD_TICK_BUDGET, pod_admin_forward(&holder))
+                    match tokio::time::timeout(FORWARD_TICK_BUDGET, pod_telemetry_forward(&holder))
                         .await
                     {
                         Ok(Ok(pf)) => {
@@ -272,7 +278,7 @@ pub async fn wait_for_leader_reconciled(client: &Client, timeout: Duration) -> a
                 }
                 // Bounded: a tick that cannot bind costs one poll interval, not
                 // half the caller's budget. See FORWARD_TICK_BUDGET.
-                let pf = tokio::time::timeout(FORWARD_TICK_BUDGET, pod_admin_forward(&holder))
+                let pf = tokio::time::timeout(FORWARD_TICK_BUDGET, pod_telemetry_forward(&holder))
                     .await
                     .ok()?
                     .ok()?;
@@ -309,19 +315,19 @@ pub fn pod_is_ready(pod: &Pod) -> bool {
 /// Dropping kills the `kubectl port-forward` child. Hold ONE of these across a
 /// poll loop and scrape through it — establishing a fresh forward per scrape
 /// costs a kubectl subprocess plus its bind-readiness wait every tick.
-pub struct PodAdminForward {
+pub struct PodManagementForward {
     child: tokio::process::Child,
     /// Local base URL, e.g. `http://127.0.0.1:49213`.
     pub base_url: String,
 }
 
-impl Drop for PodAdminForward {
+impl Drop for PodManagementForward {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
 }
 
-impl PodAdminForward {
+impl PodManagementForward {
     /// Scrape `/metrics` through this forward and return the first sample of
     /// `metric` (bare or labelled), `None` when the series is absent — which
     /// for lazily-registered gauges reads as 0.
@@ -393,7 +399,8 @@ pub async fn relay_diagnostics(client: &Client, scope: RelayScope<'_>) -> String
     // alone waits up to 30 s for the local port to bind — spending that inside a
     // timeout renderer delays the failure message by half a minute for no gain,
     // since a forward that has not bound quickly here is not going to.
-    let forward = match tokio::time::timeout(FORWARD_TICK_BUDGET, pod_admin_forward(&pod)).await {
+    let forward = match tokio::time::timeout(FORWARD_TICK_BUDGET, pod_telemetry_forward(&pod)).await
+    {
         Ok(Ok(f)) => f,
         Ok(Err(e)) => return format!("relay state unknown (port-forward to {pod} failed: {e})"),
         Err(_) => {
@@ -461,54 +468,81 @@ impl<'a> RelayScope<'a> {
     }
 }
 
-/// Open a port-forward to a control-plane `pod`'s admin port (serving
-/// `/metrics`) in the install namespace.
+/// Open a port-forward to a `pod`'s telemetry port (serving `/metrics` and
+/// `/statusz`) in the install namespace.
 ///
 /// # Errors
 ///
 /// Fails when no free local port is available or the forward cannot bind
 /// within the helper's internal deadline.
 #[must_use = "dropping the forward closes the tunnel"]
-pub async fn pod_admin_forward(pod: &str) -> anyhow::Result<PodAdminForward> {
-    pod_admin_forward_in(pod, SYSTEM_NAMESPACE).await
+pub async fn pod_telemetry_forward(pod: &str) -> anyhow::Result<PodManagementForward> {
+    pod_telemetry_forward_in(pod, SYSTEM_NAMESPACE).await
 }
 
-/// Open a port-forward to `pod`'s admin port in `namespace`.
+/// Open a port-forward to a controller `pod`'s operator port (the UI and
+/// `/api/v1/*`) in the install namespace.
 ///
-/// Every role binds admin on the same port, so only the namespace varies — a
-/// dedicated proxy or a namespace relay lives in its tenant namespace rather
-/// than the install namespace [`pod_admin_forward`] assumes.
+/// Controller-only: proxy and relay pods bind no operator port (#676), so
+/// pointing this at one would forward to a closed port. Use it to address a
+/// *specific* replica — the leader-selecting operator Service deliberately
+/// cannot reach a standby, which is exactly what a standby-behaviour test needs.
 ///
 /// # Errors
 ///
 /// Fails when no free local port is available or the forward cannot bind
 /// within the helper's internal deadline.
 #[must_use = "dropping the forward closes the tunnel"]
-pub async fn pod_admin_forward_in(pod: &str, namespace: &str) -> anyhow::Result<PodAdminForward> {
+pub async fn pod_operator_forward(pod: &str) -> anyhow::Result<PodManagementForward> {
     let local = free_port()?;
     let child = start_port_forward(
         &format!("pod/{pod}"),
         local,
-        CONTROLLER_ADMIN_PORT,
-        namespace,
+        OPERATOR_PORT,
+        SYSTEM_NAMESPACE,
     )
     .await
-    .with_context(|| format!("port-forward to pod/{pod} in '{namespace}'"))?;
+    .with_context(|| format!("port-forward to pod/{pod} operator port"))?;
+    Ok(PodManagementForward {
+        child,
+        base_url: format!("http://127.0.0.1:{local}"),
+    })
+}
+
+/// Open a port-forward to `pod`'s telemetry port in `namespace`.
+///
+/// Every role binds telemetry on the same port, so only the namespace varies — a
+/// dedicated proxy or a namespace relay lives in its tenant namespace rather
+/// than the install namespace [`pod_telemetry_forward`] assumes.
+///
+/// # Errors
+///
+/// Fails when no free local port is available or the forward cannot bind
+/// within the helper's internal deadline.
+#[must_use = "dropping the forward closes the tunnel"]
+pub async fn pod_telemetry_forward_in(
+    pod: &str,
+    namespace: &str,
+) -> anyhow::Result<PodManagementForward> {
+    let local = free_port()?;
+    let child = start_port_forward(&format!("pod/{pod}"), local, TELEMETRY_PORT, namespace)
+        .await
+        .with_context(|| format!("port-forward to pod/{pod} in '{namespace}'"))?;
     let addr = SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), local);
-    Ok(PodAdminForward {
+    Ok(PodManagementForward {
         child,
         base_url: format!("http://{addr}"),
     })
 }
 
 /// One-shot convenience: forward to `pod`, scrape one `metric`, tear down.
-/// For repeated scrapes (poll loops) hold a [`PodAdminForward`] instead.
+/// For repeated scrapes (poll loops) hold a [`PodManagementForward`] instead.
 ///
 /// # Errors
 ///
 /// Fails when the forward cannot be established or the scrape HTTP call fails.
 #[must_use = "the scraped value is the assertion input"]
 pub async fn pod_metric_value(pod: &str, metric: &str) -> anyhow::Result<Option<f64>> {
-    let pf = pod_admin_forward(pod).await?;
+    let pf = pod_telemetry_forward(pod).await?;
     pf.metric_value(metric).await
 }

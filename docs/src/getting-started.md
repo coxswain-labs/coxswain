@@ -208,10 +208,10 @@ Reach the backend by the address of whichever entry point you configured in Step
 
 ## Step 6 — Open the operator console
 
-The controller exposes a built-in web UI on its admin port. Forward it locally:
+The controller exposes a built-in web UI on its operator port. Forward it locally — this Service targets the elected leader, so the topology view is served by the replica that actually holds the discovery streams:
 
 ```bash
-kubectl -n coxswain-system port-forward svc/coxswain-controller 8082:8082
+kubectl -n coxswain-system port-forward svc/coxswain-controller-operator 8082:8082
 ```
 
 Then open `http://localhost:8082` in your browser. The console shows cluster health, the live routing table across Gateways and Ingresses, per-pod fleet status, and recent events.
