@@ -1,0 +1,29 @@
+# Route namespace for the auth-jwt cross-namespace rejection test (#688).
+#
+# The Ingress's auth-jwt annotation names a JwtAuth CR in ${TENANTNS} — a
+# namespace other than the Ingress's own (${TESTNS}). This must fail closed
+# (503) even for a request carrying a token that would validate against that
+# CR's issuer/JWKS, proving the rejection is the namespace guard, not a
+# missing-CR fallback.
+#
+# Host: authjwtxns.TESTNS.local / -> echo-a:3000 (never reached — fails closed).
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-jwt-xns-ingress
+  annotations:
+    ingress.coxswain-labs.dev/auth-jwt: "${TENANTNS}/jwtauth-xns"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: authjwtxns.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

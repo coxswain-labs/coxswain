@@ -1,0 +1,49 @@
+# Route namespace for the auth-tls-secret cross-namespace rejection test (#688).
+#
+# The Ingress's auth-tls-secret annotation names the labeled CA Secret
+# (auth_tls_ca_secret.yaml) in ${TENANTNS} — a namespace other than the
+# Ingress's own (${TESTNS}). This must fail closed: every TLS handshake to
+# this host is aborted, even one presenting a client certificate signed by
+# that exact CA — proving the rejection is the namespace guard, not a
+# missing-Secret fallback.
+#
+# Placeholders:
+#   SECRET_NAME  — name of the kubernetes.io/tls Secret for the TLS listener
+#   TLS_CRT_B64  — base64-encoded PEM server certificate
+#   TLS_KEY_B64  — base64-encoded PEM server private key
+#
+# Host: mtlsxns.TESTNS.local / -> echo-a:3000 (never reached — fails closed).
+# Apply auth_tls_ca_secret.yaml (in ${TENANTNS}) before this fixture.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ${SECRET_NAME}
+type: kubernetes.io/tls
+data:
+  tls.crt: ${TLS_CRT_B64}
+  tls.key: ${TLS_KEY_B64}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-tls-xns-ingress
+  annotations:
+    ingress.coxswain-labs.dev/auth-tls-secret: "${TENANTNS}/auth-tls-ca"
+spec:
+  ingressClassName: coxswain
+  tls:
+    - hosts:
+        - mtlsxns.${TESTNS}.local
+      secretName: ${SECRET_NAME}
+  rules:
+    - host: mtlsxns.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

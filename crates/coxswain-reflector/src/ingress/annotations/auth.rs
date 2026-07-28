@@ -55,6 +55,53 @@ pub(crate) struct SecretRef {
     pub name: String,
 }
 
+/// Outcome of parsing and namespace-validating a `namespace/name` annotation
+/// reference (#688).
+///
+/// Distinguishes "annotation not set" from "set but unusable" so callers can
+/// fail closed on the latter instead of silently treating it identically to
+/// absent — the bug this type fixes. A malformed value and a cross-namespace
+/// value collapse to the same [`Self::Invalid`] outcome: an Ingress may only
+/// reference resources in its own namespace (mirroring
+/// [`super::super::reconcile_helpers::resolve_mirror_filter`]'s existing
+/// cross-namespace rejection), so a reference to another namespace is exactly
+/// as unusable as one that doesn't parse.
+#[derive(Default)]
+pub(crate) enum ParsedRef {
+    /// Annotation key not present on the Ingress — feature not requested.
+    #[default]
+    Absent,
+    /// Annotation present but unusable: not `namespace/name` shaped, or its
+    /// namespace differs from the Ingress's own. Every caller maps this to
+    /// the same fail posture it already uses for a missing referenced
+    /// resource (fail-closed for the auth annotations, fail-open for the
+    /// config-only ones).
+    Invalid,
+    /// A well-formed, same-namespace reference.
+    Present(SecretRef),
+}
+
+impl ParsedRef {
+    /// Parse `raw` (the annotation's raw string value, if set) and validate
+    /// its namespace against `ingress_ns`.
+    #[must_use]
+    pub(super) fn parse(raw: Option<&str>, ingress_ns: &str) -> Self {
+        let Some(raw) = raw else {
+            return Self::Absent;
+        };
+        match parse_secret_ref(raw) {
+            Some(r) if r.namespace == ingress_ns => Self::Present(r),
+            _ => Self::Invalid,
+        }
+    }
+
+    /// Whether this resolved to a well-formed, same-namespace reference.
+    #[must_use]
+    pub(crate) fn is_present(&self) -> bool {
+        matches!(self, Self::Present(_))
+    }
+}
+
 // ── Parse helpers ────────────────────────────────────────────────────────────
 
 /// Parse a `namespace/name` reference.  Returns `None` when the value does not
@@ -172,6 +219,39 @@ mod auth_tests {
     #[test]
     fn auth_basic_secret_const_referenced() {
         let _ = AUTH_BASIC_SECRET;
+    }
+
+    // ── ParsedRef::parse (#688) ───────────────────────────────────────────────
+
+    #[test]
+    fn parsed_ref_absent_when_annotation_unset() {
+        assert!(matches!(
+            ParsedRef::parse(None, "default"),
+            ParsedRef::Absent
+        ));
+    }
+
+    #[test]
+    fn parsed_ref_invalid_when_malformed() {
+        assert!(matches!(
+            ParsedRef::parse(Some("no-slash"), "default"),
+            ParsedRef::Invalid
+        ));
+    }
+
+    #[test]
+    fn parsed_ref_invalid_when_cross_namespace() {
+        assert!(matches!(
+            ParsedRef::parse(Some("other-ns/my-secret"), "default"),
+            ParsedRef::Invalid
+        ));
+    }
+
+    #[test]
+    fn parsed_ref_present_when_same_namespace() {
+        let r = ParsedRef::parse(Some("default/my-secret"), "default");
+        assert!(r.is_present());
+        assert!(matches!(r, ParsedRef::Present(ref s) if s.name == "my-secret"));
     }
 
     // ── parse_secret_ref ──────────────────────────────────────────────────────

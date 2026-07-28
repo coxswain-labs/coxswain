@@ -19,12 +19,20 @@
 //!
 //! ## Structured diagnostics
 //!
-//! Parse helpers return `None` on invalid input so the annotation is treated as
-//! absent — the whole Ingress keeps its routes; only that annotation's effect is
-//! suppressed.  Callers that have the annotation-key context push an
-//! [`AnnotationIssue`] into the collector returned by `IngressAnnotations::parse`.
-//! The controller consumer converts those into `tracing::warn!` log lines and
-//! `Warning` Kubernetes Events; the proxy discards them silently.
+//! Parse helpers return `None` (or, for the `namespace/name` CR/Secret
+//! references, `auth::ParsedRef::Invalid` / `client_cert::ClientCertOutcome::Invalid`)
+//! on invalid input, so the whole Ingress keeps its routes regardless — only
+//! that one annotation's effect is affected. For most annotations "affected"
+//! means suppressed (the feature is skipped). The four fail-closed auth
+//! annotations — `auth-basic-secret`, `ext-auth`, `auth-jwt`, `auth-tls-secret`
+//! — instead install a blocking `Unavailable` check on `Invalid` (malformed
+//! *or* cross-namespace, #688): every request to the route fails with 503, or
+//! every TLS handshake is aborted, exactly as if the referenced resource were
+//! missing. See each field's own doc comment below for its actual posture.
+//! Callers that have the annotation-key context push an [`AnnotationIssue`]
+//! into the collector returned by `IngressAnnotations::parse`. The controller
+//! consumer converts those into `tracing::warn!` log lines and `Warning`
+//! Kubernetes Events; the proxy discards them silently.
 
 pub(crate) mod auth;
 pub(crate) mod client_cert;
@@ -106,14 +114,16 @@ pub(super) struct IngressAnnotations {
     /// HTTPRoute/GW API only).
     pub timeouts: RouteTimeouts,
     /// `RetryPolicy` CR reference from `retry` (#551), in intermediate
-    /// (pre-resolved) `namespace/name` form. `None` when the annotation is
-    /// absent or malformed (WARN emitted). The reconciler resolves this into
-    /// the same
-    /// [`RetryPolicyConfig`][coxswain_core::routing::RetryPolicyConfig] the
-    /// HTTPRoute `ExtensionRef` filter produces (Gateway API parity, #551).
-    /// A missing CR fails **open** (no retries) — unlike the auth
-    /// annotations, a broken reference degrades gracefully.
-    pub retry: Option<auth::SecretRef>,
+    /// (pre-resolved) `namespace/name` form. [`auth::ParsedRef::Absent`] when
+    /// the annotation is absent; [`auth::ParsedRef::Invalid`] when it is
+    /// malformed or names a namespace other than the Ingress's own (#688,
+    /// WARN emitted). The reconciler resolves a present reference into the
+    /// same [`RetryPolicyConfig`][coxswain_core::routing::RetryPolicyConfig]
+    /// the HTTPRoute `ExtensionRef` filter produces (Gateway API parity,
+    /// #551). A missing CR (or an invalid reference) fails **open** (no
+    /// retries) — unlike the auth annotations, a broken reference degrades
+    /// gracefully.
+    pub retry: auth::ParsedRef,
     /// Path rewrite from `rewrite-target` — emitted as a `FilterAction::UrlRewrite`.
     /// Holds the literal [`PathModifier::ReplaceFullPath`]; on a regex path the
     /// reconciler rebuilds it as [`PathModifier::RegexReplace`] against that path's
@@ -141,62 +151,71 @@ pub(super) struct IngressAnnotations {
     /// `None` (the default, or an unparseable value) imposes no limit.
     pub max_body_size: Option<u64>,
     /// `IpAccessControl` CR reference from `ip-access-control` (#553), in
-    /// intermediate (pre-resolved) `namespace/name` form. `None` when the
-    /// annotation is absent or malformed (WARN emitted). The reconciler
-    /// resolves this into the same `(allow_source_range, deny_source_range)`
-    /// CIDR sets the HTTPRoute/GRPCRoute `ExtensionRef` filter produces
-    /// (Gateway API parity, #553). A missing CR fails **open** (no IP
-    /// filtering) — matching the `ExtensionRef` path's fail-open behaviour.
-    pub ip_access_control: Option<auth::SecretRef>,
-    /// `RateLimit` CR reference from `rate-limit` (#552), in intermediate
-    /// (pre-resolved) `namespace/name` form. `None` when the annotation is
-    /// absent or malformed (WARN emitted). The reconciler resolves this into
-    /// the same
-    /// [`RateLimitConfig`][coxswain_core::routing::RateLimitConfig] the
+    /// intermediate (pre-resolved) `namespace/name` form. [`auth::ParsedRef::Invalid`]
+    /// when the annotation is present but malformed or cross-namespace (#688,
+    /// WARN emitted). The reconciler resolves a present reference into the
+    /// same `(allow_source_range, deny_source_range)` CIDR sets the
     /// HTTPRoute/GRPCRoute `ExtensionRef` filter produces (Gateway API
-    /// parity, #552). A missing CR fails **open** (no rate limiting) —
-    /// unlike the auth annotations, a broken reference degrades gracefully.
-    pub rate_limit: Option<auth::SecretRef>,
+    /// parity, #553). A missing CR (or an invalid reference) fails **open**
+    /// (no IP filtering) — matching the `ExtensionRef` path's fail-open
+    /// behaviour.
+    pub ip_access_control: auth::ParsedRef,
+    /// `RateLimit` CR reference from `rate-limit` (#552), in intermediate
+    /// (pre-resolved) `namespace/name` form. [`auth::ParsedRef::Invalid`]
+    /// when the annotation is present but malformed or cross-namespace (#688,
+    /// WARN emitted). The reconciler resolves a present reference into the
+    /// same [`RateLimitConfig`][coxswain_core::routing::RateLimitConfig] the
+    /// HTTPRoute/GRPCRoute `ExtensionRef` filter produces (Gateway API
+    /// parity, #552). A missing CR (or an invalid reference) fails **open**
+    /// (no rate limiting) — unlike the auth annotations, a broken reference
+    /// degrades gracefully.
+    pub rate_limit: auth::ParsedRef,
     /// `Secret` reference from `auth-basic-secret` (#24), in intermediate
-    /// (pre-resolved) `namespace/name` form. `None` when the annotation is
-    /// absent or malformed (WARN emitted). The reconciler resolves this into
+    /// (pre-resolved) `namespace/name` form. [`auth::ParsedRef::Invalid`]
+    /// when the annotation is malformed or cross-namespace (#688, WARN
+    /// emitted) — fails **closed**, matching a missing referenced Secret,
+    /// since a typo'd reference must not silently disable the check. The
+    /// reconciler resolves a present reference into
     /// [`IngressAuthConfig::Basic`][coxswain_core::routing::IngressAuthConfig::Basic]
     /// by looking up the labeled htpasswd Secret. Independent of (additive
     /// with) [`Self::auth_ext`] / [`Self::auth_jwt`] — every configured check
     /// must pass.
-    pub auth_basic: Option<auth::SecretRef>,
+    pub auth_basic: auth::ParsedRef,
     /// `CoxswainExternalAuth` CR reference from `ext-auth` (#549), in
-    /// intermediate (pre-resolved) `namespace/name` form. `None` when the
-    /// annotation is absent or malformed (WARN emitted). Independent of
-    /// (additive with) [`Self::auth_basic`] / [`Self::auth_jwt`] — the
-    /// reconciler resolves this into the same
+    /// intermediate (pre-resolved) `namespace/name` form.
+    /// [`auth::ParsedRef::Invalid`] when the annotation is malformed or
+    /// cross-namespace (#688, WARN emitted) — fails **closed**. Independent
+    /// of (additive with) [`Self::auth_basic`] / [`Self::auth_jwt`] — the
+    /// reconciler resolves a present reference into the same
     /// [`IngressAuthConfig::External`][coxswain_core::routing::IngressAuthConfig::External]
     /// the HTTPRoute `ExtensionRef` filter produces, and every configured
     /// check must pass.
-    pub auth_ext: Option<auth::SecretRef>,
+    pub auth_ext: auth::ParsedRef,
     /// `JwtAuth` CR reference from `auth-jwt` (#441), in intermediate
-    /// (pre-resolved) `namespace/name` form. `None` when the annotation is
-    /// absent or malformed (WARN emitted). Independent of (additive with)
-    /// [`Self::auth_basic`] / [`Self::auth_ext`] — the reconciler resolves
-    /// this into the same
+    /// (pre-resolved) `namespace/name` form. [`auth::ParsedRef::Invalid`]
+    /// when the annotation is malformed or cross-namespace (#688, WARN
+    /// emitted) — fails **closed**. Independent of (additive with)
+    /// [`Self::auth_basic`] / [`Self::auth_ext`] — the reconciler resolves a
+    /// present reference into the same
     /// [`IngressAuthConfig::Jwt`][coxswain_core::routing::IngressAuthConfig::Jwt]
     /// the HTTPRoute `ExtensionRef` filter produces, and every configured
     /// check must pass.
-    pub auth_jwt: Option<auth::SecretRef>,
+    pub auth_jwt: auth::ParsedRef,
     /// Fire-and-forget mirror backend ref from `mirror-target` (#283), in
     /// intermediate (pre-resolved) form.  `None` when the annotation is absent or
     /// unparseable (WARN emitted; mirror disabled).  The reconciler resolves this
     /// into a `FilterAction::Mirror` by looking up the Service endpoints.
     pub mirror_target: Option<traffic_policy::MirrorTargetRef>,
     /// `Compression` CR reference from `compression` (#550), in intermediate
-    /// (pre-resolved) `namespace/name` form. `None` when the annotation is
-    /// absent or malformed (WARN emitted). The reconciler resolves this into
-    /// the same
-    /// [`CompressionConfig`][coxswain_core::routing::CompressionConfig] the
-    /// HTTPRoute `ExtensionRef` filter produces (Gateway API parity, #550).
-    /// A missing CR fails **open** (no compression) — unlike the auth
-    /// annotations, a broken reference degrades gracefully.
-    pub compression: Option<auth::SecretRef>,
+    /// (pre-resolved) `namespace/name` form. [`auth::ParsedRef::Invalid`]
+    /// when the annotation is present but malformed or cross-namespace (#688,
+    /// WARN emitted). The reconciler resolves a present reference into the
+    /// same [`CompressionConfig`][coxswain_core::routing::CompressionConfig]
+    /// the HTTPRoute `ExtensionRef` filter produces (Gateway API parity,
+    /// #550). A missing CR (or an invalid reference) fails **open** (no
+    /// compression) — unlike the auth annotations, a broken reference
+    /// degrades gracefully.
+    pub compression: auth::ParsedRef,
     /// Trusted-proxy forwarded-IP config from the `trust-forwarded-for` family (#271).
     /// `None` when `trust-forwarded-for` is absent or `"false"`.
     pub forwarded_for: Option<ForwardedForConfig>,
@@ -217,10 +236,30 @@ impl IngressAnnotations {
     /// `tracing::warn!` and `Warning` Kubernetes Events); the proxy discards them.
     ///
     /// The Ingress is never rejected — invalid values produce an issue and use the
-    /// absent / default behaviour.
+    /// absent / default behaviour, **except** the four fail-closed auth
+    /// annotations (`auth-basic-secret`, `ext-auth`, `auth-jwt`, and
+    /// `auth-tls-secret` on the separate `client_cert` path), whose `Invalid`
+    /// outcome installs a blocking `Unavailable` check instead — see each
+    /// field's own doc comment.
+    ///
+    /// `own_annotations` is the Ingress's own, *unmerged*
+    /// `metadata.annotations` map — always the same map whether or not a
+    /// class default applies. `class_annotations_ns`, when `Some`, is the
+    /// namespace of the `CoxswainIngressClassParameters` CR that contributed
+    /// this class's defaults. Together they let the seven namespace-locked
+    /// CR/Secret reference annotations (#688) distinguish an admin-authored
+    /// class default (resolved against `class_annotations_ns`, since neither
+    /// the `IngressClass` nor its parameters CR is tenant-writable) from a
+    /// tenant-authored value directly on the Ingress (always resolved against
+    /// `ns`, regardless of what the class default would have said) — a key
+    /// present in `own_annotations` is always tenant-authored, full stop,
+    /// even if it happens to equal the class default's value.
     pub(super) fn parse(
         annotations: Option<&BTreeMap<String, String>>,
+        own_annotations: Option<&BTreeMap<String, String>>,
+        class_annotations_ns: Option<&str>,
         route_id: &str,
+        ns: &str,
     ) -> (Self, Vec<AnnotationIssue>) {
         let Some(ann) = annotations else {
             return (Self::default(), Vec::new());
@@ -236,6 +275,18 @@ impl IngressAnnotations {
                 })
             };
         }
+
+        // The namespace a `namespace/name` CR/Secret reference annotation
+        // must match (#688): the Ingress's own namespace when `key` is set
+        // directly on the Ingress, or the class-parameters CR's namespace
+        // when `key` is present only via the class-default merge.
+        let locked_ns = |key: &str| -> &str {
+            if own_annotations.is_some_and(|o| o.contains_key(key)) {
+                ns
+            } else {
+                class_annotations_ns.unwrap_or(ns)
+            }
+        };
 
         // ── Timeouts ──────────────────────────────────────────────────────────
         // `connect` converged onto `CoxswainBackendPolicy.timeouts.connect` (#554);
@@ -258,16 +309,17 @@ impl IngressAnnotations {
         });
 
         // ── Retry CR reference (#551) ──────────────────────────────────────────
-        let retry = get(ann, traffic_policy::RETRY).and_then(|v| {
-            let r = auth::parse_secret_ref(v);
-            if r.is_none() {
-                issue!(
-                    traffic_policy::RETRY,
-                    "invalid retry — expected \"namespace/name\"; retries disabled"
-                );
-            }
-            r
-        });
+        let retry = auth::ParsedRef::parse(
+            get(ann, traffic_policy::RETRY),
+            locked_ns(traffic_policy::RETRY),
+        );
+        if matches!(retry, auth::ParsedRef::Invalid) {
+            issue!(
+                traffic_policy::RETRY,
+                "invalid retry — expected \"namespace/name\" within this Ingress's own \
+                 namespace; retries disabled"
+            );
+        }
 
         // ── Path rewrite ──────────────────────────────────────────────────────
         let rewrite =
@@ -404,67 +456,67 @@ impl IngressAnnotations {
         });
 
         // ── IpAccessControl CR reference (#553) ───────────────────────────────
-        let ip_access_control = get(ann, IP_ACCESS_CONTROL).and_then(|v| {
-            let r = auth::parse_secret_ref(v);
-            if r.is_none() {
-                issue!(
-                    IP_ACCESS_CONTROL,
-                    "invalid ip-access-control — expected \"namespace/name\"; IP filtering disabled"
-                );
-            }
-            r
-        });
+        let ip_access_control =
+            auth::ParsedRef::parse(get(ann, IP_ACCESS_CONTROL), locked_ns(IP_ACCESS_CONTROL));
+        if matches!(ip_access_control, auth::ParsedRef::Invalid) {
+            issue!(
+                IP_ACCESS_CONTROL,
+                "invalid ip-access-control — expected \"namespace/name\" within this \
+                 Ingress's own namespace; IP filtering disabled"
+            );
+        }
 
         // Session affinity converged onto `CoxswainBackendPolicy.sessionPersistence`
         // (#554); resolved per backend Service by the reconciler, not parsed here.
 
         // ── RateLimit CR reference (#552) ─────────────────────────────────────
-        let rate_limit = get(ann, traffic_policy::RATE_LIMIT).and_then(|v| {
-            let r = auth::parse_secret_ref(v);
-            if r.is_none() {
-                issue!(
-                    traffic_policy::RATE_LIMIT,
-                    "invalid rate-limit — expected \"namespace/name\"; rate limiting disabled"
-                );
-            }
-            r
-        });
+        let rate_limit = auth::ParsedRef::parse(
+            get(ann, traffic_policy::RATE_LIMIT),
+            locked_ns(traffic_policy::RATE_LIMIT),
+        );
+        if matches!(rate_limit, auth::ParsedRef::Invalid) {
+            issue!(
+                traffic_policy::RATE_LIMIT,
+                "invalid rate-limit — expected \"namespace/name\" within this Ingress's \
+                 own namespace; rate limiting disabled"
+            );
+        }
 
         // ── Basic auth Secret reference (#24) ─────────────────────────────────
-        let auth_basic = get(ann, AUTH_BASIC_SECRET).and_then(|v| {
-            let r = auth::parse_secret_ref(v);
-            if r.is_none() {
-                issue!(
-                    AUTH_BASIC_SECRET,
-                    "invalid auth-basic-secret — expected \"namespace/name\" format; auth disabled"
-                );
-            }
-            r
-        });
+        // A malformed or cross-namespace value fails **closed** — see
+        // `resolve_basic_auth_config`, which maps `ParsedRef::Invalid` to
+        // `IngressAuthConfig::Unavailable` exactly like a missing Secret (#688).
+        let auth_basic =
+            auth::ParsedRef::parse(get(ann, AUTH_BASIC_SECRET), locked_ns(AUTH_BASIC_SECRET));
+        if matches!(auth_basic, auth::ParsedRef::Invalid) {
+            issue!(
+                AUTH_BASIC_SECRET,
+                "invalid auth-basic-secret — expected \"namespace/name\" within this \
+                 Ingress's own namespace; failing closed (503)"
+            );
+        }
 
         // ── External auth CR reference (#549) ─────────────────────────────────
-        let auth_ext = get(ann, auth::EXT_AUTH).and_then(|v| {
-            let r = auth::parse_secret_ref(v);
-            if r.is_none() {
-                issue!(
-                    auth::EXT_AUTH,
-                    "invalid ext-auth — expected \"namespace/name\"; external auth disabled"
-                );
-            }
-            r
-        });
+        // Fails closed on `Invalid`, matching `resolve_ext_auth_config` (#688).
+        let auth_ext = auth::ParsedRef::parse(get(ann, auth::EXT_AUTH), locked_ns(auth::EXT_AUTH));
+        if matches!(auth_ext, auth::ParsedRef::Invalid) {
+            issue!(
+                auth::EXT_AUTH,
+                "invalid ext-auth — expected \"namespace/name\" within this Ingress's \
+                 own namespace; failing closed (503)"
+            );
+        }
 
         // ── JWT auth CR reference (#441) ──────────────────────────────────────
-        let auth_jwt = get(ann, auth::AUTH_JWT).and_then(|v| {
-            let r = auth::parse_secret_ref(v);
-            if r.is_none() {
-                issue!(
-                    auth::AUTH_JWT,
-                    "invalid auth-jwt — expected \"namespace/name\"; JWT auth disabled"
-                );
-            }
-            r
-        });
+        // Fails closed on `Invalid`, matching `resolve_jwt_auth_config` (#688).
+        let auth_jwt = auth::ParsedRef::parse(get(ann, auth::AUTH_JWT), locked_ns(auth::AUTH_JWT));
+        if matches!(auth_jwt, auth::ParsedRef::Invalid) {
+            issue!(
+                auth::AUTH_JWT,
+                "invalid auth-jwt — expected \"namespace/name\" within this Ingress's \
+                 own namespace; failing closed (503)"
+            );
+        }
 
         // ── Mirror target (#283) ──────────────────────────────────────────────
         let mirror_target = get(ann, MIRROR_TARGET).and_then(|v| {
@@ -480,16 +532,17 @@ impl IngressAnnotations {
         // Service by the reconciler, not parsed here.
 
         // ── Compression CR reference (#550) ───────────────────────────────────
-        let compression = get(ann, traffic_policy::COMPRESSION).and_then(|v| {
-            let r = auth::parse_secret_ref(v);
-            if r.is_none() {
-                issue!(
-                    traffic_policy::COMPRESSION,
-                    "invalid compression — expected \"namespace/name\"; compression disabled"
-                );
-            }
-            r
-        });
+        let compression = auth::ParsedRef::parse(
+            get(ann, traffic_policy::COMPRESSION),
+            locked_ns(traffic_policy::COMPRESSION),
+        );
+        if matches!(compression, auth::ParsedRef::Invalid) {
+            issue!(
+                traffic_policy::COMPRESSION,
+                "invalid compression — expected \"namespace/name\" within this Ingress's \
+                 own namespace; compression disabled"
+            );
+        }
 
         // ── Trusted-proxy forwarded-IP headers (#271) ─────────────────────────
         let forwarded_for = edge_access::parse_forwarded_for(ann, route_id, &mut diag);
@@ -701,16 +754,16 @@ mod tests {
 
     #[test]
     fn parse_returns_defaults_when_no_annotations() {
-        let (a, _) = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, None, None, "default/test", "default");
         assert!(a.timeouts.connect.is_none());
-        assert!(a.retry.is_none());
+        assert!(matches!(a.retry, auth::ParsedRef::Absent));
         assert!(a.rewrite.is_none());
     }
 
     #[test]
     fn parse_timeout_annotations() {
         let m = ann(&[(READ_TIMEOUT, "30s"), (SEND_TIMEOUT, "10s")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         // `connect` has no annotation source — it converged onto
         // `CoxswainBackendPolicy.timeouts.connect` (#554).
         assert!(a.timeouts.connect.is_none());
@@ -724,85 +777,158 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_invalid_timeout_warns_and_uses_default() {
         let m = ann(&[(READ_TIMEOUT, "not-a-duration")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert!(a.timeouts.read.is_none());
         assert!(logs_contain("invalid duration — using default"));
     }
 
     #[test]
     fn parse_retry_valid_ref() {
-        let m = ann(&[(traffic_policy::RETRY, "retry-ns/my-retry")]);
-        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
-        let r = a.retry.expect("retry must parse");
-        assert_eq!(r.namespace, "retry-ns");
-        assert_eq!(r.name, "my-retry");
+        let m = ann(&[(traffic_policy::RETRY, "default/my-retry")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.retry, auth::ParsedRef::Present(ref r) if r.name == "my-retry"));
         assert!(diag.is_empty());
     }
 
     #[test]
     fn parse_retry_absent_is_none() {
-        let (a, diag) = IngressAnnotations::parse(None, "default/test");
-        assert!(a.retry.is_none());
+        let (a, diag) = IngressAnnotations::parse(None, None, None, "default/test", "default");
+        assert!(matches!(a.retry, auth::ParsedRef::Absent));
         assert!(diag.is_empty());
     }
 
     #[test]
     fn parse_retry_malformed_warns_and_disables() {
         let m = ann(&[(traffic_policy::RETRY, "no-slash-here")]);
-        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert!(a.retry.is_none());
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.retry, auth::ParsedRef::Invalid));
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, traffic_policy::RETRY);
+    }
+
+    /// Cross-namespace refs are rejected identically to a malformed value (#688).
+    #[test]
+    fn parse_retry_cross_namespace_disables() {
+        let m = ann(&[(traffic_policy::RETRY, "other-ns/my-retry")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.retry, auth::ParsedRef::Invalid));
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, traffic_policy::RETRY);
+    }
+
+    /// #688 class-default carve-out: a `retry` value sourced *only* from the
+    /// class default (absent from the Ingress's own annotation map) resolves
+    /// against the class-parameters CR's own namespace, not the Ingress's —
+    /// the CR is admin-authored, so this is not the tenant-crossing-namespaces
+    /// bypass the lock closes.
+    #[test]
+    fn parse_retry_class_default_resolves_against_class_namespace() {
+        let merged = ann(&[(traffic_policy::RETRY, "class-ns/shared-retry")]);
+        let own = ann(&[]); // key absent from the Ingress's own annotations
+        let (a, diag) = IngressAnnotations::parse(
+            Some(&merged),
+            Some(&own),
+            Some("class-ns"),
+            "default/test",
+            "default",
+        );
+        assert!(matches!(a.retry, auth::ParsedRef::Present(ref r) if r.name == "shared-retry"));
+        assert!(diag.is_empty());
+    }
+
+    /// #688 class-default carve-out safety boundary: a tenant who sets `retry`
+    /// directly on their own Ingress — even to a value matching the class
+    /// parameters CR's namespace — is still locked to the Ingress's own
+    /// namespace. Presence in the Ingress's own annotation map always means
+    /// tenant-authored, regardless of what the class default would resolve.
+    #[test]
+    fn parse_retry_own_annotation_ignores_class_namespace_even_when_matching() {
+        let m = ann(&[(traffic_policy::RETRY, "class-ns/shared-retry")]);
+        let (a, diag) = IngressAnnotations::parse(
+            Some(&m),
+            Some(&m), // present in the Ingress's own map — tenant-authored
+            Some("class-ns"),
+            "default/test",
+            "default", // Ingress's own namespace differs from "class-ns"
+        );
+        assert!(matches!(a.retry, auth::ParsedRef::Invalid));
         assert_eq!(diag.len(), 1);
         assert_eq!(diag[0].annotation, traffic_policy::RETRY);
     }
 
     #[test]
     fn parse_rate_limit_valid_ref() {
-        let m = ann(&[(traffic_policy::RATE_LIMIT, "rl-ns/my-limit")]);
-        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
-        let r = a.rate_limit.expect("rate_limit must parse");
-        assert_eq!(r.namespace, "rl-ns");
-        assert_eq!(r.name, "my-limit");
+        let m = ann(&[(traffic_policy::RATE_LIMIT, "default/my-limit")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.rate_limit, auth::ParsedRef::Present(ref r) if r.name == "my-limit"));
         assert!(diag.is_empty());
     }
 
     #[test]
     fn parse_rate_limit_absent_is_none() {
-        let (a, diag) = IngressAnnotations::parse(None, "default/test");
-        assert!(a.rate_limit.is_none());
+        let (a, diag) = IngressAnnotations::parse(None, None, None, "default/test", "default");
+        assert!(matches!(a.rate_limit, auth::ParsedRef::Absent));
         assert!(diag.is_empty());
     }
 
     #[test]
     fn parse_rate_limit_malformed_warns_and_disables() {
         let m = ann(&[(traffic_policy::RATE_LIMIT, "no-slash-here")]);
-        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert!(a.rate_limit.is_none());
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.rate_limit, auth::ParsedRef::Invalid));
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, traffic_policy::RATE_LIMIT);
+    }
+
+    #[test]
+    fn parse_rate_limit_cross_namespace_disables() {
+        let m = ann(&[(traffic_policy::RATE_LIMIT, "other-ns/my-limit")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.rate_limit, auth::ParsedRef::Invalid));
         assert_eq!(diag.len(), 1);
         assert_eq!(diag[0].annotation, traffic_policy::RATE_LIMIT);
     }
 
     #[test]
     fn parse_ip_access_control_valid_ref() {
-        let m = ann(&[(IP_ACCESS_CONTROL, "iac-ns/my-policy")]);
-        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
-        let r = a.ip_access_control.expect("ip_access_control must parse");
-        assert_eq!(r.namespace, "iac-ns");
-        assert_eq!(r.name, "my-policy");
+        let m = ann(&[(IP_ACCESS_CONTROL, "default/my-policy")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(
+            matches!(a.ip_access_control, auth::ParsedRef::Present(ref r) if r.name == "my-policy")
+        );
         assert!(diag.is_empty());
     }
 
     #[test]
     fn parse_ip_access_control_absent_is_none() {
-        let (a, diag) = IngressAnnotations::parse(None, "default/test");
-        assert!(a.ip_access_control.is_none());
+        let (a, diag) = IngressAnnotations::parse(None, None, None, "default/test", "default");
+        assert!(matches!(a.ip_access_control, auth::ParsedRef::Absent));
         assert!(diag.is_empty());
     }
 
     #[test]
     fn parse_ip_access_control_malformed_warns_and_disables() {
         let m = ann(&[(IP_ACCESS_CONTROL, "no-slash-here")]);
-        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert!(a.ip_access_control.is_none());
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.ip_access_control, auth::ParsedRef::Invalid));
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, IP_ACCESS_CONTROL);
+    }
+
+    #[test]
+    fn parse_ip_access_control_cross_namespace_disables() {
+        let m = ann(&[(IP_ACCESS_CONTROL, "other-ns/my-policy")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.ip_access_control, auth::ParsedRef::Invalid));
         assert_eq!(diag.len(), 1);
         assert_eq!(diag[0].annotation, IP_ACCESS_CONTROL);
     }
@@ -810,20 +936,20 @@ mod tests {
     #[test]
     fn parse_use_regex_true() {
         let m = ann(&[(USE_REGEX, "true")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert!(a.use_regex);
     }
 
     #[test]
     fn parse_use_regex_false() {
         let m = ann(&[(USE_REGEX, "false")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert!(!a.use_regex);
     }
 
     #[test]
     fn parse_use_regex_absent_defaults_false() {
-        let (a, _) = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, None, None, "default/test", "default");
         assert!(!a.use_regex);
     }
 
@@ -831,7 +957,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_use_regex_invalid_warns_and_defaults_false() {
         let m = ann(&[(USE_REGEX, "1")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert!(!a.use_regex);
         assert!(logs_contain("treating use-regex as false"));
     }
@@ -839,7 +965,7 @@ mod tests {
     #[test]
     fn parse_rewrite_target() {
         let m = ann(&[(REWRITE_TARGET, "/api")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         match a.rewrite {
             Some(PathModifier::ReplaceFullPath(s)) => assert_eq!(s, "/api"),
             _ => panic!("expected ReplaceFullPath"),
@@ -853,7 +979,7 @@ mod tests {
             (REQUEST_HEADER_ADD, "X-Add: add-value"),
             (REQUEST_HEADER_REMOVE, "X-Remove"),
         ]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         let hm = a
             .request_headers
             .as_ref()
@@ -871,7 +997,7 @@ mod tests {
             (RESPONSE_HEADER_ADD, "X-Resp-Add: v2"),
             (RESPONSE_HEADER_REMOVE, "X-Resp-Remove"),
         ]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         let hm = a
             .response_headers
             .as_ref()
@@ -883,7 +1009,7 @@ mod tests {
 
     #[test]
     fn parse_request_header_absent_when_no_keys() {
-        let (a, _) = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, None, None, "default/test", "default");
         assert!(a.request_headers.is_none());
         assert!(a.response_headers.is_none());
     }
@@ -892,7 +1018,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_request_header_invalid_name_warns_and_drops_modifier() {
         let m = ann(&[(REQUEST_HEADER_SET, "X-Bad\x01Name: value")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert!(a.request_headers.is_none());
         assert!(logs_contain("invalid header annotation"));
     }
@@ -903,7 +1029,7 @@ mod tests {
             REQUEST_HEADER_SET,
             "Cache-Control: no-cache, no-store\nX-Foo: bar",
         )]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         let hm = a
             .request_headers
             .as_ref()
@@ -914,13 +1040,13 @@ mod tests {
     #[test]
     fn parse_redirect_any_key_activates_action() {
         let m = ann(&[(REDIRECT_SCHEME, "https")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert!(a.redirect.is_some());
     }
 
     #[test]
     fn parse_redirect_no_keys_is_none() {
-        let (a, _) = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, None, None, "default/test", "default");
         assert!(a.redirect.is_none());
     }
 
@@ -933,7 +1059,7 @@ mod tests {
             (REDIRECT_PATH, "/new-path"),
             (REDIRECT_STATUS_CODE, "301"),
         ]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         match a.redirect {
             Some(FilterAction::RequestRedirect {
                 scheme,
@@ -955,7 +1081,7 @@ mod tests {
     #[test]
     fn parse_redirect_absent_fields_default_to_none() {
         let m = ann(&[(REDIRECT_STATUS_CODE, "307")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         match a.redirect {
             Some(FilterAction::RequestRedirect {
                 scheme,
@@ -977,7 +1103,7 @@ mod tests {
     #[test]
     fn parse_redirect_missing_status_code_defaults_to_302() {
         let m = ann(&[(REDIRECT_HOSTNAME, "example.com")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         match a.redirect {
             Some(FilterAction::RequestRedirect { status_code, .. }) => {
                 assert_eq!(status_code, 302);
@@ -990,7 +1116,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_redirect_invalid_scheme_warns_and_uses_none() {
         let m = ann(&[(REDIRECT_SCHEME, "ftp")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         match a.redirect {
             Some(FilterAction::RequestRedirect { scheme, .. }) => {
                 assert!(scheme.is_none());
@@ -1004,7 +1130,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_redirect_invalid_port_warns_and_uses_none() {
         let m = ann(&[(REDIRECT_PORT, "99999")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         match a.redirect {
             Some(FilterAction::RequestRedirect { port, .. }) => {
                 assert!(port.is_none());
@@ -1018,7 +1144,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_redirect_invalid_status_code_warns_and_defaults_302() {
         let m = ann(&[(REDIRECT_STATUS_CODE, "200")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         match a.redirect {
             Some(FilterAction::RequestRedirect { status_code, .. }) => {
                 assert_eq!(status_code, 302);
@@ -1031,20 +1157,20 @@ mod tests {
     #[test]
     fn parse_ssl_redirect_true() {
         let m = ann(&[(SSL_REDIRECT, "true")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert!(a.ssl_redirect);
     }
 
     #[test]
     fn parse_ssl_redirect_false() {
         let m = ann(&[(SSL_REDIRECT, "false")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert!(!a.ssl_redirect);
     }
 
     #[test]
     fn parse_ssl_redirect_absent_defaults_false() {
-        let (a, _) = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, None, None, "default/test", "default");
         assert!(!a.ssl_redirect);
     }
 
@@ -1052,7 +1178,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_ssl_redirect_invalid_warns_and_defaults_false() {
         let m = ann(&[(SSL_REDIRECT, "yes")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert!(!a.ssl_redirect);
         assert!(logs_contain("treating ssl-redirect as false"));
     }
@@ -1060,13 +1186,13 @@ mod tests {
     #[test]
     fn parse_ssl_redirect_code_valid() {
         let m = ann(&[(SSL_REDIRECT_CODE, "301")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert_eq!(a.ssl_redirect_code, Some(301));
     }
 
     #[test]
     fn parse_ssl_redirect_code_absent_is_none() {
-        let (a, _) = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, None, None, "default/test", "default");
         assert!(a.ssl_redirect_code.is_none());
     }
 
@@ -1074,7 +1200,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_ssl_redirect_code_invalid_warns_and_is_none() {
         let m = ann(&[(SSL_REDIRECT_CODE, "500")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert!(a.ssl_redirect_code.is_none());
         assert!(logs_contain("invalid ssl-redirect-code"));
     }
@@ -1082,13 +1208,13 @@ mod tests {
     #[test]
     fn parse_max_body_size_valid() {
         let m = ann(&[(MAX_BODY_SIZE, "8m")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert_eq!(a.max_body_size, Some(8 * 1024 * 1024));
     }
 
     #[test]
     fn parse_max_body_size_absent_is_none() {
-        let (a, _) = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, None, None, "default/test", "default");
         assert!(a.max_body_size.is_none());
     }
 
@@ -1096,7 +1222,7 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_max_body_size_invalid_warns_and_fails_open() {
         let m = ann(&[(MAX_BODY_SIZE, "garbage")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert!(a.max_body_size.is_none());
         assert!(logs_contain("invalid max-body-size"));
     }
@@ -1136,14 +1262,14 @@ mod tests {
 
     #[test]
     fn parse_annotation_path_normalize_absent_is_none() {
-        let (a, _) = IngressAnnotations::parse(None, "default/test");
+        let (a, _) = IngressAnnotations::parse(None, None, None, "default/test", "default");
         assert!(a.path_normalize.is_none());
     }
 
     #[test]
     fn parse_annotation_path_normalize_base() {
         let m = ann(&[(PATH_NORMALIZE, "base")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert_eq!(a.path_normalize, Some(NormalizeLevel::Base));
     }
 
@@ -1153,7 +1279,7 @@ mod tests {
         // #483: `none` is dropped — it warns and resolves to the secure `base`
         // floor, never disabling normalization.
         let m = ann(&[(PATH_NORMALIZE, "none")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert_eq!(a.path_normalize, Some(NormalizeLevel::Base));
         assert!(logs_contain("no longer supported"));
     }
@@ -1161,14 +1287,14 @@ mod tests {
     #[test]
     fn parse_annotation_path_normalize_merge_slashes() {
         let m = ann(&[(PATH_NORMALIZE, "merge-slashes")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert_eq!(a.path_normalize, Some(NormalizeLevel::MergeSlashes));
     }
 
     #[test]
     fn parse_annotation_path_normalize_decode_and_merge() {
         let m = ann(&[(PATH_NORMALIZE, "decode-and-merge-slashes")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         assert_eq!(
             a.path_normalize,
             Some(NormalizeLevel::DecodeAndMergeSlashes)
@@ -1179,36 +1305,122 @@ mod tests {
     #[tracing_test::traced_test]
     fn parse_annotation_path_normalize_unknown_warns_and_falls_back_to_base() {
         let m = ann(&[(PATH_NORMALIZE, "aggressive")]);
-        let (a, _) = IngressAnnotations::parse(Some(&m), "default/test");
+        let (a, _) = IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
         // Unknown value → explicit Base (not absent)
         assert_eq!(a.path_normalize, Some(NormalizeLevel::Base));
         assert!(logs_contain("unknown path-normalize value"));
+    }
+
+    // ── auth-basic-secret (#24) ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_auth_basic_valid_ref() {
+        let m = ann(&[(AUTH_BASIC_SECRET, "default/my-htpasswd")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.auth_basic, auth::ParsedRef::Present(ref r) if r.name == "my-htpasswd"));
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn parse_auth_basic_absent_is_none() {
+        let (a, diag) = IngressAnnotations::parse(None, None, None, "default/test", "default");
+        assert!(matches!(a.auth_basic, auth::ParsedRef::Absent));
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn parse_auth_basic_malformed_fails_closed() {
+        let m = ann(&[(AUTH_BASIC_SECRET, "no-slash-here")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.auth_basic, auth::ParsedRef::Invalid));
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, AUTH_BASIC_SECRET);
+    }
+
+    #[test]
+    fn parse_auth_basic_cross_namespace_fails_closed() {
+        let m = ann(&[(AUTH_BASIC_SECRET, "other-ns/my-htpasswd")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.auth_basic, auth::ParsedRef::Invalid));
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, AUTH_BASIC_SECRET);
+    }
+
+    // ── ext-auth (#549) ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_ext_auth_valid_ref() {
+        let m = ann(&[(auth::EXT_AUTH, "default/my-extauth")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.auth_ext, auth::ParsedRef::Present(ref r) if r.name == "my-extauth"));
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn parse_ext_auth_absent_is_none() {
+        let (a, diag) = IngressAnnotations::parse(None, None, None, "default/test", "default");
+        assert!(matches!(a.auth_ext, auth::ParsedRef::Absent));
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn parse_ext_auth_malformed_fails_closed() {
+        let m = ann(&[(auth::EXT_AUTH, "no-slash-here")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.auth_ext, auth::ParsedRef::Invalid));
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, auth::EXT_AUTH);
+    }
+
+    #[test]
+    fn parse_ext_auth_cross_namespace_fails_closed() {
+        let m = ann(&[(auth::EXT_AUTH, "other-ns/my-extauth")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.auth_ext, auth::ParsedRef::Invalid));
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, auth::EXT_AUTH);
     }
 
     // ── auth-jwt (#441) ──────────────────────────────────────────────────────
 
     #[test]
     fn parse_auth_jwt_valid_ref() {
-        let m = ann(&[(auth::AUTH_JWT, "auth-ns/my-jwt")]);
-        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
-        let r = a.auth_jwt.expect("auth_jwt must parse");
-        assert_eq!(r.namespace, "auth-ns");
-        assert_eq!(r.name, "my-jwt");
+        let m = ann(&[(auth::AUTH_JWT, "default/my-jwt")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.auth_jwt, auth::ParsedRef::Present(ref r) if r.name == "my-jwt"));
         assert!(diag.is_empty());
     }
 
     #[test]
     fn parse_auth_jwt_absent_is_none() {
-        let (a, diag) = IngressAnnotations::parse(None, "default/test");
-        assert!(a.auth_jwt.is_none());
+        let (a, diag) = IngressAnnotations::parse(None, None, None, "default/test", "default");
+        assert!(matches!(a.auth_jwt, auth::ParsedRef::Absent));
         assert!(diag.is_empty());
     }
 
     #[test]
     fn parse_auth_jwt_malformed_warns_and_disables() {
         let m = ann(&[(auth::AUTH_JWT, "no-slash-here")]);
-        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert!(a.auth_jwt.is_none());
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.auth_jwt, auth::ParsedRef::Invalid));
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, auth::AUTH_JWT);
+    }
+
+    #[test]
+    fn parse_auth_jwt_cross_namespace_fails_closed() {
+        let m = ann(&[(auth::AUTH_JWT, "other-ns/my-jwt")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.auth_jwt, auth::ParsedRef::Invalid));
         assert_eq!(diag.len(), 1);
         assert_eq!(diag[0].annotation, auth::AUTH_JWT);
     }
@@ -1217,26 +1429,38 @@ mod tests {
 
     #[test]
     fn parse_compression_valid_ref() {
-        let m = ann(&[(traffic_policy::COMPRESSION, "compress-ns/my-compression")]);
-        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
-        let r = a.compression.expect("compression must parse");
-        assert_eq!(r.namespace, "compress-ns");
-        assert_eq!(r.name, "my-compression");
+        let m = ann(&[(traffic_policy::COMPRESSION, "default/my-compression")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(
+            matches!(a.compression, auth::ParsedRef::Present(ref r) if r.name == "my-compression")
+        );
         assert!(diag.is_empty());
     }
 
     #[test]
     fn parse_compression_absent_is_none() {
-        let (a, diag) = IngressAnnotations::parse(None, "default/test");
-        assert!(a.compression.is_none());
+        let (a, diag) = IngressAnnotations::parse(None, None, None, "default/test", "default");
+        assert!(matches!(a.compression, auth::ParsedRef::Absent));
         assert!(diag.is_empty());
     }
 
     #[test]
     fn parse_compression_malformed_warns_and_disables() {
         let m = ann(&[(traffic_policy::COMPRESSION, "no-slash-here")]);
-        let (a, diag) = IngressAnnotations::parse(Some(&m), "default/test");
-        assert!(a.compression.is_none());
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.compression, auth::ParsedRef::Invalid));
+        assert_eq!(diag.len(), 1);
+        assert_eq!(diag[0].annotation, traffic_policy::COMPRESSION);
+    }
+
+    #[test]
+    fn parse_compression_cross_namespace_disables() {
+        let m = ann(&[(traffic_policy::COMPRESSION, "other-ns/my-compression")]);
+        let (a, diag) =
+            IngressAnnotations::parse(Some(&m), Some(&m), None, "default/test", "default");
+        assert!(matches!(a.compression, auth::ParsedRef::Invalid));
         assert_eq!(diag.len(), 1);
         assert_eq!(diag[0].annotation, traffic_policy::COMPRESSION);
     }

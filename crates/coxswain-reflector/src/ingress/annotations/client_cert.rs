@@ -44,32 +44,70 @@ pub(crate) struct ClientCertAnnotation {
     pub pass_to_upstream: bool,
 }
 
+// ── Parse outcome (#688) ──────────────────────────────────────────────────────
+
+/// Outcome of parsing the `auth-tls-*` annotation cluster.
+///
+/// Mirrors [`super::auth::ParsedRef`]: distinguishes "annotation not set"
+/// from "set but unusable" so the caller can fail closed (abort every TLS
+/// handshake to the affected host) on a malformed or cross-namespace
+/// `auth-tls-secret` value instead of silently treating it as mTLS-disabled.
+pub(crate) enum ClientCertOutcome {
+    /// `auth-tls-secret` not set — mTLS not requested for this Ingress.
+    Absent,
+    /// `auth-tls-secret` present but unusable: not `namespace/name` shaped,
+    /// or its namespace differs from the Ingress's own (#688).
+    Invalid,
+    /// A well-formed, same-namespace `auth-tls-secret` reference.
+    Present(ClientCertAnnotation),
+}
+
 // ── Parse helper ─────────────────────────────────────────────────────────────
 
-/// Parse the `auth-tls-*` annotation cluster into a [`ClientCertAnnotation`].
+/// Parse the `auth-tls-*` annotation cluster into a [`ClientCertOutcome`].
 ///
-/// Returns `None` when `auth-tls-secret` is absent (mTLS disabled for the
-/// route).  Invalid values for the optional knobs emit a `WARN` and fall back
+/// [`ClientCertOutcome::Absent`] when `auth-tls-secret` is absent (mTLS
+/// disabled for the route). [`ClientCertOutcome::Invalid`] when it is
+/// malformed or names a namespace other than `ingress_ns` — the caller
+/// fails closed (aborts every handshake to the affected host) rather than
+/// silently skipping mTLS, matching every other Ingress auth annotation
+/// (#688). Invalid values for the optional knobs emit a `WARN` and fall back
 /// to safe defaults; the whole block is still produced so long as the Secret
 /// reference is valid.
 #[must_use]
 pub(crate) fn parse_client_cert(
     annotations: &std::collections::BTreeMap<String, String>,
     route_id: &str,
-) -> Option<ClientCertAnnotation> {
+    ingress_ns: &str,
+) -> ClientCertOutcome {
     use super::get;
 
-    let ref_str = get(annotations, AUTH_TLS_SECRET)?;
+    let Some(ref_str) = get(annotations, AUTH_TLS_SECRET) else {
+        return ClientCertOutcome::Absent;
+    };
     let secret = match parse_secret_ref(ref_str) {
-        Some(r) => r,
+        Some(r) if r.namespace == ingress_ns => r,
+        Some(r) => {
+            tracing::warn!(
+                ingress = %route_id,
+                annotation = AUTH_TLS_SECRET,
+                secret_ns = %r.namespace,
+                ingress_ns = %ingress_ns,
+                "auth-tls-secret namespace differs from the Ingress's own — \
+                 cross-namespace references are not permitted; failing closed \
+                 (TLS handshakes to this host will be aborted)"
+            );
+            return ClientCertOutcome::Invalid;
+        }
         None => {
             tracing::warn!(
                 ingress = %route_id,
                 annotation = AUTH_TLS_SECRET,
                 value = ref_str,
-                "invalid auth-tls-secret — expected \"namespace/name\" format; mTLS disabled"
+                "invalid auth-tls-secret — expected \"namespace/name\" format; \
+                 failing closed (TLS handshakes to this host will be aborted)"
             );
-            return None;
+            return ClientCertOutcome::Invalid;
         }
     };
 
@@ -103,7 +141,7 @@ pub(crate) fn parse_client_cert(
         })
         .unwrap_or(false);
 
-    Some(ClientCertAnnotation {
+    ClientCertOutcome::Present(ClientCertAnnotation {
         secret,
         verify_depth,
         pass_to_upstream,
@@ -141,15 +179,29 @@ mod client_cert_tests {
 
     // ── parse_client_cert ─────────────────────────────────────────────────────
 
+    /// Unwrap a [`ClientCertOutcome::Present`], panicking with a descriptive
+    /// message otherwise — the assertion-failure equivalent of `Option::expect`
+    /// for a type that carries no `Debug` impl in non-test code.
+    fn expect_present(outcome: ClientCertOutcome) -> ClientCertAnnotation {
+        match outcome {
+            ClientCertOutcome::Present(ann) => ann,
+            ClientCertOutcome::Absent => panic!("expected Present, got Absent"),
+            ClientCertOutcome::Invalid => panic!("expected Present, got Invalid"),
+        }
+    }
+
     #[test]
     fn parse_client_cert_absent_is_none() {
-        assert!(parse_client_cert(&ann(&[]), "ns/test").is_none());
+        assert!(matches!(
+            parse_client_cert(&ann(&[]), "default/test", "default"),
+            ClientCertOutcome::Absent
+        ));
     }
 
     #[test]
     fn parse_client_cert_valid_ref_defaults() {
         let m = ann(&[(AUTH_TLS_SECRET, "default/my-ca")]);
-        let cc = parse_client_cert(&m, "ns/test").expect("Some");
+        let cc = expect_present(parse_client_cert(&m, "default/test", "default"));
         assert_eq!(cc.secret.namespace, "default");
         assert_eq!(cc.secret.name, "my-ca");
         assert_eq!(cc.verify_depth, 1);
@@ -162,7 +214,7 @@ mod client_cert_tests {
             (AUTH_TLS_SECRET, "default/my-ca"),
             (AUTH_TLS_VERIFY_DEPTH, "3"),
         ]);
-        let cc = parse_client_cert(&m, "ns/test").expect("Some");
+        let cc = expect_present(parse_client_cert(&m, "default/test", "default"));
         assert_eq!(cc.verify_depth, 3);
     }
 
@@ -173,7 +225,7 @@ mod client_cert_tests {
             (AUTH_TLS_SECRET, "default/my-ca"),
             (AUTH_TLS_VERIFY_DEPTH, "bad"),
         ]);
-        let cc = parse_client_cert(&m, "ns/test").expect("Some");
+        let cc = expect_present(parse_client_cert(&m, "default/test", "default"));
         assert_eq!(cc.verify_depth, 1);
         assert!(logs_contain("invalid auth-tls-verify-depth"));
     }
@@ -185,7 +237,7 @@ mod client_cert_tests {
             (AUTH_TLS_SECRET, "default/my-ca"),
             (AUTH_TLS_VERIFY_DEPTH, "0"),
         ]);
-        let cc = parse_client_cert(&m, "ns/test").expect("Some");
+        let cc = expect_present(parse_client_cert(&m, "default/test", "default"));
         assert_eq!(cc.verify_depth, 1);
         assert!(logs_contain("invalid auth-tls-verify-depth"));
     }
@@ -196,7 +248,7 @@ mod client_cert_tests {
             (AUTH_TLS_SECRET, "default/my-ca"),
             (AUTH_TLS_PASS_CERT_TO_UPSTREAM, "true"),
         ]);
-        let cc = parse_client_cert(&m, "ns/test").expect("Some");
+        let cc = expect_present(parse_client_cert(&m, "default/test", "default"));
         assert!(cc.pass_to_upstream);
     }
 
@@ -206,7 +258,7 @@ mod client_cert_tests {
             (AUTH_TLS_SECRET, "default/my-ca"),
             (AUTH_TLS_PASS_CERT_TO_UPSTREAM, "false"),
         ]);
-        let cc = parse_client_cert(&m, "ns/test").expect("Some");
+        let cc = expect_present(parse_client_cert(&m, "default/test", "default"));
         assert!(!cc.pass_to_upstream);
     }
 
@@ -217,7 +269,7 @@ mod client_cert_tests {
             (AUTH_TLS_SECRET, "default/my-ca"),
             (AUTH_TLS_PASS_CERT_TO_UPSTREAM, "yes"),
         ]);
-        let cc = parse_client_cert(&m, "ns/test").expect("Some");
+        let cc = expect_present(parse_client_cert(&m, "default/test", "default"));
         assert!(!cc.pass_to_upstream);
         assert!(logs_contain(
             "invalid auth-tls-pass-certificate-to-upstream"
@@ -226,9 +278,25 @@ mod client_cert_tests {
 
     #[test]
     #[tracing_test::traced_test]
-    fn parse_client_cert_invalid_secret_ref_warns_and_is_none() {
+    fn parse_client_cert_invalid_secret_ref_warns_and_fails_closed() {
         let m = ann(&[(AUTH_TLS_SECRET, "no-slash-here")]);
-        assert!(parse_client_cert(&m, "ns/test").is_none());
+        assert!(matches!(
+            parse_client_cert(&m, "default/test", "default"),
+            ClientCertOutcome::Invalid
+        ));
         assert!(logs_contain("invalid auth-tls-secret"));
+    }
+
+    /// #688: a cross-namespace `auth-tls-secret` fails closed exactly like a
+    /// malformed value.
+    #[test]
+    #[tracing_test::traced_test]
+    fn parse_client_cert_cross_namespace_warns_and_fails_closed() {
+        let m = ann(&[(AUTH_TLS_SECRET, "other-ns/my-ca")]);
+        assert!(matches!(
+            parse_client_cert(&m, "default/test", "default"),
+            ClientCertOutcome::Invalid
+        ));
+        assert!(logs_contain("cross-namespace references are not permitted"));
     }
 }

@@ -1,0 +1,24 @@
+# Tenant namespace for the auth-jwt cross-namespace rejection test (#688).
+#
+# Applied to a SEPARATE namespace from the Ingress under test. This JwtAuth CR
+# is otherwise identical to annotation_auth_jwt.yaml's and would admit a valid
+# token — the point of the test is that the Ingress's auth-jwt annotation must
+# not be able to reach it at all: Ingress annotation references are locked to
+# the Ingress's own namespace (#688).
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: JwtAuth
+metadata:
+  name: jwtauth-xns
+spec:
+  issuer: https://issuer.e2e.coxswain-labs.dev
+  jwks:
+    inline:
+      jwks:
+        keys:
+          - kty: EC
+            crv: P-256
+            kid: e2e-test-key
+            alg: ES256
+            x: ScOuAzhxBbDIGzXwHlAcn0nHt8tE9OvqRHm3RIGQjk8
+            "y": JiMe4KXWaBgWIBD1TTkwQdJNbLkO5AEiRQSdv8dbQyg

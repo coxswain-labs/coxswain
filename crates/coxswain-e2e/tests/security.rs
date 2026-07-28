@@ -934,6 +934,41 @@ async fn ext_authz_unechoed_response_header_stripped_from_client() -> anyhow::Re
     Ok(())
 }
 
+/// `ext-auth` naming a `CoxswainExternalAuth` CR in another namespace is
+/// rejected — fails closed (503) — even though the CR in `${tenant}` would
+/// resolve to an allow on its own (#688). Ingress annotation references are
+/// locked to the Ingress's own namespace; only the CR's *own* `backendRef`
+/// (a separate hop, gated by a `ReferenceGrant`) may still cross namespaces.
+#[tokio::test]
+async fn ingress_ext_auth_cross_namespace_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ext-auth-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "ext-auth-xns-tenant").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&tenant.name)).await?;
+    // Wait for echo-a to be ready BEFORE applying the route fixture: otherwise
+    // the very first 503 the poll below observes could be an empty-backend-group
+    // 503 (no ready endpoints yet), not the namespace-guard's Unavailable 503 —
+    // indistinguishable to `wait_for_route_status`, and a false pass against the
+    // regression this test exists to catch.
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_EXT_AUTH_XNS_TENANT,
+        FixtureVars::new(&tenant.name),
+    )
+    .await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_EXT_AUTH_XNS_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let host = format!("extauthxns.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &host, "/", 503, Duration::from_secs(90)).await?;
+    Ok(())
+}
+
 // ── Basic auth (htpasswd) ─────────────────────────────────────────────────────
 
 /// `auth-basic-secret` with a bcrypt entry: a request carrying the correct
@@ -1068,6 +1103,44 @@ async fn request_rejected_when_basic_auth_secret_unlabeled() -> anyhow::Result<(
     anyhow::ensure!(
         status == 503,
         "expected 503 (fail-closed: unlabeled secret), got {status}"
+    );
+    Ok(())
+}
+
+/// `auth-basic-secret` naming a Secret in another namespace is rejected — fails
+/// closed (503) — even for valid `alice:secret` credentials against that exact
+/// Secret (#688). Ingress annotation references are locked to the Ingress's
+/// own namespace; there is no `ReferenceGrant` model for this annotation.
+#[tokio::test]
+async fn ingress_basic_auth_cross_namespace_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "auth-basic-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "auth-basic-xns-tenant").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    // Wait for echo-a first — see the identical comment in
+    // ingress_ext_auth_cross_namespace_rejected.
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(ingress::AUTH_BASIC_SECRET, FixtureVars::new(&tenant.name)).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_BASIC_XNS_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let host = format!("authbasicxns.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &host, "/", 503, Duration::from_secs(90)).await?;
+
+    // Confirm even valid credentials (alice:secret) return 503 — the proxy never
+    // reaches the tenant Secret because the reference is rejected before lookup.
+    let status = h
+        .http
+        .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+        .await?
+        .0;
+    anyhow::ensure!(
+        status == 503,
+        "expected 503 (fail-closed: cross-namespace reference), got {status}"
     );
     Ok(())
 }
@@ -1421,6 +1494,49 @@ async fn ingress_jwt_auth_invalid_token_rejected() -> anyhow::Result<()> {
             "expected 401 for a {label} token, got {status}"
         );
     }
+    Ok(())
+}
+
+/// `auth-jwt` naming a `JwtAuth` CR in another namespace is rejected — fails
+/// closed (503) — even for a token that would validate against that exact
+/// CR's issuer/JWKS (#688). Ingress annotation references are locked to the
+/// Ingress's own namespace.
+#[tokio::test]
+async fn ingress_jwt_auth_cross_namespace_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "ing-jwtauth-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "ing-jwtauth-xns-tenant").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    // Wait for echo-a first — see the identical comment in
+    // ingress_ext_auth_cross_namespace_rejected.
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_JWT_XNS_TENANT,
+        FixtureVars::new(&tenant.name),
+    )
+    .await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_JWT_XNS_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let host = format!("authjwtxns.{}.local", ns.name);
+    wait::wait_for_route_status(&h.http, &host, "/", 503, Duration::from_secs(90)).await?;
+
+    // Confirm even a token that would validate against the tenant CR's
+    // issuer/JWKS returns 503 — the proxy never reaches that CR.
+    let token = coxswain_e2e::jwt::valid_token();
+    let bearer = format!("Bearer {token}");
+    let (status, _, _) = h
+        .http
+        .get_full_with_headers(&host, "/", &[("authorization", &bearer)])
+        .await?;
+    anyhow::ensure!(
+        status == 503,
+        "expected 503 (fail-closed: cross-namespace reference), got {status}"
+    );
     Ok(())
 }
 
@@ -2150,6 +2266,75 @@ async fn client_cert_mtls_missing_cert_rejected_at_handshake() -> anyhow::Result
         result.is_err(),
         "expected TLS handshake failure when no client cert is presented on mTLS host {host}; \
          got Ok: {:?}",
+        result.ok()
+    );
+
+    Ok(())
+}
+
+/// `auth-tls-secret` naming a CA Secret in another namespace is rejected —
+/// every TLS handshake to the host is aborted, even one presenting a client
+/// certificate signed by that exact CA (#688). Ingress annotation references
+/// are locked to the Ingress's own namespace.
+#[tokio::test]
+async fn client_cert_mtls_cross_namespace_ca_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "mtls-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "mtls-xns-tenant").await?;
+
+    let mtls = MtlsCerts::generate();
+    let server_cert = GeneratedCert::for_host(&format!("mtlsxns.{}.local", ns.name));
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    // Pod readiness dominates the reconcile-lag window this test cares about
+    // (the CA Secret and server-cert Secret are plain K8s objects, reconciled
+    // far faster than a Pod reaching Ready).
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(
+        ingress::AUTH_TLS_CA_SECRET,
+        FixtureVars::new(&tenant.name).with("CA_CRT_B64", mtls.ca_cert_b64()),
+    )
+    .await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_AUTH_TLS_XNS_ROUTE,
+        FixtureVars::new(&ns.name)
+            .with("TENANTNS", &tenant.name)
+            .with("SECRET_NAME", "mtls-xns-server-cert")
+            .with("TLS_CRT_B64", server_cert.cert_b64())
+            .with("TLS_KEY_B64", server_cert.key_b64()),
+    )
+    .await?;
+
+    let host = format!("mtlsxns.{}.local", ns.name);
+
+    // Plain-HTTP (port 80) to an mTLS host is unaffected by auth-tls-* (see the
+    // "HTTP listener" note above) — poll it first as the readiness signal that
+    // the Ingress has actually been reconciled, since the HTTPS side of this
+    // host never admits (Unavailable rejects every handshake by design, so
+    // there is no "success" signal to poll on there). The HTTP route entry and
+    // the TLS cert store are populated by the same rebuild pass
+    // (`reconcile_tls`/`build_ingress_routes` share one snapshot generation),
+    // so a live HTTP route is strong (not airtight) evidence the server
+    // certificate for this host has also landed — a residual, low-probability
+    // ambiguity between "cert not yet loaded" and "cross-ns CA rejected" that a
+    // synthetic non-mTLS TLS host would close entirely if this ever flakes.
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(90)).await?;
+
+    // A client cert signed by the exact CA in ${tenant} must still fail — the
+    // handshake is aborted before the cross-namespace CA is ever consulted.
+    let result = https_get_with_client_cert(
+        &host,
+        "/",
+        h.tls_addr,
+        &mtls.client_cert_pem,
+        &mtls.client_key_pem,
+    )
+    .await;
+    anyhow::ensure!(
+        result.is_err(),
+        "expected TLS handshake failure on {host} — auth-tls-secret names a CA \
+         Secret in another namespace and must be rejected even though the \
+         presented client cert is signed by that exact CA; got Ok: {:?}",
         result.ok()
     );
 

@@ -1,0 +1,29 @@
+# Route namespace for the auth-basic-secret cross-namespace rejection test (#688).
+#
+# The Ingress's auth-basic-secret annotation names the labeled htpasswd Secret
+# (auth_basic_secret.yaml) in ${TENANTNS} — a namespace other than the
+# Ingress's own (${TESTNS}). This must fail closed (503) even for a request
+# carrying valid credentials for that Secret, proving the rejection is the
+# namespace guard, not a missing-Secret fallback.
+#
+# Host: authbasicxns.TESTNS.local / -> echo-a:3000 (never reached — fails closed).
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: auth-basic-xns-ingress
+  annotations:
+    ingress.coxswain-labs.dev/auth-basic-secret: "${TENANTNS}/auth-htpasswd"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: authbasicxns.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

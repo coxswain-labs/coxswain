@@ -45,10 +45,12 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 /// reused directly by [`crate::ingress::reconcile_helpers`] so the Ingress
 /// `ext-auth` annotation resolves to the identical [`IngressAuthConfig`] the
 /// HTTPRoute `ExtensionRef` filter produces (Gateway API parity, #549).
-/// `policy_ns` is the namespace of the `CoxswainExternalAuth` CR itself —
-/// callers pass the route's namespace when the ref is same-namespace-only
-/// (the `ExtensionRef` filter), or the referenced CR's own namespace when the
-/// ref can cross namespaces (the Ingress annotation).
+/// `policy_ns` is the namespace of the `CoxswainExternalAuth` CR itself.
+/// Both callers always pass the referencing route's own namespace — the
+/// `ExtensionRef` filter (same-namespace-only by construction) and the
+/// Ingress `ext-auth` annotation (namespace-locked to the Ingress, #688)
+/// are both same-namespace-only, so `policy_ns` always equals the CR's own
+/// namespace by construction.
 pub(crate) fn resolve_spec(
     spec: &CoxswainExternalAuthSpec,
     policy_ns: &str,

@@ -1018,8 +1018,11 @@ pub(super) fn resolve_basic_auth_ref(
 
     // Cross-namespace secretRef requires a matching `BasicAuth → Secret`
     // ReferenceGrant (#520). Without one, fail closed (503) rather than binding a
-    // Secret in another namespace — the Ingress single-namespace precedent does not
-    // carry over to the Gateway-API trust model. Same-namespace refs need no grant.
+    // Secret in another namespace. Both surfaces now reject an ungranted
+    // cross-namespace secretRef — the Gateway BasicAuth CRD via this
+    // ReferenceGrant check, the Ingress auth-basic-secret annotation via a
+    // hard namespace lock with no grant model at all (#688). Same-namespace
+    // refs need no grant.
     if secret_ref.namespace != route_ns
         && !reference_grants::backend_ref_allowed(
             route_ns,

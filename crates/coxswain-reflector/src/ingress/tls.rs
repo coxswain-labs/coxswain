@@ -2,7 +2,7 @@
 //! and `auth-tls-*` annotations into the client-cert mTLS store (#267).
 
 use super::IngressReconciler;
-use super::annotations::client_cert::{ClientCertAnnotation, parse_client_cert};
+use super::annotations::client_cert::{ClientCertAnnotation, ClientCertOutcome, parse_client_cert};
 use super::class::claimed_ingress_class;
 use crate::MergedStore;
 use crate::tls::load_tls_cert;
@@ -110,9 +110,10 @@ impl IngressReconciler {
     /// Applies the same IngressClass filter as `reconcile()`.  The CA Secret is
     /// looked up from the label-scoped `auth_tls_secrets` store and resolved to
     /// [`ClientCertConfigState::Config`]; any failure (missing Secret, wrong
-    /// label, no `ca.crt` key, unparseable PEM) produces
-    /// [`ClientCertConfigState::Unavailable`] so the proxy fails closed by
-    /// aborting every TLS handshake to the affected host.
+    /// label, no `ca.crt` key, unparseable PEM, malformed or cross-namespace
+    /// `auth-tls-secret` value, #688) produces [`ClientCertConfigState::Unavailable`]
+    /// so the proxy fails closed by aborting every TLS handshake to the
+    /// affected host.
     ///
     /// Host set is derived from `spec.tls[].hosts` exactly as [`Self::reconcile_tls`]
     /// does (with the empty→rule-host fallback), guaranteeing that every mTLS host
@@ -145,7 +146,7 @@ impl IngressReconciler {
         let ns = ingress.metadata.namespace.as_deref().unwrap_or("default");
         let spec = ingress.spec.as_ref();
 
-        // Parse the auth-tls annotation cluster.  None → mTLS not requested.
+        // Parse the auth-tls annotation cluster.  Absent → mTLS not requested.
         let route_id = format!(
             "{}/{}",
             ns,
@@ -155,17 +156,18 @@ impl IngressReconciler {
             Some(a) => a,
             None => return,
         };
-        let Some(ann) = parse_client_cert(raw_annotations, &route_id) else {
-            return;
+        // `Invalid` (malformed, or cross-namespace, #688) still installs an
+        // `Unavailable` config for the derived host set below — a typo'd or
+        // cross-namespace reference must fail closed, not silently skip mTLS.
+        let config_state = match parse_client_cert(raw_annotations, &route_id, ns) {
+            ClientCertOutcome::Absent => return,
+            ClientCertOutcome::Invalid => Arc::new(ClientCertConfigState::Unavailable),
+            ClientCertOutcome::Present(ann) => Arc::new(resolve_client_cert_config(
+                &ann,
+                auth_tls_secrets,
+                &route_id,
+            )),
         };
-
-        // Resolve the CA Secret to a ClientCertConfigState.  Fail-closed.
-        let config_state = Arc::new(resolve_client_cert_config(
-            &ann,
-            auth_tls_secrets,
-            &route_id,
-            ns,
-        ));
 
         // Derive the host set from spec.tls[].hosts (same fallback as reconcile_tls).
         let tls_blocks = match spec.and_then(|s| s.tls.as_deref()) {
@@ -206,6 +208,11 @@ impl IngressReconciler {
 
 /// Resolve the CA Secret referenced by `ann` into a [`ClientCertConfigState`].
 ///
+/// Callers only ever hold an `ann` produced by [`ClientCertOutcome::Present`],
+/// which already guarantees `ann.secret.namespace` equals the Ingress's own
+/// namespace (#688) — cross-namespace and malformed values are rejected
+/// earlier, at [`parse_client_cert`] time.
+///
 /// # Errors (→ `Unavailable`)
 ///
 /// - Secret not found in the reflector (not labeled / not cached).
@@ -216,13 +223,8 @@ fn resolve_client_cert_config(
     ann: &ClientCertAnnotation,
     auth_tls_secrets: &MergedStore<Secret>,
     route_id: &str,
-    ingress_ns: &str,
 ) -> ClientCertConfigState {
-    let ns = if ann.secret.namespace.is_empty() {
-        ingress_ns
-    } else {
-        &ann.secret.namespace
-    };
+    let ns = &ann.secret.namespace;
 
     let key = reflector::ObjectRef::<Secret>::new(&ann.secret.name).within(ns);
     let Some(secret) = auth_tls_secrets.get(&key) else {
@@ -872,6 +874,33 @@ mod tests {
             ClientCertConfigState::Unavailable
         ));
         assert!(logs_contain("no 'ca.crt' data key"));
+    }
+
+    /// #688: a cross-namespace `auth-tls-secret` must fail closed exactly like
+    /// a missing Secret — even though the referenced Secret exists and would
+    /// otherwise resolve cleanly.
+    #[test]
+    #[tracing_test::traced_test]
+    fn reconcile_client_certs_cross_namespace_produces_unavailable() {
+        use coxswain_core::tls::ClientCertConfigState;
+        let secrets = secret_store(vec![make_auth_tls_secret("other-ns", "my-ca", FAKE_CA_PEM)]);
+        let ingress = make_ingress_with_auth_tls(
+            "default",
+            "coxswain",
+            "other-ns/my-ca",
+            vec![IngressTLS {
+                hosts: Some(vec!["example.com".to_string()]),
+                secret_name: Some("server-cert".to_string()),
+            }],
+        );
+        let mut builder = ClientCertStoreBuilder::new();
+        reconcile_client_certs_no_default(&ingress, &secrets, &owned(&["coxswain"]), &mut builder);
+        let store = builder.build();
+        assert!(matches!(
+            store.find_config(443, "example.com").unwrap().as_ref(),
+            ClientCertConfigState::Unavailable
+        ));
+        assert!(logs_contain("cross-namespace references are not permitted"));
     }
 
     #[test]

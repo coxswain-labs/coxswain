@@ -58,9 +58,9 @@ metadata:
 
 ## CR-backed annotations
 
-Eight annotations — `retry`, `rate-limit`, `ext-auth`, `auth-basic-secret`, `auth-jwt`, `auth-tls-secret`, `ip-access-control`, and `compression` — take a `namespace/name` value pointing at a Kubernetes resource: a Coxswain CRD, or a `Secret` for the auth ones. You set the annotation on the Ingress `metadata.annotations` (as in the example above), so the sections below show only the referenced resource. The same resource backs the equivalent Gateway API `ExtensionRef` filter, so one CR serves an Ingress and an HTTPRoute/GRPCRoute identically.
+Eight annotations — `retry`, `rate-limit`, `ext-auth`, `auth-basic-secret`, `auth-jwt`, `auth-tls-secret`, `ip-access-control`, and `compression` — take a `namespace/name` value pointing at a Kubernetes resource: a Coxswain CRD, or a `Secret` for the auth ones. You set the annotation on the Ingress `metadata.annotations` (as in the example above), so the sections below show only the referenced resource. The same resource backs the equivalent Gateway API `ExtensionRef` filter, so one CR serves an Ingress and an HTTPRoute/GRPCRoute identically. **The referenced resource's namespace must always match the Ingress's own namespace** — every one of the eight rejects a cross-namespace reference, mirroring `mirror-target`'s `svc.namespace:port` form below; an Ingress may only bind resources it owns.
 
-**Missing-reference behaviour** — a missing, unlabeled, or unparseable reference fails **open** (the feature is skipped, traffic flows) for every CR-backed annotation **except** the auth checks (`ext-auth`, `auth-basic-secret`, `auth-jwt`) and client-cert mTLS (`auth-tls-secret`), which fail **closed** (`503`, or an aborted handshake for mTLS) — a stale or typo'd auth reference must not silently disable enforcement.
+**Missing-reference behaviour** — a missing, unlabeled, unparseable, or cross-namespace reference fails **open** (the feature is skipped, traffic flows) for every CR-backed annotation **except** the auth checks (`ext-auth`, `auth-basic-secret`, `auth-jwt`) and client-cert mTLS (`auth-tls-secret`), which fail **closed** (`503`, or an aborted handshake for mTLS) — a stale, typo'd, or cross-namespace auth reference must not silently disable enforcement.
 
 ## Backend connection settings are not annotations
 
@@ -91,6 +91,8 @@ Maximum time to write the full request to the upstream. Corresponds to Pingora's
 ## `retry`
 
 The Ingress surface for the [`RetryPolicy` CRD](../operations/retries.md). The field shape follows the Gateway API retry model (`attempts` / `codes` / `backoff`). See the [Retries guide](../operations/retries.md) for the full model, including gRPC. Ingress is HTTP-only, so a referenced CR's `grpcCodes` field is ignored.
+
+**The `RetryPolicy`'s namespace must match the Ingress namespace.** Cross-namespace references are rejected — treated identically to a missing CR (retries disabled, controller warning), the same posture as every other `namespace/name` CR-backed annotation on this page.
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -447,6 +449,8 @@ A mirror timeout of 5 s is applied per sub-request; the primary never waits for 
 
 The Ingress surface for the [`IpAccessControl` CRD](../gateway-api/route-extensions.md#ip-access-control), same idiom as `ext-auth`/`auth-jwt`/`compression`/`retry`/`rate-limit`. Value is `namespace/name` of an `IpAccessControl` resource; both surfaces resolve the same CR to the same runtime config, so one `IpAccessControl` can back an Ingress and an HTTPRoute/GRPCRoute `ExtensionRef` filter identically. A request whose client IP falls inside `deny`, or outside every `allow` range when `allow` is non-empty, is rejected with **403 Forbidden** before any upstream connection is opened.
 
+**The `IpAccessControl`'s namespace must match the Ingress namespace.** Cross-namespace references are rejected — treated identically to a missing CR (IP filtering skipped, controller warning).
+
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
 kind: IpAccessControl
@@ -544,6 +548,8 @@ Session affinity (sticky sessions), the per-upstream-endpoint circuit breaker, a
 
 The Ingress surface for the [`RateLimit` CRD](../operations/rate-limiting.md#ratelimit-spec-fields), same idiom as `ext-auth`/`auth-jwt`/`compression`/`retry`. Value is `namespace/name` of a `RateLimit` resource; both surfaces resolve the same CR to the same runtime config, so one `RateLimit` can back an Ingress and an HTTPRoute/GRPCRoute `ExtensionRef` filter identically. Over-limit requests are rejected with **429 Too Many Requests** and a `Retry-After` header (in whole seconds) telling the client when to retry. See the [Rate limiting guide](../operations/rate-limiting.md) for the full model, including the GCRA algorithm and Gateway API usage.
 
+**The `RateLimit`'s namespace must match the Ingress namespace.** Cross-namespace references are rejected — treated identically to a missing CR (rate limiting skipped, controller warning).
+
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
 kind: RateLimit
@@ -595,7 +601,9 @@ spec:
     - x-auth-user
 ```
 
-A **2xx** (HTTP transport) or `OK` (gRPC transport) response from the auth service allows the request; any other status is returned to the client verbatim and the upstream is never hit. A missing `CoxswainExternalAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`auth-jwt`: an operator who set `ext-auth` intends the route to require the check, so a stale or typo'd reference must not silently disable it. A present CR whose `backendRef` has no ready endpoints, whose cross-namespace `backendRef` lacks a `ReferenceGrant`, or whose protocol is unsupported also fails **closed**. See the [`CoxswainExternalAuth` CRD reference](../gateway-api/route-extensions.md#external-authorization-ext_authz) for the full spec (transport, timeout, fail-closed posture, request/response-header forwarding).
+A **2xx** (HTTP transport) or `OK` (gRPC transport) response from the auth service allows the request; any other status is returned to the client verbatim and the upstream is never hit. A missing `CoxswainExternalAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`auth-jwt`: an operator who set `ext-auth` intends the route to require the check, so a stale, typo'd, or cross-namespace reference must not silently disable it. A present CR whose `backendRef` has no ready endpoints, whose cross-namespace `backendRef` lacks a `ReferenceGrant`, or whose protocol is unsupported also fails **closed**. See the [`CoxswainExternalAuth` CRD reference](../gateway-api/route-extensions.md#external-authorization-ext_authz) for the full spec (transport, timeout, fail-closed posture, request/response-header forwarding).
+
+**The `CoxswainExternalAuth`'s namespace must match the Ingress namespace.** Cross-namespace references to the CR itself are rejected, fail-closed. This is a separate hop from the CR's own `backendRef` above: the CR always lives in the Ingress's own namespace, but its `backendRef` may still point cross-namespace to another Service, gated by a `ReferenceGrant`.
 
 Only the client request headers named in `allowedHeaders` reach the auth service — everything else (`Cookie`, a custom header, anything unnamed) is withheld, so a client can't smuggle a credential or forge a header your authz policy trusts just because it wasn't allow-listed. When absent or empty, GEP-1494's per-protocol default applies (`Authorization` alone for `HTTP`; a wider GEP-1494-defined set for `GRPC`). Symmetrically, every name in `allowedResponseHeaders` is stripped from the client's request before the check runs, whether or not the auth service echoes it back on a given allow response — a client cannot forge a header your backend trusts as the auth service's word just because the service didn't set it on this particular request.
 
@@ -609,6 +617,8 @@ Enables **HTTP Basic Authentication** backed by an htpasswd Secret. Value is `na
 - **Supported hash algorithms**: **bcrypt** (`$2a$`, `$2b$`, `$2y$`) is the required minimum — use `htpasswd -B` to generate bcrypt hashes. `SHA1` (`{SHA}base64`) is accepted for compatibility with existing files but is **not recommended**: SHA1 is unsalted and trivially crackable offline. The controller emits a `Warning` Event naming each affected username. Lines using other schemes (MD5, crypt) are skipped with a controller warning.
 
 **The Secret must carry the `ingress.coxswain-labs.dev/auth-basic: "true"` label.** The proxy watches only labeled Secrets (the data-plane read-only invariant — the proxy never holds cluster-wide Secret access). A referenced Secret that is absent or unlabeled causes the proxy to return **503** for every request to that Ingress (**fail-closed**). This is intentional: misconfigured auth silences traffic rather than silently bypassing it.
+
+**The Secret's namespace must match the Ingress namespace.** A cross-namespace reference fails closed exactly like a missing Secret — an Ingress may only bind an htpasswd Secret it owns.
 
 ```yaml
 apiVersion: v1
@@ -654,7 +664,9 @@ spec:
       header: x-user-id
 ```
 
-A valid, signed, unexpired, correct-issuer bearer token is admitted; the verified `sub` claim is forwarded as `x-user-id`. A missing/invalid/expired/wrong-issuer/wrong-audience token receives **401** with `WWW-Authenticate: Bearer`. A missing `JwtAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`ext-auth`: an operator who set `auth-jwt` intends the route to require a bearer token, so a stale or typo'd reference must not silently disable authentication. An unresolved JWKS also fails **closed** (**503**). See the [`JwtAuth` CRD reference](../gateway-api/route-extensions.md#jwt-authentication) for the full spec (remote vs. inline JWKS, `fromHeaders`, `forwardPayloadHeader`, `forward`).
+A valid, signed, unexpired, correct-issuer bearer token is admitted; the verified `sub` claim is forwarded as `x-user-id`. A missing/invalid/expired/wrong-issuer/wrong-audience token receives **401** with `WWW-Authenticate: Bearer`. A missing `JwtAuth` CR fails **closed** (**503**) — matching `auth-basic-secret`/`ext-auth`: an operator who set `auth-jwt` intends the route to require a bearer token, so a stale, typo'd, or cross-namespace reference must not silently disable authentication. An unresolved JWKS also fails **closed** (**503**). See the [`JwtAuth` CRD reference](../gateway-api/route-extensions.md#jwt-authentication) for the full spec (remote vs. inline JWKS, `fromHeaders`, `forwardPayloadHeader`, `forward`).
+
+**The `JwtAuth`'s namespace must match the Ingress namespace.** Cross-namespace references are rejected, fail-closed.
 
 ## Client certificate mTLS
 
@@ -673,6 +685,8 @@ Requires clients to present a valid TLS certificate during the handshake — **m
 Reference to a Kubernetes `Opaque` Secret in `namespace/name` form whose `ca.crt` key holds one or more PEM-encoded CA certificates used to verify the client certificate chain.
 
 **The Secret must carry the `ingress.coxswain-labs.dev/auth-tls: "true"` label.** The data-plane proxy watches only labeled Secrets (the read-only-proxy invariant — the proxy never holds cluster-wide Secret access). An unlabeled or missing Secret causes every TLS handshake to the Ingress host to be aborted (**fail-closed**).
+
+**The Secret's namespace must match the Ingress namespace.** A cross-namespace reference fails closed exactly like a missing Secret.
 
 ```yaml
 apiVersion: v1
@@ -727,6 +741,8 @@ Opt-in, per-Ingress on-the-fly response compression — the Ingress surface for 
 is `namespace/name` of a `Compression` resource; both surfaces resolve the same CR to the same
 runtime config, so one `Compression` can back an Ingress and an HTTPRoute `ExtensionRef` filter
 identically.
+
+**The `Compression`'s namespace must match the Ingress namespace.** Cross-namespace references are rejected — treated identically to a missing CR (compression skipped, controller warning).
 
 ```yaml
 apiVersion: gateway.coxswain-labs.dev/v1alpha1
@@ -818,7 +834,9 @@ spec:
 2. The class default from `spec.defaultAnnotations`.
 3. The built-in Coxswain default.
 
-The merge is per-key: an Ingress that sets only `read-timeout` still inherits the class's `retry` reference. The keys and value formats in `defaultAnnotations` are exactly the per-Ingress ones — including `namespace/name` CR references like `retry`/`compression`, which resolve identically whether set directly on an Ingress or inherited from a class default; an invalid value emits a warning and falls back to the built-in default, the same as if it were set directly on an Ingress (an empty string `""` is **not** an "unset" override — it parses, warns, and falls back).
+The merge is per-key: an Ingress that sets only `read-timeout` still inherits the class's `retry` reference. The keys and value formats in `defaultAnnotations` are exactly the per-Ingress ones, and an invalid value emits a warning and falls back the same way whether set directly on an Ingress or inherited from a class default (an empty string `""` is **not** an "unset" override — it parses, warns, and falls back).
+
+**Namespace resolution differs by source, for the eight `namespace/name` CR/Secret references** (see [CR-backed annotations](#cr-backed-annotations)): a value set **directly on the Ingress** must name the Ingress's own namespace, exactly as everywhere else on this page. A value inherited **from a class default** is instead resolved against the namespace of the `CoxswainIngressClassParameters` CR itself (`coxswain-system` in the example above) — not the claiming Ingress's namespace. This is deliberate, not a loophole: the class default is admin-authored (creating an `IngressClass` and its namespaced parameters CR both require cluster-level RBAC most tenants don't have), so a shared `retry`/`ext-auth`/etc. reference pointing at a resource next to the parameters CR is the intended GitOps pattern — a fleet-wide `RetryPolicy` or `CoxswainExternalAuth` in `coxswain-system`, inherited by every Ingress in every tenant namespace that claims the class. A tenant who sets the same annotation directly on their own Ingress is never granted this reach, even if the value happens to name the parameters CR's namespace: presence on the Ingress itself always means "resolve against my own namespace."
 
 ### `spec.accessLog` — per-class access-log control
 
