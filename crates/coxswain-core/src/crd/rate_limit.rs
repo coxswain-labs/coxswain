@@ -56,10 +56,11 @@ pub struct RateLimitSpec {
     /// Requests that do not carry the header are admitted without consuming
     /// quota (fail-open), matching ingress-nginx and Envoy behaviour.
     ///
-    /// When absent (the default), buckets are keyed by real client IP address
-    /// (PROXY-protocol peer if present, else L4 downstream peer, honouring a
-    /// trusted forwarded header when one is configured — the same resolution
-    /// used by the `IpAccessControl` filter).
+    /// When absent (the default), buckets are keyed by real client IP address:
+    /// PROXY-protocol peer if present, else L4 downstream peer. On an Ingress
+    /// route that also configures `trust-forwarded-for`, a trusted forwarded
+    /// header takes precedence over both — there is no equivalent trusted-header
+    /// surface for Gateway API routes today.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by_header: Option<String>,
 }

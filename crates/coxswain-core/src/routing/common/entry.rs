@@ -41,10 +41,12 @@ pub struct RouteTimeouts {
     /// expiry; a connect failure under this budget maps to 502 (connect is
     /// always upstream-sourced).
     pub backend_request: Option<Duration>,
-    /// Unused: retained for layout stability, always `None`. The upstream
-    /// TCP-connect timeout resolves per backend from `CoxswainBackendPolicy`
-    /// (`BackendGroup::connect_timeout`) since the Ingress `connect-timeout`
-    /// annotation was removed.
+    /// Always `None` in this tree: no reflector path sets it since the Ingress
+    /// `connect-timeout` annotation was removed — the upstream TCP-connect
+    /// timeout now resolves per backend from `CoxswainBackendPolicy`
+    /// (`BackendGroup::connect_timeout`). Field 3 on the discovery wire
+    /// (`proto/coxswain/discovery/v1/discovery.proto`), so it stays populated
+    /// through encode/decode rather than being removed as dead.
     pub connect: Option<Duration>,
     /// Upstream response-read timeout (`ingress.coxswain-labs.dev/read-timeout`).
     pub read: Option<Duration>,

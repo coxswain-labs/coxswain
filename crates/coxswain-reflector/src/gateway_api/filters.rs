@@ -687,8 +687,8 @@ pub(super) fn build_backend_ref_filters(
             _ => {
                 tracing::warn!(
                     filter_type = ?f.r#type,
-                    "Skipping spec-invalid per-backend filter type \
-                     (only RequestHeaderModifier and ResponseHeaderModifier are allowed at backendRef scope)"
+                    "Skipping unsupported per-backend filter type \
+                     (coxswain implements only RequestHeaderModifier and ResponseHeaderModifier at backendRef scope)"
                 );
             }
         }
@@ -912,10 +912,10 @@ pub(super) fn resolve_basic_auth<F: ExtRefFilter>(
 ///
 /// Returns `None` when no `ExternalAuth` ref is present (no ext-auth on the
 /// route) or the referenced CR is missing (fail-open — matches the other
-/// ExtensionRef resolvers). A present-but-broken backend (no endpoints, ungranted
-/// cross-namespace ref, unsupported protocol) fails **closed** via
-/// [`IngressAuthConfig::Unavailable`], resolved in
-/// [`super::external_auth::resolve_spec`].
+/// ExtensionRef resolvers). A present-but-broken backend (no endpoints,
+/// ungranted cross-namespace ref, or a `backendRef` that isn't a core
+/// `Service`) fails **closed** via [`IngressAuthConfig::Unavailable`], resolved
+/// in [`super::external_auth::resolve_spec`].
 pub(super) fn resolve_external_auth<F: ExtRefFilter>(
     filters: &[F],
     route_ns: &str,

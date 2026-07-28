@@ -602,15 +602,16 @@ pub(crate) async fn upstream_peer(
     // connect: controls the TCP-connect phase → 502 on ConnectTimedout.
     // read:    controls the upstream response-read phase.
     // send:    controls the upstream request-send phase.
-    // backend_request: used when explicit read/send are absent (legacy behaviour).
+    // backend_request: last connect fallback, and used as the read timeout when
+    // explicit read is absent (legacy behaviour); has no bearing on send/write.
     let remaining_request = ctx
         .request_deadline
         .and_then(|d| d.checked_duration_since(Instant::now()));
     let backend_timeout = resolved.timeouts.backend_request;
 
     // Ingress-annotation-derived read/send timeouts (may be None for GW-API routes).
-    // `explicit_connect` is always `None` (`resolved.timeouts.connect` is kept only
-    // for `RouteTimeouts` layout stability, see its doc), so it never wins below —
+    // `explicit_connect` is always `None` — no reflector path sets
+    // `resolved.timeouts.connect` any more, see its doc — so it never wins below;
     // the per-backend `CoxswainBackendPolicy` connect timeout does.
     let explicit_connect = resolved.timeouts.connect;
     let explicit_read = resolved.timeouts.read;

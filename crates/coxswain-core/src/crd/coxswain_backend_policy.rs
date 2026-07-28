@@ -197,7 +197,9 @@ pub struct BackendCircuitBreaker {
 /// from `SessionPersistence` in v1.6.0. Note that `type: Header` does not
 /// issue a session identity the way `Cookie` does — it consumes an
 /// already-present request header and rendezvous-hashes it to an endpoint,
-/// behaviourally identical to `loadBalancer.algorithm: hash:header=`.
+/// the same FNV-1a-plus-rendezvous selection `loadBalancer.algorithm:
+/// hash:header=` uses (though the two differ on an empty header value: this
+/// path hashes it as-is, `hash:header=` treats it as absent).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendSessionPersistence {
