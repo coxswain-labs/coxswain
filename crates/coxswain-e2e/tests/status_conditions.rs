@@ -1002,6 +1002,160 @@ async fn grpc_route_resolvedrefs_false_for_dangling_extension_ref() -> anyhow::R
     .await
 }
 
+/// The status writer's HTTPRoute `Accepted` condition must agree with
+/// enforcement on which `ExtensionRef` kinds it supports (#690). Before this
+/// fix, `BasicAuth`/`RequestSizeLimit`/`Compression`/`ExternalAuth` were
+/// enforced correctly (`filters::build_filters`) but permanently reported
+/// `Accepted=False/UnsupportedValue` — the status kind list was a stale,
+/// independently hand-maintained copy of the enforcement one. A route
+/// referencing a genuinely unsupported kind must still be rejected: the fix
+/// must not overcorrect into accepting everything.
+#[tokio::test]
+async fn route_status_reports_accepted_true_for_previously_unlisted_extension_kinds()
+-> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "route-status-kindcov").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+    fixtures::apply_fixture(gwa::ROUTE_STATUS_KIND_COVERAGE, FixtureVars::new(&ns.name)).await?;
+
+    // The resolvable good-route programming proves the writer is live for this
+    // ns — so every sibling below has had equal opportunity to be evaluated.
+    wait::wait_for_httproute_programmed(&h.client, "good-route", &ns.name, Duration::from_secs(30))
+        .await?;
+
+    let routes: Api<HttpRoute> = Api::namespaced(h.client.clone(), &ns.name);
+
+    for (route_name, kind) in [
+        ("basicauth-route", "BasicAuth"),
+        ("requestsizelimit-route", "RequestSizeLimit"),
+        ("compression-route", "Compression"),
+        ("externalauth-route", "ExternalAuth"),
+    ] {
+        wait::poll_until(
+            Duration::from_secs(30),
+            wait::POLL,
+            || async {
+                let observed = routes.get(route_name).await.ok().map_or_else(
+                    || format!("<could not fetch {route_name}>"),
+                    |r| format!("Accepted={:?}", route_parent_condition(&r, "Accepted")),
+                );
+                format!(
+                    "{route_name} ({kind} ExtensionRef) to be Accepted=True/Accepted; observed {observed}"
+                )
+            },
+            || async {
+                let r = routes.get(route_name).await.ok()?;
+                (route_parent_condition(&r, "Accepted")
+                    == Some(("True".to_string(), "Accepted".to_string())))
+                .then_some(())
+            },
+        )
+        .await?;
+    }
+
+    // Sad-path control: a genuinely unsupported ExtensionRef kind must stay
+    // rejected — proves the kind-list fix didn't overcorrect.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            let observed = routes.get("unknown-kind-route").await.ok().map_or_else(
+                || "<could not fetch unknown-kind-route>".to_string(),
+                |r| format!("Accepted={:?}", route_parent_condition(&r, "Accepted")),
+            );
+            format!("unknown-kind-route to be Accepted=False/UnsupportedValue; observed {observed}")
+        },
+        || async {
+            let r = routes.get("unknown-kind-route").await.ok()?;
+            (route_parent_condition(&r, "Accepted")
+                == Some(("False".to_string(), "UnsupportedValue".to_string())))
+            .then_some(())
+        },
+    )
+    .await
+}
+
+/// GRPCRoute counterpart of
+/// [`route_status_reports_accepted_true_for_previously_unlisted_extension_kinds`]
+/// (#690) — GRPCRoute status was wrong in *both* directions: `JwtAuth` is
+/// genuinely enforced (`grpc_reconcile.rs`) but was reported
+/// `Accepted=False/UnsupportedValue`, while `RequestSizeLimit` — never
+/// resolved by `grpc_reconcile.rs` at all (`request_size_limits: None`) — was
+/// falsely reported `Accepted=True`.
+#[tokio::test]
+async fn grpc_route_status_reports_accepted_for_supported_and_unsupported_extension_kinds()
+-> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "sc-grpc-kindcov").await?;
+
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_deployments(&ns.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(
+        gwa::GRPC_ROUTE_STATUS_KIND_COVERAGE,
+        FixtureVars::new(&ns.name),
+    )
+    .await?;
+
+    wait::wait_for_grpcroute_programmed(
+        &h.client,
+        "good-grpc-route",
+        &ns.name,
+        Duration::from_secs(30),
+    )
+    .await?;
+
+    let routes: kube::Api<GrpcRoute> = kube::Api::namespaced(h.client.clone(), &ns.name);
+
+    // Happy: JwtAuth is genuinely enforced on GRPCRoute — must be Accepted=True.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            let observed = routes.get("jwtauth-grpc-route").await.ok().map_or_else(
+                || "<could not fetch jwtauth-grpc-route>".to_string(),
+                |r| format!("Accepted={:?}", grpcroute_parent_condition(&r, "Accepted")),
+            );
+            format!("jwtauth-grpc-route to be Accepted=True/Accepted; observed {observed}")
+        },
+        || async {
+            let r = routes.get("jwtauth-grpc-route").await.ok()?;
+            (grpcroute_parent_condition(&r, "Accepted")
+                == Some(("True".to_string(), "Accepted".to_string())))
+            .then_some(())
+        },
+    )
+    .await?;
+
+    // Sad: RequestSizeLimit is never resolved on GRPCRoute — must be
+    // Accepted=False/UnsupportedValue, not silently accepted.
+    wait::poll_until(
+        Duration::from_secs(30),
+        wait::POLL,
+        || async {
+            let observed = routes
+                .get("requestsizelimit-grpc-route")
+                .await
+                .ok()
+                .map_or_else(
+                    || "<could not fetch requestsizelimit-grpc-route>".to_string(),
+                    |r| format!("Accepted={:?}", grpcroute_parent_condition(&r, "Accepted")),
+                );
+            format!(
+                "requestsizelimit-grpc-route to be Accepted=False/UnsupportedValue; observed {observed}"
+            )
+        },
+        || async {
+            let r = routes.get("requestsizelimit-grpc-route").await.ok()?;
+            (grpcroute_parent_condition(&r, "Accepted")
+                == Some(("False".to_string(), "UnsupportedValue".to_string())))
+            .then_some(())
+        },
+    )
+    .await
+}
+
 /// Ownership negative: the status writer patches `loadBalancer` status only onto
 /// Ingresses whose class we own. An Ingress claiming a foreign IngressClass must
 /// be left untouched, even while an owned sibling in the same namespace is

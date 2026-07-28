@@ -42,6 +42,13 @@ pub const ROUTE_STATUS_BACKENDS: &str = fixture!("route_status_backends.yaml");
 /// per-parent `ResolvedRefs` (`True` vs `False/InvalidKind`) while both stay
 /// `Accepted=True` (#689/GEP-1364).
 pub const ROUTE_STATUS_EXT_REF: &str = fixture!("route_status_ext_ref.yaml");
+/// One Gateway with six HTTPRoutes, all with a resolvable backend — four
+/// carrying a dangling `ExtensionRef` of a kind enforcement supports but
+/// status previously didn't list (`BasicAuth`/`RequestSizeLimit`/
+/// `Compression`/`ExternalAuth`), one carrying a genuinely unsupported kind —
+/// for asserting `Accepted=True` for the four fixed kinds and
+/// `Accepted=False/UnsupportedValue` for the foreign-kind control (#690).
+pub const ROUTE_STATUS_KIND_COVERAGE: &str = fixture!("route_status_kind_coverage.yaml");
 /// HTTPRoute with multiple backends pooled into a single upstream.
 pub const HOST_POOL: &str = fixture!("host_pool.yaml");
 /// HTTPRoute with a wildcard hostname listener.
@@ -494,6 +501,13 @@ pub const GRPC_ROUTE_STATUS: &str = fixture!("grpc_route_status.yaml");
 /// `ExtensionRef`, one with a dangling `ExtensionRef` — for asserting
 /// per-parent `ResolvedRefs` (`True` vs `False/InvalidKind`) (#689/GEP-1364).
 pub const GRPC_ROUTE_STATUS_EXT_REF: &str = fixture!("grpc_route_status_ext_ref.yaml");
+
+/// Gateway + three GRPCRoutes, all with a resolvable backend: `good-grpc-route`
+/// (no `ExtensionRef`), `jwtauth-grpc-route` (dangling `JwtAuth` ref — enforced
+/// on GRPCRoute, must be `Accepted=True`), `requestsizelimit-grpc-route`
+/// (dangling `RequestSizeLimit` ref — never resolved on GRPCRoute, must be
+/// `Accepted=False/UnsupportedValue`) (#690).
+pub const GRPC_ROUTE_STATUS_KIND_COVERAGE: &str = fixture!("grpc_route_status_kind_coverage.yaml");
 
 /// `RateLimit` CR with `requestsPerSecond` omitted — rejected by the
 /// coxswain-owned CRD schema (`requestsPerSecond` is a required field).

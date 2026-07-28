@@ -668,13 +668,10 @@ fn build_filters(filters: &[GrpcRouteRulesFilters]) -> Vec<FilterAction> {
                 // on GRPCRoute — notably BasicAuth (#442), Compression (#446), and
                 // RequestSizeLimit (#443, see #509: a mid-stream h2 body cap deadlocks
                 // the client under pingora; gRPC is limited by the backend instead).
-                let supported = f.extension_ref.as_ref().is_some_and(|ext| {
-                    ext.group == super::COXSWAIN_GROUP
-                        && matches!(
-                            ext.kind.as_str(),
-                            "RateLimit" | "IpAccessControl" | "RetryPolicy" | "JwtAuth"
-                        )
-                });
+                let supported = f
+                    .extension_ref
+                    .as_ref()
+                    .is_some_and(|ext| super::grpc_extension_kind_supported(&ext.group, &ext.kind));
                 if !supported {
                     tracing::warn!(
                         filter_type = ?f.r#type,

@@ -47,11 +47,7 @@ impl RouteLike for HttpRoute {
                 if matches!(f.r#type, HttpRouteRulesFiltersType::ExtensionRef)
                     && let Some(ext) = &f.extension_ref
                 {
-                    return ext.group != super::COXSWAIN_GROUP
-                        || (ext.kind != "RateLimit"
-                            && ext.kind != "PathRewriteRegex"
-                            && ext.kind != "IpAccessControl"
-                            && ext.kind != "RetryPolicy");
+                    return !super::http_extension_kind_supported(&ext.group, &ext.kind);
                 }
                 false
             })
@@ -392,6 +388,84 @@ mod tests {
             "a dangling ExtensionRef must set ResolvedRefs=False"
         );
         assert_eq!(h.resolved_refs_reason, "InvalidKind");
+    }
+
+    /// For every coxswain `ExtensionRef` kind, `filters::build_filters`'s
+    /// enforcement guard and `has_unsupported_filter`'s `Accepted` guard must
+    /// agree on whether HTTPRoute supports it — both now call
+    /// [`crate::gateway_api::http_extension_kind_supported`], so this test
+    /// exercises the same decision function `build_filters` calls, not just the
+    /// constant it's backed by. Before #690 these were two independently
+    /// hand-maintained literal lists — `BasicAuth`, `RequestSizeLimit`,
+    /// `Compression`, and `ExternalAuth` were enforced but permanently reported
+    /// `Accepted=False/UnsupportedValue`. `ALL_KNOWN_KINDS` is written out by
+    /// hand (not derived from `HTTP_ROUTE_EXTENSION_KINDS`) so this test is an
+    /// independent oracle, not a tautology against the production list.
+    #[test]
+    fn enforcement_and_status_extension_kind_sets_agree() {
+        use crate::gateway_api::route_status::RouteLike;
+        use crate::gw_types::v::httproutes::{
+            HttpRouteRulesFilters, HttpRouteRulesFiltersExtensionRef, HttpRouteRulesFiltersType,
+        };
+
+        const ALL_KNOWN_KINDS: &[&str] = &[
+            "RateLimit",
+            "IpAccessControl",
+            "BasicAuth",
+            "RequestSizeLimit",
+            "Compression",
+            "ExternalAuth",
+            "RetryPolicy",
+            "JwtAuth",
+            "PathRewriteRegex",
+        ];
+
+        for &kind in ALL_KNOWN_KINDS {
+            let route = HttpRoute {
+                metadata: ObjectMeta {
+                    name: Some("route".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+                spec: HttpRouteSpec {
+                    parent_refs: Some(vec![HttpRouteParentRefs {
+                        name: "gw".to_string(),
+                        namespace: Some("default".to_string()),
+                        ..Default::default()
+                    }]),
+                    hostnames: None,
+                    rules: Some(vec![HttpRouteRules {
+                        backend_refs: Some(vec![HttpRouteRulesBackendRefs {
+                            name: "svc".to_string(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
+                        filters: Some(vec![HttpRouteRulesFilters {
+                            r#type: HttpRouteRulesFiltersType::ExtensionRef,
+                            extension_ref: Some(HttpRouteRulesFiltersExtensionRef {
+                                group: "gateway.coxswain-labs.dev".to_string(),
+                                kind: kind.to_string(),
+                                name: "does-not-exist".to_string(),
+                            }),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }]),
+                },
+                ..Default::default()
+            };
+
+            let enforcement_supports = crate::gateway_api::http_extension_kind_supported(
+                "gateway.coxswain-labs.dev",
+                kind,
+            );
+            let status_supports = !route.has_unsupported_filter();
+            assert_eq!(
+                enforcement_supports, status_supports,
+                "kind {kind}: enforcement supports={enforcement_supports}, \
+                 status supports={status_supports} — must agree"
+            );
+        }
     }
 
     #[test]

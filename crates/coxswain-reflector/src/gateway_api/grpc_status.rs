@@ -48,18 +48,14 @@ impl RouteLike for GrpcRoute {
                 if matches!(f.r#type, GrpcRouteRulesFiltersType::RequestMirror) {
                     return true;
                 }
-                // RateLimit (#25), IpAccessControl (#479), and RequestSizeLimit
-                // (#443) ExtensionRefs are supported on GRPCRoute; any other
-                // ExtensionRef is not — notably BasicAuth (#442) and Compression
-                // (#446), both HTTP-only idioms.
+                // RateLimit (#25), IpAccessControl (#479), RetryPolicy (#445), and
+                // JwtAuth (#441) ExtensionRefs are supported on GRPCRoute; any other
+                // ExtensionRef is not — notably BasicAuth (#442), Compression (#446),
+                // and RequestSizeLimit (#443), all HTTP-only idioms (#690).
                 if matches!(f.r#type, GrpcRouteRulesFiltersType::ExtensionRef)
                     && let Some(ext) = &f.extension_ref
                 {
-                    return ext.group != super::COXSWAIN_GROUP
-                        || !matches!(
-                            ext.kind.as_str(),
-                            "RateLimit" | "IpAccessControl" | "RequestSizeLimit" | "RetryPolicy"
-                        );
+                    return !super::grpc_extension_kind_supported(&ext.group, &ext.kind);
                 }
                 false
             })
@@ -215,5 +211,83 @@ mod tests {
         assert_eq!(h.accepted_reason, "Accepted");
         assert!(h.resolved_refs);
         assert_eq!(h.resolved_refs_reason, "ResolvedRefs");
+    }
+
+    /// [`status`][crate::gateway_api::status]'s
+    /// `enforcement_and_status_extension_kind_sets_agree`, for GRPCRoute — both
+    /// `grpc_reconcile`'s enforcement guard and `has_unsupported_filter` call
+    /// [`crate::gateway_api::grpc_extension_kind_supported`], so this test
+    /// exercises the same decision function `grpc_reconcile` calls. Before #690
+    /// this direction was wrong in *both* senses: `RequestSizeLimit` was falsely
+    /// reported `Accepted=True` (`grpc_reconcile` never resolves it —
+    /// `request_size_limits: None`) while `JwtAuth` (genuinely enforced) was
+    /// falsely reported `Accepted=False/UnsupportedValue`. `ALL_KNOWN_KINDS`
+    /// covers every coxswain `ExtensionRef` kind, not just the ones GRPCRoute
+    /// supports, so the HTTP-only kinds assert the negative case too.
+    #[test]
+    fn enforcement_and_status_extension_kind_sets_agree() {
+        use crate::gateway_api::route_status::RouteLike;
+        use crate::gw_types::v::grpcroutes::{
+            GrpcRouteRulesFilters, GrpcRouteRulesFiltersExtensionRef, GrpcRouteRulesFiltersType,
+        };
+
+        const ALL_KNOWN_KINDS: &[&str] = &[
+            "RateLimit",
+            "IpAccessControl",
+            "BasicAuth",
+            "RequestSizeLimit",
+            "Compression",
+            "ExternalAuth",
+            "RetryPolicy",
+            "JwtAuth",
+            "PathRewriteRegex",
+        ];
+
+        for &kind in ALL_KNOWN_KINDS {
+            let route = GrpcRoute {
+                metadata: ObjectMeta {
+                    name: Some("route".to_string()),
+                    namespace: Some("default".to_string()),
+                    ..Default::default()
+                },
+                spec: GrpcRouteSpec {
+                    parent_refs: Some(vec![GrpcRouteParentRefs {
+                        name: "gw".to_string(),
+                        namespace: Some("default".to_string()),
+                        ..Default::default()
+                    }]),
+                    rules: Some(vec![GrpcRouteRules {
+                        backend_refs: Some(vec![GrpcRouteRulesBackendRefs {
+                            name: "svc".to_string(),
+                            port: Some(80),
+                            ..Default::default()
+                        }]),
+                        filters: Some(vec![GrpcRouteRulesFilters {
+                            r#type: GrpcRouteRulesFiltersType::ExtensionRef,
+                            extension_ref: Some(GrpcRouteRulesFiltersExtensionRef {
+                                group: "gateway.coxswain-labs.dev".to_string(),
+                                kind: kind.to_string(),
+                                name: "does-not-exist".to_string(),
+                            }),
+                            ..Default::default()
+                        }]),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let enforcement_supports = crate::gateway_api::grpc_extension_kind_supported(
+                "gateway.coxswain-labs.dev",
+                kind,
+            );
+            let status_supports = !route.has_unsupported_filter();
+            assert_eq!(
+                enforcement_supports, status_supports,
+                "kind {kind}: enforcement supports={enforcement_supports}, \
+                 status supports={status_supports} — must agree"
+            );
+        }
     }
 }

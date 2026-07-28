@@ -1,0 +1,145 @@
+# Route-status ExtensionRef kind-list fixture (#690).
+#
+# One Gateway, six HTTPRoutes, all with a healthy backend (echo-a) and (except
+# good-route) a dangling ExtensionRef — the CR never exists, since only the
+# *kind* is under test here, not CR resolution (#689's route_status_ext_ref.yaml
+# already covers that):
+#   good-route             → no ExtensionRef                → Accepted=True (liveness gate)
+#   basicauth-route        → dangling BasicAuth ref          → Accepted=True (was False/UnsupportedValue)
+#   requestsizelimit-route → dangling RequestSizeLimit ref   → Accepted=True (was False/UnsupportedValue)
+#   compression-route      → dangling Compression ref        → Accepted=True (was False/UnsupportedValue)
+#   externalauth-route     → dangling ExternalAuth ref       → Accepted=True (was False/UnsupportedValue)
+#   unknown-kind-route     → dangling foreign-kind ref       → Accepted=False/UnsupportedValue (sad-path control)
+#
+# All routes attach to the listener and resolve their backendRef; they differ
+# only in which ExtensionRef kind they carry, isolating the #690
+# Accepted/UnsupportedValue assertion from backend-ref and ResolvedRefs
+# concerns. TESTNS is substituted with the test namespace at runtime.
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-test-kindcoverage
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: good-route
+spec:
+  parentRefs:
+    - name: coxswain-test-kindcoverage
+  hostnames:
+    - "good-kc.${TESTNS}.local"
+  rules:
+    - backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: basicauth-route
+spec:
+  parentRefs:
+    - name: coxswain-test-kindcoverage
+  hostnames:
+    - "basicauth-kc.${TESTNS}.local"
+  rules:
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: BasicAuth
+            name: does-not-exist
+      backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: requestsizelimit-route
+spec:
+  parentRefs:
+    - name: coxswain-test-kindcoverage
+  hostnames:
+    - "requestsizelimit-kc.${TESTNS}.local"
+  rules:
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: RequestSizeLimit
+            name: does-not-exist
+      backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: compression-route
+spec:
+  parentRefs:
+    - name: coxswain-test-kindcoverage
+  hostnames:
+    - "compression-kc.${TESTNS}.local"
+  rules:
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: Compression
+            name: does-not-exist
+      backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: externalauth-route
+spec:
+  parentRefs:
+    - name: coxswain-test-kindcoverage
+  hostnames:
+    - "externalauth-kc.${TESTNS}.local"
+  rules:
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: ExternalAuth
+            name: does-not-exist
+      backendRefs:
+        - name: echo-a
+          port: 3000
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: unknown-kind-route
+spec:
+  parentRefs:
+    - name: coxswain-test-kindcoverage
+  hostnames:
+    - "unknownkind-kc.${TESTNS}.local"
+  rules:
+    - filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.coxswain-labs.dev
+            kind: NotARealKind
+            name: does-not-exist
+      backendRefs:
+        - name: echo-a
+          port: 3000
