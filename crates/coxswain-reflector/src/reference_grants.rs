@@ -43,8 +43,10 @@ pub type GrantSet = HashSet<ReferenceGrantKey>;
 ///   resolving listener `certificateRefs` across namespaces).
 ///
 /// The filter rules mirror the Gateway API spec: `from.group` must be
-/// `gateway.networking.k8s.io` and `to.group` must be empty (core API group)
-/// or the literal `"core"`. A `to.name` of `None` flattens to a wildcard
+/// `gateway.networking.k8s.io` and `to.group` must be empty (the spec's only
+/// core-API-group spelling). Coxswain additionally accepts the literal
+/// `"core"` as a deliberate leniency, not a spec-sanctioned alias. A `to.name`
+/// of `None` flattens to a wildcard
 /// [`ReferenceGrantKey::wildcard`]; a `Some(name)` flattens to a
 /// [`ReferenceGrantKey::specific`].
 #[must_use]

@@ -67,9 +67,9 @@ pub(crate) fn resolve(req: &RequestHeader, group: &BackendGroup) -> AffinityDeci
 /// Inject the affinity `Set-Cookie` for the chosen `addr` under `cookie_name`.
 ///
 /// Value is `hex(affinity_token(addr))`; attributes are `Path=/; HttpOnly` (a session
-/// cookie — no `Max-Age`, since the annotation surface defines no lifetime). This is
-/// the one intentional owned-string allocation in cookie mode, emitted only when a
-/// fresh pin was established.
+/// cookie — no `Max-Age`, since `CoxswainBackendPolicy.sessionPersistence` carries no
+/// lifetime field). This is the one intentional owned-string allocation in cookie
+/// mode, emitted only when a fresh pin was established.
 ///
 /// # Errors
 /// Propagates Pingora's header-insertion error if the assembled value is rejected

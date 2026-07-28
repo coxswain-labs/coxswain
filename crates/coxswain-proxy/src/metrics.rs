@@ -172,8 +172,8 @@ pub(crate) fn request_duration_seconds() -> &'static HistogramVec {
 
 /// Counter: upstream-side request failures, classified by error type.
 ///
-/// Labels: `error_type ∈ {"connect", "timeout", "refused", "tls", "5xx", "other"}`.
-/// Incremented in `fail_to_proxy` (connect/timeout/refused/tls) and
+/// Labels: `error_type ∈ {"connect", "timeout", "5xx", "other"}`.
+/// Incremented in `fail_to_proxy` (connect/timeout/other) and
 /// `upstream_response_filter` (5xx). The `"other"` bucket catches Pingora
 /// error types not mapped explicitly so unexpected classes don't silently
 /// misattribute.

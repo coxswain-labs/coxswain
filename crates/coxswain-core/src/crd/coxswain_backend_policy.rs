@@ -194,7 +194,12 @@ pub struct BackendCircuitBreaker {
 /// endpoint address, or a rendezvous hash), so there is no session store to
 /// expire early; accepting those fields without enforcing them would be
 /// dishonest. `idleTimeout` is also omitted: Gateway API itself removed it
-/// from `SessionPersistence` in v1.6.0.
+/// from `SessionPersistence` in v1.6.0. Note that `type: Header` does not
+/// issue a session identity the way `Cookie` does — it consumes an
+/// already-present request header and rendezvous-hashes it to an endpoint,
+/// the same FNV-1a-plus-rendezvous selection `loadBalancer.algorithm:
+/// hash:header=` uses (though the two differ on an empty header value: this
+/// path hashes it as-is, `hash:header=` treats it as absent).
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct BackendSessionPersistence {

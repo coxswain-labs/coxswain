@@ -598,10 +598,13 @@ pub(super) fn build_predicates(
 
 /// Translate `HTTPBackendRef.filters` (per-backend filters) into `FilterAction`s.
 ///
-/// Per Gateway API GEP-1492, backendRef-scope filters may only be
-/// `RequestHeaderModifier` or `ResponseHeaderModifier`. Other types
-/// (`RequestRedirect`, `URLRewrite`, `RequestMirror`, `ExtensionRef`, `CORS`)
-/// are spec-invalid at backend-ref scope and are logged + skipped here. The
+/// Coxswain supports only `RequestHeaderModifier` and `ResponseHeaderModifier`
+/// at backend-ref scope; other types (`RequestRedirect`, `URLRewrite`,
+/// `RequestMirror`, `ExtensionRef`, `CORS`) are logged + skipped here. This is
+/// an implementation choice, not a spec requirement — the spec itself permits
+/// all of these inside `backendRefs` (`URLRewrite`/`RequestMirror`/`CORS` at
+/// `Support: Extended`, `RequestRedirect` at `Support: Core`, `ExtensionRef` at
+/// `Support: Implementation-specific`) and CEL-validates them there. The
 /// returned `Vec` is index-aligned with the caller's backendRef list.
 pub(super) fn build_backend_ref_filters(
     filters: &[HttpRouteRulesBackendRefsFilters],
@@ -684,8 +687,8 @@ pub(super) fn build_backend_ref_filters(
             _ => {
                 tracing::warn!(
                     filter_type = ?f.r#type,
-                    "Skipping spec-invalid per-backend filter type \
-                     (only RequestHeaderModifier and ResponseHeaderModifier are allowed at backendRef scope)"
+                    "Skipping unsupported per-backend filter type \
+                     (coxswain implements only RequestHeaderModifier and ResponseHeaderModifier at backendRef scope)"
                 );
             }
         }
@@ -909,10 +912,10 @@ pub(super) fn resolve_basic_auth<F: ExtRefFilter>(
 ///
 /// Returns `None` when no `ExternalAuth` ref is present (no ext-auth on the
 /// route) or the referenced CR is missing (fail-open — matches the other
-/// ExtensionRef resolvers). A present-but-broken backend (no endpoints, ungranted
-/// cross-namespace ref, unsupported protocol) fails **closed** via
-/// [`IngressAuthConfig::Unavailable`], resolved in
-/// [`super::external_auth::resolve_spec`].
+/// ExtensionRef resolvers). A present-but-broken backend (no endpoints,
+/// ungranted cross-namespace ref, or a `backendRef` that isn't a core
+/// `Service`) fails **closed** via [`IngressAuthConfig::Unavailable`], resolved
+/// in [`super::external_auth::resolve_spec`].
 pub(super) fn resolve_external_auth<F: ExtRefFilter>(
     filters: &[F],
     route_ns: &str,

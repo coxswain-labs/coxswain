@@ -81,7 +81,7 @@ pub(crate) fn new_ctx() -> ProxyCtx {
             resolved: None,
             request_deadline: None,
             request_timeout_is_controlling: false,
-            backend_request_timeout_active: false,
+            upstream_timeout_budget_active: false,
             selected_backend_filters: None,
             start: None,
             upstream_addr: None,
@@ -594,33 +594,38 @@ pub(crate) async fn upstream_peer(
     // Apply per-route timeout settings.
     //
     // Priority order (highest wins):
-    //   1. ingress connect/read/send timeouts (from ingress.coxswain-labs.dev/* annotations)
+    //   1. ingress read/send timeouts (from ingress.coxswain-labs.dev/* annotations);
+    //      connect has no ingress-annotation source — see `conn_timeout` below.
     //   2. backend_request timeout (from HTTPRoute.timeouts.backendRequest / merge_timeouts)
     //   3. request total-budget (remaining wall-clock from timeouts.request)
     //
     // connect: controls the TCP-connect phase → 502 on ConnectTimedout.
     // read:    controls the upstream response-read phase.
     // send:    controls the upstream request-send phase.
-    // backend_request: used when explicit connect/read are absent (legacy behaviour).
+    // backend_request: last connect fallback, and used as the read timeout when
+    // explicit read is absent (legacy behaviour); has no bearing on send/write.
     let remaining_request = ctx
         .request_deadline
         .and_then(|d| d.checked_duration_since(Instant::now()));
     let backend_timeout = resolved.timeouts.backend_request;
 
-    // Ingress-annotation-derived timeouts (may be None for GW-API routes).
+    // Ingress-annotation-derived read/send timeouts (may be None for GW-API routes).
+    // `explicit_connect` is always `None` — no reflector path sets
+    // `resolved.timeouts.connect` any more, see its doc — so it never wins below;
+    // the per-backend `CoxswainBackendPolicy` connect timeout does.
     let explicit_connect = resolved.timeouts.connect;
     let explicit_read = resolved.timeouts.read;
     let explicit_send = resolved.timeouts.send;
 
-    // Connection timeout precedence: an explicit per-route Ingress `connect-timeout`
-    // wins; else the per-backend `CoxswainBackendPolicy` connect timeout (#354); else
-    // the legacy `backend_request` budget.
+    // Connection timeout precedence: `explicit_connect` (always `None`, see above);
+    // else the per-backend `CoxswainBackendPolicy` connect timeout (#354); else the
+    // legacy `backend_request` budget.
     let conn_timeout = explicit_connect
         .or_else(|| resolved.backend_group.connect_timeout())
         .or(backend_timeout);
     if let Some(t) = conn_timeout {
         peer.options.connection_timeout = Some(t);
-        ctx.backend_request_timeout_active = true;
+        ctx.upstream_timeout_budget_active = true;
     }
 
     // Write (send) timeout: annotation-specific send.

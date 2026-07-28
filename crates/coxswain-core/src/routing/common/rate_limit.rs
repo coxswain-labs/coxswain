@@ -20,9 +20,11 @@ use std::sync::Arc;
 pub enum RateLimitKey {
     /// Limit by real client IP address (the default).
     ///
-    /// Uses the PROXY-protocol peer when present, else the L4 downstream peer
-    /// — the same resolution the allow-source-range filter uses. A request
-    /// whose peer address is indeterminate is admitted (fail-open); the proxy
+    /// PROXY-protocol peer if present, else L4 downstream peer. On an Ingress
+    /// route that also configures `trust-forwarded-for`, a trusted forwarded
+    /// header takes precedence over both — there is no equivalent
+    /// trusted-header surface for Gateway API routes today. A request whose
+    /// peer address is indeterminate is admitted (fail-open); the proxy
     /// cannot attribute it to a key and so cannot enforce a per-client limit.
     ClientIp,
 

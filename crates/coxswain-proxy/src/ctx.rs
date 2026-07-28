@@ -127,10 +127,14 @@ pub struct ProxyCtx {
     /// distinguish 504 from upstream errors without relying on wall-clock comparisons that can
     /// race against OS timer granularity.
     pub request_timeout_is_controlling: bool,
-    /// True when a `backendRequest` timeout was applied to this peer. Used in `fail_to_proxy` to
-    /// map ConnectTimedout and ReadTimedout/WriteTimedout to 504 (Gateway API spec requires 504
-    /// for both request and backendRequest timeout expiry).
-    pub backend_request_timeout_active: bool,
+    /// True when an upstream connect-timeout budget was applied to this peer — set in
+    /// `upstream_peer` from whichever of `CoxswainBackendPolicy`'s connect timeout or the legacy
+    /// `HTTPRoute.timeouts.backendRequest` budget resolved (see the connect-timeout precedence
+    /// there). Used in `fail_to_proxy`: a `ReadTimedout`/`WriteTimedout` under this budget maps to
+    /// 504 (Coxswain's choice — Gateway API's GEP-1742 mandates no status code here); a
+    /// `ConnectTimedout` under this same budget maps to 502 (connect failure is always
+    /// upstream-sourced).
+    pub upstream_timeout_budget_active: bool,
     /// Per-backend `RequestHeaderModifier` filters from
     /// `HTTPRoute.spec.rules[].backendRefs[].filters`, attached to whichever backend
     /// won weighted selection in `upstream_peer`. Applied AFTER the rule-level

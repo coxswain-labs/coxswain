@@ -213,8 +213,10 @@ pub struct GrpcExtAuthConfig {
     pub allowed_headers: Arc<[Box<str>]>,
     /// Header names to copy from the auth service's `OkHttpResponse.headers` onto
     /// the upstream *request* when the check allows (Envoy
-    /// `allowed_upstream_headers`; GEP-1494 `allowedResponseHeaders`). Lower-cased
-    /// at reconcile time for case-insensitive lookup.
+    /// `allowed_upstream_headers`). GEP-1494 defines `allowedResponseHeaders`
+    /// only on the HTTP transport's config type; there is no gRPC-side
+    /// equivalent in the spec, so this field is an Envoy-parity extension.
+    /// Lower-cased at reconcile time for case-insensitive lookup.
     pub response_headers: Arc<[Box<str>]>,
 }
 

@@ -37,9 +37,9 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 ///
 /// Returns [`IngressAuthConfig::Unavailable`] (fail-closed 503) when the
 /// backend has no ready endpoints, a cross-namespace ref lacks a
-/// `ReferenceGrant`, or the requested protocol is not yet supported. An
-/// operator who attached ext-auth expects enforcement, so a broken backend must
-/// never silently open the route.
+/// `ReferenceGrant`, or the `backendRef` is not a core `Service`. An operator
+/// who attached ext-auth expects enforcement, so a broken backend must never
+/// silently open the route.
 ///
 /// `pub(crate)` (not `pub(super)` like most Gateway API spec resolvers) —
 /// reused directly by [`crate::ingress::reconcile_helpers`] so the Ingress
@@ -183,7 +183,7 @@ fn earlier(a: Option<SystemTime>, b: Option<SystemTime>) -> bool {
 /// Gateway is ignored and produces no status entry.
 ///
 /// The resolved [`IngressAuthConfig`] fails **closed** (503) when the policy's
-/// `backendRef` has no endpoints or the protocol is unsupported — an accepted but
+/// `backendRef` has no endpoints or is not a core `Service` — an accepted but
 /// broken Gateway mandate denies rather than silently opening every route.
 ///
 /// # Errors

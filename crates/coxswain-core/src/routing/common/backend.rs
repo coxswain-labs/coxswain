@@ -22,9 +22,9 @@ use std::time::Duration;
 ///
 /// Stateless by construction (no server-side session map): the pin is encoded in the
 /// request itself, so affinity is naturally per-process and survives nothing across
-/// replicas — which is exactly the contract. Populated today only from the Ingress
-/// `ingress.coxswain-labs.dev/session-*` annotations; a backend with no affinity
-/// binding keeps plain weighted round-robin.
+/// replicas — which is exactly the contract. Populated from a `CoxswainBackendPolicy`
+/// `spec.sessionPersistence` attached to the target Service (#554); a backend with no
+/// affinity binding keeps plain weighted round-robin.
 #[derive(Clone, Debug)]
 pub enum SessionAffinity {
     /// Cookie mode: the proxy injects a cookie whose value is the endpoint token
@@ -413,11 +413,11 @@ pub struct BackendGroup {
     /// Upstream TCP-connect timeout for this backend, from a `CoxswainBackendPolicy`
     /// `spec.timeouts.connect` field attached to the target `Service` (#354).
     ///
-    /// `None` (the default) defers to the per-route connect timeout (Ingress
-    /// `connect-timeout` annotation) or, failing that, the Gateway API
-    /// `backendRequest` budget. When `Some`, the proxy applies it to
-    /// `HttpPeer.options.connection_timeout` in `upstream_peer`, after any
-    /// route-level connect override but before the `backendRequest` fallback.
+    /// `None` (the default) defers to the legacy `backendRequest` budget (there
+    /// is no other connect-timeout source: the former Ingress `connect-timeout`
+    /// annotation was removed). When `Some`, the proxy applies it to
+    /// `HttpPeer.options.connection_timeout` in `upstream_peer`, taking
+    /// precedence over the `backendRequest` fallback.
     connect_timeout: Option<std::time::Duration>,
     /// Per-route upstream load-balancing algorithm from the
     /// `ingress.coxswain-labs.dev/load-balance` annotation.
@@ -906,11 +906,10 @@ impl BackendGroup {
     /// `spec.timeouts.connect`, if any (#354).
     ///
     /// `None` means "no per-backend connect override" — the proxy falls back to
-    /// the per-route Ingress `connect-timeout` or the Gateway API `backendRequest`
-    /// budget. When `Some`, the proxy applies it to
-    /// `HttpPeer.options.connection_timeout` in `upstream_peer`, taking precedence
-    /// over the `backendRequest` fallback but not over an explicit route-level
-    /// connect override.
+    /// the legacy `backendRequest` budget (there is no other connect-timeout
+    /// source). When `Some`, the proxy applies it to
+    /// `HttpPeer.options.connection_timeout` in `upstream_peer`, taking
+    /// precedence over the `backendRequest` fallback.
     pub fn connect_timeout(&self) -> Option<std::time::Duration> {
         self.connect_timeout
     }

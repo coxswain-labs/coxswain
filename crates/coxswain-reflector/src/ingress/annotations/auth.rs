@@ -40,7 +40,7 @@ pub const AUTH_BASIC_SECRET: &str = "ingress.coxswain-labs.dev/auth-basic-secret
 /// in the chain must pass. Resolves to the same
 /// [`IngressAuthConfig::Jwt`][coxswain_core::routing::IngressAuthConfig::Jwt]
 /// the HTTPRoute `ExtensionRef` filter produces (Gateway API parity). A missing
-/// CR fails open (WARN, no JWT check); a present-but-unresolved JWKS fails
+/// CR fails closed (503, WARN); a present-but-unresolved JWKS also fails
 /// closed (503).
 pub const AUTH_JWT: &str = "ingress.coxswain-labs.dev/auth-jwt";
 
