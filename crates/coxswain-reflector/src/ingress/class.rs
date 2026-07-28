@@ -56,6 +56,19 @@ pub(crate) struct ResolvedClassParams {
     /// every Ingress claiming this class. Empty when the CR carries no (or an
     /// empty) `spec.defaultAnnotations`.
     pub default_annotations: BTreeMap<String, String>,
+    /// Namespace of the `CoxswainIngressClassParameters` CR that supplied
+    /// [`Self::default_annotations`] (#688). A `namespace/name` CR/Secret
+    /// reference sourced from a class default is admin-authored (an
+    /// `IngressClass` and its namespaced parameters CR both require elevated
+    /// RBAC to create), not tenant-authored — unlike the same annotation set
+    /// directly on an Ingress — so it is resolved relative to *this*
+    /// namespace rather than the claiming Ingress's own. A tenant who sets
+    /// the same annotation directly on their own Ingress still resolves
+    /// relative to the Ingress's namespace, never this one: the reconciler
+    /// distinguishes the two by checking whether the raw per-Ingress
+    /// annotation map already carries the key before falling back to the
+    /// class default.
+    pub default_annotations_ns: String,
     /// Per-class access-log enabled state, from `spec.accessLog`.
     ///
     /// `Some(false)` → suppress access-log lines for this class's routes.
@@ -140,6 +153,7 @@ pub(crate) fn resolve_class_params(
                 name.to_string(),
                 ResolvedClassParams {
                     default_annotations,
+                    default_annotations_ns: ns.to_string(),
                     access_log_enabled,
                 },
             );

@@ -1,0 +1,20 @@
+# Tenant namespace for the ext-auth cross-namespace rejection test (#688).
+#
+# Applied to a SEPARATE namespace from the Ingress under test. This
+# CoxswainExternalAuth CR is otherwise perfectly valid and would resolve to an
+# allow — the point of the test is that the Ingress's ext-auth annotation must
+# not be able to reach it at all: Ingress annotation references are locked to
+# the Ingress's own namespace (#688), unlike the Gateway API ExtensionRef
+# equivalent, which has no cross-namespace capability to begin with.
+#
+# Apply backends::AUTH_STUB to this same namespace before this fixture.
+---
+apiVersion: gateway.coxswain-labs.dev/v1alpha1
+kind: CoxswainExternalAuth
+metadata:
+  name: extauth-xns
+spec:
+  protocol: HTTP
+  backendRef:
+    name: auth-allow
+    port: 4000

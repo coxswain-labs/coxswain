@@ -2035,6 +2035,70 @@ async fn mirror_body_forwarded_without_max_body_size() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A `mirror-target` naming a Service in another namespace is rejected at
+/// reconcile time — the primary route serves normally, and no mirror
+/// sub-request ever fires (#688). `resolve_mirror_filter` has rejected
+/// cross-namespace mirror refs since #283 (the rationale: an Ingress author
+/// can only shadow traffic to Services they own), but until now the
+/// rejection had no e2e coverage of its own.
+#[tokio::test]
+async fn mirror_target_cross_namespace_rejected() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tp-ing-mirror-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "tp-ing-mirror-xns-tenant").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&tenant.name)).await?;
+    // Wait for BOTH namespaces' backends: the test's negative assertion below
+    // only proves the namespace guard if echo-b in ${tenant} is genuinely
+    // ready — otherwise `resolve_mirror_filter` would install an empty-endpoint
+    // mirror (still no ready endpoints → no dispatch, no mirror=true row) for
+    // an unrelated reason, and the test would pass even with the guard removed.
+    wait::wait_for_backends(&ns.name).await?;
+    wait::wait_for_backends(&tenant.name).await?;
+    fixtures::apply_fixture(
+        ingress::ANNOTATION_MIRROR_TARGET_XNS,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let host = format!("mirrorxns.{}.local", ns.name);
+    wait::wait_for_route(&h.http, &host, "/", Duration::from_secs(60))
+        .await?
+        .assert_backend("echo-a");
+
+    // Primary must serve normally — mirror rejection must never degrade it.
+    let (status, body) = h.http.request(Method::GET, &host, "/", &[]).await?;
+    assert_eq!(
+        status, 200,
+        "primary GET must succeed even though the mirror-target is cross-namespace \
+         and rejected; host={host}"
+    );
+    body.expect("primary response must carry echo JSON")
+        .assert_backend("echo-a");
+
+    // Redrive a few times, then assert no mirror=true row ever appeared — the
+    // target Service in ${tenant} genuinely exists and is ready, so a false
+    // pass here would mean the namespace guard silently stopped applying.
+    for _ in 0..3 {
+        let _ = h.http.request(Method::GET, &host, "/", &[]).await;
+    }
+    let logs = h.controller.shared_proxy_access_logs().await?;
+    let mirror_fired = logs.iter().any(|row| {
+        row.get("mirror").and_then(|v| v.as_bool()) == Some(true)
+            && row.get("host").and_then(|v| v.as_str()) == Some(host.as_str())
+    });
+    assert!(
+        !mirror_fired,
+        "mirror-target names a Service in another namespace ({}) — it must be \
+         rejected at reconcile time, so no mirror=true access-log row may appear \
+         for host={host}",
+        tenant.name
+    );
+
+    Ok(())
+}
+
 /// Baseline (sad/negative, #554): an Ingress backend Service with no attached
 /// `CoxswainBackendPolicy` keeps plain round-robin and never injects an
 /// affinity cookie.

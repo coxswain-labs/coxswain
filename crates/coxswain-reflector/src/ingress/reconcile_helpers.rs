@@ -4,7 +4,7 @@
 //! beside the reconcile entry point but out of it to bound that file's size.
 
 use super::annotations::AnnotationIssue;
-use super::annotations::auth::{SecretRef, parse_htpasswd};
+use super::annotations::auth::{ParsedRef, parse_htpasswd};
 use super::annotations::traffic_policy;
 use crate::MergedStore;
 use crate::endpoints::pool::EndpointCache;
@@ -142,23 +142,24 @@ pub(super) fn resolve_mirror_filter(
 /// `"auth"` key is parsed with [`parse_htpasswd`]. Any failure (missing
 /// secret, missing key, no parseable entries) emits a contextual `WARN` and
 /// returns `IngressAuthConfig::Unavailable` so the proxy fails closed with
-/// 503 rather than silently bypassing auth. `annotation: None` returns `None`
-/// (no basic-auth check configured).
+/// 503 rather than silently bypassing auth. `annotation: Absent` returns
+/// `None` (no basic-auth check configured); `Invalid` (malformed value, or a
+/// namespace other than the Ingress's own, #688) also fails **closed** —
+/// `IngressAuthConfig::Unavailable` — matching a missing Secret.
 pub(super) fn resolve_basic_auth_config(
-    annotation: Option<&SecretRef>,
+    annotation: &ParsedRef,
     auth_secrets: &MergedStore<Secret>,
     route_id: &str,
-    ingress_ns: &str,
     diag: &mut Vec<AnnotationIssue>,
 ) -> Option<IngressAuthConfig> {
-    let secret_ref = annotation?;
-    // The `auth-basic-secret` annotation is `namespace/name`; the
-    // namespace component defaults to the Ingress's own namespace.
-    let ns = if secret_ref.namespace.is_empty() {
-        ingress_ns
-    } else {
-        &secret_ref.namespace
+    let secret_ref = match annotation {
+        ParsedRef::Absent => return None,
+        ParsedRef::Invalid => return Some(IngressAuthConfig::Unavailable),
+        ParsedRef::Present(r) => r,
     };
+    // `ParsedRef::Present` guarantees `secret_ref.namespace` equals the
+    // Ingress's own namespace (#688) — cross-namespace values are `Invalid`.
+    let ns = &secret_ref.namespace;
     let key = reflector::ObjectRef::<Secret>::new(&secret_ref.name).within(ns);
     let Some(secret) = auth_secrets.get(&key) else {
         tracing::warn!(
@@ -226,28 +227,35 @@ pub(super) fn resolve_basic_auth_config(
 /// [`crate::gateway_api::external_auth::resolve_spec`] so both surfaces
 /// resolve the same CR to byte-identical runtime config.
 ///
-/// `annotation: None` (absent/malformed `ext-auth`) returns `None` — no
-/// external-auth check on the route. A present-but-missing CR fails
-/// **closed** (`Unavailable`, 503) — matching every other Ingress auth
-/// annotation resolver in this file: an operator who set `ext-auth` intends
-/// the route to require the check, so a stale or typo'd reference must not
-/// silently disable it. `policy_ns` passed to `resolve_spec` is the
-/// referenced CR's own namespace (`r.namespace`) — the CR's `backendRef` is
-/// resolved relative to where the CR lives, not the Ingress.
+/// `annotation: Absent` returns `None` — no external-auth check on the
+/// route. `Invalid` (malformed, or a namespace other than the Ingress's own,
+/// #688) and a present-but-missing CR both fail **closed** (`Unavailable`,
+/// 503) — matching every other Ingress auth annotation resolver in this
+/// file: an operator who set `ext-auth` intends the route to require the
+/// check, so a stale, typo'd, or cross-namespace reference must not silently
+/// disable it. `policy_ns` passed to `resolve_spec` is `ingress_ns` — always
+/// equal to the referenced CR's own namespace now that the annotation is
+/// namespace-locked, matching the `ExtensionRef` filter's convention of
+/// passing the referencing route's own namespace.
 pub(super) fn resolve_ext_auth_config(
-    annotation: Option<&SecretRef>,
+    annotation: &ParsedRef,
     external_auths: &MergedStore<CoxswainExternalAuth>,
     services: &MergedStore<Service>,
     endpoint_cache: &EndpointCache,
     backend_grants: &crate::reference_grants::GrantSet,
     route_id: &str,
+    ingress_ns: &str,
 ) -> Option<IngressAuthConfig> {
-    let r = annotation?;
-    let obj_ref = reflector::ObjectRef::<CoxswainExternalAuth>::new(&r.name).within(&r.namespace);
+    let r = match annotation {
+        ParsedRef::Absent => return None,
+        ParsedRef::Invalid => return Some(IngressAuthConfig::Unavailable),
+        ParsedRef::Present(r) => r,
+    };
+    let obj_ref = reflector::ObjectRef::<CoxswainExternalAuth>::new(&r.name).within(ingress_ns);
     let Some(cr) = external_auths.get(&obj_ref) else {
         tracing::warn!(
             ingress = %route_id,
-            namespace = %r.namespace,
+            namespace = %ingress_ns,
             name = %r.name,
             "CoxswainExternalAuth CR not found — failing closed (503)"
         );
@@ -255,7 +263,7 @@ pub(super) fn resolve_ext_auth_config(
     };
     Some(crate::gateway_api::external_auth::resolve_spec(
         &cr.spec,
-        &r.namespace,
+        ingress_ns,
         services,
         endpoint_cache,
         backend_grants,
@@ -268,20 +276,26 @@ pub(super) fn resolve_ext_auth_config(
 /// [`crate::gateway_api::jwt_auth::resolve_spec`] so both surfaces resolve the
 /// same CR to byte-identical runtime config.
 ///
-/// `annotation: None` (absent/malformed `auth-jwt`) returns `None` — no JWT
-/// check on the route. A present-but-missing CR fails **closed**
-/// (`Unavailable`, 503) — matching every other Ingress auth annotation
-/// resolver in this file (`auth-basic-secret`, `auth-url`): an operator who
-/// set `auth-jwt` intends the route to require a bearer token, so a stale or
-/// typo'd reference must not silently disable authentication. A present CR
-/// with an unresolved JWKS also fails **closed** inside `resolve_spec`.
+/// `annotation: Absent` returns `None` — no JWT check on the route.
+/// `Invalid` (malformed, or a namespace other than the Ingress's own, #688)
+/// and a present-but-missing CR both fail **closed** (`Unavailable`, 503) —
+/// matching every other Ingress auth annotation resolver in this file
+/// (`auth-basic-secret`, `ext-auth`): an operator who set `auth-jwt` intends
+/// the route to require a bearer token, so a stale, typo'd, or
+/// cross-namespace reference must not silently disable authentication. A
+/// present CR with an unresolved JWKS also fails **closed** inside
+/// `resolve_spec`.
 pub(super) fn resolve_jwt_auth_config(
-    annotation: Option<&super::annotations::auth::SecretRef>,
+    annotation: &ParsedRef,
     jwt_auths: &MergedStore<coxswain_core::crd::JwtAuth>,
     jwks_cache: &crate::jwks::JwksCacheHandle,
     route_id: &str,
 ) -> Option<IngressAuthConfig> {
-    let r = annotation?;
+    let r = match annotation {
+        ParsedRef::Absent => return None,
+        ParsedRef::Invalid => return Some(IngressAuthConfig::Unavailable),
+        ParsedRef::Present(r) => r,
+    };
     let obj_ref =
         reflector::ObjectRef::<coxswain_core::crd::JwtAuth>::new(&r.name).within(&r.namespace);
     let Some(cr) = jwt_auths.get(&obj_ref) else {
@@ -306,18 +320,20 @@ pub(super) fn resolve_jwt_auth_config(
 /// [`crate::gateway_api::compression::resolve_spec`] so both surfaces resolve
 /// the same CR to byte-identical runtime config.
 ///
-/// `annotation: None` (absent/malformed `compression`) returns `None` — no
-/// compression on the route. Unlike every auth resolver in this file, a
-/// present-but-missing CR (or one with both `gzip`/`brotli` disabled) fails
-/// **open** — `None`, no compression — matching the HTTPRoute `ExtensionRef`
-/// path's fail-open posture: a broken compression reference degrades to
-/// uncompressed responses, not a 503.
+/// `annotation: Absent` or `Invalid` (malformed, or cross-namespace, #688)
+/// returns `None` — no compression on the route. Unlike every auth resolver
+/// in this file, a present-but-missing CR (or one with both `gzip`/`brotli`
+/// disabled) also fails **open** — `None`, no compression — matching the
+/// HTTPRoute `ExtensionRef` path's fail-open posture: a broken compression
+/// reference degrades to uncompressed responses, not a 503.
 pub(super) fn resolve_compression_config(
-    annotation: Option<&SecretRef>,
+    annotation: &ParsedRef,
     compressions: &MergedStore<Compression>,
     route_id: &str,
 ) -> Option<Arc<CompressionConfig>> {
-    let r = annotation?;
+    let ParsedRef::Present(r) = annotation else {
+        return None;
+    };
     let obj_ref = reflector::ObjectRef::<Compression>::new(&r.name).within(&r.namespace);
     let Some(cr) = compressions.get(&obj_ref) else {
         tracing::warn!(
@@ -340,17 +356,18 @@ pub(super) fn resolve_compression_config(
 /// same CR to byte-identical runtime config. Ingress is HTTP-only, so
 /// `is_grpc` is always `false`.
 ///
-/// `annotation: None` (absent/malformed `retry`) returns
-/// [`RetryPolicyConfig::default()`] — no retries. Unlike every auth resolver
-/// in this file, a present-but-missing CR fails **open** — the default
-/// disabled policy — matching the HTTPRoute `ExtensionRef` path's fail-open
-/// posture: a broken retry reference degrades to no retries, not a 503.
+/// `annotation: Absent` or `Invalid` (malformed, or cross-namespace, #688)
+/// returns [`RetryPolicyConfig::default()`] — no retries. Unlike every auth
+/// resolver in this file, a present-but-missing CR also fails **open** — the
+/// default disabled policy — matching the HTTPRoute `ExtensionRef` path's
+/// fail-open posture: a broken retry reference degrades to no retries, not a
+/// 503.
 pub(super) fn resolve_retry_config(
-    annotation: Option<&SecretRef>,
+    annotation: &ParsedRef,
     retry_policies: &MergedStore<RetryPolicy>,
     route_id: &str,
 ) -> RetryPolicyConfig {
-    let Some(r) = annotation else {
+    let ParsedRef::Present(r) = annotation else {
         return RetryPolicyConfig::default();
     };
     let obj_ref = reflector::ObjectRef::<RetryPolicy>::new(&r.name).within(&r.namespace);
@@ -374,7 +391,8 @@ pub(super) fn resolve_retry_config(
 /// [`crate::gateway_api::rate_limit::resolve_spec`] so both surfaces resolve
 /// the same CR to byte-identical runtime config.
 ///
-/// A missing CR fails **open** (`None`, no rate limiting) — unlike the auth
+/// A missing CR (or an `Invalid` — malformed or cross-namespace, #688 —
+/// reference) fails **open** (`None`, no rate limiting) — unlike the auth
 /// resolvers above, a broken rate-limit reference degrades gracefully rather
 /// than blocking traffic.
 ///
@@ -384,13 +402,15 @@ pub(super) fn resolve_retry_config(
 /// `has_auth` (computed by the caller from the Ingress's own auth annotations)
 /// suppresses the advisory when an auth check is also configured on the route.
 pub(super) fn resolve_rate_limit_config(
-    annotation: Option<&SecretRef>,
+    annotation: &ParsedRef,
     rate_limits: &MergedStore<RateLimit>,
     route_id: &str,
     has_auth: bool,
     diag: &mut Vec<AnnotationIssue>,
 ) -> Option<Arc<RateLimitConfig>> {
-    let r = annotation?;
+    let ParsedRef::Present(r) = annotation else {
+        return None;
+    };
     let obj_ref = reflector::ObjectRef::<RateLimit>::new(&r.name).within(&r.namespace);
     let Some(cr) = rate_limits.get(&obj_ref) else {
         tracing::warn!(
@@ -426,18 +446,19 @@ pub(super) fn resolve_rate_limit_config(
 /// [`crate::gateway_api::ip_access_control::resolve_spec`] so both surfaces
 /// resolve the same CR to byte-identical CIDR sets.
 ///
-/// A missing CR fails **open** (`(None, None)`, no IP filtering) — matching
+/// A missing CR (or an `Invalid` — malformed or cross-namespace, #688 —
+/// reference) fails **open** (`(None, None)`, no IP filtering) — matching
 /// the `ExtensionRef` path's fail-open posture: a broken reference degrades to
 /// unfiltered traffic rather than blocking every request.
 pub(super) fn resolve_ip_access_control_config(
-    annotation: Option<&SecretRef>,
+    annotation: &ParsedRef,
     ip_access_controls: &MergedStore<IpAccessControl>,
     route_id: &str,
 ) -> (
     crate::gateway_api::ip_access_control::CidrSet,
     crate::gateway_api::ip_access_control::CidrSet,
 ) {
-    let Some(r) = annotation else {
+    let ParsedRef::Present(r) = annotation else {
         return (None, None);
     };
     let obj_ref = reflector::ObjectRef::<IpAccessControl>::new(&r.name).within(&r.namespace);
@@ -497,6 +518,7 @@ pub(super) fn resolve_host_builder<'b>(
 
 #[cfg(test)]
 mod tests {
+    use super::super::annotations::auth::SecretRef;
     use super::*;
     use crate::tests::fixtures::{
         empty_compression_store, empty_external_auth_store, empty_ip_access_store,
@@ -540,23 +562,40 @@ mod tests {
         }
     }
 
+    fn present(namespace: &str, name: &str) -> ParsedRef {
+        ParsedRef::Present(secret_ref(namespace, name))
+    }
+
     #[test]
     fn resolve_basic_auth_config_absent_annotation_is_none() {
         let store = empty_secret_store();
         let mut diag = vec![];
         assert!(
-            resolve_basic_auth_config(None, &store, "default/ing", "default", &mut diag).is_none()
+            resolve_basic_auth_config(&ParsedRef::Absent, &store, "default/ing", &mut diag)
+                .is_none()
         );
     }
 
     #[test]
     fn resolve_basic_auth_config_missing_secret_fails_closed() {
-        let r = secret_ref("default", "absent");
+        let r = present("default", "absent");
+        let store = empty_secret_store();
+        let mut diag = vec![];
+        let resolved = resolve_basic_auth_config(&r, &store, "default/ing", &mut diag)
+            .expect("missing Secret must still install a check (fail closed)");
+        assert!(matches!(resolved, IngressAuthConfig::Unavailable));
+    }
+
+    /// #688: a malformed value or a cross-namespace reference must fail
+    /// closed exactly like a missing Secret — the `ParsedRef` conversion
+    /// already collapsed both into `Invalid` at parse time.
+    #[test]
+    fn resolve_basic_auth_config_invalid_ref_fails_closed() {
         let store = empty_secret_store();
         let mut diag = vec![];
         let resolved =
-            resolve_basic_auth_config(Some(&r), &store, "default/ing", "default", &mut diag)
-                .expect("missing Secret must still install a check (fail closed)");
+            resolve_basic_auth_config(&ParsedRef::Invalid, &store, "default/ing", &mut diag)
+                .expect("an invalid reference must still install a check (fail closed)");
         assert!(matches!(resolved, IngressAuthConfig::Unavailable));
     }
 
@@ -567,7 +606,16 @@ mod tests {
         let cache = endpoint_cache(vec![]);
         let grants = crate::reference_grants::GrantSet::default();
         assert!(
-            resolve_ext_auth_config(None, &store, &svcs, &cache, &grants, "default/ing").is_none()
+            resolve_ext_auth_config(
+                &ParsedRef::Absent,
+                &store,
+                &svcs,
+                &cache,
+                &grants,
+                "default/ing",
+                "default"
+            )
+            .is_none()
         );
     }
 
@@ -576,14 +624,34 @@ mod tests {
         // Every other Ingress auth annotation resolver in this file fails
         // closed on a missing referenced resource; `ext-auth` must match, not
         // silently disable the auth check an operator asked for.
-        let r = secret_ref("default", "absent");
+        let r = present("default", "absent");
         let store = empty_external_auth_store();
         let svcs = empty_svc_store();
         let cache = endpoint_cache(vec![]);
         let grants = crate::reference_grants::GrantSet::default();
         let resolved =
-            resolve_ext_auth_config(Some(&r), &store, &svcs, &cache, &grants, "default/ing")
+            resolve_ext_auth_config(&r, &store, &svcs, &cache, &grants, "default/ing", "default")
                 .expect("missing CR must still install a check (fail closed)");
+        assert!(matches!(resolved, IngressAuthConfig::Unavailable));
+    }
+
+    #[test]
+    fn resolve_ext_auth_config_invalid_ref_fails_closed() {
+        // #688: mirrors `resolve_basic_auth_config_invalid_ref_fails_closed`.
+        let store = empty_external_auth_store();
+        let svcs = empty_svc_store();
+        let cache = endpoint_cache(vec![]);
+        let grants = crate::reference_grants::GrantSet::default();
+        let resolved = resolve_ext_auth_config(
+            &ParsedRef::Invalid,
+            &store,
+            &svcs,
+            &cache,
+            &grants,
+            "default/ing",
+            "default",
+        )
+        .expect("an invalid reference must still install a check (fail closed)");
         assert!(matches!(resolved, IngressAuthConfig::Unavailable));
     }
 
@@ -591,7 +659,9 @@ mod tests {
     fn resolve_jwt_auth_config_absent_annotation_is_none() {
         let store = empty_jwt_auth_store();
         let cache = empty_jwks_cache();
-        assert!(resolve_jwt_auth_config(None, &store, &cache, "default/ing").is_none());
+        assert!(
+            resolve_jwt_auth_config(&ParsedRef::Absent, &store, &cache, "default/ing").is_none()
+        );
     }
 
     #[test]
@@ -599,18 +669,28 @@ mod tests {
         // Every other Ingress auth annotation resolver in this file fails
         // closed on a missing referenced resource; `auth-jwt` must match, not
         // silently disable the auth check an operator asked for.
-        let r = secret_ref("default", "absent");
+        let r = present("default", "absent");
         let store = empty_jwt_auth_store();
         let cache = empty_jwks_cache();
-        let resolved = resolve_jwt_auth_config(Some(&r), &store, &cache, "default/ing")
+        let resolved = resolve_jwt_auth_config(&r, &store, &cache, "default/ing")
             .expect("missing CR must still install a check (fail closed)");
+        assert!(matches!(resolved, IngressAuthConfig::Unavailable));
+    }
+
+    #[test]
+    fn resolve_jwt_auth_config_invalid_ref_fails_closed() {
+        // #688: mirrors `resolve_basic_auth_config_invalid_ref_fails_closed`.
+        let store = empty_jwt_auth_store();
+        let cache = empty_jwks_cache();
+        let resolved = resolve_jwt_auth_config(&ParsedRef::Invalid, &store, &cache, "default/ing")
+            .expect("an invalid reference must still install a check (fail closed)");
         assert!(matches!(resolved, IngressAuthConfig::Unavailable));
     }
 
     #[test]
     fn resolve_compression_config_absent_annotation_is_none() {
         let store = empty_compression_store();
-        assert!(resolve_compression_config(None, &store, "default/ing").is_none());
+        assert!(resolve_compression_config(&ParsedRef::Absent, &store, "default/ing").is_none());
     }
 
     #[test]
@@ -621,15 +701,23 @@ mod tests {
         // "resolved" and "both-disabled" cases are covered by
         // `gateway_api::compression::resolve_spec`'s own test module, which
         // this function delegates to.
-        let r = secret_ref("default", "absent");
+        let r = present("default", "absent");
         let store = empty_compression_store();
-        assert!(resolve_compression_config(Some(&r), &store, "default/ing").is_none());
+        assert!(resolve_compression_config(&r, &store, "default/ing").is_none());
+    }
+
+    /// #688: an `Invalid` reference (malformed or cross-namespace) degrades
+    /// exactly like a missing CR for this fail-open annotation.
+    #[test]
+    fn resolve_compression_config_invalid_ref_fails_open() {
+        let store = empty_compression_store();
+        assert!(resolve_compression_config(&ParsedRef::Invalid, &store, "default/ing").is_none());
     }
 
     #[test]
     fn resolve_retry_config_absent_annotation_is_disabled_default() {
         let store = empty_retry_policy_store();
-        assert!(resolve_retry_config(None, &store, "default/ing").is_disabled());
+        assert!(resolve_retry_config(&ParsedRef::Absent, &store, "default/ing").is_disabled());
     }
 
     #[test]
@@ -639,16 +727,26 @@ mod tests {
         // matching the HTTPRoute ExtensionRef path. The "resolved" case is
         // covered by `gateway_api::retry::resolve_spec`'s own test module,
         // which this function delegates to.
-        let r = secret_ref("default", "absent");
+        let r = present("default", "absent");
         let store = empty_retry_policy_store();
-        assert!(resolve_retry_config(Some(&r), &store, "default/ing").is_disabled());
+        assert!(resolve_retry_config(&r, &store, "default/ing").is_disabled());
+    }
+
+    #[test]
+    fn resolve_retry_config_invalid_ref_fails_open() {
+        // #688: mirrors `resolve_compression_config_invalid_ref_fails_open`.
+        let store = empty_retry_policy_store();
+        assert!(resolve_retry_config(&ParsedRef::Invalid, &store, "default/ing").is_disabled());
     }
 
     #[test]
     fn resolve_rate_limit_config_absent_annotation_is_none() {
         let store = empty_rate_limit_store();
         let mut diag = vec![];
-        assert!(resolve_rate_limit_config(None, &store, "default/ing", false, &mut diag).is_none());
+        assert!(
+            resolve_rate_limit_config(&ParsedRef::Absent, &store, "default/ing", false, &mut diag)
+                .is_none()
+        );
         assert!(diag.is_empty());
     }
 
@@ -659,25 +757,35 @@ mod tests {
         // limit", matching the HTTPRoute/GRPCRoute ExtensionRef path. The
         // "resolved" case is covered by `gateway_api::rate_limit::resolve_spec`'s
         // own test module, which this function delegates to.
-        let r = secret_ref("default", "absent");
+        let r = present("default", "absent");
+        let store = empty_rate_limit_store();
+        let mut diag = vec![];
+        assert!(resolve_rate_limit_config(&r, &store, "default/ing", false, &mut diag).is_none());
+        assert!(diag.is_empty());
+    }
+
+    #[test]
+    fn resolve_rate_limit_config_invalid_ref_fails_open() {
+        // #688: mirrors `resolve_compression_config_invalid_ref_fails_open`.
         let store = empty_rate_limit_store();
         let mut diag = vec![];
         assert!(
-            resolve_rate_limit_config(Some(&r), &store, "default/ing", false, &mut diag).is_none()
+            resolve_rate_limit_config(&ParsedRef::Invalid, &store, "default/ing", false, &mut diag)
+                .is_none()
         );
         assert!(diag.is_empty());
     }
 
     #[test]
     fn resolve_rate_limit_config_header_without_auth_pushes_diag() {
-        let r = secret_ref("default", "by-header");
+        let r = present("default", "by-header");
         let store = make_rate_limit_store(vec![rate_limit_cr(
             "default",
             "by-header",
             Some("X-Api-Key"),
         )]);
         let mut diag = vec![];
-        let cfg = resolve_rate_limit_config(Some(&r), &store, "default/ing", false, &mut diag)
+        let cfg = resolve_rate_limit_config(&r, &store, "default/ing", false, &mut diag)
             .expect("resolved");
         assert_eq!(cfg.key, RateLimitKey::Header(Arc::from("x-api-key")));
         assert_eq!(diag.len(), 1);
@@ -686,34 +794,31 @@ mod tests {
 
     #[test]
     fn resolve_rate_limit_config_header_with_auth_no_diag() {
-        let r = secret_ref("default", "by-header");
+        let r = present("default", "by-header");
         let store = make_rate_limit_store(vec![rate_limit_cr(
             "default",
             "by-header",
             Some("X-Api-Key"),
         )]);
         let mut diag = vec![];
-        assert!(
-            resolve_rate_limit_config(Some(&r), &store, "default/ing", true, &mut diag).is_some()
-        );
+        assert!(resolve_rate_limit_config(&r, &store, "default/ing", true, &mut diag).is_some());
         assert!(diag.is_empty());
     }
 
     #[test]
     fn resolve_rate_limit_config_ip_keyed_no_diag_regardless_of_auth() {
-        let r = secret_ref("default", "ip-keyed");
+        let r = present("default", "ip-keyed");
         let store = make_rate_limit_store(vec![rate_limit_cr("default", "ip-keyed", None)]);
         let mut diag = vec![];
-        assert!(
-            resolve_rate_limit_config(Some(&r), &store, "default/ing", false, &mut diag).is_some()
-        );
+        assert!(resolve_rate_limit_config(&r, &store, "default/ing", false, &mut diag).is_some());
         assert!(diag.is_empty());
     }
 
     #[test]
     fn resolve_ip_access_control_config_absent_annotation_is_none() {
         let store = empty_ip_access_store();
-        let (allow, deny) = resolve_ip_access_control_config(None, &store, "default/ing");
+        let (allow, deny) =
+            resolve_ip_access_control_config(&ParsedRef::Absent, &store, "default/ing");
         assert!(allow.is_none());
         assert!(deny.is_none());
     }
@@ -726,23 +831,33 @@ mod tests {
         // "resolved" case is covered by
         // `gateway_api::ip_access_control::resolve_spec`'s own test module,
         // which this function delegates to.
-        let r = secret_ref("default", "absent");
+        let r = present("default", "absent");
         let store = empty_ip_access_store();
-        let (allow, deny) = resolve_ip_access_control_config(Some(&r), &store, "default/ing");
+        let (allow, deny) = resolve_ip_access_control_config(&r, &store, "default/ing");
+        assert!(allow.is_none());
+        assert!(deny.is_none());
+    }
+
+    #[test]
+    fn resolve_ip_access_control_config_invalid_ref_fails_open() {
+        // #688: mirrors `resolve_compression_config_invalid_ref_fails_open`.
+        let store = empty_ip_access_store();
+        let (allow, deny) =
+            resolve_ip_access_control_config(&ParsedRef::Invalid, &store, "default/ing");
         assert!(allow.is_none());
         assert!(deny.is_none());
     }
 
     #[test]
     fn resolve_ip_access_control_config_present_cr_resolves_allow_and_deny() {
-        let r = secret_ref("default", "policy");
+        let r = present("default", "policy");
         let store = make_ip_access_store(vec![ip_access_cr(
             "default",
             "policy",
             &["203.0.113.0/24"],
             &["10.0.0.0/8"],
         )]);
-        let (allow, deny) = resolve_ip_access_control_config(Some(&r), &store, "default/ing");
+        let (allow, deny) = resolve_ip_access_control_config(&r, &store, "default/ing");
         assert_eq!(
             *allow.expect("allow set"),
             vec!["203.0.113.0/24".parse::<ipnet::IpNet>().expect("valid")]

@@ -236,11 +236,19 @@ impl IngressReconciler {
 
         // Parse ingress.coxswain-labs.dev/* annotations once per Ingress.
         // Invalid values WARN + use default; the Ingress is never dropped.
+        // `ingress.metadata.annotations` (unmerged) lets `parse` distinguish a
+        // tenant-authored value (resolved against `ns`) from one sourced
+        // purely from the class default (resolved against the class
+        // parameters CR's own namespace, #688) for the seven namespace-locked
+        // CR/Secret reference annotations.
         let (ann, mut annotation_issues) = IngressAnnotations::parse(
             merged_annotations
                 .as_ref()
                 .or(ingress.metadata.annotations.as_ref()),
+            ingress.metadata.annotations.as_ref(),
+            resolved_params.map(|p| p.default_annotations_ns.as_str()),
             &route_id,
+            ns,
         );
 
         // Build the Ingress-wide base filter list once.  Header modifiers and the generic
@@ -279,7 +287,7 @@ impl IngressReconciler {
         // ExtensionRef path uses (#553); a missing IpAccessControl CR fails open (no
         // filtering), unlike the auth resolvers below.
         let (allow_source_range, deny_source_range) = resolve_ip_access_control_config(
-            ann.ip_access_control.as_ref(),
+            &ann.ip_access_control,
             auth_stores.ip_access_controls,
             &route_id,
         );
@@ -288,22 +296,22 @@ impl IngressReconciler {
         // `auth-jwt` (#441) are independently additive — every configured
         // check must pass, mirroring the HTTPRoute ExtensionRef chain (#23).
         let basic_auth = resolve_basic_auth_config(
-            ann.auth_basic.as_ref(),
+            &ann.auth_basic,
             auth_stores.auth_secrets,
             &route_id,
-            ns,
             &mut annotation_issues,
         );
         let ext_auth = resolve_ext_auth_config(
-            ann.auth_ext.as_ref(),
+            &ann.auth_ext,
             auth_stores.external_auths,
             services,
             endpoint_cache,
             auth_stores.backend_grants,
             &route_id,
+            ns,
         );
         let jwt_auth = resolve_jwt_auth_config(
-            ann.auth_jwt.as_ref(),
+            &ann.auth_jwt,
             auth_stores.jwt_auths,
             auth_stores.jwks_cache,
             &route_id,
@@ -317,26 +325,22 @@ impl IngressReconciler {
         // Resolved via the same `resolve_spec` the HTTPRoute ExtensionRef path uses
         // (#550); a missing/no-op Compression CR fails open (no compression), unlike
         // the auth resolvers above.
-        let compression = resolve_compression_config(
-            ann.compression.as_ref(),
-            auth_stores.compressions,
-            &route_id,
-        );
+        let compression =
+            resolve_compression_config(&ann.compression, auth_stores.compressions, &route_id);
         // Build the retry policy once and share it across every backend group.
         // Resolved via the same `resolve_spec` the HTTPRoute ExtensionRef path uses
         // (#551); a missing RetryPolicy CR fails open (no retries), unlike the auth
         // resolvers above.
-        let retries =
-            resolve_retry_config(ann.retry.as_ref(), auth_stores.retry_policies, &route_id);
+        let retries = resolve_retry_config(&ann.retry, auth_stores.retry_policies, &route_id);
         // Build the rate-limit config once and share one Arc across every route entry.
         // Resolved via the same `resolve_spec` the HTTPRoute/GRPCRoute ExtensionRef path
         // uses (#552); a missing RateLimit CR fails open (no rate limiting), unlike the
         // auth resolvers above. `has_auth` mirrors the auth-family checks above and
         // suppresses the header-keying bypass-risk advisory (#411) when an auth check
         // is also configured on this Ingress.
-        let has_auth = ann.auth_ext.is_some() || ann.auth_basic.is_some();
+        let has_auth = ann.auth_ext.is_present() || ann.auth_basic.is_present();
         let rate_limit = resolve_rate_limit_config(
-            ann.rate_limit.as_ref(),
+            &ann.rate_limit,
             auth_stores.rate_limits,
             &route_id,
             has_auth,
@@ -2604,8 +2608,21 @@ mod tests {
     // ── Class-level annotation defaults (#190) ────────────────────────────────
 
     /// Per-class params map keyed by IngressClass name, with one annotation each.
+    /// The backing `CoxswainIngressClassParameters` CR is fixed at namespace
+    /// `class-ns` (#688) — irrelevant to callers that don't exercise a
+    /// namespace-locked CR/Secret reference annotation.
     fn class_defaults(
         class: &str,
+        anns: &[(&str, &str)],
+    ) -> HashMap<String, crate::ingress::ResolvedClassParams> {
+        class_defaults_in_ns(class, "class-ns", anns)
+    }
+
+    /// Like [`class_defaults`] but with an explicit backing-CR namespace, for
+    /// tests exercising the #688 class-default namespace carve-out.
+    fn class_defaults_in_ns(
+        class: &str,
+        params_ns: &str,
         anns: &[(&str, &str)],
     ) -> HashMap<String, crate::ingress::ResolvedClassParams> {
         use crate::ingress::ResolvedClassParams;
@@ -2618,6 +2635,7 @@ mod tests {
             class.to_string(),
             ResolvedClassParams {
                 default_annotations: map,
+                default_annotations_ns: params_ns.to_string(),
                 access_log_enabled: None,
             },
         );

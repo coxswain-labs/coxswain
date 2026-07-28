@@ -59,9 +59,10 @@ pub struct BasicAuthSpec {
 pub struct BasicAuthSecretRef {
     /// Secret name.
     pub name: String,
-    /// Secret namespace. Required — mirrors the explicit `namespace/name`
-    /// form of the Ingress `auth-basic-secret` annotation; no `ReferenceGrant`
-    /// is required for cross-namespace refs, matching that precedent.
+    /// Secret namespace. Required. A cross-namespace reference requires a
+    /// matching `BasicAuth → Secret` `ReferenceGrant` (#520) — unlike the
+    /// Ingress `auth-basic-secret` annotation, which is locked to the
+    /// Ingress's own namespace and has no grant model (#688).
     pub namespace: String,
 }
 

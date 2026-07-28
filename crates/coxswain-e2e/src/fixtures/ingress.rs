@@ -211,6 +211,16 @@ pub const ANNOTATION_EXT_AUTH_DENY: &str = fixture!("annotation_ext_auth_deny.ya
 /// `backends::AUTH_STUB` being applied first.
 pub const ANNOTATION_EXT_AUTH_ALLOW_RESPONSE_HEADERS: &str =
     fixture!("annotation_ext_auth_allow_response_headers.yaml");
+/// Tenant-namespace `CoxswainExternalAuth` CR for the ext-auth cross-namespace
+/// rejection test (#688). Apply `backends::AUTH_STUB` to the same namespace
+/// first; otherwise identical to `ANNOTATION_EXT_AUTH_ALLOW`'s CR.
+pub const ANNOTATION_EXT_AUTH_XNS_TENANT: &str = fixture!("annotation_ext_auth_xns_tenant.yaml");
+/// Route-namespace Ingress whose `ext-auth` names the tenant-namespace CR from
+/// `ANNOTATION_EXT_AUTH_XNS_TENANT` via `${TENANTNS}` (#688). The reference
+/// must be rejected (503) even though the CR would otherwise resolve to an
+/// allow, proving Ingress `ext-auth` refs are locked to the Ingress's own
+/// namespace.
+pub const ANNOTATION_EXT_AUTH_XNS_ROUTE: &str = fixture!("annotation_ext_auth_xns_route.yaml");
 /// Labeled htpasswd Secret for basic-auth e2e tests (#24).
 /// Carries `ingress.coxswain-labs.dev/auth-basic: "true"` so the reflector picks it up.
 /// Contains: `alice` (bcrypt, password `secret`) + `bob` (SHA1, password `secret`).
@@ -231,11 +241,26 @@ pub const ANNOTATION_AUTH_BASIC: &str = fixture!("annotation_auth_basic.yaml");
 /// Ingress with `auth-basic-secret` pointing at the UNLABELED Secret (#24 fail-closed).
 /// Used to verify the proxy returns 503 when the Secret is not opt-in labeled.
 pub const ANNOTATION_AUTH_BASIC_UNLABELED: &str = fixture!("annotation_auth_basic_unlabeled.yaml");
+/// Route-namespace Ingress whose `auth-basic-secret` names the labeled htpasswd
+/// Secret (`AUTH_BASIC_SECRET`, applied to a tenant namespace) via `${TENANTNS}`
+/// (#688 cross-namespace rejection). The reference must be rejected (503) even
+/// for valid `alice:secret` credentials, proving Ingress `auth-basic-secret`
+/// refs are locked to the Ingress's own namespace.
+pub const ANNOTATION_AUTH_BASIC_XNS_ROUTE: &str = fixture!("annotation_auth_basic_xns_route.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/auth-jwt` naming a `JwtAuth` CR
 /// (inline JWKS, ES256 test key) — Ingress parity with
 /// `gateway_api::JWT_AUTH_EXTENSIONREF` (#441). Sign matching tokens via
 /// [`crate::jwt`].
 pub const ANNOTATION_AUTH_JWT: &str = fixture!("annotation_auth_jwt.yaml");
+/// Tenant-namespace `JwtAuth` CR for the auth-jwt cross-namespace rejection
+/// test (#688); otherwise identical to `ANNOTATION_AUTH_JWT`'s CR.
+pub const ANNOTATION_AUTH_JWT_XNS_TENANT: &str = fixture!("annotation_auth_jwt_xns_tenant.yaml");
+/// Route-namespace Ingress whose `auth-jwt` names the tenant-namespace CR from
+/// `ANNOTATION_AUTH_JWT_XNS_TENANT` via `${TENANTNS}` (#688). The reference
+/// must be rejected (503) even for a token that would validate against that
+/// CR, proving Ingress `auth-jwt` refs are locked to the Ingress's own
+/// namespace.
+pub const ANNOTATION_AUTH_JWT_XNS_ROUTE: &str = fixture!("annotation_auth_jwt_xns_route.yaml");
 /// Per-class annotation defaults via `IngressClass.spec.parameters` (#190): a
 /// `CoxswainIngressClassParameters` CR sets a default `rewrite-target`, one
 /// Ingress inherits it and a second overrides it per-key. The IngressClass is
@@ -275,6 +300,12 @@ pub const ANNOTATION_MIRROR_TARGET_UNREACHABLE: &str =
 /// appears even when `max-body-size` is absent.
 pub const ANNOTATION_MIRROR_TARGET_NO_MAX_BODY: &str =
     fixture!("annotation_mirror_target_no_max_body.yaml");
+/// Ingress with `ingress.coxswain-labs.dev/mirror-target: "echo-b.${TENANTNS}.svc:3000"`
+/// (#688 cross-namespace rejection). Apply `backends::ECHO` to `${TENANTNS}` too
+/// so the target genuinely exists and is ready. `resolve_mirror_filter` rejects
+/// the cross-namespace reference: the primary route serves normally and no
+/// mirror sub-request ever fires.
+pub const ANNOTATION_MIRROR_TARGET_XNS: &str = fixture!("annotation_mirror_target_xns.yaml");
 /// Ingress with `ingress.coxswain-labs.dev/compression: "TESTNS/compression-gzip"`
 /// referencing a `Compression` CR (`gzip: true`, `level: 6`,
 /// `types: [application/json,...]`, `minSize: 1`) (#550, formerly #270's inline
@@ -319,6 +350,15 @@ pub const AUTH_TLS_CA_SECRET: &str = fixture!("auth_tls_ca_secret.yaml");
 /// Requires `SECRET_NAME`, `TLS_CRT_B64`, `TLS_KEY_B64` fixture vars; host is
 /// `mtls.TESTNS.local`. Apply `AUTH_TLS_CA_SECRET` first.
 pub const ANNOTATION_AUTH_TLS: &str = fixture!("annotation_auth_tls.yaml");
+/// Route-namespace TLS-terminated Ingress whose `auth-tls-secret` names the
+/// labeled CA Secret (`AUTH_TLS_CA_SECRET`, applied to a tenant namespace) via
+/// `${TENANTNS}` (#688 cross-namespace rejection). Every TLS handshake to this
+/// host must be aborted — even one presenting a client cert signed by that
+/// exact CA — proving Ingress `auth-tls-secret` refs are locked to the
+/// Ingress's own namespace. Requires `SECRET_NAME`, `TLS_CRT_B64`,
+/// `TLS_KEY_B64` fixture vars; host is `mtlsxns.TESTNS.local`. Apply
+/// `AUTH_TLS_CA_SECRET` to `${TENANTNS}` first.
+pub const ANNOTATION_AUTH_TLS_XNS_ROUTE: &str = fixture!("annotation_auth_tls_xns_route.yaml");
 
 // ── load-balance (#275, #276, converged to CoxswainBackendPolicy in #554) ────
 

@@ -1,0 +1,30 @@
+# Route namespace for the ext-auth cross-namespace rejection test (#688).
+#
+# The Ingress's ext-auth annotation names a CoxswainExternalAuth CR in
+# ${TENANTNS} — a namespace other than the Ingress's own (${TESTNS}). This
+# must fail closed (503) even though the referenced CR (see
+# annotation_ext_auth_xns_tenant.yaml) would resolve to an allow if the
+# cross-namespace reference were honored — proving the rejection is the
+# namespace guard, not a missing-CR fallback.
+#
+# Host: extauthxns.TESTNS.local / -> echo-a:3000 (never reached — fails closed).
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ext-auth-xns-ingress
+  annotations:
+    ingress.coxswain-labs.dev/ext-auth: "${TENANTNS}/extauth-xns"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: extauthxns.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000

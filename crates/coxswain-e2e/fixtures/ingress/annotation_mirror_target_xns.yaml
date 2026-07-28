@@ -1,0 +1,33 @@
+# mirror-target cross-namespace rejection fixture (#688).
+#
+# The Ingress's mirror-target names echo-b in ${TENANTNS} — a namespace other
+# than the Ingress's own (${TESTNS}). resolve_mirror_filter already rejects
+# this (reconcile_helpers.rs), but the rejection previously had no e2e
+# coverage. The primary request must still reach echo-a normally; only the
+# mirror is disabled (controller warning, no mirror sub-request ever fires).
+#
+# Apply backends::ECHO to BOTH ${TESTNS} (primary echo-a) and ${TENANTNS}
+# (target echo-b) before this fixture.
+#
+# Host: mirrorxns.TESTNS.local -> echo-a:3000 (primary, still served); mirror
+# to echo-b.TENANTNS.svc:3000 is rejected at reconcile time.
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mirror-target-xns-ingress
+  annotations:
+    ingress.coxswain-labs.dev/mirror-target: "echo-b.${TENANTNS}.svc:3000"
+spec:
+  ingressClassName: coxswain
+  rules:
+    - host: mirrorxns.${TESTNS}.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: echo-a
+                port:
+                  number: 3000
