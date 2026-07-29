@@ -20,13 +20,16 @@ use crate::gw_types::{
 };
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
+use crate::reference_grants::{
+    BasicAuthSecret, ExternalAuthBackend, GatewayCert, GrantSet, HttpRouteBackend, ListenerSetCert,
+};
 use crate::status::{GatewayListenerStatus, ListenerInfo, ListenerReadiness, ListenerStatusKey};
 use coxswain_core::crd::{
     BasicAuth, Compression, CoxswainExternalAuth, IpAccessControl, JwtAuth, PathRewriteRegex,
     RateLimit, RequestSizeLimit, RetryPolicy,
 };
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::reference_grants::{self, ReferenceGrantKey};
+use coxswain_core::reference_grants::{self};
 use coxswain_core::routing::{
     BackendClientCert, BackendGroup, BackendProtocol, CompressionConfig, FilterAction,
     GatewayRoutingTableBuilder, HostRouterBuilder, IngressAuthConfig, MatchPredicates,
@@ -83,7 +86,7 @@ pub struct RouteResolution<'a> {
     /// `CoxswainExternalAuth` CR store for resolving `ExternalAuth` `ExtensionRef`
     /// filters on `HTTPRouteRule`s into per-route ext_authz config (#23).
     /// HTTPRoute-only. The auth-service `backendRef` is resolved to endpoints
-    /// against `services`/`endpoint_cache`, gated by the same backend `grants`.
+    /// against `services`/`endpoint_cache`, gated by `external_auth_grants`.
     pub external_auths: &'a MergedStore<CoxswainExternalAuth>,
     /// Per-Gateway ext-auth mandate from `CoxswainExternalAuth` policies attached
     /// via `targetRefs` (#23, GEP-713). A route bound to a Gateway present here has
@@ -105,7 +108,13 @@ pub struct RouteResolution<'a> {
     /// `secretRef.namespace` differs from the route namespace requires a matching
     /// grant; without one the cross-namespace ref fails closed, so a tenant cannot
     /// bind another namespace's auth Secret.
-    pub basic_auth_secret_grants: &'a HashSet<ReferenceGrantKey>,
+    pub basic_auth_secret_grants: &'a GrantSet<BasicAuthSecret>,
+    /// `CoxswainExternalAuth → Service` ReferenceGrants (#691) gating the CR's own
+    /// `backendRef` when it names a Service outside the CR's namespace. Distinct
+    /// from the route's own `backend_grants` (`from.kind: HTTPRoute`) — an
+    /// HTTPRoute-scoped grant must not authorize the ext-auth CR's backendRef,
+    /// and vice versa.
+    pub external_auth_grants: &'a GrantSet<ExternalAuthBackend>,
     /// `RequestSizeLimit` CR store for resolving `ExtensionRef` filters on
     /// `HTTPRouteRule`s (#443). HTTPRoute-only — NOT enforced on GRPCRoute (#509): a
     /// mid-stream body cap on HTTP/2 deadlocks the client under pingora, and gRPC
@@ -227,7 +236,7 @@ impl GatewayApiReconciler {
         endpoint_cache: &EndpointCache,
         services: &MergedStore<Service>,
         owned_gateways: &HashSet<ObjectKey>,
-        grants: &HashSet<ReferenceGrantKey>,
+        grants: &GrantSet<HttpRouteBackend>,
         resolution: RouteResolution<'_>,
         builder: &mut GatewayRoutingTableBuilder,
     ) {
@@ -246,6 +255,7 @@ impl GatewayApiReconciler {
             jwks_cache,
             auth_secrets,
             basic_auth_secret_grants,
+            external_auth_grants,
             request_size_limits,
             compressions,
             backend_client_certs,
@@ -559,7 +569,7 @@ impl GatewayApiReconciler {
                 external_auths,
                 services,
                 endpoint_cache,
-                grants,
+                external_auth_grants,
             );
             let (jwt_auth, jwt_auth_missing) =
                 super::filters::resolve_jwt_auth(rule_filters, route_ns, jwt_auths, jwks_cache);
@@ -660,7 +670,7 @@ fn resolve_weighted_backends(
     route_ns: &str,
     endpoint_cache: &EndpointCache,
     services: &MergedStore<Service>,
-    grants: &HashSet<ReferenceGrantKey>,
+    grants: &GrantSet<HttpRouteBackend>,
 ) -> Vec<(
     Arc<endpoints::ResolvedEndpoints>,
     Option<endpoints::EndpointKey>,
@@ -765,7 +775,7 @@ struct RuleContext<'a> {
     route_ns: &'a str,
     endpoint_cache: &'a EndpointCache,
     services: &'a MergedStore<Service>,
-    grants: &'a HashSet<ReferenceGrantKey>,
+    grants: &'a GrantSet<HttpRouteBackend>,
 }
 
 /// Installs one HTTPRoute rule into a `HostRouterBuilder`.
@@ -1116,8 +1126,8 @@ impl GatewayApiReconciler {
     pub(crate) fn reconcile_tls(
         target: &GatewayTlsTarget<'_>,
         secrets: &MergedStore<Secret>,
-        cert_grants: &HashSet<ReferenceGrantKey>,
-        ls_cert_grants: &HashSet<ReferenceGrantKey>,
+        cert_grants: &GrantSet<GatewayCert>,
+        ls_cert_grants: &GrantSet<ListenerSetCert>,
         builder: &mut PortTlsStoreBuilder,
     ) -> GatewayListenerStatus {
         let mut map = BTreeMap::new();
@@ -1173,7 +1183,7 @@ impl GatewayApiReconciler {
                     target.gw_name,
                     listener,
                     secrets,
-                    grants,
+                    &grants,
                     builder,
                     bind_port,
                     !vip_pending,
@@ -1232,7 +1242,7 @@ impl GatewayApiReconciler {
                     target.gw_name,
                     listener,
                     secrets,
-                    grants,
+                    &grants,
                     builder,
                     bind_port,
                     !vip_pending,
@@ -1314,11 +1324,13 @@ mod tests {
         secrets_w.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
         let secrets = MergedStore::single(secrets_w.as_reader());
 
-        // The grant lives in the WRONG set (Gateway-from). The cross-namespace
-        // check must ignore it → RefNotPermitted.
-        let grant: HashSet<ReferenceGrantKey> =
-            std::iter::once(ReferenceGrantKey::specific("team-a", "certs", "cert")).collect();
-        let empty = HashSet::new();
+        // The same flattened key, wrapped as both flavors below: the same grant
+        // data must be honored as `GrantSet<ListenerSetCert>` and ignored as
+        // `GrantSet<GatewayCert>` — kind isolation is now a type-level property
+        // of which `GrantSet<K>` a caller was handed, not a call-site convention.
+        let key = ReferenceGrantKey::specific("team-a", "certs", "cert");
+        let cert_grant: GrantSet<GatewayCert> = std::iter::once(key.clone()).collect();
+        let ls_cert_grant: GrantSet<ListenerSetCert> = std::iter::once(key).collect();
         // Provide a real internal_port so VipPending doesn't short-circuit cert validation.
         let ports = HashMap::from([(8443u16, 30001u16)]);
         let mut builder = PortTlsStoreBuilder::new();
@@ -1329,8 +1341,8 @@ mod tests {
                 internal_ports: &ports,
             },
             &secrets,
-            &grant, // cert_grants (Gateway-from) — must NOT permit an LS listener
-            &empty, // ls_cert_grants empty
+            &cert_grant, // cert_grants (Gateway-from) — must NOT permit an LS listener
+            &GrantSet::empty(), // ls_cert_grants empty
             &mut builder,
         );
         let outcome =
@@ -1351,8 +1363,8 @@ mod tests {
                 internal_ports: &ports,
             },
             &secrets,
-            &empty, // cert_grants empty
-            &grant, // ls_cert_grants (ListenerSet-from) — permits the LS listener
+            &GrantSet::empty(), // cert_grants empty
+            &ls_cert_grant,     // ls_cert_grants (ListenerSet-from) — permits the LS listener
             &mut builder2,
         );
         let outcome2 =
@@ -1401,7 +1413,6 @@ mod tests {
             conflict: ConflictReason::None,
         };
         let secrets = empty_secrets();
-        let empty = HashSet::new();
         let mut builder = PortTlsStoreBuilder::new();
         let health = GatewayApiReconciler::reconcile_tls(
             &GatewayTlsTarget {
@@ -1410,8 +1421,8 @@ mod tests {
                 internal_ports: &HashMap::new(), // no VIP → internal_port = 0
             },
             &secrets,
-            &empty, // no cert_grants
-            &empty, // no ls_cert_grants → the cross-ns ref is not permitted
+            &GrantSet::empty(), // no cert_grants
+            &GrantSet::empty(), // no ls_cert_grants → the cross-ns ref is not permitted
             &mut builder,
         );
         let outcome =
@@ -1466,7 +1477,6 @@ mod tests {
     fn tls_passthrough_without_vip_is_pending() {
         let listener = tls_listener("TLS", true);
         let secrets = empty_secrets();
-        let empty = HashSet::new();
         let mut builder = PortTlsStoreBuilder::new();
         let health = GatewayApiReconciler::reconcile_tls(
             &GatewayTlsTarget {
@@ -1475,8 +1485,8 @@ mod tests {
                 internal_ports: &HashMap::new(), // no VIP yet
             },
             &secrets,
-            &empty,
-            &empty,
+            &GrantSet::empty(),
+            &GrantSet::empty(),
             &mut builder,
         );
         let outcome = &health.listeners[&ListenerStatusKey::gateway("tls")].readiness;
@@ -1491,7 +1501,6 @@ mod tests {
     fn tls_passthrough_with_vip_is_healthy() {
         let listener = tls_listener("TLS", true);
         let secrets = empty_secrets();
-        let empty = HashSet::new();
         let mut builder = PortTlsStoreBuilder::new();
         let health = GatewayApiReconciler::reconcile_tls(
             &GatewayTlsTarget {
@@ -1500,8 +1509,8 @@ mod tests {
                 internal_ports: &std::collections::HashMap::from([(8443u16, 30001u16)]),
             },
             &secrets,
-            &empty,
-            &empty,
+            &GrantSet::empty(),
+            &GrantSet::empty(),
             &mut builder,
         );
         let outcome = &health.listeners[&ListenerStatusKey::gateway("tls")].readiness;
@@ -1546,7 +1555,6 @@ mod tests {
     fn tls_terminate_resolved_cert_without_vip_defers_install() {
         let listener = tls_listener("TLS", false);
         let secrets = make_secret_store(vec![resolvable_tls_secret("default", "cert")]);
-        let empty = HashSet::new();
         let mut builder = PortTlsStoreBuilder::new();
         let health = GatewayApiReconciler::reconcile_tls(
             &GatewayTlsTarget {
@@ -1555,8 +1563,8 @@ mod tests {
                 internal_ports: &HashMap::new(), // no VIP yet
             },
             &secrets,
-            &empty,
-            &empty,
+            &GrantSet::empty(),
+            &GrantSet::empty(),
             &mut builder,
         );
         let outcome = &health.listeners[&ListenerStatusKey::gateway("tls")].readiness;
@@ -1576,7 +1584,6 @@ mod tests {
     fn tls_terminate_missing_cert_is_invalid_even_without_vip() {
         let listener = tls_listener("TLS", false);
         let secrets = empty_secrets();
-        let empty = HashSet::new();
         let mut builder = PortTlsStoreBuilder::new();
         let health = GatewayApiReconciler::reconcile_tls(
             &GatewayTlsTarget {
@@ -1585,8 +1592,8 @@ mod tests {
                 internal_ports: &HashMap::new(), // no VIP yet
             },
             &secrets,
-            &empty,
-            &empty,
+            &GrantSet::empty(),
+            &GrantSet::empty(),
             &mut builder,
         );
         let outcome = &health.listeners[&ListenerStatusKey::gateway("tls")].readiness;
@@ -1625,7 +1632,6 @@ mod tests {
     fn tcp_proxy_without_vip_is_pending() {
         let listener = l4_listener("TCP");
         let secrets = empty_secrets();
-        let empty = HashSet::new();
         let mut builder = PortTlsStoreBuilder::new();
         let health = GatewayApiReconciler::reconcile_tls(
             &GatewayTlsTarget {
@@ -1634,8 +1640,8 @@ mod tests {
                 internal_ports: &HashMap::new(), // no VIP yet
             },
             &secrets,
-            &empty,
-            &empty,
+            &GrantSet::empty(),
+            &GrantSet::empty(),
             &mut builder,
         );
         let outcome = &health.listeners[&ListenerStatusKey::gateway("l4-proxy")].readiness;
@@ -1651,7 +1657,6 @@ mod tests {
     fn tcp_proxy_with_vip_is_healthy() {
         let listener = l4_listener("TCP");
         let secrets = empty_secrets();
-        let empty = HashSet::new();
         let mut builder = PortTlsStoreBuilder::new();
         let health = GatewayApiReconciler::reconcile_tls(
             &GatewayTlsTarget {
@@ -1660,8 +1665,8 @@ mod tests {
                 internal_ports: &HashMap::from([(5000u16, 30002u16)]),
             },
             &secrets,
-            &empty,
-            &empty,
+            &GrantSet::empty(),
+            &GrantSet::empty(),
             &mut builder,
         );
         let outcome = &health.listeners[&ListenerStatusKey::gateway("l4-proxy")].readiness;
@@ -1676,7 +1681,6 @@ mod tests {
     fn udp_proxy_without_vip_is_pending() {
         let listener = l4_listener("UDP");
         let secrets = empty_secrets();
-        let empty = HashSet::new();
         let mut builder = PortTlsStoreBuilder::new();
         let health = GatewayApiReconciler::reconcile_tls(
             &GatewayTlsTarget {
@@ -1685,8 +1689,8 @@ mod tests {
                 internal_ports: &HashMap::new(), // no VIP yet
             },
             &secrets,
-            &empty,
-            &empty,
+            &GrantSet::empty(),
+            &GrantSet::empty(),
             &mut builder,
         );
         let outcome = &health.listeners[&ListenerStatusKey::gateway("l4-proxy")].readiness;
@@ -1706,7 +1710,6 @@ mod tests {
     fn udp_proxy_with_vip_is_healthy() {
         let listener = l4_listener("UDP");
         let secrets = empty_secrets();
-        let empty = HashSet::new();
         let mut builder = PortTlsStoreBuilder::new();
         let health = GatewayApiReconciler::reconcile_tls(
             &GatewayTlsTarget {
@@ -1715,8 +1718,8 @@ mod tests {
                 internal_ports: &HashMap::from([(5000u16, 30003u16)]),
             },
             &secrets,
-            &empty,
-            &empty,
+            &GrantSet::empty(),
+            &GrantSet::empty(),
             &mut builder,
         );
         let outcome = &health.listeners[&ListenerStatusKey::gateway("l4-proxy")].readiness;
@@ -1741,7 +1744,7 @@ mod tests {
             "svc",
         );
         let mut builder = RoutingTableBuilder::new();
-        let grants = HashSet::new();
+        let grants = GrantSet::empty();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
@@ -1762,7 +1765,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1791,7 +1795,7 @@ mod tests {
             "svc",
         );
         let mut builder = RoutingTableBuilder::new();
-        let grants = HashSet::new();
+        let grants = GrantSet::empty();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
@@ -1812,7 +1816,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1841,7 +1846,7 @@ mod tests {
             "svc",
         );
         let mut builder = RoutingTableBuilder::new();
-        let grants = HashSet::new();
+        let grants = GrantSet::empty();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
@@ -1862,7 +1867,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1883,7 +1889,7 @@ mod tests {
         let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
-        let grants = HashSet::new();
+        let grants = GrantSet::empty();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
@@ -1904,7 +1910,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1924,7 +1931,7 @@ mod tests {
         let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
-        let grants = HashSet::new();
+        let grants = GrantSet::empty();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
@@ -1945,7 +1952,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2004,7 +2012,7 @@ mod tests {
         };
 
         let mut builder = RoutingTableBuilder::new();
-        let grants = HashSet::new();
+        let grants = GrantSet::empty();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
@@ -2025,7 +2033,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2060,7 +2069,7 @@ mod tests {
             "svc",
         );
         let mut builder = RoutingTableBuilder::new();
-        let grants = HashSet::new();
+        let grants = GrantSet::empty();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
@@ -2081,7 +2090,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2141,7 +2151,7 @@ mod tests {
         };
 
         let mut builder = RoutingTableBuilder::new();
-        let grants = HashSet::new();
+        let grants = GrantSet::empty();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
@@ -2162,7 +2172,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2233,7 +2244,7 @@ mod tests {
         };
 
         let mut builder = RoutingTableBuilder::new();
-        let grants = HashSet::new();
+        let grants = GrantSet::empty();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
@@ -2254,7 +2265,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2300,7 +2312,7 @@ mod tests {
             "svc",
         );
         let mut builder = RoutingTableBuilder::new();
-        let grants = HashSet::new();
+        let grants = GrantSet::empty();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
@@ -2321,7 +2333,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2406,7 +2419,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -2421,7 +2434,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2463,7 +2477,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -2478,7 +2492,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2512,7 +2527,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -2527,7 +2542,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2563,7 +2579,7 @@ mod tests {
             &endpoint_cache(vec![]),
             &crate::tests::fixtures::make_svc_store(vec![svc]),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -2578,7 +2594,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2606,7 +2623,7 @@ mod tests {
             &endpoint_cache(vec![]),
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -2621,7 +2638,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2688,7 +2706,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -2703,7 +2721,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2753,7 +2772,7 @@ mod tests {
             &endpoint_cache(vec![]),
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -2768,7 +2787,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2817,7 +2837,7 @@ mod tests {
             store,
             svcs,
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index,
@@ -2832,7 +2852,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2988,7 +3009,7 @@ mod tests {
             &endpoint_cache(vec![]),
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -3003,7 +3024,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -3059,7 +3081,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -3074,7 +3096,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -3165,7 +3188,8 @@ mod tests {
                     jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                     jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                     auth_secrets: &empty_secret_store(),
-                    basic_auth_secret_grants: &HashSet::new(),
+                    basic_auth_secret_grants: &GrantSet::empty(),
+                    external_auth_grants: &GrantSet::empty(),
                     request_size_limits: &empty_request_size_limit_store(),
                     compressions: &empty_compression_store(),
                     backend_client_certs: &HashMap::new(),

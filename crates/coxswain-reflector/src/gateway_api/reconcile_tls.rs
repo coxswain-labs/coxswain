@@ -15,10 +15,11 @@
 use crate::MergedStore;
 use crate::gw_types::v::httproutes::HttpRouteParentRefs;
 use crate::reconciler::listener_merge::EffectiveListener;
+use crate::reference_grants::{GatewayCert, GrantSet, ListenerSetCert};
 use crate::status::{ListenerReadiness, ListenerSource};
 use crate::tls::load_tls_cert;
 use coxswain_core::ownership::{ObjectKey, parent_ref_owned};
-use coxswain_core::reference_grants::{self, ReferenceGrantKey};
+use coxswain_core::reference_grants::{self};
 use coxswain_core::routing::BackendClientCert;
 use coxswain_core::tls::PortTlsStoreBuilder;
 use k8s_openapi::api::core::v1::Secret;
@@ -88,18 +89,45 @@ pub(crate) struct GatewayTlsTarget<'a> {
     pub(crate) internal_ports: &'a HashMap<u16, u16>,
 }
 
+/// The applicable cross-namespace cert `ReferenceGrant` set for one listener,
+/// resolved once by [`grants_for_source`] and threaded opaquely into
+/// [`resolve_listener_tls`].
+///
+/// An enum rather than a single `&GrantSet<K>`: `K` (`GatewayCert` vs
+/// `ListenerSetCert`) is picked at runtime by the listener's source, not
+/// statically by the caller, so the two grant-set flavors can't be unified
+/// behind one generic parameter here the way [`backend_ref_allowed`] is
+/// elsewhere — this wrapper is what still lets both flow through a single
+/// per-listener resolution path without losing the compile-time kind
+/// isolation [`crate::reference_grants::GrantSet`] provides.
+pub(super) enum ListenerCertGrants<'g> {
+    Gateway(&'g GrantSet<GatewayCert>),
+    ListenerSet(&'g GrantSet<ListenerSetCert>),
+}
+
+impl ListenerCertGrants<'_> {
+    fn allows(&self, from_ns: &str, to_ns: &str, to_name: &str) -> bool {
+        match self {
+            Self::Gateway(g) => reference_grants::backend_ref_allowed(from_ns, to_ns, to_name, g),
+            Self::ListenerSet(g) => {
+                reference_grants::backend_ref_allowed(from_ns, to_ns, to_name, g)
+            }
+        }
+    }
+}
+
 /// Select the applicable ReferenceGrant set for a listener based on its source kind.
 ///
 /// A `Gateway` listener's cross-namespace cert is permitted by `from.kind: Gateway` grants;
 /// a `ListenerSet` listener's by `from.kind: ListenerSet` grants (GEP-1713).
 pub(super) fn grants_for_source<'g>(
     source: &ListenerSource,
-    cert_grants: &'g HashSet<ReferenceGrantKey>,
-    ls_cert_grants: &'g HashSet<ReferenceGrantKey>,
-) -> &'g HashSet<ReferenceGrantKey> {
+    cert_grants: &'g GrantSet<GatewayCert>,
+    ls_cert_grants: &'g GrantSet<ListenerSetCert>,
+) -> ListenerCertGrants<'g> {
     match source {
-        ListenerSource::Gateway => cert_grants,
-        ListenerSource::ListenerSet(_) => ls_cert_grants,
+        ListenerSource::Gateway => ListenerCertGrants::Gateway(cert_grants),
+        ListenerSource::ListenerSet(_) => ListenerCertGrants::ListenerSet(ls_cert_grants),
     }
 }
 
@@ -120,7 +148,7 @@ pub(super) fn resolve_listener_tls(
     gw_name: &str,
     listener: &EffectiveListener,
     secrets: &MergedStore<Secret>,
-    cert_grants: &HashSet<ReferenceGrantKey>,
+    cert_grants: &ListenerCertGrants<'_>,
     builder: &mut PortTlsStoreBuilder,
     bind_port: u16,
     install_certs: bool,
@@ -179,14 +207,7 @@ pub(super) fn resolve_listener_tls(
 
         let ref_ns = cert_ref.namespace.as_deref().unwrap_or(owning_ns);
 
-        if ref_ns != owning_ns
-            && !reference_grants::backend_ref_allowed(
-                owning_ns,
-                ref_ns,
-                &cert_ref.name,
-                cert_grants,
-            )
-        {
+        if ref_ns != owning_ns && !cert_grants.allows(owning_ns, ref_ns, &cert_ref.name) {
             tracing::warn!(
                 gateway = %format!("{gw_name}"),
                 listener = %listener.name,

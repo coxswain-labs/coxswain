@@ -1,0 +1,21 @@
+# Cross-namespace GRPCRoute: tenant-side grant of the WRONG kind (#691, apply
+# to TENANTNS after backends::GRPC_ECHO).
+#
+# `from.kind: HTTPRoute` — NOT GRPCRoute. Proves a GRPCRoute's cross-namespace
+# backendRef is not silently authorized by an HTTPRoute-scoped grant (the core
+# defect #691 fixed: before the fix, GRPCRoute backendRefs were checked
+# against the HTTPRoute grant set). Pair with gwa::GRPC_CROSS_NAMESPACE_ROUTE
+# applied to TESTNS — the backendRef must still be denied.
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-httproute-from-${TESTNS}
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: ${TESTNS}
+  to:
+    - group: ""
+      kind: Service

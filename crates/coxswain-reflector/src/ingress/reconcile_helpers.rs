@@ -242,7 +242,9 @@ pub(super) fn resolve_ext_auth_config(
     external_auths: &MergedStore<CoxswainExternalAuth>,
     services: &MergedStore<Service>,
     endpoint_cache: &EndpointCache,
-    backend_grants: &crate::reference_grants::GrantSet,
+    external_auth_grants: &crate::reference_grants::GrantSet<
+        crate::reference_grants::ExternalAuthBackend,
+    >,
     route_id: &str,
     ingress_ns: &str,
 ) -> Option<IngressAuthConfig> {
@@ -266,7 +268,7 @@ pub(super) fn resolve_ext_auth_config(
         ingress_ns,
         services,
         endpoint_cache,
-        backend_grants,
+        external_auth_grants,
     ))
 }
 

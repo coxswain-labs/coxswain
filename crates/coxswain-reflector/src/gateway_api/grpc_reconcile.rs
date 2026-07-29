@@ -21,9 +21,10 @@ use crate::gw_types::{
 };
 use crate::k8s_utils::metadata_created_at;
 use crate::keys::ListenerKey;
+use crate::reference_grants::{GrantSet, GrpcRouteBackend};
 use coxswain_core::crd::{IpAccessControl, JwtAuth, RateLimit, RetryPolicy};
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::reference_grants::{self, ReferenceGrantKey};
+use coxswain_core::reference_grants::{self};
 use coxswain_core::routing::{
     BackendGroup, BackendProtocol, FilterAction, GatewayRoutingTableBuilder, HeaderMod,
     HeaderPredicate, HostRouterBuilder, IngressAuthConfig, MatchPredicates, RouteEntry,
@@ -143,7 +144,7 @@ pub(super) fn reconcile(
     endpoint_cache: &EndpointCache,
     services: &MergedStore<Service>,
     owned_gateways: &HashSet<ObjectKey>,
-    grants: &HashSet<ReferenceGrantKey>,
+    grants: &GrantSet<GrpcRouteBackend>,
     resolution: GrpcRouteResolution<'_>,
     builder: &mut GatewayRoutingTableBuilder,
 ) {
@@ -793,7 +794,7 @@ fn resolve_weighted_backends(
     route_ns: &str,
     endpoint_cache: &EndpointCache,
     services: &MergedStore<Service>,
-    grants: &HashSet<ReferenceGrantKey>,
+    grants: &GrantSet<GrpcRouteBackend>,
 ) -> Vec<(
     Arc<endpoints::ResolvedEndpoints>,
     Option<endpoints::EndpointKey>,
@@ -1430,7 +1431,7 @@ mod tests {
             &crate::tests::fixtures::endpoint_cache(vec![]),
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             GrpcRouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
@@ -1590,7 +1591,7 @@ mod tests {
             store,
             svcs,
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             GrpcRouteResolution {
                 listener_info: &listener_info,
                 policy_index,

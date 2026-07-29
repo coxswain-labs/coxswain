@@ -93,10 +93,10 @@ impl<'a> IngressCrRefStores<'a> {
 /// The extension-CRD stores threaded into [`IngressReconciler::reconcile`].
 ///
 /// Groups the label-scoped htpasswd Secret store (`auth-basic-secret`) with
-/// the `CoxswainExternalAuth` CR store (`ext-auth`, #549), the `JwtAuth` CR
-/// store and JWKS cache (`auth-jwt`, #441), the backend `ReferenceGrant` set
-/// (needed to resolve a `CoxswainExternalAuth` CR's cross-namespace
-/// `backendRef`), the converged-CR-reference stores ([`IngressCrRefStores`]),
+/// the `CoxswainExternalAuth` CR store (`ext-auth`, #549), the `CoxswainExternalAuth →
+/// Service` `ReferenceGrant` set (needed to resolve a `CoxswainExternalAuth` CR's
+/// cross-namespace `backendRef`, #691), the `JwtAuth` CR store and JWKS cache
+/// (`auth-jwt`, #441), the converged-CR-reference stores ([`IngressCrRefStores`]),
 /// and the per-Service `CoxswainBackendPolicy` index
 /// (`backend_policy_index`, #554) — so `reconcile` stays under the workspace
 /// argument-count limit. Not auth-specific despite the auth-heavy history —
@@ -106,7 +106,8 @@ pub struct IngressExtensionStores<'a> {
     pub(crate) external_auths: &'a MergedStore<CoxswainExternalAuth>,
     pub(crate) jwt_auths: &'a MergedStore<coxswain_core::crd::JwtAuth>,
     pub(crate) jwks_cache: &'a crate::jwks::JwksCacheHandle,
-    pub(crate) backend_grants: &'a crate::reference_grants::GrantSet,
+    pub(crate) external_auth_grants:
+        &'a crate::reference_grants::GrantSet<crate::reference_grants::ExternalAuthBackend>,
     pub(crate) compressions: &'a MergedStore<Compression>,
     pub(crate) retry_policies: &'a MergedStore<RetryPolicy>,
     pub(crate) rate_limits: &'a MergedStore<RateLimit>,
@@ -127,7 +128,9 @@ impl<'a> IngressExtensionStores<'a> {
         external_auths: &'a MergedStore<CoxswainExternalAuth>,
         jwt_auths: &'a MergedStore<coxswain_core::crd::JwtAuth>,
         jwks_cache: &'a crate::jwks::JwksCacheHandle,
-        backend_grants: &'a crate::reference_grants::GrantSet,
+        external_auth_grants: &'a crate::reference_grants::GrantSet<
+            crate::reference_grants::ExternalAuthBackend,
+        >,
         cr_refs: IngressCrRefStores<'a>,
         backend_policy_index: &'a crate::gateway_api::BackendPolicyIndex,
     ) -> Self {
@@ -136,7 +139,7 @@ impl<'a> IngressExtensionStores<'a> {
             external_auths,
             jwt_auths,
             jwks_cache,
-            backend_grants,
+            external_auth_grants,
             compressions: cr_refs.compressions,
             retry_policies: cr_refs.retry_policies,
             rate_limits: cr_refs.rate_limits,
@@ -306,7 +309,7 @@ impl IngressReconciler {
             auth_stores.external_auths,
             services,
             endpoint_cache,
-            auth_stores.backend_grants,
+            auth_stores.external_auth_grants,
             &route_id,
             ns,
         );
@@ -1866,7 +1869,7 @@ mod tests {
                 &empty_external_auth_store(),
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
-                &empty_backend_grants(),
+                &empty_external_auth_grants(),
                 IngressCrRefStores::new(
                     &empty_compression_store(),
                     &empty_retry_policy_store(),
@@ -1913,7 +1916,7 @@ mod tests {
                 &empty_external_auth_store(),
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
-                &empty_backend_grants(),
+                &empty_external_auth_grants(),
                 IngressCrRefStores::new(
                     &empty_compression_store(),
                     &empty_retry_policy_store(),
@@ -2203,7 +2206,7 @@ mod tests {
                 &empty_external_auth_store(),
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
-                &empty_backend_grants(),
+                &empty_external_auth_grants(),
                 IngressCrRefStores::new(
                     &empty_compression_store(),
                     &retry_policies,
@@ -2499,7 +2502,7 @@ mod tests {
                 &empty_external_auth_store(),
                 &empty_jwt_auth_store(),
                 &empty_jwks_cache(),
-                &empty_backend_grants(),
+                &empty_external_auth_grants(),
                 IngressCrRefStores::new(
                     &empty_compression_store(),
                     &empty_retry_policy_store(),

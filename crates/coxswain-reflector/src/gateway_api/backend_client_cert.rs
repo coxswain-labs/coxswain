@@ -20,13 +20,16 @@
 
 use crate::MergedStore;
 use crate::gw_types::v::gateways::Gateway;
+use crate::reference_grants::GatewayCert;
 use crate::tls::load_tls_cert;
 use coxswain_core::listener_status::BackendClientCertOutcome;
-use coxswain_core::reference_grants::{ReferenceGrantKey, backend_ref_allowed};
+use coxswain_core::reference_grants::{GrantSet, backend_ref_allowed};
 use coxswain_core::routing::BackendClientCert;
 use k8s_openapi::api::core::v1::Secret;
-use std::collections::HashSet;
 use std::sync::Arc;
+
+#[cfg(test)]
+use coxswain_core::reference_grants::ReferenceGrantKey;
 
 /// Resolve `spec.tls.backend.clientCertificateRef` for one Gateway.
 ///
@@ -36,7 +39,7 @@ use std::sync::Arc;
 pub(crate) fn reconcile_backend_client_cert(
     gw: &Gateway,
     secrets: &MergedStore<Secret>,
-    cert_grants: &HashSet<ReferenceGrantKey>,
+    cert_grants: &GrantSet<GatewayCert>,
 ) -> Option<(BackendClientCertOutcome, Option<Arc<BackendClientCert>>)> {
     let cref = gw
         .spec
@@ -179,7 +182,7 @@ mod tests {
     fn absent_ref_yields_no_condition() {
         let gw = gw_with_ref(None);
         let store = secret_store(vec![]);
-        assert!(reconcile_backend_client_cert(&gw, &store, &HashSet::new()).is_none());
+        assert!(reconcile_backend_client_cert(&gw, &store, &GrantSet::empty()).is_none());
     }
 
     #[test]
@@ -187,7 +190,7 @@ mod tests {
         let gw = gw_with_ref(Some(client_ref("cc", None, None, None)));
         let store = secret_store(vec![tls_secret("gw-ns", "cc")]);
         let (outcome, cert) =
-            reconcile_backend_client_cert(&gw, &store, &HashSet::new()).expect("ref present");
+            reconcile_backend_client_cert(&gw, &store, &GrantSet::empty()).expect("ref present");
         assert_eq!(outcome, BackendClientCertOutcome::Resolved);
         let cert = cert.expect("cert resolved");
         assert_eq!(&*cert.cert_pem, CERT_PEM);
@@ -199,7 +202,7 @@ mod tests {
         let gw = gw_with_ref(Some(client_ref("missing", None, None, None)));
         let store = secret_store(vec![]);
         let (outcome, cert) =
-            reconcile_backend_client_cert(&gw, &store, &HashSet::new()).expect("ref present");
+            reconcile_backend_client_cert(&gw, &store, &GrantSet::empty()).expect("ref present");
         assert!(matches!(
             outcome,
             BackendClientCertOutcome::InvalidClientCertificateRef { .. }
@@ -217,7 +220,7 @@ mod tests {
         )));
         let store = secret_store(vec![tls_secret("gw-ns", "cc")]);
         let (outcome, _) =
-            reconcile_backend_client_cert(&gw, &store, &HashSet::new()).expect("ref present");
+            reconcile_backend_client_cert(&gw, &store, &GrantSet::empty()).expect("ref present");
         assert!(matches!(
             outcome,
             BackendClientCertOutcome::InvalidClientCertificateRef { .. }
@@ -229,7 +232,7 @@ mod tests {
         let gw = gw_with_ref(Some(client_ref("cc", None, Some(""), Some("WrongKind"))));
         let store = secret_store(vec![tls_secret("gw-ns", "cc")]);
         let (outcome, _) =
-            reconcile_backend_client_cert(&gw, &store, &HashSet::new()).expect("ref present");
+            reconcile_backend_client_cert(&gw, &store, &GrantSet::empty()).expect("ref present");
         assert!(matches!(
             outcome,
             BackendClientCertOutcome::InvalidClientCertificateRef { .. }
@@ -248,7 +251,7 @@ mod tests {
         s.metadata.name = Some("cc".to_string());
         let store = secret_store(vec![s]);
         let (outcome, _) =
-            reconcile_backend_client_cert(&gw, &store, &HashSet::new()).expect("ref present");
+            reconcile_backend_client_cert(&gw, &store, &GrantSet::empty()).expect("ref present");
         assert!(matches!(
             outcome,
             BackendClientCertOutcome::InvalidClientCertificateRef { .. }
@@ -260,7 +263,7 @@ mod tests {
         let gw = gw_with_ref(Some(client_ref("cc", Some("other-ns"), None, None)));
         let store = secret_store(vec![tls_secret("other-ns", "cc")]);
         let (outcome, _) =
-            reconcile_backend_client_cert(&gw, &store, &HashSet::new()).expect("ref present");
+            reconcile_backend_client_cert(&gw, &store, &GrantSet::empty()).expect("ref present");
         assert!(matches!(
             outcome,
             BackendClientCertOutcome::RefNotPermitted { .. }
@@ -271,8 +274,8 @@ mod tests {
     fn cross_namespace_with_grant_resolves() {
         let gw = gw_with_ref(Some(client_ref("cc", Some("other-ns"), None, None)));
         let store = secret_store(vec![tls_secret("other-ns", "cc")]);
-        let mut grants = HashSet::new();
-        grants.insert(ReferenceGrantKey::wildcard("gw-ns", "other-ns"));
+        let grants: GrantSet<GatewayCert> =
+            std::iter::once(ReferenceGrantKey::wildcard("gw-ns", "other-ns")).collect();
         let (outcome, cert) =
             reconcile_backend_client_cert(&gw, &store, &grants).expect("ref present");
         assert_eq!(outcome, BackendClientCertOutcome::Resolved);

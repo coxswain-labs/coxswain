@@ -312,6 +312,7 @@ pub(crate) fn compute_grpc_listener_bindings(
 mod tests {
     use super::*;
     use crate::gateway_api::tests::*;
+    use crate::reference_grants::GrantSet;
 
     // ── parentRef attachment (GEP-1713) ──────────────────────────────────────────
 
@@ -397,7 +398,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
@@ -412,7 +413,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -450,7 +452,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &owned(&[("default", "gw")]),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
@@ -465,7 +467,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -501,7 +504,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &owned(&[("default", "gw")]),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
@@ -516,7 +519,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -552,7 +556,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &owned(&[("default", "gw")]),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
@@ -567,7 +571,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -636,7 +641,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &owned_gw,
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
@@ -651,7 +656,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -673,7 +679,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &owned_gw,
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &listener_info,
                 policy_index: &HashMap::new(),
@@ -688,7 +694,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),

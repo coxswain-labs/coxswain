@@ -100,8 +100,8 @@ mod tests {
         GrpcRouteParentRefs, GrpcRouteRules, GrpcRouteRulesBackendRefs, GrpcRouteSpec,
     };
     use crate::keys::RouteParentKey;
+    use crate::reference_grants::{GrantSet, GrpcRouteBackend};
     use coxswain_core::ownership::ObjectKey;
-    use coxswain_core::reference_grants::ReferenceGrantKey;
     use k8s_openapi::api::core::v1::Service;
     use kube::api::ObjectMeta;
     use kube::runtime::{reflector, watcher};
@@ -193,7 +193,7 @@ mod tests {
             &[gw],
             &owned,
             &std::collections::HashMap::new(),
-            &HashSet::<ReferenceGrantKey>::new(),
+            &GrantSet::<GrpcRouteBackend>::empty(),
             &stores,
             "GRPCRoute",
         );

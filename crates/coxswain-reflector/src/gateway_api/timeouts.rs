@@ -47,6 +47,7 @@ mod tests {
     // ── Timeout tests ────────────────────────────────────────────────────────────
 
     use crate::gw_types::v::httproutes::HttpRouteRulesTimeouts;
+    use crate::reference_grants::GrantSet;
     use coxswain_core::routing::RouteOutcome;
     use std::time::Duration;
 
@@ -141,7 +142,7 @@ mod tests {
         };
 
         let mut builder = RoutingTableBuilder::new();
-        let grants = HashSet::new();
+        let grants = GrantSet::empty();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
@@ -162,7 +163,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -181,7 +183,7 @@ mod tests {
         let store = endpoint_cache(vec![make_slice("default", "svc", "10.0.0.1")]);
         let route = make_route("default", &["example.com"], None, "svc");
         let mut builder = RoutingTableBuilder::new();
-        let grants = HashSet::new();
+        let grants = GrantSet::empty();
         GatewayApiReconciler::reconcile(
             &route,
             &store,
@@ -202,7 +204,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),

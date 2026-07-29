@@ -102,9 +102,9 @@ mod tests {
         HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteSpec,
     };
     use crate::keys::RouteParentKey;
+    use crate::reference_grants::{GrantSet, HttpRouteBackend};
     use crate::status::RouteStatusMap;
     use coxswain_core::ownership::ObjectKey;
-    use coxswain_core::reference_grants::ReferenceGrantKey;
     use k8s_openapi::api::core::v1::Service;
     use kube::api::ObjectMeta;
     use kube::runtime::{reflector, watcher};
@@ -191,7 +191,7 @@ mod tests {
         routes: &[Arc<HttpRoute>],
         gateways: &[Arc<Gateway>],
         owned: &[(&str, &str)],
-        grants: &HashSet<ReferenceGrantKey>,
+        grants: &GrantSet<HttpRouteBackend>,
         services: &MergedStore<Service>,
     ) -> RouteStatusMap {
         let owned_set: HashSet<ObjectKey> = owned
@@ -248,7 +248,7 @@ mod tests {
             &[route],
             &[gw],
             &[("default", "gw")],
-            &HashSet::new(),
+            &GrantSet::empty(),
             &services,
         );
 
@@ -265,7 +265,7 @@ mod tests {
         let route = make_route("default", "route", &[], "default", "gw");
 
         // owned set is empty — gw is not owned
-        let map = run(&[route], &[gw], &[], &HashSet::new(), &empty_svc_store());
+        let map = run(&[route], &[gw], &[], &GrantSet::empty(), &empty_svc_store());
 
         assert!(!map.contains_key(&key("default", "route", "default", "gw")));
     }
@@ -280,7 +280,7 @@ mod tests {
             &[route],
             &[gw],
             &[("default", "gw")],
-            &HashSet::new(),
+            &GrantSet::empty(),
             &services,
         );
 
@@ -299,7 +299,7 @@ mod tests {
             &[route],
             &[gw],
             &[("default", "gw")],
-            &HashSet::new(),
+            &GrantSet::empty(),
             &services,
         );
 
@@ -317,7 +317,7 @@ mod tests {
             &[route],
             &[gw],
             &[("default", "gw")],
-            &HashSet::new(),
+            &GrantSet::empty(),
             &empty_svc_store(),
         );
 
@@ -374,7 +374,7 @@ mod tests {
             &[route],
             &[gw],
             &[("default", "gw")],
-            &HashSet::new(),
+            &GrantSet::empty(),
             &service_store_with("default", "svc"),
         );
 
@@ -479,7 +479,7 @@ mod tests {
             &[route],
             &[gw],
             &[("gw-ns", "gw")],
-            &HashSet::new(),
+            &GrantSet::empty(),
             &empty_svc_store(),
         );
 
