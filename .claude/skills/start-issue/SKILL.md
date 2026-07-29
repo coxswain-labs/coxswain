@@ -83,11 +83,12 @@ Every issue requires e2e coverage for both happy paths and sad/error paths.
 Test names follow the **behaviour/outcome** pattern: `what_happens_when_condition`.
 
 For each scenario list:
-- **Plane**: `routing`, `tls`, `traffic_policy`, `status_conditions`, `provisioning`, `resilience`, `observability`, `discovery` — use the plane of the primary assertion target
+- **Plane**: `routing`, `tls`, `traffic_policy`, `status_conditions`, `provisioning`, `resilience`, `observability`, `discovery`, `security` — use the plane of the primary assertion target
 - **File**: `crates/coxswain-e2e/tests/<plane>.rs`
 - **Name**: `behaviour_when_condition` (snake_case)
 - **Happy path**: what the test sets up and asserts succeeds
 - **Sad path**: what misconfiguration or error condition the companion test covers
+- **Attack framing, when applicable**: if the sad path defends against an adversary reaching an asset across a trust boundary — not merely a misconfiguration a well-meaning tenant might hit — name it for the attack and the asset, not the feature (`foreign_namespace_cannot_claim_hostname_tls`, not `ingress_tls_cert_selection`), per `.claude/skills/security-audit/SKILL.md`'s Phase 6. Check whether the issue closes a row in `.claude/security/surface.yaml` (grep the issue number under `findings:`); if so, the plan's commit sequence should update that row alongside the fix, not leave it stale.
 
 Wait for user approval before writing any code.
 
@@ -137,6 +138,7 @@ Add/update scenarios in `crates/coxswain-e2e/tests/<plane>.rs` per the approved 
 - **Self-diagnosing** — assertion messages must tell you what failed without reading source
 - **Behaviour/outcome named** — `what_happens_when_condition`
 - **No bare sleeps** — all waits use `poll_until` on a real observable post-condition
+- **Verified red before green** — for every sad/error-path scenario, run it against the pre-fix code and confirm it actually fails, before implementing the fix that makes it pass. A sad-path test never observed to fail is not evidence the control works: #692 shipped a passing ReferenceGrant-revocation e2e while revocation did not land, because the test's grant shape happened not to exercise the cancelling code path. Mechanically: write the test, run it once on the pre-fix branch state (or against a stash of the old code) to see it fail for the *right* reason, then implement the fix and re-run.
 
 ## 6 — Commit checkpoint
 
