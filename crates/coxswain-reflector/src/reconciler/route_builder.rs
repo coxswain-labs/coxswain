@@ -6,6 +6,7 @@
 //! defined alongside the loop.
 
 use super::dedicated::{IngressBuildConfig, gateway_is_cut_over};
+use super::global_epoch::{GlobalEpoch, GlobalEpochInput};
 use super::listener_merge::{EffectiveGateway, EffectiveListener};
 use super::proxy::{
     IngressDefaultBackend, IngressEvent, Ownership, ReflectorStores, SharedOutputs,
@@ -208,39 +209,81 @@ pub(super) fn resolve_backend_client_certs(
 /// sources churn far less often than the endpoint/route-structural changes
 /// the partitioned rebuild specifically targets, so this fallback doesn't
 /// undermine its benchmarked wins.
+///
+/// Accumulated through `GlobalEpoch`, which admits no untagged contribution —
+/// see `GlobalEpochInput` for why an untagged term is unsafe here.
 pub(super) fn compute_global_epoch(stores: &ReflectorStores<'_>, ownership: &Ownership<'_>) -> u64 {
-    let mut epoch = 0u64;
-    epoch ^= crate::fingerprint::store_epoch(stores.policies);
-    epoch ^= crate::fingerprint::store_epoch(stores.coxswain_backend_policies);
+    let mut epoch = GlobalEpoch::new();
+    epoch.add(
+        GlobalEpochInput::BackendTlsPolicies,
+        crate::fingerprint::store_epoch(stores.policies),
+    );
+    epoch.add(
+        GlobalEpochInput::CoxswainBackendPolicies,
+        crate::fingerprint::store_epoch(stores.coxswain_backend_policies),
+    );
     // `CoxswainExternalAuth` CRs: a Gateway-level `targetRef` mandate is
     // prepended to every bound route's auth chain and is deliberately *not*
     // in `route_fingerprint` (it's targetRef-indexed, not route-spec-static),
     // so its own edits must move the epoch here — else a relaxed/redirected
     // mandate keeps being enforced on reused partitions.
-    epoch ^= crate::fingerprint::store_epoch(stores.external_auths);
-    epoch ^= crate::fingerprint::store_epoch(stores.auth_secrets);
-    epoch ^= crate::fingerprint::store_epoch(stores.secrets);
-    epoch ^= crate::fingerprint::store_epoch(stores.configmaps);
-    epoch ^= crate::fingerprint::store_epoch(stores.client_traffic_policies);
-    epoch ^= crate::fingerprint::store_epoch(stores.gateways);
+    epoch.add(
+        GlobalEpochInput::ExternalAuths,
+        crate::fingerprint::store_epoch(stores.external_auths),
+    );
+    epoch.add(
+        GlobalEpochInput::AuthSecrets,
+        crate::fingerprint::store_epoch(stores.auth_secrets),
+    );
+    epoch.add(
+        GlobalEpochInput::Secrets,
+        crate::fingerprint::store_epoch(stores.secrets),
+    );
+    epoch.add(
+        GlobalEpochInput::ConfigMaps,
+        crate::fingerprint::store_epoch(stores.configmaps),
+    );
+    epoch.add(
+        GlobalEpochInput::ClientTrafficPolicies,
+        crate::fingerprint::store_epoch(stores.client_traffic_policies),
+    );
+    epoch.add(
+        GlobalEpochInput::Gateways,
+        crate::fingerprint::store_epoch(stores.gateways),
+    );
     // The reconcile bakes resolved JWKS *text* into JWT route configs; a key
     // rotation bumps the cache generation (and wakes the rebuild loop) but no
     // watched `resourceVersion`. Fold the generation so a rotated-out key
     // can't survive on a reused JWT partition.
-    epoch ^= stores.jwks_cache.generation();
-    epoch ^= hash_grant_set(ownership.backend_grants);
-    epoch ^= hash_grant_set(ownership.basic_auth_secret_grants);
+    epoch.add(
+        GlobalEpochInput::JwksGeneration,
+        stores.jwks_cache.generation(),
+    );
+    epoch.add(
+        GlobalEpochInput::HttpBackendGrants,
+        hash_grant_set(ownership.backend_grants),
+    );
+    epoch.add(
+        GlobalEpochInput::BasicAuthSecretGrants,
+        hash_grant_set(ownership.basic_auth_secret_grants),
+    );
     // GRPCRoute goes through the same partitioned dirty-route build as HTTPRoute
     // (`plan.dirty_grpc`/`fresh_builder` in `build_gateway_routes`), so a
     // `grpc_backend_grants` create/delete must dirty cached partitions the same
     // way `backend_grants` does above — same "moves no watched resourceVersion"
     // reasoning (#691).
-    epoch ^= hash_grant_set(ownership.grpc_backend_grants);
+    epoch.add(
+        GlobalEpochInput::GrpcBackendGrants,
+        hash_grant_set(ownership.grpc_backend_grants),
+    );
     // Ext-auth resolution is baked into partitioned route auth chains (both the
     // route-level ExtensionRef and the Gateway mandate) exactly like
     // `basic_auth_secret_grants` above, so `external_auth_backend_grants` needs
     // the same fold (#691).
-    epoch ^= hash_grant_set(ownership.external_auth_backend_grants);
+    epoch.add(
+        GlobalEpochInput::ExternalAuthBackendGrants,
+        hash_grant_set(ownership.external_auth_backend_grants),
+    );
     // `Gateway → Secret` grants gating the GEP-3155 backend client cert: the
     // resolved cert is baked per-route into partitioned `RouteEntry`s
     // (`UpstreamTls.client_cert`), and a grant create/delete moves no watched
@@ -248,7 +291,10 @@ pub(super) fn compute_global_epoch(stores: &ReflectorStores<'_>, ownership: &Own
     // itself must move the epoch. (`ls_cert_grants`/`ca_grants`/`tls_backend_grants`/
     // `tcp`/`udp` grant sets deliberately absent: they feed only tables rebuilt
     // in full every pass, not the partitioned build.)
-    epoch ^= hash_grant_set(ownership.cert_grants);
+    epoch.add(
+        GlobalEpochInput::CertGrants,
+        hash_grant_set(ownership.cert_grants),
+    );
     // Ext-auth backend endpoints are baked into route auth chains (both the
     // route-level ExtensionRef and the Gateway mandate); their pod churn moves
     // neither the CR's rv nor any store above. Fold each ext-auth service's
@@ -268,13 +314,19 @@ pub(super) fn compute_global_epoch(stores: &ReflectorStores<'_>, ownership: &Own
             stores.services,
         ));
     }
-    epoch ^= ext_auth_endpoints.finish();
-    epoch
+    epoch.add(
+        GlobalEpochInput::ExternalAuthEndpoints,
+        ext_auth_endpoints.finish(),
+    );
+    epoch.finish()
 }
 
-/// Order-independent fold of a [`GrantSet`]'s members. XOR is safe here (unlike
-/// route/endpoint contribution folds): `HashSet` members are unique by
-/// definition, so equal contributions can't occur and self-cancel.
+/// Order-independent fold of a [`GrantSet`]'s members. XOR is safe *within*
+/// this one call: `HashSet` members are unique by definition, so equal
+/// contributions can't occur and self-cancel. The result is only safe to
+/// combine with another term via `GlobalEpochInput`'s tagged fold — a bare
+/// XOR of two `hash_grant_set` outputs can cancel when two differently-kinded
+/// `GrantSet`s share a key (#692; see `GlobalEpochInput`'s doc).
 fn hash_grant_set<K>(grants: &GrantSet<K>) -> u64 {
     grants
         .iter()

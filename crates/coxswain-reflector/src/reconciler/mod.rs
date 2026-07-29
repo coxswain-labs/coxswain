@@ -24,6 +24,7 @@ pub mod controller;
 mod debounce;
 mod dedicated;
 mod gateway_partition;
+mod global_epoch;
 pub(crate) mod listener_merge;
 pub mod proxy;
 mod route_builder;

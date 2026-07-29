@@ -403,6 +403,19 @@ pub const BASIC_AUTH_XNS_TENANT: &str = fixture!("basic_auth_xns_tenant.yaml");
 /// the route namespace with `.with("TENANTNS", <tenant-ns>)`. Without the
 /// ReferenceGrant from [`BASIC_AUTH_XNS_TENANT`] the proxy fails closed (503).
 pub const BASIC_AUTH_XNS_ROUTE: &str = fixture!("basic_auth_xns_route.yaml");
+/// Secret-only tenant side of the dual-kind-grant pair (#692): the htpasswd
+/// Secret with NO ReferenceGrant, so a test can assert the fail-closed state
+/// before granting. Apply to the tenant namespace; pair with
+/// [`BASIC_AUTH_XNS_DUAL_KIND_GRANT`] and [`BASIC_AUTH_XNS_ROUTE`].
+pub const BASIC_AUTH_XNS_DUAL_KIND_SECRET: &str = fixture!("basic_auth_xns_dual_kind_secret.yaml");
+/// One ReferenceGrant naming two from-kinds (`BasicAuth` and `Gateway`) against
+/// a single nameless `to: Secret` (#692), so it flattens into
+/// `basic_auth_secret_grants` and `cert_grants` with a byte-identical
+/// `ReferenceGrantKey`. That collision is what let the rebuild epoch's XOR fold
+/// cancel the grant to zero, making its creation and revocation invisible to the
+/// partition cache. Apply to the tenant namespace with
+/// `.with("TESTNS", <route-ns>)`; only the `BasicAuth` half is observable.
+pub const BASIC_AUTH_XNS_DUAL_KIND_GRANT: &str = fixture!("basic_auth_xns_dual_kind_grant.yaml");
 /// Tenant-side of the cross-namespace `CoxswainExternalAuth` backendRef pair
 /// (#691): a `CoxswainExternalAuth → Service` ReferenceGrant permitting a
 /// `CoxswainExternalAuth` CR in `TESTNS`. Apply to the tenant namespace (after

@@ -1,0 +1,31 @@
+# A SINGLE ReferenceGrant that names two from-kinds against one to-kind, so it
+# flattens into two different GrantSets with a byte-identical key.
+#
+# BasicAuth -> Secret feeds basic_auth_secret_grants; Gateway -> Secret feeds
+# cert_grants. ReferenceGrantKey is (from_ns, to_ns, to_name) with no kind, and
+# the nameless `to` entry makes both a wildcard, so both sets flatten the exact
+# same key. That collision is what made the rebuild epoch's XOR fold cancel the
+# grant to zero, leaving its creation and its revocation invisible to the
+# partition cache.
+#
+# Only the BasicAuth half is asserted by the tests; the Gateway half exists
+# solely to force the collision. No Gateway here references a Secret, so the
+# cert_grants entry authorizes nothing observable.
+#
+# TESTNS = the route namespace whose BasicAuth CR references the tenant Secret.
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-dual-kind-from-${TESTNS}
+spec:
+  from:
+    - group: gateway.coxswain-labs.dev
+      kind: BasicAuth
+      namespace: ${TESTNS}
+    - group: gateway.networking.k8s.io
+      kind: Gateway
+      namespace: ${TESTNS}
+  to:
+    - group: ""
+      kind: Secret

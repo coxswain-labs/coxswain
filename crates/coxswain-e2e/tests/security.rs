@@ -1514,6 +1514,258 @@ async fn gateway_external_auth_cross_namespace_requires_reference_grant() -> any
     Ok(())
 }
 
+/// A `ReferenceGrant` that names two from-kinds against one `to: Secret` must
+/// still be revocable (#692).
+///
+/// `ReferenceGrantKey` carries no kind, so one grant with
+/// `from: [BasicAuth, Gateway]` and a nameless `to: Secret` flattens the exact
+/// same key into `basic_auth_secret_grants` and `cert_grants`. The rebuild epoch
+/// XOR-folded both sets into one accumulator, so the two identical per-set hashes
+/// cancelled (`H ^ H == 0`) — the epoch read the same with the grant and without
+/// it, no `(port, host)` partition was ever marked dirty, and the compiled route
+/// kept honouring a grant the operator had deleted. The Gateway API requires the
+/// opposite: an implementation "MUST respond to the removal of a grant by
+/// revoking the access that the grant allowed".
+///
+/// `BasicAuth` is the observable half deliberately: an ungranted cross-namespace
+/// `secretRef` fails closed with a WARN log and *no* status write, so nothing
+/// bumps a `resourceVersion` that `route_fingerprint` folds. The epoch is
+/// genuinely the only invalidation channel here, which is what makes this a real
+/// regression proof — the equivalent HTTPRoute-backendRef test would self-heal on
+/// the next pass via its `ResolvedRefs=RefNotPermitted` status write.
+#[tokio::test]
+async fn dual_kind_grant_revocation_stops_cross_namespace_basic_auth() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-dualgrant-revoke").await?;
+    let tenant = NamespaceGuard::create(&h.client, "gw-dualgrant-revoke-tenant").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    // Tenant ns: htpasswd Secret, then the dual-kind grant that authorizes the
+    // route ns's BasicAuth CR to read it (and collides into cert_grants).
+    fixtures::apply_fixture(
+        gwa::BASIC_AUTH_XNS_DUAL_KIND_SECRET,
+        FixtureVars::new(&tenant.name),
+    )
+    .await?;
+    fixtures::apply_fixture(
+        gwa::BASIC_AUTH_XNS_DUAL_KIND_GRANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+
+    // Route ns: Gateway + BasicAuth CR (secretRef → tenant) + HTTPRoute.
+    fixtures::apply_fixture(
+        gwa::BASIC_AUTH_XNS_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwbasicauthxns.{}.local", ns.name);
+
+    // Happy: the dual-kind grant authorizes the cross-ns secretRef, so valid
+    // credentials are admitted. This also warms the partition cache, which is
+    // what the revocation below has to invalidate.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+                .await
+            {
+                Ok((status, _, _)) => format!(
+                    "200 for alice:secret via the dual-kind grant at {host}; \
+                     last observed status {status}"
+                ),
+                Err(e) => format!(
+                    "200 for alice:secret via the dual-kind grant at {host}; \
+                     last attempt failed: {e}"
+                ),
+            }
+        },
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+
+    let grant_name = format!("allow-dual-kind-from-{}", ns.name);
+    let deleted = tokio::process::Command::new("kubectl")
+        .args([
+            "delete",
+            "referencegrant",
+            &grant_name,
+            "-n",
+            &tenant.name,
+            "--ignore-not-found",
+        ])
+        .status()
+        .await
+        .map_err(|e| anyhow::anyhow!("delete ReferenceGrant: {e}"))?;
+    anyhow::ensure!(deleted.success(), "kubectl delete referencegrant failed");
+
+    // Sad: revocation must reach the data plane. A 200 that never flips here is
+    // the #692 bug itself — the grant's two colliding per-set hashes cancelled,
+    // so the epoch never moved and the cached partition kept serving.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+                .await
+            {
+                // A persistent 200 is the #692 signature: the revocation never
+                // invalidated the cached partition. Any other status is a
+                // different fault, so name what was actually seen.
+                Ok((status, _, _)) => format!(
+                    "503 after deleting the dual-kind grant at {host}; \
+                     last observed status {status} (a stuck 200 means the revocation \
+                     never invalidated the cached partition)"
+                ),
+                Err(e) => format!(
+                    "503 after deleting the dual-kind grant at {host}; \
+                     last attempt failed: {e}"
+                ),
+            }
+        },
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+                .await
+            {
+                Ok((503, _, _)) => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
+/// The creation direction of the same collision (#692): a dual-kind
+/// `ReferenceGrant` must start authorizing access the moment it is applied.
+///
+/// Symmetric to [`dual_kind_grant_revocation_stops_cross_namespace_basic_auth`]
+/// and broken by the identical zero-delta — with no grant both colliding sets
+/// are empty (`0 ^ 0`), and with the grant both hash to `H` (`H ^ H`), so the
+/// pre-fix epoch read the same either way and the fail-closed partition was
+/// never rebuilt. Covers the direction an operator hits first: granting access
+/// that never arrives.
+#[tokio::test]
+async fn dual_kind_grant_creation_starts_cross_namespace_basic_auth() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-dualgrant-create").await?;
+    let tenant = NamespaceGuard::create(&h.client, "gw-dualgrant-create-tenant").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    // Tenant ns: the htpasswd Secret only — deliberately no grant yet.
+    fixtures::apply_fixture(
+        gwa::BASIC_AUTH_XNS_DUAL_KIND_SECRET,
+        FixtureVars::new(&tenant.name),
+    )
+    .await?;
+
+    fixtures::apply_fixture(
+        gwa::BASIC_AUTH_XNS_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwbasicauthxns.{}.local", ns.name);
+
+    // Sad first: the cross-ns secretRef is ungranted, so it fails closed even
+    // for valid credentials. This warms the partition cache in the denied state.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+                .await
+            {
+                Ok((status, _, _)) => format!(
+                    "503 for the ungranted cross-ns secretRef at {host}; \
+                     last observed status {status}"
+                ),
+                Err(e) => format!(
+                    "503 for the ungranted cross-ns secretRef at {host}; \
+                     last attempt failed: {e}"
+                ),
+            }
+        },
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+                .await
+            {
+                Ok((503, _, _)) => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    fixtures::apply_fixture(
+        gwa::BASIC_AUTH_XNS_DUAL_KIND_GRANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+
+    // Happy: creating the grant is the sole mutation, so a flip to 200 proves the
+    // dual-kind grant moved the epoch and dirtied the cached partition.
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+                .await
+            {
+                // A persistent 503 is the #692 signature in the creation
+                // direction: the new grant never invalidated the fail-closed
+                // partition. Any other status is a different fault.
+                Ok((status, _, _)) => format!(
+                    "200 for alice:secret after applying the dual-kind grant at {host}; \
+                     last observed status {status} (a stuck 503 means the grant never \
+                     invalidated the cached partition)"
+                ),
+                Err(e) => format!(
+                    "200 for alice:secret after applying the dual-kind grant at {host}; \
+                     last attempt failed: {e}"
+                ),
+            }
+        },
+        || async {
+            match gw
+                .get_full_with_headers(&host, "/", &[("authorization", "Basic YWxpY2U6c2VjcmV0")])
+                .await
+            {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+
+    Ok(())
+}
+
 // ── JwtAuth ExtensionRef (Gateway API, #441) ──────────────────────────────────
 
 /// `JwtAuth` CR via `ExtensionRef`: a request carrying a valid, signed,

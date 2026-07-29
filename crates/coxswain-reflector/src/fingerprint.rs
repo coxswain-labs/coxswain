@@ -90,6 +90,23 @@ impl FingerprintAccumulator {
         self.0 = self.0.wrapping_add(hash);
     }
 
+    /// Fold in an already-computed 64-bit fingerprint, domain-separated by
+    /// `tag` — the caller's identifier for *which* input `hash` came from.
+    ///
+    /// `wrapping_add` alone (via [`Self::add_hash`]) stops two equal
+    /// fingerprints from *cancelling*, but not from being *indistinguishable*:
+    /// summing `hash` under input A and summing the same `hash` under input B
+    /// produce the same total, so a real change — input A's fingerprint
+    /// moving from `H` to `0` while input B's moves from `0` to `H` — is
+    /// invisible to a caller that folds every input through a single shared
+    /// accumulator (#692). Hashing `(tag, hash)` before folding gives each
+    /// input its own point in the output space, the same role
+    /// `hash_change_token`'s `0u8`/`1u8` discriminant plays against its own
+    /// cross-kind collision (this module, above).
+    pub(crate) fn add_tagged<T: Hash>(&mut self, tag: &T, hash: u64) {
+        self.add_hash(hash_one(&(tag, hash)));
+    }
+
     #[must_use]
     pub(crate) fn finish(&self) -> u64 {
         self.0
@@ -411,6 +428,67 @@ mod tests {
             store_epoch(&store_with(vec![old])),
             store_epoch(&store_with(vec![recreated])),
             "a recreated object at the same (ns, name, generation) must move the epoch via its uid"
+        );
+    }
+
+    #[test]
+    fn add_tagged_does_not_cancel_equal_hashes_under_distinct_tags() {
+        // The #692 bug: an accumulator folding the same fingerprint `h` twice
+        // under two different logical inputs (e.g. two GrantSets that flatten
+        // an identical ReferenceGrantKey) must not return to the empty-fold
+        // value — that would make the input's presence indistinguishable from
+        // its absence.
+        let h = hash_one(&"shared-fingerprint");
+
+        let mut empty = FingerprintAccumulator::default();
+        empty.add_tagged(&"input-a", 0);
+        empty.add_tagged(&"input-b", 0);
+
+        let mut present = FingerprintAccumulator::default();
+        present.add_tagged(&"input-a", h);
+        present.add_tagged(&"input-b", h);
+
+        assert_ne!(
+            empty.finish(),
+            present.finish(),
+            "folding an equal hash under two distinct tags must move the accumulator"
+        );
+    }
+
+    #[test]
+    fn add_tagged_distinguishes_which_tag_carries_a_hash() {
+        // Not just "did the total change" but "did it change the same way
+        // regardless of which input moved" — a swap (input A loses h, input B
+        // gains h) is a real change and must not be invisible.
+        let h = hash_one(&"moved-fingerprint");
+
+        let mut a_has_it = FingerprintAccumulator::default();
+        a_has_it.add_tagged(&"input-a", h);
+        a_has_it.add_tagged(&"input-b", 0);
+
+        let mut b_has_it = FingerprintAccumulator::default();
+        b_has_it.add_tagged(&"input-a", 0);
+        b_has_it.add_tagged(&"input-b", h);
+
+        assert_ne!(
+            a_has_it.finish(),
+            b_has_it.finish(),
+            "the same hash carried by a different tag must produce a different total"
+        );
+    }
+
+    #[test]
+    fn add_tagged_accumulates_a_repeated_tag_hash_pair() {
+        // wrapping_add's own safety net: even the identical (tag, hash) pair
+        // folded twice must not cancel back to zero (unlike XOR).
+        let mut acc = FingerprintAccumulator::default();
+        acc.add_tagged(&"input-a", 42);
+        acc.add_tagged(&"input-a", 42);
+
+        assert_ne!(
+            acc.finish(),
+            0,
+            "folding the same (tag, hash) pair twice must not self-cancel"
         );
     }
 }
