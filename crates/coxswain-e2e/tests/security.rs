@@ -1426,6 +1426,94 @@ async fn gateway_basic_auth_cross_namespace_requires_reference_grant() -> anyhow
     Ok(())
 }
 
+/// `CoxswainExternalAuth`'s own `backendRef` crossing namespaces requires a
+/// `CoxswainExternalAuth → Service` `ReferenceGrant` in the target namespace
+/// (#691). Before the fix this backendRef was checked against the HTTPRoute
+/// backend grant set, so the documented grant shape
+/// (`docs/src/gateway-api/route-extensions.md`) never matched and the
+/// reference was *permanently* denied (503) no matter what grant existed —
+/// this test's happy path is the regression proof.
+#[tokio::test]
+async fn gateway_external_auth_cross_namespace_requires_reference_grant() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "gw-extauth-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "gw-extauth-xns-tenant").await?;
+
+    fixtures::apply_fixture(backends::ECHO, FixtureVars::new(&ns.name)).await?;
+    wait::wait_for_backends(&ns.name).await?;
+
+    // Tenant ns: auth-allow backend + a CoxswainExternalAuth→Service
+    // ReferenceGrant permitting ns.
+    fixtures::apply_fixture(backends::AUTH_STUB, FixtureVars::new(&tenant.name)).await?;
+    fixtures::apply_fixture(
+        gwa::EXTERNAL_AUTH_XNS_TENANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+
+    // Route ns: Gateway + CoxswainExternalAuth CR (backendRef → tenant) + HTTPRoute.
+    fixtures::apply_fixture(
+        gwa::EXTERNAL_AUTH_XNS_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    let gw = h.gateway_http(&ns.name).await?;
+    let host = format!("gwextauthxns.{}.local", ns.name);
+
+    // Happy: with the grant in place, the auth-allow backend admits the request.
+    wait::poll_until(
+        Duration::from_secs(90),
+        wait::POLL,
+        || async { format!("cross-ns CoxswainExternalAuth to admit requests at {host}") },
+        || async {
+            match gw.get_full(&host, "/").await {
+                Ok((200, _, Some(body))) => Some(body),
+                _ => None,
+            }
+        },
+    )
+    .await?
+    .assert_backend("echo-a");
+
+    // Sad: delete the ReferenceGrant → the cross-ns backendRef fails closed
+    // (503), even though the auth service itself would have allowed. Proves
+    // the grant is load-bearing, not decorative.
+    let grant_name = format!("allow-externalauth-from-{}", ns.name);
+    let deleted = tokio::process::Command::new("kubectl")
+        .args([
+            "delete",
+            "referencegrant",
+            &grant_name,
+            "-n",
+            &tenant.name,
+            "--ignore-not-found",
+        ])
+        .status()
+        .await
+        .map_err(|e| anyhow::anyhow!("delete ReferenceGrant: {e}"))?;
+    anyhow::ensure!(deleted.success(), "kubectl delete referencegrant failed");
+
+    wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!(
+                "cross-ns CoxswainExternalAuth to fail closed (503) after grant deletion at {host}"
+            )
+        },
+        || async {
+            match gw.get_full(&host, "/").await {
+                Ok((503, _, _)) => Some(()),
+                _ => None,
+            }
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+
 // ── JwtAuth ExtensionRef (Gateway API, #441) ──────────────────────────────────
 
 /// `JwtAuth` CR via `ExtensionRef`: a request carrying a valid, signed,

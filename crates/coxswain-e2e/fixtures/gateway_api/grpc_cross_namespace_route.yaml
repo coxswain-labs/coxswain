@@ -1,0 +1,41 @@
+# Cross-namespace GRPCRoute fixture (route-side, #691).
+# TESTNS   = primary namespace (where the Gateway and GRPCRoute live)
+# TENANTNS = tenant namespace (where the grpc-echo backend Service lives)
+#
+# The backendRef crosses into TENANTNS; it only resolves when a
+# GRPCRoute → Service ReferenceGrant in TENANTNS permits it (see
+# grpc_cross_namespace_tenant.yaml / grpc_cross_namespace_tenant_wrong_kind.yaml).
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: coxswain-grpc-xns
+spec:
+  gatewayClassName: coxswain
+  listeners:
+    - name: http
+      port: ${GATEWAY_HTTP_PORT}
+      protocol: HTTP
+      allowedRoutes:
+        namespaces:
+          from: Same
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: grpc-cross-ns-route
+spec:
+  parentRefs:
+    - name: coxswain-grpc-xns
+  hostnames:
+    - "grpc-cross-ns.${TESTNS}.local"
+  rules:
+    - matches:
+        - method:
+            type: Exact
+            service: gateway_api_conformance.echo_basic.grpcecho.GrpcEcho
+            method: Echo
+      backendRefs:
+        - name: grpc-echo
+          namespace: ${TENANTNS}
+          port: 50051

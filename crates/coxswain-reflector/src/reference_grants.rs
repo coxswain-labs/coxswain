@@ -3,14 +3,21 @@
 //! Centralising the flatten logic here ensures the shared-pool builder and
 //! the dedicated-mode snapshot builder derive identical permitted-reference
 //! sets from the same input, so the two code paths cannot drift.
+//!
+//! Every `flatten_*_grants` function returns a [`GrantSet`] parameterized by a
+//! marker type below naming the `(from.group, from.kind, to.kind)` triple it
+//! was flattened for. Two sets flattened for different triples are different
+//! Rust types even though both wrap the same `HashSet<ReferenceGrantKey>`
+//! shape — passing e.g. an `HTTPRoute`-flattened set where a `GRPCRoute`-flattened
+//! one is expected is a compile error, not a silent value-level mistake (#691).
 
 // The coxswain-proprietary CRD group (`BasicAuth`, `RateLimit`, … ExtensionRef CRDs);
 // re-uses the single definition in `gateway_api` rather than a second local copy.
 use crate::gateway_api::COXSWAIN_GROUP;
 use crate::gw_types::v::referencegrants::ReferenceGrantSpec;
+pub use coxswain_core::reference_grants::GrantSet;
 use coxswain_core::reference_grants::ReferenceGrantKey;
 use kube::core::{NotUsed, Object};
-use std::collections::HashSet;
 use std::sync::Arc;
 
 /// A `ReferenceGrant` whose API version is negotiated at runtime rather than
@@ -30,11 +37,39 @@ use std::sync::Arc;
 /// got. `NotUsed` for the status: `ReferenceGrant` has none.
 pub type DynamicReferenceGrant = Object<ReferenceGrantSpec, NotUsed>;
 
-/// A flattened set of permitted cross-namespace references, keyed for O(1)
-/// lookup via [`ReferenceGrantKey`].
-pub type GrantSet = HashSet<ReferenceGrantKey>;
+/// Marker for [`flatten_grants`]'s `backend_grants`: `HTTPRoute → Service`.
+/// Also covers HTTPRoute's `RequestMirror` filter backend (a mirror target is
+/// still an HTTPRoute-sourced ref).
+pub struct HttpRouteBackend;
 
-/// Flatten `ReferenceGrant` objects into the two O(1) sets every consumer
+/// Marker for [`flatten_grpc_backend_grants`]: `GRPCRoute → Service`.
+pub struct GrpcRouteBackend;
+
+/// Marker for [`flatten_tls_backend_grants`]: `TLSRoute → Service`.
+pub struct TlsRouteBackend;
+
+/// Marker for [`flatten_tcp_backend_grants`]: `TCPRoute → Service`.
+pub struct TcpRouteBackend;
+
+/// Marker for [`flatten_udp_backend_grants`]: `UDPRoute → Service`.
+pub struct UdpRouteBackend;
+
+/// Marker for [`flatten_grants`]'s `cert_grants`: `Gateway → Secret`.
+pub struct GatewayCert;
+
+/// Marker for [`flatten_ls_cert_grants`]: `ListenerSet → Secret`.
+pub struct ListenerSetCert;
+
+/// Marker for [`flatten_ca_grants`]: `Gateway → ConfigMap`.
+pub struct GatewayCa;
+
+/// Marker for [`flatten_basic_auth_secret_grants`]: `BasicAuth → Secret`.
+pub struct BasicAuthSecret;
+
+/// Marker for [`flatten_external_auth_backend_grants`]: `CoxswainExternalAuth → Service`.
+pub struct ExternalAuthBackend;
+
+/// Flatten `ReferenceGrant` objects into the two O(1) sets [`GatewayApiReconciler`]
 /// needs for cross-namespace reference checks:
 ///
 /// - `backend_grants`: `HTTPRoute → Service` (used by the routing-table
@@ -49,8 +84,12 @@ pub type GrantSet = HashSet<ReferenceGrantKey>;
 /// of `None` flattens to a wildcard
 /// [`ReferenceGrantKey::wildcard`]; a `Some(name)` flattens to a
 /// [`ReferenceGrantKey::specific`].
+///
+/// [`GatewayApiReconciler`]: crate::gateway_api::GatewayApiReconciler
 #[must_use]
-pub fn flatten_grants(grants: &[Arc<DynamicReferenceGrant>]) -> (GrantSet, GrantSet) {
+pub fn flatten_grants(
+    grants: &[Arc<DynamicReferenceGrant>],
+) -> (GrantSet<HttpRouteBackend>, GrantSet<GatewayCert>) {
     let backend_grants = flatten(grants, GATEWAY_API_GROUP, "HTTPRoute", "Service");
     let cert_grants = flatten(grants, GATEWAY_API_GROUP, "Gateway", "Secret");
     (backend_grants, cert_grants)
@@ -68,15 +107,35 @@ const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
 /// not by the route kind. Without a matching grant a cross-namespace `secretRef`
 /// fails closed, so a tenant cannot bind another namespace's auth Secret.
 #[must_use]
-pub fn flatten_basic_auth_secret_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet {
+pub fn flatten_basic_auth_secret_grants(
+    grants: &[Arc<DynamicReferenceGrant>],
+) -> GrantSet<BasicAuthSecret> {
     flatten(grants, COXSWAIN_GROUP, "BasicAuth", "Secret")
+}
+
+/// Flatten the `CoxswainExternalAuth → Service` grants that authorize a
+/// `CoxswainExternalAuth` CR to reference its auth-service `backendRef` in
+/// another namespace (#691, matching `docs/src/gateway-api/route-extensions.md`).
+///
+/// The referrer is the `CoxswainExternalAuth` CR itself (its CRD `kind`, not
+/// the `ExtensionRef`'s `kind: ExternalAuth` shorthand), so the grant's
+/// `from.kind` is `CoxswainExternalAuth` in the proprietary
+/// `gateway.coxswain-labs.dev` group — mirroring [`flatten_basic_auth_secret_grants`].
+/// Consumed by all three ext-auth resolution surfaces: the Gateway-attached
+/// `targetRefs` mandate, the route-level `ExtensionRef` filter, and the
+/// Ingress `ext-auth` annotation.
+#[must_use]
+pub fn flatten_external_auth_backend_grants(
+    grants: &[Arc<DynamicReferenceGrant>],
+) -> GrantSet<ExternalAuthBackend> {
+    flatten(grants, COXSWAIN_GROUP, "CoxswainExternalAuth", "Service")
 }
 
 /// Flatten the `Gateway → ConfigMap` grants used by GEP-91 frontend
 /// client-certificate validation when a `caCertificateRefs` entry points at a
 /// ConfigMap in another namespace (#86). Same filter rules as [`flatten_grants`].
 #[must_use]
-pub fn flatten_ca_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet {
+pub fn flatten_ca_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet<GatewayCa> {
     flatten(grants, GATEWAY_API_GROUP, "Gateway", "ConfigMap")
 }
 
@@ -86,8 +145,31 @@ pub fn flatten_ca_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet {
 /// cross-namespace cert grant's `from.kind` is `ListenerSet` — not `Gateway`
 /// (which [`flatten_grants`] handles for Gateway-owned listeners).
 #[must_use]
-pub fn flatten_ls_cert_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet {
+pub fn flatten_ls_cert_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet<ListenerSetCert> {
     flatten(grants, GATEWAY_API_GROUP, "ListenerSet", "Secret")
+}
+
+/// Flatten the `GRPCRoute → Service` grants used when a GRPCRoute `backendRef`
+/// points at a Service in another namespace (#691). Kept separate from
+/// [`flatten_grants`]'s `backend_grants` (`from.kind: HTTPRoute`) — see
+/// [`flatten_tcp_backend_grants`]'s doc for why merging would be unsafe.
+#[must_use]
+pub fn flatten_grpc_backend_grants(
+    grants: &[Arc<DynamicReferenceGrant>],
+) -> GrantSet<GrpcRouteBackend> {
+    flatten(grants, GATEWAY_API_GROUP, "GRPCRoute", "Service")
+}
+
+/// Flatten the `TLSRoute → Service` grants used when a TLSRoute `backendRef`
+/// (passthrough or terminate) points at a Service in another namespace (#691).
+/// Kept separate from [`flatten_grants`]'s `backend_grants` (`from.kind:
+/// HTTPRoute`) — see [`flatten_tcp_backend_grants`]'s doc for why merging
+/// would be unsafe.
+#[must_use]
+pub fn flatten_tls_backend_grants(
+    grants: &[Arc<DynamicReferenceGrant>],
+) -> GrantSet<TlsRouteBackend> {
+    flatten(grants, GATEWAY_API_GROUP, "TLSRoute", "Service")
 }
 
 /// Flatten the `TCPRoute → Service` grants used when a TCPRoute `backendRef`
@@ -98,7 +180,9 @@ pub fn flatten_ls_cert_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet
 /// permit a TCPRoute's backendRef between the same namespace pair — the same
 /// per-kind isolation [`flatten_ls_cert_grants`] applies to `ListenerSet`.
 #[must_use]
-pub fn flatten_tcp_backend_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet {
+pub fn flatten_tcp_backend_grants(
+    grants: &[Arc<DynamicReferenceGrant>],
+) -> GrantSet<TcpRouteBackend> {
     flatten(grants, GATEWAY_API_GROUP, "TCPRoute", "Service")
 }
 
@@ -110,16 +194,18 @@ pub fn flatten_tcp_backend_grants(grants: &[Arc<DynamicReferenceGrant>]) -> Gran
 /// grant silently also permit a UDPRoute's backendRef between the same
 /// namespace pair.
 #[must_use]
-pub fn flatten_udp_backend_grants(grants: &[Arc<DynamicReferenceGrant>]) -> GrantSet {
+pub fn flatten_udp_backend_grants(
+    grants: &[Arc<DynamicReferenceGrant>],
+) -> GrantSet<UdpRouteBackend> {
     flatten(grants, GATEWAY_API_GROUP, "UDPRoute", "Service")
 }
 
-fn flatten(
+fn flatten<K>(
     grants: &[Arc<DynamicReferenceGrant>],
     from_group: &str,
     from_kind: &str,
     to_kind: &str,
-) -> GrantSet {
+) -> GrantSet<K> {
     grants
         .iter()
         .filter_map(|grant| {
@@ -294,5 +380,67 @@ mod tests {
         assert!(backend.contains(&ReferenceGrantKey::specific("ns-a", "backends", "svc-y")));
         assert!(backend.contains(&ReferenceGrantKey::specific("ns-b", "backends", "svc-x")));
         assert!(backend.contains(&ReferenceGrantKey::specific("ns-b", "backends", "svc-y")));
+    }
+
+    #[test]
+    fn grpc_and_tls_and_external_auth_grants_are_kind_scoped() {
+        use crate::reference_grants::{
+            flatten_external_auth_backend_grants, flatten_grpc_backend_grants,
+            flatten_tls_backend_grants,
+        };
+
+        let grants = vec![
+            grant(
+                "backends",
+                vec![("gateway.networking.k8s.io", "GRPCRoute", Some("routes"))],
+                vec![("", "Service", Some("grpc-svc"))],
+            ),
+            grant(
+                "backends2",
+                vec![("gateway.networking.k8s.io", "TLSRoute", Some("routes"))],
+                vec![("", "Service", Some("tls-svc"))],
+            ),
+            grant(
+                "backends3",
+                vec![(
+                    "gateway.coxswain-labs.dev",
+                    "CoxswainExternalAuth",
+                    Some("routes"),
+                )],
+                vec![("", "Service", Some("auth-svc"))],
+            ),
+            // An HTTPRoute-from grant to the same namespaces must not leak
+            // into any of the three kind-scoped sets above (#691's core bug).
+            grant(
+                "backends",
+                vec![("gateway.networking.k8s.io", "HTTPRoute", Some("routes"))],
+                vec![("", "Service", Some("grpc-svc"))],
+            ),
+        ];
+
+        let grpc = flatten_grpc_backend_grants(&grants);
+        let tls = flatten_tls_backend_grants(&grants);
+        let ext_auth = flatten_external_auth_backend_grants(&grants);
+
+        assert!(grpc.contains(&ReferenceGrantKey::specific(
+            "routes", "backends", "grpc-svc"
+        )));
+        assert_eq!(
+            grpc.len(),
+            1,
+            "HTTPRoute-from grant must not leak into the GRPCRoute set"
+        );
+        assert!(tls.contains(&ReferenceGrantKey::specific(
+            "routes",
+            "backends2",
+            "tls-svc"
+        )));
+        assert_eq!(tls.len(), 1);
+        assert!(ext_auth.contains(&ReferenceGrantKey::specific(
+            "routes",
+            "backends3",
+            "auth-svc"
+        )));
+        assert_eq!(ext_auth.len(), 1);
     }
 }

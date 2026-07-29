@@ -500,6 +500,7 @@ mod tests {
             BackendTlsPolicyValidationCaCertificateRefs,
         },
     };
+    use crate::reference_grants::GrantSet;
     use coxswain_core::routing::UpstreamCa;
     use k8s_openapi::api::core::v1::{ConfigMap, Service};
     use kube::api::ObjectMeta;
@@ -933,7 +934,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &index,
@@ -948,7 +949,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),

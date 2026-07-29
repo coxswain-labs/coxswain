@@ -19,9 +19,10 @@ use crate::gw_types::v::gateways::{
     Gateway, GatewayListeners, GatewayListenersAllowedRoutesNamespacesFrom,
 };
 use crate::keys::RouteParentKey;
+use crate::reference_grants::GrantSet;
 use crate::status::{RouteNamespaceSet, RouteParentStatus, RouteStatusMap};
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::reference_grants::{self, ReferenceGrantKey};
+use coxswain_core::reference_grants::{self};
 use k8s_openapi::api::core::v1::Service;
 use kube::runtime::reflector;
 use std::collections::{HashMap, HashSet};
@@ -131,12 +132,12 @@ fn spec_route_namespaces_fallback(l: &GatewayListeners, gw_ns: &str) -> RouteNam
     }
 }
 
-pub(super) fn compute_route_health<R: RouteLike>(
+pub(super) fn compute_route_health<R: RouteLike, K>(
     routes: &[Arc<R>],
     gateways: &[Arc<Gateway>],
     owned_gateways: &HashSet<ObjectKey>,
     effective: &HashMap<ObjectKey, super::super::reconciler::listener_merge::EffectiveGateway>,
-    backend_grants: &HashSet<ReferenceGrantKey>,
+    backend_grants: &GrantSet<K>,
     stores: &RefValidationStores<'_>,
     route_kind: &str,
 ) -> RouteStatusMap {
@@ -414,10 +415,10 @@ fn compute_accepted(
 /// Validates every backend ref the route exposes for health (post rule-skip).
 ///
 /// Returns `(resolved_refs, reason)` — `resolved_refs=true` means all backends valid.
-fn check_backend_refs<R: RouteLike>(
+fn check_backend_refs<R: RouteLike, K>(
     route: &R,
     route_ns: &str,
-    backend_grants: &HashSet<ReferenceGrantKey>,
+    backend_grants: &GrantSet<K>,
     service_store: &MergedStore<Service>,
 ) -> (bool, &'static str) {
     for b in route.health_backend_refs() {

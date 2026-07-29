@@ -57,6 +57,19 @@ pub const WILDCARD_HOST: &str = fixture!("wildcard_host.yaml");
 pub const CROSS_NAMESPACE_ROUTE: &str = fixture!("cross_namespace_route.yaml");
 /// `ReferenceGrant` and backend for the cross-namespace route test (tenant side).
 pub const CROSS_NAMESPACE_TENANT: &str = fixture!("cross_namespace_tenant.yaml");
+/// GRPCRoute in namespace A referencing a `grpc-echo` backend in namespace B
+/// (route side, #691). Pair with [`GRPC_CROSS_NAMESPACE_TENANT`] (or
+/// [`GRPC_CROSS_NAMESPACE_TENANT_WRONG_KIND`] for the sad path) applied to
+/// TENANTNS, after `backends::GRPC_ECHO`.
+pub const GRPC_CROSS_NAMESPACE_ROUTE: &str = fixture!("grpc_cross_namespace_route.yaml");
+/// `GRPCRoute → Service` `ReferenceGrant` for the cross-namespace GRPCRoute
+/// test (tenant side, #691). Apply after `backends::GRPC_ECHO`.
+pub const GRPC_CROSS_NAMESPACE_TENANT: &str = fixture!("grpc_cross_namespace_tenant.yaml");
+/// Same shape as [`GRPC_CROSS_NAMESPACE_TENANT`] but the grant's `from.kind`
+/// is `HTTPRoute`, not `GRPCRoute` (#691 sad path): proves an HTTPRoute-scoped
+/// grant does not silently authorize a GRPCRoute's cross-namespace backendRef.
+pub const GRPC_CROSS_NAMESPACE_TENANT_WRONG_KIND: &str =
+    fixture!("grpc_cross_namespace_tenant_wrong_kind.yaml");
 /// HTTPRoute header-match rules.
 pub const HEADER_MATCHING: &str = fixture!("header_matching.yaml");
 /// HTTPRoute method-match rules.
@@ -390,6 +403,20 @@ pub const BASIC_AUTH_XNS_TENANT: &str = fixture!("basic_auth_xns_tenant.yaml");
 /// the route namespace with `.with("TENANTNS", <tenant-ns>)`. Without the
 /// ReferenceGrant from [`BASIC_AUTH_XNS_TENANT`] the proxy fails closed (503).
 pub const BASIC_AUTH_XNS_ROUTE: &str = fixture!("basic_auth_xns_route.yaml");
+/// Tenant-side of the cross-namespace `CoxswainExternalAuth` backendRef pair
+/// (#691): a `CoxswainExternalAuth → Service` ReferenceGrant permitting a
+/// `CoxswainExternalAuth` CR in `TESTNS`. Apply to the tenant namespace (after
+/// `backends::AUTH_STUB`) with `.with("TESTNS", <route-ns>)`. Pair with
+/// [`EXTERNAL_AUTH_XNS_ROUTE`].
+pub const EXTERNAL_AUTH_XNS_TENANT: &str = fixture!("external_auth_xns_tenant.yaml");
+/// Route-side of the cross-namespace `CoxswainExternalAuth` backendRef pair
+/// (#691): Gateway + `CoxswainExternalAuth` CR whose `backendRef.namespace` is
+/// `TENANTNS` + HTTPRoute with an `ExtensionRef` filter. Apply to the route
+/// namespace with `.with("TENANTNS", <tenant-ns>)`. Without the ReferenceGrant
+/// from [`EXTERNAL_AUTH_XNS_TENANT`] the proxy fails closed (503) — before
+/// #691 this backendRef was checked against the HTTPRoute grant set, so it was
+/// *always* denied regardless of the grant.
+pub const EXTERNAL_AUTH_XNS_ROUTE: &str = fixture!("external_auth_xns_route.yaml");
 /// Gateway + HTTPRoute with a dangling `ExtensionRef` pointing at a
 /// `BasicAuth` CR that does not exist (#442, #689). The rule installs as a
 /// 500 error route (GEP-1364) rather than admitting traffic with no auth
@@ -613,6 +640,25 @@ pub const BACKEND_CLIENT_CERT_GRANT: &str = fixture!("backend_client_cert_grant.
 /// the backend — no TLS termination at the proxy.
 /// Placeholders: `GATEWAY_TLS_PASSTHROUGH_PORT`, `PASSTHROUGH_HOSTNAME`.
 pub const TLS_PASSTHROUGH: &str = fixture!("tls_passthrough.yaml");
+
+/// Cross-namespace variant of [`TLS_PASSTHROUGH`] (#691, route side): the
+/// TLSRoute's `backendRef` names a Service in `TENANTNS`. Placeholders:
+/// `GATEWAY_TLS_PASSTHROUGH_PORT`, `PASSTHROUGH_HOSTNAME`, `TENANTNS`. Pair
+/// with [`TLS_CROSS_NAMESPACE_PASSTHROUGH_TENANT`] (or
+/// [`TLS_CROSS_NAMESPACE_PASSTHROUGH_TENANT_WRONG_KIND`] for the sad path)
+/// applied to TENANTNS, after `backends::ECHO_TLS`.
+pub const TLS_CROSS_NAMESPACE_PASSTHROUGH_ROUTE: &str =
+    fixture!("tls_cross_namespace_passthrough_route.yaml");
+/// `TLSRoute → Service` `ReferenceGrant` for the cross-namespace TLSRoute
+/// passthrough test (tenant side, #691). Apply after `backends::ECHO_TLS`.
+pub const TLS_CROSS_NAMESPACE_PASSTHROUGH_TENANT: &str =
+    fixture!("tls_cross_namespace_passthrough_tenant.yaml");
+/// Same shape as [`TLS_CROSS_NAMESPACE_PASSTHROUGH_TENANT`] but the grant's
+/// `from.kind` is `HTTPRoute`, not `TLSRoute` (#691 sad path): proves an
+/// HTTPRoute-scoped grant does not silently authorize a TLSRoute's
+/// cross-namespace backendRef.
+pub const TLS_CROSS_NAMESPACE_PASSTHROUGH_TENANT_WRONG_KIND: &str =
+    fixture!("tls_cross_namespace_passthrough_tenant_wrong_kind.yaml");
 
 /// Gateway with `protocol: TLS, tls.mode: Passthrough` listener only (no TLSRoute).
 /// Used to verify the Gateway becomes `Programmed=True` even with zero routes,

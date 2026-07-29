@@ -28,10 +28,11 @@ pub(super) use crate::tests::fixtures::{
     make_retry_policy_store, make_slice, make_svc_store,
 };
 
-/// Empty `ReferenceGrant` set — every cross-namespace `CoxswainExternalAuth`
-/// `backendRef` fails closed, matching production behaviour with no grants
-/// applied.
-pub(super) fn empty_backend_grants() -> crate::reference_grants::GrantSet {
+/// Empty `CoxswainExternalAuth → Service` `ReferenceGrant` set — every
+/// cross-namespace `CoxswainExternalAuth` `backendRef` fails closed, matching
+/// production behaviour with no grants applied.
+pub(super) fn empty_external_auth_grants()
+-> crate::reference_grants::GrantSet<crate::reference_grants::ExternalAuthBackend> {
     crate::reference_grants::GrantSet::default()
 }
 
@@ -59,7 +60,7 @@ pub(super) fn reconcile_no_default(
             &empty_external_auth_store(),
             &empty_jwt_auth_store(),
             &empty_jwks_cache(),
-            &empty_backend_grants(),
+            &empty_external_auth_grants(),
             crate::ingress::IngressCrRefStores::new(
                 &empty_compression_store(),
                 &empty_retry_policy_store(),
@@ -93,7 +94,7 @@ pub(super) fn reconcile_with_class_defaults(
             &empty_external_auth_store(),
             &empty_jwt_auth_store(),
             &empty_jwks_cache(),
-            &empty_backend_grants(),
+            &empty_external_auth_grants(),
             crate::ingress::IngressCrRefStores::new(
                 &empty_compression_store(),
                 &empty_retry_policy_store(),

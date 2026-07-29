@@ -210,6 +210,7 @@ mod tests {
     use crate::gw_types::v::httproutes::{
         HttpRouteParentRefs, HttpRouteRules, HttpRouteRulesBackendRefs, HttpRouteSpec,
     };
+    use crate::reference_grants::GrantSet;
     use crate::tests::fixtures::{empty_svc_store, endpoint_cache};
     use kube::api::ObjectMeta;
 
@@ -276,7 +277,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &crate::tests::fixtures::empty_secret_store(),
-                basic_auth_secret_grants: &HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &crate::tests::fixtures::empty_request_size_limit_store(),
                 compressions: &crate::tests::fixtures::empty_compression_store(),
                 backend_client_certs: &HashMap::new(),

@@ -56,6 +56,28 @@ spec:
 
 Header matching uses the same `Exact` and `RegularExpression` semantics as `HTTPRoute`.
 
+## Cross-namespace backends
+
+By default, a `GRPCRoute` can only reference backends in its own namespace. To allow access to a Service in another namespace, create a `ReferenceGrant` in the namespace where the Service lives:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-grpcroute-from-default
+  namespace: target-namespace   # namespace of the Service
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: GRPCRoute
+      namespace: default        # namespace of the GRPCRoute
+  to:
+    - group: ""
+      kind: Service
+```
+
+A `ReferenceGrant` scoped to `kind: HTTPRoute` does **not** permit a `GRPCRoute`'s cross-namespace backendRef, and vice versa — each route kind requires its own grant. Routes that reference a backend without a matching `ReferenceGrant` are rejected with a `ResolvedRefs: False` condition.
+
 ## Supported fields
 
 | Field | Support |

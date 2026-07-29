@@ -1,0 +1,18 @@
+# Cross-namespace GRPCRoute: tenant-side grant (#691, apply to TENANTNS after
+# backends::GRPC_ECHO).
+#
+# Permits a GRPCRoute in TESTNS to reference a Service in this namespace.
+# Pair with gwa::GRPC_CROSS_NAMESPACE_ROUTE applied to TESTNS.
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-grpcroute-from-${TESTNS}
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: GRPCRoute
+      namespace: ${TESTNS}
+  to:
+    - group: ""
+      kind: Service

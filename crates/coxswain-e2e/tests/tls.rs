@@ -3475,6 +3475,191 @@ async fn tls_passthrough_listener_without_route_is_programmed_but_drops() -> any
     Ok(())
 }
 
+// ── TLSRoute passthrough cross-namespace backendRef (#691) ──────────────────
+
+/// A `TLSRoute → Service` `ReferenceGrant` in the tenant namespace permits
+/// the TLSRoute passthrough's cross-namespace `backendRef` and the raw TLS
+/// connection reaches the backend (#691 happy path). Before the fix this
+/// backendRef was checked against the HTTPRoute grant set, so the documented
+/// `from.kind: TLSRoute` grant never matched any key and the reference was
+/// always denied — this test is the regression proof.
+#[tokio::test]
+async fn tlsroute_cross_namespace_grant_allows_backend_routing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-passthrough-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "tls-passthrough-xns-tenant").await?;
+
+    let hostname = format!("passthrough.{}.local", ns.name);
+    let backend_cert = GeneratedCert::for_host(&hostname);
+
+    // Tenant ns: echo-tls backend + a TLSRoute→Service ReferenceGrant permitting ns.
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&tenant.name)
+            .with("TLS_SERVER_CERT_B64", backend_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", backend_cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&tenant.name, &["echo-tls"]).await?;
+    fixtures::apply_fixture(
+        gwa::TLS_CROSS_NAMESPACE_PASSTHROUGH_TENANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+
+    // Route ns: Gateway + TLSRoute (backendRef → tenant).
+    fixtures::apply_fixture(
+        gwa::TLS_CROSS_NAMESPACE_PASSTHROUGH_ROUTE,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("PASSTHROUGH_HOSTNAME", &hostname)
+            .with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-passthrough-xns-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let passthrough_addr = h.gateway_passthrough_addr(&ns.name).await?;
+    let trusted_ca_der = backend_cert.cert_der();
+    let body = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async { format!("cross-ns TLS passthrough route for {hostname} to become live") },
+        || async {
+            try_tls_passthrough(
+                &passthrough_addr,
+                &hostname,
+                &trusted_ca_der,
+                "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .ok()
+        },
+    )
+    .await?;
+
+    assert!(
+        body.contains("namespace"),
+        "expected echo-tls JSON body with 'namespace' field, got: {body}",
+    );
+
+    Ok(())
+}
+
+/// A `ReferenceGrant` scoped to `from.kind: HTTPRoute` does not authorize a
+/// TLSRoute's cross-namespace `backendRef` (#691 sad path) — the two kinds
+/// must be isolated. This is the exact defect #691 fixed: an HTTPRoute-scoped
+/// grant used to silently permit TLSRoute backendRefs too.
+#[tokio::test]
+async fn tlsroute_cross_namespace_wrong_kind_grant_denied() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "tls-passthrough-xns-wrong").await?;
+    let tenant = NamespaceGuard::create(&h.client, "tls-passthrough-xns-wrong-tenant").await?;
+
+    let hostname = format!("passthrough.{}.local", ns.name);
+    let backend_cert = GeneratedCert::for_host(&hostname);
+
+    fixtures::apply_fixture(
+        backends::ECHO_TLS,
+        FixtureVars::new(&tenant.name)
+            .with("TLS_SERVER_CERT_B64", backend_cert.cert_b64())
+            .with("TLS_SERVER_KEY_B64", backend_cert.key_b64()),
+    )
+    .await?;
+    wait::wait_for_deployments(&tenant.name, &["echo-tls"]).await?;
+    fixtures::apply_fixture(
+        gwa::TLS_CROSS_NAMESPACE_PASSTHROUGH_TENANT_WRONG_KIND,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+
+    fixtures::apply_fixture(
+        gwa::TLS_CROSS_NAMESPACE_PASSTHROUGH_ROUTE,
+        FixtureVars::new(&ns.name)
+            .with(
+                "GATEWAY_TLS_PASSTHROUGH_PORT",
+                GATEWAY_TLS_PASSTHROUGH_PORT.to_string(),
+            )
+            .with("PASSTHROUGH_HOSTNAME", &hostname)
+            .with("TENANTNS", &tenant.name),
+    )
+    .await?;
+
+    // The listener config itself is valid (unrelated to the backendRef grant),
+    // so the Gateway settles Programmed=True same as the happy path — the
+    // denial shows up only in the passthrough table having no reachable
+    // backend for this SNI, mirroring
+    // `tls_passthrough_listener_without_route_is_programmed_but_drops`.
+    wait::wait_for_gateway_condition(
+        &h.client,
+        "coxswain-passthrough-xns-gw",
+        &ns.name,
+        "Programmed",
+        "True",
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    // A single early connection failure is not proof of denial — the SNI table
+    // entry may simply not have propagated to the proxy over discovery yet
+    // (the happy-path sibling test allows up to 60s for that). So invert
+    // `poll_until`: keep retrying the connection for the *same* window the
+    // happy path would need to succeed in, and fail this test the instant any
+    // attempt succeeds. Only a full timeout (every attempt across the whole
+    // window denied) proves the denial holds — not just that we happened to
+    // probe during the propagation lag.
+    let passthrough_addr = h.gateway_passthrough_addr(&ns.name).await?;
+    let trusted_ca_der = backend_cert.cert_der();
+    let premature_success = wait::poll_until(
+        Duration::from_secs(60),
+        wait::POLL,
+        || async {
+            format!("cross-ns TLS passthrough for {hostname} to stay denied (wrong grant kind)")
+        },
+        || async {
+            // `try_tls_passthrough` has no internal deadline. Unlike the SNI-mismatch
+            // sad paths this helper otherwise serves (which fail fast — the proxy has
+            // no table entry to route through at all), a *denied* backendRef still
+            // leaves the SNI matched in the passthrough table with a zero-endpoint
+            // `BackendGroup` — the proxy may hold the connection open rather than
+            // reset it. Bound each attempt so a held-open connection can't stall the
+            // whole poll loop past its outer window.
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                try_tls_passthrough(
+                    &passthrough_addr,
+                    &hostname,
+                    &trusted_ca_der,
+                    "GET / HTTP/1.1\r\nHost: backend\r\nConnection: close\r\n\r\n",
+                ),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+        },
+    )
+    .await;
+
+    assert!(
+        premature_success.is_err(),
+        "cross-ns TLSRoute backendRef must stay denied for the full propagation window when \
+         only a wrong-kind (HTTPRoute) grant exists, but a connection succeeded"
+    );
+
+    Ok(())
+}
+
 // ── TLS terminate (TLSRouteModeTerminate, #481) ───────────────────────────────
 
 /// Happy path: a `TLS/Terminate` listener decrypts the TLS stream and forwards

@@ -1,0 +1,24 @@
+# Cross-namespace CoxswainExternalAuth: tenant-side fixture (apply to
+# TENANTNS, after backends::AUTH_STUB).
+#
+# Holds the CoxswainExternalAuth -> Service ReferenceGrant that permits a
+# CoxswainExternalAuth CR in TESTNS (the route namespace) to reference the
+# auth-allow Service in this namespace — the exact grant shape documented in
+# docs/src/gateway-api/route-extensions.md. Pair with
+# gwa::EXTERNAL_AUTH_XNS_ROUTE applied to TESTNS.
+#
+# TESTNS = the route namespace whose CoxswainExternalAuth CR references this
+# Service.
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-externalauth-from-${TESTNS}
+spec:
+  from:
+    - group: gateway.coxswain-labs.dev
+      kind: CoxswainExternalAuth
+      namespace: ${TESTNS}
+  to:
+    - group: ""
+      kind: Service

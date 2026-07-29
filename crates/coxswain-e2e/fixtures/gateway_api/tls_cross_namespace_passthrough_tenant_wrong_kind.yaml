@@ -1,0 +1,22 @@
+# Cross-namespace TLSRoute passthrough: tenant-side grant of the WRONG kind
+# (#691, apply to TENANTNS after backends::ECHO_TLS).
+#
+# `from.kind: HTTPRoute` — NOT TLSRoute. Proves a TLSRoute's cross-namespace
+# backendRef is not silently authorized by an HTTPRoute-scoped grant (the core
+# defect #691 fixed: before the fix, TLSRoute backendRefs were checked against
+# the HTTPRoute grant set). Pair with
+# gwa::TLS_CROSS_NAMESPACE_PASSTHROUGH_ROUTE applied to TESTNS — the
+# backendRef must still be denied.
+---
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-httproute-from-${TESTNS}
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: ${TESTNS}
+  to:
+    - group: ""
+      kind: Service

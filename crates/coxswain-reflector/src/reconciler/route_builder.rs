@@ -23,12 +23,15 @@ use crate::gw_types::{GrpcRoute, HttpRoute, TcpRoute, UdpRoute};
 use crate::ingress::annotations::AnnotationIssue;
 use crate::ingress::{IngressClassContext, IngressPorts, IngressReconciler, resolve_class_params};
 use crate::keys::ListenerKey;
+use crate::reference_grants::{
+    GatewayCert, GrantSet, TcpRouteBackend, TlsRouteBackend, UdpRouteBackend,
+};
 use crate::status::{
     BackendClientCertOutcome, GatewayListenerStatus, ListenerInfo, ListenerReadiness,
     ListenerSource, ListenerStatusKey, RouteStatusMap,
 };
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::reference_grants::{self as reference_grants, ReferenceGrantKey};
+use coxswain_core::reference_grants::{self as reference_grants};
 use coxswain_core::routing::{
     BackendClientCert, BackendGroup, GatewayRoutingTableBuilder, IngressRoutingTableBuilder,
     RouteConflict, RouteEntry, RoutingTable, RoutingTableBuilder, SharedGatewayRoutingTable,
@@ -151,7 +154,7 @@ pub(super) struct BackendClientCertResolution {
 pub(super) fn resolve_backend_client_certs(
     stores: &ReflectorStores<'_>,
     gateway_classes: &HashSet<String>,
-    cert_grants: &HashSet<ReferenceGrantKey>,
+    cert_grants: &GrantSet<GatewayCert>,
     skip_cut_over: bool,
 ) -> BackendClientCertResolution {
     let mut certs = HashMap::new();
@@ -227,13 +230,24 @@ pub(super) fn compute_global_epoch(stores: &ReflectorStores<'_>, ownership: &Own
     epoch ^= stores.jwks_cache.generation();
     epoch ^= hash_grant_set(ownership.backend_grants);
     epoch ^= hash_grant_set(ownership.basic_auth_secret_grants);
+    // GRPCRoute goes through the same partitioned dirty-route build as HTTPRoute
+    // (`plan.dirty_grpc`/`fresh_builder` in `build_gateway_routes`), so a
+    // `grpc_backend_grants` create/delete must dirty cached partitions the same
+    // way `backend_grants` does above — same "moves no watched resourceVersion"
+    // reasoning (#691).
+    epoch ^= hash_grant_set(ownership.grpc_backend_grants);
+    // Ext-auth resolution is baked into partitioned route auth chains (both the
+    // route-level ExtensionRef and the Gateway mandate) exactly like
+    // `basic_auth_secret_grants` above, so `external_auth_backend_grants` needs
+    // the same fold (#691).
+    epoch ^= hash_grant_set(ownership.external_auth_backend_grants);
     // `Gateway → Secret` grants gating the GEP-3155 backend client cert: the
     // resolved cert is baked per-route into partitioned `RouteEntry`s
     // (`UpstreamTls.client_cert`), and a grant create/delete moves no watched
     // resourceVersion — the Secret and Gateway are untouched — so the grant set
-    // itself must move the epoch. (`ls_cert_grants`/`ca_grants`/`tcp`/`udp`
-    // grant sets deliberately absent: they feed only tables rebuilt in full
-    // every pass.)
+    // itself must move the epoch. (`ls_cert_grants`/`ca_grants`/`tls_backend_grants`/
+    // `tcp`/`udp` grant sets deliberately absent: they feed only tables rebuilt
+    // in full every pass, not the partitioned build.)
     epoch ^= hash_grant_set(ownership.cert_grants);
     // Ext-auth backend endpoints are baked into route auth chains (both the
     // route-level ExtensionRef and the Gateway mandate); their pod churn moves
@@ -258,10 +272,10 @@ pub(super) fn compute_global_epoch(stores: &ReflectorStores<'_>, ownership: &Own
     epoch
 }
 
-/// Order-independent fold of a `ReferenceGrantKey` set's members. XOR is safe
-/// here (unlike route/endpoint contribution folds): `HashSet` members are
-/// unique by definition, so equal contributions can't occur and self-cancel.
-fn hash_grant_set(grants: &HashSet<ReferenceGrantKey>) -> u64 {
+/// Order-independent fold of a [`GrantSet`]'s members. XOR is safe here (unlike
+/// route/endpoint contribution folds): `HashSet` members are unique by
+/// definition, so equal contributions can't occur and self-cancel.
+fn hash_grant_set<K>(grants: &GrantSet<K>) -> u64 {
     grants
         .iter()
         .fold(0u64, |acc, g| acc ^ crate::fingerprint::hash_one(g))
@@ -367,6 +381,7 @@ pub(super) fn build_gateway_routes(
         jwks_cache: stores.jwks_cache,
         auth_secrets: stores.auth_secrets,
         basic_auth_secret_grants: ownership.basic_auth_secret_grants,
+        external_auth_grants: ownership.external_auth_backend_grants,
         request_size_limits: stores.request_size_limits,
         compressions: stores.compressions,
         backend_client_certs: ownership.backend_client_certs,
@@ -420,7 +435,7 @@ pub(super) fn build_gateway_routes(
             stores.endpoint_cache,
             stores.services,
             ownership.gateways,
-            ownership.backend_grants,
+            ownership.grpc_backend_grants,
             grpc_resolution,
             &mut fresh_builder,
         );
@@ -552,7 +567,7 @@ fn build_ingress_routes(
         stores.external_auths,
         stores.jwt_auths,
         stores.jwks_cache,
-        ownership.backend_grants,
+        ownership.external_auth_backend_grants,
         crate::ingress::IngressCrRefStores::new(
             stores.compressions,
             stores.retry_policies,
@@ -1112,7 +1127,7 @@ pub(super) fn build_passthrough_routes(
     stores: &ReflectorStores<'_>,
     owned_gateways: &HashSet<ObjectKey>,
     effective: &HashMap<ObjectKey, EffectiveGateway>,
-    backend_grants: &HashSet<ReferenceGrantKey>,
+    backend_grants: &GrantSet<TlsRouteBackend>,
     out: &SharedTlsPassthroughTable,
 ) -> RouteStatusMap {
     build_tls_l4_routes(true, stores, owned_gateways, effective, backend_grants, out)
@@ -1130,7 +1145,7 @@ pub(super) fn build_terminate_routes(
     stores: &ReflectorStores<'_>,
     owned_gateways: &HashSet<ObjectKey>,
     effective: &HashMap<ObjectKey, EffectiveGateway>,
-    backend_grants: &HashSet<ReferenceGrantKey>,
+    backend_grants: &GrantSet<TlsRouteBackend>,
     out: &SharedTlsPassthroughTable,
 ) -> RouteStatusMap {
     build_tls_l4_routes(
@@ -1227,7 +1242,7 @@ fn build_tls_l4_routes(
     stores: &ReflectorStores<'_>,
     owned_gateways: &HashSet<ObjectKey>,
     effective: &HashMap<ObjectKey, EffectiveGateway>,
-    backend_grants: &HashSet<ReferenceGrantKey>,
+    backend_grants: &GrantSet<TlsRouteBackend>,
     out: &SharedTlsPassthroughTable,
 ) -> RouteStatusMap {
     let tls_routes = stores.tls_routes.state();
@@ -1443,14 +1458,15 @@ fn tcp_route_binds(
 /// `Accepted` / `ResolvedRefs` status conditions on each route.
 ///
 /// `backend_grants` must be the `TCPRoute → Service` set
-/// ([`flatten_tcp_backend_grants`](crate::reference_grants::flatten_tcp_backend_grants)),
-/// not the generic `HTTPRoute`-scoped set — `ReferenceGrantKey` carries no
-/// `from.kind`, so passing the wrong set would silently cross-permit backends.
+/// ([`flatten_tcp_backend_grants`](crate::reference_grants::flatten_tcp_backend_grants)) —
+/// its `GrantSet<TcpRouteBackend>` type makes passing the generic
+/// `HTTPRoute`-scoped set (which would silently cross-permit backends) a
+/// compile error rather than a call-site convention.
 pub(super) fn build_tcp_routes(
     stores: &ReflectorStores<'_>,
     owned_gateways: &HashSet<ObjectKey>,
     effective: &HashMap<ObjectKey, EffectiveGateway>,
-    backend_grants: &HashSet<ReferenceGrantKey>,
+    backend_grants: &GrantSet<TcpRouteBackend>,
     out: &SharedTcpRouteTable,
 ) -> RouteStatusMap {
     let tcp_routes = stores.tcp_routes.state();
@@ -1655,14 +1671,15 @@ fn udp_route_binds(
 /// `Accepted` / `ResolvedRefs` status conditions on each route.
 ///
 /// `backend_grants` must be the `UDPRoute → Service` set
-/// ([`flatten_udp_backend_grants`](crate::reference_grants::flatten_udp_backend_grants)),
-/// not the generic `HTTPRoute`-scoped set — `ReferenceGrantKey` carries no
-/// `from.kind`, so passing the wrong set would silently cross-permit backends.
+/// ([`flatten_udp_backend_grants`](crate::reference_grants::flatten_udp_backend_grants)) —
+/// its `GrantSet<UdpRouteBackend>` type makes passing the generic
+/// `HTTPRoute`-scoped set (which would silently cross-permit backends) a
+/// compile error rather than a call-site convention.
 pub(super) fn build_udp_routes(
     stores: &ReflectorStores<'_>,
     owned_gateways: &HashSet<ObjectKey>,
     effective: &HashMap<ObjectKey, EffectiveGateway>,
-    backend_grants: &HashSet<ReferenceGrantKey>,
+    backend_grants: &GrantSet<UdpRouteBackend>,
     out: &SharedUdpRouteTable,
 ) -> RouteStatusMap {
     let udp_routes = stores.udp_routes.state();
@@ -2192,7 +2209,7 @@ mod tests {
             &[gw],
             &owned(),
             &effective,
-            &HashSet::new(),
+            &GrantSet::empty(),
             &stores,
         );
 

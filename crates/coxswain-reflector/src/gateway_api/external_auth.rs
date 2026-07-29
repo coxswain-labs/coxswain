@@ -5,18 +5,22 @@
 //!
 //! The auth-service `backendRef` is resolved to pod endpoints exactly like any
 //! other backend ([`crate::endpoints::resolve`]); a cross-namespace ref is gated
-//! by a `ReferenceGrant`, mirroring `BasicAuth`'s `secretRef` handling (#520).
-//! An endpoint-less or ungranted ref fails **closed**
-//! ([`IngressAuthConfig::Unavailable`] → 503).
+//! by a `CoxswainExternalAuth → Service` `ReferenceGrant`
+//! ([`flatten_external_auth_backend_grants`](crate::reference_grants::flatten_external_auth_backend_grants)),
+//! mirroring `BasicAuth`'s `secretRef` handling (#520). Before #691 this was
+//! checked against the `HTTPRoute → Service` set instead — the documented grant
+//! kind never matched, so the backendRef was permanently fail-closed. An
+//! endpoint-less or ungranted ref fails **closed** ([`IngressAuthConfig::Unavailable`] → 503).
 
 use crate::MergedStore;
 use crate::duration::parse_duration;
 use crate::endpoints::pool::EndpointCache;
 use crate::k8s_utils::metadata_created_at;
+use crate::reference_grants::{ExternalAuthBackend, GrantSet};
 use crate::status::CoxswainExternalAuthStatusMap;
 use coxswain_core::crd::{CoxswainExternalAuth, CoxswainExternalAuthSpec, ExternalAuthProtocol};
 use coxswain_core::ownership::ObjectKey;
-use coxswain_core::reference_grants::{self, ReferenceGrantKey};
+use coxswain_core::reference_grants::{self};
 use coxswain_core::routing::{
     DEFAULT_ALLOWED_HEADERS_GRPC, DEFAULT_ALLOWED_HEADERS_HTTP, ExtAuthConfig, ExtAuthTransport,
     GrpcExtAuthConfig, HttpExtAuthConfig, IngressAuthConfig, resolve_allowed_headers,
@@ -56,7 +60,7 @@ pub(crate) fn resolve_spec(
     policy_ns: &str,
     services: &MergedStore<Service>,
     endpoint_cache: &EndpointCache,
-    grants: &HashSet<ReferenceGrantKey>,
+    grants: &GrantSet<ExternalAuthBackend>,
 ) -> IngressAuthConfig {
     let Some(endpoints) = resolve_backend(spec, policy_ns, services, endpoint_cache, grants) else {
         return IngressAuthConfig::Unavailable;
@@ -117,7 +121,7 @@ fn resolve_backend(
     policy_ns: &str,
     services: &MergedStore<Service>,
     endpoint_cache: &EndpointCache,
-    grants: &HashSet<ReferenceGrantKey>,
+    grants: &GrantSet<ExternalAuthBackend>,
 ) -> Option<Arc<[SocketAddr]>> {
     let b = &spec.backend_ref;
     // Only core Services are valid auth backends.
@@ -198,7 +202,7 @@ pub fn resolve_gateway_policies(
     owned_gateways: &HashSet<ObjectKey>,
     services: &MergedStore<Service>,
     endpoint_cache: &EndpointCache,
-    grants: &HashSet<ReferenceGrantKey>,
+    grants: &GrantSet<ExternalAuthBackend>,
 ) -> (ExternalAuthGatewayIndex, CoxswainExternalAuthStatusMap) {
     // Candidate per Gateway: (creationTimestamp, policy_key, resolved-config).
     type Candidate = (Option<SystemTime>, ObjectKey, Arc<IngressAuthConfig>);
@@ -353,7 +357,7 @@ mod tests {
             &owned(&[("ns", "gw")]),
             &empty_svc(),
             &empty_endpoint_cache(),
-            &HashSet::new(),
+            &GrantSet::empty(),
         );
         assert!(index.is_empty());
         assert!(status.is_empty());
@@ -368,7 +372,7 @@ mod tests {
             &owned(&[("ns", "gw")]),
             &empty_svc(),
             &empty_endpoint_cache(),
-            &HashSet::new(),
+            &GrantSet::empty(),
         );
         assert!(
             index.is_empty(),
@@ -387,7 +391,7 @@ mod tests {
             &owned(&[("ns", "gw")]),
             &empty_svc(),
             &empty_endpoint_cache(),
-            &HashSet::new(),
+            &GrantSet::empty(),
         );
         assert!(
             index.contains_key(&ObjectKey::new("ns", "gw")),
@@ -413,7 +417,7 @@ mod tests {
             &owned(&[("ns", "gw")]),
             &empty_svc(),
             &empty_endpoint_cache(),
-            &HashSet::new(),
+            &GrantSet::empty(),
         );
         assert!(index.is_empty());
         assert!(
@@ -433,7 +437,7 @@ mod tests {
             &owned(&[("ns", "gw")]),
             &empty_svc(),
             &empty_endpoint_cache(),
-            &HashSet::new(),
+            &GrantSet::empty(),
         );
         assert_eq!(index.len(), 1, "one Gateway → one index entry");
         let older_status = status
@@ -499,7 +503,7 @@ mod tests {
             "ns",
             &crate::tests::fixtures::empty_svc_store(),
             &resolvable_authz_endpoints(),
-            &HashSet::new(),
+            &GrantSet::empty(),
         );
         let IngressAuthConfig::External(cfg) = resolved else {
             panic!("expected External with a resolvable backend, got {resolved:?}");
@@ -525,7 +529,7 @@ mod tests {
             "ns",
             &crate::tests::fixtures::empty_svc_store(),
             &resolvable_authz_endpoints(),
-            &HashSet::new(),
+            &GrantSet::empty(),
         );
         let IngressAuthConfig::External(cfg) = resolved else {
             panic!("expected External with a resolvable backend, got {resolved:?}");
@@ -554,7 +558,7 @@ mod tests {
             "ns",
             &crate::tests::fixtures::empty_svc_store(),
             &resolvable_authz_endpoints(),
-            &HashSet::new(),
+            &GrantSet::empty(),
         );
         let IngressAuthConfig::External(cfg) = resolved else {
             panic!("expected External with a resolvable backend, got {resolved:?}");
@@ -582,7 +586,7 @@ mod tests {
             &owned(&[("ns", "gw")]),
             &empty_svc(),
             &empty_endpoint_cache(),
-            &HashSet::new(),
+            &GrantSet::empty(),
         );
         assert_eq!(index.len(), 1, "one Gateway → one index entry");
         let s = status

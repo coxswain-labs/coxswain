@@ -64,6 +64,28 @@ Matching follows Gateway API hostname precedence: exact before wildcard before c
 !!! note
     Wildcard matching here is routing-only (no cert is involved at the proxy on the passthrough path), and follows the same any-number-of-labels semantics as [HTTPRoute wildcards](httproute.md#wildcard-hostnames).
 
+## Cross-namespace backends
+
+By default, a `TLSRoute` can only reference backends in its own namespace — this applies to both Passthrough and Terminate mode. To allow access to a Service in another namespace, create a `ReferenceGrant` in the namespace where the Service lives:
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: allow-tlsroute-from-default
+  namespace: target-namespace   # namespace of the Service
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: TLSRoute
+      namespace: default        # namespace of the TLSRoute
+  to:
+    - group: ""
+      kind: Service
+```
+
+A `ReferenceGrant` scoped to `kind: HTTPRoute` does **not** permit a `TLSRoute`'s cross-namespace backendRef, and vice versa — each route kind requires its own grant. Routes that reference a backend without a matching `ReferenceGrant` are rejected with a `ResolvedRefs: False` condition.
+
 ## Supported fields
 
 | Field | Support |

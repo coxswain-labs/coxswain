@@ -8,11 +8,12 @@ use crate::gw_types::v::httproutes::{
     HttpRouteRulesFiltersCors, HttpRouteRulesFiltersType, HttpRouteRulesMatchesHeadersType,
     HttpRouteRulesMatchesMethod, HttpRouteRulesMatchesQueryParamsType,
 };
+use crate::reference_grants::{BasicAuthSecret, ExternalAuthBackend, GrantSet, HttpRouteBackend};
 use coxswain_core::crd::{
     BasicAuth, Compression, CoxswainExternalAuth, IpAccessControl, RateLimit, RequestSizeLimit,
     RetryPolicy,
 };
-use coxswain_core::reference_grants::{self, ReferenceGrantKey};
+use coxswain_core::reference_grants::{self};
 use coxswain_core::routing::{
     BackendGroup, CompressionConfig, CorsConfig, CorsOrigin, FilterAction, HeaderMod,
     HeaderPredicate, IngressAuthConfig, MatchPredicates, MirrorFraction, PathModifier,
@@ -21,7 +22,6 @@ use coxswain_core::routing::{
 use http::{HeaderName, Method};
 use k8s_openapi::api::core::v1::{Secret, Service};
 use kube::runtime::reflector;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 /// A resolved source-IP CIDR set attached to a route (allow or deny list), or
@@ -34,7 +34,7 @@ pub(super) use super::ip_access_control::CidrSet;
 pub(super) struct BackendStores<'a> {
     pub(super) endpoint_cache: &'a EndpointCache,
     pub(super) services: &'a MergedStore<Service>,
-    pub(super) grants: &'a HashSet<ReferenceGrantKey>,
+    pub(super) grants: &'a GrantSet<HttpRouteBackend>,
 }
 
 /// Outcome of resolving one route-rule `ExtensionRef` against a specific coxswain
@@ -972,7 +972,7 @@ pub(super) fn resolve_basic_auth<F: ExtRefFilter>(
     route_ns: &str,
     basic_auths: &MergedStore<BasicAuth>,
     auth_secrets: &MergedStore<Secret>,
-    secret_grants: &HashSet<ReferenceGrantKey>,
+    secret_grants: &GrantSet<BasicAuthSecret>,
 ) -> (Option<Arc<IngressAuthConfig>>, bool) {
     // Unlike the other resolvers, basic-auth historically *kept scanning* past
     // a missing CR rather than stopping, so a later `BasicAuth` ref on the same
@@ -1006,7 +1006,7 @@ pub(super) fn resolve_external_auth<F: ExtRefFilter>(
     external_auths: &MergedStore<CoxswainExternalAuth>,
     services: &MergedStore<Service>,
     endpoint_cache: &EndpointCache,
-    grants: &HashSet<ReferenceGrantKey>,
+    grants: &GrantSet<ExternalAuthBackend>,
 ) -> (Option<Arc<IngressAuthConfig>>, bool) {
     let mut missing = false;
     for (g, k, n) in ext_refs(filters) {
@@ -1098,7 +1098,7 @@ pub(super) fn resolve_basic_auth_ref(
     route_ns: &str,
     basic_auths: &MergedStore<BasicAuth>,
     auth_secrets: &MergedStore<Secret>,
-    secret_grants: &HashSet<ReferenceGrantKey>,
+    secret_grants: &GrantSet<BasicAuthSecret>,
 ) -> RefResolution<Arc<IngressAuthConfig>> {
     if ext_group != super::COXSWAIN_GROUP || ext_kind != "BasicAuth" {
         return RefResolution::NotMine;
@@ -1406,7 +1406,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -1421,7 +1421,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1501,7 +1502,7 @@ mod tests {
                 &store,
                 &empty_svc_store(),
                 &default_owned(),
-                &HashSet::new(),
+                &GrantSet::empty(),
                 crate::gateway_api::RouteResolution {
                     listener_info: &no_listener_info(),
                     policy_index: &HashMap::new(),
@@ -1516,7 +1517,8 @@ mod tests {
                     jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                     jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                     auth_secrets: &empty_secret_store(),
-                    basic_auth_secret_grants: &std::collections::HashSet::new(),
+                    basic_auth_secret_grants: &GrantSet::empty(),
+                    external_auth_grants: &GrantSet::empty(),
                     request_size_limits: &empty_request_size_limit_store(),
                     compressions: &empty_compression_store(),
                     backend_client_certs: &HashMap::new(),
@@ -1608,7 +1610,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -1623,7 +1625,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1669,7 +1672,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -1684,7 +1687,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1736,7 +1740,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -1751,7 +1755,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -1810,7 +1815,7 @@ mod tests {
             &store,
             &empty_svc_store(),
             &default_owned(),
-            &HashSet::new(),
+            &GrantSet::empty(),
             crate::gateway_api::RouteResolution {
                 listener_info: &no_listener_info(),
                 policy_index: &HashMap::new(),
@@ -1825,7 +1830,8 @@ mod tests {
                 jwt_auths: &crate::tests::fixtures::empty_jwt_auth_store(),
                 jwks_cache: &crate::tests::fixtures::empty_jwks_cache(),
                 auth_secrets: &empty_secret_store(),
-                basic_auth_secret_grants: &std::collections::HashSet::new(),
+                basic_auth_secret_grants: &GrantSet::empty(),
+                external_auth_grants: &GrantSet::empty(),
                 request_size_limits: &empty_request_size_limit_store(),
                 compressions: &empty_compression_store(),
                 backend_client_certs: &HashMap::new(),
@@ -2118,7 +2124,7 @@ mod tests {
             "default",
             &basic_auths,
             &auth_secrets,
-            &std::collections::HashSet::new(),
+            &GrantSet::empty(),
         );
         assert!(cfg.is_none());
         assert!(!unresolved);
@@ -2134,7 +2140,7 @@ mod tests {
             "default",
             &basic_auths,
             &auth_secrets,
-            &std::collections::HashSet::new(),
+            &GrantSet::empty(),
         );
         assert!(cfg.is_none(), "missing CR installs no auth config");
         assert!(
@@ -2159,7 +2165,7 @@ mod tests {
             "default",
             &basic_auths,
             &auth_secrets,
-            &std::collections::HashSet::new(),
+            &GrantSet::empty(),
         );
         let cfg = cfg.expect("Some when CR present");
         assert!(matches!(*cfg, IngressAuthConfig::Unavailable));
@@ -2188,7 +2194,7 @@ mod tests {
             "default",
             &basic_auths,
             &auth_secrets,
-            &std::collections::HashSet::new(),
+            &GrantSet::empty(),
         );
         let cfg = cfg.expect("Some when CR and Secret present");
         assert!(matches!(*cfg, IngressAuthConfig::Basic(ref creds) if creds.len() == 1));
@@ -2209,7 +2215,7 @@ mod tests {
             "default",
             &basic_auths,
             &auth_secrets,
-            &std::collections::HashSet::new(),
+            &GrantSet::empty(),
         );
         let cfg = cfg.expect("Some when CR present");
         assert!(matches!(*cfg, IngressAuthConfig::Unavailable));
@@ -2236,7 +2242,7 @@ mod tests {
             "default",
             &basic_auths,
             &auth_secrets,
-            &std::collections::HashSet::new(),
+            &GrantSet::empty(),
         );
         let cfg = cfg.expect("Some when CR present");
         assert!(matches!(*cfg, IngressAuthConfig::Unavailable));
@@ -2257,12 +2263,14 @@ mod tests {
             "my-htpasswd",
             "alice:$2y$12$abcdefghijklmnopqrstuuVGKkqzuSFPb0h.d.XRjRijkFvxONxfy\n",
         )]);
-        let mut grants = std::collections::HashSet::new();
-        grants.insert(ReferenceGrantKey::specific(
-            "default",
-            "other",
-            "my-htpasswd",
-        ));
+        let grants: GrantSet<BasicAuthSecret> = std::iter::once(
+            coxswain_core::reference_grants::ReferenceGrantKey::specific(
+                "default",
+                "other",
+                "my-htpasswd",
+            ),
+        )
+        .collect();
         let (cfg, _) = resolve_basic_auth(
             &[basic_auth_ext_ref("policy")],
             "default",
@@ -2557,7 +2565,7 @@ mod tests {
             &external_auths,
             &empty_svc_store(),
             &endpoint_cache(vec![]),
-            &std::collections::HashSet::new(),
+            &GrantSet::empty(),
         );
         assert!(cfg.is_none());
         assert!(!unresolved);
@@ -2573,7 +2581,7 @@ mod tests {
             &external_auths,
             &empty_svc_store(),
             &endpoint_cache(vec![]),
-            &std::collections::HashSet::new(),
+            &GrantSet::empty(),
         );
         assert!(cfg.is_none(), "missing CR installs no auth config");
         assert!(
@@ -2592,7 +2600,7 @@ mod tests {
             &external_auths,
             &empty_svc_store(),
             &endpoint_cache(vec![]),
-            &std::collections::HashSet::new(),
+            &GrantSet::empty(),
         );
         // The CR itself resolved; no ready endpoints on the auth backend fails
         // **closed** via `Unavailable` (a distinct mechanism, unaffected by

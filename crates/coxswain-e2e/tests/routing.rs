@@ -1889,6 +1889,157 @@ async fn grpc_route_unmatched_method_is_not_served() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── GRPCRoute cross-namespace backendRef (#691) ──────────────────────────────
+
+/// A `GRPCRoute → Service` `ReferenceGrant` in the tenant namespace permits
+/// the GRPCRoute's cross-namespace `backendRef` and the call reaches the
+/// backend (#691 happy path). Before the fix this backendRef was checked
+/// against the HTTPRoute grant set, so the documented `from.kind: GRPCRoute`
+/// grant never matched any key and the reference was always denied — this
+/// test is the regression proof.
+#[tokio::test]
+async fn grpc_route_cross_namespace_grant_allows_backend_routing() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-grpc-xns").await?;
+    let tenant = NamespaceGuard::create(&h.client, "rt-grpc-xns-tenant").await?;
+
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&tenant.name)).await?;
+    wait::wait_for_deployments(&tenant.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(
+        gwa::GRPC_CROSS_NAMESPACE_TENANT,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+
+    fixtures::apply_fixture(
+        gwa::GRPC_CROSS_NAMESPACE_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+    wait::wait_for_grpcroute_programmed(
+        &h.client,
+        "grpc-cross-ns-route",
+        &ns.name,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let host = format!("grpc-cross-ns.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+    let origin: tonic::transport::Uri = format!("http://{}:{}", host, gw_addr.port()).parse()?;
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))?.origin(origin);
+
+    let inner = wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async { format!("cross-ns gRPC Echo call via {host} to succeed") },
+        || async {
+            let channel = endpoint.clone().connect().await.ok()?;
+            let mut client = tonic::client::Grpc::new(channel);
+            client.ready().await.ok()?;
+            let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo"
+                .parse::<tonic::codegen::http::uri::PathAndQuery>()
+                .ok()?;
+            let codec =
+                tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+            client
+                .unary(tonic::Request::new(grpcecho::EchoRequest {}), path, codec)
+                .await
+                .ok()
+                .map(tonic::Response::into_inner)
+        },
+    )
+    .await?;
+
+    let pod = inner
+        .assertions
+        .and_then(|a| a.context)
+        .map(|c| c.pod)
+        .unwrap_or_default();
+    assert!(
+        pod.starts_with("grpc-echo-"),
+        "response must come from grpc-echo-* pod, got {pod:?}"
+    );
+
+    Ok(())
+}
+
+/// A `ReferenceGrant` scoped to `from.kind: HTTPRoute` does not authorize a
+/// GRPCRoute's cross-namespace `backendRef` (#691 sad path) — the two kinds
+/// must be isolated. This is the exact defect #691 fixed: an HTTPRoute-scoped
+/// grant used to silently permit GRPCRoute backendRefs too.
+#[tokio::test]
+async fn grpc_route_cross_namespace_wrong_kind_grant_denied() -> anyhow::Result<()> {
+    let h = Harness::start().await?;
+    let ns = NamespaceGuard::create(&h.client, "rt-grpc-xns-wrong").await?;
+    let tenant = NamespaceGuard::create(&h.client, "rt-grpc-xns-wrong-tenant").await?;
+
+    fixtures::apply_fixture(backends::GRPC_ECHO, FixtureVars::new(&tenant.name)).await?;
+    wait::wait_for_deployments(&tenant.name, &["grpc-echo"]).await?;
+    fixtures::apply_fixture(
+        gwa::GRPC_CROSS_NAMESPACE_TENANT_WRONG_KIND,
+        FixtureVars::new(&tenant.name).with("TESTNS", &ns.name),
+    )
+    .await?;
+
+    fixtures::apply_fixture(
+        gwa::GRPC_CROSS_NAMESPACE_ROUTE,
+        FixtureVars::new(&ns.name).with("TENANTNS", &tenant.name),
+    )
+    .await?;
+    wait::wait_for_grpcroute_programmed(
+        &h.client,
+        "grpc-cross-ns-route",
+        &ns.name,
+        Duration::from_secs(60),
+    )
+    .await?;
+
+    let host = format!("grpc-cross-ns.{}.local", ns.name);
+    let gw_addr = h.gateway_http_addr(&ns.name).await?;
+    let origin: tonic::transport::Uri = format!("http://{}:{}", host, gw_addr.port()).parse()?;
+    let endpoint =
+        tonic::transport::Endpoint::from_shared(format!("http://{gw_addr}"))?.origin(origin);
+
+    // A single early failure is not proof of denial — the route may simply not
+    // have propagated to the proxy over discovery yet (the happy-path sibling
+    // test allows up to 60s for that). So invert `poll_until`: keep retrying
+    // the call for the *same* window the happy path would need to succeed in,
+    // and fail this test the instant any call succeeds. Only a full timeout
+    // (every attempt across the whole window denied) proves the denial holds
+    // — not just that we happened to probe during the propagation lag.
+    let premature_success = wait::poll_until(
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async {
+            format!("cross-ns gRPC Echo call via {host} to stay denied (wrong grant kind)")
+        },
+        || async {
+            let channel = endpoint.clone().connect().await.ok()?;
+            let mut client = tonic::client::Grpc::new(channel);
+            client.ready().await.ok()?;
+            let path = "/gateway_api_conformance.echo_basic.grpcecho.GrpcEcho/Echo"
+                .parse::<tonic::codegen::http::uri::PathAndQuery>()
+                .ok()?;
+            let codec =
+                tonic_prost::ProstCodec::<grpcecho::EchoRequest, grpcecho::EchoResponse>::default();
+            client
+                .unary(tonic::Request::new(grpcecho::EchoRequest {}), path, codec)
+                .await
+                .ok()
+        },
+    )
+    .await;
+    assert!(
+        premature_success.is_err(),
+        "cross-ns gRPC Echo call must stay denied for the full propagation window when only \
+         a wrong-kind (HTTPRoute) grant exists, but a call succeeded"
+    );
+
+    Ok(())
+}
+
 // ── GRPCRouteNamedRouteRule — GEP-995 (#504) ─────────────────────────────────
 
 /// A `GRPCRoute` rule carrying `.name` still routes correctly, and the name

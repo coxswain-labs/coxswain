@@ -43,8 +43,11 @@ use crate::ingress::IngressPorts;
 use crate::k8s_utils::{WatchScope, scoped_api};
 use crate::merged_store::MergedStore;
 use crate::reference_grants::{
-    DynamicReferenceGrant, GrantSet, flatten_basic_auth_secret_grants, flatten_ca_grants,
-    flatten_grants, flatten_ls_cert_grants, flatten_tcp_backend_grants, flatten_udp_backend_grants,
+    BasicAuthSecret, DynamicReferenceGrant, ExternalAuthBackend, GatewayCa, GatewayCert, GrantSet,
+    GrpcRouteBackend, HttpRouteBackend, ListenerSetCert, flatten_basic_auth_secret_grants,
+    flatten_ca_grants, flatten_external_auth_backend_grants, flatten_grants,
+    flatten_grpc_backend_grants, flatten_ls_cert_grants, flatten_tcp_backend_grants,
+    flatten_tls_backend_grants, flatten_udp_backend_grants,
 };
 use crate::status::{
     BackendTlsPolicyStatusHandle, ClientTrafficPolicyStatusHandle,
@@ -1254,20 +1257,37 @@ pub(super) struct Ownership<'a> {
     pub(super) default_ingress_class: Option<&'a str>,
     pub(super) gateways: &'a HashSet<ObjectKey>,
     pub(super) gateway_classes: &'a HashSet<String>,
-    pub(super) backend_grants: &'a GrantSet,
-    pub(super) cert_grants: &'a GrantSet,
+    pub(super) backend_grants: &'a GrantSet<HttpRouteBackend>,
+    /// `GRPCRoute → Service` grants (#691). Distinct from `backend_grants`
+    /// (`from.kind: HTTPRoute`) — a GRPCRoute's cross-namespace backendRef must
+    /// not be authorized by an HTTPRoute-scoped grant, and vice versa.
+    ///
+    /// GRPCRoute shares HTTPRoute's partitioned build path, which is why this
+    /// (unlike TLSRoute's grant set) is threaded through `Ownership` rather
+    /// than kept as a `rebuild()`-local: `compute_global_epoch` needs it to
+    /// invalidate cached partitions on a grant change (see there). TLSRoute's
+    /// L4 tables are rebuilt in full every pass, so its grant set stays a
+    /// `rebuild()`-local passed directly to `build_passthrough_routes`/
+    /// `build_terminate_routes` — same as `tcp_backend_grants`/`udp_backend_grants`.
+    pub(super) grpc_backend_grants: &'a GrantSet<GrpcRouteBackend>,
+    pub(super) cert_grants: &'a GrantSet<GatewayCert>,
     /// `ListenerSet → Secret` grants for GEP-1713 ListenerSet HTTPS listeners whose
     /// `certificateRefs` point at a Secret in another namespace (#93). Distinct from
     /// `cert_grants` because the grant's `from.kind` is `ListenerSet`, not `Gateway`.
-    pub(super) ls_cert_grants: &'a GrantSet,
+    pub(super) ls_cert_grants: &'a GrantSet<ListenerSetCert>,
     /// `Gateway → ConfigMap` grants for GEP-91 frontend client-cert validation
     /// CA refs that point at a ConfigMap in another namespace (#86).
-    pub(super) ca_grants: &'a GrantSet,
+    pub(super) ca_grants: &'a GrantSet<GatewayCa>,
     /// `BasicAuth → Secret` grants authorizing a `BasicAuth` CR to reference its
     /// htpasswd `secretRef` in another namespace (#520). Distinct from `cert_grants`
     /// because the grant's `from.kind`/`from.group` is `BasicAuth`/coxswain, not
     /// `Gateway`/gateway-api. A missing grant fails the cross-namespace ref closed.
-    pub(super) basic_auth_secret_grants: &'a GrantSet,
+    pub(super) basic_auth_secret_grants: &'a GrantSet<BasicAuthSecret>,
+    /// `CoxswainExternalAuth → Service` grants (#691) authorizing the CR's own
+    /// `backendRef` in another namespace. Consumed by all three ext-auth
+    /// surfaces: the Gateway-attached `targetRefs` mandate, the route-level
+    /// `ExtensionRef` filter, and the Ingress `ext-auth` annotation.
+    pub(super) external_auth_backend_grants: &'a GrantSet<ExternalAuthBackend>,
     /// Per-(Service, port) `BackendTLSPolicy` lookup table, built before this
     /// `Ownership` is constructed. Carried alongside ownership data because
     /// `build_routes` and the per-route `reconcile` both need it on the same
@@ -3272,6 +3292,12 @@ fn rebuild(
     let basic_auth_secret_grants = flatten_basic_auth_secret_grants(&grants_snapshot);
     let tcp_backend_grants = flatten_tcp_backend_grants(&grants_snapshot);
     let udp_backend_grants = flatten_udp_backend_grants(&grants_snapshot);
+    // #691: previously shared `backend_grants` (HTTPRoute) with GRPCRoute/TLSRoute/
+    // CoxswainExternalAuth — an HTTPRoute-scoped grant silently authorized their
+    // cross-ns refs too, and their own spec-correct grant kind matched nothing.
+    let grpc_backend_grants = flatten_grpc_backend_grants(&grants_snapshot);
+    let tls_backend_grants = flatten_tls_backend_grants(&grants_snapshot);
+    let external_auth_backend_grants = flatten_external_auth_backend_grants(&grants_snapshot);
 
     tracing::debug!(
         http_routes = routes.len(),
@@ -3306,7 +3332,7 @@ fn rebuild(
             &owned_gateways,
             stores.services,
             stores.endpoint_cache,
-            &backend_grants,
+            &external_auth_backend_grants,
         );
 
     // GEP-3155: resolve each Gateway's backend client cert once. `certs` is attached
@@ -3332,10 +3358,12 @@ fn rebuild(
         gateways: &owned_gateways,
         gateway_classes: &owned_gateway_classes,
         backend_grants: &backend_grants,
+        grpc_backend_grants: &grpc_backend_grants,
         cert_grants: &cert_grants,
         ls_cert_grants: &ls_cert_grants,
         ca_grants: &ca_grants,
         basic_auth_secret_grants: &basic_auth_secret_grants,
+        external_auth_backend_grants: &external_auth_backend_grants,
         policy_index: &policy_index,
         backend_policy_index: &backend_policy_index,
         external_auth_gateway_index: &external_auth_gateway_index,
@@ -3499,7 +3527,7 @@ fn rebuild(
         &gateways,
         &owned_gateways,
         &effective,
-        &backend_grants,
+        &grpc_backend_grants,
         &grpc_ref_validation_stores,
     );
 
@@ -3631,7 +3659,7 @@ fn rebuild(
         stores,
         &owned_gateways,
         &effective,
-        &backend_grants,
+        &tls_backend_grants,
         outputs.passthrough_routes,
     );
     // Build the SNI-keyed TLS terminate table from TLSRoutes bound to
@@ -3644,7 +3672,7 @@ fn rebuild(
         stores,
         &owned_gateways,
         &effective,
-        &backend_grants,
+        &tls_backend_grants,
         outputs.terminate_routes,
     );
     // Merge both status maps (passthrough wins on key collision — same route,

@@ -26,14 +26,14 @@ use crate::gw_types::v::gateways::{
     Gateway, GatewayTlsFrontend, GatewayTlsFrontendDefaultValidationMode,
     GatewayTlsFrontendPerPortTlsValidationMode,
 };
+use crate::reference_grants::GatewayCa;
 use coxswain_core::listener_status::{
     FrontendValidationOutcome, FrontendValidationStatus, GatewayListenerStatus, ListenerStatusKey,
 };
-use coxswain_core::reference_grants::{ReferenceGrantKey, backend_ref_allowed};
+use coxswain_core::reference_grants::{GrantSet, backend_ref_allowed};
 use coxswain_core::tls::{ClientCertConfig, ClientCertConfigState, ClientCertStoreBuilder};
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::runtime::reflector;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 /// One `caCertificateRefs` entry normalized across the `default` and `perPort`
@@ -76,7 +76,7 @@ enum CaResolution {
 pub(crate) fn reconcile_frontend_validation(
     gateway: &Gateway,
     configmaps: &MergedStore<ConfigMap>,
-    ca_grants: &HashSet<ReferenceGrantKey>,
+    ca_grants: &GrantSet<GatewayCa>,
     builder: &mut ClientCertStoreBuilder,
     health: &mut GatewayListenerStatus,
 ) {
@@ -245,7 +245,7 @@ fn resolve_ca(
     gw_name: &str,
     refs: &[NormalizedRef<'_>],
     configmaps: &MergedStore<ConfigMap>,
-    ca_grants: &HashSet<ReferenceGrantKey>,
+    ca_grants: &GrantSet<GatewayCa>,
 ) -> CaResolution {
     let Some(ca_ref) = refs.first() else {
         return CaResolution::InvalidRef(
@@ -311,7 +311,7 @@ mod tests {
     use coxswain_core::tls::ClientCertStoreBuilder;
     use k8s_openapi::api::core::v1::ConfigMap;
     use kube::runtime::reflector::store;
-    use std::collections::{BTreeMap, HashSet};
+    use std::collections::BTreeMap;
 
     fn make_gateway(
         ns: &str,
@@ -413,7 +413,7 @@ mod tests {
         let cms = empty_cm_store();
         let mut builder = ClientCertStoreBuilder::new();
         let mut health = GatewayListenerStatus::default();
-        reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
+        reconcile_frontend_validation(&gw, &cms, &GrantSet::empty(), &mut builder, &mut health);
         assert!(health.frontend_validation.is_none());
         assert_eq!(builder.build().host_count(), 0);
     }
@@ -431,7 +431,7 @@ mod tests {
         let cms = cm_store_with("default", "my-ca", FAKE_PEM);
         let mut builder = ClientCertStoreBuilder::new();
         let mut health = health_with_bind_port("l1", 30443);
-        reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
+        reconcile_frontend_validation(&gw, &cms, &GrantSet::empty(), &mut builder, &mut health);
 
         let fv = health.frontend_validation.as_ref().unwrap();
         assert!(fv.resolved_refs, "resolved_refs should be true");
@@ -458,7 +458,7 @@ mod tests {
         let cms = empty_cm_store();
         let mut builder = ClientCertStoreBuilder::new();
         let mut health = health_with_bind_port("l1", 30443);
-        reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
+        reconcile_frontend_validation(&gw, &cms, &GrantSet::empty(), &mut builder, &mut health);
 
         let fv = health.frontend_validation.as_ref().unwrap();
         assert!(!fv.resolved_refs, "resolved_refs should be false");
@@ -486,7 +486,7 @@ mod tests {
         let cms = cm_store_with("default", "my-ca", FAKE_PEM);
         let mut builder = ClientCertStoreBuilder::new();
         let mut health = health_with_bind_port("l1", 30443);
-        reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
+        reconcile_frontend_validation(&gw, &cms, &GrantSet::empty(), &mut builder, &mut health);
 
         let fv = health.frontend_validation.as_ref().unwrap();
         assert!(fv.insecure_fallback, "insecure_fallback should be true");
@@ -548,7 +548,7 @@ mod tests {
         let cms = empty_cm_store();
         let mut builder = ClientCertStoreBuilder::new();
         let mut health = health_with_bind_port("l1", 30443);
-        reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
+        reconcile_frontend_validation(&gw, &cms, &GrantSet::empty(), &mut builder, &mut health);
 
         let fv = health.frontend_validation.as_ref().unwrap();
         assert!(!fv.resolved_refs);
@@ -675,7 +675,7 @@ mod tests {
         let cms = cm_store_with("ns", "pp-ca", PEM); // only the perPort CA exists
         let mut builder = ClientCertStoreBuilder::new();
         let mut health = health_with_bind_port("l1", 30843);
-        reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
+        reconcile_frontend_validation(&gw, &cms, &GrantSet::empty(), &mut builder, &mut health);
 
         // The listener resolved against the perPort CA (which exists), not the default.
         let outcome = &health
@@ -714,7 +714,7 @@ mod tests {
         let cms = cm_store_with("default", "my-ca", PEM);
         let mut builder = ClientCertStoreBuilder::new();
         let mut health = GatewayListenerStatus::default();
-        reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
+        reconcile_frontend_validation(&gw, &cms, &GrantSet::empty(), &mut builder, &mut health);
 
         assert!(
             matches!(
@@ -747,7 +747,7 @@ mod tests {
         let cms = empty_cm_store();
         let mut builder = ClientCertStoreBuilder::new();
         let mut health = GatewayListenerStatus::default();
-        reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
+        reconcile_frontend_validation(&gw, &cms, &GrantSet::empty(), &mut builder, &mut health);
 
         let outcome = &health
             .listeners
@@ -772,8 +772,10 @@ mod tests {
             None,
         );
         let cms = cm_store_with("other-ns", "other-ca", PEM);
-        let mut grants = HashSet::new();
-        grants.insert(ReferenceGrantKey::wildcard("ns", "other-ns"));
+        let grants: GrantSet<GatewayCa> = std::iter::once(
+            coxswain_core::reference_grants::ReferenceGrantKey::wildcard("ns", "other-ns"),
+        )
+        .collect();
         let mut builder = ClientCertStoreBuilder::new();
         let mut health = GatewayListenerStatus::default();
         reconcile_frontend_validation(&gw, &cms, &grants, &mut builder, &mut health);
@@ -802,7 +804,7 @@ mod tests {
         let cms = empty_cm_store();
         let mut builder = ClientCertStoreBuilder::new();
         let mut health = GatewayListenerStatus::default();
-        reconcile_frontend_validation(&gw, &cms, &HashSet::new(), &mut builder, &mut health);
+        reconcile_frontend_validation(&gw, &cms, &GrantSet::empty(), &mut builder, &mut health);
 
         let outcome = &health
             .listeners

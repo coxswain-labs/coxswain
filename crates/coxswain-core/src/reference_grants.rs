@@ -1,6 +1,7 @@
 //! `ReferenceGrant` key types and cross-namespace backend-ref permission checks.
 
 use std::collections::HashSet;
+use std::marker::PhantomData;
 
 /// A flattened entry from a `ReferenceGrant`, ready for O(1) lookup.
 /// `to_name = None` means the grant covers any resource in `to_ns` (wildcard).
@@ -38,24 +39,130 @@ impl ReferenceGrantKey {
     }
 }
 
-/// Returns true if `grants` permits an HTTPRoute in `from_ns` to reference
-/// a Service named `to_name` in `to_ns`.
-pub fn backend_ref_allowed(
+/// A [`ReferenceGrantKey`] set flattened for exactly one `(from.group, from.kind,
+/// to.kind)` triple — e.g. `HTTPRoute → Service` vs `GRPCRoute → Service` vs
+/// `Gateway → Secret`.
+///
+/// `K` is a zero-sized marker type (never constructed) naming which triple this
+/// set was flattened for; it carries no runtime data. Without it, every flattened
+/// set is an indistinguishable bare `HashSet<ReferenceGrantKey>` — nothing stops
+/// an `HTTPRoute`-flattened set from being passed where a `GRPCRoute`-flattened
+/// one is expected, since the two are structurally identical types. That gap is
+/// exactly what let `GRPCRoute`, `TLSRoute`, and `CoxswainExternalAuth` backend
+/// refs get checked against the `HTTPRoute` grant set for a release (#691).
+/// Parameterizing by `K` turns that mistake into a compile error: a
+/// `GrantSet<HttpRouteBackend>` cannot be passed where a `GrantSet<GrpcRouteBackend>`
+/// is expected. The concrete marker types live in `coxswain-reflector` (the crate
+/// that knows about `HTTPRoute`/`GRPCRoute`/etc.) — this crate only provides the
+/// generic mechanism.
+pub struct GrantSet<K> {
+    keys: HashSet<ReferenceGrantKey>,
+    _kind: PhantomData<fn() -> K>,
+}
+
+// Manual impls, not `#[derive(..)]`: deriving would add a `K: Trait` bound to
+// every impl even though `K` is never stored (only `PhantomData<fn() -> K>` is),
+// which would wrongly force every marker type to implement Clone/Debug/etc.
+impl<K> Clone for GrantSet<K> {
+    fn clone(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+            _kind: PhantomData,
+        }
+    }
+}
+
+impl<K> std::fmt::Debug for GrantSet<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GrantSet")
+            .field("keys", &self.keys)
+            .finish()
+    }
+}
+
+impl<K> PartialEq for GrantSet<K> {
+    fn eq(&self, other: &Self) -> bool {
+        self.keys == other.keys
+    }
+}
+
+impl<K> Eq for GrantSet<K> {}
+
+impl<K> Default for GrantSet<K> {
+    fn default() -> Self {
+        Self {
+            keys: HashSet::new(),
+            _kind: PhantomData,
+        }
+    }
+}
+
+impl<K> GrantSet<K> {
+    /// An empty grant set — denies every cross-namespace reference.
+    #[must_use]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Number of flattened grant keys.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// True when no grant is present — every cross-namespace reference is denied.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    /// Iterate the flattened keys, e.g. to fold them into a fingerprint.
+    pub fn iter(&self) -> impl Iterator<Item = &ReferenceGrantKey> {
+        self.keys.iter()
+    }
+
+    /// True when `key` was flattened into this set.
+    #[must_use]
+    pub fn contains(&self, key: &ReferenceGrantKey) -> bool {
+        self.keys.contains(key)
+    }
+}
+
+impl<K> FromIterator<ReferenceGrantKey> for GrantSet<K> {
+    fn from_iter<T: IntoIterator<Item = ReferenceGrantKey>>(iter: T) -> Self {
+        Self {
+            keys: iter.into_iter().collect(),
+            _kind: PhantomData,
+        }
+    }
+}
+
+/// Returns true if a `K`-kinded referrer in `from_ns` is permitted to reference
+/// a `to_name` resource in `to_ns`, per `grants`. `K` pins `grants` to the one
+/// `(from.kind, to.kind)` triple it was flattened for — see [`GrantSet`].
+pub fn backend_ref_allowed<K>(
     from_ns: &str,
     to_ns: &str,
     to_name: &str,
-    grants: &HashSet<ReferenceGrantKey>,
+    grants: &GrantSet<K>,
 ) -> bool {
-    grants.contains(&ReferenceGrantKey::wildcard(from_ns, to_ns))
-        || grants.contains(&ReferenceGrantKey::specific(from_ns, to_ns, to_name))
+    grants
+        .keys
+        .contains(&ReferenceGrantKey::wildcard(from_ns, to_ns))
+        || grants
+            .keys
+            .contains(&ReferenceGrantKey::specific(from_ns, to_ns, to_name))
 }
 
 #[cfg(test)]
 mod tests {
     use crate::reference_grants::*;
-    use std::collections::HashSet;
 
-    fn grants(entries: &[(&str, &str, Option<&str>)]) -> HashSet<ReferenceGrantKey> {
+    /// Test-only marker — the kind-isolation the real markers provide isn't
+    /// under test here, only the key-matching logic itself.
+    struct TestKind;
+
+    fn grants(entries: &[(&str, &str, Option<&str>)]) -> GrantSet<TestKind> {
         entries
             .iter()
             .map(|(f, t, n)| match n {
@@ -102,7 +209,7 @@ mod tests {
             "apps",
             "billing",
             "payments",
-            &HashSet::new()
+            &GrantSet::<TestKind>::empty()
         ));
     }
 
