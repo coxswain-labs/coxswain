@@ -1,0 +1,661 @@
+# Coxswain attack-surface register.
+#
+# This file is the deterministic spine of `/security-audit`. The audit does not
+# decide what to look at — it reads this list and returns a verdict for every
+# row. That is the whole mechanism: as long as "what to examine" is inferred by a
+# model at runtime, two audits sample different subsets of 130k lines and produce
+# incomparable reports. Move the enumeration into data and the only remaining
+# variance is per-row judgement, which is stable and, crucially, diffable.
+#
+# `verdict: unverified` is a first-class answer and must carry a `why`. A row
+# that was not examined has to say so — silence would read identically to safe.
+#
+# Rows are appended by the audit's drift phase, never by hand alone: if a new
+# listener, RPC, tenant-writable field, RBAC verb, or secret-bearing wire field
+# exists in the code and not here, that is a finding about this file.
+
+schema: 1
+audited_at: 78a2d363          # commit of the last full pass
+audited_on: 2026-07-29
+
+boundaries:
+  TB1: internet → data plane (HTTP, gRPC, TCP, TLS, UDP)
+  TB2: tenant namespace → cluster-privileged control plane
+  TB3: pod network → management and control ports
+  TB4: controller ↔ proxy / relay (discovery fabric)
+  TB5: proxy → upstream backend
+  TB6: build and release supply chain
+
+adversaries:
+  AC1: anonymous network client reaching a data-plane listener
+  AC2: tenant holding create-rights in exactly one namespace
+  AC3: pod running in the cluster with zero Kubernetes RBAC
+  AC4: compromised proxy or relay pod
+  AC5: compromised controller pod
+  AC6: supply chain or maintainer
+
+assets:
+  A1: private keys — TLS server keys, discovery CA, cluster Secrets
+  A2: cross-tenant traffic integrity and authentication
+  A3: availability of a shared data or control plane
+  A4: disclosure and reconnaissance
+
+surfaces:
+
+  # ── TB1 internet → data plane ─────────────────────────────────────────────
+
+  - id: http-header-trust
+    boundary: TB1
+    entry: inbound HTTP request headers reaching the backend
+    anchors: [crates/coxswain-proxy/src/filters/header.rs, crates/coxswain-proxy/src/hooks.rs]
+    adversaries: [AC1]
+    assets: [A2]
+    asks:
+      - which client-settable headers does the backend treat as proxy-authoritative
+      - is every one of them stripped before the check that would set it runs
+      - does the strip list cover ext_authz allowedResponseHeaders and JWT claim destinations
+    verdict: safe
+    evidence: filters/header.rs:20-42 strips x-forwarded-proto, x-real-ip, x-ssl-client-cert; policy/auth.rs:39-45 and :886 strip configured destinations before the check
+    audited: 78a2d363
+
+  - id: http-client-ip
+    boundary: TB1
+    entry: X-Forwarded-For / configured forwarded header
+    anchors: [crates/coxswain-proxy/src/policy/access_control.rs]
+    adversaries: [AC1]
+    assets: [A2]
+    asks:
+      - is the header honoured only when the L4 peer is a configured trusted proxy
+      - which tokens are skipped during the rightmost-untrusted walk, and can a client control the first non-skipped one
+      - is the empty trusted set fail-closed
+    verdict: finding
+    findings: [731]
+    evidence: access_control.rs:60-73 skips PRIVATE_NETS as well as trusted hops, so a privately-addressed client's forged token is returned
+    audited: 78a2d363
+
+  - id: http-path-match
+    boundary: TB1
+    entry: request path → route selection and path-scoped policy
+    anchors: [crates/coxswain-core/src/routing/common/host_router.rs, crates/coxswain-reflector/src/gateway_api/reconcile.rs]
+    adversaries: [AC1]
+    assets: [A2]
+    asks:
+      - are regex path matches anchored to the full path
+      - does normalization run before every path-scoped policy decision
+      - does a non-matching higher-precedence rule fall through to the next
+    verdict: finding
+    findings: [698, 699, 697]
+    evidence: pre-existing; not re-derived this run
+    audited: 78a2d363
+
+  - id: http-framing
+    boundary: TB1
+    entry: HTTP/1.1 and HTTP/2 message framing
+    anchors: [crates/coxswain-proxy/src/hooks.rs]
+    adversaries: [AC1]
+    assets: [A2, A3]
+    asks:
+      - is any framing decision made in coxswain rather than delegated to pingora
+      - is Host / :authority reconciled with the routed hostname
+      - are header count and size bounded
+    verdict: unverified
+    why: framing is delegated to pingora and was not read this run; request-smuggling exposure is unassessed
+    audited: 78a2d363
+
+  - id: tls-sni-cert-selection
+    boundary: TB1
+    entry: TLS ClientHello SNI → certificate installed
+    anchors: [crates/coxswain-proxy/src/edge/tls.rs, crates/coxswain-core/src/tls.rs]
+    adversaries: [AC1, AC2]
+    assets: [A2, A3]
+    asks:
+      - who may register a certificate for a hostname, and is namespace ownership checked
+      - what orders multiple certs for one pattern, and can a claimant control that order
+      - is selection port-scoped so sibling listeners cannot supply each other's material
+    verdict: finding
+    findings: [727]
+    evidence: core/tls.rs:404-409 sorts on attacker-settable notAfter; edge/tls.rs:171-181 installs certs[0]
+    audited: 78a2d363
+
+  - id: tls-acceptor-params
+    boundary: TB1
+    entry: shared SslAcceptor construction
+    anchors: [crates/coxswain-proxy/src/edge/accept.rs]
+    adversaries: [AC1]
+    assets: [A2]
+    asks:
+      - what is the minimum protocol version and cipher policy
+      - is session resumption disabled so a resumed handshake cannot skip per-SNI mTLS
+      - is ALPN advertised only where h2 is actually served
+    verdict: safe
+    evidence: accept.rs:1604-1611 mozilla_intermediate_v5 (TLS 1.2+), session cache OFF, NO_TICKET
+    audited: 78a2d363
+
+  - id: tls-client-cert-frontend
+    boundary: TB1
+    entry: GEP-91 frontendValidation / auth-tls-* mTLS
+    anchors: [crates/coxswain-proxy/src/edge/tls.rs, crates/coxswain-proxy/src/policy/client_cert.rs]
+    adversaries: [AC1, AC2]
+    assets: [A2]
+    asks:
+      - is an unverified certificate distinguishable from a verified one at every consumer
+      - does an unusable CA fail closed, and can a tenant induce that state for a hostname it does not own
+      - does the cross-SNI guard fire on a connection that matched a different host
+    verdict: finding
+    findings: [730, 727]
+    evidence: edge/tls.rs:290-312 captures peer_certificate() without checking verify_result()
+    audited: 78a2d363
+
+  - id: tls-passthrough-peek
+    boundary: TB1
+    entry: MSG_PEEK SNI extraction on passthrough listeners
+    anchors: [crates/coxswain-proxy/src/edge/passthrough.rs, crates/coxswain-proxy/src/edge/peek.rs]
+    adversaries: [AC1]
+    assets: [A3]
+    asks:
+      - is the peek buffer bounded and the wait deadlined
+      - does a stalled peer park rather than spin
+      - can a catch-all listener terminate an SNI destined for passthrough
+    verdict: safe
+    evidence: passthrough.rs:32-35 MAX_PEEK 16 KiB / PEEK_TIMEOUT 10s; peek.rs:17-71 capped backoff; core/tls.rs:168-192 has_specific_cert gates the hybrid decision
+    audited: 78a2d363
+
+  - id: l4-tcp-terminate
+    boundary: TB1
+    entry: TCPRoute and TLS-terminate L4 listeners
+    anchors: [crates/coxswain-proxy/src/edge/tcp.rs, crates/coxswain-proxy/src/edge/terminate.rs]
+    adversaries: [AC1]
+    assets: [A3]
+    asks:
+      - is per-connection upstream selection deterministic under conflicting routes
+      - are dial timeouts and connection caps enforced
+    verdict: unverified
+    why: not read this run
+    audited: 78a2d363
+
+  - id: udp-datagram
+    boundary: TB1
+    entry: UDPRoute listeners
+    anchors: [crates/coxswain-proxy/src/edge/udp.rs]
+    adversaries: [AC1]
+    assets: [A3]
+    asks:
+      - what keys a session, and is that key attacker-chosen
+      - what bounds the session table, and what happens at the bound
+      - can the forwarder be made to reflect or amplify toward a third party
+    verdict: finding
+    findings: [729]
+    evidence: udp.rs:169 keyed on source SocketAddr, :141 capped at 2048, :456-463 drops at the cap
+    audited: 78a2d363
+
+  - id: auth-basic
+    boundary: TB1
+    entry: Authorization Basic against a BasicAuth CR / auth-basic annotation
+    anchors: [crates/coxswain-proxy/src/policy/auth.rs]
+    adversaries: [AC1]
+    assets: [A2]
+    asks:
+      - is the comparison constant-time for every supported hash form
+      - is an unavailable credential source fail-closed
+      - is plaintext zeroized on both the success and failure path
+    verdict: unverified
+    why: module contract read, verification path not traced; SHA1 acceptance for legacy files is a design decision needing its own review
+    audited: 78a2d363
+
+  - id: auth-jwt
+    boundary: TB1
+    entry: JwtAuth bearer-token verification
+    anchors: [crates/coxswain-proxy/src/policy/auth.rs]
+    adversaries: [AC1]
+    assets: [A2]
+    asks:
+      - does the verification algorithm come from the JWK or from the token header
+      - are symmetric keys rejected outright
+      - are iss and aud enforced when the claim is absent from the token
+      - is the raw token stripped upstream unless forwarding is requested
+    verdict: safe
+    evidence: policy/auth.rs:919-979 selects alg from the JWK and rejects oct; :966-979 sets issuer and audience; adversarial test at :1132-1147
+    audited: 78a2d363
+
+  - id: auth-extauthz
+    boundary: TB1
+    entry: HTTP forward-auth and Envoy gRPC Check sub-requests
+    anchors: [crates/coxswain-proxy/src/policy/auth.rs]
+    adversaries: [AC1, AC2]
+    assets: [A2]
+    asks:
+      - which client headers reach the auth service, and is the default deny-by-omission
+      - can a client forge a header the auth service is trusted to set
+      - what is the behaviour on timeout, connect error, and non-2xx
+    verdict: unverified
+    why: contract read, request-construction path not traced; #702 and #703 are open against this surface
+    findings: [702, 703]
+    audited: 78a2d363
+
+  - id: rate-limit
+    boundary: TB1
+    entry: RateLimit CR / annotation enforcement
+    anchors: [crates/coxswain-proxy/src/policy/rate_limit.rs]
+    adversaries: [AC1]
+    assets: [A3]
+    asks:
+      - what is the enforcement scope relative to replica count, and is it documented
+      - is the keyed bucket space bounded against a high-cardinality key
+      - does an absent keying header fail open or closed, and is that intended
+    verdict: safe
+    evidence: per-process by design, stated as rps × replica_count at docs/src/operations/rate-limiting.md:160; sweep bounds the key space (rate_limit.rs:16-21)
+    note: the enforced limit is weaker than the configured one wherever a RateLimit fronts an authentication check
+    audited: 78a2d363
+
+  - id: ip-access-control
+    boundary: TB1
+    entry: IpAccessControl allow / deny evaluation
+    anchors: [crates/coxswain-proxy/src/policy/access_control.rs]
+    adversaries: [AC1]
+    assets: [A2]
+    asks:
+      - is deny evaluated before allow
+      - is an unattributable client rejected by an allow-list and not matched by a deny-list
+      - are IPv4-mapped IPv6 forms canonicalized before matching
+    verdict: safe
+    evidence: access_control.rs:167-190 deny-then-allow; :122-152 fail-closed allow, fail-open deny, to_canonical() on both
+    note: correctness here is downstream of `http-client-ip`, which is a finding
+    audited: 78a2d363
+
+  - id: filters-cors
+    boundary: TB1
+    entry: CORS filter
+    anchors: [crates/coxswain-proxy/src/filters/cors.rs]
+    adversaries: [AC1]
+    assets: [A2]
+    asks:
+      - can a wildcard be emitted alongside credentials
+      - is a preflight evaluated before the auth chain
+      - is a filter with no allowOrigins dropped or fail-closed
+    verdict: finding
+    findings: [713, 700]
+    evidence: pre-existing; not re-derived this run
+    audited: 78a2d363
+
+  - id: filters-mirror-redirect-rewrite
+    boundary: TB1
+    entry: mirror, redirect, rewrite filters
+    anchors: [crates/coxswain-proxy/src/filters/]
+    adversaries: [AC1, AC2]
+    assets: [A2, A4]
+    asks:
+      - can a mirror destination be steered outside the tenant's grant
+      - can a redirect target be attacker-influenced (open redirect)
+      - does a rewrite preserve path-scoped policy decisions made before it
+    verdict: unverified
+    why: not read this run
+    audited: 78a2d363
+
+  - id: conn-admission
+    boundary: TB1
+    entry: TCP accept path
+    anchors: [crates/coxswain-proxy/src/edge/accept.rs]
+    adversaries: [AC1]
+    assets: [A3]
+    asks:
+      - is concurrent connection count bounded
+      - is there a deadline between accept and first byte
+      - is PROXY-protocol parsing bounded and only trusted where configured
+    verdict: unverified
+    why: MAX_CONCURRENT_CONNECTIONS = 4096 confirmed at accept.rs:69; slowloris-class deadlines and PROXY trust scoping not traced. #695 is open on the timeout family
+    findings: [695]
+    audited: 78a2d363
+
+  # ── TB2 tenant namespace → control plane ──────────────────────────────────
+
+  - id: ingress-hostname-claims
+    boundary: TB2
+    entry: Ingress spec.tls[].hosts, rules[].host, auth-tls-* annotations
+    anchors: [crates/coxswain-reflector/src/ingress/tls.rs, crates/coxswain-reflector/src/ingress/reconcile.rs]
+    adversaries: [AC2]
+    assets: [A2, A3]
+    asks:
+      - is a hostname claim arbitrated across namespaces for routes, certs, and mTLS config
+      - what does a losing claim produce — a conflict, or silent last-writer-wins
+      - can a claim on an unowned hostname degrade the owner's listener
+    verdict: finding
+    findings: [727, 728]
+    evidence: ingress/tls.rs:29-103 registers by hostname with no ownership check; core/tls.rs:768 last-writer-wins for client-cert config
+    audited: 78a2d363
+
+  - id: ingress-annotation-parsing
+    boundary: TB2
+    entry: ingress.coxswain-labs.dev/* annotation values
+    anchors: [crates/coxswain-reflector/src/ingress/annotations/]
+    adversaries: [AC2]
+    assets: [A2, A3]
+    asks:
+      - which annotations resolve a reference, and is every one locked to the Ingress's own namespace
+      - which accept an unbounded value (size, count, compile cost)
+      - does an unparseable value fail closed for that Ingress only, or for the table
+    verdict: unverified
+    why: the class-parameter inheritance rule (docs/src/ingress/annotations.md:839) was read; the parse implementations were not
+    audited: 78a2d363
+
+  - id: crd-egress-jwks
+    boundary: TB2
+    entry: JwtAuth.spec.jwks.remote.uri fetched by the controller
+    anchors: [crates/coxswain-reflector/src/egress.rs, crates/coxswain-reflector/src/jwks.rs]
+    adversaries: [AC2]
+    assets: [A1, A4]
+    asks:
+      - is the policy enforced on the resolved address rather than the URL string
+      - are literal-IP hosts checked on the path that bypasses the resolver
+      - is the response body bounded and the failure fail-closed
+    verdict: safe
+    evidence: egress.rs:1-24 and :47-70 — GuardedResolver on resolved addrs, 24 reserved ranges denied by default, literal-IP checked separately; jwks.rs:52 1 MiB cap; :57-66 fail-closed
+    audited: 78a2d363
+
+  - id: tenant-input-halts-reconcile
+    boundary: TB2
+    entry: any tenant field consumed by the routing-table build
+    anchors: [crates/coxswain-reflector/src/reconciler/route_builder.rs, crates/coxswain-reflector/src/gateway_api/reconcile.rs]
+    adversaries: [AC2]
+    assets: [A3]
+    asks:
+      - can one tenant's value fail the whole table build rather than its own route
+      - is every tenant-supplied regex validated before insertion, on every API path
+      - does the offending object report the failure in its own status
+    verdict: finding
+    findings: [693]
+    evidence: pre-existing; the Ingress path validates and the Gateway API path does not
+    audited: 78a2d363
+
+  - id: reference-grant
+    boundary: TB2
+    entry: cross-namespace references from routes, policies, and coxswain CRs
+    anchors: [crates/coxswain-core/src/reference_grants.rs, crates/coxswain-reflector/src/reconciler/route_builder.rs]
+    adversaries: [AC2]
+    assets: [A1, A2]
+    asks:
+      - is every cross-namespace reference kind gated by a grant of the correct from/to pair
+      - does a grant revocation actually invalidate the cached decision
+      - does an absent grant fail closed
+    verdict: finding
+    findings: [692]
+    evidence: pre-existing; the grant-set epoch fold cancels, so revocation does not land
+    note: e2e for grant creation and revocation exists and passes — it does not reach the cancelling case. Test names are not evidence
+    audited: 78a2d363
+
+  - id: podtemplate-overlay
+    boundary: TB2
+    entry: CoxswainGatewayParameters podTemplate merged into a controller-created Deployment
+    anchors: [crates/coxswain-controller/src/operator/]
+    adversaries: [AC2]
+    assets: [A1, A2]
+    asks:
+      - which fields does the controller re-assert after the strategic merge
+      - can the overlay reach a volume source, hostPath, serviceAccountName, or host namespace flag
+      - is an overwritten field reported to the tenant
+    verdict: unverified
+    why: the envelope is described at docs/src/architecture/index.md:55; the filter implementation was not read. This is a privilege-escalation surface (tenant-writable input to a cluster-privileged pod creator) and should be an early row next run
+    audited: 78a2d363
+
+  - id: status-write-integrity
+    boundary: TB2
+    entry: leader-elected status writer
+    anchors: [crates/coxswain-controller/src/]
+    adversaries: [AC2, AC4]
+    assets: [A3]
+    asks:
+      - can a tenant object drive unbounded write amplification against the apiserver
+      - can a node's self-reported state gate another tenant's readiness
+    verdict: finding
+    findings: [705]
+    evidence: pre-existing (self-sustaining patch loop); the node-report isolation claim at docs/src/architecture/discovery-protocol.md:120 was not verified in code
+    audited: 78a2d363
+
+  # ── TB3 pod network → management ports ────────────────────────────────────
+
+  - id: operator-api-authn
+    boundary: TB3
+    entry: operator port 8082 — UI and /api/v1/*
+    anchors: [crates/coxswain-admin/src/lib.rs, crates/coxswain-admin/src/auth.rs, charts/coxswain/templates/controller-networkpolicy.yaml]
+    adversaries: [AC3]
+    assets: [A4]
+    asks:
+      - what is reachable without a credential in a default install
+      - is the fence on by default and does it admit only what it must
+      - when auth is configured, is any path exempt
+    verdict: safe
+    evidence: networkpolicy admits the operator port from install-namespace pods only (:73-83); optional bcrypt-only single credential (admin/src/auth.rs:1-33), off by default (values.yaml:215-216)
+    note: residual — default install serves the operator API unauthenticated to the install namespace. #596 tracks a ServiceAccount-scoped fence
+    audited: 78a2d363
+
+  - id: operator-api-scope
+    boundary: TB3
+    entry: /api/v1/manifests/*, /api/v1/pods/*/logs
+    anchors: [crates/coxswain-admin/src/aggregator/manifests.rs, crates/coxswain-admin/src/aggregator/pod_logs.rs]
+    adversaries: [AC3]
+    assets: [A4]
+    asks:
+      - is the resource kind allowlisted, and does the list exclude Secrets
+      - can the namespace or name segment be steered to an arbitrary object
+      - does log streaming resolve its target from a trusted registry rather than the URL
+    verdict: safe
+    evidence: manifests.rs:41-107 allowlists httproute|gateway|ingress|pod; pod_logs.rs:40-45 resolves namespace from the fleet registry
+    note: a Pod manifest carries spec.containers[].env verbatim for any namespace — the documented reason the fence exists
+    audited: 78a2d363
+
+  - id: telemetry-and-health-ports
+    boundary: TB3
+    entry: /metrics, /statusz, /healthz, /readyz
+    anchors: [crates/coxswain-health/src/lib.rs]
+    adversaries: [AC3]
+    assets: [A4]
+    asks:
+      - what cluster data do metric labels enumerate
+      - is the port fenceable without breaking scraping, and is the trade documented
+      - does the health port carry anything beyond pass/fail
+    verdict: safe
+    evidence: health/src/lib.rs:1-14 — health is pass/fail only; telemetry fenceable via networkPolicy.telemetry.fenced with the cost documented at docs/src/operations/running-in-production.md:220-240
+    audited: 78a2d363
+
+  # ── TB4 discovery fabric ──────────────────────────────────────────────────
+
+  - id: discovery-bootstrap-issuance
+    boundary: TB4
+    entry: Bootstrap RPC on :50052
+    anchors: [crates/coxswain-discovery/src/bootstrap_server.rs]
+    adversaries: [AC3]
+    assets: [A1]
+    asks:
+      - which identities may obtain an SVID, and is there an allowlist
+      - is the token audience enforced
+      - what does a rejected bootstrap emit for the operator
+    verdict: finding
+    findings: [726]
+    evidence: bootstrap_server.rs:182-183 — any ServiceAccount passing TokenReview is issued an SVID
+    audited: 78a2d363
+
+  - id: discovery-subscribe-authz
+    boundary: TB4
+    entry: Subscribe RPC on :50051
+    anchors: [crates/coxswain-discovery/src/server/mod.rs, crates/coxswain-discovery/src/server/authz.rs]
+    adversaries: [AC3, AC4]
+    assets: [A1, A4]
+    asks:
+      - which scopes are authorized at open time and against what identity
+      - does any scope fail open when a registry entry is absent
+      - what does an absent scope field default to
+    verdict: finding
+    findings: [726]
+    evidence: server/mod.rs:293-297 defaults to SharedPool; :307-353 gates only Gateway and Namespace; authz.rs:32-39 has no SharedPool subscribe check
+    audited: 78a2d363
+
+  - id: discovery-wire-decode
+    boundary: TB4
+    entry: snapshot and client-message decoding on both ends
+    anchors: [crates/coxswain-discovery/src/wire/, crates/coxswain-discovery/src/apply.rs]
+    adversaries: [AC4, AC5]
+    assets: [A3]
+    asks:
+      - are message sizes bounded in both directions
+      - do out-of-range numeric fields fail the decode rather than truncate
+      - does a failed apply retain the last-good world
+    verdict: unverified
+    why: the invariants are asserted at docs/src/architecture/discovery-protocol.md:62-70; the decode and apply paths were not read. Doc assertions are not evidence
+    audited: 78a2d363
+
+  - id: discovery-node-registry
+    boundary: TB4
+    entry: client-chosen node_id and the node registry
+    anchors: [crates/coxswain-discovery/src/server/mod.rs, crates/coxswain-discovery/src/server/identity.rs]
+    adversaries: [AC4]
+    assets: [A3]
+    asks:
+      - can one peer claim another's live node_id
+      - is a node's own reconnect still admitted
+      - is a stale session reaped
+    verdict: safe
+    evidence: server/mod.rs:363-385 binds each claimed node_id to the peer's identity fingerprint; a different fingerprint gets ALREADY_EXISTS
+    audited: 78a2d363
+
+  - id: discovery-roster-and-health
+    boundary: TB4
+    entry: RosterReport and HealthReport client messages
+    anchors: [crates/coxswain-discovery/src/server/authz.rs, crates/coxswain-discovery/src/server/mod.rs]
+    adversaries: [AC4]
+    assets: [A3]
+    asks:
+      - which identity may fold a roster, per scope
+      - is a report from an unauthorized sender dropped without resetting its backoff
+      - can a health report affect another node's readiness gate
+    verdict: safe
+    evidence: authz.rs:169-180 gates the fold per scope; the shared-relay path requires the exact identity triple (:135-146)
+    note: the "health gates nothing" claim (discovery-protocol.md:120) is doc-only and unverified in code
+    audited: 78a2d363
+
+  - id: discovery-upstream-policy
+    boundary: TB4
+    entry: PreferredUpstream directives and bootstrap-delivered upstream pointers
+    anchors: [crates/coxswain-discovery/src/bootstrap_client.rs, crates/coxswain-discovery/src/upstream.rs]
+    adversaries: [AC4]
+    assets: [A2, A3]
+    asks:
+      - can a pointer name a host outside the three locally-derivable upstreams
+      - is the scheme pinned, and the name's suffix
+      - is expected_server_sa cross-checked rather than trusted
+    verdict: unverified
+    why: the policy is documented at docs/src/operations/control-plane-security.md:178-201 and covered by unit tests per that page; the resolution code was not read this run
+    audited: 78a2d363
+
+  - id: discovery-ca-lifecycle
+    boundary: TB4
+    entry: CA generation, storage, rotation, trust-bundle publication
+    anchors: [crates/coxswain-bin/src/discovery.rs, crates/coxswain-discovery/src/svid.rs]
+    adversaries: [AC5]
+    assets: [A1]
+    asks:
+      - who can read the CA Secret, and does the proxy ever reference it
+      - is the auto-mode create race safe across replicas
+      - does external mode fail closed when the Secret is absent
+    verdict: unverified
+    why: behaviour described at docs/src/operations/control-plane-security.md:53-113; not read in code
+    audited: 78a2d363
+
+  - id: relay-tier-residual
+    boundary: TB4
+    entry: relay serving reconstructed snapshots to its leaves
+    anchors: [crates/coxswain-discovery/src/relay.rs]
+    adversaries: [AC4]
+    assets: [A2]
+    asks:
+      - can a leaf distinguish controller-authored configuration from relay-authored
+      - what is the reach of a compromised relay
+    verdict: finding
+    findings: [679]
+    evidence: known and documented at docs/src/operations/control-plane-security.md:218-231 — snapshots carry no provenance independent of the transport
+    audited: 78a2d363
+
+  # ── TB5 proxy → upstream ──────────────────────────────────────────────────
+
+  - id: upstream-tls
+    boundary: TB5
+    entry: BackendTLSPolicy — CA, SAN, and peer options
+    anchors: [crates/coxswain-proxy/src/edge/upstream_ca.rs]
+    adversaries: [AC1, AC2]
+    assets: [A2]
+    asks:
+      - is the TLS config bound to the backendRef it was authored for
+      - is the hostname verified against the policy's SAN rather than the request Host
+      - does an unresolvable CA fail closed
+    verdict: finding
+    findings: [694]
+    evidence: pre-existing — config is attached per BackendGroup, so one backendRef's config is used for another's endpoints
+    audited: 78a2d363
+
+  - id: upstream-pool-keying
+    boundary: TB5
+    entry: pingora connection-pool reuse across upstream TLS configurations
+    anchors: [crates/coxswain-proxy/src/edge/upstream_ca.rs, crates/coxswain-proxy/src/hooks.rs]
+    adversaries: [AC2]
+    assets: [A2]
+    asks:
+      - does the pool key distinguish peers that differ only by CA or client cert
+      - is group_key set per policy where it must be
+    verdict: unverified
+    why: HttpPeer's Hash omits options.ca, so backends differing only by custom CA can alias in the pool unless group_key is set per policy. Hypothesis recorded, not verified this run
+    audited: 78a2d363
+
+  # ── TB6 supply chain ──────────────────────────────────────────────────────
+
+  - id: container-image
+    boundary: TB6
+    entry: runtime image and pod security context
+    anchors: [Dockerfile, charts/coxswain/values.yaml]
+    adversaries: [AC6]
+    assets: [A1]
+    asks:
+      - is the runtime distroless and non-root with no shell
+      - are allowPrivilegeEscalation, readOnlyRootFilesystem, and capability drops defaults rather than opt-ins
+      - is a PSS-restricted mode available
+    verdict: safe
+    evidence: Dockerfile:66-70 distroless/cc-debian13:nonroot; values.yaml:56-80 runAsNonRoot, seccomp RuntimeDefault, readOnlyRootFilesystem, drop ALL, security.rootless for PSS restricted
+    audited: 78a2d363
+
+  - id: rbac-grants
+    boundary: TB6
+    entry: controller ClusterRole and provisioned ServiceAccounts
+    anchors: [charts/coxswain/templates/controller-rbac.yaml, deploy/manifests/]
+    adversaries: [AC5]
+    assets: [A1]
+    asks:
+      - which grants exceed what the code actually uses, and can RBAC express the narrower form
+      - do proxy and relay ServiceAccounts hold zero write verbs
+      - is a namespaced lockdown documented and reproducible
+    verdict: safe
+    evidence: cluster-wide secrets read (controller-rbac.yaml:40-42) is broader than the code's use (field-selected to type=kubernetes.io/tls at reconciler/proxy.rs:2620-2623) because RBAC cannot filter by type or label; watchNamespace lockdown documented at docs/src/operations/running-in-production.md:334-336
+    note: residual — a compromised controller reads every Secret in the cluster. Accepted, with the lockdown as the mitigation
+    audited: 78a2d363
+
+  - id: dependency-advisories
+    boundary: TB6
+    entry: cargo-deny and image CVE scanning
+    anchors: [deny.toml, .trivyignore]
+    adversaries: [AC6]
+    assets: [A1, A3]
+    asks:
+      - is every advisory ignore justified with a reachability argument and a tracking issue
+      - are sources restricted to crates.io with no git dependencies
+    verdict: safe
+    evidence: deny.toml:21-23 three unmaintained crates, all transitive via pingora with no upgrade path; :33-36 registry-only, allow-git empty; .trivyignore entry carries readelf evidence
+    audited: 78a2d363
+
+  - id: release-provenance
+    boundary: TB6
+    entry: published images and charts
+    anchors: [.github/workflows/, docs/src/operations/verifying-releases.md]
+    adversaries: [AC6]
+    assets: [A1]
+    asks:
+      - are artifacts signed, and is verification documented for a consumer
+      - is the build reproducible from a tagged commit
+    verdict: unverified
+    why: not examined this run
+    audited: 78a2d363
