@@ -345,6 +345,7 @@ async fn apply_shared_relay_at(
         discovery_sa_token_path: &ctx.discovery_sa_token_path,
         discovery_ca_bundle_path: &ctx.discovery_ca_bundle_path,
         discovery_trust_domain: &ctx.discovery_trust_domain,
+        shared_proxy_sa: &ctx.shared_proxy.name,
         resources,
         pod_template: None,
         telemetry_port: ctx.telemetry_port,

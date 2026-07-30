@@ -33,6 +33,14 @@ pub trait ScopeAuthorizer: Send + Sync {
     /// Returns `true` if `peer` may open a `Namespace{namespace}` subscribe.
     fn allows_namespace(&self, peer: &PeerSvid, namespace: &str) -> bool;
 
+    /// Returns `true` if `peer` may open a `SharedPool` subscribe (#726).
+    ///
+    /// `SharedPool` carries every shared-pool TLS private key and basic-auth
+    /// credential hash, so this gate has a strictly bigger blast radius than
+    /// [`Self::allows_namespace`] — no fail-open on an absent `PeerSvid` is
+    /// acceptable here either.
+    fn allows_shared_pool(&self, peer: &PeerSvid) -> bool;
+
     /// Returns `true` if `peer` may submit a `RosterReport` on a stream
     /// subscribed at `scope`.
     fn allows_roster(&self, peer: &PeerSvid, scope: &Scope) -> bool;
@@ -50,6 +58,10 @@ pub struct DenyAll;
 
 impl ScopeAuthorizer for DenyAll {
     fn allows_namespace(&self, _peer: &PeerSvid, _namespace: &str) -> bool {
+        false
+    }
+
+    fn allows_shared_pool(&self, _peer: &PeerSvid) -> bool {
         false
     }
 
@@ -77,6 +89,11 @@ pub struct RelayAuthzConfig {
     pub shared_relay_sa: String,
     /// Namespace the shared relay runs in (the coxswain install namespace).
     pub install_namespace: String,
+    /// The shared-proxy pool's ServiceAccount name (#726). Unlike the relay
+    /// constants this is install-configurable (`--shared-proxy-name`), not a
+    /// fixed constant — sourced from the same config the pool is rendered
+    /// with, so the authorized identity cannot drift from the deployed one.
+    pub shared_proxy_sa: String,
 }
 
 /// Provenance-backed [`ScopeAuthorizer`] (#584, #666): authorizes a
@@ -112,6 +129,7 @@ pub struct ProvisionedRelayAuthorizer {
     trust_domain: String,
     shared_relay_sa: String,
     install_namespace: String,
+    shared_proxy_sa: String,
 }
 
 impl ProvisionedRelayAuthorizer {
@@ -125,14 +143,15 @@ impl ProvisionedRelayAuthorizer {
             trust_domain: config.trust_domain,
             shared_relay_sa: config.shared_relay_sa,
             install_namespace: config.install_namespace,
+            shared_proxy_sa: config.shared_proxy_sa,
         }
     }
 
-    /// Whether `peer` is exactly the shared relay's identity: SVID
-    /// `(trust_domain, install_namespace, shared_relay_sa)`. No provenance gate
-    /// — the shared relay is a single cluster-wide singleton, not a per-namespace
-    /// grant, so the identity triple alone is the whole check.
-    fn is_shared_relay_identity(&self, peer: &PeerSvid) -> bool {
+    /// Whether `peer` is exactly the singleton install identity
+    /// `(trust_domain, install_namespace, sa)`. No provenance gate — both the
+    /// shared relay and the shared-proxy pool are cluster-wide singletons, not
+    /// per-namespace grants, so the identity triple alone is the whole check.
+    fn matches_install_identity(&self, peer: &PeerSvid, sa: &str) -> bool {
         if peer.uri_sans.is_empty() {
             return false;
         }
@@ -140,9 +159,15 @@ impl ProvisionedRelayAuthorizer {
             SpiffeId::parse(uri.as_str()).is_ok_and(|id| {
                 id.trust_domain() == self.trust_domain
                     && id.namespace() == self.install_namespace
-                    && id.service_account() == self.shared_relay_sa
+                    && id.service_account() == sa
             })
         })
+    }
+
+    /// Whether `peer` is exactly the shared relay's identity: SVID
+    /// `(trust_domain, install_namespace, shared_relay_sa)`.
+    fn is_shared_relay_identity(&self, peer: &PeerSvid) -> bool {
+        self.matches_install_identity(peer, &self.shared_relay_sa)
     }
 }
 
@@ -164,6 +189,11 @@ impl ScopeAuthorizer for ProvisionedRelayAuthorizer {
                     && id.service_account() == self.relay_sa
             })
         })
+    }
+
+    fn allows_shared_pool(&self, peer: &PeerSvid) -> bool {
+        self.is_shared_relay_identity(peer)
+            || self.matches_install_identity(peer, &self.shared_proxy_sa)
     }
 
     fn allows_roster(&self, peer: &PeerSvid, scope: &Scope) -> bool {

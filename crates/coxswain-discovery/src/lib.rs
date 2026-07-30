@@ -56,7 +56,8 @@ pub use bootstrap_client::{
     BootstrapClient, BootstrapClientConfig, BootstrapClientHandle, BootstrapRunner,
 };
 pub use bootstrap_server::{
-    BootstrapService, NoOpRejectHook, RejectHook, ResolvedUpstream, UpstreamResolverConfig,
+    BootstrapIdentityAllowlist, BootstrapService, NoOpRejectHook, RejectHook, ResolvedUpstream,
+    UpstreamResolverConfig,
 };
 pub use client::{
     DiscoveryClient, DiscoveryClientConfig, DiscoverySupervisor, Supervisor,
@@ -278,6 +279,32 @@ pub mod bench_internals {
             let out = self.demux.apply(msg, self.expect_full).map(|_| ());
             self.expect_full = false;
             out
+        }
+    }
+
+    /// A [`crate::ScopeAuthorizer`] that allows every subscribe (#726) — the
+    /// bench-only counterpart to production's `DenyAll` default, needed
+    /// because `benches/relay_fanout.rs`'s synthetic subscribers connect
+    /// plaintext (no `PeerSvid`), which the real `ProvisionedRelayAuthorizer`
+    /// always denies. Same non-API status as [`Harness`]; never wire this
+    /// outside a bench.
+    pub struct AllowAllScopes;
+
+    impl crate::ScopeAuthorizer for AllowAllScopes {
+        fn allows_namespace(&self, _peer: &crate::auth::PeerSvid, _namespace: &str) -> bool {
+            true
+        }
+
+        fn allows_shared_pool(&self, _peer: &crate::auth::PeerSvid) -> bool {
+            true
+        }
+
+        fn allows_roster(
+            &self,
+            _peer: &crate::auth::PeerSvid,
+            _scope: &crate::subscription::Scope,
+        ) -> bool {
+            true
         }
     }
 }

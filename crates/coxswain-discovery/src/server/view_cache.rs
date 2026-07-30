@@ -109,10 +109,15 @@ pub(super) fn view_for(
 /// must be denied this Gateway's real world (served [`empty_view`] instead).
 ///
 /// The build-time complement to the open-time `PERMISSION_DENIED` check in
-/// [`DiscoveryService::stream`](crate::DiscoveryService::stream) — it closes the appear-after-open race (#427)
-/// where a Gateway's dedicated-registry entry materializes *after* a stream with a
-/// non-matching SVID was already accepted (accepted because, at open time, the
-/// absent entry made the world fail-closed empty regardless).
+/// [`DiscoveryService::stream`](crate::DiscoveryService::stream) — it closes the
+/// entry-changes-after-open race: a Gateway's dedicated-registry entry's
+/// `expected_proxy_sa` can change after a stream opened with a matching SVID
+/// (e.g. the Gateway is deleted and recreated under a different GatewayClass).
+/// Before #726 it also covered the entry-appears-after-open case (an absent
+/// entry let the stream open unauthenticated); #726 closed that at open time
+/// instead, so this build-time check's remaining job is narrower — an
+/// already-open stream whose authorization was valid at open time but no
+/// longer is.
 ///
 /// - No `peer_svid` (plaintext / test path): never denied — mTLS is mandatory in
 ///   production, so this mirrors the open-time fail-open.

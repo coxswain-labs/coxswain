@@ -157,6 +157,12 @@ pub(crate) struct RelayRenderInputs<'a> {
     pub discovery_ca_bundle_path: &'a str,
     /// SPIFFE trust domain (`--discovery-trust-domain`).
     pub discovery_trust_domain: &'a str,
+    /// The shared-proxy pool's ServiceAccount name, rendered as
+    /// `--shared-proxy-name` (#726) — a shared relay needs it to authorize its
+    /// downstream `SharedPool` subscribers; inert on a dedicated relay. Sourced
+    /// from the same `ProxyPoolConfig` the controller renders the pool's own
+    /// `ServiceAccount` from, so the two can never drift.
+    pub shared_proxy_sa: &'a str,
     /// Container resource requests/limits, either from a `CoxswainRelayPolicy`
     /// override (#589) or built from the controller's `--relay-cpu-request` /
     /// `--relay-memory-request` / `--relay-memory-limit` (#584) by [`relay_resources`].
@@ -305,6 +311,7 @@ fn render_relay_deployment(inputs: &RelayRenderInputs<'_>) -> (Deployment, Harde
             inputs.discovery_ca_bundle_path
         ),
         format!("--discovery-trust-domain={}", inputs.discovery_trust_domain),
+        format!("--shared-proxy-name={}", inputs.shared_proxy_sa),
         format!("--discovery-port={RELAY_DISCOVERY_PORT}"),
         // Same invariant as the dedicated proxy: the pod must bind the port its
         // annotation and container port advertise, or the controller's
@@ -525,6 +532,7 @@ mod tests {
             discovery_sa_token_path: "/var/run/secrets/coxswain/discovery-token/token",
             discovery_ca_bundle_path: "/var/run/secrets/coxswain/trust-bundle/ca.crt",
             discovery_trust_domain: "cluster.local",
+            shared_proxy_sa: "coxswain-shared-proxy",
             resources: relay_resources("50m", "64Mi", "256Mi"),
             pod_template: None,
             telemetry_port: 8082,
@@ -628,6 +636,12 @@ mod tests {
         assert!(
             !args.iter().any(|a| a.starts_with("--namespace")),
             "shared relay carries no --namespace: {args:?}"
+        );
+        assert!(
+            args.iter()
+                .any(|a| a == "--shared-proxy-name=coxswain-shared-proxy"),
+            "shared relay carries the pool's SA so it can authorize its downstream \
+             SharedPool subscribers (#726): {args:?}"
         );
         assert!(
             r.deployment.metadata.owner_references.is_none()

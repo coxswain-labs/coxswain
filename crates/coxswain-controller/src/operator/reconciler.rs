@@ -328,6 +328,15 @@ pub struct OperatorConfig {
     /// authorizer still works off `provisioned_relays`). The discovery server holds
     /// the paired receiver (`DiscoveryService::with_upstream_directives`).
     pub relay_changed_tx: Option<watch::Sender<u64>>,
+    /// Every dedicated-mode Gateway's expected proxy identity (#726): `ObjectKey`
+    /// → `expected_proxy_sa` (GEP-1762, `{gw}-{class}`). Written by the per-Gateway
+    /// reconcile at *provisioning intent* — the same "join before Ready" timing as
+    /// [`Self::provisioned_relays`] — not gated on cut-over, so it exists before the
+    /// post-cut-over [`coxswain_core::dedicated_registry::DedicatedRoutingRegistry`]
+    /// entry does. Read lock-free by `coxswain_discovery::BootstrapIdentityAllowlist`
+    /// so a fresh dedicated proxy's very first bootstrap attempt is already
+    /// authorized, instead of racing the cut-over condition.
+    pub dedicated_identities: Shared<HashMap<ObjectKey, String>>,
 }
 
 /// Provisioning operator. Registered as a Pingora `BackgroundService` next
@@ -473,6 +482,14 @@ pub(crate) struct ReconcileContext {
     /// cleared by [`reconcile`] on the first `Ok`. Guard is never held across
     /// an `.await` (same discipline as `last_hashes`).
     error_attempts: Mutex<HashMap<ObjectKey, u32>>,
+    /// See [`OperatorConfig::dedicated_identities`] (#726). Recomputed
+    /// wholesale by [`recompute_dedicated_identities`] on every reconcile
+    /// dispatch, on every replica — a single atomic replace, so unlike
+    /// `provisioned_relays`/`active_relays` (also wholesale, but serialized
+    /// under `relay_states`'s lock) this needs no lock of its own: there is
+    /// no read-modify-write window for concurrent Gateways' reconciles to
+    /// race.
+    pub(super) dedicated_identities: Shared<HashMap<ObjectKey, String>>,
 }
 
 impl ReconcileContext {
@@ -534,6 +551,7 @@ impl ReconcileContext {
             vip_failures: config.vip_failures,
             node_registry: config.node_registry,
             publish_index: config.publish_index,
+            dedicated_identities: config.dedicated_identities,
             relay: config.relay,
             provisioned_relays: config.provisioned_relays,
             active_relays: config.active_relays,
@@ -820,6 +838,14 @@ pub(crate) async fn reconcile_dedicated(
 ) -> StatusOutcome {
     let started = std::time::Instant::now();
     let key = gateway_key(&gw);
+    // Recompute dedicated_identities (#726) from purely local reflector
+    // state, unconditionally on every replica — NOT gated on leadership like
+    // the provisioning below. Publishing involves no Kubernetes write (unlike
+    // `apply_rendered`), so every replica can do it from its own watch;
+    // gating it on leadership would leave a standby's Bootstrap identity
+    // allowlist permanently empty, since the Bootstrap RPC is served by
+    // every replica, not just the leader.
+    recompute_dedicated_identities(&ctx);
     // Relay-tier convergence no longer runs here (#602): it moved out of the
     // per-Gateway reconcile into the serialized `run_relay_reconciler` loop, which
     // is driven by the node registry (live subscriber count) + a periodic tick, not
@@ -899,6 +925,11 @@ async fn reconcile_inner(
             // owner-ref driven; nothing else to do here.
             ctx.last_hashes.lock().remove(&key);
             ctx.error_attempts.lock().remove(&key);
+            // dedicated_identities excludes this Gateway already — it's a
+            // wholesale rebuild off `gateways_store` (#726), and the
+            // apiserver has already dropped this object from that store by
+            // the time a `deletionTimestamp` reconcile without our finalizer
+            // could even fire (finalizer removal is what unblocks the delete).
             clear_dataplane_gauge(&gw); // #585: drop the live gauge series
         }
         return Ok(StatusOutcome::await_change());
@@ -1025,6 +1056,12 @@ async fn reconcile_inner(
                 remove_finalizer(&ctx.client, &gw, &identity).await?;
                 ctx.last_hashes.lock().remove(&key);
                 ctx.error_attempts.lock().remove(&key);
+                // dedicated_identities excludes this Gateway already —
+                // `recompute_dedicated_identities` (#726) resolves this same
+                // `gw` against the same stores earlier in this reconcile
+                // pass, gets the same `Ok(None)` (shared mode) this branch
+                // is already handling, and excludes it — from the very first
+                // reconcile of this hand-off, not just this final step.
                 clear_dataplane_gauge(&gw); // #585: no longer a dedicated Gateway
             }
             // Shared-mode Gateway (no parametersRef): its VIP Service is owned by
@@ -1148,6 +1185,9 @@ async fn reconcile_inner(
     // (post-#424) with zero Kubernetes API access, so the rendered SA carries
     // no RoleBindings — it exists only as the pod identity.
     apply::apply_rendered(&ctx.client, gw_namespace, &rendered).await?;
+    // dedicated_identities already carries this Gateway's identity —
+    // `recompute_dedicated_identities` (#726) resolved it before the leader
+    // gate, from the same class/params resolution repeated here for the render.
 
     // A Gateway that migrated shared→dedicated still carries the shared-mode
     // identity ServiceAccount (#482) in its namespace; owner-ref GC cannot
@@ -1552,6 +1592,83 @@ fn clear_dataplane_gauge(gw: &Gateway) {
     }
 }
 
+/// Recompute the WHOLE of [`ReconcileContext::dedicated_identities`] (#726)
+/// from purely local reflector state — every Gateway's own spec plus the
+/// `GatewayClass`/params stores — wholesale, and store it as one atomic
+/// replace. Runs unconditionally, on every replica, before the leader gate
+/// (unlike the actual provisioning, this involves no Kubernetes write, so
+/// every replica can do it from its own watch).
+///
+/// A wholesale replace rather than an incremental per-Gateway publish/retract
+/// on purpose:
+/// - **Garbage collection by construction.** A Gateway that vanishes from the
+///   store without an intervening reconcile that observed its
+///   `deletionTimestamp` (a fast create-then-delete race) simply isn't in the
+///   next recomputed map; an incremental retract keyed off *this* Gateway's
+///   own delete event can miss that case and leak the entry forever.
+/// - **No lock needed.** A full replace has no read-modify-write window for
+///   concurrent Gateways' reconciles to race; an incremental insert/remove
+///   does (the second writer's `store` can silently drop the first's).
+///
+/// A Gateway keeps its identity even when its params fail to resolve
+/// (`Err(_)`, e.g. its `CoxswainGatewayParameters` was deleted out from under
+/// it) — that state does not tear the Deployment down (`reconcile_inner` just
+/// patches `InvalidParameters` and requeues, never reaching
+/// `delete_dedicated_resources`), so retracting here would strand an
+/// already-running proxy's SVID renewal the next time its rotation dials
+/// Bootstrap. Only a deleted Gateway, an absent/foreign `GatewayClass`, or
+/// explicit shared mode (`Ok(None)`) excludes it.
+fn recompute_dedicated_identities(ctx: &ReconcileContext) {
+    let classes = ctx.class_store.state();
+    let params = ctx.params_store.state();
+    let map = ctx
+        .gateways_store
+        .state()
+        .iter()
+        .filter_map(|gw| classify_dedicated_identity(gw, &classes, &params, &ctx.controller_name))
+        .collect();
+    ctx.dedicated_identities.store(Arc::new(map));
+}
+
+/// The per-Gateway decision [`recompute_dedicated_identities`] folds over
+/// every Gateway in the store: `Some((key, expected_proxy_sa))` if `gw` is a
+/// live, owned, dedicated-mode Gateway (regardless of whether its params
+/// currently resolve — see the `Err(_)` note above), `None` otherwise. Split
+/// out from the wholesale fold so the classification itself is unit-testable
+/// without constructing a full [`ReconcileContext`].
+fn classify_dedicated_identity(
+    gw: &Gateway,
+    classes: &[Arc<GatewayClass>],
+    params: &[Arc<CoxswainGatewayParameters>],
+    controller_name: &str,
+) -> Option<(ObjectKey, String)> {
+    if gw.metadata.deletion_timestamp.is_some() {
+        return None;
+    }
+    let key = gateway_key(gw);
+    let class_name = &gw.spec.gateway_class_name;
+    let class = classes
+        .iter()
+        .find(|gc| gc.meta().name.as_deref() == Some(class_name.as_str()))?;
+    if class.spec.controller_name != controller_name {
+        return None;
+    }
+    let resolved = params::resolve(gw, class, |r: &params::ParamsRef| {
+        params
+            .iter()
+            .find(|p| {
+                p.meta().namespace.as_deref() == Some(r.namespace.as_str())
+                    && p.meta().name.as_deref() == Some(r.name.as_str())
+            })
+            .map(|p| p.spec.clone())
+    });
+    if matches!(resolved, Ok(None)) {
+        return None;
+    }
+    let expected_proxy_sa = render::resource_name(&key.name, class_name);
+    Some((key, expected_proxy_sa))
+}
+
 /// Delete the per-Gateway shared-mode identity `ServiceAccount` (#482) for a
 /// Gateway that has migrated shared→dedicated.
 ///
@@ -1768,6 +1885,184 @@ mod tests {
         let k = gateway_key(&gw);
         assert_eq!(k.ns, "tenant-a");
         assert_eq!(k.name, "my-gw");
+    }
+
+    // ── classify_dedicated_identity (#726) ─────────────────────────────────────
+
+    const TEST_CONTROLLER: &str = "coxswain-labs.dev/gateway-controller";
+    const PARAMS_CRD_GROUP: &str = "gateway.coxswain-labs.dev";
+    const PARAMS_CRD_KIND: &str = "CoxswainGatewayParameters";
+
+    fn test_gateway_class(name: &str) -> GatewayClass {
+        use coxswain_reflector::gw_types::v::gatewayclasses::GatewayClassSpec;
+        GatewayClass {
+            metadata: kube::api::ObjectMeta {
+                name: Some(name.to_owned()),
+                ..Default::default()
+            },
+            spec: GatewayClassSpec {
+                controller_name: TEST_CONTROLLER.to_owned(),
+                parameters_ref: None,
+                description: None,
+            },
+            status: None,
+        }
+    }
+
+    /// A dedicated-mode Gateway: `spec.infrastructure.parametersRef` points at
+    /// `params_name` in the Gateway's own namespace.
+    fn dedicated_gateway(
+        namespace: &str,
+        name: &str,
+        class_name: &str,
+        params_name: &str,
+    ) -> Gateway {
+        use coxswain_reflector::gw_types::v::gateways::{
+            GatewayInfrastructure, GatewayInfrastructureParametersRef, GatewaySpec,
+        };
+        Gateway {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some(namespace.to_owned()),
+                name: Some(name.to_owned()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: class_name.to_owned(),
+                listeners: vec![],
+                infrastructure: Some(GatewayInfrastructure {
+                    parameters_ref: Some(GatewayInfrastructureParametersRef {
+                        group: PARAMS_CRD_GROUP.to_owned(),
+                        kind: PARAMS_CRD_KIND.to_owned(),
+                        name: params_name.to_owned(),
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    /// A shared-mode Gateway: no `parametersRef` anywhere.
+    fn shared_mode_gateway(namespace: &str, name: &str, class_name: &str) -> Gateway {
+        use coxswain_reflector::gw_types::v::gateways::GatewaySpec;
+        Gateway {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some(namespace.to_owned()),
+                name: Some(name.to_owned()),
+                ..Default::default()
+            },
+            spec: GatewaySpec {
+                gateway_class_name: class_name.to_owned(),
+                listeners: vec![],
+                ..Default::default()
+            },
+            status: None,
+        }
+    }
+
+    fn test_params(namespace: &str, name: &str) -> CoxswainGatewayParameters {
+        CoxswainGatewayParameters {
+            metadata: kube::api::ObjectMeta {
+                namespace: Some(namespace.to_owned()),
+                name: Some(name.to_owned()),
+                ..Default::default()
+            },
+            spec: coxswain_core::crd::CoxswainGatewayParametersSpec::default(),
+        }
+    }
+
+    #[test]
+    fn classify_dedicated_identity_accepts_dedicated_gateway_with_valid_params() {
+        let classes = vec![Arc::new(test_gateway_class("coxswain"))];
+        let params = vec![Arc::new(test_params("team-a", "my-params"))];
+        let gw = dedicated_gateway("team-a", "my-gw", "coxswain", "my-params");
+
+        let result = classify_dedicated_identity(&gw, &classes, &params, TEST_CONTROLLER);
+
+        assert_eq!(
+            result,
+            Some((
+                ObjectKey::new("team-a".to_owned(), "my-gw".to_owned()),
+                "my-gw-coxswain".to_owned()
+            )),
+            "a dedicated Gateway with resolvable params must classify with its GEP-1762 SA"
+        );
+    }
+
+    #[test]
+    fn classify_dedicated_identity_keeps_dedicated_gateway_with_broken_params() {
+        // parametersRef points at an object that isn't in the params slice —
+        // `params::resolve` returns `Err(NotFound)`. The Gateway is still
+        // dedicated-mode (its Deployment may already be running), so it must
+        // still classify — retracting here would strand an already-running
+        // proxy's SVID renewal.
+        let classes = vec![Arc::new(test_gateway_class("coxswain"))];
+        let params: Vec<Arc<CoxswainGatewayParameters>> = vec![];
+        let gw = dedicated_gateway("team-a", "my-gw", "coxswain", "missing-params");
+
+        let result = classify_dedicated_identity(&gw, &classes, &params, TEST_CONTROLLER);
+
+        assert_eq!(
+            result,
+            Some((
+                ObjectKey::new("team-a".to_owned(), "my-gw".to_owned()),
+                "my-gw-coxswain".to_owned()
+            )),
+            "a dedicated Gateway must keep its identity even when params fail to resolve"
+        );
+    }
+
+    #[test]
+    fn classify_dedicated_identity_excludes_shared_mode_gateway() {
+        let classes = vec![Arc::new(test_gateway_class("coxswain"))];
+        let params: Vec<Arc<CoxswainGatewayParameters>> = vec![];
+        let gw = shared_mode_gateway("team-a", "my-gw", "coxswain");
+
+        assert_eq!(
+            classify_dedicated_identity(&gw, &classes, &params, TEST_CONTROLLER),
+            None,
+            "a shared-mode Gateway (no parametersRef anywhere) must never classify"
+        );
+    }
+
+    #[test]
+    fn classify_dedicated_identity_excludes_deleted_gateway() {
+        let classes = vec![Arc::new(test_gateway_class("coxswain"))];
+        let params = vec![Arc::new(test_params("team-a", "my-params"))];
+        let mut gw = dedicated_gateway("team-a", "my-gw", "coxswain", "my-params");
+        gw.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
+            ));
+
+        assert_eq!(
+            classify_dedicated_identity(&gw, &classes, &params, TEST_CONTROLLER),
+            None,
+            "a Gateway with deletionTimestamp set must never classify, even if otherwise dedicated"
+        );
+    }
+
+    #[test]
+    fn classify_dedicated_identity_excludes_absent_or_foreign_class() {
+        let params = vec![Arc::new(test_params("team-a", "my-params"))];
+        let gw = dedicated_gateway("team-a", "my-gw", "coxswain", "my-params");
+
+        // No GatewayClass in the store at all.
+        assert_eq!(
+            classify_dedicated_identity(&gw, &[], &params, TEST_CONTROLLER),
+            None,
+            "an absent GatewayClass must exclude the Gateway"
+        );
+
+        // A GatewayClass exists but is owned by a different controller.
+        let mut foreign = test_gateway_class("coxswain");
+        foreign.spec.controller_name = "example.com/other-controller".to_owned();
+        assert_eq!(
+            classify_dedicated_identity(&gw, &[Arc::new(foreign)], &params, TEST_CONTROLLER),
+            None,
+            "a GatewayClass owned by a different controller must exclude the Gateway"
+        );
     }
 
     fn relay_deployment_in(namespace: Option<&str>, replicas: Option<i32>) -> Deployment {

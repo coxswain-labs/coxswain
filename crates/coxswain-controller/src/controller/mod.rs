@@ -90,6 +90,20 @@ use ingress_status::ingress_lb_already_matches;
 /// the current tracking set (no worse than the pre-#593 empty one).
 const REHYDRATE_BOUND: Duration = Duration::from_secs(5);
 
+/// Re-hydration cadence for a **standby** replica's `provisioned_relays` /
+/// shared-relay tracking cells (#726). Rehydration otherwise only runs once at
+/// process start and on the promotion edge — a standby that never gets
+/// promoted keeps a frozen snapshot for its whole lifetime, so a relay
+/// provisioned or torn down after this replica started stays wrongly
+/// mis-tracked on it for as long as it stays standby. That set is read by the
+/// Bootstrap identity allowlist and `ScopeAuthorizer` (both served by every
+/// replica, not just the leader), so a stale standby wrongly 403s a fraction
+/// of the fleet's bootstrap/subscribe traffic that happens to land on it.
+/// Five minutes is generous overhead-wise (one cluster-wide `LIST` per
+/// standby) while keeping the staleness window a small fraction of the
+/// default 24h SVID TTL a relay bootstraps against.
+const STANDBY_REHYDRATE_INTERVAL: Duration = Duration::from_secs(300);
+
 /// Re-queue interval for a reconcile that ran on a non-leader pod. Long enough
 /// not to hot-spin, short enough that leader promotion translates into action
 /// promptly (the lease TTL defaults to 15 s).
@@ -553,6 +567,19 @@ impl Controller {
             tokio::time::Instant::now() + self.config.lease.renew_interval,
             self.config.lease.renew_interval,
         );
+        let mut standby_rehydrate_interval = tokio::time::interval_at(
+            tokio::time::Instant::now() + STANDBY_REHYDRATE_INTERVAL,
+            STANDBY_REHYDRATE_INTERVAL,
+        );
+        // The default `Burst` behavior fires once per MISSED period the
+        // instant this arm becomes pollable again — and it is only polled
+        // while `!is_leader`, so a long leadership tenure followed by a
+        // demotion would otherwise replay every tick missed during that
+        // whole tenure back-to-back, each spawning a cluster-wide LIST at an
+        // apiserver a demotion often means is already struggling. One
+        // rehydrate on catch-up is enough; the next scheduled tick resumes
+        // the normal cadence.
+        standby_rehydrate_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -619,14 +646,16 @@ impl Controller {
                             // fencing margin; on timeout/error the pass proceeds with
                             // the current set (no worse than pre-#593).
                             if let Some(op_ctx) = &op_ctx_promotion {
-                                rehydrate_on_promotion(
+                                rehydrate_bounded(
                                     "relay-tracking",
+                                    "promotion",
                                     op_ctx.rehydrate_provisioned_relays(),
                                 )
                                 .await;
                                 // Same for the shared-relay cell (#605).
-                                rehydrate_on_promotion(
+                                rehydrate_bounded(
                                     "shared-relay",
+                                    "promotion",
                                     op_ctx.rehydrate_shared_relay(),
                                 )
                                 .await;
@@ -636,6 +665,42 @@ impl Controller {
                             // now, not at the next rebuild.
                             enqueue_all_status(&self.queue, &stores);
                         }
+                    }
+                }
+                _ = standby_rehydrate_interval.tick(), if !is_leader => {
+                    // Only while standby: the leader's own relay control loop
+                    // (`run_relay_reconciler`'s resync tick) already keeps
+                    // these cells live continuously, so rehydrating here too
+                    // would just duplicate that LIST for no benefit.
+                    //
+                    // Detached via a bare `tokio::spawn`, not awaited inline
+                    // and not tracked on `tasks`: this `select!` arm shares
+                    // the loop with the lease-renewal tick that is how a
+                    // standby ACQUIRES the lease on leader loss — awaiting a
+                    // (bounded, but still up-to-`2×REHYDRATE_BOUND`) LIST here
+                    // would delay that acquisition attempt by the same
+                    // amount, stretching a failover past its TTL budget for
+                    // no reason (this rehydrate has no such deadline).
+                    // `tasks` specifically is the wrong home regardless of
+                    // await-vs-spawn: its `join_next()` arm treats every
+                    // completion as a defect (a long-lived task exiting
+                    // unexpectedly) — this task is short-lived BY DESIGN,
+                    // every 5 minutes, and would fire that warning on schedule.
+                    if let Some(op_ctx) = op_ctx_promotion.clone() {
+                        tokio::spawn(async move {
+                            rehydrate_bounded(
+                                "relay-tracking",
+                                "standby resync",
+                                op_ctx.rehydrate_provisioned_relays(),
+                            )
+                            .await;
+                            rehydrate_bounded(
+                                "shared-relay",
+                                "standby resync",
+                                op_ctx.rehydrate_shared_relay(),
+                            )
+                            .await;
+                        });
                     }
                 }
                 res = tasks.join_next() => {
@@ -1007,21 +1072,25 @@ async fn dispatch(
     }
 }
 
-/// Run one relay-rehydration future on the leader-promotion edge under
-/// [`REHYDRATE_BOUND`], logging (never failing the promotion) on error or timeout.
-/// `what` names the subsystem for the warn line (e.g. `relay-tracking`,
-/// `shared-relay`). The bound keeps a hung LIST from eroding the lease-renewal
-/// fencing margin; on timeout/error the pass proceeds with the current set.
-async fn rehydrate_on_promotion(
+/// Run one relay-rehydration future under [`REHYDRATE_BOUND`], logging (never
+/// panicking or propagating) on error or timeout. `what` names the subsystem
+/// for the warn line (e.g. `relay-tracking`, `shared-relay`); `when` names the
+/// triggering event (e.g. `promotion`, `standby resync`) so the two call
+/// sites' log lines stay distinguishable. The bound keeps a hung LIST from
+/// eroding the lease-renewal fencing margin on the promotion path, and from
+/// piling up standby resync ticks on the periodic path; on timeout/error the
+/// caller proceeds with its current set.
+async fn rehydrate_bounded(
     what: &str,
+    when: &str,
     fut: impl std::future::Future<Output = Result<(), kube::Error>>,
 ) {
     match tokio::time::timeout(REHYDRATE_BOUND, fut).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            tracing::warn!(error = %e, "operator: {what} rehydration on promotion failed")
+            tracing::warn!(error = %e, "operator: {what} rehydration on {when} failed")
         }
-        Err(_) => tracing::warn!("operator: {what} rehydration on promotion timed out"),
+        Err(_) => tracing::warn!("operator: {what} rehydration on {when} timed out"),
     }
 }
 

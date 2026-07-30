@@ -130,6 +130,100 @@ async fn wrong_trust_domain_keeps_proxy_not_ready() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Deploy `shared_proxy_deployment` into the install namespace under the real
+/// shared-proxy pool's own ServiceAccount (#726): the *only* identity a
+/// `serve proxy --shared` pod can both bootstrap and subscribe `SharedPool`
+/// as, since #726 pins both checks to `(coxswain-system, coxswain-shared-proxy)`
+/// — a pod in any other namespace, or under any other ServiceAccount, is
+/// denied by the bootstrap allowlist before it ever gets an SVID. Tests that
+/// only need the pod to stay `NotReady` (a wrong trust domain, a bad scope,
+/// etc.) don't need this — they can keep using the plain fixture in an
+/// ordinary tenant namespace, since the pre-#726 rejection they exercise
+/// fires earlier (client-side TLS) or is unrelated to identity.
+///
+/// The install namespace already carries the `coxswain-discovery-trust`
+/// ConfigMap, so no `copy_trust_bundle` call is needed. Applied via
+/// server-side apply (idempotent — `coxswain-system` is not torn down between
+/// tests, unlike a `NamespaceGuard`-owned namespace), so the caller must
+/// explicitly delete it once the test is done.
+async fn deploy_as_shared_pool_identity(
+    client: &kube::Client,
+    name: &str,
+) -> anyhow::Result<DeploymentGuard> {
+    let mut deploy = shared_proxy_deployment(DISCOVERY_NAMESPACE, name, "cluster.local")?;
+    deploy.metadata.namespace = Some(DISCOVERY_NAMESPACE.to_owned());
+    deploy
+        .spec
+        .as_mut()
+        .and_then(|s| s.template.spec.as_mut())
+        .context("shared_proxy_deployment must always carry a pod spec")?
+        .service_account_name = Some("coxswain-shared-proxy".to_owned());
+
+    let deployments: Api<Deployment> = Api::namespaced(client.clone(), DISCOVERY_NAMESPACE);
+    deployments
+        .patch(
+            name,
+            &PatchParams::apply("e2e-test"),
+            &Patch::Apply(&deploy),
+        )
+        .await
+        .with_context(|| format!("apply {name} Deployment in {DISCOVERY_NAMESPACE}"))?;
+    Ok(DeploymentGuard {
+        namespace: DISCOVERY_NAMESPACE.to_owned(),
+        name: name.to_owned(),
+    })
+}
+
+/// RAII guard that deletes a namespaced `Deployment` on drop, so a panicking
+/// assertion (which unwinds past a manual `delete` call) still cleans up a
+/// pod deployed into a persistent namespace like `coxswain-system` — unlike a
+/// `NamespaceGuard`-owned namespace, nothing else tears this down between
+/// tests. Deletion runs on a dedicated OS thread with its own runtime and
+/// client: `Drop` fires after a `#[tokio::test]`'s own current-thread runtime
+/// is already gone, so a `tokio::spawn`ed delete here would never run and a
+/// client built on the vanished runtime would hang forever. Mirrors
+/// `coxswain_e2e::NamespaceGuard`'s own cleanup for the identical reason.
+struct DeploymentGuard {
+    namespace: String,
+    name: String,
+}
+
+impl Drop for DeploymentGuard {
+    fn drop(&mut self) {
+        let namespace = self.namespace.clone();
+        let name = self.name.clone();
+        let handle = std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::warn!(error = %e, %namespace, %name, "could not build cleanup runtime");
+                    return;
+                }
+            };
+            rt.block_on(async move {
+                let client = match kube::Client::try_default().await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(error = %e, %namespace, %name, "could not build cleanup client");
+                        return;
+                    }
+                };
+                let api: Api<Deployment> = Api::namespaced(client, &namespace);
+                match api.delete(&name, &DeleteParams::default()).await {
+                    Ok(_) => tracing::debug!(%namespace, %name, "deleted test Deployment"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, %namespace, %name, "failed to delete test Deployment")
+                    }
+                }
+            });
+        });
+        let _ = handle.join();
+    }
+}
+
 /// Happy path / recovery: the same proxy configuration with the correct
 /// `COXSWAIN_DISCOVERY_TRUST_DOMAIN=cluster.local` bootstraps its SVID,
 /// applies the first routing snapshot, and reaches `Ready=True`.
@@ -141,30 +235,22 @@ async fn wrong_trust_domain_keeps_proxy_not_ready() -> anyhow::Result<()> {
 #[tokio::test]
 async fn corrected_trust_domain_lets_proxy_become_ready() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "disc-auth-good").await?;
 
-    copy_trust_bundle(&h.client, &ns.name).await?;
-
-    // Deploy with the correct trust domain.
-    let deploy = shared_proxy_deployment(&ns.name, "disc-good-trust", "cluster.local")?;
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    deployments
-        .create(&PostParams::default(), &deploy)
-        .await
-        .context("create disc-good-trust Deployment")?;
+    // Deploy with the correct trust domain, as the real shared-proxy pool's
+    // own identity (#726) — the only identity that can actually reach Ready.
+    // `_guard` deletes it on drop even if an assertion below panics.
+    let _guard = deploy_as_shared_pool_identity(&h.client, "disc-good-trust").await?;
 
     // Wait for the pod to reach Ready=True (proves bootstrap + first snapshot
     // + Ack all succeeded). 90 s is generous; on a warm OrbStack cluster the
     // full bootstrap chain typically completes in under 10 s.
     wait_for_pod_ready(
         &h.client,
-        &ns.name,
+        DISCOVERY_NAMESPACE,
         "app=disc-good-trust",
         Duration::from_secs(90),
     )
-    .await?;
-
-    Ok(())
+    .await
 }
 
 // ── Group 2 — Convergence / readiness lifecycle ───────────────────────────────
@@ -180,22 +266,17 @@ async fn corrected_trust_domain_lets_proxy_become_ready() -> anyhow::Result<()> 
 #[tokio::test]
 async fn fresh_proxy_converges_and_registers_in_node_registry() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "disc-converge").await?;
 
-    copy_trust_bundle(&h.client, &ns.name).await?;
-
-    let deploy = shared_proxy_deployment(&ns.name, "disc-converge", "cluster.local")?;
-    let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
-    deployments
-        .create(&PostParams::default(), &deploy)
-        .await
-        .context("create disc-converge Deployment")?;
+    // Deployed as the real shared-proxy pool's own identity (#726) — the only
+    // identity that can actually reach Ready and register. `_guard` deletes
+    // it on drop even if an assertion below panics.
+    let _guard = deploy_as_shared_pool_identity(&h.client, "disc-converge").await?;
 
     // Wait for the proxy pod's readinessProbe to flip Ready=True (proves the
     // full bootstrap → snapshot → Ack chain completed).
     wait_for_pod_ready(
         &h.client,
-        &ns.name,
+        DISCOVERY_NAMESPACE,
         "app=disc-converge",
         Duration::from_secs(90),
     )
@@ -782,45 +863,66 @@ async fn rogue_relay_pod_status(client: &kube::Client, ns: &str) -> String {
     format!("phase={phase} restarts={restarts} container_state={state}")
 }
 
-/// Sad path (#682): a pod running the real `serve relay --shared` binary role
-/// under an ordinary (non-`coxswain-relay-shared`) ServiceAccount bootstraps
-/// successfully — bootstrap authenticates any ServiceAccount that passes
-/// TokenReview, with no identity allowlist — and its upstream `RosterReport`
-/// is silently dropped, never folded into the node registry.
+/// Sad path (#726): a pod running the real `serve relay --shared` binary role
+/// under an ordinary (non-`coxswain-relay-shared`) ServiceAccount attempts the
+/// full attack the issue describes — bootstrap an SVID, then open a
+/// scope-less Subscribe (which defaults to `SharedPool`, carrying every
+/// shared-pool TLS private key and basic-auth credential hash).
 ///
-/// This is the live-cluster proof for the sender-identity gate (#666)'s
-/// `rejected` outcome: no new hostile-client code is needed, since the
-/// SHIPPED relay binary always wires its roster reporter regardless of which
-/// identity it runs under — enforcing that identity is the *server's* job,
-/// not the client's. The controller is the sole diagnostic emitter; there is
-/// no Warning Event for this path (unlike the wrong-audience bootstrap
-/// rejection above), so the Prometheus counter is the only observable.
+/// #726 shipped two independent controls: the identity allowlist on
+/// `Bootstrap` (`BootstrapIdentityAllowlist`) and the `SharedPool`
+/// authorization gate on `Subscribe` (`ScopeAuthorizer::allows_shared_pool`).
+/// This rogue identity — `default` SA, an ordinary tenant namespace — fails
+/// *both*, and the allowlist is reached first: `Bootstrap` denies it
+/// `PERMISSION_DENIED` before it ever holds an SVID, so it never reaches the
+/// point of dialling `Subscribe` at all. That is a *stronger* outcome than
+/// the issue's own attack narrative assumed (which had the attacker
+/// successfully bootstrapping), not a weaker one — the attacker gets nothing
+/// at the earliest possible point, not an empty-but-open stream at a later
+/// one.
+///
+/// Before #726 the rogue's bootstrap AND Subscribe both succeeded (no
+/// allowlist, Subscribe scope-only not identity-gated) and only its
+/// downstream `RosterReport` was rejected — this test used to prove that
+/// narrower invariant. The `SharedPool` Subscribe gate itself (the case where
+/// an identity clears bootstrap but is still not the shared-proxy/shared-relay
+/// identity) is proven directly by `coxswain-discovery`'s own unit and
+/// integration tests (`shared_pool_subscribe_denied_by_default`,
+/// `provenance_authorizer_denies_unauthenticated_shared_pool_subscribe`,
+/// `allows_shared_pool_*`) — production has no identity that clears the
+/// bootstrap allowlist without also clearing the Subscribe gate, so there is
+/// no live rogue this e2e could dial that would reach `Subscribe` at all. A
+/// legitimate shared proxy or shared relay must still bootstrap, subscribe,
+/// and converge — proven implicitly by every other passing test in this
+/// suite (and the harness's own baseline shared proxy), since none of them
+/// could pass if a real shared-pool identity were also denied.
 #[tokio::test]
-async fn rogue_relay_identity_is_rejected_by_roster_gate() -> anyhow::Result<()> {
+async fn unauthorized_identity_cannot_subscribe_shared_pool() -> anyhow::Result<()> {
     let h = Harness::start().await?;
-    let ns = NamespaceGuard::create(&h.client, "roster-reject").await?;
+    let ns = NamespaceGuard::create(&h.client, "shared-pool-reject").await?;
     copy_trust_bundle(&h.client, &ns.name).await?;
 
     // Baseline BEFORE the rogue pod exists — `rejected` is a cumulative
     // process-lifetime counter shared across every serial test on this
     // controller pod, and legitimately moves on ordinary namespace/relay
-    // teardown elsewhere in the suite (#666), so the assertion below is a
-    // delta against this baseline, never an absolute value.
+    // teardown elsewhere in the suite, so the assertion below is a delta
+    // against this baseline, never an absolute value.
     let (_leader_pf, server_url) = leader_discovery_metrics(&h.client).await?;
     let rejected_before = scrape_metric_label_sum(
         &server_url,
-        "coxswain_discovery_roster_reports_total",
-        "result=\"rejected\"",
+        "coxswain_discovery_bootstrap_total",
+        "reason=\"identity_not_allowlisted\"",
     )
     .await
     .unwrap_or(0.0);
 
-    // The real `serve relay --shared` binary, correctly audienced (bootstrap
-    // must succeed — the roster fold is what's under test, not bootstrap
-    // itself), but with NO `serviceAccountName` override: it runs as this
-    // fresh namespace's `default` SA, which is neither `coxswain-relay-shared`
-    // nor in the install namespace, so it fails the shared-relay identity
-    // check on both counts.
+    // The real `serve relay --shared` binary, correctly audienced (TokenReview
+    // must succeed — the identity allowlist is what's under test, not the
+    // token's audience), but with NO `serviceAccountName` override: it runs as
+    // this fresh namespace's `default` SA, which is neither
+    // `coxswain-relay-shared` nor `coxswain-shared-proxy` in the install
+    // namespace, nor a provisioned relay, nor a dedicated Gateway's identity —
+    // it fails the allowlist on every count.
     let deployments: Api<Deployment> = Api::namespaced(h.client.clone(), &ns.name);
     let rogue: Deployment = serde_json::from_value(json!({
         "apiVersion": "apps/v1",
@@ -875,13 +977,11 @@ async fn rogue_relay_identity_is_rejected_by_roster_gate() -> anyhow::Result<()>
     }))?;
     deployments.create(&PostParams::default(), &rogue).await?;
 
-    // The client queues an initial RosterReport behind its Subscribe on every
-    // session (`client.rs`'s `stream_until_closed`, #585) — it does not wait
-    // for the relay's downstream registry to change, so the rogue reports
-    // promptly regardless of whether any leaf ever attaches to it. Poll past
-    // bootstrap + dial latency; the timeout message also renders the rogue
+    // The client attempts bootstrap on startup (`client.rs`'s bootstrap loop),
+    // so a rejected-bootstrap count past baseline follows promptly. Poll past
+    // scheduling + dial latency; the timeout message also renders the rogue
     // pod's own status, since the most likely failure here is the pod never
-    // reaching the point of streaming at all (image pull, scheduling, a bad
+    // reaching the point of dialling at all (image pull, scheduling, a bad
     // mount), which a metric-only message can't distinguish from a genuine
     // gate regression.
     wait::poll_until(
@@ -894,13 +994,13 @@ async fn rogue_relay_identity_is_rejected_by_roster_gate() -> anyhow::Result<()>
             async move {
                 let now = scrape_metric_label_sum(
                     &server_url,
-                    "coxswain_discovery_roster_reports_total",
-                    "result=\"rejected\"",
+                    "coxswain_discovery_bootstrap_total",
+                    "reason=\"identity_not_allowlisted\"",
                 )
                 .await;
                 let pod = rogue_relay_pod_status(&client, &ns_name).await;
                 format!(
-                    "controller coxswain_discovery_roster_reports_total{{result=\"rejected\"}} \
+                    "controller coxswain_discovery_bootstrap_total{{reason=\"identity_not_allowlisted\"}} \
                      to exceed the {rejected_before} baseline; currently: {now:?}; rogue pod: {pod}"
                 )
             }
@@ -910,8 +1010,8 @@ async fn rogue_relay_identity_is_rejected_by_roster_gate() -> anyhow::Result<()>
             async move {
                 let now = scrape_metric_label_sum(
                     &server_url,
-                    "coxswain_discovery_roster_reports_total",
-                    "result=\"rejected\"",
+                    "coxswain_discovery_bootstrap_total",
+                    "reason=\"identity_not_allowlisted\"",
                 )
                 .await?;
                 (now > rejected_before).then_some(())
@@ -920,11 +1020,10 @@ async fn rogue_relay_identity_is_rejected_by_roster_gate() -> anyhow::Result<()>
     )
     .await?;
 
-    // Defense-in-depth cross-check: the rogue DOES connect (Subscribe/connect
-    // is scope-only, not identity-gated — only its RosterReport is under
-    // test), so its own node_id legitimately appears in the topology as an
-    // ordinary SharedPool node. What must never happen is the fold: it must
-    // never be marked `is_relay`, and no OTHER node may claim it as `parent`.
+    // The rogue never obtains an SVID, so it never dials Subscribe at all —
+    // its own node_id must never reach the topology, the inverse of the
+    // pre-#726 behaviour (which accepted the connection and only withheld the
+    // roster fold).
     let pod_name = Api::<Pod>::namespaced(h.client.clone(), &ns.name)
         .list(&ListParams::default().labels("app=rogue-relay"))
         .await?
@@ -932,29 +1031,13 @@ async fn rogue_relay_identity_is_rejected_by_roster_gate() -> anyhow::Result<()>
         .into_iter()
         .next()
         .and_then(|p| p.metadata.name)
-        .context("the rogue relay pod must exist by the time its RosterReport was rejected")?;
+        .context("the rogue relay pod must exist by the time its bootstrap was rejected")?;
     let topology_url = h.controller_operator_url("/api/v1/topology");
     let topology = fetch_topology(&topology_url).await?;
-    let rogue_node = find_node(&topology, &pod_name).with_context(|| {
-        format!(
-            "the rogue relay's own node_id ('{pod_name}') must appear as an ordinary connected node"
-        )
-    })?;
-    assert_eq!(
-        rogue_node.get("is_relay").and_then(|v| v.as_bool()),
-        Some(false),
-        "the rogue relay's RosterReport must never fold — its own node must never be marked is_relay"
-    );
-    let folded_under_rogue = topology
-        .get("nodes")
-        .and_then(|n| n.as_array())
-        .into_iter()
-        .flatten()
-        .any(|n| n.get("parent").and_then(|v| v.as_str()) == Some(pod_name.as_str()));
     assert!(
-        !folded_under_rogue,
-        "no node may appear folded (parent == rogue node_id) — the rejected RosterReport \
-         must never have produced children"
+        find_node(&topology, &pod_name).is_none(),
+        "the rogue relay's node_id ('{pod_name}') must never appear in the topology — its \
+         bootstrap was denied before it ever obtained an SVID to Subscribe with"
     );
 
     Ok(())

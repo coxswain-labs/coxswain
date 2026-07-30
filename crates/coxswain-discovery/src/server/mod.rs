@@ -307,10 +307,27 @@ impl Discovery for DiscoveryService {
         // claim matches the authenticated peer SVID identity.
         //
         // A dedicated proxy must present a SVID whose namespace + SA equal those
-        // of its provisioned ServiceAccount (`{gw}-{class}`). The check fires only
-        // when the Gateway's dedicated-registry entry exists — if absent, the
-        // snapshot is fail-closed empty regardless, so we let the stream open and
-        // re-check on every build_snapshot call.
+        // of its provisioned ServiceAccount (`{gw}-{class}`). Checked first
+        // against `source.dedicated_identities` (#726) — published at
+        // provisioning *intent*, before cut-over — so a fresh dedicated proxy
+        // connecting directly to the controller doesn't race
+        // `gateway_is_cut_over` for its very first connect. That cell is
+        // controller-internal (not carried on the wire), so a namespace
+        // relay's downstream `SnapshotSource` never populates it; the check
+        // falls back to `source.dedicated` (the routing registry, populated
+        // only post-cut-over but mirrored to relays via the wire protocol).
+        // An absent entry in both is denied, not fail-open (the general #726
+        // tightening — a Gateway with no entry anywhere has nothing for the
+        // claim to legitimately be) — so a dedicated proxy behind an
+        // already-provisioned relay still eats a rejected-connect/backoff
+        // cycle on its own first connect, exactly like the controller-direct
+        // case does whenever `dedicated_identities` doesn't (yet) help. Not
+        // fixed further here: closing it needs the pre-cut-over identity
+        // carried on the wire so a relay can populate its own copy, which is
+        // out of scope for this change. `source.dedicated` remains the
+        // actual served content either way; `view_cache::gateway_svid_denied`
+        // re-checks against it on every build as the entry-changes-after-open
+        // backstop.
         //
         // When no PeerSvid is present (plaintext/test path) we skip the check and
         // fail-open — mTLS is mandatory in production, so this branch is
@@ -319,13 +336,20 @@ impl Discovery for DiscoveryService {
             && let Scope::Gateway { name, namespace } = &scope
         {
             let key = ObjectKey::new(namespace.clone(), name.clone());
-            if let Some(entry) = self.source.dedicated.load().map.get(&key)
-                && !svid_matches_dedicated_gateway(
-                    &peer.uri_sans,
-                    namespace,
-                    &entry.expected_proxy_sa,
-                )
-            {
+            let pre_cutover = self.source.dedicated_identities.load();
+            let expected_proxy_sa = pre_cutover.get(&key).cloned().or_else(|| {
+                self.source
+                    .dedicated
+                    .load()
+                    .map
+                    .get(&key)
+                    .map(|entry| entry.expected_proxy_sa.clone())
+            });
+            let denied = match &expected_proxy_sa {
+                Some(sa) => !svid_matches_dedicated_gateway(&peer.uri_sans, namespace, sa),
+                None => true,
+            };
+            if denied {
                 crate::metrics::streams_total()
                     .with_label_values(&["rejected"])
                     .inc();
@@ -350,6 +374,24 @@ impl Discovery for DiscoveryService {
                     .inc();
                 return Err(Status::permission_denied(
                     "discovery: Namespace scope not authorized for this identity",
+                ));
+            }
+        }
+
+        // Open-time scope authorization for `Scope::SharedPool` (#726): same
+        // no-fail-open discipline as Namespace, but with a strictly bigger
+        // blast radius — the shared-pool snapshot carries every shared-pool
+        // TLS private key and basic-auth credential hash. An absent `scope`
+        // field defaults to `SharedPool` above, so this also gates the
+        // scope-less Subscribe every client sends by default.
+        if let Scope::SharedPool = &scope {
+            let peer = peer_svid.clone().unwrap_or_default();
+            if !self.authorizer.allows_shared_pool(&peer) {
+                crate::metrics::streams_total()
+                    .with_label_values(&["rejected"])
+                    .inc();
+                return Err(Status::permission_denied(
+                    "discovery: SharedPool scope not authorized for this identity",
                 ));
             }
         }
@@ -468,6 +510,7 @@ mod tests {
     const AUTHZ_TD: &str = "cluster.local";
     const AUTHZ_RELAY_SA: &str = "coxswain-relay";
     const AUTHZ_SHARED_RELAY_SA: &str = "coxswain-relay-shared";
+    const AUTHZ_SHARED_PROXY_SA: &str = "coxswain-shared-proxy";
     const AUTHZ_INSTALL_NS: &str = "coxswain-system";
 
     fn relay_peer(ns: &str, sa: &str) -> PeerSvid {
@@ -484,6 +527,7 @@ mod tests {
             trust_domain: AUTHZ_TD.to_owned(),
             shared_relay_sa: AUTHZ_SHARED_RELAY_SA.to_owned(),
             install_namespace: AUTHZ_INSTALL_NS.to_owned(),
+            shared_proxy_sa: AUTHZ_SHARED_PROXY_SA.to_owned(),
         })
     }
 
@@ -741,7 +785,7 @@ mod tests {
         );
     }
 
-    // ── RosterReport sender authorization (#666) ──────────────────────────────
+    // ── SharedPool subscribe authorization (#726) ─────────────────────────────
 
     fn shared_relay_authz_peer() -> PeerSvid {
         PeerSvid {
@@ -750,6 +794,61 @@ mod tests {
             )],
         }
     }
+
+    fn shared_proxy_authz_peer() -> PeerSvid {
+        PeerSvid {
+            uri_sans: vec![format!(
+                "spiffe://{AUTHZ_TD}/ns/{AUTHZ_INSTALL_NS}/sa/{AUTHZ_SHARED_PROXY_SA}"
+            )],
+        }
+    }
+
+    #[test]
+    fn allows_shared_pool_accepts_shared_relay_identity() {
+        let a = provenance_authorizer(&[]);
+        assert!(
+            a.allows_shared_pool(&shared_relay_authz_peer()),
+            "the shared relay's own identity must be authorized to subscribe SharedPool"
+        );
+    }
+
+    #[test]
+    fn allows_shared_pool_accepts_shared_proxy_identity() {
+        let a = provenance_authorizer(&[]);
+        assert!(
+            a.allows_shared_pool(&shared_proxy_authz_peer()),
+            "the shared-proxy pool's own identity must be authorized to subscribe SharedPool"
+        );
+    }
+
+    #[test]
+    fn allows_shared_pool_denies_rogue_service_account() {
+        let a = provenance_authorizer(&[]);
+        assert!(
+            !a.allows_shared_pool(&relay_peer(AUTHZ_INSTALL_NS, "rogue")),
+            "a self-made SA in the install namespace must not be authorized for SharedPool"
+        );
+    }
+
+    #[test]
+    fn allows_shared_pool_denies_wrong_namespace() {
+        let a = provenance_authorizer(&[]);
+        assert!(
+            !a.allows_shared_pool(&relay_peer("some-tenant", AUTHZ_SHARED_PROXY_SA)),
+            "the shared-proxy SA outside the install namespace must not be authorized"
+        );
+    }
+
+    #[test]
+    fn allows_shared_pool_denies_empty_sans() {
+        let a = provenance_authorizer(&[]);
+        assert!(
+            !a.allows_shared_pool(&PeerSvid::default()),
+            "an absent PeerSvid (empty SANs) must never be authorized for SharedPool"
+        );
+    }
+
+    // ── RosterReport sender authorization (#666) ──────────────────────────────
 
     #[test]
     fn roster_report_authorized_for_provisioned_namespace_relay() {
@@ -1000,6 +1099,7 @@ mod tests {
             client_certs: SharedClientCertStore::new(),
             listener_status: GatewayListenerStatusHandle::new(),
             dedicated: DedicatedRoutingRegistry::new(),
+            dedicated_identities: coxswain_core::Shared::new(),
             passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
             terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
             tcp_routes: coxswain_core::routing::SharedTcpRouteTable::new(),
@@ -1019,8 +1119,15 @@ mod tests {
         (h, leader_tx)
     }
 
+    /// The default authorizer for tests that don't care about authorization
+    /// (delta encoding, backpressure, node registry, roster folding, etc.) —
+    /// `AllowAll`, not the production `DenyAll` default. Tests that verify
+    /// deny-by-default behavior wire `DenyAll` explicitly via
+    /// `start_harness_with_authorizer`; the real production wiring
+    /// (`DiscoveryService::new()`) still defaults to `DenyAll` regardless of
+    /// this test scaffold.
     async fn start_harness_with_gate(leader_rx: Option<watch::Receiver<bool>>) -> TestHarness {
-        start_harness_with(leader_rx, Arc::new(DenyAll)).await
+        start_harness_with(leader_rx, Arc::new(AllowAll)).await
     }
 
     /// Start the harness with a custom [`ScopeAuthorizer`] installed (#582),
@@ -1061,13 +1168,18 @@ mod tests {
         }
     }
 
-    /// A [`ScopeAuthorizer`] test double that allows every `Namespace` subscribe
-    /// and every `RosterReport` — the inverse of the production [`DenyAll`]
-    /// default.
-    struct AllowAllNamespaces;
+    /// A [`ScopeAuthorizer`] test double that allows every `Namespace`
+    /// subscribe, every `SharedPool` subscribe, and every `RosterReport` —
+    /// the inverse of the production [`DenyAll`] default, and the default for
+    /// [`start_harness_with_gate`] (tests that don't care about authz).
+    struct AllowAll;
 
-    impl ScopeAuthorizer for AllowAllNamespaces {
+    impl ScopeAuthorizer for AllowAll {
         fn allows_namespace(&self, _peer: &PeerSvid, _namespace: &str) -> bool {
+            true
+        }
+
+        fn allows_shared_pool(&self, _peer: &PeerSvid) -> bool {
             true
         }
 
@@ -2269,9 +2381,12 @@ mod tests {
     /// The default [`DenyAll`] authorizer rejects a `Namespace`
     /// subscribe with `PERMISSION_DENIED`, even on the plaintext (no PeerSvid)
     /// test path — unlike the Gateway binding check, this must NOT fail-open.
+    /// `DenyAll` wired explicitly: the test-harness default is `AllowAll`
+    /// (tests that don't care about authz), so proving the production
+    /// deny-by-default behavior needs the real production default here.
     #[tokio::test]
     async fn namespace_subscribe_denied_by_default() {
-        let h = start_harness().await;
+        let h = start_harness_with_authorizer(Arc::new(DenyAll)).await;
         let err = open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "prod"))
             .await
             .expect_err("Namespace subscribe must be denied by the default authorizer");
@@ -2283,7 +2398,7 @@ mod tests {
     /// deny-by-default.
     #[tokio::test]
     async fn namespace_subscribe_allowed_by_stub_authorizer() {
-        let h = start_harness_with_authorizer(Arc::new(AllowAllNamespaces)).await;
+        let h = start_harness_with_authorizer(Arc::new(AllowAll)).await;
         let (tx, mut rx) =
             open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "prod"))
                 .await
@@ -2293,15 +2408,54 @@ mod tests {
         drop(tx);
     }
 
-    /// `SharedPool`/`Gateway` subscribes are unaffected by the `ScopeAuthorizer`
-    /// seam — the default deny-all authorizer only gates `Namespace`.
+    // ── #726: SharedPool scope authorization ──────────────────────────────────
+
+    fn shared_pool_subscribe(node_id: &str) -> p::Subscribe {
+        p::Subscribe {
+            node_id: node_id.to_owned(),
+            wire_version: WIRE_VERSION,
+            scope: Some(crate::wire::scope_to_wire(&Scope::SharedPool)),
+        }
+    }
+
+    /// The default [`DenyAll`] authorizer rejects a `SharedPool` subscribe
+    /// with `PERMISSION_DENIED`, even on the plaintext (no PeerSvid) test
+    /// path — the #726 fix. `DenyAll` wired explicitly for the same reason as
+    /// `namespace_subscribe_denied_by_default`.
     #[tokio::test]
-    async fn shared_pool_subscribe_unaffected_by_namespace_authorizer() {
-        let h = start_harness().await;
-        let (tx, mut rx) = open_stream(h.addr, "node-shared").await;
-        let snap = recv_snapshot(&mut rx).await;
-        assert!(snap.full);
-        drop(tx);
+    async fn shared_pool_subscribe_denied_by_default() {
+        let h = start_harness_with_authorizer(Arc::new(DenyAll)).await;
+        let err = open_stream_with_subscribe(h.addr, shared_pool_subscribe("node-shared"))
+            .await
+            .expect_err("SharedPool subscribe must be denied by the default authorizer");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
+    }
+
+    /// The **real** `ProvisionedRelayAuthorizer` (not a stub) wired into the
+    /// server fail-closes: even with no provisioning restriction at all, an
+    /// unauthenticated (empty-SAN, plaintext-path) peer is rejected
+    /// `PERMISSION_DENIED`. Mirrors
+    /// `provenance_authorizer_denies_unauthenticated_namespace_subscribe`. The
+    /// full identity allow/deny matrix is unit-tested on the authorizer
+    /// itself (`allows_shared_pool_*`); the authorized case is exercised
+    /// end-to-end (real mTLS) by the discovery e2e.
+    #[tokio::test]
+    async fn provenance_authorizer_denies_unauthenticated_shared_pool_subscribe() {
+        let authz = Arc::new(ProvisionedRelayAuthorizer::new(RelayAuthzConfig {
+            provisioned: Shared::from_value(HashSet::new()),
+            relay_sa: "coxswain-relay".to_owned(),
+            trust_domain: "cluster.local".to_owned(),
+            shared_relay_sa: "coxswain-relay-shared".to_owned(),
+            install_namespace: "coxswain-system".to_owned(),
+            shared_proxy_sa: "coxswain-shared-proxy".to_owned(),
+        }));
+        let h = start_harness_with_authorizer(authz).await;
+        let err = open_stream_with_subscribe(h.addr, shared_pool_subscribe("node-shared"))
+            .await
+            .expect_err(
+                "the real ProvisionedRelayAuthorizer must deny an unauthenticated SharedPool subscribe",
+            );
+        assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
     }
 
     /// The **real** `ProvisionedRelayAuthorizer` (not a stub) wired into the
@@ -2321,6 +2475,7 @@ mod tests {
             trust_domain: "cluster.local".to_owned(),
             shared_relay_sa: "coxswain-relay-shared".to_owned(),
             install_namespace: "coxswain-system".to_owned(),
+            shared_proxy_sa: "coxswain-shared-proxy".to_owned(),
         }));
         let h = start_harness_with_authorizer(authz).await;
         let err = open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "prod"))
@@ -2683,13 +2838,40 @@ mod tests {
         .unwrap_or_else(|e| panic!("invariant: pre-send channel is open: {e}"));
     }
 
+    /// A [`ScopeAuthorizer`] stub for an ordinary shared-pool proxy: authorized
+    /// to *subscribe* `SharedPool` (like the real shared-proxy pool identity)
+    /// but never authorized to submit a *roster* — roster authorization is a
+    /// stricter, separate gate that only the shared relay's own identity
+    /// passes (`ProvisionedRelayAuthorizer::allows_roster`). Needed because the
+    /// plaintext test harness carries no `PeerSvid`, so the real authorizer
+    /// cannot distinguish "an authorized ordinary proxy" from "unauthenticated"
+    /// — both present empty SANs — the way it can end-to-end over real mTLS.
+    struct AllowSharedPoolSubscribeOnly;
+
+    impl ScopeAuthorizer for AllowSharedPoolSubscribeOnly {
+        fn allows_namespace(&self, _peer: &PeerSvid, _namespace: &str) -> bool {
+            false
+        }
+
+        fn allows_shared_pool(&self, _peer: &PeerSvid) -> bool {
+            true
+        }
+
+        fn allows_roster(&self, _peer: &PeerSvid, _scope: &Scope) -> bool {
+            false
+        }
+    }
+
     /// The #666 regression, exercised on the real dispatch path (not just the
     /// extracted `allows_roster`/`record_roster_report` functions): an ordinary
-    /// `SharedPool` stream under the default `DenyAll` authorizer sends a
-    /// `RosterReport` — it must never be folded into the registry.
+    /// `SharedPool` stream — authorized to subscribe, but not the shared
+    /// relay's identity — sends a `RosterReport`; it must never be folded into
+    /// the registry. (Before #726, an *unauthorized* SharedPool subscribe could
+    /// reach this same dispatch path at all; that case is now covered earlier,
+    /// by `shared_pool_subscribe_denied_by_default` — the stream never opens.)
     #[tokio::test]
-    async fn roster_report_on_shared_pool_stream_never_folds_under_deny_all() {
-        let h = start_harness().await;
+    async fn roster_report_on_shared_pool_stream_never_folds_even_when_subscribe_is_authorized() {
+        let h = start_harness_with_authorizer(Arc::new(AllowSharedPoolSubscribeOnly)).await;
         let (tx, _rx) = open_stream(h.addr, "impostor-shared-proxy").await;
         send_roster_report(&tx, "team-a").await;
 
@@ -2712,7 +2894,7 @@ mod tests {
     /// proving the gate doesn't regress the legitimate relay path.
     #[tokio::test]
     async fn roster_report_on_namespace_stream_folds_under_allowing_authorizer() {
-        let h = start_harness_with_authorizer(Arc::new(AllowAllNamespaces)).await;
+        let h = start_harness_with_authorizer(Arc::new(AllowAll)).await;
         let (tx, _rx) =
             open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "team-a"))
                 .await
@@ -2751,7 +2933,7 @@ mod tests {
     /// negative over an actual stream.
     #[tokio::test]
     async fn same_identity_reconnect_to_a_live_relay_node_id_is_not_refused() {
-        let h = start_harness_with_authorizer(Arc::new(AllowAllNamespaces)).await;
+        let h = start_harness_with_authorizer(Arc::new(AllowAll)).await;
         let (relay_tx, _relay_rx) =
             open_stream_with_subscribe(h.addr, namespace_subscribe("relay-1", "team-a"))
                 .await

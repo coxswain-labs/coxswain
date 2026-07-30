@@ -4,8 +4,12 @@
 //! per connection (tonic requires `Clone`) and never touches the Kubernetes API at
 //! serve time.
 
+use std::collections::HashMap;
+
+use coxswain_core::Shared;
 use coxswain_core::dedicated_registry::DedicatedRoutingRegistry;
 use coxswain_core::listener_status::GatewayListenerStatusHandle;
+use coxswain_core::ownership::ObjectKey;
 use coxswain_core::publish_index::GatewayPublishIndexHandle;
 use coxswain_core::routing::{
     SharedGatewayRoutingTable, SharedIngressRoutingTable, SharedTcpRouteTable,
@@ -43,6 +47,14 @@ pub struct SnapshotSource {
     /// serve [`Scope::SharedPool`](crate::subscription::Scope::SharedPool) and deliberately exclude cut-over Gateways. The
     /// shared reconciler is the sole writer.
     pub dedicated: DedicatedRoutingRegistry,
+    /// Every dedicated-mode Gateway's expected proxy identity (#726),
+    /// published at *provisioning intent* — before cut-over, unlike
+    /// [`Self::dedicated`] above. Read at `Subscribe` open time for the
+    /// Gateway-scope SVID binding check, so a fresh dedicated proxy's very
+    /// first connect is already authorized instead of racing cut-over.
+    /// `Self::dedicated` remains what actually gets served — this field only
+    /// answers "is there a legitimate claim to check the SVID against."
+    pub dedicated_identities: Shared<HashMap<ObjectKey, String>>,
     /// SNI-keyed TLS passthrough routing table for TLSRoute / GEP-2643 (#70).
     /// Only populated for [`Scope::SharedPool`](crate::subscription::Scope::SharedPool) subscribers; dedicated proxies
     /// receive an empty table (TLSRoutes are shared-pool only).
