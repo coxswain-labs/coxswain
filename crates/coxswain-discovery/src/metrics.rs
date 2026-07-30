@@ -71,7 +71,8 @@ pub fn connected_proxies() -> &'static IntGauge {
 ///
 /// Labels: `result` (`accepted` — Subscribe validated and node registered;
 /// `rejected` — wire-version mismatch, malformed scope, SVID/scope-binding
-/// denial before registration, or a `node_id` colliding with an already-connected
+/// denial before registration, an unauthorized `SharedPool` or `Namespace`
+/// subscribe (#726/#582), or a `node_id` colliding with an already-connected
 /// relay (#666 — a hijack attempt, or a legitimate relay losing its own
 /// reconnect race); `rejected_not_leader` — dial reached a standby replica
 /// while the Stream RPC is leader-gated, #531). A rising `rejected` rate flags

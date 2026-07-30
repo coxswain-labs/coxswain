@@ -527,7 +527,15 @@ async fn run_server(world_size: usize, churn_rate: f64, scope: BenchScope) {
         }
     };
 
-    let svc = DiscoveryService::new(source, registry, rebuild_rx);
+    // `--scope shared` subscribers connect plaintext (no `PeerSvid`), which
+    // the real `ProvisionedRelayAuthorizer` always denies (#726) — this
+    // harness measures fan-out cost, not authz, so it wires the bench-only
+    // `AllowAllScopes` instead of the production `DenyAll` default. `--scope
+    // gateway` is unaffected either way (a separate SVID-binding check, not
+    // gated by `ScopeAuthorizer`).
+    let svc = DiscoveryService::new(source, registry, rebuild_rx).with_scope_authorizer(
+        std::sync::Arc::new(coxswain_discovery::bench_internals::AllowAllScopes),
+    );
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .unwrap_or_else(|e| panic!("bind loopback: {e}"));
@@ -621,6 +629,7 @@ fn empty_source() -> SnapshotSource {
         client_certs: SharedClientCertStore::new(),
         listener_status: GatewayListenerStatusHandle::new(),
         dedicated: DedicatedRoutingRegistry::new(),
+        dedicated_identities: coxswain_core::Shared::new(),
         passthrough_routes: SharedTlsPassthroughTable::new(),
         terminate_routes: SharedTlsPassthroughTable::new(),
         tcp_routes: SharedTcpRouteTable::new(),

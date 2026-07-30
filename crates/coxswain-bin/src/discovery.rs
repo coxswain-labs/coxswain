@@ -16,10 +16,10 @@ use coxswain_controller::{
 use coxswain_core::health::{HealthRegistry, SubsystemHandle};
 use coxswain_core::identity::{SpiffeId, SvidIssuer};
 use coxswain_discovery::{
-    BootstrapClient, BootstrapClientConfig, BootstrapRunner, BootstrapService,
-    DiscoveryBootstrapServerTls, DiscoveryClient, DiscoveryClientConfig, DiscoveryServerTls, Scope,
-    SharedSvid, SpiffeMatcher, Supervisor, UpstreamNames, UpstreamPolicy, UpstreamResolverConfig,
-    serve_discovery_with_tls,
+    BootstrapClient, BootstrapClientConfig, BootstrapIdentityAllowlist, BootstrapRunner,
+    BootstrapService, DiscoveryBootstrapServerTls, DiscoveryClient, DiscoveryClientConfig,
+    DiscoveryServerTls, Scope, SharedSvid, SpiffeMatcher, Supervisor, UpstreamNames,
+    UpstreamPolicy, UpstreamResolverConfig, serve_discovery_with_tls,
 };
 use pingora_core::server::{Server, ShutdownWatch};
 use pingora_core::services::background::background_service;
@@ -78,7 +78,23 @@ pub(crate) struct DiscoveryIdentityService {
     pub(crate) pod_name: String,
     /// Best-upstream resolver (#601): the bootstrap handler returns each client's
     /// current best routing upstream `(endpoint, expected_server_sa)` from it.
+    /// Also supplies `shared_relay_sa`/`relay_sa`/`install_namespace` for the
+    /// identity allowlist below — one source for both, so the two seams can't
+    /// drift apart on the relay tier's own identity constants.
     pub(crate) upstream_resolver: Arc<UpstreamResolverConfig>,
+    /// The shared-proxy pool's ServiceAccount name (#726 identity allowlist).
+    pub(crate) shared_proxy_sa: String,
+    /// Namespaces with a controller-provisioned relay (#726 identity
+    /// allowlist) — the same live set `ScopeAuthorizer::allows_namespace`
+    /// reads for the relay's own live subscribe.
+    pub(crate) provisioned_relays: coxswain_core::Shared<std::collections::HashSet<String>>,
+    /// Every dedicated-mode Gateway's expected proxy identity (#726 identity
+    /// allowlist), published by the operator at *provisioning intent* —
+    /// before cut-over — so a fresh dedicated proxy's very first bootstrap
+    /// attempt is already authorized.
+    pub(crate) dedicated_identities: coxswain_core::Shared<
+        std::collections::HashMap<coxswain_core::ownership::ObjectKey, String>,
+    >,
 }
 
 #[async_trait]
@@ -177,9 +193,18 @@ impl pingora_core::services::background::BackgroundService for DiscoveryIdentity
             self.pod_name.clone(),
             self.namespace.clone(),
         ));
+        let identity_allowlist = Arc::new(BootstrapIdentityAllowlist {
+            install_namespace: self.upstream_resolver.install_namespace.clone(),
+            shared_proxy_sa: self.shared_proxy_sa.clone(),
+            shared_relay_sa: self.upstream_resolver.shared_relay_sa.clone(),
+            relay_sa: self.upstream_resolver.relay_sa.clone(),
+            provisioned_relays: self.provisioned_relays.clone(),
+            dedicated_identities: self.dedicated_identities.clone(),
+        });
         let bootstrap_service =
             BootstrapService::with_reject_hook(authority, authenticator, reject_hook)
-                .with_upstream_resolver(self.upstream_resolver.clone());
+                .with_upstream_resolver(self.upstream_resolver.clone())
+                .with_identity_allowlist(identity_allowlist);
 
         tracing::info!(
             stream_addr = %self.stream_addr,

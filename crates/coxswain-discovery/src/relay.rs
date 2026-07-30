@@ -105,6 +105,11 @@ pub fn shared_relay(
         listener_status: cells.listener_status,
         // A shared relay serves no dedicated Gateways.
         dedicated: DedicatedRoutingRegistry::new(),
+        // Controller-internal (#726); not carried on the wire, so a relay's
+        // downstream Gateway-scope check always falls back to `dedicated`
+        // above — see `server::stream`'s Gap A. Irrelevant here regardless
+        // (a shared relay serves no dedicated Gateways).
+        dedicated_identities: coxswain_core::Shared::new(),
         passthrough_routes: cells.passthrough,
         terminate_routes: cells.terminate,
         tcp_routes: cells.tcp,
@@ -157,6 +162,14 @@ pub fn namespace_relay(
         client_certs: coxswain_core::tls::SharedClientCertStore::new(),
         listener_status: coxswain_core::listener_status::GatewayListenerStatusHandle::new(),
         dedicated,
+        // Controller-internal (#726); not carried on the wire, so a namespace
+        // relay's downstream Gateway-scope check always falls back to
+        // `dedicated` above, which is post-cut-over only — a dedicated proxy
+        // behind this relay is not covered by #726's pre-cut-over fast path
+        // the way a controller-direct proxy is (its first connect can still
+        // hit the general #726 absent-entry deny and pay a backoff cycle).
+        // See `server::stream`'s Gap A for the full accounting.
+        dedicated_identities: coxswain_core::Shared::new(),
         passthrough_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         terminate_routes: coxswain_core::routing::SharedTlsPassthroughTable::new(),
         tcp_routes: coxswain_core::routing::SharedTcpRouteTable::new(),
@@ -529,6 +542,7 @@ mod tests {
             client_certs: SharedClientCertStore::new(),
             listener_status: GatewayListenerStatusHandle::new(),
             dedicated,
+            dedicated_identities: coxswain_core::Shared::new(),
             passthrough_routes: SharedTlsPassthroughTable::new(),
             terminate_routes: SharedTlsPassthroughTable::new(),
             tcp_routes: SharedTcpRouteTable::new(),
@@ -572,6 +586,7 @@ mod tests {
             client_certs: SharedClientCertStore::new(),
             listener_status: GatewayListenerStatusHandle::new(),
             dedicated,
+            dedicated_identities: coxswain_core::Shared::new(),
             passthrough_routes: SharedTlsPassthroughTable::new(),
             terminate_routes: SharedTlsPassthroughTable::new(),
             tcp_routes: SharedTcpRouteTable::new(),

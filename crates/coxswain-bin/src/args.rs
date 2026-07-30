@@ -1345,6 +1345,16 @@ pub(crate) struct RelayRoleArgs {
     /// behind it to subscribe on. Mirrors the controller's `--discovery-port`.
     #[arg(long, env = "COXSWAIN_DISCOVERY_PORT", default_value_t = RELAY_DISCOVERY_PORT)]
     pub discovery_port: u16,
+
+    /// ServiceAccount name of the shared-proxy pool this relay serves.
+    /// Only used with `--shared`. Set it only if you overrode the pool's
+    /// name at install time (`--shared-proxy-name` on the controller).
+    #[arg(
+        long,
+        env = "COXSWAIN_SHARED_PROXY_NAME",
+        default_value = "coxswain-shared-proxy"
+    )]
+    pub shared_proxy_name: String,
 }
 
 /// Resolved upstream subscription scope for a `relay` role invocation.

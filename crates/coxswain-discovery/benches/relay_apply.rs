@@ -105,6 +105,7 @@ fn dedicated_source(g: usize, bump_gw0: bool) -> SnapshotSource {
         client_certs: SharedClientCertStore::new(),
         listener_status: GatewayListenerStatusHandle::new(),
         dedicated,
+        dedicated_identities: coxswain_core::Shared::new(),
         passthrough_routes: SharedTlsPassthroughTable::new(),
         terminate_routes: SharedTlsPassthroughTable::new(),
         tcp_routes: SharedTcpRouteTable::new(),

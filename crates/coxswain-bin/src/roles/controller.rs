@@ -4,7 +4,7 @@
 //! subresources; runs no data-plane services. Shared wiring lives in
 //! [`crate::wiring`], [`crate::services`], and [`crate::discovery`].
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -124,6 +124,12 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
     // VIP reconciler, read by the status writer so a Gateway still provisioning
     // its VIP is held Pending rather than briefly reporting AddressNotUsable.
     let vip_failures = Shared::<HashSet<ObjectKey>>::new();
+    // Every dedicated-mode Gateway's expected proxy identity (#726), published
+    // by the per-Gateway reconcile at provisioning intent (before cut-over) —
+    // read lock-free by both the Bootstrap identity allowlist and the
+    // Gateway-scope Subscribe binding check, so a fresh dedicated proxy's
+    // first bootstrap/connect is already authorized.
+    let dedicated_identities = Shared::<HashMap<ObjectKey, String>>::new();
     let discovery_source = coxswain_discovery::SnapshotSource {
         ingress: status_writer.outputs.ingress_routes.clone(),
         gateway: status_writer.outputs.gateway_routes.clone(),
@@ -131,6 +137,7 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         client_certs: status_writer.outputs.client_certs.clone(),
         listener_status: listener_status.clone(),
         dedicated: status_writer.outputs.dedicated_registry.clone(),
+        dedicated_identities: dedicated_identities.clone(),
         passthrough_routes: status_writer.outputs.passthrough_routes.clone(),
         terminate_routes: status_writer.outputs.terminate_routes.clone(),
         tcp_routes: status_writer.outputs.tcp_routes.clone(),
@@ -200,6 +207,7 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             trust_domain: args.controller.discovery_trust_domain.clone(),
             shared_relay_sa: SHARED_RELAY_SERVICE_ACCOUNT.to_string(),
             install_namespace: args.common.pod_namespace.clone(),
+            shared_proxy_sa: args.controller.shared_proxy_name.clone(),
         },
     )))
     .with_upstream_directives(upstream_resolver.clone(), relay_changed_rx);
@@ -225,6 +233,9 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
             controller_name: args.common.controller_name.clone(),
             pod_name: args.common.pod_name.clone(),
             upstream_resolver,
+            shared_proxy_sa: args.controller.shared_proxy_name.clone(),
+            provisioned_relays: provisioned_relays.clone(),
+            dedicated_identities: dedicated_identities.clone(),
         },
     ));
 
@@ -277,6 +288,7 @@ pub(crate) fn run_controller(args: ControllerRoleArgs) -> Result<()> {
         relay: args.controller.relay_config(),
         provisioned_relays,
         active_relays,
+        dedicated_identities,
         // Shared-pool repoint gate (#605): the shared-relay control loop flips this,
         // the resolver reads it (same cell as above).
         shared_relay_active,

@@ -468,25 +468,26 @@ surfaces:
       - which identities may obtain an SVID, and is there an allowlist
       - is the token audience enforced
       - what does a rejected bootstrap emit for the operator
-    verdict: finding
-    findings: [726]
-    evidence: bootstrap_server.rs:182-183 — any ServiceAccount passing TokenReview is issued an SVID
-    audited: 78a2d363
+    verdict: safe
+    findings: []
+    evidence: bootstrap_server.rs BootstrapIdentityAllowlist::allows (#726) restricts SVID issuance to the shared proxy/relay in the install namespace, the relay SA in a provisioned namespace, or a dedicated Gateway's expected_proxy_sa; wired unconditionally in coxswain-bin's DiscoveryIdentityService::start. A denial increments bootstrap_total{rejected,identity_not_allowlisted} and fires the reject hook (BootstrapRejected Warning Event), same as every other rejection reason. The dedicated-Gateway arm reads a pre-cut-over live set (ReconcileContext::dedicated_identities, published at provisioning intent by reconciler.rs) rather than the post-cut-over routing registry, so a fresh dedicated proxy's very first bootstrap attempt is already authorized, not racing gateway_is_cut_over. The relay-tracking arm is kept fresh on standby replicas too (controller/mod.rs's periodic standby_rehydrate_interval), not just at startup/promotion, since Bootstrap is served by every replica
+    audited: 78a2d363 (fix landed after this audit commit; a full /security-audit pass should refresh this stamp)
 
   - id: discovery-subscribe-authz
     boundary: TB4
-    entry: Subscribe RPC on :50051
-    anchors: [crates/coxswain-discovery/src/server/mod.rs, crates/coxswain-discovery/src/server/authz.rs]
+    entry: Subscribe RPC on :50051 (controller) and the relay's own re-implementation of the same RPC on its downstream port
+    anchors: [crates/coxswain-discovery/src/server/mod.rs, crates/coxswain-discovery/src/server/authz.rs, crates/coxswain-bin/src/roles/relay.rs]
     adversaries: [AC3, AC4]
     assets: [A1, A4]
     asks:
       - which scopes are authorized at open time and against what identity
       - does any scope fail open when a registry entry is absent
       - what does an absent scope field default to
-    verdict: finding
-    findings: [726]
-    evidence: server/mod.rs:293-297 defaults to SharedPool; :307-353 gates only Gateway and Namespace; authz.rs:32-39 has no SharedPool subscribe check
-    audited: 78a2d363
+      - is every server that runs this RPC (not just the controller) wired with a real authorizer
+    verdict: safe
+    findings: []
+    evidence: server/mod.rs gates SharedPool (#726) the same way Namespace already was — ScopeAuthorizer::allows_shared_pool, no fail-open on an absent PeerSvid — which also covers the absent-scope-field default (still SharedPool). The Gateway-scope binding's entry-absent fail-open is closed too (an absent dedicated-registry entry now denies rather than silently opening). ProvisionedRelayAuthorizer::allows_shared_pool authorizes only the shared-relay or shared-proxy identity pinned to the install namespace. The RELAY runs the identical DiscoveryService/Subscribe code on its own downstream port for a shared relay's leaves (ordinary shared-proxy pool pods) — roles/relay.rs wires the same ProvisionedRelayAuthorizer there too (an empty provenance set, since a relay's leaves never subscribe Namespace), sourced from a new --shared-proxy-name flag the controller renders from its own configured pool name so the two can't drift
+    audited: 78a2d363 (fix landed after this audit commit; a full /security-audit pass should refresh this stamp)
 
   - id: discovery-wire-decode
     boundary: TB4

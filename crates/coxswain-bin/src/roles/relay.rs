@@ -3,14 +3,33 @@
 //! Relays delta snapshots from the controller to proxy replicas without watching
 //! the cluster. Shared wiring lives in [`crate::wiring`], [`crate::services`], and
 //! [`crate::discovery`].
+//!
+//! # `--shared-proxy-name` (#726)
+//!
+//! A **shared** relay (`--shared`) needs the shared-proxy pool's
+//! ServiceAccount name to authorize its own downstream `SharedPool`
+//! subscribers — its leaves are ordinary shared-proxy pool pods, and without
+//! this the relay's `ScopeAuthorizer` would reject every one of them. Unused
+//! by a **dedicated** relay (`--namespace`), whose leaves subscribe `Gateway`
+//! scope instead (a separate SVID-binding check, not gated by
+//! `ScopeAuthorizer` at all). The controller always renders this flag from
+//! its own `--shared-proxy-name` when it provisions a relay Deployment
+//! (`coxswain-controller`'s `render_relay.rs`), so the two configured names
+//! cannot drift apart; the CLI default here matters only for manual or test
+//! invocations that bypass controller rendering.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use coxswain_controller::{RELAY_SERVICE_ACCOUNT, SHARED_RELAY_SERVICE_ACCOUNT};
+use coxswain_core::Shared;
 use coxswain_core::health::HealthRegistry;
 use coxswain_discovery::{
-    DiscoveryService, RelayUpstream, RotatingServerTls, Scope, SpiffeMatcher, namespace_relay,
-    serve_discovery_with_tls, shared_relay,
+    DiscoveryService, ProvisionedRelayAuthorizer, RelayAuthzConfig, RelayUpstream,
+    RotatingServerTls, Scope, SpiffeMatcher, namespace_relay, serve_discovery_with_tls,
+    shared_relay,
 };
 use pingora_core::services::background::background_service;
 
@@ -29,8 +48,10 @@ use crate::wiring::{
 /// rotating bootstrapped SVID and the mounted trust bundle, so it needs no CA
 /// Secret, trust-bundle ConfigMap, or TokenReview (all of which the controller's
 /// discovery server needs and none of which the relay's RBAC-less SA can reach).
-/// The default `DenyAll` authorizer on the downstream `DiscoveryService`
-/// rejects any leaf `Namespace` subscribe (relay-behind-relay is out of scope).
+/// The downstream `DiscoveryService`'s `ProvisionedRelayAuthorizer` (an empty
+/// provenance set) rejects any leaf `Namespace` subscribe (relay-behind-relay is
+/// out of scope) while still authorizing the shared-proxy pool's `SharedPool`
+/// subscribes on a shared relay (#726).
 pub(crate) fn run_relay(args: RelayRoleArgs) -> Result<()> {
     init_logger(args.common.log_format, &args.common.log_filter)?;
 
@@ -102,13 +123,30 @@ pub(crate) fn run_relay(args: RelayRoleArgs) -> Result<()> {
     };
 
     // Downstream discovery service over the relay's own `SnapshotSource`. No
-    // leader gate (the relay is not leader-elected) and the default
-    // `DenyAll` authorizer (a leaf never subscribes `Namespace`).
+    // leader gate (the relay is not leader-elected). A leaf never subscribes
+    // `Namespace` (relay-behind-relay is out of scope), but a *shared*
+    // relay's leaves ARE ordinary shared-proxy pool pods subscribing
+    // `SharedPool` — reusing the default `DenyAll` here would reject every
+    // one of them post-#726, so `ProvisionedRelayAuthorizer` is wired with an
+    // empty provenance set (no `Namespace` subscribe is ever legitimate here)
+    // and the shared-proxy/shared-relay identity constants, exactly as the
+    // controller wires its own. Inert but harmless on a dedicated relay,
+    // whose leaves subscribe `Gateway` scope (a separate SVID-binding check,
+    // not gated by `ScopeAuthorizer` at all).
     // Directive forwarding (#601): the upstream client fans controller
     // `PreferredUpstream` directives into `directive_tx`; the downstream server
     // forwards each to the leaf it targets so a repoint reaches a relay-fronted
     // proxy through the relay.
+    let downstream_authorizer = Arc::new(ProvisionedRelayAuthorizer::new(RelayAuthzConfig {
+        provisioned: Shared::from_value(HashSet::new()),
+        relay_sa: RELAY_SERVICE_ACCOUNT.to_string(),
+        trust_domain: args.discovery.discovery_trust_domain.clone(),
+        shared_relay_sa: SHARED_RELAY_SERVICE_ACCOUNT.to_string(),
+        install_namespace: args.common.pod_namespace.clone(),
+        shared_proxy_sa: args.shared_proxy_name.clone(),
+    }));
     let discovery_service = DiscoveryService::new(source, node_registry.clone(), rebuild_rx)
+        .with_scope_authorizer(downstream_authorizer)
         .with_directive_forwarding(directive_tx);
 
     // Debounced roster reporter: watch the downstream registry and republish it

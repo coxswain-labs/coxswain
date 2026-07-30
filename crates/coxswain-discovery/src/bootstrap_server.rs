@@ -24,7 +24,7 @@
 //! - Port 50051: `DiscoveryServer::new(DiscoveryService)` — mTLS mandatory.
 //! - Port 50052: `DiscoveryServer::new(BootstrapService)` — server-auth-only.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
@@ -178,11 +178,12 @@ impl UpstreamResolverConfig {
     /// dedicated tier, where relay=`Namespace` and proxy=`Gateway` are distinct
     /// scopes). `None` peer (plaintext/test path) → treated as a proxy.
     ///
-    /// Checks the full identity triple, not `shared_relay_sa` alone (#666):
-    /// bootstrap issues an SVID to any ServiceAccount that passes `TokenReview`
-    /// with no allowlist, so a tenant could otherwise mint
-    /// `ServiceAccount/coxswain-relay-shared` in their own namespace and match
-    /// on SA name alone. The projected token cryptographically binds the SVID's
+    /// Checks the full identity triple, not `shared_relay_sa` alone (#666): a
+    /// tenant could otherwise mint `ServiceAccount/coxswain-relay-shared` in
+    /// their own namespace and match on SA name alone (defense in depth —
+    /// [`BootstrapIdentityAllowlist`] (#726) already denies that identity SVID
+    /// issuance in the first place, but this check does not rely on it being
+    /// wired). The projected token cryptographically binds the SVID's
     /// namespace to the pod's own namespace, so pinning `install_namespace` too
     /// makes the identity unforgeable from outside it — matching the same
     /// strict triple `ScopeAuthorizer::allows_roster` requires for this
@@ -266,6 +267,86 @@ impl UpstreamResolverConfig {
     }
 }
 
+// ── BootstrapIdentityAllowlist ──────────────────────────────────────────────────
+
+/// Defense-in-depth allowlist (#726) restricting SVID issuance to
+/// coxswain-managed identities.
+///
+/// Bootstrap authenticates the presenting ServiceAccount via `TokenReview`
+/// (any SA that passes is otherwise issued an SVID, with no allowlist) — a
+/// pod with zero Kubernetes RBAC can mint any ServiceAccount's own token via
+/// the projected-token mechanism, so `TokenReview` alone proves only "this
+/// pod really is this SA," not "this SA is one coxswain deploys." The
+/// SharedPool/Namespace/Gateway subscribe-time authorization gates are the
+/// primary control against a minted SVID being *used* to read data (#726);
+/// this allowlist narrows the SVID-issuance primitive itself.
+///
+/// Kept as plain data mirroring [`crate::server::RelayAuthzConfig`]'s shape:
+/// this crate depends on neither `coxswain-controller` nor `coxswain-bin`, so
+/// the identity constants and live cells are passed in from whichever binary
+/// wires the bootstrap server.
+pub struct BootstrapIdentityAllowlist {
+    /// Namespace the shared proxy pool and shared relay run in (the coxswain
+    /// install namespace).
+    pub install_namespace: String,
+    /// The shared-proxy pool's ServiceAccount name (install-configurable).
+    pub shared_proxy_sa: String,
+    /// The shared relay's fixed ServiceAccount name (`coxswain-relay-shared`).
+    pub shared_relay_sa: String,
+    /// The namespace-relay ServiceAccount name every provisioned relay runs
+    /// as (`coxswain-relay`), checked jointly with `provisioned_relays`.
+    pub relay_sa: String,
+    /// Namespaces with a controller-provisioned relay, live per the operator's
+    /// relay convergence — the same set `ScopeAuthorizer::allows_namespace`
+    /// reads for the relay's own live subscribe, so a relay's bootstrap and
+    /// its subsequent Namespace subscribe are gated by the same provenance.
+    pub provisioned_relays: Shared<HashSet<String>>,
+    /// Every dedicated-mode Gateway's expected proxy identity:
+    /// `ObjectKey` (the Gateway's own namespace/name) → `expected_proxy_sa`
+    /// (GEP-1762, `{gateway}-{class}`). Written by the per-Gateway reconcile
+    /// at *provisioning intent* — before cut-over — so a fresh dedicated
+    /// proxy's very first bootstrap attempt is already authorized instead of
+    /// racing `gateway_is_cut_over`. Deliberately **not** the post-cut-over
+    /// `coxswain_core::dedicated_registry::DedicatedRoutingRegistry` the
+    /// Gateway-scope Subscribe binding check reads — that registry exists
+    /// only once the proxy is already Ready, which would make bootstrap
+    /// authorization circular with the thing it's gating.
+    pub dedicated_identities: Shared<HashMap<coxswain_core::ownership::ObjectKey, String>>,
+}
+
+impl BootstrapIdentityAllowlist {
+    /// Whether `spiffe` is a coxswain-managed identity eligible for SVID
+    /// issuance: the shared proxy or shared relay in the install namespace,
+    /// the relay ServiceAccount in a currently-provisioned namespace, or the
+    /// `{gateway}-{class}` identity of a currently dedicated-mode Gateway.
+    ///
+    /// No trust-domain check: `spiffe` here is server-derived from a
+    /// `TokenReview`-validated principal, not a client-presented certificate,
+    /// so its trust domain is already correct by construction (unlike
+    /// `svid_matches_dedicated_gateway`, which checks an mTLS peer's own
+    /// claimed SAN).
+    #[must_use]
+    pub fn allows(&self, spiffe: &SpiffeId) -> bool {
+        let namespace = spiffe.namespace();
+        let sa = spiffe.service_account();
+
+        if namespace == self.install_namespace
+            && (sa == self.shared_proxy_sa || sa == self.shared_relay_sa)
+        {
+            return true;
+        }
+
+        if sa == self.relay_sa && self.provisioned_relays.load().contains(namespace) {
+            return true;
+        }
+
+        self.dedicated_identities
+            .load()
+            .iter()
+            .any(|(key, expected_proxy_sa)| key.ns == namespace && expected_proxy_sa == sa)
+    }
+}
+
 // ── RejectHook ────────────────────────────────────────────────────────────────
 
 /// Callback invoked when a Bootstrap request is rejected.
@@ -316,6 +397,9 @@ pub struct BootstrapService<I, A, H = NoOpRejectHook> {
     /// case the response carries an empty upstream pointer (the client keeps its
     /// configured fallback).
     upstream: Option<Arc<UpstreamResolverConfig>>,
+    /// Identity allowlist (#726). `None` in tests; always wired in production
+    /// (`coxswain-bin`) — see [`BootstrapIdentityAllowlist`].
+    identity_allowlist: Option<Arc<BootstrapIdentityAllowlist>>,
 }
 
 impl<I, A> BootstrapService<I, A, NoOpRejectHook>
@@ -331,6 +415,7 @@ where
             authenticator,
             reject_hook: Arc::new(NoOpRejectHook),
             upstream: None,
+            identity_allowlist: None,
         }
     }
 }
@@ -349,6 +434,7 @@ where
             authenticator,
             reject_hook,
             upstream: None,
+            identity_allowlist: None,
         }
     }
 
@@ -357,6 +443,14 @@ where
     #[must_use]
     pub fn with_upstream_resolver(mut self, resolver: Arc<UpstreamResolverConfig>) -> Self {
         self.upstream = Some(resolver);
+        self
+    }
+
+    /// Attach the identity allowlist (#726) so SVID issuance is restricted to
+    /// coxswain-managed identities. Always wired in production.
+    #[must_use]
+    pub fn with_identity_allowlist(mut self, allowlist: Arc<BootstrapIdentityAllowlist>) -> Self {
+        self.identity_allowlist = Some(allowlist);
         self
     }
 }
@@ -389,8 +483,10 @@ where
     ///
     /// 1. Reject requests with a mismatched `wire_version` (clear protocol error).
     /// 2. Authenticate the SA token via [`TokenAuthenticator`] → [`SpiffeId`].
-    /// 3. Sign the CSR via [`SvidIssuer`] → [`coxswain_core::identity::IssuedSvid`].
-    /// 4. Return the cert PEM, trust bundle PEM, and `not_after` timestamp.
+    /// 3. Check the resulting identity against [`BootstrapIdentityAllowlist`]
+    ///    (#726), when one is wired.
+    /// 4. Sign the CSR via [`SvidIssuer`] → [`coxswain_core::identity::IssuedSvid`].
+    /// 5. Return the cert PEM, trust bundle PEM, and `not_after` timestamp.
     ///
     /// Any failure invokes the reject hook before returning `Unauthenticated`.
     async fn bootstrap(
@@ -438,6 +534,21 @@ where
         };
 
         info!(spiffe_id = %spiffe_id, "bootstrap: SA token authenticated");
+
+        // 2.5. Identity allowlist (#726): `TokenReview` proves the presenting
+        // pod really is the ServiceAccount it claims, not that coxswain
+        // deploys that ServiceAccount — any pod with zero RBAC can mint its
+        // own SA's projected token. `None` (tests / not-yet-wired paths) skips
+        // this check; production always wires it.
+        if let Some(allowlist) = &self.identity_allowlist
+            && !allowlist.allows(&spiffe_id)
+        {
+            let msg = "identity is not a coxswain-managed ServiceAccount";
+            warn!(spiffe_id = %spiffe_id, "bootstrap: identity not allowlisted");
+            reject("identity_not_allowlisted");
+            self.reject_hook.on_reject(spiffe_id.as_str(), msg).await;
+            return Err(Status::permission_denied(msg));
+        }
 
         // 3. Sign the CSR.
         let csr = CsrPem::new(req.csr_pem);
@@ -913,5 +1024,155 @@ mod tests {
             "https://coxswain-relay.team-a.svc:50051"
         );
         assert_eq!(body.expected_server_sa, "coxswain-relay");
+    }
+
+    // ── BootstrapIdentityAllowlist (#726) ───────────────────────────────────────
+
+    fn empty_dedicated_identities() -> Shared<HashMap<coxswain_core::ownership::ObjectKey, String>>
+    {
+        Shared::from_value(HashMap::new())
+    }
+
+    /// A dedicated-identities set with one entry: `(namespace, name)` expects
+    /// `expected_proxy_sa`.
+    fn dedicated_identities_with(
+        namespace: &str,
+        name: &str,
+        expected_proxy_sa: &str,
+    ) -> Shared<HashMap<coxswain_core::ownership::ObjectKey, String>> {
+        use coxswain_core::ownership::ObjectKey;
+
+        let key = ObjectKey::new(namespace.to_owned(), name.to_owned());
+        Shared::from_value(HashMap::from([(key, expected_proxy_sa.to_owned())]))
+    }
+
+    fn test_allowlist(
+        dedicated_identities: Shared<HashMap<coxswain_core::ownership::ObjectKey, String>>,
+    ) -> BootstrapIdentityAllowlist {
+        BootstrapIdentityAllowlist {
+            install_namespace: "coxswain-system".to_owned(),
+            shared_proxy_sa: "coxswain-shared-proxy".to_owned(),
+            shared_relay_sa: "coxswain-relay-shared".to_owned(),
+            relay_sa: "coxswain-relay".to_owned(),
+            provisioned_relays: Shared::from_value(HashSet::from(["team-a".to_owned()])),
+            dedicated_identities,
+        }
+    }
+
+    #[test]
+    fn allowlist_accepts_shared_proxy_identity() {
+        let a = test_allowlist(empty_dedicated_identities());
+        let id = SpiffeId::from_parts("cluster.local", "coxswain-system", "coxswain-shared-proxy");
+        assert!(
+            a.allows(&id),
+            "the shared proxy pool's own identity must be allowlisted"
+        );
+    }
+
+    #[test]
+    fn allowlist_accepts_shared_relay_identity() {
+        let a = test_allowlist(empty_dedicated_identities());
+        let id = SpiffeId::from_parts("cluster.local", "coxswain-system", "coxswain-relay-shared");
+        assert!(
+            a.allows(&id),
+            "the shared relay's own identity must be allowlisted"
+        );
+    }
+
+    #[test]
+    fn allowlist_accepts_provisioned_namespace_relay() {
+        let a = test_allowlist(empty_dedicated_identities());
+        assert!(
+            a.allows(&relay_id("team-a")),
+            "the relay SA in a provisioned namespace must be allowlisted"
+        );
+    }
+
+    #[test]
+    fn allowlist_denies_relay_sa_in_unprovisioned_namespace() {
+        let a = test_allowlist(empty_dedicated_identities());
+        assert!(
+            !a.allows(&relay_id("team-b")),
+            "the relay SA outside a provisioned namespace must be denied"
+        );
+    }
+
+    #[test]
+    fn allowlist_accepts_dedicated_gateway_proxy() {
+        let a = test_allowlist(dedicated_identities_with(
+            "team-c",
+            "my-gw",
+            "my-gw-coxswain",
+        ));
+        assert!(
+            a.allows(&dedicated_id("team-c")),
+            "a dedicated Gateway's own expected_proxy_sa must be allowlisted, even pre-cutover"
+        );
+    }
+
+    #[test]
+    fn allowlist_denies_rogue_identity() {
+        let a = test_allowlist(dedicated_identities_with(
+            "team-c",
+            "my-gw",
+            "my-gw-coxswain",
+        ));
+        let id = SpiffeId::from_parts("cluster.local", "some-tenant", "coxswain-proxy");
+        assert!(
+            !a.allows(&id),
+            "an ordinary self-made ServiceAccount must never be allowlisted"
+        );
+    }
+
+    /// Existing tests (no allowlist wired) are unaffected — `None` skips the
+    /// check entirely.
+    #[tokio::test]
+    async fn bootstrap_rejects_identity_not_on_allowlist() {
+        let svc = BootstrapService::new(
+            Arc::new(OkIssuer {
+                cert: vec![],
+                bundle: vec![],
+                not_after: 0,
+            }),
+            Arc::new(OkAuthenticator(proxy_id())),
+        )
+        .with_identity_allowlist(Arc::new(test_allowlist(empty_dedicated_identities())));
+
+        let rejected_before = crate::metrics::bootstrap_total()
+            .with_label_values(&["rejected", "identity_not_allowlisted"])
+            .get();
+
+        let err = svc
+            .bootstrap(make_request("tok", b"csr"))
+            .await
+            .expect_err("an identity absent from the allowlist must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied, "got: {err:?}");
+
+        assert_eq!(
+            crate::metrics::bootstrap_total()
+                .with_label_values(&["rejected", "identity_not_allowlisted"])
+                .get(),
+            rejected_before + 1,
+            "a rejected identity must increment bootstrap_total{{rejected,identity_not_allowlisted}}"
+        );
+    }
+
+    /// A matching identity still succeeds when an allowlist is wired — proves
+    /// the seam is wired end-to-end, not just deny-by-default.
+    #[tokio::test]
+    async fn bootstrap_accepts_identity_on_allowlist() {
+        let svc = BootstrapService::new(
+            Arc::new(OkIssuer {
+                cert: b"cert".to_vec(),
+                bundle: b"bundle".to_vec(),
+                not_after: 9999,
+            }),
+            Arc::new(OkAuthenticator(relay_id("team-a"))),
+        )
+        .with_identity_allowlist(Arc::new(test_allowlist(empty_dedicated_identities())));
+
+        svc.bootstrap(make_request("tok", b"csr"))
+            .await
+            .expect("a provisioned-namespace relay identity must be accepted by the allowlist");
     }
 }
